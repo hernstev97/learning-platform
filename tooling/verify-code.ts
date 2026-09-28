@@ -33,6 +33,7 @@ function exec(command: string, args: string[], options: { input?: string; cwd?: 
     child.stdout.on('data', (d) => { stdout += d; });
     child.stderr.on('data', (d) => { stderr += d; });
     child.on('close', (code) => { clearTimeout(timer); resolve({ code, stdout, stderr, timedOut }); });
+    child.stdin.on('error', () => { /* the program may exit before reading stdin (EPIPE) */ });
     child.stdin.end(options.input ?? '');
   });
 }
