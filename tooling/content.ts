@@ -146,7 +146,7 @@ function exercise(raw: Obj, moduleId: string, where: string, report: Reporter): 
         if (!answer.trim() || !tokens(answer, language).length) report.error(where, `Lücke ${i + 1} ist leer`);
         const accept = g.list<string>('accept').map(String);
         if (!meta.hint) report.warn(where, `Lücke ${i + 1} hat keinen Hinweis`);
-        return { id: `g${i + 1}`, label: g.str('label', false) || `Lücke ${i + 1}`, answers: [answer, ...accept], hint: g.str('hint', false), multiline: answer.includes('\n') || answer.length > 65 };
+        return { id: `g${i + 1}`, label: g.str('label', false) || `Lücke ${i + 1}`, answers: [answer, ...accept], hint: inline(g.str('hint', false)), multiline: answer.includes('\n') || answer.length > 65 };
       });
       return { ...base, type, lang: language, code, gaps, fingerprint: fingerprint([type, language, code, gaps.map((g) => g.answers)]) };
     }
@@ -292,7 +292,7 @@ function loadBear(areaDir: string, path: string, report: Reporter): { modules: M
       exercises: tasks.map((task: Obj): Exercise => ({
         id: `${id}/${task.id}`, module: id, type: 'gap', lang: 'kotlin', title: task.title, prompt: paragraphs(task.prompt),
         explanation: paragraphs(task.explanation), wiki: { title: task.wiki.title, body: paragraphs(task.wiki.body) }, hints: [],
-        resources: task.resources, code: task.code, gaps: task.gaps, source: task.source, fingerprint: task.fingerprint,
+        resources: task.resources, code: task.code, gaps: task.gaps.map((g: Obj) => ({ ...g, hint: escape(g.hint) })), source: task.source, fingerprint: task.fingerprint,
       })),
     };
   });

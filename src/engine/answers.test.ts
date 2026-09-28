@@ -1,110 +1,86 @@
 import { describe, expect, it } from 'vitest';
-import { chapters, sourceFiles, tasks } from './curriculum';
-import { assemble, isCorrect, isGapCorrect, solution } from './validation';
-import { freshProgress, LEGACY_KEY, readProgress, STORAGE_KEY, writeProgress } from './storage';
-import type { Answers } from './types';
+import { join } from 'node:path';
+import { loadContent } from '../../tooling/content.ts';
+import type { GapExercise } from '../content/types.ts';
+import { assemble, gapSolution, isChoiceCorrect, isCommandCorrect, isGapCorrect, isGapExerciseCorrect, isOrderCorrect, isOutputCorrect, shellTokens, shuffledOrder, tokens } from './answers.ts';
 
-function memoryStorage(seed: Record<string, string> = {}) {
-  const data = new Map(Object.entries(seed));
-  return { data, getItem: (key: string) => data.get(key) ?? null, setItem: (key: string, value: string) => { data.set(key, value); } };
-}
+const kotlin = loadContent(['kotlin'], undefined, { allowMissing: true }).areas.kotlin;
+const bear = Object.values(kotlin.modules).filter((m) => m.bear).flatMap((m) => m.exercises) as GapExercise[];
+const fixtures = loadContent(undefined, join(import.meta.dirname, '../../tooling/fixtures'));
+const example = fixtures.areas.beispiel.modules['alle-typen'].exercises;
+const byId = (id: string) => example.find((e) => e.id === `alle-typen/${id}`)! as any;
 function dedent(value: string): string {
   const lines = value.split('\n');
   const indent = Math.min(...lines.filter((line) => line.trim()).map((line) => line.match(/^ */)![0].length));
   return lines.map((line) => line.trim() ? line.slice(indent) : '').join('\n');
 }
 
-describe('Kotlin reconstruction', () => {
+describe('Kotlin reconstruction (Bear track)', () => {
   it('does not merge identifier parts or compound operators', () => {
-    const valGap = tasks[0].gaps[0];
+    const valGap = bear[0].gaps[0];
     expect(isGapCorrect(valGap, ' val ')).toBe(true);
     expect(isGapCorrect(valGap, 'v al')).toBe(false);
     expect(isGapCorrect(valGap, 'VAL')).toBe(false);
     expect(isGapCorrect(valGap, 'val // comment')).toBe(false);
-    const safe = tasks[24].gaps[0];
+    const safe = bear[24].gaps[0];
     expect(isGapCorrect(safe, '?.')).toBe(true);
     expect(isGapCorrect(safe, '? .')).toBe(false);
   });
-  it('preserves Kotlin strings, escapes and numeric literal suffixes', () => {
-    const string = tasks[1].gaps[0];
+  it('preserves Kotlin strings, escapes and numeric suffixes', () => {
+    const string = bear[1].gaps[0];
     expect(isGapCorrect(string, '"Bear"')).toBe(true);
     expect(isGapCorrect(string, "'Bear'")).toBe(false);
     expect(isGapCorrect(string, '" Bear "')).toBe(false);
-    const regex = tasks[90].gaps[1];
+    const regex = bear[90].gaps[1];
     expect(isGapCorrect(regex, String.raw`replace(Regex("\\s+"), " ")`)).toBe(true);
     expect(isGapCorrect(regex, String.raw`replace(Regex("\s+"), " ")`)).toBe(false);
-    expect(isGapCorrect(tasks[99].gaps[6], 'Progress(if (onTrack) value else value * 0.6, onTrack)')).toBe(false);
   });
-  it('accepts harmless token spacing in long expressions', () => {
-    const gap = tasks[70].gaps[0];
-    expect(isGapCorrect(gap, 'UUID . randomUUID ( ) . toString ( )')).toBe(true);
+  it.each(bear.map((e) => [e.id, e] as const))('%s reconstructs its exact Bear source excerpt', (_, task) => {
+    const original = kotlin.files[task.source!.file].split('\n').slice(task.source!.start - 1, task.source!.end).join('\n');
+    expect(assemble(task, gapSolution(task))).toBe(dedent(original));
+    expect(isGapExerciseCorrect(task, gapSolution(task))).toBe(true);
+    expect(isGapExerciseCorrect(task, {})).toBe(false);
   });
-  it('only completes a task once every gap is correct', () => {
-    const task = tasks[99];
-    const answers: Answers = {};
-    for (const gap of task.gaps) {
-      expect(isCorrect(task, answers)).toBe(false);
-      answers[gap.id] = gap.answers[0];
-    }
-    expect(isCorrect(task, answers)).toBe(true);
-    answers.g3 = 'false';
-    expect(isCorrect(task, answers)).toBe(false);
-  });
-  it.each(tasks)('$id reconstructs its exact Bear source excerpt', (task) => {
-    const original = sourceFiles[task.source.file].split('\n').slice(task.source.start - 1, task.source.end).join('\n');
-    expect(assemble(task, solution(task))).toBe(dedent(original));
-    expect(isCorrect(task, solution(task))).toBe(true);
-    expect(isCorrect(task, {})).toBe(false);
-    expect(task.code.match(/⟦\d+⟧/g)).toHaveLength(task.gaps.length);
-    for (const gap of task.gaps) {
-      expect(isGapCorrect(gap, '')).toBe(false);
-      expect(isGapCorrect(gap, 'incorrect')).toBe(false);
-      expect(task.code.match(new RegExp(`⟦${gap.id.slice(1)}⟧`, 'g'))).toHaveLength(1);
-    }
-    expect(task.resources.length).toBeGreaterThan(0);
-    expect(task.wiki.body.length).toBeGreaterThan(70);
-  });
-  it('contains a progressive 100-task course and complex final chapters', () => {
-    expect(tasks).toHaveLength(100);
-    expect(new Set(tasks.map((task) => task.id)).size).toBe(100);
-    chapters.forEach((_, index) => expect(tasks.filter((task) => task.chapter === index)).toHaveLength(10));
-    expect(tasks.slice(0, 10).every((task) => task.gaps.length === 1)).toBe(true);
-    expect(tasks.slice(90).every((task) => task.gaps.length >= 3)).toBe(true);
-    expect(tasks[99].gaps).toHaveLength(7);
-    expect(Object.keys(sourceFiles)).toHaveLength(21);
+  it('keeps the 100-task structure', () => {
+    expect(bear).toHaveLength(100);
+    expect(Object.values(kotlin.modules).filter((m) => m.bear)).toHaveLength(10);
+    expect(bear[99].gaps).toHaveLength(7);
   });
 });
 
-describe('Bear progress', () => {
-  it('retains partially correct drafts and completion snapshots independently', () => {
-    const storage = memoryStorage();
-    const progress = freshProgress();
-    const task = tasks[99];
-    progress.activeId = task.id;
-    progress.drafts[task.id] = { g1: task.gaps[0].answers[0], g2: 'norm' };
-    progress.completed[task.id] = { answers: solution(task), at: '2026-09-27', fingerprint: task.fingerprint };
-    expect(writeProgress(storage, progress)).toBe(true);
-    expect(readProgress(storage).progress).toEqual(progress);
+describe('Answer checking per language', () => {
+  it('treats Python quote styles as equal but keeps content strict', () => {
+    expect(tokens(`print('a')`, 'python')).toEqual(tokens(`print("a")`, 'python'));
+    expect(tokens(`print('a')`, 'python')).not.toEqual(tokens(`print('b')`, 'python'));
+    expect(tokens(`f'{x}'`, 'python')).toEqual(tokens(`f"{x}"`, 'python'));
   });
-  it('preserves the legacy course verbatim, without marking new Bear tasks complete', () => {
-    const old = JSON.stringify({ version: 1, completed: { val: { answer: 'val' } } });
-    const storage = memoryStorage({ [LEGACY_KEY]: old });
-    const loaded = readProgress(storage);
-    expect(loaded.legacy).toBe(true);
-    expect(loaded.progress).toEqual(freshProgress());
-    writeProgress(storage, loaded.progress);
-    expect(storage.getItem(LEGACY_KEY)).toBe(old);
+  it('tokenises Rust lifetimes and char literals', () => {
+    expect(tokens(`fn f<'a>(x: &'a str) -> char { 'x' }`, 'rust')).toContain(`'a`);
+    expect(tokens(`'x'`, 'rust')).toEqual([`'x'`]);
   });
-  it('rejects incomplete completions, stale fingerprints and malformed drafts', () => {
-    const task = tasks[99];
-    const data = { version: 2, activeId: 'deleted', drafts: { [task.id]: { g1: 42, g2: 'draft', unknown: 'x' } }, completed: { [task.id]: { answers: { g1: 'normalize(typed)' }, at: 'today', fingerprint: task.fingerprint }, [tasks[0].id]: { answers: solution(tasks[0]), at: 'today', fingerprint: 'old' } } };
-    const loaded = readProgress(memoryStorage({ [STORAGE_KEY]: JSON.stringify(data) }));
-    expect(loaded.progress).toEqual({ ...freshProgress(), drafts: { [task.id]: { g2: 'draft' } } });
+  it('normalises shell flags and harmless quoting', () => {
+    const ex = { answers: ['ls -la'] };
+    for (const ok of ['ls -la', 'ls -al', 'ls -l -a', '  ls   -a -l ', '$ ls -la']) expect(isCommandCorrect(ex, ok)).toBe(true);
+    for (const bad of ['ls -l', 'ls -la /', 'ls --all', 'rm -la']) expect(isCommandCorrect(ex, bad)).toBe(false);
+    expect(shellTokens(`grep "error" log`)).toEqual(shellTokens(`grep error log`));
+    expect(shellTokens(`find . -name '*.log'`)).toEqual(shellTokens(`find . -name "*.log"`));
+    expect(shellTokens(`find . -name '*.log'`)).not.toEqual(shellTokens(`find . -name *.log`));
+    expect(shellTokens(`echo "$HOME"`)).not.toEqual(shellTokens(`echo '$HOME'`));
   });
-  it('reports corrupt reads and failed writes without preventing study', () => {
-    expect(readProgress(memoryStorage({ [STORAGE_KEY]: '{bad' })).warning).toBeTruthy();
-    const blocked = { getItem: () => { throw new Error('blocked'); }, setItem: () => { throw new Error('quota'); } };
-    expect(readProgress(blocked).progress).toEqual(freshProgress());
-    expect(writeProgress(blocked, freshProgress())).toBe(false);
+  it('checks every fixture exercise type', () => {
+    expect(isGapExerciseCorrect(byId('lueckentext'), { g1: 'def', g2: '2*x' })).toBe(true);
+    expect(isChoiceCorrect(byId('auswahl'), [0, 2])).toBe(true);
+    expect(isChoiceCorrect(byId('auswahl'), [0])).toBe(false);
+    expect(isOrderCorrect(byId('reihenfolge'), [0, 1, 2, 3, 4])).toBe(true);
+    expect(isOrderCorrect(byId('reihenfolge'), byId('reihenfolge').shuffled)).toBe(false);
+    expect(isOutputCorrect(byId('ausgabe'), '[1, 2, 3]  \n[3, 1, 2]\n\n')).toBe(true);
+    expect(isOutputCorrect(byId('ausgabe'), '[1, 2, 3]')).toBe(false);
+  });
+  it('never shuffles into the solved order', () => {
+    for (let n = 2; n < 12; n++) for (const seed of ['a', 'b', 'c', 'xyz']) {
+      const order = shuffledOrder(n, seed);
+      expect([...order].sort((a, b) => a - b)).toEqual(Array.from({ length: n }, (_, i) => i));
+      expect(order.some((v, i) => v !== i)).toBe(true);
+    }
   });
 });

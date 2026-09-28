@@ -12,8 +12,18 @@ export function content(): Plugin {
   let cache: Loaded | null = null;
   const load = (): Loaded => {
     if (cache) return cache;
-    const loaded = loadContent();
-    if (loaded.errors.length) throw new Error(`Inhalte sind ungültig (${loaded.errors.length} Fehler):\n${formatIssues(loaded.errors)}\n\nDetails: pnpm content:check`);
+    // CONTENT_LENIENT=1 (local work in progress): report problems but serve what is valid.
+    const lenient = !!process.env.CONTENT_LENIENT;
+    const loaded = loadContent(undefined, undefined, { allowMissing: lenient });
+    // CONTENT_FIXTURES=1 (browser tests): also serve tooling/fixtures, which covers every exercise type.
+    if (process.env.CONTENT_FIXTURES) {
+      const fixtures = loadContent(undefined, join(ROOT, 'tooling/fixtures'));
+      loaded.catalog.areas.push(...fixtures.catalog.areas);
+      Object.assign(loaded.areas, fixtures.areas);
+      loaded.errors.push(...fixtures.errors);
+    }
+    if (loaded.errors.length && lenient) console.warn(`[content] ${loaded.errors.length} Fehler werden übersprungen:\n${formatIssues(loaded.errors)}`);
+    else if (loaded.errors.length) throw new Error(`Inhalte sind ungültig (${loaded.errors.length} Fehler):\n${formatIssues(loaded.errors)}\n\nDetails: pnpm content:check`);
     cache = loaded;
     return loaded;
   };
