@@ -10,8 +10,8 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--check', action='store_true', help='Check generated course without writing it')
 parser.add_argument('--verify-bear', type=Path, help='Also compare the snapshot to its original commit in this Bear checkout')
 args = parser.parse_args()
-APP = Path(__file__).resolve().parents[1]
-snapshot = json.loads((APP / 'course/bear-source.json').read_text())
+HERE = Path(__file__).resolve().parent
+snapshot = json.loads((HERE / 'bear-source.json').read_text())
 MAIN = 'android/app/src/main/java/app/kiumu/bear/'
 TEST = 'android/app/src/test/java/app/kiumu/bear/'
 REV = snapshot['revision']
@@ -122,14 +122,14 @@ N = 'data/linear/LinearClient.kt'
 Z = 'alarm/RoundScheduler.kt'
 
 # The curriculum is authored separately; it only names real source spans and masks.
-exec((APP / 'course/lessons.py').read_text(), globals())
+exec((HERE / 'lessons.py').read_text(), globals())
 assert len(lessons) == 100, len(lessons)
 assert set(files) == set(snapshot['files']), 'Snapshot contains unused source files.'
 output = dict(revision=REV, chapters=[dict(title=t, short=s, description=d) for t,s,d in chapters], tasks=lessons, files=files)
-target = APP / 'src/bear-course.json'
+target = HERE / 'bear-course.json'
 serialized = json.dumps(output, ensure_ascii=False, indent=2) + '\n'
 if args.check:
-    assert target.read_text() == serialized, 'Source snapshot or curriculum is out of date. Run pnpm course:build.'
+    assert target.read_text() == serialized, 'Source snapshot or curriculum is out of date. Run pnpm bear:build.'
 else:
     target.write_text(serialized)
 print(f'{len(lessons)} lessons, {sum(len(t["gaps"]) for t in lessons)} gaps, {len(files)} original files; Bear {REV[:7]}')
