@@ -1,3 +1,5 @@
+> **Hinweis (September 2026):** Dieser Kurs ist jetzt der Track „Praxis: Kotlin mit Bear“ auf learn.kiumu.app. Die Web-App aus `kotlin-lernen` wurde durch die Plattform ersetzt (Oberfläche, Speicherung, Tests: siehe `README.md` und `HANDBUCH.md` im Wurzelverzeichnis). In diesem Ordner liegen nur noch Generator (`build_course.py`), Aufgaben (`lessons.py`), der gepinnte Bear-Snapshot (`bear-source.json`) und der erzeugte Kurs (`bear-course.json`). Befehle: `pnpm bear:build`, `pnpm bear:check`. Der Text unten beschreibt die ursprüngliche eigenständige App und bleibt zur Nachvollziehbarkeit erhalten.
+
 # Kotlin mit Bear
 
 Live: [kotlin.kiumu.app](https://kotlin.kiumu.app) · Privates Repository: [hernstev97/kotlin-lernen](https://github.com/hernstev97/kotlin-lernen)
