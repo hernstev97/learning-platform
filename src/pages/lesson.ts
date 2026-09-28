@@ -1,4 +1,4 @@
-import { loadArea, progressOf, save, summaryOf } from '../app.ts';
+import { loadArea, onProgressChange, progressOf, setEntry, summaryOf } from '../app.ts';
 import { isDone } from '../engine/storage.ts';
 import { moduleNumber } from '../ui/area-nav.ts';
 import { enhanceCode } from '../ui/code.ts';
@@ -11,8 +11,6 @@ const lesson: Page<{ name: 'lesson'; area: string; module: string }> = async (ma
   const module = area.modules[route.module];
   if (!module) return (await import('./not-found.ts')).default(main, { name: 'not-found' });
   const progress = progressOf(summary.id);
-  progress.last = `/${summary.id}/${module.id}`;
-  save(summary.id);
   const index = summary.modules.findIndex((m) => m.id === module.id);
   const prev = summary.modules[index - 1];
   const next = summary.modules[index + 1];
@@ -64,7 +62,7 @@ const lesson: Page<{ name: 'lesson'; area: string; module: string }> = async (ma
   $<HTMLInputElement>('#read', main).addEventListener('change', (event) => {
     if ((event.target as HTMLInputElement).checked) progress.read[module.id] = new Date().toISOString();
     else delete progress.read[module.id];
-    save(summary.id);
+    setEntry(summary.id, { kind: 'lesson', id: module.id, completedAt: progress.read[module.id] ?? null });
   });
   // Highlight the current section in the table of contents.
   const links = new Map([...main.querySelectorAll<HTMLAnchorElement>('.toc a')].map((a) => [a.hash.slice(1), a]));
@@ -76,6 +74,18 @@ const lesson: Page<{ name: 'lesson'; area: string; module: string }> = async (ma
   }, { rootMargin: '-20% 0px -70% 0px' });
   main.querySelectorAll('.prose h2[id], #uebungen').forEach((h) => observer.observe(h));
   const cleanCode = enhanceCode(main);
-  return () => { observer.disconnect(); cleanCode(); };
+  const unsubscribe = onProgressChange(() => {
+    $<HTMLInputElement>('#read', main).checked = !!progress.read[module.id];
+    main.querySelectorAll('.exercise-list a').forEach((link, index) => {
+      const done = isDone(progress, module.exercises[index]);
+      link.classList.toggle('done', done);
+      const state = link.querySelector('.exercise-state')!;
+      state.setAttribute('aria-label', done ? 'gelöst' : 'offen');
+      state.innerHTML = done ? icons.check : '';
+    });
+    const next = Math.max(0, module.exercises.findIndex((e) => !isDone(progress, e)));
+    main.querySelectorAll<HTMLAnchorElement>('.module-actions a, .exercise-overview > a').forEach((a) => { a.href = `/${summary.id}/${module.id}/${next + 1}`; });
+  });
+  return () => { observer.disconnect(); cleanCode(); unsubscribe(); };
 };
 export default lesson;

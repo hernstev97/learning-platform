@@ -9,7 +9,7 @@ import { codeCard, langName } from './basic.ts';
 import type { ExerciseRenderer } from './types.ts';
 
 export const order: ExerciseRenderer<OrderExercise, number[]> = (exercise, ctx) => {
-  let arrangement = ctx.draft?.length === exercise.lines.length ? [...ctx.draft] : [...exercise.shuffled];
+  const arrangement = ctx.draft?.length === exercise.lines.length ? [...ctx.draft] : [...exercise.shuffled];
   const lineMarkup = (index: number, position: number) => html`<li class="order-item" data-index="${index}" draggable="true">
     <span class="order-handle" aria-hidden="true">⠿</span>
     <code class="order-code">${raw(highlight(exercise.lines[index], exercise.lang) || ' ')}</code>

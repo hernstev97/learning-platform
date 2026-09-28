@@ -1,6 +1,6 @@
-import { loadArea, progressOf, save, summaryOf } from '../app.ts';
+import { loadArea, onProgressChange, progressOf, reviewCard, summaryOf } from '../app.ts';
 import type { Card } from '../content/types.ts';
-import { INTERVALS, gradeCard, localDay } from '../engine/storage.ts';
+import { INTERVALS, localDay } from '../engine/storage.ts';
 import { areaBanner } from '../ui/area-nav.ts';
 import { $, $$, LEVELS, html, raw } from '../ui/dom.ts';
 import type { Page } from '../router.ts';
@@ -81,8 +81,7 @@ const cards: Page<{ name: 'cards'; area: string }> = async (main, route) => {
   const reveal = () => { revealed = true; renderDeck(); };
   const grade = (knew: boolean) => {
     const card = queue[position];
-    progress.cards[card.id] = gradeCard(progress.cards[card.id], knew, today);
-    save(summary.id);
+    reviewCard(summary.id, card.id, knew);
     if (knew) sessionKnown++; else queue.push(card);
     position++;
     revealed = false;
@@ -116,6 +115,7 @@ const cards: Page<{ name: 'cards'; area: string }> = async (main, route) => {
   renderDeck();
   renderList();
   void INTERVALS; void $$;
-  return () => document.removeEventListener('keydown', keys);
+  const unsubscribe = onProgressChange(() => { renderList(); if (!queue.length || position >= queue.length) renderDeck(); });
+  return () => { document.removeEventListener('keydown', keys); unsubscribe(); };
 };
 export default cards;

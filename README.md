@@ -4,7 +4,7 @@ Private Lernplattform für Kotlin & Android, Rust, Linux, Python und Automation 
 
 Die Plattform ist kein Nachschlagewerk. Jedes Modul besteht aus einer Lektion, die ein Denkmodell aufbaut und auf die offizielle Dokumentation verweist, und aus 10–14 Übungen in fester Reihenfolge: verstehen → vorhersagen → schreiben → Fehler finden → erklären → anwenden. Jeder Bereich hat Interview-Karteikarten mit Wiederholung, Projekte und ein Abschlussprojekt, das wie eine Take-Home-Aufgabe im Bewerbungsprozess geschnitten ist.
 
-**Neue Lernbereiche anlegen: siehe [HANDBUCH.md](HANDBUCH.md).**
+**Neue Lernbereiche anlegen: siehe [HANDBUCH.md](HANDBUCH.md).** Anmeldung, Convex, Migration und Deployment: **[docs/CONVEX.md](docs/CONVEX.md)**. Prüfbericht und offene Grenzen: [Convex-Audit](docs/CONVEX-AUDIT.md).
 
 ## Start
 
@@ -12,6 +12,8 @@ Node.js 24, pnpm 11. Für `pnpm verify` zusätzlich `python3` (3.14) und `rustc`
 
 ```sh
 pnpm install
+cp .env.example .env.local # Clerk konfigurieren: docs/CONVEX.md
+pnpm convex:dev     # eigenes Convex-Projekt verbinden, in diesem Terminal weiterlaufen lassen
 pnpm dev            # http://127.0.0.1:5180
 ```
 
@@ -21,6 +23,8 @@ pnpm dev            # http://127.0.0.1:5180
 | `pnpm verify [bereich]` | Python-Übungen und -Beispiele ausführen, Rust kompilieren, Ausgaben vergleichen |
 | `pnpm links [bereich]` | Alle externen Links und Anker prüfen |
 | `pnpm test` | Unit-Tests (Prüflogik, Speicher, Bear-Rekonstruktion, Inhalte) |
+| `pnpm lint`, `pnpm typecheck` | ESLint und strikte TypeScript-Prüfung einschließlich Backend |
+| `pnpm test:convex:e2e` | Echte lokale Convex-Verbindung und mehrere Browsersitzungen; Setup in docs/CONVEX.md |
 | `pnpm test:e2e` | Browser-Tests aller Lernbereiche, neun Übungsarten, Python-Laufzeit, Lernstand und Bear-Track |
 | `pnpm build` | TypeScript prüfen und statisch nach `dist/` bauen |
 | `pnpm bear:build`, `pnpm bear:check` | Bear-Track aus dem gepinnten Snapshot erzeugen bzw. prüfen |
@@ -39,17 +43,21 @@ tooling/vite-plugins.ts    Inhalte als virtuelle Module (ein Chunk pro Bereich),
 tooling/verify-code.ts     Führt Musterlösungen und Beispiele aus
 tooling/fixtures/          Beispielbereich mit jeder Übungsart (Tests, Vorlage)
 src/engine/                Prüflogik (tokenbasiert je Sprache), Highlighter, Lernstand
+convex/                    Schema, zentrale Einzelnutzer-Autorisierung, Fortschritt und Migration
+src/main.ts                Clerk-Anmeldung und geschlossenes Zugriffstor
+src/app.ts                 Reaktiver Convex-Lernstand und optimistische Mutationen
+src/shell.ts               Bestehende Lernoberfläche und Navigation nach autorisiertem Laden
 src/exercises/             Die neun Übungsarten
 src/pages/                 Startseite, Bereich, Lektion, Übung, Karten, Projekte, Nachschlageseiten, Daten
 src/python/                Pyodide-Worker und Harness (dieselbe Harness nutzt pnpm verify)
 vendor/pyodide/            Zusätzliche Pyodide-Pakete (tzdata, beautifulsoup4, PyYAML)
 ```
 
-Die App ist ein statisches Vite-Projekt ohne Framework, Backend oder Konto. Alle Assets, Schriften und die Python-Laufzeit werden vom eigenen Ursprung geladen; nur explizit geöffnete Doku-Links und der Rust Playground führen nach außen.
+Die Oberfläche bleibt ein statisches Vite-Projekt ohne Frontendframework. Inhalte, Schriften und Python-Laufzeit werden vom eigenen Ursprung geladen. Clerk stellt die Anmeldung bereit; Convex speichert und synchronisiert den persönlichen Lernstand. Genau ein serverseitig konfiguriertes Clerk-Konto erhält Zugriff auf die privaten Backendfunktionen. Das Curriculum bleibt statisch im Repository.
 
 ## Lernstand
 
-Pro Bereich ein Eintrag `learn:<bereich>:v1` im `localStorage`: gelöste Übungen mit Fingerprint, Entwürfe, gelesene Lektionen, Kartenboxen, Projektschritte. Ändert sich der geprüfte Teil einer Übung, zählt ein früherer Erfolg nicht mehr. Unter `/daten` lässt sich alles als JSON sichern und wieder zusammenführen; dort kann auch der alte Stand von kotlin.kiumu.app übernommen werden.
+Convex speichert gelöste Übungen mit Fingerprint, versionierte Entwürfe, gelesene Lektionen, Kartenboxen, Projektschritte und die letzte Lernposition. Fortschrittsanzeigen werden daraus berechnet. Ändert sich der geprüfte Teil einer Übung, zählt ein früherer Erfolg nicht mehr. Bestehende `learn:<bereich>:v1`-Einträge werden nach Anmeldung erkannt und unter `/daten` bewusst importiert; Originale bleiben erhalten. Dort gibt es weiterhin JSON-Sicherung, Wiederherstellung, Bereichsreset und Bear-Import. Details und Konfliktregeln: [Convex-Dokumentation](docs/CONVEX.md).
 
 ## Prüfung der Antworten – und ihre Grenzen
 
@@ -60,11 +68,14 @@ Pro Bereich ein Eintrag `learn:<bereich>:v1` im `localStorage`: gelöste Übunge
 
 ## Deployment
 
-Vercel-Projekt `learning-platform` im Team `kiumu`, verbunden mit diesem Repository. `main` wird automatisch gebaut (`pnpm build`) und unter https://learn.kiumu.app veröffentlicht. `vercel.json` enthält das SPA-Routing, Cache- und Sicherheits-Header. Die gepinnte pnpm-Version wird über Corepack genutzt (`ENABLE_EXPERIMENTAL_COREPACK=1`).
+Vercel-Projekt `learning-platform` im Team `kiumu`, verbunden mit diesem Repository. `main` wird über `pnpm build:production` gebaut und unter https://learn.kiumu.app veröffentlicht. **Vor dem ersten Deployment die Convex-/Clerk-Produktionsvariablen einrichten**, siehe [Setup](docs/CONVEX.md#produktion-und-vercel). Dieser Build verbindet Backenddeployment und passende Frontend-URL. `vercel.json` enthält weiterhin SPA-Routing, Cache- und Sicherheits-Header. Die gepinnte pnpm-Version wird über Corepack genutzt (`ENABLE_EXPERIMENTAL_COREPACK=1`).
 
 ```sh
-PLAYWRIGHT_BASE_URL=https://learn.kiumu.app pnpm test:e2e e2e/learning-paths.spec.ts e2e/kotlin-bear.spec.ts --workers=3
+# Die vorhandene Regression läuft lokal mit einem nur für Tests geladenen Adapter.
+pnpm test:e2e
 ```
+
+Die bisherige unangemeldete Produktions-Smoke-Prüfung ist durch die Anmeldung nicht mehr passend. Eine echte Cloud-Abnahme erfolgt nach dem Setup mit dem erlaubten Konto und einer zweiten Sitzung; Backend-Sicherheit und lokale Cross-Device-Synchronisierung werden separat automatisiert geprüft.
 
 ## Herkunft
 

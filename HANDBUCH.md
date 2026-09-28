@@ -31,7 +31,7 @@ Die Plattform soll auf eine Anstellung als Entwickler vorbereiten. Sie ist **kei
 5. **Berufsrelevanz.** Zeige, wie etwas in echten Projekten aussieht, was in Code-Reviews auffällt und was im Vorstellungsgespräch gefragt wird (Callouts `PRAXIS` und `INTERVIEW`, Interview-Karten). Jeder Bereich endet mit einem **realistischen Abschlussprojekt**, das sich wie eine Take-Home-Aufgabe eines Arbeitgebers anfühlt und ins Portfolio gehört.
 6. **Erklären, nicht nur bewerten.** Jede Übung hat eine Erklärung, die das *Warum* liefert. Falsche Optionen begründen, warum sie falsch sind.
 7. **Ehrlich über Grenzen.** Wenn eine Prüfung nur vergleicht und nicht ausführt, steht das da. Wenn es mehrere richtige Antworten gibt, werden sie akzeptiert oder die Aufgabe wird eindeutig formuliert.
-8. **Keine Hürden.** Kein Konto, keine Streaks, keine Pflichtreihenfolge. Fortschritt liegt im Browser (`localStorage`) und lässt sich exportieren.
+8. **Persönlich und frei nutzbar.** Ein freigeschaltetes Konto synchronisiert den Lernstand über Convex. Keine Streaks oder Pflichtreihenfolge. Inhalte bleiben hier im Repository, Fortschritt lässt sich exportieren. Backend und Einrichtung: [docs/CONVEX.md](docs/CONVEX.md).
 
 ## 2. Aufbau eines Bereichs
 
@@ -495,7 +495,7 @@ projects:
       Markdown: Ausgangslage, Anforderungen (als Liste), Rahmenbedingungen.
     skills: [argparse, json, pathlib]
     steps:                      # Meilensteine; werden abgehakt und gespeichert
-      - id: datenmodell         # optional; Standard ist der Titel als Slug
+      - id: datenmodell         # Pflicht, stabil; nicht aus dem sichtbaren Titel ableiten
         title: Datenmodell entwerfen
         detail: Markdown mit konkreten Hinweisen, aber ohne fertige Lösung.
     stretch:                    # Zusatzaufgaben für Ehrgeizige
@@ -504,7 +504,7 @@ projects:
       Wie man das Projekt im Portfolio und im Gespräch präsentiert.
 ```
 
-Richtwert: 3–5 Projekte je Bereich, vom Wochenendprojekt bis zum Portfolio-Stück, jedes mit 5–10 Schritten. `acceptance` (optional, Liste) enthält überprüfbare Abnahmekriterien.
+Richtwert: 3–5 Projekte je Bereich, vom Wochenendprojekt bis zum Portfolio-Stück, jedes mit 5–10 Schritten. `acceptance` (optional, Liste aus `{ id, text }`) enthält überprüfbare Abnahmekriterien mit stabilen IDs. Schritt- und Abnahme-IDs müssen innerhalb des Projekts eindeutig sein.
 
 **Abschlussprojekt.** Genau ein Projekt pro Bereich trägt `capstone: true`. Es erscheint am Ende des Lernpfads und fühlt sich an wie eine echte Aufgabe eines Arbeitgebers: ein Auftraggeber mit Problem, klare fachliche Anforderungen, technische Rahmenbedingungen, mindestens fünf Abnahmekriterien (Tests, CI, README, Fehlerbehandlung, Code-Qualität, Sicherheit), 8–12 Meilensteine und eine Anleitung, wie man es im Portfolio und im Gespräch präsentiert. Es verbindet die Inhalte möglichst vieler Module des Bereichs.
 
@@ -515,8 +515,8 @@ Richtwert: 3–5 Projekte je Bereich, vom Wochenendprojekt bis zum Portfolio-St�
     level: 3
     hours: 40
     acceptance:
-      - "`cargo test` und `cargo clippy -- -D warnings` laufen in GitHub Actions grün."
-      - …
+      - id: ci-pruefung
+        text: "`cargo test` und `cargo clippy -- -D warnings` laufen in GitHub Actions grün."
 ```
 
 ### glossary.yaml
@@ -566,12 +566,15 @@ Checkliste vor dem Commit:
 
 ## 11. IDs, Fortschritt und Änderungen
 
-Fortschritt wird pro Bereich unter `learn:<bereich>:v1` im Browser gespeichert: gelöste Übungen (mit Fingerprint), Entwürfe, gelesene Lektionen, Kartenboxen und Projektschritte.
+Fortschritt liegt nach Anmeldung in Convex: gelöste Übungen (mit Fingerprint), Entwürfe, gelesene Lektionen, Kartenboxen, Projektschritte und die letzte Lernposition. Die alten Browser-Einträge `learn:<bereich>:v1` bleiben als importierbare Quelle unverändert. [Migration und Zustandsmodell](docs/CONVEX.md).
 
 - **Übungs-ID** = `<modul>/<id>`. Wer eine ID oder den Modulnamen ändert, verliert den Fortschritt dieser Übung.
 - **Fingerprint:** Ändert sich der geprüfte Teil einer Übung (Code, Antworten, Optionen, Tests), zählt ein früherer Erfolg nicht mehr. Tippfehler in Titel oder Erklärung ändern den Fingerprint nicht.
 - **Neue Übungen** ans Ende eines Moduls oder dazwischen einfügen ist unproblematisch – die Nummer in der URL ändert sich, der Fortschritt nicht.
 - Module umsortieren ist jederzeit möglich (`area.yaml`).
+- Auch „Weiterlernen“ speichert jetzt die Übungs-ID und berechnet die aktuelle URL-Nummer daraus.
+- Abnahmekriterien tragen explizite IDs. Die früher verwendeten Schlüssel `abnahme-N` bleiben bei bestehenden Inhalten erhalten und dürfen beim Umsortieren nicht neu nummeriert werden. Neue Kriterien brauchen neue IDs.
+- Entwürfe sind an ihren Inhaltsfingerprint gebunden; veraltete Entwürfe bleiben exportierbar, werden aber nicht automatisch in geänderte Übungen geladen.
 
 ## 12. YAML-Fallen
 
@@ -592,3 +595,5 @@ pnpm bear:check   # prüft, dass bear-course.json aktuell ist
 ```
 
 `area.yaml` bindet ihn mit `bear: bear/bear-course.json` als eigenen Track ein; der Loader macht daraus zehn Module `bear-01` … `bear-10`. Details: [content/kotlin/bear/README.md](content/kotlin/bear/README.md).
+
+Aufgaben in `lessons.py` nennen ihre bestehende Aufgaben-ID und Kapitel-ID jetzt ausdrücklich als erste zwei Argumente. Kapitel in `build_course.py` besitzen ebenfalls eine explizite ID. Diese Kennungen niemals aus der neuen Reihenfolge neu erzeugen. `bear-course.json` immer mit dem Generator bauen, nicht von Hand ändern.

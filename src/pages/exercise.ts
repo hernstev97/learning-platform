@@ -1,4 +1,4 @@
-import { loadArea, progressOf, save, summaryOf } from '../app.ts';
+import { loadArea, onProgressChange, progressOf, saveAnswer, setEntry, summaryOf } from '../app.ts';
 import type { Exercise } from '../content/types.ts';
 import { highlight } from '../engine/highlight.ts';
 import { isDone } from '../engine/storage.ts';
@@ -22,8 +22,6 @@ const exercisePage: Page<{ name: 'exercise'; area: string; module: string; index
   const index = route.index - 1;
   const total = module.exercises.length;
   const base = `/${summary.id}/${module.id}`;
-  progress.last = `${base}/${route.index}`;
-  save(summary.id);
   document.title = `${exercise.title} · ${module.title}`;
 
   let solvedNow = isDone(progress, exercise);
@@ -53,12 +51,12 @@ const exercisePage: Page<{ name: 'exercise'; area: string; module: string; index
     draft: progress.drafts[exercise.id] as any,
     done: solvedNow,
     areaId: summary.id,
-    save(draft: unknown) { progress.drafts[exercise.id] = draft; save(summary.id); },
+    save(draft: unknown) { saveAnswer(summary.id, exercise, draft); },
     feedback: setFeedback,
     complete() {
       if (!isDone(progress, exercise)) {
         progress.done[exercise.id] = { at: new Date().toISOString(), fp: exercise.fingerprint, ...(progress.revealed[exercise.id] ? { help: true } : {}) };
-        save(summary.id);
+        setEntry(summary.id, { kind: 'completion', id: exercise.id, value: progress.done[exercise.id] });
       }
       const first = !solvedNow;
       solvedNow = true;
@@ -133,7 +131,7 @@ const exercisePage: Page<{ name: 'exercise'; area: string; module: string; index
     const panel = $('#solution', main);
     panel.hidden = !panel.hidden;
     (event.currentTarget as HTMLElement).textContent = panel.hidden ? 'Lösung zeigen' : 'Lösung ausblenden';
-    if (!panel.hidden && !isDone(progress, exercise)) { progress.revealed[exercise.id] = true; save(summary.id); }
+    if (!panel.hidden && !isDone(progress, exercise)) { progress.revealed[exercise.id] = true; setEntry(summary.id, { kind: 'revealed', id: exercise.id, value: true }); }
     if (!panel.hidden) showExplanation();
   });
   if (source) {
@@ -155,6 +153,21 @@ const exercisePage: Page<{ name: 'exercise'; area: string; module: string; index
     navigate(`${base}/${target + 1}`);
     requestAnimationFrame(() => document.querySelector<HTMLElement>('.step.active')?.focus());
   });
+  cleanups.push(onProgressChange((draft) => {
+    if (draft && !main.querySelector('#refresh-draft')) {
+      const button = document.createElement('button');
+      button.id = 'refresh-draft'; button.className = 'btn small';
+      button.textContent = 'Geänderter Entwurf verfügbar · Laden';
+      button.addEventListener('click', () => navigate(location.pathname, { replace: true, keepScroll: true }));
+      feedbackBox().after(button);
+    }
+    const nextSolved = isDone(progress, exercise);
+    if (nextSolved !== solvedNow) {
+      solvedNow = nextSolved;
+      setFeedback(solvedNow ? 'ok' : 'info', solvedNow ? 'Auf einem Gerät gelöst und synchronisiert.' : 'Der gespeicherte Erfolg wurde zurückgesetzt.');
+      updateNav();
+    }
+  }));
   return () => cleanups.forEach((fn) => fn && fn());
 };
 export default exercisePage;

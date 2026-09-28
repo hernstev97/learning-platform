@@ -1,6 +1,7 @@
 """Build lessons from the pinned Bear snapshot, independently of a Bear checkout."""
 from pathlib import Path
 import argparse
+import re
 import hashlib
 import json
 import subprocess
@@ -66,20 +67,25 @@ FLOW = a('kotlin/flow/stateflow-and-sharedflow', 'StateFlow')
 DATA = a('topic/libraries/architecture/datastore', 'DataStore')
 CORO = a('kotlin/coroutines/coroutines-best-practices', 'Coroutines')
 chapters = [
-    ('Bear lesen lernen', 'Grundlagen', 'Werte, Typen und Schreibweisen an kleinen Originalzeilen.'),
-    ('Bear entscheidet', 'Logik', 'Bedingungen, Funktionen und Kontrollfluss.'),
-    ('Bears Datenmodelle', 'Modelle', 'Klassen, nullable Werte und Kotlin-Konventionen.'),
-    ('Listen und Bear-Blöcke', 'Sammlungen', 'Lambdas, Sammlungen und strukturierter Text.'),
-    ('Bears Android-Oberfläche', 'Compose', 'Activity, Layout, Callbacks und lokale UI-Zustände.'),
-    ('Vom Zustand zur Oberfläche', 'Datenfluss', 'Flows, State Hoisting und Lebenszyklen.'),
-    ('Was Bear sich merkt', 'Speicherung', 'Room, DataStore und manuell verdrahtete Abhängigkeiten.'),
-    ('Von Bear nach Linear', 'Synchronisierung', 'Coroutines, lokale Warteschlangen und Wiederholungen.'),
-    ('Bears Regeln beweisen', 'Algorithmen', 'Runden, Zeitfenster, Textvergleich und echte Tests.'),
-    ('Zusammenhänge rekonstruieren', 'Werkstatt', 'Lange Originalfunktionen und mehrteilige Implementierungen.'),
+    ('bear-01', 'Bear lesen lernen', 'Grundlagen', 'Werte, Typen und Schreibweisen an kleinen Originalzeilen.'),
+    ('bear-02', 'Bear entscheidet', 'Logik', 'Bedingungen, Funktionen und Kontrollfluss.'),
+    ('bear-03', 'Bears Datenmodelle', 'Modelle', 'Klassen, nullable Werte und Kotlin-Konventionen.'),
+    ('bear-04', 'Listen und Bear-Blöcke', 'Sammlungen', 'Lambdas, Sammlungen und strukturierter Text.'),
+    ('bear-05', 'Bears Android-Oberfläche', 'Compose', 'Activity, Layout, Callbacks und lokale UI-Zustände.'),
+    ('bear-06', 'Vom Zustand zur Oberfläche', 'Datenfluss', 'Flows, State Hoisting und Lebenszyklen.'),
+    ('bear-07', 'Was Bear sich merkt', 'Speicherung', 'Room, DataStore und manuell verdrahtete Abhängigkeiten.'),
+    ('bear-08', 'Von Bear nach Linear', 'Synchronisierung', 'Coroutines, lokale Warteschlangen und Wiederholungen.'),
+    ('bear-09', 'Bears Regeln beweisen', 'Algorithmen', 'Runden, Zeitfenster, Textvergleich und echte Tests.'),
+    ('bear-10', 'Zusammenhänge rekonstruieren', 'Werkstatt', 'Lange Originalfunktionen und mehrteilige Implementierungen.'),
 ]
+assert len({chapter[0] for chapter in chapters}) == len(chapters), 'Duplicate chapter IDs'
+assert all(re.fullmatch(r'bear-[0-9]{2}', chapter[0]) for chapter in chapters), 'Invalid chapter ID'
 
 
-def lesson(title, prompt, location, gaps, topic, body, resources, explain=None):
+def lesson(task_id, chapter_id, title, prompt, location, gaps, topic, body, resources, explain=None):
+    assert re.fullmatch(r"bear-[0-9]{3}", task_id), task_id
+    assert not any(t["id"] == task_id for t in lessons), task_id
+    chapter_index = next(i for i, chapter in enumerate(chapters) if chapter[0] == chapter_id)
     original, source = snippet(*location)
     spans = []
     gap_defs = []
@@ -97,8 +103,7 @@ def lesson(title, prompt, location, gaps, topic, body, resources, explain=None):
     code = original
     for start, end, marker in sorted(spans, reverse=True):
         code = code[:start] + marker + code[end:]
-    number = len(lessons) + 1
-    lessons.append(dict(id=f'bear-{number:03}', chapter=(number-1)//10, title=title, prompt=prompt, code=code, gaps=gap_defs,
+    lessons.append(dict(id=task_id, chapter=chapter_index, chapterId=chapter_id, title=title, prompt=prompt, code=code, gaps=gap_defs,
         wiki=dict(title=topic, body=body), explanation=explain or body.split('. ')[0] + '.', resources=resources, source=source,
         fingerprint=hashlib.sha256((original+json.dumps(gap_defs, ensure_ascii=False)).encode()).hexdigest()[:16]))
 
@@ -125,7 +130,7 @@ Z = 'alarm/RoundScheduler.kt'
 exec((HERE / 'lessons.py').read_text(), globals())
 assert len(lessons) == 100, len(lessons)
 assert set(files) == set(snapshot['files']), 'Snapshot contains unused source files.'
-output = dict(revision=REV, chapters=[dict(title=t, short=s, description=d) for t,s,d in chapters], tasks=lessons, files=files)
+output = dict(revision=REV, chapters=[dict(id=id, title=t, short=s, description=d) for id,t,s,d in chapters], tasks=lessons, files=files)
 target = HERE / 'bear-course.json'
 serialized = json.dumps(output, ensure_ascii=False, indent=2) + '\n'
 if args.check:

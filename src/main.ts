@@ -3,82 +3,66 @@ import './styles/layout.css';
 import './styles/content.css';
 import './styles/exercise.css';
 import './styles/pages.css';
-import { catalog, getStorageWarning, loadArea, onStorageChange, summaryOf } from './app.ts';
-import { $, html } from './ui/dom.ts';
-import type { Page } from './router.ts';
-import { navigate, parseRoute, startRouter } from './router.ts';
+import { html } from './ui/dom.ts';
 
-const app = $('#app');
-app.innerHTML = html`
-  <a class="skip-link" href="#main">Zum Inhalt springen</a>
-  <header class="topbar">
-    <a class="logo" href="/" aria-label="learn.kiumu.app – Startseite"><span class="logo-mark" aria-hidden="true">L</span><span class="logo-text">learn<span>.kiumu</span></span></a>
-    <nav class="topnav" aria-label="Lernbereiche">
-      ${catalog.areas.map((area) => html`<a href="/${area.id}" data-area="${area.id}" style="--area:${area.color}">${area.short}</a>`)}
-    </nav>
-    <a class="topbar-data" href="/daten">Daten</a>
-  </header>
-  <p id="storage-warning" class="storage-warning" role="status" hidden></p>
-  <main id="main" tabindex="-1"></main>
-  <footer class="footer">
-    <span>learn.kiumu.app</span>
-    <span id="storage-status">Lernstand nur in diesem Browser gespeichert</span>
-    <a href="/daten">Sichern &amp; übertragen</a>
-  </footer>`.value;
+const root = document.querySelector<HTMLElement>('#app')!;
+const gate = (title: string, text: string) => {
+  document.title = `${title} · learn.kiumu.app`;
+  root.innerHTML = html`<main class="page narrow data-page"><p class="label">learn.kiumu · Private Lernplattform</p><h1 class="page-title">${title}</h1><p class="page-intro">${text}</p><div id="session-actions"></div></main>`.value;
+};
+gate('Anmeldung', 'Dein persönlicher Lernstand wird geladen …');
 
-const main = $('#main');
-let cleanup: (() => void) | void;
-let renderToken = 0;
-
-function updateStorage(): void {
-  const warning = getStorageWarning();
-  const element = $('#storage-warning');
-  element.hidden = !warning;
-  element.textContent = warning ?? '';
-  $('#storage-status').textContent = warning ? 'Nicht gespeichert' : 'Lernstand nur in diesem Browser gespeichert';
-}
-onStorageChange(updateStorage);
-
-async function render(): Promise<void> {
-  const token = ++renderToken;
-  const route = parseRoute(location.pathname);
-  if (cleanup) { cleanup(); cleanup = undefined; }
-  const area = 'area' in route ? summaryOf(route.area) : undefined;
-  document.documentElement.style.setProperty('--accent', area?.color ?? '#FF4F00');
-  document.documentElement.dataset.area = area?.id ?? '';
-  document.querySelectorAll<HTMLAnchorElement>('.topnav a').forEach((link) => link.toggleAttribute('aria-current', link.dataset.area === area?.id));
-  let page: Page;
-  switch (route.name) {
-    case 'home': page = (await import('./pages/home.ts')).default; break;
-    case 'data': page = (await import('./pages/data.ts')).default; break;
-    case 'area': page = (await import('./pages/area.ts')).default; break;
-    case 'lesson': page = (await import('./pages/lesson.ts')).default; break;
-    case 'exercise': page = (await import('./pages/exercise.ts')).default; break;
-    case 'cards': page = (await import('./pages/cards.ts')).default; break;
-    case 'projects': case 'project': page = (await import('./pages/projects.ts')).default; break;
-    case 'reference': page = (await import('./pages/reference.ts')).default; break;
-    default: page = (await import('./pages/not-found.ts')).default;
+async function start(): Promise<void> {
+  const url = import.meta.env.VITE_CONVEX_URL;
+  const key = import.meta.env.VITE_CLERK_PUBLISHABLE_KEY;
+  if (!url || !/^https?:\/\//.test(url) || !key || !/^pk_(test|live)_/.test(key)) {
+    gate('Einrichtung fehlt', 'Convex und Anmeldung sind noch nicht konfiguriert. Die benötigten Einstellungen stehen in docs/CONVEX.md. Vorhandener lokaler Lernstand bleibt erhalten.');
+    return;
   }
-  if (token !== renderToken) return;
-  if (area === undefined && 'area' in route) page = (await import('./pages/not-found.ts')).default;
+  const [{ Clerk }, { ConvexClient }, state] = await Promise.all([import('@clerk/clerk-js/no-rhc'), import('convex/browser'), import('./app.ts')]);
+  const clerk = new Clerk(key);
+  await clerk.load();
+  const button = (text: string, action: () => Promise<unknown>) => {
+    const b = document.createElement('button'); b.className = 'btn primary'; b.textContent = text;
+    b.addEventListener('click', () => { b.disabled = true; void action().catch(() => { b.disabled = false; gate('Anmeldung nicht verfügbar', 'Bitte prüfe deine Verbindung und lade die Seite erneut.'); }); });
+    document.querySelector('#session-actions')!.append(b);
+  };
+  if (!clerk.session) {
+    gate('Anmelden', 'Melde dich mit deinem freigeschalteten Konto an, um deinen Lernstand auf allen Geräten zu nutzen.');
+    button('Anmelden', () => clerk.redirectToSignIn({ signInForceRedirectUrl: location.href }));
+    return;
+  }
+  const sessionId = clerk.session.id;
+  const client = new ConvexClient(url, { unsavedChangesWarning: true });
+  let disconnect = () => {};
+  let stopped = false;
+  const lock = () => {
+    if (stopped) return;
+    stopped = true; disconnect(); void client.close();
+    // Remove private DOM immediately, even if a browser delays or cancels navigation.
+    gate('Sitzung beendet', 'Die Anmeldung wird erneut geprüft …');
+    // Reload also disposes page listeners, open editors and cached private state.
+    location.reload();
+  };
+  clerk.addListener(({ session }) => { if (session?.id !== sessionId) lock(); });
+  client.setAuth(async ({ forceRefreshToken }) => clerk.session?.getToken({ template: 'convex', skipCache: forceRefreshToken }) ?? null);
+  const slowConnection = setTimeout(() => gate('Verbindung wird hergestellt', 'Der Server antwortet noch nicht. Prüfe deine Verbindung. Die Seite lädt weiter; du kannst sie auch erneut laden.'), 12_000);
   try {
-    // Finish lazy content loading before a page can touch the shared main element.
-    // A slower earlier navigation must not overwrite the page selected in the meantime.
-    if (area && !['home', 'data', 'area', 'not-found'].includes(route.name)) await loadArea(area.id);
-    if (token !== renderToken) return;
-    cleanup = await page(main, route as never);
-  } catch (error) {
-    if (token !== renderToken) return;
-    console.error(error);
-    main.innerHTML = html`<section class="page narrow"><h1 class="page-title" tabindex="-1">Fehler</h1><p>Diese Seite konnte nicht geladen werden: ${String((error as Error).message)}</p><p><a class="btn" href="/">Zur Startseite</a></p></section>`.value;
-  }
-  if (token !== renderToken) return;
-  updateStorage();
+    disconnect = await state.connectProgress(client, lock);
+    if (stopped) { disconnect(); return; }
+  } catch {
+    await client.close();
+    gate('Kein Zugriff', 'Dieses Konto ist nicht freigeschaltet oder die Backend-Anmeldung ist noch nicht eingerichtet. Prüfe die Konto-ID und den Clerk-Aussteller in Convex.');
+    button('Abmelden', () => clerk.signOut({ redirectUrl: location.origin }));
+    return;
+  } finally { clearTimeout(slowConnection); }
+  const { mount } = await import('./shell.ts');
+  mount(async () => {
+    if (state.hasPendingWrites()) {
+      alert('Änderungen werden noch gespeichert. Bitte warte vor dem Abmelden auf „Lernstand synchronisiert“.');
+      return;
+    }
+    await clerk.signOut({ redirectUrl: location.origin });
+  });
 }
-
-startRouter(async (scroll) => {
-  const requested = location.href;
-  await render();
-  if (location.href === requested) scroll();
-});
-export { navigate };
+void start().catch(() => gate('Verbindung fehlgeschlagen', 'Anmeldung oder Backend sind gerade nicht erreichbar. Prüfe deine Verbindung und lade die Seite erneut.'));

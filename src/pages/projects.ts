@@ -1,4 +1,4 @@
-import { loadArea, progressOf, save, summaryOf } from '../app.ts';
+import { loadArea, onProgressChange, progressOf, setEntry, summaryOf } from '../app.ts';
 import { areaBanner } from '../ui/area-nav.ts';
 import { $$, LEVELS, html, icons, raw } from '../ui/dom.ts';
 import type { Page } from '../router.ts';
@@ -8,7 +8,7 @@ const projects: Page<{ name: 'projects'; area: string } | { name: 'project'; are
   const area = await loadArea(route.area);
   const progress = progressOf(summary.id);
   const sorted = [...area.projects].sort((a, b) => Number(a.capstone) - Number(b.capstone) || a.level - b.level);
-  const stepsDone = (id: string) => Object.values(progress.projects[id] ?? {}).filter(Boolean).length;
+  const stepsDone = (id: string) => summary.projects.find((p) => p.id === id)!.steps.filter((key) => progress.projects[id]?.[key]).length;
 
   if (route.name === 'projects') {
     document.title = `Projekte · ${summary.title}`;
@@ -48,7 +48,7 @@ const projects: Page<{ name: 'projects'; area: string } | { name: 'project'; are
         <div>
           <section class="prose">${raw(project.brief)}</section>
           <section class="project-section"><h2 class="section-title">Meilensteine</h2><ol class="project-steps">${project.steps.map((s) => checkbox(s.id, s.title, s.detail))}</ol></section>
-          ${project.acceptance.length ? html`<section class="project-section"><h2 class="section-title">Abnahmekriterien</h2><p class="muted">Erst wenn alle Punkte erfüllt sind, ist das Projekt fertig – so wie bei einer echten Abnahme.</p><ol class="project-steps">${project.acceptance.map((a, i) => checkbox(`abnahme-${i + 1}`, a))}</ol></section>` : ''}
+          ${project.acceptance.length ? html`<section class="project-section"><h2 class="section-title">Abnahmekriterien</h2><p class="muted">Erst wenn alle Punkte erfüllt sind, ist das Projekt fertig – so wie bei einer echten Abnahme.</p><ol class="project-steps">${project.acceptance.map((a) => checkbox(a.id, a.text))}</ol></section>` : ''}
           ${project.stretch.length ? html`<section class="project-section"><h2 class="section-title">Für Ehrgeizige</h2><ul class="plain-list">${project.stretch.map((s) => html`<li>${raw(s)}</li>`)}</ul></section>` : ''}
           ${project.portfolio ? html`<section class="project-section portfolio"><h2 class="section-title">Fürs Portfolio</h2><div class="prose">${raw(project.portfolio)}</div></section>` : ''}
         </div>
@@ -56,12 +56,17 @@ const projects: Page<{ name: 'projects'; area: string } | { name: 'project'; are
       </div>
     </div>`.value;
   const total = project.steps.length + project.acceptance.length;
-  const count = () => { main.querySelector('#project-count')!.textContent = `${Object.values(state).filter(Boolean).length}/${total}`; };
+  const count = () => { main.querySelector('#project-count')!.textContent = `${stepsDone(project.id)}/${total}`; };
   $$<HTMLInputElement>('[data-key]', main).forEach((box) => box.addEventListener('change', () => {
+    const state = progress.projects[project.id] ??= {};
     if (box.checked) state[box.dataset.key!] = true; else delete state[box.dataset.key!];
-    save(summary.id);
+    setEntry(summary.id, { kind: 'step', id: `${project.id}/${box.dataset.key!}`, completed: box.checked });
     count();
   }));
   count();
+  return onProgressChange(() => {
+    $$<HTMLInputElement>('[data-key]', main).forEach((box) => { box.checked = !!progress.projects[project.id]?.[box.dataset.key!]; });
+    count();
+  });
 };
 export default projects;

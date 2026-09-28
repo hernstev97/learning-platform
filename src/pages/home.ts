@@ -1,4 +1,4 @@
-import { catalog, progressOf } from '../app.ts';
+import { catalog, getContinueHref, progressOf } from '../app.ts';
 import { areaStats } from '../engine/storage.ts';
 import { html, icons, pad, raw } from '../ui/dom.ts';
 import type { Page } from '../router.ts';
@@ -8,11 +8,13 @@ const home: Page = (main) => {
   const areas = catalog.areas;
   const totals = areas.reduce((sum, a) => ({ modules: sum.modules + a.counts.modules, exercises: sum.exercises + a.counts.exercises, cards: sum.cards + a.counts.cards }), { modules: 0, exercises: 0, cards: 0 });
   const layout = ['wide', 'narrow', 'narrow', 'wide', 'full'];
+  const last = getContinueHref();
   main.innerHTML = html`
     <section class="hero">
       <div class="hero-text">
         <p class="label">Private Lernplattform · ${areas.length} Bereiche</p>
         <h1 class="hero-title">Vom Verstehen<br>zum Können.</h1>
+        ${last ? html`<p><a class="btn primary" href="${last}">Weiterlernen ${raw(icons.arrow)}</a></p>` : ''}
       </div>
       <div class="hero-side">
         <p class="hero-lead">Hier lerne ich die Dinge, die ich im Job brauche. Jede Lektion endet in Übungen, in denen ich selbst Code schreibe, Fehler suche, Verhalten vorhersage und fremden Code erkläre. Jeder Bereich endet mit einem Projekt, das sich wie eine echte Aufgabe im Job anfühlt.</p>

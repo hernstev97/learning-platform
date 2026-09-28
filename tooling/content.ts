@@ -16,6 +16,7 @@ export const CONTENT = join(ROOT, 'content');
 export const RESERVED = ['karten', 'projekte', 'spickzettel', 'glossar', 'beruf'];
 const TYPES = ['gap', 'choice', 'order', 'output', 'command', 'code', 'practice', 'bug', 'explain'] as const;
 const ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const validId = (id: unknown): id is string => typeof id === 'string' && id.length <= 120 && ID.test(id) && !['constructor', 'prototype'].includes(id);
 
 export class ContentError extends Error {}
 export type Issue = { file: string; where: string; message: string };
@@ -119,7 +120,7 @@ function exercise(raw: Obj, moduleId: string, where: string, report: Reporter): 
   if (!TYPES.includes(type)) { report.error(where, `"type" muss einer von ${TYPES.join(', ')} sein`); return null; }
   const f = fields(raw, where, report, [...COMMON, ...BY_TYPE[type]]);
   const id = f.str('id');
-  if (id && !ID.test(id)) report.error(where, `id "${id}" muss kebab-case sein (a-z, 0-9, -)`);
+  if (id && !validId(id)) report.error(where, `id "${id}" muss ein gültiger kebab-case-Schlüssel sein (a-z, 0-9, -, maximal 120 Zeichen, keine reservierten Objektschlüssel)`);
   const wikiRaw = raw.wiki;
   let wiki: Exercise['wiki'] = null;
   if (typeof wikiRaw === 'string') wiki = { title: 'Zum Nachlesen', body: block(wikiRaw) };
@@ -278,10 +279,20 @@ function loadBear(areaDir: string, path: string, report: Reporter): { modules: M
   const file = join(areaDir, path);
   if (!existsSync(file)) { report.error('bear', `${path} fehlt`); return { modules: [], files: {} }; }
   const course = JSON.parse(readFileSync(file, 'utf8'));
+  const chapterIds = new Set<string>();
+  for (const chapter of course.chapters) {
+    if (!validId(chapter.id) || chapterIds.has(chapter.id)) report.error('bear', 'Kapitel braucht eine gültige, eindeutige, stabile id');
+    chapterIds.add(chapter.id);
+  }
+  const taskIds = new Set<string>();
+  for (const task of course.tasks) {
+    if (!validId(task.id) || taskIds.has(task.id) || !chapterIds.has(task.chapterId)) report.error('bear', 'Aufgabe braucht eine eindeutige id und eine vorhandene chapterId');
+    taskIds.add(task.id);
+  }
   const paragraphs = (text: string) => text.split(/\n{2,}/).map((p) => `<p>${escape(p)}</p>`).join('');
   const modules = course.chapters.map((chapter: Obj, index: number): Module => {
-    const id = `bear-${String(index + 1).padStart(2, '0')}`;
-    const tasks = course.tasks.filter((task: Obj) => task.chapter === index);
+    const id = String(chapter.id);
+    const tasks = course.tasks.filter((task: Obj) => task.chapterId === id);
     const topics = tasks.map((task: Obj) => ({ id: slug(`${task.id}-${task.wiki.title}`), title: task.wiki.title, body: task.wiki.body }));
     const lesson = `<p>${escape(chapter.description)} Alle zehn Aufgaben stammen aus echtem Bear-Code (Commit <code>${escape(course.revision.slice(0, 7))}</code>). Du rekonstruierst die Originalzeilen; über den Dateiverweis siehst du jeden Ausschnitt im vollständigen Dateikontext.</p>`
       + `<aside class="callout callout-note"><p class="callout-title"><span>Hinweis</span></p><p>Die Prüfung vergleicht mit Bears Implementierung und führt keinen Kotlin-Compiler aus. Vorhandener Projektcode ist kein automatischer Best-Practice-Beweis; die Texte benennen bekannte Grenzen.</p></aside>`
@@ -306,7 +317,7 @@ function loadArea(dir: string, raw: RawExercise[], sink: { errors: Issue[]; warn
   if (!data) { flush(report); return null; }
   const f = fields(data, 'Bereich', report, ['id', 'title', 'short', 'tagline', 'description', 'color', 'order', 'outcomes', 'tracks']);
   const id = f.str('id');
-  if (!ID.test(id)) report.error('Bereich', `id "${id}" muss kebab-case sein`);
+  if (!validId(id)) report.error('Bereich', `id "${id}" muss ein gültiger kebab-case-Schlüssel sein`);
   const color = f.str('color');
   if (!/^#[0-9a-fA-F]{6}$/.test(color)) report.error('Bereich', '"color" muss #RRGGBB sein');
   const modules: Record<string, Module> = {};
@@ -322,7 +333,7 @@ function loadArea(dir: string, raw: RawExercise[], sink: { errors: Issue[]; warn
       for (const module of bear.modules) { modules[module.id] = module; ids.push(module.id); }
     }
     for (const moduleId of tf.list<string>('modules')) {
-      if (!ID.test(moduleId)) { report.error(where, `Modul-id "${moduleId}" muss kebab-case sein`); continue; }
+      if (!validId(moduleId)) { report.error(where, `Modul-id "${moduleId}" muss ein gültiger kebab-case-Schlüssel sein`); continue; }
       if (RESERVED.includes(moduleId)) { report.error(where, `Modul-id "${moduleId}" ist für eine Bereichsseite reserviert`); continue; }
       if (modules[moduleId]) { report.error(where, `Modul "${moduleId}" ist doppelt`); continue; }
       const file = join(dir, 'modules', `${moduleId}.yaml`);
@@ -353,7 +364,7 @@ function loadArea(dir: string, raw: RawExercise[], sink: { errors: Issue[]; warn
         const where = `Karte ${i + 1}${card?.id ? ` (${card.id})` : ''}`;
         const c = fields(card ?? {}, where, r, ['id', 'q', 'a', 'tags', 'level']);
         const cid = c.str('id');
-        if (!ID.test(cid)) r.error(where, 'id muss kebab-case sein');
+        if (!validId(cid)) r.error(where, 'id muss ein gültiger kebab-case-Schlüssel sein');
         if (seen.has(cid)) r.error(where, `doppelte id "${cid}"`);
         seen.add(cid);
         cards.push({ id: cid, question: block(c.str('q')), answer: block(c.str('a')), tags: c.list<string>('tags').map(String), level: level(card?.level, where, r) });
@@ -374,20 +385,29 @@ function loadArea(dir: string, raw: RawExercise[], sink: { errors: Issue[]; warn
         const p = fields(project ?? {}, where, r, ['id', 'title', 'capstone', 'level', 'hours', 'summary', 'brief', 'skills', 'steps', 'acceptance', 'stretch', 'portfolio']);
         if (project?.capstone !== undefined && typeof project.capstone !== 'boolean') r.error(where, '"capstone" muss true oder false sein');
         const pid = p.str('id');
-        if (!ID.test(pid)) r.error(where, 'id muss kebab-case sein');
+        if (!validId(pid)) r.error(where, 'id muss ein gültiger kebab-case-Schlüssel sein');
         const stepIds = new Set<string>();
         const steps = p.list<Obj>('steps', true).map((step, s) => {
           const sf = fields(step ?? {}, `${where} › steps[${s}]`, r, ['id', 'title', 'detail']);
           const title = sf.str('title');
-          const sid = sf.str('id', false) || slug(title);
+          const sid = sf.str('id');
+          if (!validId(sid)) r.error(where, 'Schritt-id muss ein gültiger kebab-case-Schlüssel sein');
           if (stepIds.has(sid)) r.error(where, `Schritt-id "${sid}" doppelt – gib eine eigene id an`);
           stepIds.add(sid);
           return { id: sid, title: inline(title), detail: block(sf.str('detail', false)) };
         });
         if (steps.length < 3) r.warn(where, 'weniger als drei Schritte');
+        const acceptance = p.list<Obj>('acceptance').map((item, a) => {
+          const af = fields(item ?? {}, `${where} › acceptance[${a}]`, r, ['id', 'text']);
+          const id = af.str('id');
+          if (!validId(id) || stepIds.has(id)) r.error(where, `Abnahme-id "${id}" muss gültig und eindeutig sein`);
+          stepIds.add(id);
+          return { id, text: inline(af.str('text')) };
+        });
+        if (projects.some((p) => p.id === pid)) r.error(where, `Projekt-id "${pid}" doppelt`);
         projects.push({
           id: pid, title: p.str('title'), capstone: project?.capstone === true, level: level(project?.level, where, r), hours: p.num('hours', 10, 1, 500), summary: inline(p.str('summary')),
-          brief: block(p.str('brief')), skills: p.list<string>('skills').map(String), steps, acceptance: p.list<string>('acceptance').map((a) => inline(String(a))),
+          brief: block(p.str('brief')), skills: p.list<string>('skills').map(String), steps, acceptance,
           stretch: p.list<string>('stretch').map((s) => inline(String(s))), portfolio: block(p.str('portfolio', false)),
         });
       });
@@ -429,7 +449,7 @@ function loadArea(dir: string, raw: RawExercise[], sink: { errors: Issue[]; warn
   const summary: AreaSummary = {
     id, title: f.str('title'), short: f.str('short', false) || f.str('title'), tagline: f.str('tagline'), description: f.str('description'), color,
     outcomes: f.list<string>('outcomes').map((o) => inline(String(o))), tracks, modules: moduleSummaries,
-    cards: cards.map((c) => c.id), projects: projects.map((p) => ({ id: p.id, title: p.title, capstone: p.capstone, level: p.level, hours: p.hours, summary: p.summary, steps: p.steps.map((s) => s.id) })),
+    cards: cards.map((c) => c.id), projects: projects.map((p) => ({ id: p.id, title: p.title, capstone: p.capstone, level: p.level, hours: p.hours, summary: p.summary, steps: [...p.steps.map((s) => s.id), ...p.acceptance.map((a) => a.id)] })),
     counts: {
       modules: moduleSummaries.length, exercises: moduleSummaries.reduce((n, m) => n + m.exercises.length, 0), cards: cards.length,
       projects: projects.length, glossary: glossary.length, minutes: moduleSummaries.reduce((n, m) => n + m.minutes, 0),

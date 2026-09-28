@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { join } from 'node:path';
+import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { formatIssues, loadContent } from './content.ts';
 import { codeBlock } from './markdown.ts';
 
@@ -25,5 +27,18 @@ describe('content', () => {
   it('does not offer deliberately invalid Rust snippets as executable playground examples', () => {
     expect(codeBlock('fn main() { invalid }', 'rust nocheck')).not.toContain('data-playground');
     expect(codeBlock('fn main() {}', 'rust')).toContain('data-playground="rust"');
+  });
+  it('keeps Bear exercise IDs and fingerprints when chapters and tasks are reordered', () => {
+    const root = mkdtempSync(join(tmpdir(), 'learning-bear-ids-'));
+    try {
+      cpSync(join(import.meta.dirname, '../content/kotlin'), join(root, 'kotlin'), { recursive: true });
+      const identities = () => loadContent(['kotlin'], root).catalog.areas[0].modules.flatMap((m) => m.exercises.map((e) => `${e.id}:${e.fingerprint}`)).sort();
+      const before = identities();
+      const file = join(root, 'kotlin/bear/bear-course.json');
+      const course = JSON.parse(readFileSync(file, 'utf8'));
+      course.chapters.reverse(); course.tasks.reverse(); course.chapters[0].title = 'Renamed chapter';
+      writeFileSync(file, JSON.stringify(course));
+      expect(identities()).toEqual(before);
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });

@@ -1,5 +1,6 @@
-// Learning progress, one localStorage entry per area. Nothing leaves the browser unless exported.
+// Existing progress view, legacy localStorage reader and portable JSON backups.
 import type { AreaSummary } from '../content/types.ts';
+import { parsePosition, type Position } from '../../convex/model.ts';
 
 export const VERSION = 1;
 export const keyFor = (area: string) => `learn:${area}:v${VERSION}`;
@@ -13,39 +14,47 @@ export type AreaProgress = {
   done: Record<string, Completion>;
   /** Type-specific drafts (answers, code, order …) by exercise id. */
   drafts: Record<string, unknown>;
+  /** New backups retain the content version attached to answer drafts. */
+  draftFingerprints?: Record<string, string>;
   /** Exercises whose solution was revealed before they were solved. */
   revealed: Record<string, true>;
   read: Record<string, string>;
   cards: Record<string, CardState>;
   projects: Record<string, Record<string, boolean>>;
   last: string | null;
+  position?: Position;
 };
 
 type StoragePort = Pick<Storage, 'getItem' | 'setItem'>;
 export const freshProgress = (): AreaProgress => ({ version: 1, done: {}, drafts: {}, revealed: {}, read: {}, cards: {}, projects: {}, last: null });
-const record = (value: unknown): value is Record<string, any> => typeof value === 'object' && value !== null && !Array.isArray(value);
+const record = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
+const safeKey = (key: string) => !['__proto__', 'constructor', 'prototype'].includes(key);
 
 /** Accepts anything that parses; drops malformed parts instead of failing as a whole. */
 export function sanitize(data: unknown): AreaProgress {
   const progress = freshProgress();
   if (!record(data) || data.version !== VERSION) throw new Error('Unbekanntes Format');
   if (record(data.done)) for (const [id, value] of Object.entries(data.done)) {
+    if (!safeKey(id)) continue;
     if (record(value) && typeof value.at === 'string' && typeof value.fp === 'string') progress.done[id] = { at: value.at, fp: value.fp, ...(value.help ? { help: true } : {}) };
   }
   if (record(data.drafts)) for (const [id, value] of Object.entries(data.drafts)) {
-    if (JSON.stringify(value).length <= 60000) progress.drafts[id] = value;
+    if (safeKey(id) && (JSON.stringify(value)?.length ?? Infinity) <= 60000) progress.drafts[id] = value;
   }
-  if (record(data.revealed)) for (const id of Object.keys(data.revealed)) progress.revealed[id] = true;
-  if (record(data.read)) for (const [id, value] of Object.entries(data.read)) if (typeof value === 'string') progress.read[id] = value;
+  if (record(data.draftFingerprints)) progress.draftFingerprints = Object.fromEntries(Object.entries(data.draftFingerprints).filter(([, value]) => typeof value === 'string')) as Record<string, string>;
+  if (record(data.revealed)) for (const id of Object.keys(data.revealed)) if (safeKey(id)) progress.revealed[id] = true;
+  if (record(data.read)) for (const [id, value] of Object.entries(data.read)) if (safeKey(id) && typeof value === 'string') progress.read[id] = value;
   if (record(data.cards)) for (const [id, value] of Object.entries(data.cards)) {
-    if (record(value) && Number.isInteger(value.box) && value.box >= 0 && value.box <= 5 && typeof value.due === 'string') {
+    if (safeKey(id) && record(value) && typeof value.box === 'number' && Number.isInteger(value.box) && value.box >= 1 && value.box <= 5 && typeof value.due === 'string') {
       progress.cards[id] = { box: value.box, due: value.due, seen: Number(value.seen) || 0, ...(typeof value.last === 'string' ? { last: value.last } : {}) };
     }
   }
   if (record(data.projects)) for (const [id, steps] of Object.entries(data.projects)) {
-    if (record(steps)) progress.projects[id] = Object.fromEntries(Object.entries(steps).filter(([, v]) => v === true));
+    if (safeKey(id) && record(steps)) progress.projects[id] = Object.fromEntries(Object.entries(steps).filter(([key, v]) => safeKey(key) && v === true).map(([key]) => [key, true]));
   }
   if (typeof data.last === 'string' && /^\/[a-z0-9-]+(?:\/[a-z0-9-]+){0,2}$/.test(data.last)) progress.last = data.last;
+  const position = parsePosition(data.position);
+  if (position) progress.position = position;
   return progress;
 }
 
@@ -112,6 +121,7 @@ export function mergeProgress(local: AreaProgress, incoming: AreaProgress): Area
   }
   for (const [id, steps] of Object.entries(incoming.projects)) merged.projects[id] = { ...steps, ...merged.projects[id] };
   merged.last ??= incoming.last;
+  merged.position ??= incoming.position;
   return merged;
 }
 export function parseBackup(text: string): Record<string, AreaProgress> {
@@ -138,6 +148,13 @@ export function convertLegacyBear(text: string, modules: { id: string; exercises
   if (record(data.drafts)) for (const [task, answers] of Object.entries(data.drafts)) {
     const exercise = byTask.get(task);
     if (exercise && record(answers)) progress.drafts[exercise.id] = answers;
+  }
+  const active = typeof data.activeId === 'string' ? byTask.get(data.activeId) : undefined;
+  if (active) {
+    const moduleId = active.id.split('/')[0];
+    const index = modules.find((m) => m.id === moduleId)!.exercises.findIndex((e) => e.id === active.id);
+    progress.position = { page: 'exercise', moduleId, exerciseId: active.id };
+    progress.last = `/kotlin/${moduleId}/${index + 1}`;
   }
   return progress;
 }

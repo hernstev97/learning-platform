@@ -71,7 +71,7 @@ export type Project = {
   brief: string;
   skills: string[];
   steps: ProjectStep[];
-  acceptance: string[];
+  acceptance: { id: string; text: string }[];
   stretch: string[];
   portfolio: string;
 };
