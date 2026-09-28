@@ -68,6 +68,7 @@ function renderTask(focus = false): void {
       <div class="task-meta"><span class="chapter-tag">${pad(task.chapter + 1)} <span aria-hidden="true">/</span> ${escape(chapter.short)}</span><span>Aufgabe ${pad(index + 1)} <span class="muted">/ ${tasks.length}</span></span></div>
       <h1 id="task-title" tabindex="-1">${escape(task.title)}</h1>
       <p class="task-prompt">${escape(task.prompt)}</p>
+      <nav class="resources" aria-label="Dokumentation zur aktuellen Aufgabe"><span class="resource-label">In der Dokumentation vertiefen</span>${task.resources.map((resource) => `<a href="${escape(resource.url)}" target="_blank" rel="noopener noreferrer">${escape(resource.title)} <span aria-hidden="true">↗</span><span class="sr-only"> (neuer Tab, englisch)</span></a>`).join('')}</nav>
       <div class="source-reference"><button id="open-source" class="text-button" title="Original im Dateikontext öffnen; enthält die Lösung">${escape(shortPath(task.source.file))}<span class="source-lines">:${task.source.start}${task.source.end !== task.source.start ? `–${task.source.end}` : ''}</span> ↗</button><span>Bear · ${escape(task.source.revision.slice(0, 7))}</span></div>
       <div class="code-card"><div class="code-toolbar"><span>Originalausschnitt aus Bear</span><span>${task.gaps.length === 1 ? '1 LÜCKE' : `${task.gaps.length} LÜCKEN`}</span></div><pre tabindex="0" aria-label="Kotlin-Code mit nummerierten Lücken"><code>${highlight(task.code)}</code></pre></div>
       <div class="answer-intro"><span>Ergänze den Bear-Code</span><span>Jede Lücke wird sofort geprüft</span></div>
@@ -77,7 +78,7 @@ function renderTask(focus = false): void {
       <div id="completion-message" class="completion-message" hidden></div>
       <section class="learning" aria-label="Lernmaterial zur aktuellen Aufgabe"><details id="wiki">
         <summary><span class="wiki-icon" aria-hidden="true"><svg viewBox="0 0 20 20" fill="none"><path d="M10 5v12M3 4c3-1 5 0 7 1 2-1 4-2 7-1v11c-3-1-5 0-7 1-2-1-4-2-7-1V4Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg></span><span>Zum Nachlesen <small>Dein Mini-Wiki</small></span><span class="chevron" aria-hidden="true">⌄</span></summary>
-        <div class="wiki-content"><h2>${escape(task.wiki.title)}</h2><p>${escape(task.wiki.body)}</p><div class="resources"><span class="resource-label">Weiterlernen</span>${task.resources.map((resource) => `<a href="${escape(resource.url)}" target="_blank" rel="noopener noreferrer">${escape(resource.title)} <span aria-hidden="true">↗</span><span class="sr-only"> (neuer Tab, englisch)</span></a>`).join('')}</div></div>
+        <div class="wiki-content"><h2>${escape(task.wiki.title)}</h2><p>${escape(task.wiki.body)}</p></div>
       </details></section>
       <p class="checking-note">Du rekonstruierst echten Bear-Code. Die Lückenprüfung vergleicht mit der Bear-Lösung; sie führt Kotlin nicht aus. Imports und umgebende Deklarationen findest du in der Originaldatei.</p>
     </article>`;

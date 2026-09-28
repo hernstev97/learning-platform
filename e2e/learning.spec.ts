@@ -78,6 +78,7 @@ test('all 100 tasks and 235 gaps are solvable through the UI', async ({ page }) 
     await expect(page.locator('main article')).toHaveCount(1);
     await expect(page.locator('.wiki-content')).toBeHidden();
     await expect(page.locator('.resources a')).toHaveCount(task.resources.length);
+    await expect(page.locator('.resources a').first()).toBeVisible();
     for (const gap of task.gaps) await page.locator(`#answer-${gap.id}`).fill(gap.answers[0]);
     await expect(page.locator('#feedback')).toContainText('Richtig.');
     await expect(page.locator('#progress-count')).toHaveText(`${index + 1} von 100 erledigt`);

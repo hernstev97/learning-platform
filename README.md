@@ -39,7 +39,7 @@ Wenn der Testbrowser fehlt: `pnpm exec playwright install chromium`.
 - Lange Ausdrücke und Codeblöcke können mehrzeilig eingegeben werden.
 - Erst wenn **alle** Lücken korrekt sind, zählt die Aufgabe als erledigt. Richtige Teillösungen bleiben als Entwurf erhalten.
 - Das Mini-Wiki ist anfänglich geschlossen. Bei jedem Aufgabenwechsel wird es wieder geschlossen – auch nach Erfolg, beim Überspringen, beim Zurückgehen und beim Wechsel über die Linien oder Kapitelauswahl. Während der Eingabe bleibt ein manuell geöffnetes Wiki offen.
-- Pro Aufgabe: Bear-bezogene Erklärung, Hinweise und offizielle Kotlin-/Android-Lernressourcen.
+- Pro Aufgabe: Bear-bezogene Erklärung und Hinweise im Mini-Wiki sowie direkt sichtbare Links zur offiziellen Kotlin-/Android-Dokumentation unter der Aufgabenbeschreibung. Grundlagen verweisen gezielt auf den passenden Artikelabschnitt; die Links öffnen einen neuen Tab und bleiben auch bei geschlossenem Mini-Wiki erreichbar.
 - Der Dateiverweis öffnet den vollständigen lokalen Originalcode im Dialog und markiert die verwendeten Zeilen. **Die Originaldatei enthält auch die Lösungen.** Escape oder Schließen kehrt zur Aufgabe zurück.
 
 ## Kursaufbau

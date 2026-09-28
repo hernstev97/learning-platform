@@ -48,14 +48,14 @@ def g(answer, label, hint, within=None, occurrence=1, alternatives=None):
     return dict(answer=answer, label=label, hint=hint, within=within, occurrence=occurrence, alternatives=alternatives or [])
 
 
-def k(page):
-    return dict(title='Kotlin · ' + page.replace('-', ' '), url='https://kotlinlang.org/docs/' + page + '.html')
+def k(page, title=None, section=None):
+    return dict(title='Kotlin · ' + (title or page.replace('-', ' ').capitalize()), url='https://kotlinlang.org/docs/' + page + '.html' + ('#' + section if section else ''))
 
 
 def a(page, title):
     return dict(title='Android · ' + title, url='https://developer.android.com/' + page)
 
-BASIC = k('basic-syntax')
+BASIC = k('basic-syntax', 'Variablen: val und var', 'variables')
 FUN = k('functions')
 NULL = k('null-safety')
 LAMBDA = k('lambdas')
