@@ -1,0 +1,925 @@
+id: architektur
+title: "App-Architektur: MVVM, UDF und Dependency Injection"
+level: 2
+minutes: 150
+summary: Wie du eine Android-App in Schichten teilst, Zustand in eine Richtung fließen lässt und Abhängigkeiten von außen hereinreichst – damit sie testbar und änderbar bleibt.
+goals:
+  - Du erklärst die vier Architekturprinzipien des offiziellen Guides und ordnest Code der UI-, Domain- oder Datenschicht zu.
+  - Du baust ein ViewModel, das einen `StateFlow<UiState>` mit `stateIn` und `WhileSubscribed(5_000)` bereitstellt, und wählst begründet zwischen Data Class und Sealed Interface.
+  - Du behandelst einmalige Ereignisse wie Snackbars als Zustand und begründest, warum `Channel` und `SharedFlow` dafür riskant sind.
+  - Du verdrahtest Abhängigkeiten manuell mit einem `AppContainer` und mit Hilt und erklärst, was ein Scope bewirkt.
+  - Du erkennst typische Architekturfehler im Code-Review, etwa `Context` im ViewModel oder einen vergessenen Scope.
+resources:
+  - title: Guide to app architecture
+    url: https://developer.android.com/topic/architecture
+  - title: Recommendations for Android architecture
+    url: https://developer.android.com/topic/architecture/recommendations
+  - title: ViewModel overview
+    url: https://developer.android.com/topic/libraries/architecture/viewmodel
+  - title: Dependency injection with Hilt
+    url: https://developer.android.com/training/dependency-injection/hilt-android
+  - title: Manual dependency injection
+    url: https://developer.android.com/training/dependency-injection/manual
+lesson: |
+  Stell dir die erste Version einer App vor: Die `MainActivity` lädt beim Start Daten per HTTP, hält sie in einer Variablen, zeigt sie an und schreibt Änderungen direkt zurück an den Server. Das funktioniert – bis jemand das Handy dreht (die Activity wird neu erzeugt, die Daten sind weg, der Request läuft doppelt), bis das Netz fehlt (der Bildschirm bleibt leer), bis du einen Test schreiben willst (dafür brauchst du ein Gerät und einen Server) oder bis die API ein Feld umbenennt (du suchst die Stelle in 800 Zeilen UI-Code).
+
+  Architektur ist die Antwort auf genau diese vier Probleme. Sie ist kein Selbstzweck: Gute Architektur macht Code **testbar** (Logik läuft ohne Gerät und ohne Server) und **änderbar** (eine Änderung betrifft eine Stelle). In diesem Modul lernst du die Architektur, die Google für Android empfiehlt und die du in fast jeder professionellen Codebasis wiederfindest: Schichten, MVVM mit Unidirectional Data Flow, Repository als Single Source of Truth und Dependency Injection. Bear dient als roter Faden – die App speichert Gedanken zuerst lokal und schickt sie danach an Linear.
+
+  ## Vier Prinzipien, eine Richtung
+
+  Der offizielle [Guide to app architecture](https://developer.android.com/topic/architecture#common-principles) stützt sich auf vier Grundsätze:
+
+  1. **Separation of concerns.** Activities und Composables zeigen an und nehmen Eingaben entgegen – mehr nicht. Android kann eine Activity jederzeit zerstören; Daten und Logik haben dort nichts verloren.
+  2. **UI aus Datenmodellen ableiten**, bevorzugt aus persistenten. Die Oberfläche ist eine Funktion des Zustands: gleicher Zustand, gleicher Bildschirm.
+  3. **Single Source of Truth (SSOT).** Jeder Datentyp hat genau einen Besitzer, und nur dieser Besitzer ändert ihn. Alle anderen lesen.
+  4. **Unidirectional Data Flow (UDF).** Zustand fließt nach unten, Ereignisse fließen nach oben.
+
+  ```text
+            Zustand: StateFlow<UiState>
+     ┌─────────────────────────────────────────┐
+     │                                         │
+     ▼                                         │
+   UI (Composables) ── Ereignis ──▶ ViewModel ──▶ Repository ──▶ Room / Netzwerk
+                       onSaveClicked()           capture(text)
+  ```
+
+  Das Denkmodell dahinter: Die UI verändert keinen Zustand selbst, sie *bittet* darum. Ein Tipp auf „Speichern“ ruft `viewModel.onSaveClicked()` auf; das ViewModel ruft das Repository; das Repository schreibt in die Datenbank; die Datenbank meldet die neue Liste; das ViewModel baut daraus einen neuen `UiState`; Compose zeichnet neu. Weil es nur diesen einen Weg gibt, lässt sich jeder Fehler auf die Frage „Welcher Zustand hat diesen Bildschirm erzeugt?“ zurückführen.
+
+  > [!MERKE]
+  > Zustand nach unten, Ereignisse nach oben. Wer Zustand besitzt, ändert ihn – und nur der.
+
+  ## Die Schichten: UI, Domain, Daten
+
+  Die [empfohlene Architektur](https://developer.android.com/topic/architecture#recommended-app-arch) hat zwei Pflichtschichten und eine optionale:
+
+  | Schicht | Inhalt | Kennt |
+  | --- | --- | --- |
+  | UI-Schicht | Composables und State Holder wie das ViewModel | Domain- und Datenschicht |
+  | Domain-Schicht (optional) | Use Cases: wiederverwendbare Geschäftslogik | Datenschicht |
+  | Datenschicht | Repositories und Data Sources (Room, DataStore, Netzwerk) | nur sich selbst |
+
+  Abhängigkeiten zeigen nur nach unten. Die Datenschicht weiß nichts von ViewModels oder Compose – deshalb kannst du sie ohne UI testen und die UI austauschen, ohne die Daten anzufassen. Die öffentliche API der Datenschicht folgt einer einfachen Regel: [Daten, die sich ändern, als `Flow`; einmalige Aktionen als `suspend fun`](https://developer.android.com/topic/architecture/data-layer#expose-apis).
+
+  ```kotlin
+  // Datenschicht: die öffentliche API als Interface
+  interface ThoughtRepository {
+      fun observeThoughts(): Flow<List<Thought>>  // ändert sich über die Zeit → Flow
+      suspend fun capture(text: String)          // einmalige Aktion → suspend
+      suspend fun resendPending()
+  }
+
+  // Domain-Schicht: Logik, die mehrere Repositories verbindet
+  class ConnectLinearUseCase(
+      private val settings: SettingsRepository,
+      private val thoughts: ThoughtRepository,
+  ) {
+      suspend operator fun invoke(apiKey: String) {
+          settings.saveApiKey(apiKey)
+          thoughts.resendPending()
+      }
+  }
+  ```
+
+  Ein [Use Case](https://developer.android.com/topic/architecture/domain-layer#use-cases-kotlin) hat genau eine öffentliche Funktion. Mit `operator fun invoke` rufst du ihn wie eine Funktion auf: `connectLinear(key)`. Die offiziellen Empfehlungen stufen die Domain-Schicht als „recommended in big apps“ ein: Sie lohnt sich, wenn mehrere ViewModels dieselbe Logik brauchen oder ein ViewModel zu viel weiß. In einer kleinen App wie Bear steckt diese Logik stattdessen in `AppContainer.connectLinear` – ein Use Case ohne eigenen Namen.
+
+  Jede Schicht darf eigene Modelle haben: ein DTO für die JSON-Antwort, eine Entity für Room, ein Domain-Modell `Thought` für den Rest der App und einen `UiState` für den Bildschirm. Das [Mapping an den Grenzen](https://developer.android.com/topic/architecture/data-layer#business-models) kostet ein paar Zeilen, schützt aber den Rest der App davor, dass ein umbenanntes API-Feld bis in die UI durchschlägt.
+
+  ## ViewModel: Zustandshalter mit Lebensdauer
+
+  Das [ViewModel](https://developer.android.com/topic/libraries/architecture/viewmodel#lifecycle) ist der State Holder auf Bildschirmebene. Es gehört zu einem `ViewModelStoreOwner` – einer Activity oder einem Eintrag im Navigations-Backstack – und lebt, bis dieser endgültig verschwindet. Eine Drehung überlebt es, weil die neue Activity dasselbe ViewModel wiederbekommt. Endet der Owner, ruft Android `onCleared()` auf und bricht den `viewModelScope` ab. Dieser Scope läuft auf `Dispatchers.Main.immediate` mit einem `SupervisorJob`: Ein fehlgeschlagener Kind-Job reißt die anderen nicht mit.
+
+  Den Tod des Prozesses überlebt das ViewModel nicht. Wenn Android eine App im Hintergrund beendet, um Speicher freizugeben, und der Nutzer zurückkehrt, entsteht ein neues ViewModel. Dafür gibt es [`SavedStateHandle`](https://developer.android.com/topic/libraries/architecture/viewmodel/viewmodel-savedstate): ein kleiner Schlüssel-Wert-Speicher, der im Bundle der Activity landet.
+
+  ```kotlin
+  class TopicDetailViewModel(
+      savedStateHandle: SavedStateHandle,
+      private val topics: TopicRepository,
+  ) : ViewModel() {
+      // Navigationsargument: überlebt auch den Prozesstod
+      private val issueId: String = checkNotNull(savedStateHandle.get<String>("issueId"))
+
+      fun onMarkDoneClicked() {
+          viewModelScope.launch { topics.markDone(issueId) }
+      }
+  }
+  ```
+
+  | Ereignis | Wert im ViewModel | `SavedStateHandle` | Room / DataStore |
+  | --- | --- | --- | --- |
+  | Drehung, Dark Mode, Sprache | bleibt | bleibt | bleibt |
+  | System beendet den Prozess im Hintergrund | weg | bleibt | bleibt |
+  | Nutzer wischt die App aus „Zuletzt verwendet“ | weg | weg | bleibt |
+  | Neustart des Geräts | weg | weg | bleibt |
+
+  `SavedStateHandle` ist für kleine UI-Werte gedacht: eine ID, einen Suchbegriff, einen Tab-Index. Alles, was wirklich zählt, gehört in die Datenbank.
+
+  > [!WARNING] Kein Context im ViewModel
+  > Ein ViewModel lebt länger als die Activity, die es erzeugt hat. Hält es eine Referenz auf die Activity, einen `Context` oder `Resources`, bleibt nach jeder Drehung die alte Activity im Speicher. Die [Empfehlungen](https://developer.android.com/topic/architecture/recommendations#viewmodel) raten deshalb auch von `AndroidViewModel` ab: Was einen Context braucht, gehört in die Daten- oder die UI-Schicht.
+
+  ## UI-State modellieren
+
+  Der Zustand eines Bildschirms ist ein unveränderliches Objekt. Für seine Form gibt es zwei Muster, und beide sind richtig – für unterschiedliche Bildschirme.
+
+  ```kotlin
+  // Muster 1: eine Data Class mit Feldern, die sich frei kombinieren
+  data class CaptureUiState(
+      val text: String = "",
+      val isSaving: Boolean = false,
+      val userMessage: String? = null,
+  )
+
+  // Muster 2: ein Sealed Interface für Zustände, die sich ausschließen
+  sealed interface TopicUiState {
+      data object Loading : TopicUiState
+      data class Content(val topic: Topic, val isSyncing: Boolean) : TopicUiState
+      data class Error(val message: String) : TopicUiState
+  }
+  ```
+
+  Das [Sealed Interface](https://kotlinlang.org/docs/sealed-classes.html) macht unmögliche Zustände unmöglich: „lädt und hat einen Fehler und zeigt Inhalt“ lässt sich nicht einmal hinschreiben, und `when` über alle Fälle ist erschöpfend – vergisst du einen, meldet der Compiler das. Der Preis: Beim Wechsel nach `Loading` verschwindet der Inhalt. Deshalb steckt das Nachladen oben als `isSyncing` *in* `Content`. Die Data Class ist bequemer, wenn Felder unabhängig sind (Eingabetext, Speichern läuft, Meldung), erlaubt aber widersprüchliche Kombinationen. Beide Varianten sind nach dem Schema *Funktion + UiState* benannt, wie es der [UI-Layer-Guide](https://developer.android.com/topic/architecture/ui-layer#define-ui-state) vorschlägt.
+
+  Kommt der Zustand aus einem Flow der Datenschicht, wandelt `stateIn` ihn in einen `StateFlow` um:
+
+  ```kotlin
+  class TopicViewModel(
+      savedStateHandle: SavedStateHandle,
+      topics: TopicRepository,
+  ) : ViewModel() {
+      private val issueId: String = checkNotNull(savedStateHandle.get<String>("issueId"))
+
+      val uiState: StateFlow<TopicUiState> = topics.observe(issueId)
+          .map { topic ->
+              if (topic == null) TopicUiState.Error("Thema nicht gefunden")
+              else TopicUiState.Content(topic, isSyncing = false)
+          }
+          .stateIn(
+              scope = viewModelScope,
+              started = SharingStarted.WhileSubscribed(5_000),
+              initialValue = TopicUiState.Loading,
+          )
+  }
+  ```
+
+  Besitzt das ViewModel den Zustand selbst (etwa Formulareingaben), hält es einen privaten `MutableStateFlow` und gibt nach außen nur `asStateFlow()` heraus. Geändert wird mit `update { it.copy(...) }`, das atomar liest und schreibt.
+
+  In Compose sammelst du den Zustand lebenszyklusbewusst mit [`collectAsStateWithLifecycle()`](https://developer.android.com/topic/libraries/architecture/coroutines) und reichst nur Werte und Lambdas weiter – nie das ViewModel selbst:
+
+  ```kotlin
+  @Composable
+  fun TopicRoute(viewModel: TopicViewModel = viewModel(factory = TopicViewModel.Factory)) {
+      val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+      TopicScreen(uiState = uiState, onMarkDone = viewModel::onMarkDoneClicked)
+  }
+
+  @Composable
+  fun TopicScreen(uiState: TopicUiState, onMarkDone: () -> Unit) {
+      when (uiState) {
+          TopicUiState.Loading -> CircularProgressIndicator()
+          is TopicUiState.Content -> TopicContent(uiState.topic, onMarkDone)
+          is TopicUiState.Error -> Text(uiState.message)
+      }
+  }
+  ```
+
+  Die Trennung in `TopicRoute` (holt den Zustand) und `TopicScreen` (zeigt ihn) ist kein Selbstzweck: `TopicScreen` braucht kein ViewModel und lässt sich deshalb in Previews und UI-Tests mit beliebigen Zuständen füttern.
+
+  > [!DEEP] Warum genau 5 000 Millisekunden?
+  > `WhileSubscribed(5_000)` hält den Upstream – etwa die Room-Abfrage – noch fünf Sekunden aktiv, nachdem der letzte Collector verschwunden ist. Eine Drehung dauert kürzer: Die neue UI sammelt wieder, bevor die Frist abläuft, und die Abfrage startet nicht neu. Geht die App in den Hintergrund, endet die Abfrage nach fünf Sekunden und spart Akku. `Eagerly` würde sie bis zum Ende des ViewModels laufen lassen, `Lazily` nach dem ersten Collector ebenfalls.
+
+  ## Einmalige Ereignisse sind Zustand
+
+  „Gespeichert“ als Snackbar, Navigation nach dem Speichern, ein Fehlerhinweis: Solche Dinge sollen genau einmal passieren. Der naheliegende Weg ist ein `Channel` oder `SharedFlow`, in den das ViewModel ein Ereignis schickt. Der [offizielle Guide](https://developer.android.com/topic/architecture/ui-layer/events#handle-viewmodel-events) rät davon ab: Das ViewModel lebt länger als die UI, die zuhört. Sendet es genau in dem Moment, in dem die Activity neu erzeugt wird oder im Hintergrund ist, geht das Ereignis verloren – ein `SharedFlow` ohne Replay verwirft es, weil niemand sammelt. Die Empfehlung lautet deshalb: Ein Ereignis aus dem ViewModel wird zu einer **Zustandsänderung**, und die UI meldet zurück, wenn sie es verarbeitet hat.
+
+  ```kotlin
+  class CaptureViewModel(private val thoughts: ThoughtRepository) : ViewModel() {
+      private val _uiState = MutableStateFlow(CaptureUiState())
+      val uiState: StateFlow<CaptureUiState> = _uiState.asStateFlow()
+
+      fun onSaveClicked() {
+          val text = _uiState.value.text
+          viewModelScope.launch {
+              thoughts.capture(text)
+              _uiState.update { it.copy(text = "", userMessage = "Gespeichert") }
+          }
+      }
+
+      fun userMessageShown() {
+          _uiState.update { it.copy(userMessage = null) }
+      }
+  }
+
+  // in CaptureRoute:
+  uiState.userMessage?.let { message ->
+      LaunchedEffect(message) {
+          snackbarHostState.showSnackbar(message)
+          viewModel.userMessageShown()
+      }
+  }
+  ```
+
+  Nach einer Drehung steht die Meldung noch im Zustand, bis die UI sie quittiert hat – sie geht nicht verloren. Nach dem Quittieren ist sie `null` und erscheint kein zweites Mal. Dasselbe Muster funktioniert für Navigation: Ein Feld `savedThoughtId` im Zustand löst die Navigation aus; danach setzt die UI es zurück. Hängt die Navigation nicht vom Ergebnis ab, ruft die UI sie direkt im Klick-Callback auf.
+
+  > [!INTERVIEW] „Wie zeigst du eine Snackbar, die das ViewModel auslöst?“
+  > Als Teil des UI-State: Das ViewModel setzt `userMessage`, die UI zeigt die Snackbar in einem `LaunchedEffect` und ruft danach `userMessageShown()`, das die Meldung auf `null` setzt. So überlebt die Meldung Drehung und Hintergrund, und sie erscheint genau einmal. Einen `Channel` nennst du als bekannte Alternative, mit dem Hinweis, dass er ohne Collector Ereignisse zurückhält oder – als `SharedFlow` ohne Replay – verliert, und dass Google deshalb Zustand empfiehlt.
+
+  ## Repository und Single Source of Truth
+
+  Ein [Repository](https://developer.android.com/topic/architecture/data-layer#architecture) ist die einzige Tür zu einem Datentyp. Es stellt Daten bereit, bündelt Änderungen, löst Konflikte zwischen Quellen und versteckt, woher die Daten kommen. Das ViewModel weiß nicht, ob hinter `observeTopics()` Room, eine Datei oder ein Server steckt.
+
+  Für Apps, die offline funktionieren sollen, ist die lokale Datenbank die [Single Source of Truth](https://developer.android.com/topic/architecture/data-layer#source-of-truth). Das Netzwerk liefert nie direkt an die UI, sondern schreibt in die Datenbank; die UI liest nur aus der Datenbank:
+
+  ```kotlin
+  class OfflineFirstTopicRepository(
+      private val dao: TopicDao,
+      private val api: LinearApi,
+  ) : TopicRepository {
+      override fun observeTopics(): Flow<List<Topic>> =
+          dao.observeAll().map { entities -> entities.map(TopicEntity::toDomain) }
+
+      override suspend fun refresh() {
+          val remote = api.fetchTopics()              // Netzwerk …
+          dao.upsertAll(remote.map(TopicDto::toEntity)) // … schreibt nur in die Datenbank
+      }
+  }
+  ```
+
+  Ruft der Nutzer `refresh()` auf, liefert der Flow aus `observeTopics()` automatisch die neue Liste – das ViewModel muss nichts zusammenführen. Fällt das Netz aus, zeigt die App den letzten bekannten Stand. Wie Room, Retrofit und WorkManager diese Idee umsetzen, behandelt das Modul „Daten & Netzwerk“. Namenskonvention nach dem Guide: *Datentyp + Repository* (`TopicRepository`), Data Sources als *Datentyp + Quelle + DataSource* (`TopicRemoteDataSource`).
+
+  ## Dependency Injection: manuell oder mit Hilt
+
+  Dependency Injection (DI) heißt: Eine Klasse baut ihre Abhängigkeiten nicht selbst, sie bekommt sie über den Konstruktor. `OfflineFirstTopicRepository` ruft nicht `Room.databaseBuilder(...)` auf, sondern erhält einen `TopicDao`. Das hat zwei Folgen: Im Test übergibst du einen Fake, und eine einzige Stelle entscheidet, wie lange welches Objekt lebt.
+
+  **Manuelle DI** bedeutet: Du schreibst diese Stelle selbst. Bear macht es so – mit einem [`AppContainer`](https://developer.android.com/training/dependency-injection/manual#dependencies-container), den die `Application` einmal erzeugt:
+
+  ```kotlin
+  /** Hand-wired dependencies. The app is small enough not to need a DI framework. */
+  class AppContainer(context: Context) {
+      val db = BearDatabase.create(context)
+      val settings = SettingsStore(context)
+      val linear = LinearClient()
+      val edits = EditQueue(context, db)
+      val topics = TopicRepository(db, settings, linear, edits)
+  }
+
+  class BearApp : Application() {
+      lateinit var container: AppContainer
+          private set
+
+      override fun onCreate() {
+          super.onCreate()
+          container = AppContainer(this)
+      }
+  }
+  ```
+
+  ViewModels kommen über eine [Factory](https://developer.android.com/topic/libraries/architecture/viewmodel/viewmodel-factories#creationextras_android) an ihre Abhängigkeiten:
+
+  ```kotlin
+  companion object {
+      val Factory: ViewModelProvider.Factory = viewModelFactory {
+          initializer {
+              val app = this[APPLICATION_KEY] as BearApp
+              TopicViewModel(createSavedStateHandle(), app.container.topics)
+          }
+      }
+  }
+  ```
+
+  **Hilt** generiert diesen Code zur Compile-Zeit aus Annotationen und prüft dabei, ob jede Abhängigkeit erfüllbar ist. Fehlt eine, bricht der Build ab, nicht die App.
+
+  | Annotation | Wirkung |
+  | --- | --- |
+  | `@HiltAndroidApp` | an der `Application`: erzeugt den obersten Container (`SingletonComponent`) |
+  | `@AndroidEntryPoint` | an Activity, Service, BroadcastReceiver: Hilt darf dort injizieren |
+  | `@Inject constructor` | Hilt weiß, wie es die Klasse baut |
+  | `@Module` + `@InstallIn` | Anleitungen für Typen, die Hilt nicht selbst bauen kann |
+  | `@Binds` | Interface → Implementierung (abstrakte Funktion) |
+  | `@Provides` | Objekt per Code bauen, etwa Room oder Retrofit |
+  | `@HiltViewModel` | ViewModel mit `@Inject constructor`; in Compose über `hiltViewModel()` |
+  | `@Singleton`, `@ViewModelScoped`, … | Scope: eine Instanz pro Component |
+
+  ```kotlin
+  @Module
+  @InstallIn(SingletonComponent::class)
+  object DatabaseModule {
+      @Provides
+      @Singleton
+      fun provideDatabase(@ApplicationContext context: Context): BearDatabase =
+          Room.databaseBuilder(context, BearDatabase::class.java, "bear.db").build()
+
+      @Provides
+      fun provideTopicDao(db: BearDatabase): TopicDao = db.topics()
+  }
+
+  @Module
+  @InstallIn(SingletonComponent::class)
+  abstract class RepositoryModule {
+      @Binds
+      abstract fun bindTopicRepository(impl: OfflineFirstTopicRepository): TopicRepository
+  }
+
+  @HiltViewModel
+  class TopicViewModel @Inject constructor(
+      savedStateHandle: SavedStateHandle,
+      topics: TopicRepository,
+  ) : ViewModel()
+  ```
+
+  Der wichtigste Stolperstein ist der Scope. `@InstallIn(SingletonComponent::class)` legt fest, *wo* eine Bindung verfügbar ist. Ob es nur *eine* Instanz gibt, entscheidet allein die Scope-Annotation. Ohne `@Singleton` baut Hilt bei jeder Injektion ein neues Objekt – auch in einem Modul der `SingletonComponent`. Die [Tabelle der Component-Scopes](https://developer.android.com/training/dependency-injection/hilt-android#component-scopes) zeigt, welcher Scope zu welcher Lebensdauer gehört. Scope nur, was geteilten veränderlichen Zustand hält oder teuer zu erzeugen ist, wie die Datenbank.
+
+  Welcher Weg? Die [Empfehlungen](https://developer.android.com/topic/architecture/recommendations#handle-dependencies) sagen: manuelle DI oder Hilt für einfache Apps, Hilt, sobald mehrere Bildschirme mit ViewModels, WorkManager oder an den Navigations-Backstack gebundene ViewModels im Spiel sind. In Stellenanzeigen für Android steht meist Hilt; manche Teams nutzen Koin, das Abhängigkeiten zur Laufzeit statt zur Compile-Zeit auflöst.
+
+  > [!PRAXIS] Bear und der AppContainer
+  > Bear kommt mit einem handgeschriebenen Container aus – bewusst, wie der Kommentar sagt. Der Preis zeigt sich in den Workern: `SendThoughtWorker` holt sich mit `(applicationContext as BearApp).container` alles selbst. Das ist ein Service Locator – die Abhängigkeiten stehen nicht im Konstruktor, und ein Test muss eine echte `BearApp` bereitstellen. Mit Hilt würde der Worker `@HiltWorker` und `@AssistedInject` bekommen. Im Code-Review ist das kein Fehler, aber eine bewusste Abwägung, die du erklären können solltest.
+
+  ## Ausblick: Modularisierung
+
+  Wächst eine App, teilen Teams sie in Gradle-Module: `:app`, `:feature:capture`, `:feature:topics`, `:core:data`, `:core:database`, `:core:model`. Die [Modularisierung](https://developer.android.com/topic/modularization#benefits) bringt schnellere inkrementelle Builds, weil Gradle nur geänderte Module neu übersetzt, echte Kapselung durch `internal` und klare Zuständigkeiten im Team. Sie kostet Konfigurationsaufwand; zu feine Module machen den Build langsamer statt schneller. Die Schichten dieses Moduls sind die natürliche Schnittlinie. Das offizielle Beispielprojekt [Now in Android](https://github.com/android/nowinandroid) zeigt beides – Architektur und Modularisierung – in einer realistischen Codebasis.
+
+  ## Häufige Fehler
+
+  - **`Context` oder Activity im ViewModel.** Symptom: LeakCanary meldet eine geleakte Activity nach jeder Drehung. Lösung: Context-abhängige Arbeit in die Datenschicht (mit Application-Context) oder in die UI verlagern.
+  - **`MutableStateFlow` öffentlich.** Die UI kann den Zustand am ViewModel vorbei ändern, UDF ist gebrochen. Lösung: `private val _uiState` plus `asStateFlow()`.
+  - **ViewModel spricht direkt mit DAO oder Retrofit.** Kein SSOT, kein Offline-Verhalten, schwer testbar. Lösung: Repository dazwischen.
+  - **Ereignisse über `Channel`/`SharedFlow`.** Symptom: Snackbar fehlt manchmal nach einer Drehung oder erscheint doppelt. Lösung: Ereignis als Zustand plus Quittung.
+  - **`collectAsState()` statt `collectAsStateWithLifecycle()`.** Der Flow läuft auch im Hintergrund weiter und verbraucht Akku.
+  - **Scope vergessen oder alles `@Singleton`.** Vergessen: zwei Bildschirme sehen verschiedene Instanzen mit verschiedenem Zustand. Alles scopen: Objekte leben unnötig lange im Speicher.
+  - **ViewModel an Kind-Composables weiterreichen.** Die Kinder sind dann nicht mehr isoliert testbar. Lösung: Zustand und Lambdas übergeben.
+
+  ## Zusammenfassung
+
+  - Architektur macht Code testbar und änderbar; die vier Prinzipien sind Separation of Concerns, UI aus Modellen, Single Source of Truth und Unidirectional Data Flow.
+  - UI-Schicht, optionale Domain-Schicht, Datenschicht: Abhängigkeiten zeigen nur nach unten. Die Datenschicht bietet `Flow` für Daten und `suspend` für Aktionen.
+  - Das ViewModel überlebt Drehungen, nicht den Prozesstod. Kleine UI-Werte kommen in `SavedStateHandle`, wichtige Daten in Room.
+  - `UiState` ist unveränderlich: Data Class für unabhängige Felder, Sealed Interface für sich ausschließende Zustände. Aus Flows wird er mit `stateIn(viewModelScope, WhileSubscribed(5_000), initial)`.
+  - Einmalige Ereignisse sind Zustand, den die UI quittiert – kein `Channel`.
+  - Das Repository ist die einzige Tür zu einem Datentyp; offline-first heißt: Die Datenbank ist die Quelle der Wahrheit.
+  - Manuelle DI mit `AppContainer` reicht für kleine Apps; Hilt generiert den Container und prüft ihn zur Compile-Zeit. Scope-Annotationen, nicht `@InstallIn`, machen ein Objekt zum Singleton.
+exercises:
+  - id: was-ueberlebt-was
+    type: choice
+    title: Was überlebt was?
+    prompt: |
+      Ein `TopicViewModel` hält die Liste der Themen in einer normalen Property und die ID des ausgewählten Themas in `SavedStateHandle`. Welche Aussagen stimmen?
+    options:
+      - text: Nach einer Drehung bekommt die neue Activity dieselbe ViewModel-Instanz.
+        correct: true
+        why: Der `ViewModelStore` der Activity überlebt Konfigurationsänderungen; die neue Activity erhält das vorhandene ViewModel.
+      - text: Bei einer Drehung bricht Android den `viewModelScope` ab und startet laufende Coroutines neu.
+        correct: false
+        why: Der Scope wird erst in `onCleared()` abgebrochen, also wenn der Owner endgültig verschwindet – nicht bei einer Drehung.
+      - text: Beendet das System den Prozess im Hintergrund, ist die ausgewählte ID nach der Rückkehr noch da.
+        correct: true
+        why: Genau dafür gibt es `SavedStateHandle`; der Wert wird im gespeicherten Zustand der Activity abgelegt und wiederhergestellt.
+      - text: Beendet das System den Prozess im Hintergrund, ist die Themenliste in der Property noch da.
+        correct: false
+        why: Nach dem Prozesstod entsteht ein neues ViewModel; normale Properties beginnen wieder bei ihrem Anfangswert.
+      - text: Wischt der Nutzer die App aus „Zuletzt verwendet“, bleibt die ID in `SavedStateHandle` erhalten.
+        correct: false
+        why: Gespeicherter Zustand hängt am Task. Entfernt der Nutzer den Task, sind auch die gespeicherten Werte weg – nur Room oder DataStore überleben das.
+    explanation: |
+      Drei Speicherorte, drei Lebensdauern: Das ViewModel überlebt Konfigurationsänderungen, `SavedStateHandle` zusätzlich den vom System ausgelösten Prozesstod, und nur persistente Speicher wie Room überleben, dass der Nutzer die App bewusst schließt. Daraus folgt die Faustregel: kleine UI-Werte in `SavedStateHandle`, Daten in die Datenbank.
+    resources:
+      - title: SavedStateHandle
+        url: https://developer.android.com/topic/libraries/architecture/viewmodel/viewmodel-savedstate
+      - title: Lifecycle of a ViewModel
+        url: https://developer.android.com/topic/libraries/architecture/viewmodel#lifecycle
+  - id: udf-kreislauf
+    type: order
+    title: Einmal im Kreis
+    prompt: |
+      In Bear tippt jemand auf „Speichern“. Bring die Schritte in die Reihenfolge, in der sie bei Unidirectional Data Flow mit Room als Single Source of Truth passieren.
+    lang: text
+    lines: |
+      Der Nutzer tippt auf „Speichern“.
+      Das Composable ruft viewModel.onSaveClicked() auf.
+      Das ViewModel startet in viewModelScope thoughts.capture(text).
+      Das Repository schreibt den Gedanken als Zeile in Room.
+      Der Flow des DAO liefert die neue Liste.
+      Das ViewModel bildet daraus einen neuen UiState.
+      collectAsStateWithLifecycle liefert den Zustand, Compose zeichnet neu.
+    explanation: |
+      Ereignisse gehen nach oben (UI → ViewModel → Repository → Datenbank), Zustand kommt nach unten zurück (Datenbank → Flow → ViewModel → UI). Die UI ändert die Liste nie selbst. Weil die Datenbank die einzige Quelle ist, zeigt der Bildschirm nach jedem Weg zur Datenbank – ob durch Nutzer, Sync oder Worker – automatisch den richtigen Stand.
+    resources:
+      - title: Unidirectional data flow
+        url: https://developer.android.com/topic/architecture#unidirectional-data-flow
+  - id: sharedflow-verliert
+    type: output
+    title: Wer hört zu?
+    prompt: |
+      Ein ViewModel verschickt Ereignisse über einen `MutableSharedFlow` ohne Replay. Was gibt dieses Programm aus? (Es läuft in einem einzigen Thread.)
+    lang: kotlin
+    code: |
+      import kotlinx.coroutines.*
+      import kotlinx.coroutines.flow.MutableSharedFlow
+
+      fun main() = runBlocking {
+          val events = MutableSharedFlow<String>()
+          events.emit("Gespeichert")
+          val ui = launch { events.collect { println("UI: $it") } }
+          yield()
+          events.emit("Gesendet")
+          yield()
+          ui.cancel()
+          println("fertig")
+      }
+    expected: |
+      UI: Gesendet
+      fertig
+    hints:
+      - "`launch` startet die Coroutine erst, wenn `runBlocking` das nächste Mal suspendiert."
+      - Wer ist beim ersten `emit` schon Subscriber?
+    explanation: |
+      `MutableSharedFlow()` hat standardmäßig `replay = 0` und keinen Puffer. Beim ersten `emit` gibt es noch keinen Subscriber – `launch` hat die Coroutine nur eingeplant, sie läuft erst beim `yield()`. Ohne Subscriber suspendiert `emit` nicht und verwirft den Wert: „Gespeichert“ ist weg. Beim zweiten `emit` wartet der Collector bereits und gibt „UI: Gesendet“ aus. Genau das passiert in einer App, wenn das ViewModel ein Ereignis schickt, während die UI nach einer Drehung noch nicht wieder sammelt – deshalb empfiehlt Google Ereignisse als Zustand.
+    resources:
+      - title: SharedFlow (API-Referenz)
+        url: https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines.flow/-shared-flow/
+      - title: Handle ViewModel events
+        url: https://developer.android.com/topic/architecture/ui-layer/events#handle-viewmodel-events
+  - id: stateflow-konflation
+    type: output
+    title: Drei Zuweisungen, wie viele Zustände?
+    prompt: |
+      Das ViewModel setzt den Zustand dreimal hintereinander, ohne dazwischen zu suspendieren. Was sieht der Collector? (Ein Thread, `runBlocking`.)
+    lang: kotlin
+    code: |
+      import kotlinx.coroutines.*
+      import kotlinx.coroutines.flow.MutableStateFlow
+
+      data class UiState(val isLoading: Boolean = false, val items: List<String> = emptyList())
+
+      fun main() = runBlocking {
+          val state = MutableStateFlow(UiState())
+          val ui = launch { state.collect { println(it) } }
+          yield()
+          state.value = state.value.copy(isLoading = true)
+          state.value = state.value.copy(isLoading = false, items = listOf("Milch"))
+          state.value = state.value.copy()
+          yield()
+          ui.cancel()
+      }
+    expected: |
+      UiState(isLoading=false, items=[])
+      UiState(isLoading=false, items=[Milch])
+    hints:
+      - Ein `StateFlow` hat immer genau einen aktuellen Wert. Wann liest der Collector ihn?
+      - Was macht `StateFlow`, wenn der neue Wert per `equals` gleich dem alten ist?
+    explanation: |
+      Beim ersten `yield()` startet der Collector und gibt den Anfangswert aus. Die drei Zuweisungen laufen danach ohne Unterbrechung; der Collector kommt erst beim zweiten `yield()` wieder dran und sieht nur den **neuesten** Wert – `StateFlow` ist konflatierend, der Zwischenzustand `isLoading = true` geht verloren. Die dritte Zuweisung ist per `equals` gleich dem aktuellen Wert und löst gar nichts aus. Für UI-State ist das gewollt: Die UI soll den aktuellen Zustand zeigen, nicht jeden Zwischenschritt. Für Ereignisse, die jeder einzeln zählen, ist `StateFlow` deshalb das falsche Werkzeug.
+    resources:
+      - title: StateFlow (API-Referenz)
+        url: https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines.flow/-state-flow/
+  - id: uistate-statein
+    type: gap
+    title: Zustand aus der Datenbank
+    prompt: |
+      Ergänze den UI-State als Sealed Interface und das ViewModel, das ihn aus dem Repository ableitet. `Loading` soll ein lesbares `toString()` haben, und der Upstream soll nach dem letzten Collector noch **fünf Sekunden** weiterlaufen.
+    lang: kotlin
+    code: |
+      ⟦sealed interface⟧ ThoughtsUiState {
+          ⟦data object⟧ Loading : ThoughtsUiState
+          data class Content(val thoughts: List<Thought>) : ThoughtsUiState
+          data class Error(val message: String) : ThoughtsUiState
+      }
+
+      class ThoughtsViewModel(thoughts: ThoughtRepository) : ViewModel() {
+          val uiState: ⟦StateFlow<ThoughtsUiState>⟧ = thoughts.observeThoughts()
+              .map<List<Thought>, ThoughtsUiState> { ThoughtsUiState.Content(it) }
+              .catch { emit(ThoughtsUiState.Error(it.message ?: "Unbekannter Fehler")) }
+              .⟦stateIn⟧(
+                  scope = ⟦viewModelScope⟧,
+                  started = SharingStarted.⟦WhileSubscribed(5_000)⟧,
+                  initialValue = ⟦ThoughtsUiState.Loading⟧,
+              )
+      }
+    gaps:
+      - label: Art des Typs
+        hint: Zwei Wörter – eine Hierarchie, deren Untertypen der Compiler vollständig kennt.
+        accept: ["sealed class"]
+      - label: Einzelner Zustand ohne Daten
+        hint: Ein Objekt mit generiertem `toString()`, `equals()` und `hashCode()`.
+      - label: Typ der Property
+        hint: Ein Flow mit immer genau einem aktuellen Wert, nur lesbar.
+      - label: Operator
+        hint: Macht aus einem kalten Flow einen `StateFlow`.
+      - label: Scope
+        hint: Der Scope, der mit dem ViewModel endet.
+      - label: Start-Strategie
+        hint: Aktiv, solange jemand sammelt – plus Wartezeit in Millisekunden.
+        accept: ["WhileSubscribed(5000)", "WhileSubscribed(stopTimeoutMillis = 5_000)", "WhileSubscribed(stopTimeoutMillis = 5000)"]
+      - label: Anfangswert
+        hint: Was die UI zeigt, bevor die Datenbank antwortet.
+    explanation: |
+      `sealed interface` plus `data object` für den datenlosen Fall ist das idiomatische Muster seit Kotlin 1.9; eine `sealed class` funktioniert ebenso. `stateIn` braucht drei Dinge: den Scope, der die Sammlung trägt (`viewModelScope`), die Start-Strategie und einen Anfangswert, weil ein `StateFlow` immer einen Wert haben muss. `WhileSubscribed(5_000)` überbrückt Drehungen, ohne die Abfrage im Hintergrund ewig laufen zu lassen. Das explizite `map<List<Thought>, ThoughtsUiState>` sorgt dafür, dass `catch` einen `Error` emittieren darf – sonst wäre der Flow auf `Content` festgelegt.
+    resources:
+      - title: stateIn (API-Referenz)
+        url: https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines.flow/state-in.html
+      - title: Architecture recommendations · ViewModel
+        url: https://developer.android.com/topic/architecture/recommendations#viewmodel
+  - id: appcontainer-verdrahten
+    type: gap
+    title: Von Hand verdrahtet
+    prompt: |
+      Ergänze die manuelle Dependency Injection im Stil von Bear: Der Container entsteht einmal in der `Application`, und das ViewModel holt seine Abhängigkeit über eine Factory aus `CreationExtras`.
+    lang: kotlin
+    code: |
+      class AppContainer(context: Context) {
+          private val db = BearDatabase.create(context)
+          val thoughts: ThoughtRepository = OfflineFirstThoughtRepository(db.thoughts())
+      }
+
+      class BearApp : Application() {
+          ⟦lateinit var⟧ container: AppContainer
+              private set
+
+          override fun onCreate() {
+              super.onCreate()
+              container = ⟦AppContainer(this)⟧
+          }
+      }
+
+      class ThoughtsViewModel(private val thoughts: ThoughtRepository) : ViewModel() {
+          companion object {
+              val Factory: ViewModelProvider.Factory = ⟦viewModelFactory⟧ {
+                  initializer {
+                      val app = this[⟦APPLICATION_KEY⟧] as BearApp
+                      ThoughtsViewModel(⟦app.container.thoughts⟧)
+                  }
+              }
+          }
+      }
+
+      @Composable
+      fun ThoughtsRoute(viewModel: ThoughtsViewModel = viewModel(factory = ⟦ThoughtsViewModel.Factory⟧)) {
+          /* … */
+      }
+    gaps:
+      - label: Später initialisierte Property
+        hint: Die Property bekommt ihren Wert erst in `onCreate()`, ist aber nicht nullable.
+      - label: Container erzeugen
+        hint: Die `Application` ist selbst ein `Context`.
+      - label: Factory-DSL
+        hint: Eine Funktion aus `androidx.lifecycle.viewmodel`, die einen Block mit `initializer` nimmt.
+      - label: Schlüssel für die Application
+        hint: Ein vordefinierter `CreationExtras`-Schlüssel aus `AndroidViewModelFactory`.
+      - label: Abhängigkeit aus dem Container
+        hint: Über die Application zum Container und dort zum Repository.
+      - label: Factory übergeben
+        hint: Die Property im Companion Object.
+    explanation: |
+      Der Container ist ein gewöhnliches Objekt, das die `Application` in `onCreate()` genau einmal erzeugt – damit leben alle Objekte darin so lange wie der Prozess. `lateinit var` mit `private set` erlaubt die späte Zuweisung, ohne dass andere Klassen den Container austauschen können. Die Factory liest die `Application` über `APPLICATION_KEY` aus den `CreationExtras` und reicht nur das Repository an das ViewModel weiter; das ViewModel selbst kennt weder Container noch `Context`. Das ist der Code, den Hilt dir sonst generiert.
+    resources:
+      - title: CreationExtras with APPLICATION_KEY
+        url: https://developer.android.com/topic/libraries/architecture/viewmodel/viewmodel-factories#creationextras_android
+      - title: Managing dependencies with a container
+        url: https://developer.android.com/training/dependency-injection/manual#dependencies-container
+  - id: hilt-annotationen
+    type: gap
+    title: Hilt übernimmt
+    prompt: |
+      Dieselbe Verdrahtung mit Hilt. Ergänze die fehlenden Annotationen und Angaben. Das Repository wird über ein Interface gebunden.
+    lang: kotlin
+    code: |
+      ⟦@HiltAndroidApp⟧
+      class BearApp : Application()
+
+      ⟦@AndroidEntryPoint⟧
+      class MainActivity : ComponentActivity() { /* setContent { … } */ }
+
+      class OfflineFirstThoughtRepository ⟦@Inject constructor⟧(
+          private val dao: ThoughtDao,
+      ) : ThoughtRepository { /* … */ }
+
+      @Module
+      @InstallIn(⟦SingletonComponent::class⟧)
+      abstract class RepositoryModule {
+          ⟦@Binds⟧
+          abstract fun bindThoughtRepository(impl: OfflineFirstThoughtRepository): ThoughtRepository
+      }
+
+      ⟦@HiltViewModel⟧
+      class ThoughtsViewModel @Inject constructor(
+          private val thoughts: ThoughtRepository,
+      ) : ViewModel()
+    gaps:
+      - label: Application
+        hint: Erzeugt den obersten Container der App.
+      - label: Activity
+        hint: Markiert eine Android-Klasse als Einstiegspunkt für Injektion.
+      - label: Konstruktor
+        hint: Sagt Hilt, wie die Klasse gebaut wird – Annotation plus Schlüsselwort.
+      - label: Component
+        hint: Die Component, die so lange lebt wie die Application.
+      - label: Interface-Bindung
+        hint: Abstrakte Funktion, die eine Implementierung an ihr Interface bindet.
+      - label: ViewModel
+        hint: Damit `hiltViewModel()` das ViewModel bauen kann.
+    explanation: |
+      `@HiltAndroidApp` erzeugt die `SingletonComponent`, `@AndroidEntryPoint` erlaubt Injektion in die Activity (und in Compose damit `hiltViewModel()`). `@Inject constructor` beschreibt, wie Hilt `OfflineFirstThoughtRepository` baut; weil das ViewModel aber das *Interface* verlangt, braucht es ein Modul mit `@Binds`. `@Binds` ist abstrakt und erzeugt keinen Aufrufcode – effizienter als ein `@Provides`, das die Implementierung von Hand zurückgibt. Der `ThoughtDao` selbst kommt aus einem `@Provides` in einem Datenbankmodul.
+    resources:
+      - title: Inject interface instances with @Binds
+        url: https://developer.android.com/training/dependency-injection/hilt-android#inject-interfaces
+      - title: Inject ViewModel objects with Hilt
+        url: https://developer.android.com/training/dependency-injection/hilt-jetpack#viewmodels
+  - id: wohin-gehoert-das
+    type: choice
+    title: Wohin gehört das?
+    prompt: |
+      Welche dieser Aufgaben gehören in die **Datenschicht** (Repository oder Data Source)? Mehrere Antworten sind richtig.
+    options:
+      - text: Entscheiden, ob Themen aus Room gelesen oder erst von Linear geladen werden.
+        correct: true
+        why: Quellen auswählen und Konflikte zwischen ihnen lösen ist die Kernaufgabe eines Repositorys.
+      - text: Die JSON-Antwort von Linear (DTO) in das Domain-Modell `Topic` umwandeln.
+        correct: true
+        why: Das Mapping an der Grenze zur Außenwelt gehört in die Datenschicht, damit der Rest der App das API-Format nicht kennt.
+      - text: Aus `createdAt` den Text „vor 3 Minuten“ für die Liste formatieren.
+        correct: false
+        why: Das ist Darstellungslogik; sie hängt von Sprache und Bildschirm ab und gehört ins ViewModel oder die UI.
+      - text: Den aktuellen Inhalt des Eingabefelds halten, während der Nutzer tippt.
+        correct: false
+        why: Flüchtiger Bildschirmzustand gehört in den UI-State (ViewModel oder Composable), nicht in ein Repository.
+      - text: Einen Schreibvorgang für später einplanen, wenn gerade kein Netz da ist.
+        correct: true
+        why: Synchronisation und Wiederholung sind Datenschicht – die UI soll nur sagen „speichere das“, nicht wie und wann gesendet wird.
+    explanation: |
+      Die Datenschicht enthält die Geschäftslogik rund um Daten: woher sie kommen, wie sie gespeichert, abgeglichen und synchronisiert werden. Alles, was nur für die Anzeige existiert – Formatierung, Eingaben, Sichtbarkeit – gehört in die UI-Schicht. Ein guter Test dafür: Würde die Logik unverändert bleiben, wenn die App morgen eine Wear-OS-Oberfläche bekäme? Dann gehört sie nach unten.
+    resources:
+      - title: Data layer
+        url: https://developer.android.com/topic/architecture/data-layer
+  - id: singleton-vergessen
+    type: bug
+    title: Zwei Bildschirme, zwei Entwürfe
+    prompt: |
+      Der Eingabebildschirm und die Vorschau injizieren beide `DraftRepository` in ihre ViewModels. Was der Nutzer im Eingabebildschirm tippt, soll sofort in der Vorschau erscheinen. Die Vorschau bleibt aber leer – jedes ViewModel sieht einen eigenen, leeren Entwurf. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: kotlin
+    code: |
+      class InMemoryDraftRepository : DraftRepository {
+          private val _draft = MutableStateFlow("")
+          override val draft: StateFlow<String> = _draft.asStateFlow()
+          override fun update(text: String) { _draft.value = text }
+      }
+
+      @Module
+      @InstallIn(SingletonComponent::class)
+      object DraftModule {
+          @Provides fun provideDraftRepository(): DraftRepository = InMemoryDraftRepository()
+      }
+    lines: [10]
+    fix:
+      - line: 10
+        answers:
+          - "@Provides @Singleton fun provideDraftRepository(): DraftRepository = InMemoryDraftRepository()"
+          - "@Singleton @Provides fun provideDraftRepository(): DraftRepository = InMemoryDraftRepository()"
+    hints:
+      - Wie oft ruft Hilt `provideDraftRepository()` auf, wenn zwei ViewModels ein `DraftRepository` verlangen?
+      - "`@InstallIn` bestimmt, wo eine Bindung verfügbar ist – nicht, wie viele Instanzen es gibt."
+    explanation: |
+      Ohne Scope-Annotation ruft Hilt die `@Provides`-Funktion bei **jeder** Injektion neu auf. Jedes ViewModel bekommt also ein eigenes `InMemoryDraftRepository` mit eigenem `MutableStateFlow`. Dass das Modul in der `SingletonComponent` installiert ist, ändert daran nichts. Erst `@Singleton` sorgt dafür, dass die Component die Instanz einmal erzeugt und danach wiederverwendet. Scope genau dann, wenn eine Klasse geteilten veränderlichen Zustand hält – wie hier.
+    resources:
+      - title: Component scopes
+        url: https://developer.android.com/training/dependency-injection/hilt-android#component-scopes
+      - title: Hilt Components (Dagger-Doku)
+        url: https://dagger.dev/hilt/components
+  - id: snackbar-kommt-wieder
+    type: bug
+    title: Die Snackbar, die nicht gehen will
+    prompt: |
+      Nach dem Speichern erscheint „Gespeichert“ als Snackbar – wie gewünscht. Dreht der Nutzer danach das Handy oder kehrt er aus einer anderen App zurück, erscheint dieselbe Snackbar erneut, jedes Mal. Die UI zeigt die Meldung in `LaunchedEffect(message)` und ruft danach `viewModel.userMessageShown()` auf. Finde die fehlerhafte Zeile im ViewModel und korrigiere sie.
+    lang: kotlin
+    code: |
+      class CaptureViewModel(private val thoughts: ThoughtRepository) : ViewModel() {
+          private val _uiState = MutableStateFlow(CaptureUiState())
+          val uiState: StateFlow<CaptureUiState> = _uiState.asStateFlow()
+
+          fun onSaveClicked() {
+              val text = _uiState.value.text
+              viewModelScope.launch {
+                  thoughts.capture(text)
+                  _uiState.update { it.copy(text = "", userMessage = "Gespeichert") }
+              }
+          }
+
+          fun userMessageShown() {
+              _uiState.update { it.copy(text = "") }
+          }
+      }
+    lines: [14]
+    fix:
+      - line: 14
+        answers:
+          - "_uiState.update { it.copy(userMessage = null) }"
+          - "_uiState.update { it.copy(text = \"\", userMessage = null) }"
+          - "_uiState.value = _uiState.value.copy(userMessage = null)"
+    hints:
+      - Welcher Wert im Zustand sorgt dafür, dass die UI überhaupt eine Snackbar zeigt?
+    explanation: |
+      Die Meldung ist Teil des Zustands – das ist richtig so. Nach dem Anzeigen muss die UI sie aber *quittieren*, und `userMessageShown()` muss sie dabei auf `null` setzen. Hier setzt die Funktion stattdessen den Text zurück; `userMessage` bleibt „Gespeichert“. Jede neue Komposition (nach einer Drehung, nach der Rückkehr in die App) trifft auf eine Meldung ungleich `null` und startet den `LaunchedEffect` erneut. Mit `userMessage = null` erscheint die Snackbar genau einmal.
+    resources:
+      - title: Consuming events can trigger state updates
+        url: https://developer.android.com/topic/architecture/ui-layer/events#consuming-trigger-updates
+  - id: bear-appcontainer-erklaeren
+    type: explain
+    title: Bears AppContainer im Code-Review
+    prompt: |
+      Das ist ein gekürzter Ausschnitt aus Bear. Erkläre wie im Code-Review: Welche Architekturidee steckt dahinter, wie lange leben die Objekte, was spricht für diese Lösung und wo liegen ihre Grenzen im Vergleich zu Hilt?
+    lang: kotlin
+    code: |
+      /** Hand-wired dependencies. The app is small enough not to need a DI framework. */
+      class AppContainer(context: Context) {
+          val appContext: Context = context.applicationContext
+          val db = BearDatabase.create(context)
+          val settings = SettingsStore(context)
+          val linear = LinearClient()
+          val edits = EditQueue(context, db)
+          val thoughts = ThoughtRepository(context, db, edits)
+          val topics = TopicRepository(db, settings, linear, edits)
+
+          suspend fun connectLinear(key: String): String {
+              val name = linear.viewerName(key)
+              settings.saveConnection(key, name)
+              thoughts.resendPending()
+              edits.enqueueAll()
+              return name
+          }
+      }
+
+      class BearApp : Application() {
+          lateinit var container: AppContainer
+              private set
+
+          override fun onCreate() {
+              super.onCreate()
+              container = AppContainer(this)
+          }
+      }
+
+      // in SendThoughtWorker.doWork():
+      val c = (applicationContext as BearApp).container
+    points:
+      - Manuelle Dependency Injection – der Container baut jede Abhängigkeit genau einmal und reicht sie über Konstruktoren weiter (etwa `db` und `edits` an `TopicRepository`).
+      - Die Objekte leben so lange wie der Prozess, weil die `Application` den Container in `onCreate()` erzeugt – faktisch Singletons ohne Framework; der Application-Context verhindert Activity-Leaks.
+      - "Vorteile: kein Codegenerator, keine Annotationen, jede Verdrahtung ist gewöhnlicher Kotlin-Code, den der Compiler prüft; für eine kleine App angemessen."
+      - "Grenzen: Scopes und Lebensdauern verwaltest du selbst, und Worker holen sich den Container per Cast (Service Locator) – ihre Abhängigkeiten stehen nicht im Konstruktor und sind schwerer zu ersetzen."
+      - "`connectLinear` orchestriert mehrere Repositories – das ist ein Use Case, der in einer größeren App eine eigene Klasse in der Domain-Schicht wäre."
+    explanation: |
+      Der `AppContainer` ist manuelle Dependency Injection: Er erzeugt Datenbank, Einstellungen, HTTP-Client und Repositories einmal und übergibt sie über Konstruktoren – `TopicRepository` baut sich nichts selbst und lässt sich deshalb mit Fakes testen. Weil `BearApp.onCreate()` den Container erzeugt, leben alle Objekte so lange wie der Prozess; mit dem Application-Context hält keins davon eine Activity fest. Für eine App dieser Größe ist das angemessen: kein Codegenerator, kein Build-Overhead, alles ist lesbarer Kotlin-Code. Die Grenzen zeigen sich an zwei Stellen. Erstens verwaltet niemand Scopes für dich – bräuchte ein Bildschirmfluss eigene, kurzlebige Objekte, müsstest du Unter-Container selbst anlegen und aufräumen. Zweitens holen sich Worker den Container per Cast; das ist ein Service Locator, bei dem Abhängigkeiten versteckt sind. Hilt würde beides lösen (`@HiltWorker`, Scopes) und die Verdrahtung zur Compile-Zeit prüfen. `connectLinear` schließlich verbindet Einstellungen, Gedanken und Änderungen – ein klassischer Use Case, der mit wachsender App aus dem Container in die Domain-Schicht wandern sollte.
+    resources:
+      - title: Manual dependency injection · Conclusion
+        url: https://developer.android.com/training/dependency-injection/manual#conclusion
+      - title: Inject WorkManager with Hilt
+        url: https://developer.android.com/training/dependency-injection/hilt-jetpack#workmanager
+  - id: suche-erklaeren
+    type: explain
+    title: Eine Suche, die Drehung und Prozesstod übersteht
+    prompt: |
+      Erkläre, was dieses ViewModel tut und warum es so gebaut ist. Gehe auf `SavedStateHandle`, `flatMapLatest` und die Start-Strategie von `stateIn` ein. Was passiert bei einer Drehung, was nach dem Prozesstod?
+    lang: kotlin
+    code: |
+      @OptIn(ExperimentalCoroutinesApi::class, FlowPreview::class)
+      @HiltViewModel
+      class TopicSearchViewModel @Inject constructor(
+          private val savedStateHandle: SavedStateHandle,
+          private val topics: TopicRepository,
+      ) : ViewModel() {
+
+          val query: StateFlow<String> = savedStateHandle.getStateFlow(QUERY_KEY, "")
+
+          val results: StateFlow<List<Topic>> = query
+              .debounce(300)
+              .flatMapLatest { q -> topics.search(q) }
+              .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+          fun onQueryChange(value: String) {
+              savedStateHandle[QUERY_KEY] = value
+          }
+
+          private companion object {
+              const val QUERY_KEY = "query"
+          }
+      }
+    points:
+      - Der Suchbegriff liegt in `SavedStateHandle`; `getStateFlow` macht ihn beobachtbar, und er überlebt Drehung und Prozesstod.
+      - "`onQueryChange` schreibt nur in `SavedStateHandle` – die Suche folgt daraus automatisch (UDF, eine Quelle für den Begriff)."
+      - "`debounce(300)` wartet, bis der Nutzer kurz aufhört zu tippen; `flatMapLatest` bricht die alte Suche ab, sobald ein neuer Begriff kommt."
+      - "`WhileSubscribed(5_000)` hält die Suche bei einer Drehung am Leben und stoppt sie im Hintergrund; `emptyList()` ist der Anfangswert."
+      - Nach dem Prozesstod entsteht ein neues ViewModel; der Begriff kommt aus dem gespeicherten Zustand zurück und die Ergebnisse werden neu berechnet.
+    explanation: |
+      Das ViewModel hat genau eine Quelle für den Suchbegriff: `SavedStateHandle`. `getStateFlow` liefert ihn als `StateFlow`, und `onQueryChange` schreibt nur dorthin – der Rest folgt daraus. `debounce(300)` verhindert, dass jeder Tastendruck eine Abfrage startet, und `flatMapLatest` bricht die laufende Suche ab, sobald ein neuer Begriff eintrifft, damit keine veraltete Antwort eine neuere überschreibt. `stateIn` mit `WhileSubscribed(5_000)` macht aus der Kette einen `StateFlow`, der bei einer Drehung weiterläuft (die neue UI sammelt innerhalb der fünf Sekunden wieder) und im Hintergrund stoppt. Bei einer Drehung bleibt das ViewModel samt Ergebnissen erhalten. Nach dem Prozesstod entsteht ein neues ViewModel; der Begriff kommt aus `SavedStateHandle` zurück, und die Ergebnisse werden aus dem Repository neu berechnet – gespeichert wird nur der kleine Wert, nicht die Liste. Die Opt-in-Annotation ist nötig, weil `debounce` und `flatMapLatest` als Preview- bzw. experimentelle API markiert sind.
+    resources:
+      - title: SavedStateHandle · StateFlow
+        url: https://developer.android.com/topic/libraries/architecture/viewmodel/viewmodel-savedstate#savedstate-stateflow
+      - title: flatMapLatest (API-Referenz)
+        url: https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines.flow/flat-map-latest.html
+  - id: capture-viewmodel-bauen
+    type: practice
+    title: Das Capture-ViewModel
+    prompt: |
+      Schreibe das ViewModel für Bears Eingabebildschirm. Gegeben ist:
+
+      ```kotlin
+      interface ThoughtRepository {
+          suspend fun capture(text: String)
+      }
+      ```
+
+      Anforderungen:
+
+      - Der Zustand `CaptureUiState` enthält den Eingabetext, ob gerade gespeichert wird, und eine optionale Meldung für eine Snackbar.
+      - `onTextChange(text)` aktualisiert den Text.
+      - `onSaveClicked()` ignoriert leeren oder nur aus Leerzeichen bestehenden Text und setzt dann die Meldung „Leerer Gedanke – nichts gespeichert“.
+      - Ein zweiter Tipp, während noch gespeichert wird, startet keinen zweiten Speichervorgang.
+      - Nach dem Speichern ist das Feld leer und die Meldung lautet „Gespeichert“.
+      - Die UI quittiert Meldungen mit `userMessageShown()`.
+      - Das ViewModel bekommt sein Repository über den Konstruktor und kennt keinen `Context`.
+
+      Schreibe zusätzlich eine `Factory` für die manuelle DI mit `AppContainer`, wie in der Lektion.
+    lang: kotlin
+    starter: |
+      data class CaptureUiState(
+          // Felder
+      )
+
+      class CaptureViewModel(
+          private val thoughts: ThoughtRepository,
+      ) : ViewModel() {
+          // Zustand, onTextChange, onSaveClicked, userMessageShown, Factory
+      }
+    solution: |
+      import androidx.lifecycle.ViewModel
+      import androidx.lifecycle.ViewModelProvider
+      import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.APPLICATION_KEY
+      import androidx.lifecycle.viewModelScope
+      import androidx.lifecycle.viewmodel.initializer
+      import androidx.lifecycle.viewmodel.viewModelFactory
+      import kotlinx.coroutines.flow.MutableStateFlow
+      import kotlinx.coroutines.flow.StateFlow
+      import kotlinx.coroutines.flow.asStateFlow
+      import kotlinx.coroutines.flow.update
+      import kotlinx.coroutines.launch
+
+      data class CaptureUiState(
+          val text: String = "",
+          val isSaving: Boolean = false,
+          val userMessage: String? = null,
+      )
+
+      class CaptureViewModel(
+          private val thoughts: ThoughtRepository,
+      ) : ViewModel() {
+
+          private val _uiState = MutableStateFlow(CaptureUiState())
+          val uiState: StateFlow<CaptureUiState> = _uiState.asStateFlow()
+
+          fun onTextChange(text: String) {
+              _uiState.update { it.copy(text = text) }
+          }
+
+          fun onSaveClicked() {
+              val current = _uiState.value
+              if (current.isSaving) return
+              val text = current.text.trim()
+              if (text.isEmpty()) {
+                  _uiState.update { it.copy(userMessage = "Leerer Gedanke – nichts gespeichert") }
+                  return
+              }
+              _uiState.update { it.copy(isSaving = true) }
+              viewModelScope.launch {
+                  try {
+                      thoughts.capture(text)
+                      _uiState.update { it.copy(text = "", userMessage = "Gespeichert") }
+                  } finally {
+                      _uiState.update { it.copy(isSaving = false) }
+                  }
+              }
+          }
+
+          fun userMessageShown() {
+              _uiState.update { it.copy(userMessage = null) }
+          }
+
+          companion object {
+              val Factory: ViewModelProvider.Factory = viewModelFactory {
+                  initializer {
+                      val app = this[APPLICATION_KEY] as BearApp
+                      CaptureViewModel(app.container.thoughts)
+                  }
+              }
+          }
+      }
+    checklist:
+      - "`CaptureUiState` ist eine Data Class mit `val`-Feldern und Standardwerten."
+      - Der `MutableStateFlow` ist privat; nach außen gibt es nur einen `StateFlow` über `asStateFlow()`.
+      - Alle Änderungen laufen über `update { it.copy(...) }`, nicht über veränderliche Felder.
+      - "`onSaveClicked()` kehrt sofort zurück, wenn `isSaving` wahr ist, und setzt `isSaving` noch vor dem `launch`."
+      - Leerer Text führt zu einer Meldung statt zu einem Aufruf von `capture`.
+      - "`isSaving` wird auch dann zurückgesetzt, wenn `capture` eine Exception wirft (`finally`)."
+      - "`userMessageShown()` setzt `userMessage` auf `null`."
+      - Das ViewModel kennt weder `Context` noch `AppContainer`; nur die Factory greift auf den Container zu.
+    explanation: |
+      Der Kern ist UDF im Kleinen: Die UI ruft Funktionen auf, das ViewModel ändert seinen privaten Zustand, die UI sammelt den öffentlichen `StateFlow`. `isSaving` wird *vor* dem `launch` gesetzt; so sieht ein schneller zweiter Tipp den Wert schon, weil beide Aufrufe auf dem Main-Thread laufen. Das `finally` stellt sicher, dass der Button nicht dauerhaft gesperrt bleibt, wenn das Speichern fehlschlägt – in einer echten App würdest du die Exception zusätzlich fangen und eine Fehlermeldung in den Zustand schreiben. Die Factory ist die einzige Stelle, die den Container kennt; im Test übergibst du dem Konstruktor einen `FakeThoughtRepository`, wie im Modul „Testing“ gezeigt.
+    resources:
+      - title: Expose UI state
+        url: https://developer.android.com/topic/architecture/ui-layer#expose-ui-state
+      - title: ViewModel factories
+        url: https://developer.android.com/topic/libraries/architecture/viewmodel/viewmodel-factories

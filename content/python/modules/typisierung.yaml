@@ -1,0 +1,958 @@
+id: typisierung
+title: Typisierung mit Type Hints
+level: 2
+minutes: 150
+summary: Type Hints, Generics mit der Syntax ab 3.12, Protocols und Narrowing – und wie du mypy-Meldungen liest, bevor der Bug in Produktion geht.
+goals:
+  - Du erklärst, was Type Hints zur Laufzeit bewirken (fast nichts) und wofür Typechecker sie nutzen.
+  - Du annotierst Funktionen mit eingebauten Generics, `X | None`, `Literal`, `TypedDict`, `Callable` und abstrakten Typen aus `collections.abc`.
+  - Du schreibst generische Funktionen und Klassen mit der Syntax ab Python 3.12 und Typ-Aliase mit `type`.
+  - Du unterscheidest `Protocol` von ABCs und `Any` von `object` und begründest die Wahl.
+  - Du liest mypy-Meldungen, behebst sie durch Narrowing statt `# type: ignore` und führst Typisierung schrittweise in bestehenden Code ein.
+resources:
+  - title: typing – Support for type hints
+    url: https://docs.python.org/3/library/typing.html
+  - title: Python Typing Documentation (Spezifikation und Guides)
+    url: https://typing.python.org/en/latest/
+  - title: mypy · Type hints cheat sheet
+    url: https://mypy.readthedocs.io/en/stable/cheat_sheet_py3.html
+  - title: PEP 695 – Type Parameter Syntax
+    url: https://peps.python.org/pep-0695/
+  - title: mypy · Using mypy with an existing codebase
+    url: https://mypy.readthedocs.io/en/stable/existing_code.html
+lesson: |
+  Freitagabend, der Export-Job bricht ab: `TypeError: can't multiply sequence by non-int of type 'float'`. Die Ursache steht drei Module entfernt. Eine Funktion liest Preise aus einer CSV-Datei und gibt sie als Strings weiter, `netto * 1.19` scheitert erst beim Rechnen. In TypeScript hätte der Compiler das beim Speichern angestrichen. In Python übernimmt diese Aufgabe ein **Typechecker** wie mypy oder pyright – wenn der Code Type Hints trägt.
+
+  Type Hints sind in Python optional. Genau das macht sie im Job so wichtig zu verstehen: Du triffst auf Codebasen, die komplett typisiert sind, auf halb typisierte und auf solche ganz ohne. Diese Lektion zeigt, was Hints sind, wie du sie schreibst, wie du Fehlermeldungen liest und wie du Typisierung in bestehenden Code bringst.
+
+  ## Was Type Hints sind – und was nicht
+
+  Ein Type Hint ist eine **Annotation**: ein Ausdruck hinter `:` oder `->`, den Python speichert, aber nicht prüft. Die [typing-Dokumentation](https://docs.python.org/3/library/typing.html) sagt es im ersten Absatz deutlich: Die Laufzeit erzwingt keine Annotationen. Werkzeuge wie Typechecker, IDEs und Linter werten sie aus.
+
+  ```python run
+  def netto(brutto: float, steuersatz: float = 0.19) -> float:
+      return brutto / (1 + steuersatz)
+
+  print(netto(119))                    # int statt float: für Python kein Problem
+  print(netto.__annotations__)
+
+  def verdopple(x: int) -> int:
+      return x * 2
+
+  print(verdopple("ab"))               # läuft: "abab" – der Hint wird nicht geprüft
+  ```
+
+  Das Denkmodell: Python-Code läuft in zwei Welten. Zur **Laufzeit** zählt, welche Objekte tatsächlich da sind (Duck Typing). **Vor** der Laufzeit liest ein Typechecker den Quelltext, leitet Typen ab und meldet Widersprüche. Die Hints sind der Vertrag, den der Checker prüft. Sie kosten zur Laufzeit fast nichts. Seit Python 3.14 wertet Python Annotationen sogar erst aus, wenn jemand sie abfragt ([PEP 649](https://peps.python.org/pep-0649/) und [PEP 749](https://peps.python.org/pep-0749/)); Vorwärtsverweise auf Klassen, die erst später im Modul definiert sind, brauchen deshalb keine Anführungszeichen mehr. Das Modul [`annotationlib`](https://docs.python.org/3/library/annotationlib.html) liest Annotationen bei Bedarf aus.
+
+  Warum sich der Aufwand lohnt:
+
+  - **Fehler früher finden.** `None`-Zugriffe, vertauschte Argumente, vergessene Rückgabewerte fallen im Editor oder in der CI auf, nicht nachts im Betrieb.
+  - **Dokumentation, die nicht veraltet.** `def finde(email: str) -> Nutzer | None` sagt mehr als ein Docstring, und der Checker merkt, wenn sie nicht mehr stimmt.
+  - **Werkzeuge.** Autovervollständigung, sicheres Umbenennen und Refactoring in der IDE hängen an Typinformationen. Bibliotheken wie FastAPI und pydantic lesen Annotationen zur Laufzeit aus und bauen daraus Validierung.
+
+  ## Grundlagen: Funktionen, Container, None
+
+  Seit Python 3.9 kannst du die eingebauten Container direkt parametrisieren ([PEP 585](https://peps.python.org/pep-0585/)), seit 3.10 schreibst du Vereinigungen mit `|` ([PEP 604](https://peps.python.org/pep-0604/)). `List`, `Dict` und `Optional` aus `typing` brauchst du in neuem Code nicht mehr.
+
+  ```python
+  from collections.abc import Callable, Iterable, Mapping, Sequence
+
+  ports: list[int] = [80, 443]
+  header: dict[str, str] = {"Accept": "application/json"}
+  punkt: tuple[float, float] = (52.5, 13.4)       # genau zwei Elemente
+  ids: tuple[int, ...] = (1, 2, 3)                # beliebig viele ints
+
+  def finde_nutzer(email: str) -> Nutzer | None: ...          # kann None liefern
+  def verbinde(host: str, timeout: float | None = None) -> None: ...
+  def summe(preise: Iterable[float]) -> float: ...            # nimmt Liste, Tupel, Generator
+  def rendere(werte: Mapping[str, str]) -> str: ...
+  def wiederhole(aktion: Callable[[], None], mal: int) -> None: ...
+  ```
+
+  Zwei Faustregeln aus der Praxis:
+
+  - **Parameter breit, Rückgaben konkret.** Eine Funktion, die nur iteriert, nimmt `Iterable[float]` statt `list[float]` – dann passen auch Tupel und Generatoren. Die abstrakten Typen stehen in [`collections.abc`](https://docs.python.org/3/library/collections.abc.html). Zurückgegeben wird der konkrete Typ, damit Aufrufer alle Methoden nutzen können.
+  - **`list` ist invariant.** Eine `list[Hund]` ist für den Checker **keine** `list[Tier]`, obwohl `Hund` von `Tier` erbt. Sonst könnte die Funktion eine `Katze` in die Hundeliste hängen. Nur lesende Typen wie `Sequence` und `Iterable` sind kovariant. Die [mypy-Doku zu Varianz](https://mypy.readthedocs.io/en/stable/common_issues.html#variance) erklärt das an Beispielen.
+
+  ### `Any` oder `object`?
+
+  Beide passen auf jeden Wert, bedeuten aber das Gegenteil. [`Any`](https://docs.python.org/3/library/typing.html#typing.Any) schaltet die Prüfung ab: Alles ist erlaubt, und jedes Ergebnis ist wieder `Any`. `object` ist der allgemeinste echte Typ: Der Checker erlaubt nur, was jedes Objekt kann, und verlangt, dass du den Typ vorher eingrenzt.
+
+  ```python
+  def logge(wert: object) -> None:
+      print(wert.upper())      # mypy: "object" has no attribute "upper"  [attr-defined]
+
+  def logge_any(wert: Any) -> None:
+      print(wert.upper())      # mypy: kein Fehler – und zur Laufzeit AttributeError bei int
+  ```
+
+  `Any` ist ansteckend. `json.loads` gibt `Any` zurück; alles, was du daraus liest, ist ungeprüft, bis du es validierst. Nimm `object` für „irgendein Wert“, `Any` nur als bewusste Lücke.
+
+  ## Strukturierte Daten: Literal, TypedDict, Final
+
+  [`Literal`](https://docs.python.org/3/library/typing.html#typing.Literal) beschränkt einen Wert auf feste Konstanten – typisch für Modi, Status und Log-Level. [`TypedDict`](https://docs.python.org/3/library/typing.html#typing.TypedDict) beschreibt Dictionaries mit festen Schlüsseln, etwa JSON aus einer API. [`Final`](https://docs.python.org/3/library/typing.html#typing.Final) markiert Namen, die nicht neu zugewiesen werden dürfen.
+
+  ```python run
+  from typing import Final, Literal, NotRequired, TypedDict
+
+  type Status = Literal["offen", "bezahlt", "storniert"]   # Typ-Alias, seit 3.12
+
+  class Bestellung(TypedDict):
+      id: int
+      status: Status
+      gutschein: NotRequired[str]          # Schlüssel darf fehlen
+
+  MAX_POSITIONEN: Final = 100
+
+  def ist_abgeschlossen(b: Bestellung) -> bool:
+      return b["status"] in ("bezahlt", "storniert")
+
+  b: Bestellung = {"id": 7, "status": "offen"}
+  print(ist_abgeschlossen(b), type(b).__name__)
+  ```
+
+  Beachte `type(b).__name__`: Zur Laufzeit ist ein `TypedDict` ein gewöhnliches `dict`. Der Checker prüft Schlüssel und Werttypen, Python prüft nichts. Für Daten von außen (HTTP-Requests, Dateien) brauchst du deshalb zusätzlich eine Validierung zur Laufzeit – dazu am Ende mehr.
+
+  ## Protocol oder ABC: strukturelle und nominale Typen
+
+  Eine [abstrakte Basisklasse](https://docs.python.org/3/library/abc.html) (ABC) ist **nominal**: Eine Klasse erfüllt sie nur, wenn sie davon erbt (oder registriert ist). Ein [`Protocol`](https://docs.python.org/3/library/typing.html#typing.Protocol) ist **strukturell** ([PEP 544](https://peps.python.org/pep-0544/)): Jede Klasse, die die geforderten Methoden mit passenden Signaturen hat, erfüllt es – ohne Vererbung. Das ist Duck Typing, geprüft vom Checker. TypeScript-Interfaces funktionieren genauso.
+
+  ```python run
+  from typing import Protocol
+
+  class Speicher(Protocol):
+      def schreibe(self, schluessel: str, daten: bytes) -> None: ...
+
+  class S3Speicher:                                    # erbt von nichts
+      def schreibe(self, schluessel: str, daten: bytes) -> None:
+          print(f"PUT s3://backups/{schluessel} ({len(daten)} Bytes)")
+
+  class TestSpeicher:
+      def __init__(self) -> None:
+          self.inhalt: dict[str, bytes] = {}
+      def schreibe(self, schluessel: str, daten: bytes) -> None:
+          self.inhalt[schluessel] = daten
+
+  def sichere_backup(ziel: Speicher, daten: bytes) -> None:
+      ziel.schreibe("backup-2026-09-28.tar", daten)
+
+  sichere_backup(S3Speicher(), b"...")
+  fake = TestSpeicher()
+  sichere_backup(fake, b"abc")
+  print(fake.inhalt)
+  ```
+
+  Hätte `TestSpeicher.schreibe` den Parameter `daten: str`, meldet mypy den Aufruf und listet unter „Following member(s) have conflicts“ erwartete und tatsächliche Signatur auf. Wann was?
+
+  | | `Protocol` | ABC |
+  | --- | --- | --- |
+  | Zugehörigkeit | Struktur (passende Methoden) | Vererbung |
+  | Geprüft von | Typechecker | Laufzeit: Instanziieren ohne alle `@abstractmethod`s scheitert |
+  | Geteilter Code | nein (nur Schnittstelle) | ja, konkrete Methoden in der Basisklasse |
+  | Typischer Einsatz | Schnittstellen für fremde Klassen, Test-Fakes | Framework-Basisklassen mit Grundverhalten |
+
+  `@runtime_checkable` erlaubt `isinstance` gegen ein Protocol, prüft dann aber nur, ob die Methoden **existieren**, nicht ihre Signaturen.
+
+  > [!INTERVIEW] „Was ist der Unterschied zwischen einem Protocol und einer ABC?“
+  > Kernsatz: Ein Protocol ist strukturell, eine ABC nominal. Dann das Beispiel: Ein `Speicher`-Protocol erfüllt jede Klasse mit passender `schreibe`-Methode, auch eine aus einer fremden Bibliothek oder ein Test-Fake – ohne Import und Vererbung. Eine ABC verlangt Vererbung, bringt dafür gemeinsame Implementierung mit und erzwingt abstrakte Methoden zur Laufzeit. Wer noch erwähnt, dass `Iterable` und `Sized` aus `collections.abc` für den Checker wie Protocols wirken, zeigt Tiefe.
+
+  ## Generics mit der Syntax ab Python 3.12
+
+  Eine Funktion, die das erste Element einer Folge liefert, soll für `list[str]` einen `str` zurückgeben und für `list[int]` einen `int`. Mit `Any` ginge die Information verloren. Eine **Typvariable** verbindet Eingabe und Ausgabe. Seit Python 3.12 deklarierst du sie in eckigen Klammern direkt hinter dem Namen ([PEP 695](https://peps.python.org/pep-0695/), [Sprachreferenz](https://docs.python.org/3/reference/compound_stmts.html#type-params)):
+
+  ```python run
+  from collections.abc import Callable, Hashable, Iterable, Sequence
+
+  def erstes[T](werte: Sequence[T]) -> T:
+      return werte[0]
+
+  def gruppiere[K: Hashable, V](elemente: Iterable[V], schluessel: Callable[[V], K]) -> dict[K, list[V]]:
+      gruppen: dict[K, list[V]] = {}
+      for element in elemente:
+          gruppen.setdefault(schluessel(element), []).append(element)
+      return gruppen
+
+  class Stapel[T]:
+      def __init__(self) -> None:
+          self._elemente: list[T] = []
+
+      def push(self, element: T) -> None:
+          self._elemente.append(element)
+
+      def pop(self) -> T:
+          return self._elemente.pop()
+
+  type Json = dict[str, Json] | list[Json] | str | int | float | bool | None
+
+  print(erstes(["api", "worker"]))
+  print(gruppiere(["GET /a", "POST /b", "GET /c"], lambda zeile: zeile.split()[0]))
+  s = Stapel[int]()
+  s.push(3)
+  print(s.pop(), Stapel.__type_params__, Json.__value__)
+  ```
+
+  `K: Hashable` ist eine **Schranke** (Bound): `K` darf jeder Typ sein, der `Hashable` erfüllt. `[T: (str, bytes)]` wäre eine **Einschränkung** (Constraint): genau `str` oder genau `bytes`. Die [`type`-Anweisung](https://docs.python.org/3/reference/simple_stmts.html#the-type-statement) erzeugt Typ-Aliase, die sich auf sich selbst beziehen dürfen – wie `Json` oben.
+
+  Älteren Code (vor 3.12) erkennst du an explizit erzeugten Typvariablen:
+
+  ```python
+  from typing import Generic, TypeVar
+
+  T = TypeVar("T")
+
+  def erstes(werte: Sequence[T]) -> T: ...
+
+  class Stapel(Generic[T]): ...
+  ```
+
+  Beide Schreibweisen bedeuten dasselbe; in neuem Code nimmst du die kurze. Zwei verwandte Helfer: [`Self`](https://docs.python.org/3/library/typing.html#typing.Self) (seit 3.11) als Rückgabetyp von Methoden, die `self` oder eine Instanz derselben Klasse liefern – etwa bei Builder-APIs mit `return self`. Und [`@overload`](https://docs.python.org/3/library/typing.html#typing.overload), wenn der Rückgabetyp vom Argument abhängt (`lade(pfad, als_text=True)` liefert `str`, sonst `bytes`). Die [Spezifikation zu Generics](https://typing.python.org/en/latest/spec/generics.html) beschreibt die Regeln vollständig.
+
+  ## Narrowing: Typen eingrenzen
+
+  Bei `Nutzer | None` erlaubt der Checker `nutzer.email` erst, wenn du `None` ausgeschlossen hast. Er folgt dem Kontrollfluss und **grenzt den Typ ein** (Narrowing): nach `if nutzer is None: return`, nach `isinstance(x, str)`, nach `if not werte:`.
+
+  ```python
+  def email_von(nutzer_id: int) -> str:
+      nutzer = finde(nutzer_id)          # Nutzer | None
+      if nutzer is None:
+          raise LookupError(f"Nutzer {nutzer_id} unbekannt")
+      return nutzer.email                # hier: Nutzer
+  ```
+
+  Für eigene Prüffunktionen gibt es [`TypeIs`](https://docs.python.org/3/library/typing.html#typing.TypeIs) (seit 3.13, [PEP 742](https://peps.python.org/pep-0742/)): `def ist_str(x: object) -> TypeIs[str]` sagt dem Checker, dass nach `if ist_str(x):` ein `str` vorliegt – und im `else`-Zweig keiner. Das ältere [`TypeGuard`](https://docs.python.org/3/library/typing.html#typing.TypeGuard) grenzt nur im `if`-Zweig ein; nimm es, wenn der geprüfte Typ kein Untertyp der Eingabe ist (etwa `list[object]` → `list[str]`). Mit [`assert_never`](https://docs.python.org/3/library/typing.html#typing.assert_never) im letzten `case` meldet der Checker, wenn ein `match` einen `Literal`-Wert vergisst. Der [Narrowing-Guide](https://typing.python.org/en/latest/guides/type_narrowing.html) zeigt alle Formen.
+
+  ## mypy und pyright im Alltag
+
+  [mypy](https://mypy.readthedocs.io/en/stable/getting_started.html) ist der Referenz-Checker, [pyright](https://microsoft.github.io/pyright/) steckt in VS Code (Pylance) und ist schneller. Beide lesen dieselben Hints. Eine typische mypy-Ausgabe:
+
+  ```console
+  $ uv run mypy src/
+  src/shop/nutzer.py:35: error: Item "None" of "Nutzer | None" has no attribute "email"  [union-attr]
+  src/shop/export.py:19: error: Argument 1 to "registriere" has incompatible type "list[Hund]"; expected "list[Tier]"  [arg-type]
+  src/shop/export.py:19: note: "list" is invariant -- see https://mypy.readthedocs.io/en/stable/common_issues.html#variance
+  src/shop/export.py:19: note: Consider using "Sequence" instead, which is covariant
+  src/shop/netz.py:22: error: Incompatible default for parameter "timeout" (default has type "None", parameter has type "float")  [assignment]
+  Found 3 errors in 3 files (checked 14 source files)
+  ```
+
+  Lies jede Zeile als `Datei:Zeile: Schwere: Meldung [Fehlercode]`. Die `note`-Zeilen gehören zum Fehler darüber und enthalten oft schon die Lösung. Der Fehlercode in eckigen Klammern ist der Schlüssel zur [Liste der Fehlercodes](https://mypy.readthedocs.io/en/stable/error_code_list.html) und zum gezielten Unterdrücken: `# type: ignore[union-attr]` statt eines pauschalen `# type: ignore`. Wenn du nicht weißt, welchen Typ mypy an einer Stelle sieht, schreib `reveal_type(ausdruck)` hin und lass mypy laufen.
+
+  Eine wichtige Voreinstellung: mypy prüft den **Rumpf** von Funktionen ohne Annotationen standardmäßig nicht. Unannotierter Code „besteht“ also, ohne geprüft zu sein. Mit `strict = true` meldet mypy fehlende Annotationen und `Any`, das aus einer Funktion zurückfließt.
+
+  ### Typisierung schrittweise einführen
+
+  In einer bestehenden Codebasis schaltest du nicht über Nacht `strict` ein. Bewährt hat sich die Reihenfolge aus der [mypy-Doku](https://mypy.readthedocs.io/en/stable/existing_code.html):
+
+  1. mypy in der CI mit der Grundkonfiguration laufen lassen, bis es grün ist.
+  2. Neue und geänderte Module vollständig annotieren; zuerst die Kernmodule, die viele andere importieren.
+  3. Strengere Optionen pro Modul einschalten und Altlasten ausnehmen.
+  4. Fehlende Stubs für Bibliotheken installieren (etwa `types-requests`) statt Imports zu ignorieren.
+
+  ```toml title=pyproject.toml
+  [tool.mypy]
+  python_version = "3.14"
+  strict = true
+
+  [[tool.mypy.overrides]]
+  module = ["shop.legacy.*"]
+  ignore_errors = true            # Altlast: wird Modul für Modul abgebaut
+  ```
+
+  > [!PRAXIS] Typen an der Systemgrenze
+  > Type Hints schützen nur, was der Checker sieht. Daten aus HTTP-Requests, Dateien und Umgebungsvariablen sind zur Laufzeit beliebig. Deshalb validieren Teams sie an der Grenze – meist mit [pydantic](https://docs.pydantic.dev/latest/concepts/models/): Eine Klasse `class Bestellung(BaseModel)` mit annotierten Feldern prüft und konvertiert Eingaben zur Laufzeit und wirft einen `ValidationError` mit genauen Feldangaben. FastAPI nutzt genau das für Request-Bodies. Ab der Grenze ist der Code typsicher, dahinter übernimmt mypy. Im Code-Review fallen typische Schwächen auf: `Any` als Ausweg, `# type: ignore` ohne Fehlercode und `cast(...)` ohne Begründung.
+
+  ## Häufige Fehler
+
+  - **Implizites Optional.** `def f(timeout: float = None)` ist ein Fehler: `None` ist kein `float`. Richtig ist `float | None = None`.
+  - **`list[Unterklasse]` an `list[Basisklasse]` übergeben.** Listen sind invariant. Nimmt die Funktion nur zum Lesen, annotiere `Sequence[...]` oder `Iterable[...]`.
+  - **`Any` statt `object`.** `Any` schaltet die Prüfung ab und breitet sich aus; `object` erzwingt Narrowing.
+  - **Hints für Laufzeitprüfung halten.** `isinstance(x, list[int])` wirft `TypeError`, und ein `TypedDict` prüft nichts. Laufzeitvalidierung ist eine eigene Aufgabe.
+  - **`# type: ignore` als Reflex.** Meist fehlt eine `None`-Prüfung oder ein genauerer Typ. Wenn Ignorieren nötig ist, dann mit Fehlercode und Kommentar.
+  - **Grüne CI trotz ungeprüftem Code.** Ohne Annotationen prüft mypy Funktionsrümpfe nicht; ohne `strict` bleibt ein `Any` aus `json.loads` unbemerkt.
+
+  > [!MERKE]
+  > Type Hints sind ein Vertrag für Werkzeuge, nicht für die Laufzeit. Den Vertrag prüft der Checker; Daten von außen prüfst du selbst.
+
+  ## Zusammenfassung
+
+  - Python speichert Annotationen, prüft sie aber nicht; seit 3.14 wertet es sie erst bei Bedarf aus.
+  - Eingebaute Generics (`list[int]`, `dict[str, int]`), `X | None` und abstrakte Typen aus `collections.abc` für Parameter.
+  - `Any` schaltet Prüfungen ab, `object` verlangt Narrowing.
+  - `Literal`, `TypedDict` und `Final` beschreiben Konstanten, JSON-artige Dictionaries und unveränderliche Namen.
+  - `Protocol` ist strukturell (passende Methoden reichen), eine ABC nominal (Vererbung).
+  - Generics ab 3.12: `def f[T](...)`, `class C[T]`, `type Alias = ...`; `TypeVar` in älterem Code.
+  - Narrowing mit `is None`, `isinstance`, `TypeIs`; `assert_never` für vollständige Fallunterscheidungen.
+  - mypy-Meldungen lesen: Zeile, Meldung, Fehlercode, Notes. Schrittweise typisieren, Grenzen zur Laufzeit validieren.
+exercises:
+  - id: laufzeit-und-hints
+    type: choice
+    title: Was prüft Python wirklich?
+    prompt: |
+      Ein Kollege ruft `netto("119", 0.19)` auf. Welche Aussagen stimmen?
+    lang: python
+    code: |
+      def netto(brutto: float, steuersatz: float) -> float:
+          return brutto / (1 + steuersatz)
+    options:
+      - text: Python prüft die Hints beim Aufruf nicht. Der Fehler entsteht erst bei der Division, als `TypeError` über `str` und `float`.
+        correct: true
+        why: Die Laufzeit erzwingt keine Annotationen. Erst `"119" / 1.19` scheitert.
+      - text: mypy meldet den Aufruf, ohne das Programm auszuführen.
+        correct: true
+        why: "mypy liest den Quelltext und meldet `Argument 1 to \"netto\" has incompatible type \"str\"; expected \"float\"  [arg-type]`."
+      - text: Python 3.14 wertet Annotationen bei jedem Aufruf aus und wirft sofort einen `TypeError`.
+        correct: false
+        why: Python 3.14 wertet Annotationen **später** aus als früher – erst wenn jemand sie abfragt. Geprüft werden sie nie.
+      - text: Durch die Hints kann CPython den Code schneller ausführen.
+        correct: false
+        why: CPython nutzt Annotationen nicht zur Optimierung. Sie sind Information für Werkzeuge.
+    explanation: |
+      Type Hints sind Annotationen: Python speichert sie, führt sie aber nicht als Prüfung aus. Den Widerspruch zwischen `str` und `float` findet ein Typechecker vor der Laufzeit. Deshalb gehört mypy oder pyright in die CI – ohne Checker sind Hints nur Dokumentation.
+    resources:
+      - title: typing – Einleitung
+        url: https://docs.python.org/3/library/typing.html
+      - title: What's New in Python 3.14 · Deferred annotations
+        url: https://docs.python.org/3/whatsnew/3.14.html#whatsnew314-deferred-annotations
+
+  - id: any-oder-object
+    type: choice
+    title: Any oder object?
+    prompt: Eine Hilfsfunktion soll beliebige Werte entgegennehmen und protokollieren. Welche Aussagen stimmen?
+    lang: python
+    code: |
+      from typing import Any
+
+      def logge_a(wert: Any) -> None:
+          print(wert.upper())
+
+      def logge_b(wert: object) -> None:
+          print(wert.upper())
+    options:
+      - text: mypy meldet `logge_b`, weil `object` kein Attribut `upper` hat. Vor dem Zugriff müsstest du den Typ eingrenzen.
+        correct: true
+        why: "Mit `object` erlaubt der Checker nur, was jedes Objekt kann. Nach `if isinstance(wert, str):` wäre `upper()` erlaubt."
+      - text: mypy meldet `logge_a` nicht, obwohl `logge_a(42)` zur Laufzeit mit `AttributeError` scheitert.
+        correct: true
+        why: "`Any` schaltet die Prüfung für diesen Wert ab – jede Operation ist erlaubt, jedes Ergebnis ist wieder `Any`."
+      - text: Für mypy sind `Any` und `object` gleichwertig, beide akzeptieren jeden Wert.
+        correct: false
+        why: Beide akzeptieren jeden Wert als Argument, aber nur `object` wird danach geprüft. `Any` ist die Abwesenheit einer Prüfung.
+      - text: Für eine Funktion, die beliebige Werte nur mit `print` ausgibt, ist `Any` die sauberste Wahl.
+        correct: false
+        why: "`object` drückt „beliebiger Wert“ aus und bleibt geprüft. `print(wert)` ist mit `object` erlaubt."
+    explanation: |
+      `object` ist der Obertyp aller Typen: Er nimmt alles an und erlaubt nur, was alle können. `Any` ist mit jedem Typ in beide Richtungen verträglich und schaltet damit die Prüfung aus. Deshalb gilt: `object` für „irgendein Wert“, `Any` nur als bewusste, markierte Lücke – etwa bei untypisierten Bibliotheken.
+    resources:
+      - title: typing.Any
+        url: https://docs.python.org/3/library/typing.html#typing.Any
+      - title: mypy · Dynamically typed code
+        url: https://mypy.readthedocs.io/en/stable/dynamic_typing.html
+
+  - id: typeddict-laufzeit
+    type: output
+    title: Was prüft ein TypedDict?
+    prompt: Was gibt dieses Programm aus? (mypy würde die Zeilen 7 und 8 anmerken – aber Python?)
+    lang: python
+    code: |
+      from typing import TypedDict
+
+      class Nutzer(TypedDict):
+          name: str
+          alter: int
+
+      n: Nutzer = {"name": "Ada", "alter": "36"}
+      print(type(n).__name__, n["alter"] + "!")
+
+      type Id = int
+      print(Id.__value__)
+    expected: |
+      dict 36!
+      <class 'int'>
+    hints:
+      - Zur Laufzeit gibt es keine TypedDict-Instanzen – nur das, was das Literal erzeugt.
+    explanation: |
+      Ein `TypedDict` ist zur Laufzeit ein gewöhnliches `dict`; `"36"` bleibt ein String, also funktioniert `+ "!"`. mypy hätte die Zuweisung mit `Incompatible types (expression has type "str", TypedDict item "alter" has type "int")  [typeddict-item]` gemeldet. Die `type`-Anweisung erzeugt ein `TypeAliasType`-Objekt; sein Wert steht in `__value__` und wird erst beim Zugriff ausgewertet.
+    resources:
+      - title: typing.TypedDict
+        url: https://docs.python.org/3/library/typing.html#typing.TypedDict
+      - title: Die type-Anweisung
+        url: https://docs.python.org/3/reference/simple_stmts.html#the-type-statement
+
+  - id: annotationen-spaet
+    type: output
+    title: Ein Vorwärtsverweis in Python 3.14
+    prompt: Was gibt dieses Programm unter Python 3.14 aus?
+    lang: python
+    code: |
+      def speichere(nutzer: Nutzer) -> None:
+          print("speichere", nutzer)
+
+      speichere({"name": "Ada"})
+
+      class Nutzer:
+          pass
+
+      print(speichere.__annotations__["nutzer"].__name__)
+    expected: |
+      speichere {'name': 'Ada'}
+      Nutzer
+    hints:
+      - Wann wertet Python 3.14 den Ausdruck hinter `nutzer:` aus?
+    explanation: |
+      Seit Python 3.14 (PEP 649/749) wertet Python Annotationen erst aus, wenn jemand sie abfragt. Die `def`-Zeile scheitert deshalb nicht am noch unbekannten Namen `Nutzer`, und der Aufruf mit einem Dictionary läuft, weil Hints nicht geprüft werden. Beim Zugriff auf `__annotations__` existiert die Klasse, also liefert die Auswertung sie. Unter Python 3.13 wäre schon die `def`-Zeile mit `NameError` gescheitert – dort brauchte man `"Nutzer"` in Anführungszeichen oder `from __future__ import annotations`.
+    resources:
+      - title: PEP 649 – Deferred Evaluation Of Annotations
+        url: https://peps.python.org/pep-0649/
+      - title: Annotations Best Practices (HOWTO)
+        url: https://docs.python.org/3/howto/annotations.html
+
+  - id: signaturen-annotieren
+    type: gap
+    title: Signaturen annotieren
+    prompt: |
+      Ergänze die Typen. Die Kommentare beschreiben, was die Funktion annimmt oder liefert. Nutze die moderne Schreibweise (eingebaute Generics, `|`) und für Parameter die breitesten passenden Typen aus `collections.abc`.
+    lang: python
+    code: |
+      from collections.abc import Callable, Iterable
+
+      # liefert Schlüssel und Werte als Strings
+      def lade_config(pfad: str) -> ⟦dict[str, str]⟧: ...
+
+      # liefert den Nutzer oder nichts, wenn es keinen gibt
+      def finde_nutzer(email: str) -> ⟦Nutzer | None⟧: ...
+
+      # iteriert einmal über Preise (Liste, Tupel oder Generator)
+      def summe(preise: ⟦Iterable[float]⟧) -> float: ...
+
+      # ruft eine Funktion ohne Argumente und ohne Rückgabewert mehrmals auf
+      def wiederhole(aktion: ⟦Callable[[], None]⟧, mal: int) -> None: ...
+    gaps:
+      - label: Rückgabe von lade_config
+        hint: Eingebautes Dictionary mit zwei Typparametern.
+      - label: Rückgabe von finde_nutzer
+        hint: Eine Vereinigung mit `|`.
+        accept: ["None | Nutzer"]
+      - label: Parameter von summe
+        hint: Der allgemeinste Typ, über den man iterieren kann.
+      - label: Parameter von wiederhole
+        hint: "`Callable[[Parametertypen], Rückgabetyp]`"
+    explanation: |
+      `dict[str, str]` ist seit 3.9 ohne Import möglich, `Nutzer | None` seit 3.10 statt `Optional[Nutzer]`. `Iterable[float]` akzeptiert alles, worüber man iterieren kann; `list[float]` würde Tupel und Generatoren unnötig ausschließen. `Callable[[], None]` beschreibt eine Funktion ohne Parameter, deren Rückgabe ignoriert wird.
+    resources:
+      - title: collections.abc
+        url: https://docs.python.org/3/library/collections.abc.html
+      - title: mypy · Type hints cheat sheet
+        url: https://mypy.readthedocs.io/en/stable/cheat_sheet_py3.html
+
+  - id: generics-neue-syntax
+    type: gap
+    title: Generics mit der Syntax ab 3.12
+    prompt: Ergänze die Lücken so, dass Python 3.12+ und ein Typechecker den Code verstehen – ohne `TypeVar`.
+    lang: python
+    code: |
+      from collections.abc import Sequence
+
+      def letztes⟦[T]⟧(werte: Sequence[T]) -> ⟦T⟧:
+          return werte[-1]
+
+      class Warteschlange⟦[T]⟧:
+          def __init__(self) -> None:
+              self._elemente: list[T] = []
+
+          def hinein(self, element: T) -> None:
+              self._elemente.append(element)
+
+          def heraus(self) -> T:
+              return self._elemente.pop(0)
+
+      ⟦type⟧ Json = dict[str, Json] | list[Json] | str | int | float | bool | None
+    gaps:
+      - label: Typparameter der Funktion
+        hint: Eckige Klammern direkt hinter dem Funktionsnamen.
+      - label: Rückgabetyp
+        hint: Derselbe Typ wie die Elemente der Folge.
+      - label: Typparameter der Klasse
+        hint: Wie bei der Funktion, direkt hinter dem Klassennamen.
+      - label: Alias-Anweisung
+        hint: Ein Soft Keyword, seit Python 3.12.
+    explanation: |
+      Seit PEP 695 deklarierst du Typparameter in eckigen Klammern hinter dem Namen; `TypeVar` und `Generic[T]` sind dafür nicht mehr nötig. Der Checker leitet `T` pro Aufruf ab: `letztes(["a", "b"])` hat den Typ `str`. Die `type`-Anweisung erzeugt einen lazy ausgewerteten Alias, deshalb darf `Json` sich selbst referenzieren.
+    resources:
+      - title: Sprachreferenz · Type parameter lists
+        url: https://docs.python.org/3/reference/compound_stmts.html#type-params
+      - title: PEP 695 – Type Parameter Syntax
+        url: https://peps.python.org/pep-0695/
+
+  - id: stapel-generisch
+    type: code
+    title: Ein generischer Stapel
+    prompt: |
+      Schreibe die generische Klasse `Stapel[T]` mit der Syntax ab Python 3.12:
+
+      - `push(element: T) -> None` legt oben ab.
+      - `pop() -> T` entfernt das oberste Element und gibt es zurück.
+      - `oben() -> T` gibt das oberste Element zurück, ohne es zu entfernen.
+      - `len(stapel)` liefert die Anzahl der Elemente.
+      - `pop()` und `oben()` auf einem leeren Stapel werfen `IndexError` mit der Meldung `"Stapel ist leer"`.
+    lang: python
+    starter: |
+      class Stapel:
+          def __init__(self) -> None:
+              self._elemente = []
+    solution: |
+      class Stapel[T]:
+          def __init__(self) -> None:
+              self._elemente: list[T] = []
+
+          def push(self, element: T) -> None:
+              self._elemente.append(element)
+
+          def pop(self) -> T:
+              if not self._elemente:
+                  raise IndexError("Stapel ist leer")
+              return self._elemente.pop()
+
+          def oben(self) -> T:
+              if not self._elemente:
+                  raise IndexError("Stapel ist leer")
+              return self._elemente[-1]
+
+          def __len__(self) -> int:
+              return len(self._elemente)
+    tests:
+      - name: Die Klasse ist generisch
+        code: |
+          params = getattr(Stapel, "__type_params__", ())
+          assert len(params) == 1, "Deklariere den Typparameter mit `class Stapel[T]:`."
+      - name: LIFO-Reihenfolge
+        code: |
+          s = Stapel[str]()
+          s.push("a"); s.push("b"); s.push("c")
+          assert s.pop() == "c"
+          assert s.pop() == "b"
+          assert len(s) == 1, f"erwartet 1 Element, len ist {len(s)}"
+      - name: oben entfernt nichts
+        code: |
+          s = Stapel[int]()
+          s.push(42)
+          assert s.oben() == 42
+          assert len(s) == 1, "oben() darf das Element nicht entfernen."
+      - name: Leerer Stapel
+        code: |
+          s = Stapel[int]()
+          for methode in (s.pop, s.oben):
+              try:
+                  methode()
+              except IndexError as fehler:
+                  assert str(fehler) == "Stapel ist leer", f"Meldung: {fehler!r}"
+              else:
+                  raise AssertionError(f"{methode.__name__}() auf leerem Stapel muss IndexError werfen.")
+    hints:
+      - "`class Stapel[T]:` – danach kannst du `T` in allen Methoden benutzen."
+      - "`__len__` macht `len(stapel)` möglich."
+    explanation: |
+      `class Stapel[T]` macht `T` in der ganzen Klasse verfügbar. Zur Laufzeit ist `Stapel[int]()` ein gewöhnlicher `Stapel`; die Typinformation nutzt nur der Checker, der dann `s.push("x")` auf einem `Stapel[int]` meldet. Die eigene `IndexError`-Meldung ist besser als der Fehler von `list.pop` (`pop from empty list`), weil sie die Abstraktion nicht verrät.
+    resources:
+      - title: Sprachreferenz · Generic classes
+        url: https://docs.python.org/3/reference/compound_stmts.html#generic-classes
+      - title: Typing Reference · Generics
+        url: https://typing.python.org/en/latest/reference/generics.html
+
+  - id: gruppiere-generisch
+    type: code
+    title: Gruppieren mit zwei Typparametern
+    prompt: |
+      Schreibe `gruppiere(elemente, schluessel)` als generische Funktion mit zwei Typparametern `K` und `V` (Syntax ab 3.12). Sie ordnet jedes Element der Liste unter `schluessel(element)` zu und erhält die Reihenfolge der Elemente innerhalb jeder Gruppe.
+
+      Signatur: `def gruppiere[K, V](elemente: Iterable[V], schluessel: Callable[[V], K]) -> dict[K, list[V]]`
+    lang: python
+    starter: |
+      from collections.abc import Callable, Iterable
+
+      def gruppiere(elemente, schluessel):
+          ...
+    solution: |
+      from collections.abc import Callable, Iterable
+
+      def gruppiere[K, V](elemente: Iterable[V], schluessel: Callable[[V], K]) -> dict[K, list[V]]:
+          gruppen: dict[K, list[V]] = {}
+          for element in elemente:
+              gruppen.setdefault(schluessel(element), []).append(element)
+          return gruppen
+    tests:
+      - name: Logzeilen nach Level
+        code: |
+          zeilen = ["ERROR db down", "INFO start", "ERROR timeout", "INFO ok"]
+          ergebnis = gruppiere(zeilen, lambda z: z.split()[0])
+          assert ergebnis == {"ERROR": ["ERROR db down", "ERROR timeout"], "INFO": ["INFO start", "INFO ok"]}, ergebnis
+      - name: Zahlen nach Rest
+        code: |
+          assert gruppiere(range(6), lambda n: n % 3) == {0: [0, 3], 1: [1, 4], 2: [2, 5]}
+      - name: Leere Eingabe
+        code: |
+          assert gruppiere([], len) == {}
+      - name: Funktioniert mit Generatoren
+        code: |
+          ergebnis = gruppiere((w for w in ["api", "db", "web"]), len)
+          assert ergebnis == {3: ["api", "web"], 2: ["db"]}, ergebnis
+      - name: Zwei Typparameter deklariert
+        code: |
+          namen = [p.__name__ for p in getattr(gruppiere, "__type_params__", ())]
+          assert namen == ["K", "V"], f"erwartet Typparameter ['K', 'V'], gefunden {namen}"
+    hints:
+      - "`dict.setdefault(schluessel, [])` liefert die vorhandene Liste oder legt eine neue an."
+      - Die Typparameter stehen in eckigen Klammern zwischen Funktionsname und Parameterliste.
+    explanation: |
+      Die Typparameter verbinden Ein- und Ausgabe: Aus `Iterable[str]` und einer Funktion `str -> str` leitet der Checker `dict[str, list[str]]` ab. `Iterable[V]` statt `list[V]` erlaubt Generatoren und `range`. `setdefault` spart die Prüfung, ob die Gruppe schon existiert; `collections.defaultdict(list)` wäre die Alternative.
+    resources:
+      - title: Sprachreferenz · Generic functions
+        url: https://docs.python.org/3/reference/compound_stmts.html#generic-functions
+      - title: dict.setdefault
+        url: https://docs.python.org/3/library/stdtypes.html#dict.setdefault
+
+  - id: protocol-cache
+    type: code
+    title: Ein Cache-Protocol
+    prompt: |
+      Der Service soll mit Redis in Produktion und einem Dictionary in Tests laufen, ohne dass beide von einer gemeinsamen Basisklasse erben.
+
+      1. Definiere ein `Protocol` namens `Cache` mit den Methoden `hole(self, schluessel: str) -> bytes | None` und `setze(self, schluessel: str, wert: bytes) -> None`.
+      2. Schreibe `hole_mit_cache(cache: Cache, schluessel: str, laden: Callable[[str], bytes]) -> bytes`: Liegt der Wert im Cache, gib ihn zurück. Sonst rufe `laden(schluessel)` auf, speichere das Ergebnis im Cache und gib es zurück.
+    lang: python
+    starter: |
+      from collections.abc import Callable
+      from typing import Protocol
+
+      def hole_mit_cache(cache, schluessel, laden):
+          return laden(schluessel)
+    solution: |
+      from collections.abc import Callable
+      from typing import Protocol
+
+      class Cache(Protocol):
+          def hole(self, schluessel: str) -> bytes | None: ...
+          def setze(self, schluessel: str, wert: bytes) -> None: ...
+
+      def hole_mit_cache(cache: Cache, schluessel: str, laden: Callable[[str], bytes]) -> bytes:
+          wert = cache.hole(schluessel)
+          if wert is None:
+              wert = laden(schluessel)
+              cache.setze(schluessel, wert)
+          return wert
+    setup: |
+      class DictCache:
+          """Test-Fake: erbt von nichts."""
+          def __init__(self):
+              self.daten = {}
+          def hole(self, schluessel):
+              return self.daten.get(schluessel)
+          def setze(self, schluessel, wert):
+              self.daten[schluessel] = wert
+    tests:
+      - name: Cache ist ein Protocol
+        code: |
+          import typing
+          assert "Cache" in globals(), "Definiere die Klasse `Cache`."
+          assert typing.is_protocol(Cache), "`Cache` soll von `typing.Protocol` erben."
+          assert {"hole", "setze"} <= typing.get_protocol_members(Cache), "Cache braucht die Methoden hole und setze."
+      - name: Lädt beim ersten Mal und speichert
+        code: |
+          cache = DictCache()
+          geladen = []
+          def laden(s):
+              geladen.append(s)
+              return b"profil:" + s.encode()
+          assert hole_mit_cache(cache, "nutzer:7", laden) == b"profil:nutzer:7"
+          assert cache.daten == {"nutzer:7": b"profil:nutzer:7"}, f"Cache-Inhalt: {cache.daten}"
+          assert geladen == ["nutzer:7"]
+      - name: Zweiter Aufruf kommt aus dem Cache
+        code: |
+          cache = DictCache()
+          geladen = []
+          def laden(s):
+              geladen.append(s)
+              return b"x"
+          hole_mit_cache(cache, "a", laden)
+          hole_mit_cache(cache, "a", laden)
+          assert geladen == ["a"], f"laden wurde {len(geladen)}-mal aufgerufen, erwartet 1-mal"
+      - name: Leere Bytes sind ein gültiger Treffer
+        code: |
+          cache = DictCache()
+          cache.setze("leer", b"")
+          def laden(s):
+              raise AssertionError("b'' liegt im Cache – prüfe auf `is None`, nicht auf Wahrheitswert.")
+          assert hole_mit_cache(cache, "leer", laden) == b""
+    hints:
+      - "Methoden eines Protocols bekommen als Rumpf nur `...`."
+      - "`bytes | None`: Prüfe mit `is None`. `if not wert` würde auch `b\"\"` als Fehltreffer behandeln."
+    explanation: |
+      `DictCache` erbt weder von `Cache` noch kennt es die Klasse – trotzdem akzeptiert ein Typechecker es als `Cache`, weil die Methoden passen. Das ist strukturelle Typisierung: Die Schnittstelle gehört dem Nutzer (`hole_mit_cache`), nicht den Implementierungen. Die Prüfung `is None` ist das Narrowing von `bytes | None` auf `bytes`; `if not wert` wäre ein Bug, weil leere Bytes falsy sind.
+    resources:
+      - title: typing.Protocol
+        url: https://docs.python.org/3/library/typing.html#typing.Protocol
+      - title: Typing Reference · Protocols and structural subtyping
+        url: https://typing.python.org/en/latest/reference/protocols.html
+
+  - id: bestellung-validieren
+    type: code
+    title: JSON an der Grenze prüfen
+    prompt: |
+      `json.loads` liefert ungeprüfte Daten. Schreibe `parse_bestellung(daten: object) -> Bestellung`, die prüft und ein `Bestellung`-TypedDict zurückgibt – oder `ValueError` wirft:
+
+      - `daten` muss ein `dict` sein.
+      - `id`: `int`, aber **nicht** `bool` (in Python ist `True` ein `int`!)
+      - `kunde`: nicht leerer `str`
+      - `status`: einer der Werte aus `Status`
+      - `betrag`: `int` oder `float` (kein `bool`), im Ergebnis immer als `float`
+
+      Weitere Schlüssel ignorierst du; sie kommen nicht ins Ergebnis.
+    lang: python
+    starter: |
+      from typing import Literal, TypedDict, get_args
+
+      Status = Literal["offen", "bezahlt", "storniert"]
+
+      class Bestellung(TypedDict):
+          id: int
+          kunde: str
+          status: Status
+          betrag: float
+
+      def parse_bestellung(daten: object) -> Bestellung:
+          return daten
+    solution: |
+      from typing import Literal, TypedDict, get_args
+
+      Status = Literal["offen", "bezahlt", "storniert"]
+
+      class Bestellung(TypedDict):
+          id: int
+          kunde: str
+          status: Status
+          betrag: float
+
+      def parse_bestellung(daten: object) -> Bestellung:
+          if not isinstance(daten, dict):
+              raise ValueError("Bestellung muss ein Objekt sein")
+          id_ = daten.get("id")
+          if not isinstance(id_, int) or isinstance(id_, bool):
+              raise ValueError("id muss eine ganze Zahl sein")
+          kunde = daten.get("kunde")
+          if not isinstance(kunde, str) or not kunde:
+              raise ValueError("kunde muss ein nicht leerer Text sein")
+          status = daten.get("status")
+          if status not in get_args(Status):
+              raise ValueError(f"unbekannter status: {status!r}")
+          betrag = daten.get("betrag")
+          if not isinstance(betrag, (int, float)) or isinstance(betrag, bool):
+              raise ValueError("betrag muss eine Zahl sein")
+          return {"id": id_, "kunde": kunde, "status": status, "betrag": float(betrag)}
+    tests:
+      - name: Gültige Bestellung
+        code: |
+          ergebnis = parse_bestellung({"id": 7, "kunde": "Ada", "status": "offen", "betrag": 19.99})
+          assert ergebnis == {"id": 7, "kunde": "Ada", "status": "offen", "betrag": 19.99}, ergebnis
+      - name: Ganzzahliger Betrag wird float, Extras fallen weg
+        code: |
+          ergebnis = parse_bestellung({"id": 1, "kunde": "Linus", "status": "bezahlt", "betrag": 20, "notiz": "x"})
+          assert ergebnis == {"id": 1, "kunde": "Linus", "status": "bezahlt", "betrag": 20.0}, ergebnis
+          assert type(ergebnis["betrag"]) is float, "betrag soll immer float sein"
+      - name: Kein Dictionary
+        code: |
+          for falsch in (None, [1, 2], "id=7"):
+              try:
+                  parse_bestellung(falsch)
+              except ValueError:
+                  pass
+              else:
+                  raise AssertionError(f"{falsch!r} muss ValueError auslösen")
+      - name: Falsche Feldtypen
+        code: |
+          basis = {"id": 7, "kunde": "Ada", "status": "offen", "betrag": 10}
+          faelle = [
+              {**basis, "id": "7"},
+              {**basis, "id": True},
+              {**basis, "kunde": ""},
+              {**basis, "status": "versendet"},
+              {**basis, "betrag": "10"},
+              {**basis, "betrag": False},
+              {k: v for k, v in basis.items() if k != "kunde"},
+          ]
+          for fall in faelle:
+              try:
+                  parse_bestellung(fall)
+              except ValueError:
+                  pass
+              else:
+                  raise AssertionError(f"{fall!r} muss ValueError auslösen")
+    hints:
+      - "`isinstance(True, int)` ist `True`. Schließe `bool` ausdrücklich aus."
+      - "`typing.get_args(Status)` liefert das Tupel der erlaubten Literal-Werte."
+      - Baue das Ergebnis neu auf, statt `daten` zurückzugeben – so fallen Extras weg.
+    explanation: |
+      Das ist Validierung an der Systemgrenze: Eingang `object`, Ausgang ein präziser Typ. Jede `isinstance`-Prüfung ist Narrowing, danach weiß auch der Checker, dass `kunde` ein `str` ist. `bool` erbt von `int`, deshalb würde `{"id": true}` aus JSON sonst durchrutschen. `get_args` liest die Literal-Werte aus dem Typ selbst, so gibt es nur eine Quelle der Wahrheit. In echten Projekten übernimmt pydantic diese Arbeit – mit genau diesen Regeln und besseren Fehlermeldungen.
+    resources:
+      - title: typing.get_args
+        url: https://docs.python.org/3/library/typing.html#typing.get_args
+      - title: pydantic · Models
+        url: https://docs.pydantic.dev/latest/concepts/models/
+
+  - id: invarianz-liste
+    type: bug
+    title: Hunde sind doch Tiere?
+    prompt: |
+      mypy meldet für den Aufruf in der letzten Zeile:
+
+      ```text
+      error: Argument 1 to "fuettere_alle" has incompatible type "list[Hund]"; expected "list[Tier]"  [arg-type]
+      note: "list" is invariant -- see https://mypy.readthedocs.io/en/stable/common_issues.html#variance
+      note: Consider using "Sequence" instead, which is covariant
+      ```
+
+      Die Funktion liest die Liste nur. Korrigiere die Zeile, die den Fehler verursacht – ohne `# type: ignore` und ohne den Aufruf zu ändern.
+    lang: python
+    code: |
+      from collections.abc import Sequence
+
+      class Tier:
+          name: str = "?"
+
+      class Hund(Tier):
+          pass
+
+      def fuettere_alle(tiere: list[Tier]) -> None:
+          for tier in tiere:
+              print(f"füttere {tier.name}")
+
+      hunde: list[Hund] = [Hund(), Hund()]
+      fuettere_alle(hunde)
+    lines: [9]
+    fix:
+      - line: 9
+        answers:
+          - "def fuettere_alle(tiere: Sequence[Tier]) -> None:"
+    hints:
+      - Der Fehler liegt nicht beim Aufrufer, sondern in einer Signatur.
+    explanation: |
+      Wäre `list[Hund]` eine `list[Tier]`, dürfte `fuettere_alle` mit `tiere.append(Katze())` eine Katze in die Hundeliste legen – der Aufrufer hätte danach eine `list[Hund]` mit Katze. Deshalb ist `list` invariant. `Sequence` bietet nur Lesezugriffe und ist daher kovariant: Eine `Sequence[Hund]` ist eine `Sequence[Tier]`. Die Regel „Parameter so breit wie möglich“ vermeidet den Fehler von vornherein.
+    resources:
+      - title: mypy · Variance
+        url: https://mypy.readthedocs.io/en/stable/common_issues.html#variance
+      - title: Typing Spec · Generics
+        url: https://typing.python.org/en/latest/spec/generics.html
+
+  - id: implizites-optional
+    type: bug
+    title: None als Default
+    prompt: |
+      mypy meldet in einem Modul, das seit Jahren läuft:
+
+      ```text
+      netz.py:4: error: Incompatible default for parameter "timeout" (default has type "None", parameter has type "float")  [assignment]
+      netz.py:4: note: PEP 484 prohibits implicit Optional. Accordingly, mypy has changed its default to no_implicit_optional=True
+      ```
+
+      Korrigiere die Zeile so, dass die Annotation das tatsächliche Verhalten beschreibt.
+    lang: python
+    code: |
+      import socket
+
+
+      def verbinde(host: str, port: int, timeout: float = None) -> socket.socket:
+          verbindung = socket.create_connection((host, port), timeout=timeout)
+          return verbindung
+    lines: [4]
+    fix:
+      - line: 4
+        answers:
+          - "def verbinde(host: str, port: int, timeout: float | None = None) -> socket.socket:"
+          - "def verbinde(host: str, port: int, timeout: None | float = None) -> socket.socket:"
+    explanation: |
+      Der Default `None` ist kein `float`. Früher hat mypy daraus stillschweigend `Optional[float]` gemacht; seit mypy 0.990 ist das abgeschaltet, weil PEP 484 es nicht (mehr) vorsieht. `float | None = None` sagt jetzt ausdrücklich: Der Aufrufer darf nichts übergeben, und die Funktion muss mit `None` umgehen können – hier reicht sie es an `create_connection` weiter, das `None` als „kein Timeout“ versteht.
+    resources:
+      - title: mypy · Optional types and the None type
+        url: https://mypy.readthedocs.io/en/stable/kinds_of_types.html#optional-types-and-the-none-type
+      - title: PEP 604 – Allow writing union types as X | Y
+        url: https://peps.python.org/pep-0604/
+
+  - id: mypy-ausgabe-lesen
+    type: explain
+    title: mypy-Meldungen deuten
+    prompt: |
+      Du übernimmst ein Modul. mypy meldet drei Fehler. Erkläre für jeden, was mypy bemängelt, ob es ein echter Bug ist und wie du ihn behebst.
+
+      ```text
+      shop.py:18: error: Item "None" of "Kunde | None" has no attribute "email"  [union-attr]
+      shop.py:20: error: Argument 1 to "setze_level" has incompatible type "Literal['verbose']"; expected "Literal['debug', 'info', 'warning']"  [arg-type]
+      shop.py:22: error: Incompatible types (expression has type "str", TypedDict item "port" has type "int")  [typeddict-item]
+      ```
+    lang: python
+    code: |
+      from dataclasses import dataclass
+      from typing import Literal, TypedDict
+
+      @dataclass
+      class Kunde:
+          email: str
+
+      class DbKonfig(TypedDict):
+          host: str
+          port: int
+
+      def finde_kunde(kunden_id: int) -> Kunde | None: ...
+
+      def setze_level(level: Literal["debug", "info", "warning"]) -> None: ...
+
+      def rechnungs_email(kunden_id: int) -> str:
+          kunde = finde_kunde(kunden_id)
+          return kunde.email
+
+      setze_level("verbose")
+
+      konfig: DbKonfig = {"host": "db", "port": "5432"}
+    points:
+      - "Zeile 18: `finde_kunde` kann `None` liefern; der Zugriff ohne Prüfung ist ein echter Bug (AttributeError bei unbekanntem Kunden). Lösung: `if kunde is None:` behandeln (Exception oder Rückgabe) – danach grenzt mypy auf `Kunde` ein."
+      - "Zeile 20: `\"verbose\"` gehört nicht zu den erlaubten Literal-Werten. Entweder den Aufruf korrigieren oder, wenn das Level gewollt ist, den Literal-Typ und die Funktion erweitern."
+      - "Zeile 22: Der Port ist ein String statt `int`. Zur Laufzeit ist das nur ein dict, der Fehler knallt erst beim Verbinden. Lösung: `5432` als Zahl bzw. beim Einlesen aus der Umgebung mit `int(...)` konvertieren."
+      - "Aufbau jeder Zeile: Datei, Zeile, Meldung und Fehlercode in eckigen Klammern; der Code dient zum Nachschlagen und für gezielte `# type: ignore[...]`, die hier aber alle falsch wären."
+    explanation: |
+      Alle drei Meldungen zeigen echte Fehler, die zur Laufzeit erst spät auffallen würden.
+
+      `[union-attr]` in Zeile 18: Der Rückgabetyp `Kunde | None` verlangt, dass du `None` behandelst, bevor du auf `.email` zugreifst. Ohne Prüfung gibt es bei unbekannter ID einen `AttributeError` tief im Rechnungslauf. Nach `if kunde is None: raise LookupError(...)` grenzt mypy den Typ auf `Kunde` ein.
+
+      `[arg-type]` in Zeile 20: Der Parameter erlaubt nur drei String-Konstanten. `"verbose"` ist ein Tippfehler oder ein neuer Wert – im zweiten Fall erweiterst du den `Literal` und die Implementierung.
+
+      `[typeddict-item]` in Zeile 22: `"5432"` ist ein `str`. Ein `TypedDict` prüft zur Laufzeit nichts, der Treiber würde später scheitern. Typisch ist die Ursache ein Wert aus `os.environ`, der mit `int(...)` konvertiert werden muss. Ein `# type: ignore` wäre bei allen drei Meldungen falsch, weil es echte Bugs versteckt.
+    resources:
+      - title: mypy · Error codes enabled by default
+        url: https://mypy.readthedocs.io/en/stable/error_code_list.html
+      - title: mypy · Type narrowing
+        url: https://mypy.readthedocs.io/en/stable/type_narrowing.html
+
+  - id: any-schleicht-durch
+    type: explain
+    title: Warum ist mypy hier still?
+    prompt: |
+      `uv run mypy src/` meldet für diese Funktion keinen Fehler. In Produktion liefert sie aber einen String, und ein Vergleich `lade_port(...) > 1024` wirft `TypeError`. Mit `mypy --strict` erscheint dagegen: `error: Returning Any from function declared to return "int"  [no-any-return]`. Erkläre, warum mypy im Standardmodus schweigt, und wie du die Funktion robust machst.
+    lang: python
+    code: |
+      import json
+      from pathlib import Path
+
+      def lade_port(pfad: Path) -> int:
+          daten = json.loads(pfad.read_text(encoding="utf-8"))
+          return daten["port"]           # in der Datei steht "port": "8080"
+    points:
+      - "`json.loads` ist mit Rückgabetyp `Any` annotiert; damit ist `daten` und auch `daten[\"port\"]` `Any`."
+      - "`Any` ist mit jedem Typ verträglich, also akzeptiert mypy die Rückgabe als `int` – ohne Prüfung."
+      - "`--strict` (genauer `warn_return_any`) macht solche Stellen sichtbar."
+      - "Robust wird es durch Laufzeitprüfung an der Grenze: `port = daten.get(\"port\")`, `isinstance`-Prüfung bzw. `int(...)` mit Fehlerbehandlung, oder ein pydantic-Modell."
+    explanation: |
+      `json.loads` kann nicht wissen, was in der Datei steht, deshalb ist sein Rückgabetyp `Any`. `Any` ist in beide Richtungen mit jedem Typ verträglich: mypy nimmt an, dass `daten["port"]` ein `int` sein **könnte**, und meldet nichts. Die Typsicherheit endet also an der Stelle, an der `Any` in den Code fließt – still.
+
+      `--strict` schaltet unter anderem `warn_return_any` ein und zeigt, dass hier ein ungeprüfter Wert als `int` zurückgegeben wird. Beheben lässt sich das nur zur Laufzeit: Wert holen, mit `isinstance` prüfen oder mit `int(...)` konvertieren und einen verständlichen Fehler werfen. Danach ist der Typ tatsächlich `int`, und mypy weiß es auch. Bei größeren Strukturen übernimmt ein pydantic-Modell diese Prüfung.
+    resources:
+      - title: mypy · The Any type
+        url: https://mypy.readthedocs.io/en/stable/kinds_of_types.html#the-any-type
+      - title: mypy · Command line (--strict, --warn-return-any)
+        url: https://mypy.readthedocs.io/en/stable/command_line.html

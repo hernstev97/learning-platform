@@ -1,0 +1,616 @@
+id: netzwerk-ssh
+title: Netzwerk & SSH
+level: 2
+minutes: 180
+summary: Wie Pakete ihren Weg finden, wie du Verbindungsprobleme Schicht für Schicht eingrenzt und wie du mit SSH, curl und rsync sicher und bequem mit Servern arbeitest.
+goals:
+  - Du erklärst IP-Adresse, Subnetz (CIDR), Gateway, DNS, Ports sowie den Unterschied zwischen TCP und UDP und liest `ip addr`, `ip route` und `ss -tulpn`.
+  - Du grenzt ein Verbindungsproblem systematisch ein – Name, Route, Port, Dienst – mit `resolvectl`, `dig`, `ping`, `tracepath` und `curl`.
+  - Du richtest SSH mit ed25519-Schlüsseln, `~/.ssh/config` und ssh-agent ein und reagierst richtig auf Host-Key-Warnungen.
+  - Du nutzt Port-Forwarding (`-L`, `-R`) und Jump Hosts (`-J`) und überträgst Dateien mit `rsync`, ohne dich von Schrägstrichen und `--delete` überraschen zu lassen.
+  - Du kennst das Konzept einer Host-Firewall (nftables, ufw, firewalld).
+resources:
+  - title: ss(8)
+    url: https://man7.org/linux/man-pages/man8/ss.8.html
+  - title: ssh(1) – OpenSSH
+    url: https://man.openbsd.org/ssh.1
+  - title: ssh_config(5) – OpenSSH
+    url: https://man.openbsd.org/ssh_config.5
+  - title: rsync(1)
+    url: https://download.samba.org/pub/rsync/rsync.1
+  - title: curl – Handbuchseite
+    url: https://curl.se/docs/manpage.html
+lesson: |
+  Dein Frontend meldet „Network Error“ beim Aufruf der API auf dem Staging-Server. Ist der Name falsch aufgelöst? Fehlt eine Route? Blockiert eine Firewall den Port? Läuft der Dienst gar nicht – oder lauscht er nur auf `127.0.0.1`? Wer diese Fragen der Reihe nach mit je einem Befehl beantworten kann, findet die Ursache in Minuten statt in Stunden. Und für fast alles, was danach kommt – Logs lesen, deployen, eine Datenbank untersuchen –, verbindest du dich per SSH mit dem Server.
+
+  Dieses Modul baut zuerst das Denkmodell auf und führt dann durch die Werkzeuge in genau der Reihenfolge, in der du sie bei der Fehlersuche brauchst.
+
+  ## Das Modell: Adresse, Netz, Gateway, Name, Port
+
+  Damit `curl https://api.shop.example/health` eine Antwort bekommt, müssen fünf Dinge stimmen:
+
+  1. **Name → Adresse.** DNS übersetzt `api.shop.example` in eine IP-Adresse, etwa `203.0.113.10` (IPv4) oder `2001:db8::10` (IPv6).
+  2. **Eigene Adresse und Subnetz.** Dein Rechner hat zum Beispiel `192.168.178.42/24`. Die Zahl hinter dem Schrägstrich (**CIDR**-Notation, [RFC 4632](https://www.rfc-editor.org/rfc/rfc4632.html)) sagt, wie viele Bits vorn das Netz bezeichnen: Bei `/24` sind es drei Byte, das Netz umfasst `192.168.178.0` bis `192.168.178.255`. Ein `/16` ist 256-mal größer, ein `/32` genau eine Adresse. Adressen aus `10.0.0.0/8`, `172.16.0.0/12` und `192.168.0.0/16` sind privat und im Internet nicht direkt erreichbar ([RFC 1918](https://www.rfc-editor.org/rfc/rfc1918.html)).
+  3. **Route.** Liegt das Ziel im eigenen Subnetz, wird es direkt angesprochen. Sonst geht das Paket an das **Gateway** (den Router), meist über die Default-Route.
+  4. **Port.** Eine IP-Adresse identifiziert einen Rechner, der **Port** den Dienst darauf: 22 SSH, 53 DNS, 80 HTTP, 443 HTTPS, 5432 PostgreSQL. Ports unter 1024 dürfen nur privilegierte Prozesse öffnen.
+  5. **Dienst.** Auf dem Server muss ein Prozess an diesem Port lauschen – und zwar auf einer Adresse, die von außen erreichbar ist.
+
+  **TCP oder UDP?** [TCP](https://man7.org/linux/man-pages/man7/tcp.7.html) baut eine Verbindung auf (Handshake), liefert Daten vollständig und in der richtigen Reihenfolge und wiederholt verlorene Pakete – HTTP/1.1, HTTP/2, SSH und Datenbanken nutzen es. [UDP](https://man7.org/linux/man-pages/man7/udp.7.html) schickt einzelne Datagramme ohne Verbindung und ohne Garantie; das ist schneller und passt zu DNS-Anfragen, Videostreams, WireGuard und HTTP/3 (QUIC), das Zuverlässigkeit selbst oberhalb von UDP regelt.
+
+  **Auf welcher Adresse lauscht ein Dienst?** `127.0.0.1:8000` heißt: nur von diesem Rechner erreichbar (Loopback). `0.0.0.0:8000` bzw. `[::]:8000` heißt: auf allen Schnittstellen, also auch von außen, sofern keine Firewall dazwischen steht. Das ist die häufigste Ursache für „läuft lokal, aber nicht vom Laptop aus“ – und umgekehrt für versehentlich offene Datenbanken.
+
+  > [!MERKE]
+  > Fehlersuche von unten nach oben: Habe ich eine Adresse und eine Route? Wird der Name aufgelöst? Ist das Ziel erreichbar? Ist der Port offen? Antwortet der Dienst richtig? Jede Frage hat ihren eigenen Befehl.
+
+  ## Die eigene Maschine: ip und ss
+
+  Das Werkzeug für Schnittstellen und Routen ist [`ip`](https://man7.org/linux/man-pages/man8/ip.8.html) aus iproute2. Das alte `ifconfig` gehört zum Paket net-tools, das auf vielen Systemen nicht mehr installiert ist.
+
+  ```console
+  $ ip -br addr
+  lo               UNKNOWN        127.0.0.1/8 ::1/128
+  enp4s0           UP             192.168.178.51/24 2a02:8071:53c1:5760::51/64 fe80::5cdb:f9fa:56d2:12c7/64
+  wlan0            DOWN
+  $ ip route
+  default via 192.168.178.1 dev enp4s0 proto dhcp src 192.168.178.51 metric 100
+  172.17.0.0/16 dev docker0 proto kernel scope link src 172.17.0.1 linkdown
+  192.168.178.0/24 dev enp4s0 proto kernel scope link src 192.168.178.51 metric 100
+  $ ip route get 1.1.1.1
+  1.1.1.1 via 192.168.178.1 dev enp4s0 src 192.168.178.51 uid 1000
+  ```
+
+  `ip -br addr` (brief) zeigt pro Schnittstelle Zustand und Adressen; `ip link` nur die Schnittstellen selbst. `fe80::…` ist eine link-lokale IPv6-Adresse, die nur im lokalen Segment gilt. In der Routing-Tabelle gewinnt immer die **spezifischste** passende Route (längstes Präfix): Für `172.17.0.5` passt `172.17.0.0/16` (Docker-Bridge), für alles ohne speziellere Route gilt `default`. `ip route get` beantwortet die Frage „Welchen Weg nimmt ein Paket zu dieser Adresse?“ direkt ([ip-route(8)](https://man7.org/linux/man-pages/man8/ip-route.8.html)).
+
+  Welche Ports offen sind und welcher Prozess dahintersteckt, zeigt [`ss`](https://man7.org/linux/man-pages/man8/ss.8.html):
+
+  ```console
+  $ sudo ss -tulpn
+  Netid State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process
+  udp   UNCONN 0      0         127.0.0.54:53         0.0.0.0:*     users:(("systemd-resolve",pid=512,fd=17))
+  tcp   LISTEN 0      128          0.0.0.0:22         0.0.0.0:*     users:(("sshd",pid=801,fd=3))
+  tcp   LISTEN 0      511          0.0.0.0:443        0.0.0.0:*     users:(("nginx",pid=1120,fd=7))
+  tcp   LISTEN 0      2048       127.0.0.1:8000       0.0.0.0:*     users:(("gunicorn",pid=2231,fd=5))
+  ```
+
+  Die Optionen lesen sich als Satz: **t**cp, **u**dp, **l**istening, **p**rocesses, **n**umeric (Ports als Zahl statt Namen). Ohne `sudo` siehst du die Prozesse fremder Benutzer nicht. `netstat` aus net-tools kann Ähnliches, ist aber veraltet; `ss` fragt den Kernel direkt und ist auf jedem aktuellen System vorhanden. Suchst du nur einen Port: `ss -ltnp 'sport = :5173'`.
+
+  ## Erreichbarkeit und Namen
+
+  [`ping`](https://man7.org/linux/man-pages/man8/ping.8.html) schickt ICMP-Echo-Anfragen und misst die Antwortzeit; `ping -c 3 1.1.1.1` hört nach drei Paketen auf. Kommt keine Antwort, ist das noch kein Beweis: Viele Server und Cloud-Firewalls blockieren ICMP. [`tracepath`](https://man7.org/linux/man-pages/man8/tracepath.8.html) (oder `traceroute`, `mtr`) zeigt die Router auf dem Weg und damit, **wo** Pakete hängen bleiben.
+
+  **DNS.** Wenn ein Programm einen Namen auflöst, fragt es nicht direkt einen DNS-Server, sondern die C-Bibliothek. Die richtet sich nach `/etc/nsswitch.conf` ([nsswitch.conf(5)](https://man7.org/linux/man-pages/man5/nsswitch.conf.5.html)): Dort steht, welche Quellen in welcher Reihenfolge gefragt werden – typischerweise die Datei [`/etc/hosts`](https://man7.org/linux/man-pages/man5/hosts.5.html) und DNS. Auf CachyOS, Arch, Fedora und Ubuntu übernimmt [systemd-resolved](https://www.freedesktop.org/software/systemd/man/latest/systemd-resolved.service.html) die DNS-Auflösung: `/etc/resolv.conf` zeigt dann auf den lokalen Stub `127.0.0.53`, und die echten DNS-Server stehen in `resolvectl status`.
+
+  ```console
+  $ resolvectl query api.shop.example
+  api.shop.example: 203.0.113.10                   -- link: enp4s0
+  $ dig +short api.shop.example
+  203.0.113.10
+  $ dig @1.1.1.1 +short api.shop.example
+  203.0.113.10
+  $ getent hosts api.shop.test
+  127.0.0.1       api.shop.test
+  ```
+
+  Die Werkzeuge beantworten unterschiedliche Fragen. `dig` spricht DNS direkt und ignoriert `/etc/hosts`; mit `@server` fragst du gezielt einen bestimmten DNS-Server – ideal, um zu prüfen, ob ein neuer Eintrag schon weltweit sichtbar ist. `getent hosts` und [`resolvectl query`](https://www.freedesktop.org/software/systemd/man/latest/resolvectl.html) gehen denselben Weg wie deine Programme, inklusive `/etc/hosts`. Liefert `dig` die richtige Adresse, dein Browser aber eine andere, steckt oft ein alter Eintrag in `/etc/hosts` oder ein Cache dahinter (`resolvectl flush-caches`).
+
+  ### Firewall: das Konzept
+
+  Auch wenn ein Dienst auf `0.0.0.0` lauscht, kann ihn eine Firewall abschirmen. Im Linux-Kernel filtert **nftables** Pakete (Nachfolger von iptables); `ufw` (Ubuntu) und `firewalld` (Fedora, RHEL) sind bequemere Oberflächen dafür ([ArchWiki · nftables](https://wiki.archlinux.org/title/Nftables)). Das Grundprinzip auf Servern: eingehend alles verbieten, was nicht ausdrücklich erlaubt ist. Mit ufw erlaubst du zuerst SSH und schaltest dann ein – in dieser Reihenfolge, sonst sperrst du dich aus: `sudo ufw allow OpenSSH`, `sudo ufw enable`, `sudo ufw status verbose`. Regeln, Härtung und Stolperfallen wie Docker, das veröffentlichte Ports an ufw vorbei freigibt, behandelt das Modul zu Sicherheit.
+
+  ## HTTP von der Kommandozeile: curl und wget
+
+  [`curl`](https://curl.se/docs/manpage.html) ist das Schweizer Taschenmesser für HTTP – zum Testen von APIs, für Healthchecks und in CI-Pipelines.
+
+  ```console
+  $ curl -I https://shop.example              # nur Statuszeile und Header (HEAD-Anfrage)
+  $ curl -IL http://shop.example              # dazu Weiterleitungen folgen
+  $ curl -v https://api.shop.example/health   # alles: DNS, TCP, TLS, Anfrage, Antwort
+  $ curl -o shop.tar.gz https://example.org/shop.tar.gz
+  $ curl --fail -sS https://api.shop.example/health
+  $ curl -X POST -H "Content-Type: application/json" \
+         -d '{"sku": "TSHIRT-42", "menge": 2}' \
+         https://api.shop.example/v1/warenkorb
+  ```
+
+  - `-I` fragt nur die Header ab, `-L` folgt Weiterleitungen (ohne `-L` bekommst du bei `http://` oft nur ein `301`).
+  - `-v` zeigt, an welcher Stelle eine Verbindung scheitert: Kommt keine Adresse zustande (DNS), kein `Connected to` (Route, Firewall, Port), bricht TLS ab (Zertifikat) oder antwortet der Server mit einem Fehlerstatus?
+  - `-X` setzt die Methode, `-H` einen Header, `-d` den Body. `-d` allein macht bereits einen POST mit `Content-Type: application/x-www-form-urlencoded` – für JSON musst du den Header setzen oder `--json '{…}'` nutzen, das beides erledigt ([curl · --json](https://curl.se/docs/manpage.html#--json)).
+  - `-o datei` speichert die Antwort, `-O` unter dem Namen aus der URL.
+  - **`--fail`** ist für Skripte entscheidend: Ohne die Option endet curl auch bei `404` oder `500` mit Exit-Status 0, weil die HTTP-Übertragung ja geklappt hat. Mit `--fail` liefert es bei Status ab 400 den Exit-Code 22 ([curl · --fail](https://curl.se/docs/manpage.html#--fail)). `-sS` unterdrückt den Fortschrittsbalken, zeigt Fehler aber trotzdem.
+
+  `wget` ist auf das Herunterladen spezialisiert: `wget https://example.org/datei.iso` speichert unter dem Namen aus der URL, `wget -c` setzt einen abgebrochenen Download fort ([wget(1)](https://man.archlinux.org/man/wget.1)). Für APIs ist curl das Werkzeug der Wahl.
+
+  ## SSH im Alltag
+
+  SSH verschlüsselt die Verbindung zu einem entfernten Rechner und authentifiziert **beide** Seiten: Der Server beweist mit seinem **Host-Key**, dass er der richtige ist; du beweist mit deinem **Schlüsselpaar**, wer du bist. Passwörter sind möglich, Schlüssel aber sicherer und bequemer.
+
+  **Schlüssel erzeugen und verteilen.** ed25519 ist der empfohlene Typ – kurz, schnell, sicher; seit OpenSSH 9.5 auch der Standard von [`ssh-keygen`](https://man.openbsd.org/ssh-keygen.1).
+
+  ```console
+  $ ssh-keygen -t ed25519 -C "steven@cachyos"
+  Generating public/private ed25519 key pair.
+  Enter file in which to save the key (/home/steven/.ssh/id_ed25519):
+  Enter passphrase for "/home/steven/.ssh/id_ed25519" (empty for no passphrase):
+  $ ssh-copy-id -i ~/.ssh/id_ed25519.pub deploy@203.0.113.10
+  $ ssh deploy@203.0.113.10
+  ```
+
+  Es entstehen zwei Dateien: `id_ed25519` (privat, verlässt nie deinen Rechner, Rechte `600`) und `id_ed25519.pub` (öffentlich, darf überall hin). [`ssh-copy-id`](https://man.archlinux.org/man/ssh-copy-id.1) hängt den öffentlichen Schlüssel auf dem Server an `~/.ssh/authorized_keys` an. Eine Passphrase schützt den privaten Schlüssel, falls dein Laptop gestohlen wird; damit du sie nicht bei jeder Verbindung tippen musst, merkt sich der **ssh-agent** den entschlüsselten Schlüssel für die Sitzung: `ssh-add ~/.ssh/id_ed25519`, Kontrolle mit `ssh-add -l`. Auf den meisten Desktops läuft bereits ein Agent.
+
+  **Host-Keys und known_hosts.** Beim ersten Kontakt fragt ssh, ob du dem Fingerabdruck des Servers vertraust, und speichert ihn in `~/.ssh/known_hosts`. Ändert er sich später, bricht ssh mit `WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!` ab. Das ist entweder harmlos (Server neu installiert, IP an eine neue VM vergeben) oder ein Angriff (Man-in-the-Middle). Deshalb löschst du den alten Eintrag mit `ssh-keygen -R host` erst, **nachdem** du den neuen Fingerabdruck über einen unabhängigen Weg geprüft hast – etwa in der Web-Konsole des Hosters mit `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`.
+
+  **~/.ssh/config.** Statt dir Adressen, Benutzer und Schlüssel zu merken, gibst du jedem Server einen Kurznamen ([ssh_config(5)](https://man.openbsd.org/ssh_config.5)):
+
+  ```text title=~/.ssh/config
+  Host staging
+      HostName 203.0.113.10
+      User deploy
+      IdentityFile ~/.ssh/id_ed25519
+      IdentitiesOnly yes
+
+  Host db-intern
+      HostName 10.0.2.15
+      User steven
+      ProxyJump staging
+
+  Host *
+      AddKeysToAgent yes
+      ServerAliveInterval 60
+  ```
+
+  Danach genügen `ssh staging` und `ssh db-intern`; auch `scp`, `rsync` und Git nutzen die Einträge. `IdentitiesOnly yes` verhindert, dass ssh alle Schlüssel aus dem Agent durchprobiert (und nach zu vielen Versuchen abgewiesen wird). Wichtig: Für jede Einstellung gilt der **erste** gefundene Wert. Allgemeine Vorgaben unter `Host *` gehören deshalb ans Ende der Datei.
+
+  **Jump Hosts.** `db-intern` hat nur eine private Adresse. `ProxyJump staging` (auf der Kommandozeile `ssh -J staging steven@10.0.2.15`) baut erst die Verbindung zu `staging` auf und tunnelt darüber zu `db-intern` – Ende-zu-Ende verschlüsselt, dein privater Schlüssel bleibt auf deinem Rechner ([ssh · -J](https://man.openbsd.org/ssh.1#J)). Das ist sicherer als Agent-Forwarding mit `-A`, bei dem jeder mit root-Rechten auf dem Zwischenrechner deinen Agent benutzen kann.
+
+  **Port-Forwarding.** SSH kann TCP-Verbindungen durch den verschlüsselten Kanal leiten ([ssh · -L](https://man.openbsd.org/ssh.1#L), [-R](https://man.openbsd.org/ssh.1#R)):
+
+  ```console
+  $ ssh -N -L 5433:localhost:5432 staging
+  $ ssh -N -R 8080:localhost:3000 staging
+  ```
+
+  - `-L 5433:localhost:5432` (**lokal**): Dein Rechner öffnet Port 5433. Was dort ankommt, reicht der Server weiter an `localhost:5432` – aus **seiner** Sicht. So erreichst du eine Datenbank, die auf dem Server nur auf `127.0.0.1` lauscht, mit `psql -h localhost -p 5433`.
+  - `-R 8080:localhost:3000` (**remote**): Der Server öffnet Port 8080 und reicht Verbindungen an Port 3000 **deines** Rechners weiter – etwa um einem Kollegen deinen lokalen Dev-Server zu zeigen oder einen Webhook zu testen.
+  - `-N` führt keinen Befehl aus, hält nur den Tunnel offen.
+
+  Die Merkhilfe: Der Buchstabe sagt, **auf welcher Seite der Port geöffnet wird** – `L` lokal, `R` auf dem entfernten Rechner. Das Ziel dahinter wird immer von der jeweils anderen Seite aus aufgelöst.
+
+  > [!INTERVIEW] „Wie greifst du auf eine Datenbank zu, die nicht öffentlich erreichbar ist?“
+  > Über einen SSH-Tunnel: `ssh -N -L 5433:localhost:5432 bastion` bzw. mit `-J`, wenn die Datenbank hinter einem Bastion-Host liegt. Die Datenbank bleibt auf `127.0.0.1` oder im privaten Netz, es wird kein Port nach außen geöffnet, und die Verbindung ist verschlüsselt und an meinen SSH-Schlüssel gebunden. Lokal verbinde ich mich dann mit `localhost:5433`.
+
+  ## Dateien übertragen: scp und rsync
+
+  `scp quelle ziel` kopiert einzelne Dateien über SSH: `scp dump.sql staging:/tmp/`. Seit OpenSSH 9.0 nutzt `scp` intern das SFTP-Protokoll ([Release Notes 9.0](https://www.openssh.com/txt/release-9.0)). Für Verzeichnisse, Deployments und Backups ist [`rsync`](https://download.samba.org/pub/rsync/rsync.1) besser: Es überträgt nur Unterschiede, kann abgebrochene Übertragungen fortsetzen und zeigt vorher, was es tun würde.
+
+  ```console
+  $ rsync -avz --dry-run dist/ staging:/var/www/shop/
+  $ rsync -avz --delete dist/ staging:/var/www/shop/
+  ```
+
+  `-a` (archive) überträgt rekursiv und erhält Rechte, Zeitstempel und symbolische Links; `-v` listet die Dateien; `-z` komprimiert unterwegs. `--dry-run` (`-n`) zeigt nur, was passieren würde – vor jedem `--delete` Pflicht.
+
+  **Der Schrägstrich am Ende der Quelle entscheidet alles.** `rsync -a dist staging:/var/www/shop/` kopiert das **Verzeichnis** `dist` hinein, es entsteht `/var/www/shop/dist/index.html`. `rsync -a dist/ staging:/var/www/shop/` kopiert den **Inhalt** von `dist`, es entsteht `/var/www/shop/index.html`. Am Ziel spielt der Schrägstrich keine Rolle.
+
+  **`--delete`** löscht am Ziel alles, was in der Quelle fehlt – genau das Richtige, um ein Verzeichnis zu spiegeln, und genau das Falsche, wenn Quelle oder Ziel vertauscht sind oder der Schrägstrich fehlt. Ein vertauschtes `rsync -a --delete leer/ ~/` leert dein Home-Verzeichnis. Deshalb: erst `--dry-run`, Ausgabe lesen, dann ohne.
+
+  > [!PRAXIS] Die Reihenfolge bei „die API ist nicht erreichbar“
+  > Auf dem eigenen Rechner: `resolvectl query api.staging.example` (Name?), `ip route get <ip>` (Weg?), `curl -v https://api.staging.example/health` (Verbindung, TLS, Status?). Auf dem Server per `ssh staging`: `systemctl status shop` (läuft der Dienst?), `sudo ss -tlnp` (lauscht er, und auf welcher Adresse?), `sudo ufw status` (lässt die Firewall den Port durch?), `curl -v http://127.0.0.1:8000/health` (antwortet er lokal?). Die erste Frage mit einer unerwarteten Antwort ist deine Spur.
+
+  ## Häufige Fehler
+
+  - **Dienst lauscht nur auf `127.0.0.1`.** Von außen: `Connection refused`. `ss -tlnp` zeigt es sofort. Oft ist das gewollt (hinter nginx) – dann ist der Test von außen falsch, nicht der Dienst.
+  - **`ping` geht nicht, also ist der Server weg.** ICMP wird oft gefiltert. Teste den eigentlichen Port mit `curl` oder `nc -zv host 443`.
+  - **`dig` und Browser liefern verschiedene Adressen.** `/etc/hosts` oder ein Cache ist im Spiel; `getent hosts` zeigt, was Programme wirklich bekommen.
+  - **Skripte ohne `curl --fail`.** Ein `500` gilt als Erfolg, die Pipeline bleibt grün.
+  - **Host-Key-Warnung wegklicken** mit `ssh-keygen -R` oder `StrictHostKeyChecking no`, ohne den Fingerabdruck zu prüfen.
+  - **Privaten Schlüssel kopieren oder mit falschen Rechten ablegen.** ssh verweigert Schlüssel, die andere lesen können (`UNPROTECTED PRIVATE KEY FILE`). `chmod 600 ~/.ssh/id_ed25519`, `chmod 700 ~/.ssh`.
+  - **`-L` und `-R` verwechselt.** Der Tunnel steht, aber auf der falschen Seite, und `psql` meldet `Connection refused`.
+  - **Schrägstrich bei rsync vergessen** oder `--delete` ohne `--dry-run`.
+  - **`ufw enable` vor `ufw allow OpenSSH`** auf einem entfernten Server.
+
+  ## Zusammenfassung
+
+  - Eine Verbindung braucht Adresse und Subnetz (CIDR), eine Route (direkt oder über das Gateway), einen aufgelösten Namen, einen offenen Port und einen Dienst, der auf der richtigen Adresse lauscht.
+  - TCP: Verbindung, Reihenfolge, Zuverlässigkeit. UDP: einzelne Datagramme ohne Garantie. `127.0.0.1` = nur lokal, `0.0.0.0`/`[::]` = alle Schnittstellen.
+  - `ip -br addr`, `ip route`, `ip route get` für die eigene Maschine; `ss -tulpn` für offene Ports samt Prozess.
+  - `dig` fragt DNS direkt, `getent hosts`/`resolvectl query` gehen den Weg der Programme inklusive `/etc/hosts`.
+  - `curl -I`, `-L`, `-v`, `-X`, `-H`, `-d`, `-o` und in Skripten immer `--fail`.
+  - SSH: ed25519-Schlüssel, `ssh-copy-id`, `~/.ssh/config` mit spezifischen Einträgen vor `Host *`, Agent für die Passphrase, Host-Key-Warnungen erst prüfen, dann handeln.
+  - `-L` öffnet den Port lokal, `-R` auf dem Server; `-J`/`ProxyJump` für Jump Hosts statt `-A`.
+  - rsync: `-avz`, Schrägstrich an der Quelle = Inhalt statt Verzeichnis, `--delete` nur nach `--dry-run`.
+exercises:
+  - id: cidr-verstehen
+    type: choice
+    title: Wer ist im selben Netz?
+    prompt: Dein Laptop hat die Adresse `192.168.178.42/24`, das Gateway ist `192.168.178.1`. Welche Aussagen stimmen?
+    options:
+      - text: "Das Subnetz reicht von `192.168.178.0` bis `192.168.178.255`, weil die ersten 24 Bit das Netz festlegen."
+        correct: true
+        why: Drei Byte (24 Bit) sind fest, das letzte Byte ist frei – 256 Adressen, davon sind die erste (Netz) und die letzte (Broadcast) reserviert.
+      - text: "Pakete an `192.168.178.20` gehen direkt an das Ziel, ohne über das Gateway zu laufen."
+        correct: true
+        why: Das Ziel liegt im eigenen Subnetz. Die Route `192.168.178.0/24 dev …` passt spezifischer als die Default-Route.
+      - text: "Ein Netz `10.0.0.0/8` ist kleiner als ein `/24`-Netz, weil 8 kleiner als 24 ist."
+        correct: false
+        why: Umgekehrt. Weniger Netzbits heißt mehr freie Bits für Hosts – ein `/8` umfasst rund 16,7 Millionen Adressen, ein `/24` nur 256.
+      - text: Das Gateway muss immer die Adresse mit `.1` am Ende haben.
+        correct: false
+        why: "`.1` ist nur eine verbreitete Konvention. Das Gateway kann jede Adresse im Subnetz haben; welche es ist, steht in `ip route` hinter `default via`."
+    explanation: |
+      Die Präfixlänge hinter dem Schrägstrich zählt die festen Netzbits. Alles im selben Präfix ist direkt erreichbar, alles andere geht an das Gateway. Diese Unterscheidung brauchst du ständig: bei Docker-Netzen, VPNs, Cloud-Subnetzen und Firewall-Regeln.
+    resources:
+      - title: RFC 4632 – CIDR
+        url: https://www.rfc-editor.org/rfc/rfc4632.html
+
+  - id: anfrage-weg-ordnen
+    type: order
+    title: Der Weg einer Anfrage
+    prompt: Du führst `curl https://api.shop.example/health` aus. Bring die Schritte in die richtige Reihenfolge.
+    lang: text
+    lines: |
+      curl bittet die C-Bibliothek, den Namen aufzulösen; /etc/nsswitch.conf legt die Quellen fest.
+      Der Resolver prüft /etc/hosts und fragt dann per DNS nach (unter systemd-resolved über 127.0.0.53).
+      Der Kernel wählt anhand der Routing-Tabelle Schnittstelle und Gateway für die Ziel-IP.
+      TCP-Handshake mit Port 443 des Servers (SYN, SYN-ACK, ACK).
+      TLS-Handshake: curl prüft das Zertifikat, beide Seiten handeln Schlüssel aus.
+      curl sendet die HTTP-Anfrage GET /health.
+      curl liest Statuszeile, Header und Body und beendet sich mit Exit-Status 0.
+    explanation: |
+      Ohne Adresse keine Route, ohne Route kein TCP, ohne TCP kein TLS, ohne TLS kein HTTP. Diese Kette ist die Vorlage für die Fehlersuche: `curl -v` zeigt, bis zu welchem Schritt es kommt. Scheitert schon die Namensauflösung, hilft kein Blick in die Firewall; kommt `Connected to` und danach ein TLS-Fehler, ist das Netz in Ordnung.
+    resources:
+      - title: nsswitch.conf(5)
+        url: https://man7.org/linux/man-pages/man5/nsswitch.conf.5.html
+      - title: curl – Handbuchseite
+        url: https://curl.se/docs/manpage.html
+
+  - id: routing-vorhersagen
+    type: output
+    title: Welche Schnittstelle?
+    prompt: |
+      Über welche Schnittstelle schickt der Kernel Pakete an die vier Ziele unten? Gib pro Ziel den Namen der Schnittstelle aus, eine Zeile pro Ziel, in der gegebenen Reihenfolge.
+    lang: console
+    code: |
+      $ ip route
+      default via 192.168.178.1 dev wlan0 proto dhcp src 192.168.178.42 metric 600
+      10.8.0.0/24 dev wg0 proto kernel scope link src 10.8.0.2
+      172.17.0.0/16 dev docker0 proto kernel scope link src 172.17.0.1
+      192.168.178.0/24 dev wlan0 proto kernel scope link src 192.168.178.42 metric 600
+
+      # Ziele:
+      # 10.8.0.15
+      # 192.168.178.20
+      # 140.82.121.4
+      # 172.17.0.5
+    expected: |
+      wg0
+      wlan0
+      wlan0
+      docker0
+    explanation: |
+      Der Kernel nimmt die spezifischste passende Route (längstes Präfix). `10.8.0.15` liegt in `10.8.0.0/24` – das WireGuard-VPN. `192.168.178.20` liegt im lokalen WLAN-Subnetz und wird direkt angesprochen. Für `140.82.121.4` passt keine spezielle Route, also greift `default` über das Gateway auf `wlan0`. `172.17.0.5` ist ein Docker-Container hinter der Bridge `docker0`. Nachprüfen kannst du das mit `ip route get 140.82.121.4`.
+    resources:
+      - title: ip-route(8)
+        url: https://man7.org/linux/man-pages/man8/ip-route.8.html
+
+  - id: rsync-schraegstrich
+    type: output
+    title: Ein Schrägstrich Unterschied
+    prompt: Was gibt dieses Skript aus?
+    lang: bash
+    code: |
+      mkdir -p projekt/css
+      touch projekt/index.html projekt/css/app.css
+      rsync -a projekt ziel1/
+      rsync -a projekt/ ziel2/
+      find ziel1 ziel2 -type f | sort
+    expected: |
+      ziel1/projekt/css/app.css
+      ziel1/projekt/index.html
+      ziel2/css/app.css
+      ziel2/index.html
+    verify: true
+    explanation: |
+      Ohne Schrägstrich am Ende der Quelle überträgt rsync das Verzeichnis `projekt` selbst – es landet als Unterordner in `ziel1/`. Mit Schrägstrich überträgt es den **Inhalt** von `projekt`, also direkt `index.html` und `css/` nach `ziel2/`. Gelesen wird das so: `projekt/` heißt „alles in projekt“. Am Ziel ist der Schrägstrich bedeutungslos.
+    resources:
+      - title: rsync(1) – USAGE
+        url: https://download.samba.org/pub/rsync/rsync.1
+      - title: ArchWiki · rsync – Trailing slash caveat
+        url: https://wiki.archlinux.org/title/Rsync
+
+  - id: ss-tulpn
+    type: command
+    title: Wer lauscht hier?
+    prompt: Zeige alle lauschenden TCP- und UDP-Sockets mit numerischen Ports und dem zugehörigen Prozess – auch für Prozesse anderer Benutzer.
+    context: Du bist auf einem Server als Benutzer mit sudo-Rechten angemeldet und willst wissen, welche Dienste von außen erreichbar sein könnten.
+    answers:
+      - sudo ss -tulpn
+      - sudo ss -tulnp
+      - sudo ss -t -u -l -p -n
+      - sudo ss --tcp --udp --listening --processes --numeric
+    explanation: |
+      `-t` TCP, `-u` UDP, `-l` nur lauschende Sockets, `-p` den Prozess dazu, `-n` Zahlen statt Dienstnamen (also `443` statt `https`). Die Reihenfolge der Buchstaben ist egal. Ohne `sudo` fehlt die Prozessspalte bei Diensten, die anderen Benutzern gehören – und das sind auf Servern fast alle. `netstat -tulpn` aus dem veralteten net-tools-Paket kann dasselbe, ist aber oft gar nicht mehr installiert.
+    resources:
+      - title: ss(8)
+        url: https://man7.org/linux/man-pages/man8/ss.8.html
+
+  - id: curl-header-redirect
+    type: command
+    title: Wohin leitet die Seite weiter?
+    prompt: Rufe von `http://shop.example` **nur die Header** ab und folge dabei allen Weiterleitungen.
+    context: Du willst prüfen, ob HTTP korrekt auf HTTPS und auf `www.` umgeleitet wird, ohne die ganze Seite herunterzuladen.
+    answers:
+      - curl -IL http://shop.example
+      - curl -I -L http://shop.example
+      - curl --head --location http://shop.example
+      - curl --location --head http://shop.example
+      - curl -I --location http://shop.example
+      - curl --head -L http://shop.example
+    output: |
+      HTTP/1.1 301 Moved Permanently
+      Server: nginx
+      Location: https://shop.example/
+
+      HTTP/2 301
+      location: https://www.shop.example/
+
+      HTTP/2 200
+      content-type: text/html; charset=utf-8
+      strict-transport-security: max-age=31536000
+    explanation: |
+      `-I` schickt eine HEAD-Anfrage und zeigt nur Statuszeile und Header. `-L` folgt jedem `Location`-Header. So siehst du die ganze Kette: erst die Umleitung von HTTP auf HTTPS, dann auf `www.`, dann die eigentliche Antwort. Zwei Weiterleitungen statt einer kosten jeden Besucher eine zusätzliche Rundreise – ein typischer Befund in Code-Reviews von nginx-Konfigurationen. Manche Server beantworten HEAD anders als GET; im Zweifel `curl -sSL -o /dev/null -D - URL` nutzen.
+    resources:
+      - title: curl · --location
+        url: https://curl.se/docs/manpage.html#--location
+      - title: curl · --head
+        url: https://curl.se/docs/manpage.html#--head
+
+  - id: ssh-keygen-ed25519
+    type: command
+    title: Dein erster Schlüssel
+    prompt: Erzeuge ein neues SSH-Schlüsselpaar vom Typ **ed25519** mit dem Kommentar `steven@cachyos`. Nimm den vorgeschlagenen Dateinamen.
+    answers:
+      - ssh-keygen -t ed25519 -C steven@cachyos
+      - ssh-keygen -C steven@cachyos -t ed25519
+      - ssh-keygen -t ed25519 -C steven@cachyos -f ~/.ssh/id_ed25519
+      - ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -C steven@cachyos
+    output: |
+      Generating public/private ed25519 key pair.
+      Enter file in which to save the key (/home/steven/.ssh/id_ed25519):
+      Enter passphrase for "/home/steven/.ssh/id_ed25519" (empty for no passphrase):
+      Enter same passphrase again:
+      Your identification has been saved in /home/steven/.ssh/id_ed25519
+      Your public key has been saved in /home/steven/.ssh/id_ed25519.pub
+    explanation: |
+      `-t` wählt den Typ, `-C` setzt einen Kommentar, der am Ende des öffentlichen Schlüssels steht – so erkennst du auf dem Server in `authorized_keys`, zu welchem Gerät ein Schlüssel gehört, und kannst ihn gezielt entfernen, wenn das Gerät verloren geht. Seit OpenSSH 9.5 ist ed25519 ohnehin der Standard; die explizite Angabe macht den Befehl auch auf älteren Systemen eindeutig. Eine Passphrase ist empfehlenswert, der ssh-agent erspart dir das ständige Tippen.
+    resources:
+      - title: ssh-keygen(1)
+        url: https://man.openbsd.org/ssh-keygen.1
+      - title: ArchWiki · SSH keys
+        url: https://wiki.archlinux.org/title/SSH_keys
+
+  - id: host-key-warnung
+    type: choice
+    title: REMOTE HOST IDENTIFICATION HAS CHANGED
+    prompt: |
+      Du willst dich wie jeden Tag mit `ssh staging` verbinden und bekommst:
+
+      ```text
+      @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+      @    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @
+      @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+      IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!
+      Offending ED25519 key in /home/steven/.ssh/known_hosts:7
+      Host key verification failed.
+      ```
+
+      Was tust du?
+    options:
+      - text: Sofort `ssh-keygen -R staging` ausführen und die neue Verbindung bestätigen – der Server wurde bestimmt neu aufgesetzt.
+        correct: false
+        why: Genau so gelingt ein Man-in-the-Middle-Angriff. Du vertraust dem neuen Schlüssel, ohne zu wissen, wem er gehört.
+      - text: Klären, ob der Server neu installiert oder die IP neu vergeben wurde, und den neuen Fingerabdruck über einen unabhängigen Weg prüfen (Web-Konsole des Hosters, Kollegin mit Zugang). Erst dann den alten Eintrag mit `ssh-keygen -R staging` entfernen.
+        correct: true
+        why: Der Fingerabdruck ist der einzige Beweis für die Identität des Servers. Er muss über einen Kanal geprüft werden, den ein Angreifer nicht kontrolliert.
+      - text: "In `~/.ssh/config` für alle Hosts `StrictHostKeyChecking no` eintragen, damit die Warnung nicht mehr stört."
+        correct: false
+        why: Damit schaltest du die Prüfung der Server-Identität für alle Verbindungen ab. Die Verschlüsselung schützt dann nicht mehr davor, mit dem Falschen zu sprechen.
+      - text: Einen neuen eigenen Schlüssel erzeugen, weil der alte offenbar nicht mehr akzeptiert wird.
+        correct: false
+        why: Die Warnung betrifft den Host-Key des **Servers**, nicht deinen Benutzerschlüssel. Ein neuer Schlüssel ändert nichts.
+    explanation: |
+      SSH prüft bei jeder Verbindung, ob der Server denselben Host-Key vorlegt wie beim ersten Mal. Eine Änderung hat harmlose Gründe (Neuinstallation, neue VM mit derselben IP) oder einen gefährlichen (jemand fängt die Verbindung ab). Unterscheiden kannst du das nur, indem du den neuen Fingerabdruck auf einem zweiten Weg prüfst – auf dem Server zeigt ihn `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`.
+    resources:
+      - title: ssh(1) – VERIFYING HOST KEYS
+        url: https://man.openbsd.org/ssh.1
+      - title: ssh-keygen(1) – -R und -l
+        url: https://man.openbsd.org/ssh-keygen.1
+
+  - id: ssh-config-luecken
+    type: gap
+    title: Zwei Server, ein Kurzname
+    prompt: |
+      Ergänze die `~/.ssh/config`. `staging` hat die öffentliche Adresse `203.0.113.10`, du meldest dich dort als `deploy` mit deinem ed25519-Schlüssel an. `db-intern` (`10.0.2.15`) ist nur über `staging` erreichbar; beim Verbinden soll automatisch die dortige PostgreSQL (lauscht auf `127.0.0.1:5432`) auf deinem lokalen Port 5433 erscheinen.
+    lang: text
+    code: |
+      Host staging
+          ⟦HostName⟧ 203.0.113.10
+          User ⟦deploy⟧
+          ⟦IdentityFile⟧ ~/.ssh/id_ed25519
+          IdentitiesOnly yes
+
+      Host db-intern
+          HostName 10.0.2.15
+          User steven
+          ⟦ProxyJump⟧ staging
+          ⟦LocalForward⟧ 5433 localhost:5432
+
+      Host *
+          AddKeysToAgent yes
+    gaps:
+      - label: Echte Adresse
+        hint: Der Kurzname steht hinter `Host`; die tatsächliche Adresse unter einem ähnlichen Schlüsselwort.
+      - label: Benutzer
+        hint: Steht in der Aufgabe.
+      - label: Privater Schlüssel
+        hint: Das Schlüsselwort für die Datei, mit der du dich ausweist.
+      - label: Jump Host
+        hint: Das Gegenstück zu `ssh -J`.
+      - label: Tunnel beim Verbinden
+        hint: Das Gegenstück zu `ssh -L`.
+    explanation: |
+      `Host` ist der Kurzname, `HostName` die echte Adresse. `IdentityFile` zeigt auf den **privaten** Schlüssel. `ProxyJump staging` baut die Verbindung zu `db-intern` durch `staging` hindurch und nutzt dafür automatisch dessen Eintrag mit Benutzer und Schlüssel. `LocalForward 5433 localhost:5432` entspricht `-L 5433:localhost:5432` – `localhost` ist dabei aus Sicht von `db-intern` gemeint. Der Block `Host *` steht am Ende, weil für jede Einstellung der erste gefundene Wert gilt.
+    resources:
+      - title: ssh_config(5) – ProxyJump
+        url: https://man.openbsd.org/ssh_config.5#ProxyJump
+      - title: ssh_config(5) – LocalForward
+        url: https://man.openbsd.org/ssh_config.5#LocalForward
+
+  - id: tunnel-falsche-richtung
+    type: bug
+    title: Der Tunnel steht, psql kommt nicht an
+    prompt: |
+      Das Skript soll die Produktionsdatenbank auf deinem Rechner unter Port 5433 erreichbar machen. Es läuft ohne Fehlermeldung, aber `psql -h localhost -p 5433 shop` meldet auf deinem Laptop:
+
+      ```text
+      psql: error: connection to server at "localhost" (127.0.0.1), port 5433 failed: Connection refused
+      ```
+
+      Auf `db01` zeigt `ss -tlnp` dafür einen neuen Socket auf `127.0.0.1:5433`. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: bash
+    code: |
+      #!/usr/bin/env bash
+      # db-tunnel.sh – Produktions-DB lokal auf Port 5433 erreichbar machen.
+      # PostgreSQL lauscht auf db01 nur auf 127.0.0.1:5432.
+      set -euo pipefail
+      echo "Tunnel läuft. Verbinde dich mit: psql -h localhost -p 5433 shop"
+      ssh -N -R 5433:localhost:5432 steven@db01
+    lines: [6]
+    fix:
+      - line: 6
+        answers:
+          - ssh -N -L 5433:localhost:5432 steven@db01
+          - ssh -L 5433:localhost:5432 -N steven@db01
+          - ssh -N -L 5433:127.0.0.1:5432 steven@db01
+          - ssh -L 5433:127.0.0.1:5432 -N steven@db01
+          - ssh -NL 5433:localhost:5432 steven@db01
+    explanation: |
+      `-R` öffnet den Port auf dem **entfernten** Rechner: Auf `db01` lauscht jetzt `127.0.0.1:5433` und leitet zu Port 5432 **deines Laptops** – dort läuft aber keine Datenbank, und auf deinem Laptop ist Port 5433 gar nicht offen. Gebraucht wird `-L`: Port 5433 öffnet sich lokal, und `db01` verbindet sich aus seiner Sicht mit `localhost:5432`. Merkhilfe: Der Buchstabe sagt, auf welcher Seite der Port aufgeht.
+    resources:
+      - title: ssh(1) – -L
+        url: https://man.openbsd.org/ssh.1#L
+      - title: ssh(1) – -R
+        url: https://man.openbsd.org/ssh.1#R
+
+  - id: deploy-rsync-slash
+    type: bug
+    title: Die Seite zeigt die alte Version
+    prompt: |
+      Nach dem Deploy mit diesem Skript liefert nginx weiterhin die alte Version aus, obwohl der Build neu ist. Auf dem Server findest du ein neues Verzeichnis `/var/www/shop/dist/` mit dem aktuellen Build; die alten Dateien direkt in `/var/www/shop/` sind unverändert. nginx hat `root /var/www/shop;`. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: bash
+    code: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      npm ci
+      npm run build
+      rsync -avz --delete dist deploy@web01:/var/www/shop/
+      ssh deploy@web01 'sudo systemctl reload nginx'
+    lines: [5]
+    fix:
+      - line: 5
+        answers:
+          - rsync -avz --delete dist/ deploy@web01:/var/www/shop/
+          - rsync -avz --delete dist/ deploy@web01:/var/www/shop
+          - rsync -azv --delete dist/ deploy@web01:/var/www/shop/
+          - rsync -avz --delete ./dist/ deploy@web01:/var/www/shop/
+    explanation: |
+      Ohne Schrägstrich hinter `dist` überträgt rsync das Verzeichnis selbst, also entsteht `/var/www/shop/dist/`. Auch `--delete` greift dann nur innerhalb von `dist/` – die alten Dateien eine Ebene höher bleiben liegen und werden weiter ausgeliefert. Mit `dist/` wird der **Inhalt** nach `/var/www/shop/` gespiegelt, und `--delete` entfernt dort veraltete Dateien. Vor der ersten Ausführung einer solchen Zeile gehört ein Lauf mit `--dry-run` dazu.
+    resources:
+      - title: rsync(1)
+        url: https://download.samba.org/pub/rsync/rsync.1
+      - title: ArchWiki · rsync
+        url: https://wiki.archlinux.org/title/Rsync
+
+  - id: ss-ausgabe-erklaeren
+    type: explain
+    title: Was ist hier von außen erreichbar?
+    prompt: Du übernimmst einen Server und führst `ss` aus. Erkläre, welche Dienste von außen erreichbar sind, welche nicht, was davon ein Risiko ist und was du tun würdest.
+    lang: console
+    code: |
+      $ sudo ss -tlnp
+      State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process
+      LISTEN 0      4096   127.0.0.53%lo:53        0.0.0.0:*     users:(("systemd-resolve",pid=512,fd=15))
+      LISTEN 0      128          0.0.0.0:22        0.0.0.0:*     users:(("sshd",pid=801,fd=3))
+      LISTEN 0      511          0.0.0.0:80        0.0.0.0:*     users:(("nginx",pid=1120,fd=6))
+      LISTEN 0      511          0.0.0.0:443       0.0.0.0:*     users:(("nginx",pid=1120,fd=7))
+      LISTEN 0      2048       127.0.0.1:8000      0.0.0.0:*     users:(("gunicorn",pid=2231,fd=5))
+      LISTEN 0      200          0.0.0.0:5432      0.0.0.0:*     users:(("postgres",pid=1822,fd=6))
+      LISTEN 0      128             [::]:22           [::]:*     users:(("sshd",pid=801,fd=4))
+    points:
+      - "`0.0.0.0` und `[::]` bedeuten „alle Schnittstellen“: sshd (22, IPv4 und IPv6) und nginx (80, 443) sind von außen erreichbar – so gewollt."
+      - "`127.0.0.1` bzw. `127.0.0.53` sind nur lokal erreichbar: Gunicorn sitzt korrekt hinter nginx, der DNS-Stub von systemd-resolved dient nur dem Server selbst."
+      - PostgreSQL lauscht auf `0.0.0.0:5432` und ist damit potenziell aus dem Internet erreichbar – das ist das Risiko.
+      - "Abhilfe: `listen_addresses = 'localhost'` in der PostgreSQL-Konfiguration (Zugriff für Admins per SSH-Tunnel) und/oder eine Firewall, die nur 22, 80 und 443 eingehend erlaubt; danach mit `ss` und von außen prüfen."
+      - "`-t` zeigt nur TCP; offene UDP-Ports sieht man erst mit `ss -ulnp`."
+    explanation: |
+      Entscheidend ist die Spalte „Local Address“. Alles auf `0.0.0.0` oder `[::]` nimmt Verbindungen auf jeder Schnittstelle an: sshd auf 22 und nginx auf 80 und 443 – das ist der beabsichtigte Eingang. Gunicorn lauscht nur auf `127.0.0.1:8000`, also kann nur nginx auf demselben Rechner ihn erreichen, genau richtig für einen Reverse Proxy. Der DNS-Stub auf `127.0.0.53` ist ebenfalls lokal. Das Problem ist PostgreSQL auf `0.0.0.0:5432`: Ohne Firewall kann jeder im Internet es erreichen und Passwörter durchprobieren. Ich würde `listen_addresses` auf `localhost` setzen, Admin-Zugriffe per `ssh -L` tunneln und zusätzlich eine Firewall einrichten, die eingehend nur 22, 80 und 443 durchlässt. Weil ich nur TCP angesehen habe, prüfe ich UDP noch mit `ss -ulnp`.
+    resources:
+      - title: ss(8)
+        url: https://man7.org/linux/man-pages/man8/ss.8.html
+      - title: PostgreSQL · listen_addresses
+        url: https://www.postgresql.org/docs/current/runtime-config-connection.html
+
+  - id: ssh-einrichten
+    type: practice
+    title: SSH-Zugang wie im Job einrichten
+    prompt: |
+      Richte für einen Server oder eine VM (zum Beispiel eine Debian-VM in virt-manager oder GNOME Boxes, oder einen günstigen VPS) einen Zugang ein, wie du ihn im Job erwarten würdest:
+
+      1. Erzeuge einen ed25519-Schlüssel mit Passphrase und kommentiertem Gerätenamen.
+      2. Übertrage den öffentlichen Schlüssel auf den Server und prüfe dort die Rechte von `~/.ssh` und `authorized_keys`.
+      3. Lege in `~/.ssh/config` einen Eintrag `lab` an und verbinde dich nur noch mit `ssh lab`.
+      4. Lade den Schlüssel in den ssh-agent, sodass du die Passphrase einmal pro Sitzung eingibst.
+      5. Starte auf dem Server `python3 -m http.server 8000 --bind 127.0.0.1` und rufe die Seite auf deinem Rechner über einen SSH-Tunnel mit `curl` ab.
+      6. Übertrage ein Verzeichnis mit `rsync`: erst mit `--dry-run`, dann echt.
+
+      Notiere die Befehle, die du verwendet hast.
+    lang: console
+    solution: |
+      $ ssh-keygen -t ed25519 -C "steven@cachyos"
+      $ ssh-copy-id -i ~/.ssh/id_ed25519.pub steven@192.168.122.50
+      $ ssh steven@192.168.122.50 'ls -ld ~/.ssh ~/.ssh/authorized_keys'
+      drwx------ 2 steven steven 4096 Sep 28 19:02 /home/steven/.ssh
+      -rw------- 1 steven steven  96 Sep 28 19:02 /home/steven/.ssh/authorized_keys
+      $ cat >> ~/.ssh/config
+      Host lab
+          HostName 192.168.122.50
+          User steven
+          IdentityFile ~/.ssh/id_ed25519
+          IdentitiesOnly yes
+          AddKeysToAgent yes
+      ^D
+      $ ssh-add ~/.ssh/id_ed25519
+      Identity added: /home/steven/.ssh/id_ed25519 (steven@cachyos)
+      $ ssh-add -l
+      256 SHA256:… steven@cachyos (ED25519)
+      $ ssh lab 'python3 -m http.server 8000 --bind 127.0.0.1' &
+      $ ssh -N -L 8080:localhost:8000 lab &
+      $ curl -sS http://localhost:8080/ | head -3
+      <!DOCTYPE HTML>
+      <html lang="en">
+      <head>
+      $ rsync -avz --dry-run ~/Notizen/ lab:~/notizen-backup/
+      $ rsync -avz ~/Notizen/ lab:~/notizen-backup/
+    checklist:
+      - Der private Schlüssel ist mit einer Passphrase geschützt und hat die Rechte `600`; nur die `.pub`-Datei hat deinen Rechner verlassen.
+      - Auf dem Server hat `~/.ssh` die Rechte `700` und `authorized_keys` die Rechte `600`.
+      - "`ssh lab` funktioniert ohne Angabe von Adresse, Benutzer oder Schlüssel."
+      - "`ssh-add -l` zeigt deinen Schlüssel, und weitere Verbindungen fragen nicht mehr nach der Passphrase."
+      - Der HTTP-Server ist auf dem Server nur an `127.0.0.1` gebunden und trotzdem über `-L` von deinem Rechner erreichbar.
+      - Du hast die `--dry-run`-Ausgabe gelesen, bevor du rsync echt ausgeführt hast, und kannst erklären, warum die Quelle mit `/` endet.
+    explanation: |
+      Diese Abfolge ist der Alltag, wenn du einen neuen Server bekommst. Der Schlüssel bleibt privat und mit Passphrase geschützt, der Agent nimmt dir das Tippen ab. Die `config` macht aus Adressen Namen, die auch `rsync`, `scp` und Git verstehen. Der Tunnel zeigt das wichtigste Prinzip für interne Dienste: Sie lauschen nur auf `127.0.0.1`, und du erreichst sie trotzdem – verschlüsselt und ohne offenen Port. Bei Problemen hilft `ssh -v lab`: Es zeigt, welche Konfiguration gelesen, welcher Schlüssel angeboten und warum er abgelehnt wurde. Die Härtung des SSH-Servers selbst (Passwort-Login abschalten, root-Login verbieten) folgt im Modul zu Sicherheit.
+    resources:
+      - title: ArchWiki · OpenSSH
+        url: https://wiki.archlinux.org/title/OpenSSH
+      - title: ssh-add(1)
+        url: https://man.openbsd.org/ssh-add.1

@@ -21,7 +21,7 @@ pnpm dev            # http://127.0.0.1:5180
 | `pnpm verify [bereich]` | Python-Übungen und -Beispiele ausführen, Rust kompilieren, Ausgaben vergleichen |
 | `pnpm links [bereich]` | Alle externen Links und Anker prüfen |
 | `pnpm test` | Unit-Tests (Prüflogik, Speicher, Bear-Rekonstruktion, Inhalte) |
-| `pnpm test:e2e` | Browser-Tests mit Playwright gegen den Beispielbereich und den Bear-Track |
+| `pnpm test:e2e` | Browser-Tests aller Lernbereiche, neun Übungsarten, Python-Laufzeit, Lernstand und Bear-Track |
 | `pnpm build` | TypeScript prüfen und statisch nach `dist/` bauen |
 | `pnpm bear:build`, `pnpm bear:check` | Bear-Track aus dem gepinnten Snapshot erzeugen bzw. prüfen |
 | `pnpm screenshots /pfad@390 …` | Screenshots gegen den laufenden Dev-Server |
@@ -63,7 +63,7 @@ Pro Bereich ein Eintrag `learn:<bereich>:v1` im `localStorage`: gelöste Übunge
 Vercel-Projekt `learning-platform` im Team `kiumu`, verbunden mit diesem Repository. `main` wird automatisch gebaut (`pnpm build`) und unter https://learn.kiumu.app veröffentlicht. `vercel.json` enthält das SPA-Routing, Cache- und Sicherheits-Header. Die gepinnte pnpm-Version wird über Corepack genutzt (`ENABLE_EXPERIMENTAL_COREPACK=1`).
 
 ```sh
-PLAYWRIGHT_BASE_URL=https://learn.kiumu.app pnpm test:e2e e2e/kotlin-bear.spec.ts
+PLAYWRIGHT_BASE_URL=https://learn.kiumu.app pnpm test:e2e e2e/learning-paths.spec.ts e2e/kotlin-bear.spec.ts --workers=3
 ```
 
 ## Herkunft

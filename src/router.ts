@@ -14,7 +14,9 @@ export type Page<R extends Route = any> = (main: HTMLElement, route: R) => Promi
 
 const SEGMENT = /^[a-z0-9-]+$/;
 export function parseRoute(pathname: string): Route {
-  const parts = pathname.replace(/\/+$/, '').split('/').filter(Boolean).map(decodeURIComponent);
+  let parts: string[];
+  try { parts = pathname.replace(/\/+$/, '').split('/').filter(Boolean).map(decodeURIComponent); }
+  catch { return { name: 'not-found' }; }
   if (!parts.length) return { name: 'home' };
   if (parts.some((part) => !SEGMENT.test(part))) return { name: 'not-found' };
   const [area, second, third] = parts;
@@ -30,18 +32,23 @@ export function parseRoute(pathname: string): Route {
 let onChange: (scroll: () => void) => Promise<void> = async () => {};
 const scrollFor = (hash: string, preserve?: number) => () => {
   if (preserve !== undefined) { window.scrollTo(0, preserve); return; }
-  const target = hash ? document.getElementById(decodeURIComponent(hash.slice(1))) : null;
+  const target = hashTarget(hash);
   if (target) target.scrollIntoView();
   else window.scrollTo(0, 0);
   const heading = document.querySelector<HTMLElement>('main h1');
   if (!target && heading) { heading.setAttribute('tabindex', '-1'); heading.focus({ preventScroll: true }); }
 };
 
+function hashTarget(hash: string): HTMLElement | null {
+  try { return hash ? document.getElementById(decodeURIComponent(hash.slice(1))) : null; }
+  catch { return null; }
+}
+
 export function navigate(path: string, options: { replace?: boolean; keepScroll?: boolean } = {}): void {
   const url = new URL(path, location.href);
   if (url.pathname === location.pathname && url.hash && !options.replace) {
     history.pushState(null, '', url);
-    document.getElementById(decodeURIComponent(url.hash.slice(1)))?.scrollIntoView();
+    hashTarget(url.hash)?.scrollIntoView();
     return;
   }
   if (options.replace) history.replaceState(null, '', url); else history.pushState(null, '', url);

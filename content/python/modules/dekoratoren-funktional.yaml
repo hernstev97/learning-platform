@@ -1,0 +1,1125 @@
+id: dekoratoren-funktional
+title: Dekoratoren & funktionale Werkzeuge
+level: 2
+minutes: 150
+summary: Closures, Dekoratoren mit und ohne Argumente, functools und eigene Context Manager – die Werkzeuge hinter jedem `@` in FastAPI, pytest und Co.
+goals:
+  - Du erklärst, was eine Closure einfängt, und vermeidest den Late-Binding-Fehler in Schleifen.
+  - Du schreibst Dekoratoren mit und ohne Argumente, die Rückgabewerte und Metadaten (`functools.wraps`) erhalten.
+  - Du sagst voraus, in welcher Reihenfolge gestapelte Dekoratoren angewendet werden und laufen.
+  - Du setzt `cache`/`lru_cache`, `partial`, `reduce` und `singledispatch` gezielt ein und kennst ihre Fallen.
+  - Du schreibst Context Manager als Klasse und mit `@contextmanager`, die auch bei Exceptions aufräumen.
+resources:
+  - title: Sprachreferenz · Function definitions (Dekoratoren)
+    url: https://docs.python.org/3/reference/compound_stmts.html#function-definitions
+  - title: functools – Higher-order functions
+    url: https://docs.python.org/3/library/functools.html
+  - title: contextlib – Utilities for with-statement contexts
+    url: https://docs.python.org/3/library/contextlib.html
+  - title: Functional Programming HOWTO
+    url: https://docs.python.org/3/howto/functional.html
+  - title: PEP 318 – Decorators for Functions and Methods
+    url: https://peps.python.org/pep-0318/
+lesson: |
+  In fast jedem Python-Projekt stehen Zeilen mit `@` über Funktionen: `@app.get("/nutzer")` in FastAPI, `@pytest.fixture` in Tests, `@dataclass` über Klassen, `@lru_cache` über teuren Berechnungen. Früher oder später willst du selbst so etwas schreiben. Etwa weil fünf Funktionen, die eine externe API aufrufen, bei Netzwerkfehlern dreimal wiederholen sollen – und du diese Logik nicht fünfmal kopieren willst.
+
+  Das `@` ist kein Sonderfall der Sprache. Es baut auf drei Ideen auf: Funktionen sind Objekte, innere Funktionen merken sich ihre Umgebung (Closures), und `@` ist eine Kurzschreibweise für einen Funktionsaufruf. Mit diesen drei Ideen liest du auch `functools` und Context Manager ohne Mühe.
+
+  ## Funktionen sind Objekte
+
+  `def` erzeugt ein Funktionsobjekt und bindet es an einen Namen – so wie `x = 5` ein `int`-Objekt an `x` bindet. Du kannst eine Funktion deshalb einer anderen Variable zuweisen, in ein Dictionary legen, als Argument übergeben und aus einer Funktion zurückgeben. Funktionen, die Funktionen annehmen oder zurückgeben, heißen **Higher-Order Functions**. `sorted(..., key=...)` kennst du schon.
+
+  ```python run
+  def starte(dienst: str) -> str:
+      return f"{dienst} gestartet"
+
+  def stoppe(dienst: str) -> str:
+      return f"{dienst} gestoppt"
+
+  # Dispatch-Tabelle statt if/elif-Kette
+  befehle = {"start": starte, "stop": stoppe}
+  print(befehle["start"]("nginx"))
+  print(starte.__name__, type(starte).__name__)
+
+  laufzeiten_ms = {"api": 312, "worker": 45, "db": 1201}
+  print(sorted(laufzeiten_ms, key=laufzeiten_ms.get))   # Funktion als Argument
+  ```
+
+  Halte zwei Dinge auseinander: `starte` ist das Funktionsobjekt, `starte("nginx")` ist ein Aufruf und damit sein Ergebnis. Wer `key=laufzeiten_ms.get()` schreibt, übergibt ein Ergebnis statt einer Funktion. Genau diese Verwechslung begegnet dir bei Dekoratoren wieder.
+
+  ## Closures: Funktionen mit Gedächtnis
+
+  Eine Funktion, die in einer anderen Funktion definiert ist, kann auf deren Variablen zugreifen – auch nachdem die äußere Funktion längst zurückgekehrt ist. Die Kombination aus Funktion und eingefangenen Variablen heißt **Closure**.
+
+  ```python run
+  def mache_zaehler(start: int = 0):
+      stand = start
+
+      def weiter() -> int:
+          nonlocal stand      # ohne diese Zeile: UnboundLocalError
+          stand += 1
+          return stand
+
+      return weiter
+
+  anfragen = mache_zaehler()
+  fehler = mache_zaehler(100)
+  print(anfragen(), anfragen(), fehler())
+  print(anfragen.__closure__[0].cell_contents)
+  ```
+
+  Das Denkmodell: Jeder Aufruf von `mache_zaehler` erzeugt einen neuen Satz lokaler Variablen. Die innere Funktion hält eine Referenz auf die **Variable** `stand` (CPython legt dafür eine sogenannte *Cell* an), nicht auf ihren Wert zum Zeitpunkt der Definition. Deshalb haben `anfragen` und `fehler` getrennte Zähler, und deshalb sieht die innere Funktion jede spätere Änderung.
+
+  Lesen darf die innere Funktion die äußere Variable ohne Weiteres. Sobald sie ihr aber etwas zuweist (`stand += 1`), behandelt der Compiler `stand` als lokale Variable der inneren Funktion. `stand += 1` liest dann eine lokale Variable, die noch keinen Wert hat, und Python wirft `UnboundLocalError`. [`nonlocal`](https://docs.python.org/3/reference/simple_stmts.html#the-nonlocal-statement) sagt dem Compiler, dass die Zuweisung die Variable der umschließenden Funktion meint. Die Regeln dahinter stehen unter [Naming and binding](https://docs.python.org/3/reference/executionmodel.html#naming-and-binding) in der Sprachreferenz.
+
+  > [!WARNING] Späte Bindung in Schleifen
+  > Weil Closures Variablen einfangen und keine Werte, liefern Funktionen, die in einer Schleife entstehen, alle denselben Wert:
+  >
+  > ```python
+  > handler = [lambda: f"Knopf {i}" for i in range(3)]
+  > print([h() for h in handler])   # ['Knopf 2', 'Knopf 2', 'Knopf 2']
+  > ```
+  >
+  > Alle drei Lambdas lesen `i` erst beim Aufruf, und dann steht `i` auf 2. Abhilfe: den aktuellen Wert als Default-Argument einfrieren (`lambda i=i: …` – Default-Werte wertet Python bei der Definition aus) oder `functools.partial` nutzen. Die [Programming FAQ](https://docs.python.org/3/faq/programming.html#why-do-lambdas-defined-in-a-loop-with-different-values-all-return-the-same-result) beschreibt genau diesen Fall.
+
+  ## Dekoratoren: `@` ist ein Funktionsaufruf
+
+  Ein Dekorator ist eine Funktion, die eine Funktion bekommt und etwas zurückgibt, das an ihre Stelle tritt. Meist ist das eine neue Funktion, die die alte umhüllt – der **Wrapper**. Die [Sprachreferenz](https://docs.python.org/3/reference/compound_stmts.html#function-definitions) definiert `@` als Kurzschreibweise:
+
+  ```python
+  @protokolliere
+  def lade_nutzer(nutzer_id): ...
+
+  # entspricht (bis auf ein Detail: der Name ist nie an das undekorierte Original gebunden)
+  def lade_nutzer(nutzer_id): ...
+  lade_nutzer = protokolliere(lade_nutzer)
+  ```
+
+  Ein vollständiger Dekorator mit allem, was in echtem Code dazugehört:
+
+  ```python run
+  import functools
+  import time
+
+  def protokolliere(func):
+      print(f"dekoriere {func.__name__}")          # läuft EINMAL, bei der Definition
+
+      @functools.wraps(func)
+      def wrapper(*args, **kwargs):
+          start = time.perf_counter()
+          ergebnis = func(*args, **kwargs)          # Originalfunktion aus der Closure
+          dauer_ms = (time.perf_counter() - start) * 1000
+          print(f"{func.__name__}{args} -> {ergebnis!r} ({dauer_ms:.2f} ms)")
+          return ergebnis                           # Ergebnis durchreichen!
+      return wrapper
+
+  @protokolliere
+  def lade_nutzer(nutzer_id: int) -> dict:
+      """Lädt einen Nutzer aus der Datenbank."""
+      return {"id": nutzer_id, "name": "Ada"}
+
+  lade_nutzer(42)
+  lade_nutzer(7)
+  print(lade_nutzer.__name__, "|", lade_nutzer.__doc__)
+  ```
+
+  Drei Dinge musst du an diesem Beispiel verstanden haben:
+
+  1. **Zwei Zeitpunkte.** Der Körper von `protokolliere` läuft einmal, wenn Python die `def`-Anweisung ausführt – bei Modulcode also beim Import. Der Körper von `wrapper` läuft bei jedem Aufruf von `lade_nutzer`. Frameworks nutzen den ersten Zeitpunkt: `@app.get("/nutzer")` trägt die Funktion beim Import in eine Routing-Tabelle ein.
+  2. **`*args, **kwargs` und `return`.** Der Wrapper kennt die Signatur der dekorierten Funktion nicht. Mit `*args, **kwargs` nimmt er alles an und reicht es unverändert weiter. Das Ergebnis muss er mit `return` zurückgeben, sonst liefert jede dekorierte Funktion `None`.
+  3. **`functools.wraps`.** Ohne ihn hieße `lade_nutzer` danach `wrapper` und hätte keinen Docstring. [`functools.wraps`](https://docs.python.org/3/library/functools.html#functools.wraps) kopiert Name, qualifizierten Namen, Modul, Docstring und Annotationen vom Original auf den Wrapper und setzt `__wrapped__` auf die Originalfunktion. Das ist mehr als Kosmetik. Tracebacks und Logs zeigen den richtigen Namen, und [`inspect.signature`](https://docs.python.org/3/library/inspect.html#inspect.signature) folgt `__wrapped__`. Werkzeuge wie pytest und FastAPI lesen Parameter über diese Funktion – ohne `wraps` sehen sie nur `(*args, **kwargs)`.
+
+  ## Dekoratoren mit Argumenten und gestapelte Dekoratoren
+
+  `@wiederhole(versuche=3)` sieht aus wie ein Dekorator mit Argument. Genau gelesen ist der Ausdruck hinter `@` ein Aufruf, und erst dessen **Ergebnis** ist der Dekorator, der die Funktion bekommt. Deshalb braucht man drei Ebenen:
+
+  ```python run
+  import functools
+
+  def wiederhole(versuche: int, ausnahmen: tuple[type[Exception], ...] = (ConnectionError,)):
+      def dekorator(func):                           # Ebene 2: bekommt die Funktion
+          @functools.wraps(func)
+          def wrapper(*args, **kwargs):              # Ebene 3: läuft bei jedem Aufruf
+              for versuch in range(1, versuche + 1):
+                  try:
+                      return func(*args, **kwargs)
+                  except ausnahmen as fehler:
+                      print(f"Versuch {versuch} fehlgeschlagen: {fehler}")
+                      if versuch == versuche:
+                          raise
+          return wrapper
+      return dekorator                               # Ebene 1 liefert den Dekorator
+
+  antworten = iter([ConnectionError("Timeout"), ConnectionError("Reset"), {"status": "ok"}])
+
+  @wiederhole(versuche=3)          # hole_status = wiederhole(versuche=3)(hole_status)
+  def hole_status() -> dict:
+      antwort = next(antworten)
+      if isinstance(antwort, Exception):
+          raise antwort
+      return antwort
+
+  print(hole_status())
+  ```
+
+  In echtem Code gehört zwischen die Versuche eine Pause mit wachsendem Abstand (Exponential Backoff). Das Prinzip bleibt gleich.
+
+  Mehrere Dekoratoren wendet Python **von unten nach oben** an: Der Dekorator direkt über `def` kommt zuerst dran, der oberste zuletzt. Beim Aufruf läuft es umgekehrt – der äußerste Wrapper beginnt:
+
+  ```python
+  @authentifiziere        # 2. umhüllt das Ergebnis von 1 → läuft beim Aufruf zuerst
+  @protokolliere          # 1. umhüllt die Originalfunktion
+  def loesche_nutzer(nutzer_id): ...
+
+  # entspricht:
+  loesche_nutzer = authentifiziere(protokolliere(loesche_nutzer))
+  ```
+
+  Die Reihenfolge hat Folgen. Hier protokolliert `protokolliere` nur Aufrufe, die die Authentifizierung überstanden haben. Stehen die beiden andersherum, landen auch abgewiesene Versuche im Log.
+
+  Dekoratoren funktionieren auch über Klassen. Ein **Klassen-Dekorator** bekommt die fertige Klasse und gibt eine Klasse zurück – meist dieselbe, ergänzt um Methoden. [`@dataclass`](https://docs.python.org/3/library/dataclasses.html#dataclasses.dataclass) erzeugt so `__init__`, `__repr__` und `__eq__`, [`functools.total_ordering`](https://docs.python.org/3/library/functools.html#functools.total_ordering) ergänzt fehlende Vergleichsoperatoren. Ein häufiges eigenes Muster ist eine Registrierung:
+
+  ```python run
+  EXPORTER: dict[str, type] = {}
+
+  def exporter(format_name: str):
+      def registriere(cls: type) -> type:
+          EXPORTER[format_name] = cls
+          return cls              # Klasse unverändert zurückgeben
+      return registriere
+
+  @exporter("csv")
+  class CsvExport:
+      def schreibe(self, zeilen): ...
+
+  @exporter("json")
+  class JsonExport:
+      def schreibe(self, zeilen): ...
+
+  print(sorted(EXPORTER))
+  print(EXPORTER["csv"].__name__)
+  ```
+
+  > [!INTERVIEW] „Schreib einen Dekorator, der die Laufzeit misst.“
+  > Eine der häufigsten Live-Coding-Fragen für Python-Stellen. Eine gute Antwort zeigt ohne Nachfrage: `*args, **kwargs` im Wrapper, `return` des Ergebnisses, `@functools.wraps` und [`time.perf_counter()`](https://docs.python.org/3/library/time.html#time.perf_counter) statt `time.time()` (hohe Auflösung, springt nicht, wenn jemand die Systemuhr stellt). Wer danach erklärt, dass `@timer` nur `f = timer(f)` ist, und eine Variante mit Argumenten skizziert, hat die Frage vollständig beantwortet.
+
+  ## functools: Caching, partial, reduce, singledispatch
+
+  Das Modul [`functools`](https://docs.python.org/3/library/functools.html) enthält fertige Higher-Order Functions. Vier davon begegnen dir ständig.
+
+  ### `cache` und `lru_cache`
+
+  [`@functools.lru_cache(maxsize=128)`](https://docs.python.org/3/library/functools.html#functools.lru_cache) speichert Ergebnisse in einem Dictionary, dessen Schlüssel aus den Argumenten entsteht (Memoization). Ein zweiter Aufruf mit denselben Argumenten liefert das gespeicherte Ergebnis, ohne die Funktion auszuführen. Ist der Cache voll, fliegt der am längsten nicht benutzte Eintrag raus (*least recently used*). [`@functools.cache`](https://docs.python.org/3/library/functools.html#functools.cache) ist dasselbe ohne Größenbegrenzung.
+
+  ```python run
+  from functools import cache
+
+  @cache
+  def wege(n: int) -> int:
+      """Auf wie viele Arten kommst du mit 1er- und 2er-Schritten n Stufen hoch?"""
+      return 1 if n < 2 else wege(n - 1) + wege(n - 2)
+
+  print(wege(80))
+  print(wege.cache_info())
+  ```
+
+  Ohne Cache bräuchte `wege(80)` Billionen Aufrufe, mit Cache sind es 81 Berechnungen. Aus dem Mechanismus – ein Dictionary mit den Argumenten als Schlüssel – folgen die Fallen:
+
+  - **Argumente müssen hashbar sein.** Eine Liste als Argument führt zu `TypeError: unhashable type: 'list'`. Übergib ein Tupel oder ein `frozenset`.
+  - **Das Ergebnis ist geteilt.** Gibt die Funktion eine Liste zurück und ein Aufrufer hängt etwas an, bekommt der nächste Aufrufer die veränderte Liste aus dem Cache.
+  - **Nur für reine Funktionen.** Hängt das Ergebnis von der Uhrzeit, einer Datenbank oder einer Datei ab, liefert der Cache veraltete Werte, bis du `cache_clear()` aufrufst. Eine Ablaufzeit kennt `lru_cache` nicht.
+  - **Vorsicht bei Methoden.** Auf einer Methode ist `self` Teil des Schlüssels. Der Cache hängt an der Funktion in der Klasse und hält jede Instanz am Leben, bis ihr Eintrag verdrängt wird. Die [Programming FAQ](https://docs.python.org/3/faq/programming.html#how-do-i-cache-method-calls) vergleicht die Alternativen, etwa [`functools.cached_property`](https://docs.python.org/3/library/functools.html#functools.cached_property) für Methoden ohne Argumente.
+
+  ### `partial`, `reduce` und `singledispatch`
+
+  [`partial`](https://docs.python.org/3/library/functools.html#functools.partial) belegt Argumente einer Funktion vor und liefert ein neues aufrufbares Objekt. Das liest sich besser als ein Lambda und bindet Werte sofort – späte Bindung kann nicht passieren.
+
+  [`reduce`](https://docs.python.org/3/library/functools.html#functools.reduce) faltet eine Folge mit einer Funktion aus zwei Argumenten zu einem Wert zusammen: `reduce(f, [a, b, c])` ist `f(f(a, b), c)`. Für Summen, Maxima und Verkettungen sind `sum`, `max`, `math.prod` und `"".join` klarer. Ohne Startwert wirft `reduce` bei einer leeren Folge `TypeError`, gib ihn deshalb fast immer an.
+
+  [`singledispatch`](https://docs.python.org/3/library/functools.html#functools.singledispatch) macht aus einer Funktion eine **generische Funktion**, die je nach Typ des ersten Arguments eine andere Implementierung aufruft. Anders als eine `isinstance`-Kette lässt sie sich von außen erweitern, ohne die ursprüngliche Funktion anzufassen:
+
+  ```python run
+  import json
+  from datetime import date
+  from decimal import Decimal
+  from functools import partial, reduce, singledispatch
+  from operator import mul
+
+  @singledispatch
+  def als_json(obj):
+      raise TypeError(f"{type(obj).__name__} ist nicht JSON-serialisierbar")
+
+  @als_json.register
+  def _(obj: date) -> str:          # Typ kommt aus der Annotation
+      return obj.isoformat()
+
+  @als_json.register
+  def _(obj: Decimal) -> str:
+      return str(obj)
+
+  rechnung = {"datum": date(2026, 9, 28), "betrag": Decimal("19.99")}
+  print(json.dumps(rechnung, default=als_json))
+
+  kompakt = partial(json.dumps, separators=(",", ":"), default=als_json)
+  print(kompakt(rechnung))
+  print(reduce(mul, [2, 3, 4], 1))
+  ```
+
+  ## Context Manager selbst schreiben
+
+  `with` garantiert Aufräumarbeit: Datei schließen, Lock freigeben, Transaktion abschließen – auch wenn im Block eine Exception fliegt. Jedes Objekt mit den Methoden [`__enter__` und `__exit__`](https://docs.python.org/3/reference/datamodel.html#context-managers) kann hinter `with` stehen. Den genauen Ablauf beschreibt die [Sprachreferenz zu `with`](https://docs.python.org/3/reference/compound_stmts.html#the-with-statement):
+
+  1. Python ruft `__enter__()` auf und bindet den Rückgabewert an den Namen hinter `as`.
+  2. Der Block läuft.
+  3. Python ruft `__exit__(exc_type, exc, tb)` **immer** auf. Ohne Exception sind alle drei Argumente `None`, mit Exception bekommt `__exit__` Typ, Objekt und Traceback.
+  4. Gibt `__exit__` einen wahren Wert zurück, gilt die Exception als behandelt und verschwindet. Sonst fliegt sie weiter.
+
+  ```python run
+  class Transaktion:
+      def __init__(self, log: list[str]):
+          self.log = log
+
+      def __enter__(self):
+          self.log.append("BEGIN")
+          return self
+
+      def __exit__(self, exc_type, exc, tb):
+          self.log.append("ROLLBACK" if exc_type else "COMMIT")
+          return False                     # Exceptions nicht verschlucken
+
+  log: list[str] = []
+  with Transaktion(log):
+      log.append("UPDATE konto SET saldo = saldo - 50")
+
+  try:
+      with Transaktion(log):
+          raise ValueError("Saldo negativ")
+  except ValueError as fehler:
+      print("Fehler:", fehler)
+
+  print(log)
+  ```
+
+  Für die meisten Fälle ist eine Klasse zu viel. [`contextlib.contextmanager`](https://docs.python.org/3/library/contextlib.html#contextlib.contextmanager) macht aus einer Generatorfunktion einen Context Manager: Alles vor `yield` entspricht `__enter__`, der Wert von `yield` landet hinter `as`, alles danach entspricht `__exit__`.
+
+  ```python run
+  import time
+  from contextlib import contextmanager
+
+  @contextmanager
+  def stoppuhr(name: str):
+      start = time.perf_counter()
+      try:
+          yield                      # hier läuft der with-Block
+      finally:                       # läuft auch, wenn der Block eine Exception wirft
+          print(f"{name}: {time.perf_counter() - start:.4f} s")
+
+  with stoppuhr("Summe"):
+      summe = sum(range(100_000))
+  ```
+
+  Das `try`/`finally` ist Pflicht, sobald Aufräumen zählt. Wirft der `with`-Block eine Exception, löst `contextmanager` sie im Generator an der Stelle des `yield` erneut aus. Ohne `finally` läuft der Code nach `yield` dann nicht – die Datei bleibt offen, das Lock gesperrt.
+
+  Zwei fertige Helfer aus `contextlib` solltest du kennen. [`suppress(FileNotFoundError)`](https://docs.python.org/3/library/contextlib.html#contextlib.suppress) ignoriert genau die genannten Exceptions; setze es sparsam ein, denn was verschluckt ist, taucht in keinem Log auf. [`ExitStack`](https://docs.python.org/3/library/contextlib.html#contextlib.ExitStack) verwaltet eine erst zur Laufzeit bekannte Zahl von Context Managern, etwa eine Liste von Dateien, die alle gleichzeitig offen sein müssen.
+
+  ## map, filter, Comprehensions und operator
+
+  [`map`](https://docs.python.org/3/library/functions.html#map) wendet eine Funktion auf jedes Element an, [`filter`](https://docs.python.org/3/library/functions.html#filter) behält die Elemente, für die eine Funktion wahr liefert. Beide geben **Iteratoren** zurück: Sie rechnen erst, wenn jemand die Werte abholt, und lassen sich nur einmal durchlaufen. List Comprehensions und Generator Expressions sind meist lesbarer, weil Ausdruck und Bedingung an einer Stelle stehen.
+
+  ```python run
+  from dataclasses import dataclass
+  from operator import attrgetter, itemgetter
+
+  zeilen = [" 200 ", "404", " 500", "200 "]
+  codes = list(map(int, map(str.strip, zeilen)))   # map mit vorhandenen Funktionen: gut lesbar
+  fehler = [c for c in codes if c >= 400]           # Bedingung + Ausdruck: Comprehension
+  print(codes, fehler)
+
+  quadrate = map(lambda c: c * c, codes)            # map + lambda: Comprehension wäre klarer
+  print(sum(quadrate), sum(quadrate))               # zweiter Durchlauf: Iterator ist leer
+
+  @dataclass
+  class Nutzer:
+      name: str
+      alter: int
+
+  team = [Nutzer("Grace", 45), Nutzer("Linus", 28), Nutzer("Ada", 36)]
+  print([n.name for n in sorted(team, key=attrgetter("alter"))])
+  bestellungen = [("Ada", 120), ("Linus", 80), ("Grace", 200)]
+  print(max(bestellungen, key=itemgetter(1)))
+  ```
+
+  Faustregel: `map` mit einer vorhandenen Funktion (`map(str.strip, zeilen)`) ist in Ordnung. `map` oder `filter` mit `lambda` schreibst du besser als Comprehension. Das [Functional Programming HOWTO](https://docs.python.org/3/howto/functional.html) vertieft den Vergleich.
+
+  Das Modul [`operator`](https://docs.python.org/3/library/operator.html) liefert Operatoren als Funktionen: `operator.add` und `operator.mul` für `reduce`, vor allem aber [`itemgetter`](https://docs.python.org/3/library/operator.html#operator.itemgetter) und [`attrgetter`](https://docs.python.org/3/library/operator.html#operator.attrgetter) als Sortierschlüssel. `itemgetter("alter")` tut dasselbe wie `lambda x: x["alter"]`. Mit mehreren Schlüsseln – `itemgetter("abteilung", "name")` – liefert es Tupel und damit eine Sortierung nach zwei Kriterien.
+
+  ## Häufige Fehler
+
+  - **Wrapper ohne `return`.** Symptom: Seit dem Dekorator liefert die Funktion `None`. Der Wrapper ruft `func(...)` auf, gibt das Ergebnis aber nicht zurück.
+  - **`wraps` vergessen.** In Logs und Tracebacks heißt jede Funktion `wrapper`, und Werkzeuge, die Parameter auslesen, sehen nur `(*args, **kwargs)`.
+  - **Klammern verwechselt.** `@wiederhole` ohne Klammern übergibt die Funktion als `versuche`. Der Fehler zeigt sich erst beim ersten Aufruf, meist als verwirrender `TypeError`.
+  - **Späte Bindung.** Callbacks aus einer Schleife benutzen alle den letzten Wert. Binde ihn mit Default-Argument oder `partial`.
+  - **`lru_cache` mit Listen als Argument oder auf Methoden.** Das erste endet in `TypeError: unhashable type`, das zweite in wachsendem Speicher bei langlebigen Prozessen.
+  - **`@contextmanager` ohne `try`/`finally`.** Das Aufräumen fällt genau dann aus, wenn es am nötigsten ist – bei einer Exception.
+  - **Iterator zweimal benutzt.** Der zweite Durchlauf über ein `map`-Objekt ist leer, ohne Fehlermeldung.
+
+  > [!PRAXIS] Wo dir das im Job begegnet
+  > In Web-Backends registrieren Dekoratoren Routen (`@app.get`), prüfen Berechtigungen und öffnen Datenbank-Sessions. Die [FastAPI-Dokumentation](https://fastapi.tiangolo.com/advanced/settings/#creating-the-settings-only-once-with-lru-cache) legt `@lru_cache` über eine Funktion `get_settings()`, damit die Konfiguration nur einmal aus Umgebungsvariablen gelesen wird. pytest-Fixtures mit `yield` folgen demselben Muster wie `@contextmanager`: Vorbereitung vor `yield`, Aufräumen danach. Im Code-Review fällt ein fehlendes `@wraps` sofort auf – ebenso ein `@lru_cache` auf einer Methode einer Klasse, von der ständig neue Instanzen entstehen.
+
+  > [!MERKE]
+  > `@d` über `def f` heißt `f = d(f)`. Der Dekorator läuft einmal bei der Definition, der Wrapper bei jedem Aufruf.
+
+  ## Zusammenfassung
+
+  - Funktionen sind Objekte: Du kannst sie speichern, übergeben und zurückgeben.
+  - Eine Closure fängt Variablen der umgebenden Funktion ein, keine Werte. Zum Zuweisen braucht sie `nonlocal`; in Schleifen droht späte Bindung.
+  - `@d` ist `f = d(f)`, `@d(x)` ist `f = d(x)(f)` – deshalb haben Dekoratoren mit Argumenten drei Ebenen.
+  - Gestapelte Dekoratoren wirken von unten nach oben; beim Aufruf läuft der oberste Wrapper zuerst.
+  - Ein guter Wrapper nimmt `*args, **kwargs`, gibt das Ergebnis zurück und trägt `@functools.wraps`.
+  - `cache` und `lru_cache` brauchen hashbare Argumente und reine Funktionen; auf Methoden halten sie Instanzen am Leben.
+  - `__exit__` läuft immer. Mit `@contextmanager` gehört das Aufräumen in `finally`.
+  - Comprehensions statt `map`/`filter` mit `lambda`; `itemgetter` und `attrgetter` als Sortierschlüssel.
+exercises:
+  - id: was-bewirkt-das-at
+    type: choice
+    title: Was passiert beim @?
+    prompt: Welche Aussagen über diesen Code stimmen?
+    lang: python
+    code: |
+      import functools
+
+      def timer(func):
+          @functools.wraps(func)
+          def wrapper(*args, **kwargs):
+              # ... Zeit messen ...
+              return func(*args, **kwargs)
+          return wrapper
+
+      @timer
+      def berechne_rechnung(kunde_id: int) -> float: ...
+    options:
+      - text: "`berechne_rechnung = timer(berechne_rechnung)` läuft genau einmal – wenn Python die `def`-Anweisung ausführt."
+        correct: true
+        why: "`@timer` ist eine Kurzschreibweise für diese Zuweisung direkt nach der Definition. Bei Modulcode passiert das beim Import."
+      - text: "`timer` wird bei jedem Aufruf von `berechne_rechnung` erneut aufgerufen."
+        correct: false
+        why: Bei jedem Aufruf läuft `wrapper`. `timer` hat seine Arbeit mit dem Zurückgeben des Wrappers erledigt.
+      - text: Nach der Dekoration zeigt der Name `berechne_rechnung` auf den Wrapper; die Originalfunktion ist über die Closure und `__wrapped__` erreichbar.
+        correct: true
+        why: "`timer` gibt `wrapper` zurück, und das steht danach unter dem Namen. `functools.wraps` setzt zusätzlich `__wrapped__` auf das Original."
+      - text: Ohne `@functools.wraps` würde die dekorierte Funktion nicht mehr funktionieren.
+        correct: false
+        why: Sie funktioniert, verliert aber ihre Metadaten. `__name__` wäre dann `wrapper`, der Docstring fehlt, und `inspect.signature` sieht nur `(*args, **kwargs)`.
+    explanation: |
+      Ein Dekorator ist ein gewöhnlicher Funktionsaufruf zur Definitionszeit: `f = timer(f)`. Was `timer` zurückgibt, ersetzt die Funktion unter ihrem Namen. Der Dekorator selbst läuft einmal, der Wrapper bei jedem Aufruf. `functools.wraps` ist keine Voraussetzung für die Funktion, aber für Debugging, Logs und Werkzeuge, die Signaturen auslesen.
+    resources:
+      - title: Sprachreferenz · Function definitions
+        url: https://docs.python.org/3/reference/compound_stmts.html#function-definitions
+      - title: functools.wraps
+        url: https://docs.python.org/3/library/functools.html#functools.wraps
+
+  - id: stoppuhr-zusammenbauen
+    type: order
+    title: Ein Timing-Dekorator
+    prompt: |
+      Bring die Zeilen in die richtige Reihenfolge, sodass ein Dekorator `stoppuhr` entsteht. Er misst die Laufzeit, gibt sie aus und reicht das Ergebnis der Funktion zurück. `functools` und `time` sind bereits importiert.
+    lang: python
+    lines: |
+      def stoppuhr(func):
+          @functools.wraps(func)
+          def wrapper(*args, **kwargs):
+              start = time.perf_counter()
+              ergebnis = func(*args, **kwargs)
+              dauer = time.perf_counter() - start
+              print(f"{func.__name__}: {dauer:.3f} s")
+              return ergebnis
+          return wrapper
+    hints:
+      - Der Dekorator `@functools.wraps(func)` steht direkt über der Funktion, die er markiert.
+      - Der äußere Dekorator gibt am Ende den Wrapper zurück, der Wrapper gibt das Ergebnis zurück.
+    explanation: |
+      Die Startzeit muss vor dem Aufruf stehen, die Dauer danach. `return ergebnis` kommt zuletzt im Wrapper, sonst würde die Ausgabe nie erreicht. `return wrapper` steht auf der Ebene von `stoppuhr` und liefert die neue Funktion, die an die Stelle der alten tritt. `perf_counter` ist die Uhr für Laufzeitmessungen: hohe Auflösung und unabhängig davon, ob jemand die Systemuhr stellt.
+    resources:
+      - title: time.perf_counter
+        url: https://docs.python.org/3/library/time.html#time.perf_counter
+
+  - id: zaehler-closures
+    type: output
+    title: Wer zählt hier mit?
+    prompt: Was gibt dieses Programm aus?
+    lang: python
+    code: |
+      def mache_zaehler(start=0):
+          stand = start
+          def weiter():
+              nonlocal stand
+              stand += 1
+              return stand
+          return weiter
+
+      a = mache_zaehler()
+      b = mache_zaehler(10)
+      c = a
+      print(a(), a(), b())
+      print(c(), b(), a())
+    expected: |
+      1 2 11
+      3 12 4
+    hints:
+      - Jeder Aufruf von `mache_zaehler` erzeugt eine neue Variable `stand`.
+      - "`c = a` kopiert keine Funktion, sondern bindet einen zweiten Namen an dasselbe Objekt."
+    explanation: |
+      `a` und `b` stammen aus zwei Aufrufen von `mache_zaehler` und haben deshalb je ihre eigene eingefangene Variable `stand` (0 und 10). `c = a` erzeugt keine neue Closure, sondern einen zweiten Namen für dieselbe Funktion – `c()` zählt also den Zähler von `a` weiter. Ohne `nonlocal` würde schon der erste Aufruf mit `UnboundLocalError` scheitern.
+    resources:
+      - title: Die nonlocal-Anweisung
+        url: https://docs.python.org/3/reference/simple_stmts.html#the-nonlocal-statement
+      - title: Naming and binding
+        url: https://docs.python.org/3/reference/executionmodel.html#naming-and-binding
+
+  - id: stapel-reihenfolge
+    type: output
+    title: Zwei Dekoratoren übereinander
+    prompt: Was gibt dieses Programm aus? Achte auf **wann** und **mit welchem Namen** etwas ausgegeben wird.
+    lang: python
+    code: |
+      def markiere(zeichen):
+          def dekorator(func):
+              print(f"dekoriere {func.__name__} mit {zeichen}")
+              def wrapper():
+                  return zeichen + func() + zeichen
+              return wrapper
+          return dekorator
+
+      @markiere("*")
+      @markiere("_")
+      def titel():
+          return "Bericht"
+
+      print("--- Aufruf ---")
+      print(titel())
+    expected: |
+      dekoriere titel mit _
+      dekoriere wrapper mit *
+      --- Aufruf ---
+      *_Bericht_*
+    hints:
+      - "Schreib die Dekoratoren als Zuweisung aus: `titel = markiere(\"*\")(markiere(\"_\")(titel))`."
+      - Der innere Wrapper hat kein `functools.wraps`.
+    explanation: |
+      Python wendet den unteren Dekorator zuerst an: `markiere("_")` bekommt die echte Funktion `titel`. Der obere bekommt danach deren **Wrapper** – und weil kein `functools.wraps` die Metadaten kopiert, heißt dieser `wrapper`. Beide Ausgaben entstehen bei der Definition, vor `--- Aufruf ---`. Beim Aufruf läuft der äußere Wrapper zuerst und umschließt das Ergebnis des inneren: `*` + `_Bericht_` + `*`.
+    resources:
+      - title: Sprachreferenz · Function definitions
+        url: https://docs.python.org/3/reference/compound_stmts.html#function-definitions
+
+  - id: exit-verschluckt
+    type: output
+    title: Wann verschwindet eine Exception?
+    prompt: Was gibt dieses Programm aus?
+    lang: python
+    code: |
+      class Protokoll:
+          def __init__(self, name):
+              self.name = name
+
+          def __enter__(self):
+              print(f"betrete {self.name}")
+              return self
+
+          def __exit__(self, exc_type, exc, tb):
+              status = exc_type.__name__ if exc_type else "ok"
+              print(f"verlasse {self.name}: {status}")
+              return exc_type is KeyError
+
+      with Protokoll("a"):
+          print("im Block")
+
+      with Protokoll("b"):
+          {}["fehlt"]
+          print("nie")
+      print("weiter")
+
+      try:
+          with Protokoll("c"):
+              raise ValueError("kaputt")
+      except ValueError as fehler:
+          print(f"gefangen: {fehler}")
+    expected: |
+      betrete a
+      im Block
+      verlasse a: ok
+      betrete b
+      verlasse b: KeyError
+      weiter
+      betrete c
+      verlasse c: ValueError
+      gefangen: kaputt
+    hints:
+      - "`__exit__` läuft in jedem Fall. Entscheidend ist, was es zurückgibt."
+    explanation: |
+      `__exit__` läuft nach jedem Block, egal wie er endet. Im Fall `b` bricht der `KeyError` den Block ab (`nie` erscheint nicht); `__exit__` gibt `True` zurück, also gilt die Exception als behandelt und das Programm läuft nach dem `with` weiter. Im Fall `c` gibt `__exit__` `False` zurück, der `ValueError` fliegt weiter bis zum `except`. Ein Context Manager, der pauschal `True` zurückgibt, verschluckt jeden Fehler – das ist fast immer ein Bug.
+    resources:
+      - title: Datenmodell · With Statement Context Managers
+        url: https://docs.python.org/3/reference/datamodel.html#context-managers
+      - title: Die with-Anweisung
+        url: https://docs.python.org/3/reference/compound_stmts.html#the-with-statement
+
+  - id: limit-dekorator
+    type: gap
+    title: Ein Dekorator mit Argument und Gedächtnis
+    prompt: |
+      `begrenze(max_aufrufe)` soll verhindern, dass eine Funktion öfter als erlaubt aufgerufen wird – etwa ein SMS-Versand, der pro Prozess höchstens dreimal laufen darf. Ergänze die vier Lücken.
+    lang: python
+    code: |
+      import functools
+
+      def begrenze(max_aufrufe):
+          def dekorator(func):
+              aufrufe = 0
+
+              ⟦@functools.wraps(func)⟧
+              def wrapper(*args, **kwargs):
+                  ⟦nonlocal aufrufe⟧
+                  if aufrufe >= max_aufrufe:
+                      raise RuntimeError(f"{func.__name__}: Limit {max_aufrufe} erreicht")
+                  aufrufe += 1
+                  return func(*args, **kwargs)
+
+              return ⟦wrapper⟧
+          return ⟦dekorator⟧
+
+      @begrenze(max_aufrufe=3)
+      def sende_sms(nummer: str, text: str) -> None:
+          ...
+    gaps:
+      - label: Metadaten übernehmen
+        hint: Ein Dekorator aus `functools`, der Name und Docstring kopiert.
+      - label: Zähler schreiben dürfen
+        hint: "`aufrufe += 1` weist zu. Welche Anweisung erlaubt das für eine Variable der umschließenden Funktion?"
+      - label: Rückgabe von dekorator
+        hint: Was soll an die Stelle von `sende_sms` treten?
+      - label: Rückgabe von begrenze
+        hint: "`begrenze(max_aufrufe=3)` muss etwas liefern, das man auf eine Funktion anwenden kann."
+    explanation: |
+      Drei Ebenen: `begrenze(3)` liefert `dekorator`, `dekorator(sende_sms)` liefert `wrapper`, und `wrapper` läuft bei jedem Aufruf. `aufrufe` liegt in `dekorator`, also gibt es pro dekorierter Funktion einen eigenen Zähler. Weil `wrapper` ihm etwas zuweist, braucht es `nonlocal` – sonst wäre `aufrufe` lokal in `wrapper` und `aufrufe >= max_aufrufe` würde mit `UnboundLocalError` scheitern.
+    resources:
+      - title: functools.wraps
+        url: https://docs.python.org/3/library/functools.html#functools.wraps
+      - title: Die nonlocal-Anweisung
+        url: https://docs.python.org/3/reference/simple_stmts.html#the-nonlocal-statement
+
+  - id: operator-partial
+    type: gap
+    title: Sortieren, falten, vorbelegen
+    prompt: Ergänze die Lücken mit Werkzeugen aus `operator` und `functools`, ohne `lambda` zu benutzen.
+    lang: python
+    code: |
+      import json
+      from functools import partial, reduce
+      from operator import itemgetter, mul
+
+      bestellungen = [
+          {"kunde": "Ada", "abteilung": "IT", "betrag": 120},
+          {"kunde": "Linus", "abteilung": "IT", "betrag": 80},
+          {"kunde": "Grace", "abteilung": "HR", "betrag": 200},
+      ]
+      # nach Abteilung und innerhalb der Abteilung nach Betrag sortieren
+      sortiert = sorted(bestellungen, key=⟦itemgetter("abteilung", "betrag")⟧)
+
+      # alle Faktoren multiplizieren; bei leerer Liste soll 1 herauskommen
+      faktoren = [1.19, 0.9]
+      gesamt = reduce(⟦mul⟧, faktoren, ⟦1⟧)
+
+      # json.dumps mit festen Optionen vorbelegen
+      kompakt = ⟦partial⟧(json.dumps, separators=(",", ":"), ensure_ascii=False)
+      print(kompakt(sortiert[0]))
+    gaps:
+      - label: Sortierschlüssel
+        hint: "`itemgetter` mit zwei Schlüsseln liefert ein Tupel."
+        accept: ["itemgetter('abteilung', 'betrag')"]
+      - label: Funktion für reduce
+        hint: Der Operator `*` als Funktion aus dem Modul `operator`.
+      - label: Startwert
+        hint: Das neutrale Element der Multiplikation.
+        accept: ["1.0"]
+      - label: Vorbelegen
+        hint: Belegt Argumente einer Funktion im Voraus.
+    explanation: |
+      `itemgetter("abteilung", "betrag")` liefert für jede Bestellung das Tupel `(abteilung, betrag)`; Tupel vergleicht Python elementweise, also entsteht eine Sortierung nach zwei Kriterien. `reduce(mul, faktoren, 1)` rechnet `(1 * 1.19) * 0.9`; der Startwert sorgt dafür, dass eine leere Liste `1` ergibt statt `TypeError`. `partial` liefert eine neue Funktion, bei der die Keyword-Argumente fest eingetragen sind.
+    resources:
+      - title: operator.itemgetter
+        url: https://docs.python.org/3/library/operator.html#operator.itemgetter
+      - title: functools.reduce
+        url: https://docs.python.org/3/library/functools.html#functools.reduce
+      - title: functools.partial
+        url: https://docs.python.org/3/library/functools.html#functools.partial
+
+  - id: aufrufe-zaehlen
+    type: code
+    title: Aufrufe zählen
+    prompt: |
+      Schreibe einen Dekorator `zaehle_aufrufe`, der mitzählt, wie oft die dekorierte Funktion aufgerufen wurde. Der Zähler steht im Attribut `aufrufe` der dekorierten Funktion und beginnt bei `0`.
+
+      Sonst soll sich die Funktion verhalten wie vorher: gleiche Argumente (auch Keyword-Argumente), gleicher Rückgabewert, gleicher `__name__` und Docstring.
+    lang: python
+    starter: |
+      import functools
+
+      def zaehle_aufrufe(func):
+          ...
+    solution: |
+      import functools
+
+      def zaehle_aufrufe(func):
+          @functools.wraps(func)
+          def wrapper(*args, **kwargs):
+              wrapper.aufrufe += 1
+              return func(*args, **kwargs)
+
+          wrapper.aufrufe = 0
+          return wrapper
+    tests:
+      - name: Argumente und Rückgabewert bleiben erhalten
+        code: |
+          @zaehle_aufrufe
+          def brutto(netto, *, steuersatz=0.19):
+              return round(netto * (1 + steuersatz), 2)
+
+          assert brutto is not None, "Der Dekorator gibt nichts zurück – fehlt `return wrapper`?"
+          ergebnis = brutto(100, steuersatz=0.07)
+          assert ergebnis == 107.0, f"erwartet 107.0, bekommen {ergebnis!r} – gibt der Wrapper das Ergebnis zurück?"
+      - name: Zählt jeden Aufruf
+        code: |
+          @zaehle_aufrufe
+          def ping():
+              return "pong"
+
+          assert getattr(ping, "aufrufe", None) == 0, "Vor dem ersten Aufruf soll `ping.aufrufe` 0 sein."
+          for _ in range(3):
+              ping()
+          assert ping.aufrufe == 3, f"nach drei Aufrufen erwartet 3, bekommen {ping.aufrufe!r}"
+      - name: Jede Funktion hat ihren eigenen Zähler
+        code: |
+          @zaehle_aufrufe
+          def lade():
+              return 1
+
+          @zaehle_aufrufe
+          def speichere():
+              return 2
+
+          lade(); lade(); speichere()
+          assert (lade.aufrufe, speichere.aufrufe) == (2, 1), f"erwartet (2, 1), bekommen {(lade.aufrufe, speichere.aufrufe)!r}"
+      - name: Name und Docstring bleiben erhalten
+        code: |
+          @zaehle_aufrufe
+          def lade_konfig():
+              """Liest die Konfiguration."""
+
+          assert lade_konfig.__name__ == "lade_konfig", f"__name__ ist {lade_konfig.__name__!r} – fehlt functools.wraps?"
+          assert lade_konfig.__doc__ == "Liest die Konfiguration."
+          assert hasattr(lade_konfig, "__wrapped__"), "functools.wraps setzt __wrapped__ auf das Original."
+    hints:
+      - Funktionen sind Objekte – du kannst dem Wrapper ein Attribut geben, z. B. `wrapper.aufrufe = 0`.
+      - Im Wrapper erreichst du den Zähler über `wrapper.aufrufe`; `nonlocal` brauchst du dafür nicht.
+    explanation: |
+      Der Zähler hängt als Attribut am Wrapper, denn der Wrapper ist es, der nach der Dekoration unter dem Namen der Funktion steht. Weil `wrapper.aufrufe += 1` ein Attribut ändert und keine Variable neu bindet, ist kein `nonlocal` nötig. Wichtig ist die Reihenfolge: `functools.wraps` aktualisiert `__dict__` des Wrappers mit dem der Originalfunktion, deshalb setzt die Lösung `aufrufe` erst danach. `*args, **kwargs` und `return` sorgen dafür, dass sich die Funktion von außen nicht verändert.
+    resources:
+      - title: functools.wraps
+        url: https://docs.python.org/3/library/functools.html#functools.wraps
+      - title: functools.update_wrapper
+        url: https://docs.python.org/3/library/functools.html#functools.update_wrapper
+
+  - id: wiederholen
+    type: code
+    title: Retry-Dekorator
+    prompt: |
+      Schreibe den Dekorator `wiederhole(versuche, ausnahmen=(ConnectionError,))`:
+
+      - Wirft die dekorierte Funktion eine Exception aus `ausnahmen`, ruft der Wrapper sie erneut auf – insgesamt höchstens `versuche`-mal.
+      - Klappt auch der letzte Versuch nicht, fliegt die Exception des letzten Versuchs weiter.
+      - Andere Exceptions fliegen sofort weiter, ohne Wiederholung.
+      - Rückgabewert und `__name__` bleiben erhalten.
+    lang: python
+    starter: |
+      import functools
+
+      def wiederhole(versuche, ausnahmen=(ConnectionError,)):
+          ...
+    solution: |
+      import functools
+
+      def wiederhole(versuche, ausnahmen=(ConnectionError,)):
+          def dekorator(func):
+              @functools.wraps(func)
+              def wrapper(*args, **kwargs):
+                  for versuch in range(1, versuche + 1):
+                      try:
+                          return func(*args, **kwargs)
+                      except ausnahmen:
+                          if versuch == versuche:
+                              raise
+              return wrapper
+          return dekorator
+    tests:
+      - name: Erfolg nach zwei Fehlschlägen
+        code: |
+          aufrufe = []
+
+          @wiederhole(versuche=3)
+          def hole_kurs(waehrung):
+              aufrufe.append(waehrung)
+              if len(aufrufe) < 3:
+                  raise ConnectionError("Timeout")
+              return 1.08
+
+          ergebnis = hole_kurs("USD")
+          assert ergebnis == 1.08, f"erwartet 1.08, bekommen {ergebnis!r}"
+          assert len(aufrufe) == 3, f"erwartet 3 Aufrufe, gezählt {len(aufrufe)}"
+      - name: Gibt nach versuche Aufrufen auf
+        code: |
+          aufrufe = []
+
+          @wiederhole(versuche=4)
+          def immer_offline():
+              aufrufe.append(1)
+              raise ConnectionError(f"Versuch {len(aufrufe)}")
+
+          try:
+              immer_offline()
+          except ConnectionError as fehler:
+              assert str(fehler) == "Versuch 4", f"Die letzte Exception soll weiterfliegen, bekommen: {fehler}"
+          else:
+              raise AssertionError("Nach dem letzten Versuch muss die ConnectionError weiterfliegen.")
+          assert len(aufrufe) == 4, f"erwartet 4 Aufrufe, gezählt {len(aufrufe)}"
+      - name: Andere Exceptions ohne Wiederholung
+        code: |
+          aufrufe = []
+
+          @wiederhole(versuche=3)
+          def kaputte_eingabe():
+              aufrufe.append(1)
+              raise ValueError("ungültige Währung")
+
+          try:
+              kaputte_eingabe()
+          except ValueError:
+              pass
+          else:
+              raise AssertionError("ValueError muss weiterfliegen.")
+          assert len(aufrufe) == 1, f"ValueError darf nicht wiederholt werden – {len(aufrufe)} Aufrufe"
+      - name: Eigene Ausnahmen-Liste
+        code: |
+          aufrufe = []
+
+          @wiederhole(versuche=2, ausnahmen=(TimeoutError,))
+          def langsam():
+              aufrufe.append(1)
+              if len(aufrufe) == 1:
+                  raise TimeoutError()
+              return "ok"
+
+          assert langsam() == "ok"
+          assert len(aufrufe) == 2
+      - name: Name bleibt erhalten
+        code: |
+          @wiederhole(versuche=2)
+          def synchronisiere():
+              return None
+
+          assert synchronisiere.__name__ == "synchronisiere", f"__name__ ist {synchronisiere.__name__!r}"
+    hints:
+      - "Drei Ebenen: `wiederhole(...)` gibt `dekorator` zurück, `dekorator(func)` gibt `wrapper` zurück."
+      - "`except ausnahmen:` funktioniert mit einem Tupel von Exception-Klassen."
+      - Ein nacktes `raise` im `except`-Block wirft die gerade behandelte Exception erneut.
+    explanation: |
+      `wiederhole(versuche=3)` wird zuerst ausgewertet und liefert den Dekorator, der dann die Funktion bekommt. `except ausnahmen` fängt nur die übergebenen Klassen, alles andere fliegt ohne Umweg weiter. Das nackte `raise` im letzten Versuch wirft die Original-Exception mit Traceback erneut. `return` im `try` beendet die Schleife beim ersten Erfolg. In Produktion käme zwischen die Versuche eine wachsende Pause, damit ein überlasteter Dienst nicht zusätzlich belastet wird.
+    resources:
+      - title: Die try-Anweisung
+        url: https://docs.python.org/3/reference/compound_stmts.html#the-try-statement
+      - title: Sprachreferenz · Function definitions
+        url: https://docs.python.org/3/reference/compound_stmts.html#function-definitions
+
+  - id: umgebung-reparieren
+    type: code
+    title: Repariere den Umgebungs-Context-Manager
+    prompt: |
+      Für Tests setzt `umgebungsvariablen(**werte)` Umgebungsvariablen für die Dauer eines `with`-Blocks und soll danach den alten Zustand herstellen. Zwei Fehlerberichte aus dem Team:
+
+      1. Schlägt ein Test im `with`-Block fehl, bleiben die Testwerte in `os.environ` stehen und verseuchen die folgenden Tests.
+      2. Variablen, die es vorher nicht gab, sind auch nach einem erfolgreichen Block noch gesetzt.
+
+      Repariere die Funktion. Exceptions aus dem Block sollen weiterhin beim Aufrufer ankommen.
+    lang: python
+    starter: |
+      import os
+      from contextlib import contextmanager
+
+      @contextmanager
+      def umgebungsvariablen(**werte: str):
+          """Setzt Umgebungsvariablen für die Dauer des with-Blocks."""
+          vorher = {name: os.environ.get(name) for name in werte}
+          os.environ.update(werte)
+          yield
+          for name, alter_wert in vorher.items():
+              if alter_wert is not None:
+                  os.environ[name] = alter_wert
+    solution: |
+      import os
+      from contextlib import contextmanager
+
+      @contextmanager
+      def umgebungsvariablen(**werte: str):
+          """Setzt Umgebungsvariablen für die Dauer des with-Blocks."""
+          vorher = {name: os.environ.get(name) for name in werte}
+          os.environ.update(werte)
+          try:
+              yield
+          finally:
+              for name, alter_wert in vorher.items():
+                  if alter_wert is None:
+                      os.environ.pop(name, None)
+                  else:
+                      os.environ[name] = alter_wert
+    tests:
+      - name: Setzt die Werte im Block
+        code: |
+          import os
+          os.environ["LERN_DB_URL"] = "sqlite:///prod.db"
+          os.environ.pop("LERN_DEBUG", None)
+          with umgebungsvariablen(LERN_DB_URL="sqlite:///:memory:", LERN_DEBUG="1"):
+              assert os.environ["LERN_DB_URL"] == "sqlite:///:memory:"
+              assert os.environ["LERN_DEBUG"] == "1"
+      - name: Stellt alte Werte wieder her
+        code: |
+          import os
+          os.environ["LERN_DB_URL"] = "sqlite:///prod.db"
+          with umgebungsvariablen(LERN_DB_URL="sqlite:///:memory:"):
+              pass
+          assert os.environ["LERN_DB_URL"] == "sqlite:///prod.db", f"nach dem Block: {os.environ.get('LERN_DB_URL')!r}"
+      - name: Entfernt Variablen, die vorher fehlten
+        code: |
+          import os
+          os.environ.pop("LERN_DEBUG", None)
+          with umgebungsvariablen(LERN_DEBUG="1"):
+              pass
+          assert "LERN_DEBUG" not in os.environ, "LERN_DEBUG gab es vorher nicht – nach dem Block muss sie wieder weg sein."
+      - name: Räumt auch nach einer Exception auf
+        code: |
+          import os
+          os.environ["LERN_DB_URL"] = "sqlite:///prod.db"
+          os.environ.pop("LERN_DEBUG", None)
+          try:
+              with umgebungsvariablen(LERN_DB_URL="sqlite:///:memory:", LERN_DEBUG="1"):
+                  raise RuntimeError("Test schlägt fehl")
+          except RuntimeError:
+              pass
+          assert os.environ.get("LERN_DB_URL") == "sqlite:///prod.db", f"LERN_DB_URL nach Exception: {os.environ.get('LERN_DB_URL')!r}"
+          assert "LERN_DEBUG" not in os.environ, "LERN_DEBUG ist nach der Exception noch gesetzt."
+      - name: Exceptions kommen beim Aufrufer an
+        code: |
+          import os
+          angekommen = False
+          try:
+              with umgebungsvariablen(LERN_DEBUG="1"):
+                  raise KeyError("fehlt")
+          except KeyError:
+              angekommen = True
+          assert angekommen, "Der Context Manager darf die Exception nicht verschlucken."
+          os.environ.pop("LERN_DEBUG", None)
+    hints:
+      - Wirft der Block eine Exception, taucht sie im Generator an der Stelle von `yield` auf. Was läuft dann noch?
+      - "`try: yield` mit `finally:` für das Aufräumen."
+      - "`os.environ.pop(name, None)` entfernt eine Variable, ohne bei Fehlen zu scheitern."
+    explanation: |
+      `contextmanager` wirft eine Exception aus dem `with`-Block im Generator an der Stelle des `yield` erneut. Ohne `try`/`finally` bricht der Generator dort ab, und der Code nach `yield` läuft nie – das war Fehler 1. Ein `finally` ohne `except` verschluckt nichts, die Exception fliegt nach dem Aufräumen weiter. Fehler 2: `os.environ.get` liefert `None` für fehlende Variablen, und genau diese Fälle muss das Aufräumen mit `pop` entfernen, statt sie zu überspringen. pytest bringt für diesen Zweck `monkeypatch.setenv` mit, das nach demselben Prinzip arbeitet.
+    resources:
+      - title: contextlib.contextmanager
+        url: https://docs.python.org/3/library/contextlib.html#contextlib.contextmanager
+      - title: os.environ
+        url: https://docs.python.org/3/library/os.html#os.environ
+
+  - id: json-singledispatch
+    type: code
+    title: JSON für Rechnungen
+    prompt: |
+      Eine API soll Rechnungen als JSON ausliefern, aber `json.dumps` kennt weder `date` noch `Decimal` noch Mengen. Ergänze die generische Funktion `als_json`, die du als `json.dumps(..., default=als_json)` übergibst:
+
+      - `date` und `datetime` → ISO-String (`"2026-10-01"` bzw. `"2026-09-28T14:30:00"`)
+      - `Decimal` → String, damit keine Rundungsfehler durch `float` entstehen
+      - `set` und `frozenset` → sortierte Liste
+      - alles andere → `TypeError` (ist schon da)
+
+      Nutze `@als_json.register`, keine `isinstance`-Kette.
+    lang: python
+    starter: |
+      import json
+      from datetime import date, datetime
+      from decimal import Decimal
+      from functools import singledispatch
+
+      @singledispatch
+      def als_json(obj):
+          raise TypeError(f"{type(obj).__name__} ist nicht JSON-serialisierbar")
+
+      # Registriere hier die Implementierungen.
+    solution: |
+      import json
+      from datetime import date, datetime
+      from decimal import Decimal
+      from functools import singledispatch
+
+      @singledispatch
+      def als_json(obj):
+          raise TypeError(f"{type(obj).__name__} ist nicht JSON-serialisierbar")
+
+      @als_json.register
+      def _(obj: date) -> str:          # deckt auch datetime ab (Unterklasse)
+          return obj.isoformat()
+
+      @als_json.register
+      def _(obj: Decimal) -> str:
+          return str(obj)
+
+      @als_json.register
+      def _(obj: set | frozenset) -> list:
+          return sorted(obj)
+    tests:
+      - name: Datum
+        code: |
+          ergebnis = json.dumps({"faellig": date(2026, 10, 1)}, default=als_json)
+          assert ergebnis == '{"faellig": "2026-10-01"}', ergebnis
+      - name: Zeitpunkt
+        code: |
+          ergebnis = json.dumps({"erstellt": datetime(2026, 9, 28, 14, 30)}, default=als_json)
+          assert ergebnis == '{"erstellt": "2026-09-28T14:30:00"}', ergebnis
+      - name: Decimal als String
+        code: |
+          ergebnis = json.dumps({"betrag": Decimal("19.99")}, default=als_json)
+          assert ergebnis == '{"betrag": "19.99"}', ergebnis
+      - name: Mengen als sortierte Liste
+        code: |
+          assert json.dumps({"tags": {"b", "a", "c"}}, default=als_json) == '{"tags": ["a", "b", "c"]}'
+          assert json.dumps(frozenset({3, 1}), default=als_json) == "[1, 3]"
+      - name: Unbekannte Typen lösen TypeError aus
+        code: |
+          class Kunde:
+              pass
+
+          try:
+              als_json(Kunde())
+          except TypeError as fehler:
+              assert "Kunde" in str(fehler), f"Meldung soll den Typ nennen: {fehler}"
+          else:
+              raise AssertionError("Für unbekannte Typen muss TypeError fliegen.")
+    hints:
+      - "`@als_json.register` über einer Funktion mit annotiertem ersten Parameter registriert sie für diesen Typ."
+      - "`datetime` ist eine Unterklasse von `date`. Brauchst du wirklich zwei Registrierungen?"
+      - "Seit Python 3.11 akzeptiert `register` auch Union-Typen wie `set | frozenset`."
+    explanation: |
+      `singledispatch` wählt die Implementierung anhand der Klasse des ersten Arguments und folgt dabei der Vererbung (MRO). Deshalb deckt eine Registrierung für `date` auch `datetime` ab, und `obj.isoformat()` ruft dann die passende Methode der Unterklasse auf. Die Basisfunktion ist der Rückfall für alle nicht registrierten Typen. Der Vorteil gegenüber einer `isinstance`-Kette: Ein anderes Modul kann eigene Typen mit `@als_json.register` hinzufügen, ohne diese Datei anzufassen.
+    resources:
+      - title: functools.singledispatch
+        url: https://docs.python.org/3/library/functools.html#functools.singledispatch
+      - title: json.dumps und default
+        url: https://docs.python.org/3/library/json.html#json.dumps
+
+  - id: wrapper-ohne-return
+    type: bug
+    title: Der Dekorator frisst das Ergebnis
+    prompt: |
+      Seit `@protokolliere` über `lade_nutzer` steht, bekommt jeder Aufrufer `None` zurück. Die Logzeile erscheint korrekt, und ohne Dekorator liefert `lade_nutzer` ein Dictionary. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: python
+    code: |
+      import functools
+      import logging
+
+      log = logging.getLogger("api")
+
+      def protokolliere(func):
+          @functools.wraps(func)
+          def wrapper(*args, **kwargs):
+              log.info("Aufruf %s%r", func.__name__, args)
+              func(*args, **kwargs)
+          return wrapper
+
+      @protokolliere
+      def lade_nutzer(nutzer_id: int) -> dict:
+          return {"id": nutzer_id, "name": "Ada"}
+    lines: [10]
+    fix:
+      - line: 10
+        answers: ["return func(*args, **kwargs)"]
+    explanation: |
+      Nach der Dekoration steht unter `lade_nutzer` der Wrapper. Er ruft das Original auf, wirft dessen Ergebnis aber weg; eine Funktion ohne `return` liefert `None`. Richtig ist `return func(*args, **kwargs)`. Solche Fehler fallen oft erst spät auf, weil die Logzeile beweist, dass „alles läuft“ – ein Test, der den Rückgabewert einer dekorierten Funktion prüft, fängt ihn sofort.
+    resources:
+      - title: Sprachreferenz · Function definitions
+        url: https://docs.python.org/3/reference/compound_stmts.html#function-definitions
+
+  - id: callbacks-schleife
+    type: bug
+    title: Alle Alarme landen per SMS
+    prompt: |
+      `handler["email"]("Server down")` soll `[email] Server down` liefern, gibt aber `[sms] Server down` zurück. Auch `handler["slack"]` sendet per SMS. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: python
+    code: |
+      import functools
+
+      def sende(kanal: str, nachricht: str) -> str:
+          return f"[{kanal}] {nachricht}"
+
+      handler = {}
+      for kanal in ["email", "slack", "sms"]:
+          handler[kanal] = lambda nachricht: sende(kanal, nachricht)
+
+      print(handler["email"]("Server down"))
+    lines: [8]
+    fix:
+      - line: 8
+        answers:
+          - "handler[kanal] = functools.partial(sende, kanal)"
+          - "handler[kanal] = lambda nachricht, kanal=kanal: sende(kanal, nachricht)"
+          - "handler[kanal] = lambda nachricht, k=kanal: sende(k, nachricht)"
+    hints:
+      - Wann liest das Lambda den Wert von `kanal` – bei der Definition oder beim Aufruf?
+    explanation: |
+      Das Lambda fängt die **Variable** `kanal` ein, nicht ihren Wert. Aufgerufen wird es erst nach der Schleife, und da steht `kanal` auf `"sms"`. `functools.partial(sende, kanal)` wertet `kanal` sofort aus und speichert den Wert im partial-Objekt. Gleichwertig ist ein Default-Argument (`kanal=kanal`), weil Python Default-Werte bei der Definition auswertet.
+    resources:
+      - title: Programming FAQ · Lambdas in Schleifen
+        url: https://docs.python.org/3/faq/programming.html#why-do-lambdas-defined-in-a-loop-with-different-values-all-return-the-same-result
+      - title: functools.partial
+        url: https://docs.python.org/3/library/functools.html#functools.partial
+
+  - id: lru-cache-methode
+    type: explain
+    title: Warum hilft dieser Cache nicht?
+    prompt: |
+      Ein Kollege hat `lru_cache` eingebaut, um Aufrufe einer Wechselkurs-API zu sparen. Nach ein paar Tagen im Betrieb wächst der Speicher des Webservers stetig, und die API wird trotzdem bei fast jedem Request aufgerufen. Erkläre beide Beobachtungen und schlage eine bessere Lösung vor.
+    lang: python
+    code: |
+      from functools import lru_cache
+
+      class Wechselkurse:
+          def __init__(self, api_client):
+              self.api = api_client
+
+          @lru_cache(maxsize=None)
+          def kurs(self, waehrung: str) -> float:
+              return self.api.hole_kurs(waehrung)
+
+      # im Request-Handler, pro Request:
+      def preis_in(waehrung: str, betrag_eur: float, client) -> float:
+          return betrag_eur * Wechselkurse(client).kurs(waehrung)
+    points:
+      - "`self` ist Teil des Cache-Schlüssels. Pro Request entsteht eine neue Instanz, also ein neuer Schlüssel – der Cache trifft fast nie."
+      - Der Cache hängt an der Funktion in der Klasse und hält starke Referenzen auf jede Instanz samt Client. Mit `maxsize=None` fliegt nichts raus – ein Speicherleck.
+      - "`lru_cache` kennt keine Ablaufzeit. Selbst mit Treffern würden Wechselkurse nie aktualisiert."
+      - Besser ist ein Cache, dessen Schlüssel nur die Währung ist (auf Modulebene oder in einem langlebigen Objekt), mit Ablaufzeit, etwa ein Dictionary mit Zeitstempel.
+    explanation: |
+      `lru_cache` bildet den Schlüssel aus **allen** Argumenten, bei einer Methode also auch aus `self`. Da `Wechselkurse(client)` pro Request neu entsteht, ist jeder Schlüssel neu, und die API wird trotzdem gerufen. Gleichzeitig liegt der Cache nicht in der Instanz, sondern an der Funktion `Wechselkurse.kurs` in der Klasse: Er referenziert jede je erzeugte Instanz, und ohne `maxsize` wird nichts verdrängt. Das ist der Speicherzuwachs. Und selbst ein funktionierender `lru_cache` würde Kurse nie auffrischen.
+
+      Besser: ein Cache pro Währung, der die Instanz nicht einschließt – etwa ein Dictionary `{waehrung: (kurs, zeitpunkt)}` auf Modulebene oder in einem Objekt, das die App einmal beim Start erzeugt – mit Ablaufzeit von einigen Minuten. Die Python-FAQ beschreibt die Abwägung zwischen `lru_cache` und `cached_property` bei Methoden.
+    resources:
+      - title: Programming FAQ · How do I cache method calls?
+        url: https://docs.python.org/3/faq/programming.html#how-do-i-cache-method-calls
+      - title: functools.lru_cache
+        url: https://docs.python.org/3/library/functools.html#functools.lru_cache

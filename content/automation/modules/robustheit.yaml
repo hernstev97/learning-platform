@@ -1,0 +1,437 @@
+id: robustheit
+title: Robuste Automatisierung
+level: 3
+minutes: 190
+summary: 'Fehler begrenzen, Wiederholung sicher machen und Zustand nachvollziehbar halten: Budgets, Idempotenz,
+  atomare Dateien, Logging und Wiederaufnahme.'
+goals:
+- Du unterscheidest dauerhafte, vorübergehende und unklare Fehler.
+- Du begrenzt Wiederholungen mit prüfbaren Regeln und injizierten Wartefunktionen.
+- Du trennst Planung, Wirkung und bestätigten Zustand.
+- Du entwirfst Trockenlauf, Wiederaufnahme und aussagekräftige Betriebsdaten.
+resources:
+- &id001
+  title: Python · Exceptions
+  url: https://docs.python.org/3/tutorial/errors.html
+- title: Python · logging
+  url: https://docs.python.org/3/library/logging.html
+- title: Python · os.replace
+  url: https://docs.python.org/3/library/os.html#os.replace
+- title: Python · contextlib
+  url: https://docs.python.org/3/library/contextlib.html
+lesson: |
+  Ein Skript funktioniert zehnmal und scheitert beim elften Lauf nach der Hälfte. Der Zielordner enthält bereits einige Dateien, ein externer Dienst hat zwei Aufträge angenommen und die Fortschrittsdatei ist unvollständig. „Noch einmal starten“ kann jetzt entweder reparieren oder doppelte Arbeit erzeugen. Robustheit bedeutet, diese Situationen vorab als Teil des normalen Betriebs zu behandeln.
+
+  Du brauchst dafür keine große Infrastruktur. Klare Zustände, begrenzte Versuche, ein Trockenlauf und wenige gezielte Tests helfen schon in kleinen Skripten. Entscheidend ist, dass dein Programm seinen Erfolg genau so weit behauptet, wie er tatsächlich bestätigt wurde.
+
+  ## Fehlerklassen statt pauschalem Verschlucken
+
+  Ein ungültiger Dateipfad, eine fehlende Berechtigung, eine unterbrochene Verbindung und ein Programmierfehler haben verschiedene Ursachen. Ein gemeinsames `except Exception: pass` entfernt gerade die Information, die zur Korrektur nötig wäre. Die [Python-Fehlerbehandlung](https://docs.python.org/3/tutorial/errors.html) erlaubt gezielte Typen und Weitergabe der Ursache.
+
+  ```python run
+  def menge(text):
+      try:
+          wert = int(text)
+      except ValueError as ursache:
+          raise ValueError("Menge muss eine ganze Zahl sein") from ursache
+      if wert < 0:
+          raise ValueError("Menge darf nicht negativ sein")
+      return wert
+  print(menge("12"))
+  ```
+
+  Ein permanenter Eingabefehler wird durch Retry nicht besser. Ein vorübergehender Fehler kann später verschwinden. Ein unklarer Fehler betrifft die Wirkung: Nach einem Timeout könnte der Server eine Änderung schon ausgeführt haben. Diese letzte Klasse verlangt Abgleich oder Idempotenz, nicht bloß eine weitere Schleifenrunde.
+
+  Erzeuge fachliche Fehler dort, wo Kontext vorhanden ist. „Datei nicht lesbar: Auftrag 42“ hilft mehr als ein nacktes `False`. Bewahre die ursprüngliche Exception als Ursache, damit Entwickler den technischen Grund untersuchen können. Vertrauliche Inhalte gehören trotzdem nicht automatisch in die Meldung.
+
+  ## Budgets machen Wiederholung endlich
+
+  Ein Retry braucht erlaubte Fehlertypen, eine maximale Versuchsanzahl und eine passende Pause. Die folgende Funktion wiederholt nur `ConnectionError` und lässt andere Fehler sofort sichtbar werden. Eine injizierte Wartefunktion vermeidet echte Pausen im Test.
+
+  ```python run
+  def wiederhole(aktion, warte, versuche=3):
+      if versuche < 1:
+          raise ValueError("mindestens ein Versuch")
+      for nummer in range(1, versuche + 1):
+          try:
+              return aktion()
+          except ConnectionError:
+              if nummer == versuche:
+                  raise
+              warte(2 ** (nummer - 1))
+
+  antworten = iter([ConnectionError("kurz offline"), "bereit"])
+  def aktion():
+      wert = next(antworten)
+      if isinstance(wert, Exception):
+          raise wert
+      return wert
+  pausen = []
+  print(wiederhole(aktion, pausen.append))
+  print(pausen)
+  ```
+
+  Die letzte fehlgeschlagene Ausführung wirft erneut; sie wird nicht als `None` zurückgegeben. Pausen gibt es nur zwischen Versuchen. Ein Retry-Budget kann außerdem eine Gesamtdauer und Kosten begrenzen. Einzelne Request-Timeouts addieren sich, deshalb kann ein Job trotz kurzer Einzelgrenzen lange laufen.
+
+  Zeitmessung mit [`time.monotonic`](https://docs.python.org/3/library/time.html#time.monotonic) ist für solche Laufzeitbudgets geeignet. Injiziere die Uhr ebenfalls, wenn du die Grenze präzise testen willst. Grenzen sollten vor dem nächsten teuren Schritt geprüft werden und nicht erst nach beliebig viel zusätzlicher Arbeit.
+
+  ## Idempotenz braucht einen fachlichen Schlüssel
+
+  Eine idempotente Operation hat bei Wiederholung dieselbe beabsichtigte Endwirkung. „Setze Status auf fertig“ kann idempotent sein; „erhöhe Zähler um eins“ ist es ohne weiteren Mechanismus nicht. Entscheidend ist die Wirkung, nicht ob dieselbe Python-Funktion verwendet wird.
+
+  ```python run
+  def markiere_fertig(auftraege, kennung):
+      auftraege[kennung] = "fertig"
+  zustand = {}
+  markiere_fertig(zustand, "auftrag-42")
+  markiere_fertig(zustand, "auftrag-42")
+  print(zustand)
+  ```
+
+  Bei einem Import identifiziert eine stabile Quell-ID denselben Datensatz. Eine zufällige ID pro Lauf macht jede Wiederholung zu einem neuen Datensatz. Eine Datenbank mit Unique-Constraint kann doppelte Schlüssel atomar abweisen; eine Python-Menge in einem einzelnen Prozess schützt keine parallelen Prozesse und überlebt keinen Neustart.
+
+  ```python run
+  import sqlite3
+  con = sqlite3.connect(":memory:")
+  try:
+      con.execute("CREATE TABLE done (id TEXT PRIMARY KEY)")
+      con.execute("INSERT OR IGNORE INTO done VALUES (?)", ("job-42",))
+      con.execute("INSERT OR IGNORE INTO done VALUES (?)", ("job-42",))
+      print(con.execute("SELECT COUNT(*) FROM done").fetchone()[0])
+  finally:
+      con.close()
+  ```
+
+  Diese Tabelle demonstriert nur Deduplizierung. Wenn zwischen externer Wirkung und lokaler Markierung ein Absturz möglich ist, bleibt ein unklarer Zustand. Speichere deshalb genug Kontext zum Abgleich, etwa eine vom externen Dienst bestätigte Referenz. Behaupte keine Exactly-once-Garantie allein wegen einer lokalen Liste erledigter IDs.
+
+  ## Dateien atomar ersetzen und Ressourcen aufräumen
+
+  Eine Fortschrittsdatei direkt zu überschreiben kann bei einem Absturz halb geschrieben zurückbleiben. Schreibe zuerst in eine temporäre Datei im selben Verzeichnis und ersetze danach das Ziel mit [`os.replace`](https://docs.python.org/3/library/os.html#os.replace). So sehen andere Leser beim erfolgreichen atomaren Austausch entweder den alten oder den neuen Dateinameninhalt.
+
+  ```python
+  import json
+  import os
+  import tempfile
+  from pathlib import Path
+
+  def speichere(ziel, daten):
+      ziel = Path(ziel)
+      temp = None
+      try:
+          with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=ziel.parent, delete=False) as datei:
+              temp = Path(datei.name)
+              json.dump(daten, datei, ensure_ascii=False)
+              datei.flush()
+              os.fsync(datei.fileno())
+          os.replace(temp, ziel)
+      finally:
+          if temp is not None:
+              temp.unlink(missing_ok=True)
+  ```
+
+  Das Beispiel ist für eine lokale Dateisystemumgebung gedacht. Austausch und Stromausfall-Dauerhaftigkeit sind verschiedene Eigenschaften. Für strengere Dauerhaftigkeit können weitere Schritte wie ein Verzeichnis-Sync nötig sein; das hängt vom Betriebssystem und Dateisystem ab. Ebenso verhindert atomarer Ersatz nicht, dass zwei unabhängige Schreiber einander mit jeweils vollständigen Dateien überschreiben. Dafür brauchst du eine Besitz- oder Sperrregel.
+
+  [`contextlib`](https://docs.python.org/3/library/contextlib.html) und `with` helfen, Ressourcen auch bei Fehlern freizugeben. Unterdrücke nur ausdrücklich erwartete Ausnahmen. Ein Cleanup-Fehler sollte die ursprüngliche Ursache nicht unbemerkt ersetzen; bei wichtigen Ressourcen muss beides nachvollziehbar bleiben.
+
+  ```python run
+  from tempfile import TemporaryDirectory
+  from pathlib import Path
+  with TemporaryDirectory() as verzeichnis:
+      datei = Path(verzeichnis) / "probe.txt"
+      datei.write_text("Test", encoding="utf-8")
+      print(datei.read_text(encoding="utf-8"))
+  print(Path(verzeichnis).exists())
+  ```
+
+  ## Planung, Trockenlauf und Wirkung trennen
+
+  Erzeuge für riskante Änderungen zuerst einen Plan. Ein Plan enthält Quelle, Ziel und Grund. Prüfe Kollisionen und erlaubte Grenzen, bevor du eine Änderung ausführst. Ein Trockenlauf zeigt genau diesen Plan und zählt dieselben vorgesehenen Operationen, ruft aber die Wirkungsfunktion nicht auf.
+
+  ```python run
+  def ausfuehren(plan, anwenden, dry_run=False):
+      if dry_run:
+          return {"geplant": len(plan), "ausgefuehrt": 0}
+      for schritt in plan:
+          anwenden(schritt)
+      return {"geplant": len(plan), "ausgefuehrt": len(plan)}
+  print(ausfuehren(["a", "b"], lambda x: None, dry_run=True))
+  ```
+
+  Ein alter Plan kann inzwischen ungültig geworden sein, etwa weil ein Zielname belegt wurde. Prüfe kritische Voraussetzungen daher auch unmittelbar vor der Wirkung. Für einen mehrstufigen Job halte Zustände wie `geplant`, `gestartet`, `bestätigt` und `fehlgeschlagen` auseinander. „Versucht“ ist nicht dasselbe wie „erledigt“.
+
+  ## Beobachtung und Wiederaufnahme
+
+  [`logging`](https://docs.python.org/3/library/logging.html) bietet Schweregrade und strukturierbare Ereignisse. Ein nützliches Log enthält Job-ID, Phase, Anzahl und Fehlerklasse. Ein Erfolgseintrag sollte nach der Bestätigung entstehen. Für vertrauliche Eingaben loggst du Referenzen oder redigierte Ausschnitte statt Rohdaten.
+
+  ```python run
+  ereignis = {"job_id": "lauf-42", "phase": "abgeschlossen", "verarbeitet": 12, "fehler": 0}
+  print(ereignis["phase"], ereignis["verarbeitet"])
+  ```
+
+  Bei einer Wiederaufnahme lädst du den letzten bestätigten Zustand und planst die restliche Arbeit. Prüfe beschädigte Zustandsdateien ausdrücklich; „konnte nicht lesen, also alles neu“ kann eine gefährliche automatische Entscheidung sein. Bewahre bei Bedarf das kaputte Artefakt für Diagnose und verlange eine klare Wiederherstellungsstrategie.
+
+  > [!PRAXIS]
+  > Teste einen Fehler genau zwischen zwei Arbeitsschritten und starte danach neu. Prüfe Endzustand und Zahl der Wirkungen. Das zeigt mehr über Robustheit als zehn vollständige Erfolgsdurchläufe.
+
+  > [!INTERVIEW]
+  > „Warum reicht try/except nicht?“ Weil Fehlerbehandlung allein keine bereits erfolgten Wirkungen rückgängig macht. Du brauchst Grenzen, Zustände und einen definierten Wiederholungs- oder Kompensationsvertrag.
+
+  > [!MERKE]
+  > Robust ist ein Skript, wenn sein Verhalten bei Teilfehlern verständlich und begrenzt bleibt.
+
+  ## Zusammenfassung
+
+  - Klassifiziere Fehler nach sinnvoller Folgeaktion.
+  - Begrenze Wiederholung in Anzahl, Zeit und Wirkung.
+  - Nutze stabile fachliche IDs für Deduplizierung.
+  - Atomarer Dateiaustausch ersetzt keine konkurrierende Schreibkontrolle.
+  - Trockenlauf und echte Ausführung teilen denselben geprüften Plan.
+  - Speichere bestätigte Zustände und teste Wiederaufnahme gezielt.
+exercises:
+- id: fehlerklassen
+  type: choice
+  title: Welcher Fehler wird nicht weggewartet?
+  prompt: Welche Reaktion ist angemessen?
+  options:
+  - text: Ungültige Konfiguration sichtbar ablehnen, statt endlos erneut zu starten.
+    correct: true
+    why: Zeit verändert die fehlerhafte Eingabe nicht.
+  - text: Jede Exception in eine leere Ergebnisliste umwandeln.
+    correct: false
+    why: Das täuscht einen erfolgreichen leeren Lauf vor.
+  - text: Alle POST-Anfragen nach Timeout ungeprüft wiederholen.
+    correct: false
+    why: Die erste Wirkung könnte bereits erfolgt sein.
+  explanation: Die Fehlerklasse bestimmt die sinnvolle Reaktion. Ein universeller Retry oder Fallback verdeckt relevante
+    Unterschiede.
+  resources:
+  - *id001
+- id: bestaetigung
+  type: order
+  title: Was ist wirklich erledigt?
+  prompt: Ordne einen kontrollierten Arbeitsschritt.
+  lang: python
+  lines: |-
+    # Voraussetzungen prüfen
+    # Stabile Operations-ID bestimmen
+    # Beabsichtigte Wirkung ausführen
+    # Ergebnis beziehungsweise Quittung prüfen
+    # Bestätigten Abschluss speichern
+  explanation: Ein früher gespeicherter Abschluss könnte nach einem Fehler notwendige Arbeit unterdrücken. Die Lücke
+    nach externer Wirkung muss zusätzlich im Wiederaufnahmevertrag berücksichtigt werden.
+  resources:
+  - *id001
+- id: idempotenz
+  type: output
+  title: Zweimal setzen
+  prompt: Welche Ausgabe erzeugt dieses Programm?
+  lang: python
+  code: |-
+    status = {}
+    status["42"] = "fertig"
+    status["42"] = "fertig"
+    print(status)
+    print(len(status))
+  expected: |-
+    {'42': 'fertig'}
+    1
+  explanation: Dieselbe Zuweisung erzeugt hier denselben Endzustand. Eine Zählererhöhung hätte bei zweimaligem Aufruf
+    eine andere Wirkung.
+  resources:
+  - *id001
+- id: budget
+  type: output
+  title: Pausen vor dem letzten Versuch
+  prompt: Welche Ausgabe erzeugt dieses Programm?
+  lang: python
+  code: |-
+    pausen = [2 ** (n - 1) for n in range(1, 3)]
+    print(pausen)
+    print(sum(pausen))
+  expected: |-
+    [1, 2]
+    3
+  explanation: Bei drei Versuchen gibt es zwei Zwischenpausen. Nach dem letzten Fehlschlag soll der Fehler weitergegeben
+    und nicht noch sinnlos gewartet werden.
+  resources:
+  - *id001
+- id: retry
+  type: code
+  title: Begrenzt wiederholen
+  prompt: 'Schreibe `wiederhole(aktion, warte, versuche)`: versuche>=1, nur ConnectionError wiederholen, zwischen
+    Versuchen warte(1), nach letztem Fehler weiterwerfen. Erfolg sofort zurückgeben.'
+  lang: python
+  starter: |-
+    def wiederhole(aktion, warte, versuche):
+        ...
+  solution: |-
+    def wiederhole(aktion, warte, versuche):
+        for nummer in range(versuche):
+            try:
+                return aktion()
+            except ConnectionError:
+                if nummer == versuche - 1:
+                    raise
+                warte(1)
+  tests:
+  - name: Sofortiger Erfolg
+    code: 'pausen=[]; assert wiederhole(lambda: 7,pausen.append,3)==7 and pausen==[]'
+  - name: Ein Fehler
+    code: |-
+      folge=iter([ConnectionError(),9]); pausen=[]
+      def a():
+          x=next(folge)
+          if isinstance(x,Exception): raise x
+          return x
+      assert wiederhole(a,pausen.append,3)==9 and pausen==[1]
+  - name: Letzter Fehler
+    code: |-
+      pausen=[]
+      def a(): raise ConnectionError("offline")
+      try:
+          wiederhole(a,pausen.append,2)
+      except ConnectionError:
+          pass
+      else:
+          assert False, "letzter Fehler muss sichtbar bleiben"
+      assert pausen==[1]
+  - name: Falsche Fehlerart
+    code: |-
+      pausen=[]
+      def a(): raise ValueError("Konfiguration")
+      try:
+          wiederhole(a,pausen.append,3)
+      except ValueError:
+          pass
+      else:
+          assert False
+      assert pausen==[]
+  explanation: Die Funktion modelliert Anzahl und Fehlertyp ausdrücklich. Ein Nicht-Retry-Fehler und der letzte
+    Versuch verlassen die Schleife sofort.
+  resources:
+  - *id001
+- id: dry-run
+  type: code
+  title: Wirkung im Trockenlauf verhindern
+  prompt: Schreibe `verarbeite(plan, anwenden, dry_run)`. Im Trockenlauf liefere len(plan), ohne anwenden aufzurufen.
+    Sonst rufe anwenden für jedes Element in Reihenfolge auf und liefere ebenfalls len(plan). plan ist eine Liste.
+  lang: python
+  starter: |-
+    def verarbeite(plan, anwenden, dry_run):
+        ...
+  solution: |-
+    def verarbeite(plan, anwenden, dry_run):
+        if not dry_run:
+            for schritt in plan:
+                anwenden(schritt)
+        return len(plan)
+  tests:
+  - name: Trocken
+    code: aufrufe=[]; assert verarbeite([1,2],aufrufe.append,True)==2 and aufrufe==[]
+  - name: Echt
+    code: aufrufe=[]; assert verarbeite([1,2],aufrufe.append,False)==2 and aufrufe==[1,2]
+  - name: Leer
+    code: aufrufe=[]; assert verarbeite([],aufrufe.append,False)==0 and aufrufe==[]
+  explanation: Der Plan bleibt in beiden Modi derselbe. Nur die Wirkung wird ausgeschaltet; der Trockenlauf darf
+    keinen Erfolg einer realen Ausführung vortäuschen.
+  resources:
+  - *id001
+- id: ursache
+  type: gap
+  title: Den ursprünglichen Fehler erhalten
+  prompt: Ergänze die Exception-Verkettung mit der vorhandenen Variable ursache.
+  lang: python
+  code: |-
+    try:
+        int(text)
+    except ValueError as ursache:
+        raise ValueError("Menge ungültig") ⟦from ursache⟧
+  explanation: from erhält den kausalen Zusammenhang. Die fachliche Fehlermeldung ergänzt die technische Ursache,
+    statt sie zu verbergen.
+  resources:
+  - *id001
+  gaps:
+  - label: Den ursprünglichen Fehler erhalten
+    hint: Ein Schlüsselwort verbindet die neue Exception mit der ursprünglichen Ursache.
+- id: offen
+  type: code
+  title: Wiederaufnahme planen
+  prompt: 'Schreibe `rest(auftraege, bestaetigt)`: Liefere Aufträge, deren id nicht im Set bestaetigt liegt, in
+    ursprünglicher Reihenfolge. Verändere weder Liste noch Dictionaries.'
+  lang: python
+  starter: |-
+    def rest(auftraege, bestaetigt):
+        ...
+  solution: |-
+    def rest(auftraege, bestaetigt):
+        return [a for a in auftraege if a["id"] not in bestaetigt]
+  tests:
+  - name: Teilweise
+    code: assert rest([{"id":"a"},{"id":"b"}],{"a"})==[{"id":"b"}]
+  - name: Alles fertig
+    code: assert rest([{"id":"a"}],{"a"})==[]
+  - name: Eingabe bleibt
+    code: daten=[{"id":"a","v":2}]; assert rest(daten,set())==daten and daten==[{"id":"a","v":2}]
+  explanation: Nur bestätigte IDs werden ausgeschlossen. Gestartete oder versuchte Aufträge brauchen einen anderen
+    Zustand und können nicht pauschal als fertig gelten.
+  resources:
+  - *id001
+- id: falscher-erfolg
+  type: bug
+  title: Ein Fehler wird als Erfolg gespeichert
+  prompt: Wenn aktion scheitert, darf die ID nicht in fertig landen. Korrigiere die Reihenfolge der markierten Zeile.
+  lang: python
+  code: |-
+    def schritt(id, aktion, fertig):
+        fertig.add(id); aktion()
+  lines:
+  - 2
+  fix:
+  - line: 2
+    answers:
+    - aktion(); fertig.add(id)
+  explanation: Der lokale Abschluss folgt der fehlerfreien Rückkehr. Bei externen Effekten muss ein späterer Neustart
+    trotzdem mögliche bereits ausgeführte Wirkungen abgleichen.
+  resources:
+  - *id001
+- id: atomar
+  type: explain
+  title: Was garantiert replace?
+  prompt: Erkläre Wirkung und Grenzen dieses Dateiaustauschs.
+  lang: python
+  code: |-
+    temp.write_text(neuer_inhalt, encoding="utf-8")
+    os.replace(temp, ziel)
+  points:
+  - Die temporäre Datei wird vor dem Austausch vollständig geschrieben.
+  - Für den atomaren Austausch müssen passende Dateisystembedingungen gelten.
+  - Leser sehen am Ziel den alten oder neuen Stand statt bewusst halb geschriebener Zieldaten.
+  - Das verhindert weder verlorene Updates konkurrierender Schreiber noch garantiert es allein Stromausfall-Dauerhaftigkeit.
+  explanation: Atomarer Ersatz schützt die Sichtbarkeit eines einzelnen Austauschs. Dauerhafte Speicherung und Koordination
+    mehrerer Schreiber sind weitere Anforderungen, die getrennte Mechanismen benötigen.
+  resources:
+  - *id001
+- id: abbruch
+  type: practice
+  title: Einen Teilfehler überleben
+  prompt: Baue einen Job über fünf künstliche Aufträge. Lasse Auftrag drei einmal scheitern. Speichere bestätigte
+    IDs und starte danach erneut; prüfe, dass eins und zwei nicht erneut angewendet werden.
+  lang: python
+  solution: |-
+    def lauf(auftraege, fertig, anwenden, speichern):
+        for auftrag in auftraege:
+            if auftrag["id"] in fertig:
+                continue
+            anwenden(auftrag)
+            fertig.add(auftrag["id"])
+            speichern(fertig)
+  checklist:
+  - Der erste Lauf bestätigt nur eins und zwei.
+  - Der zweite Lauf beginnt fachlich mit drei.
+  - Fehler bleiben im Abschlussstatus sichtbar.
+  - Persistenzfehler und externe Wirkungen werden als getrennte Grenzen beschrieben.
+  - Der Trockenlauf verändert weder Aufträge noch bestätigte IDs.
+  explanation: Die Übung zeigt den Wiederaufnahmegedanken mit einer kontrollierten Wirkung. Für echte externe Systeme
+    muss zusätzlich das Fenster zwischen Wirkung und Speicherung durch Idempotenz oder Abgleich behandelt werden.
+  resources:
+  - *id001

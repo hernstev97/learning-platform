@@ -1,0 +1,281 @@
+id: speicher-dateisysteme
+title: Speicher, Dateisysteme & Backups
+level: 2
+minutes: 170
+summary: Du unterscheidest Datenträger, Dateisysteme und Mounts, erklärst Speicherverbrauch und planst Backups mit einem nachgewiesenen Restore.
+goals:
+  - Du liest Geräte-, Dateisystem- und Mountinformationen ohne Datenträger zu verändern.
+  - Du erklärst fstab, UUIDs und die Unterschiede zwischen df, du und Inodes.
+  - Du unterscheidest Btrfs-Snapshots, LVM, Swap und unabhängige Backups.
+  - Du erstellst einen sicheren Speicher- und Wiederherstellungsplan für eine Test-VM.
+resources:
+  - title: lsblk(8)
+    url: https://man7.org/linux/man-pages/man8/lsblk.8.html
+  - title: mount(8)
+    url: https://man7.org/linux/man-pages/man8/mount.8.html
+  - title: fstab(5)
+    url: https://man7.org/linux/man-pages/man5/fstab.5.html
+  - title: Btrfs · Subvolumes
+    url: https://btrfs.readthedocs.io/en/latest/btrfs-subvolume.html
+  - title: Restic · Restore
+    url: https://restic.readthedocs.io/en/stable/050_restore.html
+lesson: |
+  Ein Deployment schlägt mit „No space left on device“ fehl. Du löschst eine große Datei, aber `df` zeigt fast denselben Verbrauch. Vielleicht liegt die Datei auf einem anderen Mount, vielleicht hält ein Prozess sie offen, vielleicht fehlen Inodes statt Datenblöcke. Speicherfehler lassen sich nur zuverlässig erklären, wenn du die Ebenen auseinanderhältst.
+
+  Wir beginnen mit lesender Bestandsaufnahme. Befehle zum Partitionieren, Formatieren und Mounten gehören ausschließlich auf ausdrücklich dafür vorgesehene Testdatenträger. Ein sichtbarer Gerätename ist keine Garantie, dass das Gerät entbehrlich ist. Der praktische Erfolg dieses Moduls ist ein dokumentierter Aufbau samt Restore-Test, nicht das möglichst schnelle Ausführen eines Formatierungsbefehls.
+
+  ## Vom Blockgerät bis zum Pfad
+
+  Eine SSD ist ein **Blockgerät**. Eine Partition beschreibt einen Bereich davon. Auf einer Partition kann ein Dateisystem liegen, das Blöcke in Dateien und Verzeichnisse organisiert. Ein **Mount** hängt dieses Dateisystem an einen Verzeichnispfad. Zusätzliche Schichten wie Verschlüsselung und LVM können zwischen Gerät und Dateisystem liegen. Ein Linux-Pfad nennt deshalb nicht direkt die Hardware ([mount(8)](https://man7.org/linux/man-pages/man8/mount.8.html)).
+
+  ```bash
+  lsblk -o NAME,TYPE,SIZE,FSTYPE,UUID,MOUNTPOINTS
+  findmnt /
+  findmnt -T /var/log
+  lsblk -f
+  ```
+
+  `lsblk` zeigt Beziehungen zwischen Blockgeräten. `findmnt -T` beantwortet, welches Dateisystem einen konkreten Pfad trägt. Das ist vor einer Verbrauchsanalyse wichtiger als die Vermutung, alles unter `/var` müsse auf derselben Partition liegen. `blkid` identifiziert Dateisystemsignaturen und UUIDs; je nach Zugriffsrechten kann die vollständige Erkennung Privilegien benötigen ([lsblk(8)](https://man7.org/linux/man-pages/man8/lsblk.8.html), [findmnt(8)](https://man7.org/linux/man-pages/man8/findmnt.8.html)).
+
+  ```text
+  NAME         TYPE  SIZE FSTYPE MOUNTPOINTS
+  nvme0n1      disk  100G
+  ├─nvme0n1p1  part    1G vfat   /boot
+  └─nvme0n1p2  part   99G btrfs  /
+  ```
+
+  Bei SATA- und USB-Geräten heißen Pfade oft `/dev/sda` und `/dev/sda1`, bei NVMe `/dev/nvme0n1` und `/dev/nvme0n1p1`. Die Nummerierung kann sich ändern. Verwende für dauerhafte Zuordnung eine geprüfte UUID statt eines zufälligen Buchstabens. Auch eine UUID ist kein Geheimnis und kein Ersatz für die Prüfung von Größe, Typ, Seriennummer und Inhalt vor einer Änderung.
+
+  Eine GPT-Partitionstabelle beschreibt Partitionen, keine Dateien. `fdisk` oder `parted` ändern diese Tabelle. `mkfs.ext4` beziehungsweise `mkfs.btrfs` erzeugen ein Dateisystem und können vorhandene Daten zerstören. Ein Dateisystemtyp wird nicht dadurch geändert, dass du eine andere Zeichenfolge in `fstab` schreibst. Die Schichten müssen tatsächlich zusammenpassen.
+
+  ## Dateisystemwahl und Mount-Vertrag
+
+  **ext4** ist für viele gewöhnliche Linux-Datenvolumes eine übersichtliche Wahl. **XFS** ist ein etabliertes Dateisystem für große und parallele Arbeitslasten; seine Größenänderung ist kein beliebiges Vergrößern und Verkleinern. **Btrfs** bietet unter anderem Copy-on-Write, Prüfsummen und Subvolumes. **vfat** wird häufig für EFI-Systempartitionen verwendet und hat kein natives Unix-Besitzer- und Rechtemodell wie ext4. Die Wahl folgt Anforderungen und Betriebserfahrung, nicht einer pauschalen Rangliste ([Kernel · ext4](https://docs.kernel.org/filesystems/ext4/index.html), [Kernel · XFS](https://docs.kernel.org/filesystems/xfs/index.html)).
+
+  Ein Mount verdeckt vorübergehend vorhandene Einträge unter dem Mountpunkt. Diese Dateien werden nicht automatisch in das neue Dateisystem verschoben. Wenn ein Backupmedium nicht eingehängt ist, kann ein Skript versehentlich auf die Systemplatte in das leere Mountverzeichnis schreiben. Prüfe daher den erwarteten Mount ausdrücklich, bevor große Kopien starten.
+
+  ```bash
+  findmnt --mountpoint /mnt/backup
+  mountpoint -q /mnt/backup
+  df -h /mnt/backup
+  ```
+
+  Die Datei `/etc/fstab` beschreibt dauerhafte Mounts mit sechs Feldern: Quelle, Ziel, Typ, Optionen, dump-Feld und Prüfreihenfolge. Ein Schema für ein separates, optionales ext4-Datenvolume könnte so aussehen; die Beispiel-UUID musst du durch die tatsächlich ermittelte ersetzen ([fstab(5)](https://man7.org/linux/man-pages/man5/fstab.5.html)).
+
+  ```text
+  UUID=BEISPIEL-UUID /srv/archive ext4 defaults,nofail 0 2
+  ```
+
+  `nofail` macht das Fehlen dieses Dateisystems beim Booten weniger blockierend. Es garantiert nicht, dass die Anwendung ohne das Volume korrekt arbeitet. Für benötigte Daten muss der Dienst den Mount als Voraussetzung behandeln. Bei systemd kann `RequiresMountsFor=/srv/archive` eine passende Abhängigkeit herstellen. Wähle Optionen entsprechend dem Nutzungsfall und prüfe die effektiven Optionen mit `findmnt` ([systemd.mount](https://www.freedesktop.org/software/systemd/man/latest/systemd.mount.html)).
+
+  Nach einer kontrollierten Änderung prüfst du zuerst `findmnt --verify --verbose`. In der Test-VM kann anschließend `sudo mount -a` die aktiven Mountversuche aus `fstab` auslösen; das ist eine echte Systemänderung, keine reine Syntaxprüfung. Prüfe danach gezielt den neuen Mount und einen Neustart der VM. Ein erfolgreicher Mount nach dem Login allein belegt noch keinen zuverlässigen Bootablauf. `umount` heißt ohne n und kann bei offenen Dateien oder Arbeitsverzeichnissen scheitern; untersuche die Nutzung, statt einen erzwungenen Unmount als ersten Schritt zu wählen.
+
+  ## Verbrauch messen: df, du und Inodes
+
+  `df` fragt die Belegung eines Dateisystems ab. `du` läuft durch erreichbare Verzeichniseinträge und summiert zugeordnete Dateiblöcke. Damit beantworten sie verschiedene Fragen. `du -x` bleibt auf einem Dateisystem und verhindert, dass ein darunter gemountetes großes Datenvolume die Analyse der Systemplatte verfälscht ([Coreutils · df](https://www.gnu.org/software/coreutils/manual/html_node/df-invocation.html), [Coreutils · du](https://www.gnu.org/software/coreutils/manual/html_node/du-invocation.html)).
+
+  ```bash
+  df -h /var
+  df -i /var
+  du -xhd1 /var 2> du-fehler.log
+  du -sh ./berichte
+  ```
+
+  Ein laufender Prozess kann eine gelöschte Datei weiter geöffnet halten. Ihr Name ist weg und `du` findet sie nicht mehr, aber die Blöcke bleiben bis zum letzten Schließen belegt. `lsof +L1` kann solche Dateien zeigen. Die richtige Maßnahme hängt vom Prozess ab: unterstützte Logrotation oder ein geordneter Neustart sind nachvollziehbarer als wahlloses Beenden. Metadaten, reservierter Platz, Snapshots, Hardlinks und unterschiedliche Zugriffsrechte erklären weitere Abweichungen.
+
+  Eine **Sparse-Datei** besitzt eine logische Länge, ohne für jeden Nullbereich physische Blöcke zu belegen. `ls -l` zeigt die logische Größe; `du` normalerweise den tatsächlich zugeordneten Platz. `du --apparent-size` wechselt auf die scheinbare Größe. Ein Dateiformat für VM-Abbilder kann deshalb groß aussehen und zunächst wenig Platz verbrauchen. Kopierwerkzeuge und Optionen entscheiden, ob Löcher erhalten bleiben.
+
+  ```bash
+  printf 'abc\n' > klein.txt
+  stat -c 'Bytes: %s' klein.txt
+  du --apparent-size --block-size=1 klein.txt
+  ```
+
+  Inodes speichern Metadaten und Verweise auf Dateidaten. Bei Dateisystemen mit begrenztem Inode-Vorrat können sehr viele kleine Dateien das Anlegen neuer Dateien verhindern, obwohl noch Datenblöcke frei sind. `df -i` prüft diese Ressource. Btrfs hat kein gleichartiges festes Inode-Kontingent; interpretiere die Ausgabe passend zum Dateisystem. Ein großes `du` kann selbst I/O verursachen, deshalb beginne gezielt beim betroffenen Mount statt immer bei `/`.
+
+  > [!PRAXIS]
+  > Ein Speicherbericht nennt Mount, Zeitpunkt, belegte Blöcke, Inode-Situation und die größten bekannten Verbraucher. „Platte voll“ ohne diese Angaben ist eine Beobachtung, noch keine Ursache.
+
+  ## Btrfs, Snapshots und weitere Speicherschichten
+
+  Ein Btrfs-Subvolume besitzt eine eigene Verzeichnishierarchie innerhalb desselben Dateisystems. Ein Snapshot beginnt mit dem Stand eines Subvolumes und teilt zunächst dessen Datenblöcke über Copy-on-Write. Änderungen lösen die nötigen neuen Blöcke aus. Verschachtelte Subvolumes werden nicht rekursiv mitsnapshottet; ein Snapshot von `/` ist deshalb nicht automatisch ein Snapshot aller darin sichtbaren Daten ([Btrfs · Subvolumes](https://btrfs.readthedocs.io/en/latest/btrfs-subvolume.html)).
+
+  ```bash
+  btrfs subvolume list /
+  btrfs filesystem usage /
+  snapper list-configs
+  snapper -c root list
+  ```
+
+  Diese lesenden Befehle setzen ein passendes Btrfs-System und gegebenenfalls zusätzliche Rechte voraus. Snapper verwaltet Snapshots nach Konfigurationen. Prüfe zuerst, welche Konfigurationen und Subvolumes tatsächlich existieren. Ein Distributionsname garantiert kein bestimmtes Layout. Ein Root-Rollback kann Systemdateien zurücksetzen, während separate Home- oder Daten-Subvolumes unberührt bleiben; genau deshalb muss der Umfang dokumentiert sein ([Snapper-Dokumentation](https://snapper.io/documentation.html)).
+
+  Snapshots auf demselben Datenträger helfen bei versehentlichen Änderungen. Sie schützen nicht vor Verlust dieses Datenträgers. Außerdem behalten sie alte Datenblöcke und können weiteren Platz binden. Löschen einer großen Datei gibt daher nicht zwingend sofort ihren gesamten Platz frei. Für Btrfs-Auslastung ist die eigene Dateisystemstatistik aussagekräftiger als eine vorschnelle Addition sichtbarer Dateigrößen.
+
+  **LVM** bietet eine andere Schicht: Physical Volumes werden zu einer Volume Group zusammengefasst, daraus entstehen Logical Volumes als Blockgeräte. Darauf können Dateisysteme liegen. Vergrößern des Logical Volume und Vergrößern des Dateisystems sind getrennte Operationen. Ein LVM-Snapshot ist deshalb nicht dasselbe Objekt wie ein Btrfs-Subvolume-Snapshot ([LVM2-Dokumentation](https://sourceware.org/lvm2/)).
+
+  **Swap** gibt dem Kernel die Möglichkeit, geeignete Speicherseiten aus dem RAM auszulagern. `swapon --show` zeigt aktive Swap-Bereiche. **zram** stellt komprimierte Blockgeräte im RAM bereit und wird häufig für Swap verwendet; es verbraucht weiterhin RAM und CPU. Mehr Swap löst ein ungebremstes Speicherleck nicht. Prüfe Druck und Arbeitslast, bevor du Größenwerte änderst ([Kernel · zram](https://docs.kernel.org/admin-guide/blockdev/zram.html)).
+
+  ## Backups sind Wiederherstellungsabläufe
+
+  Ein Backup braucht einen unabhängigen Aufbewahrungsort, Versionen und einen getesteten Restore. Die 3-2-1-Heuristik erinnert an mehrere Kopien, verschiedene Speichermöglichkeiten und eine räumlich getrennte Kopie. Wichtiger als die Formel ist das konkrete Ausfallszenario: Kannst du nach Verlust des Rechners, versehentlichem Löschen oder kompromittierten Zugangsdaten noch wiederherstellen?
+
+  `rsync` eignet sich zum Kopieren und Synchronisieren. Ein Spiegel kann aber Löschungen und Beschädigungen übernehmen; `--delete` macht ihn noch nicht zu einem versionierten Backup. Beginne mit `--dry-run`, prüfe den abschließenden Schrägstrich an der Quelle und dokumentiere die Zielstruktur. Restic und Borg ergänzen Versionierung und weitere Backupfunktionen. Schlüssel und Passwörter müssen außerhalb des einzigen gesicherten Rechners wiederauffindbar sein ([rsync-Handbuch](https://download.samba.org/pub/rsync/rsync.1), [Restic · Preparing a repository](https://restic.readthedocs.io/en/stable/030_preparing_a_new_repo.html)).
+
+  ```bash
+  rsync -an -- ./daten/ /mnt/backup/daten/
+  restic snapshots
+  restic check
+  restic restore latest --target ./restore-test
+  ```
+
+  Die Restic-Beispiele setzen ein bereits konfiguriertes Repository voraus. Ein Integritätscheck prüft nicht allein, ob dein Anwendungsbetrieb nach dem Restore funktioniert. Stelle Daten in ein separates Verzeichnis zurück, vergleiche Inhalte und starte die Anwendung mit dieser Kopie. Datenbanken brauchen einen konsistenten Dump oder ein unterstütztes Backupverfahren; das Kopieren gerade beschriebener Datenbankdateien ist kein allgemein gültiges Rezept ([Restic · Restore](https://restic.readthedocs.io/en/stable/050_restore.html)).
+
+  > [!INTERVIEW]
+  > „Wann ist ein Backup erfolgreich?“ – Wenn der gewünschte Stand außerhalb des betroffenen Systems verfügbar ist und ein dokumentierter Restore die benötigten Daten und Funktionen innerhalb des vereinbarten Zeitfensters zurückbringt.
+
+  ## Häufige Fehler und Zusammenfassung
+
+  Verwechsele nie Gerätepfade und Mountpunkte. Ein belegtes `/srv` kann auf der Root-Partition liegen, obwohl ein Datenvolume geplant war. `nofail` ist kein Gesundheitscheck. Snapshots ersetzen keine unabhängige Kopie. Und eine grüne nächtliche Backupmeldung ersetzt keinen Restore-Test. Halte jeden Eingriff klein, sichere die Konfiguration und prüfe das Ergebnis mit einem zweiten, passenden Signal.
+
+  - Identifiziere Gerät, Dateisystem und Mount vor jeder Änderung.
+  - UUIDs helfen bei dauerhafter Zuordnung.
+  - `df`, `du` und `df -i` beantworten unterschiedliche Fragen.
+  - Ein gelöschter Name bedeutet nicht sofort freigegebene Blöcke.
+  - Snapshots, Swap und LVM lösen verschiedene Probleme.
+  - Definiere Backupumfang, Aufbewahrung und Wiederherstellungsnachweis.
+exercises:
+  - id: schichten
+    type: order
+    title: Vom Gerät zum Anwendungspfad
+    prompt: Ordne dieses vereinfachte Setup ohne Verschlüsselung und LVM von unten nach oben.
+    lang: text
+    lines: |
+      Physische SSD als Blockgerät
+      Partition in der GPT-Tabelle
+      ext4-Dateisystem auf der Partition
+      Mount des Dateisystems unter /srv/archive
+      Datei /srv/archive/bericht.txt
+    explanation: Die Datei wird über den Mountpunkt erreicht; ihre Daten liegen im Dateisystem auf der Partition. Jede Schicht muss vor einem Eingriff korrekt identifiziert werden.
+  - id: backup-grenze
+    type: choice
+    title: Was schützt vor einem verlorenen Datenträger?
+    prompt: Welche Maßnahme erfüllt diese Anforderung für sich genommen?
+    options:
+      - text: Eine überprüfte wiederherstellbare Kopie auf einem unabhängigen Datenträger
+        correct: true
+        why: Sie bleibt beim Verlust des ursprünglichen Datenträgers verfügbar.
+      - text: Ein zusätzlicher Btrfs-Snapshot auf derselben SSD
+        correct: false
+        why: Snapshot und Original hängen von derselben Hardware ab.
+      - text: Ein zweiter Hardlink im selben Dateisystem
+        correct: false
+        why: Er ist nur ein weiterer Name für dieselben Dateidaten.
+    explanation: Die Aufbewahrung muss außerhalb des betrachteten Ausfalls liegen. Versionen und Restore-Tests sind weitere Anforderungen, die danach geprüft werden müssen.
+    resources:
+      - title: Btrfs · Subvolumes
+        url: https://btrfs.readthedocs.io/en/latest/btrfs-subvolume.html
+  - id: dateilaenge
+    type: output
+    title: Logische Bytes zählen
+    prompt: Welche Bytezahl gibt stat aus? Alle Zeichen sind ASCII.
+    lang: bash
+    code: |
+      printf 'abc\n' > messung.txt
+      stat -c '%s' messung.txt
+    expected: '4'
+    verify: true
+    explanation: Drei Buchstaben und ein Zeilenumbruch ergeben vier Bytes. Zugeordnete Dateisystemblöcke können mehr Platz beanspruchen als diese logische Länge.
+  - id: sparse-laenge
+    type: output
+    title: Eine große logische Datei
+    prompt: Welche logische Größe wird ausgegeben? truncate erzeugt hier nur eine lokale Testdatei; wir fragen keine physische Belegung ab.
+    lang: bash
+    code: |
+      truncate -s 1048576 image.test
+      stat -c '%s' image.test
+    expected: '1048576'
+    verify: true
+    explanation: Die angeforderte Länge ist genau 1 MiB. Daraus allein kann man nicht ableiten, wie viele physische Blöcke das Dateisystem zugeordnet hat.
+    resources:
+      - title: Coreutils · truncate
+        url: https://www.gnu.org/software/coreutils/manual/html_node/truncate-invocation.html
+  - id: mount-finden
+    type: command
+    title: Welcher Mount trägt das Log?
+    prompt: Ermittle mit findmnt das Dateisystem für `/var/log/app.log`, auch wenn die Datei innerhalb eines Mounts liegt.
+    answers: ["findmnt -T /var/log/app.log", "findmnt --target /var/log/app.log"]
+    explanation: Die Zielabfrage löst den Pfad auf den zuständigen Mount auf. Erst dann ist klar, auf welchem Dateisystem du den Platzbedarf untersuchen musst.
+    resources:
+      - title: findmnt(8)
+        url: https://man7.org/linux/man-pages/man8/findmnt.8.html
+  - id: inode-pruefung
+    type: command
+    title: Platz frei, Anlegen trotzdem unmöglich
+    prompt: Zeige mit df die Inode-Belegung des Dateisystems an, auf dem `/var` liegt.
+    answers: ["df -i /var", "df --inodes /var"]
+    explanation: Viele kleine Dateien können einen begrenzten Inode-Vorrat erschöpfen. Die normale Blockbelegung aus `df -h` beantwortet diese Frage nicht.
+    resources:
+      - title: Coreutils · df
+        url: https://www.gnu.org/software/coreutils/manual/html_node/df-invocation.html
+  - id: fstab-pruefen
+    type: command
+    title: Die Tabelle zuerst prüfen
+    prompt: Prüfe mit findmnt ausführlich die Plausibilität der fstab, ohne mount -a auszuführen.
+    answers: ["findmnt --verify --verbose"]
+    explanation: Die Prüfung entdeckt viele Tabellen- und Pfadprobleme vor einem echten Mountversuch. Ein erfolgreicher Neustart und der tatsächliche Mount bleiben eigenständige Nachweise.
+    resources:
+      - title: findmnt(8)
+        url: https://man7.org/linux/man-pages/man8/findmnt.8.html
+  - id: falsche-ebene
+    type: bug
+    title: Ein Bericht zählt das externe Backup mit
+    prompt: Du willst unter `/var` nur Verbrauch im selben Dateisystem summieren. Ein darunter gemountetes Backupvolume verfälscht die Ausgabe. Ergänze die passende GNU-du-Option.
+    lang: bash
+    code: |
+      du -hd1 /var
+    lines: [1]
+    fix:
+      - line: 1
+        answers: ["du -xhd1 /var", "du -h -x -d 1 /var", "du -h --one-file-system --max-depth=1 /var"]
+    explanation: |
+      `-x` begrenzt den Verzeichnislauf auf ein Dateisystem. Das macht die Summe besser mit der Belegung dieses Mounts vergleichbar.
+  - id: geloescht-offen
+    type: explain
+    title: Warum bleibt df voll?
+    prompt: Erkläre diese Beobachtung und einen kontrollierten nächsten Schritt. Die Ausgabe ist ein vereinfachter Diagnoseausschnitt.
+    lang: text
+    code: |
+      df: /var ist fast voll
+      du: die größte Logdatei ist nicht mehr sichtbar
+      lsof +L1: app 1234 ... /var/log/app.log (deleted)
+    points:
+      - Der Verzeichniseintrag wurde entfernt, der Prozess hält die Datei aber offen.
+      - Die Blöcke bleiben bis zum letzten Schließen der Datei belegt.
+      - du kann den entfernten Namen nicht mehr beim Verzeichnislauf finden.
+      - Ein unterstütztes Log-Reopen oder geordneter Dienstneustart wird nach Prüfung geplant.
+    explanation: Das Löschen des Namens beendet den offenen Dateideskriptor nicht. Erst ein kontrolliertes Schließen kann den Platz freigeben; weitere zufällige Löschungen lösen diese Ursache nicht.
+    resources:
+      - title: unlink(2)
+        url: https://man7.org/linux/man-pages/man2/unlink.2.html
+  - id: restore-probe
+    type: practice
+    title: Wiederherstellung nachweisen
+    prompt: Plane einen Restore-Test für ein bereits eingerichtetes Restic-Repository. Nutze einen expliziten Snapshot und ein neues Zielverzeichnis. Prüfe Dateien, Metadaten und eine fachliche Lesefunktion, ohne die Originaldaten zu überschreiben.
+    lang: bash
+    solution: |
+      restic snapshots
+      restic check
+      # SNAPSHOT_ID durch den gewählten tatsächlichen Snapshot ersetzen:
+      restic restore SNAPSHOT_ID --target ./restore-probe
+      # Danach ausgewählte Prüfsummen, Rechte und die Anwendung prüfen.
+    checklist:
+      - Der ausgewählte Snapshot und sein Zeitpunkt sind dokumentiert.
+      - Das Restore-Ziel liegt getrennt vom produktiven Datenpfad.
+      - Erwartete Dateien und ausgewählte Inhalte oder Prüfsummen stimmen.
+      - Benötigte Besitzer und Rechte sind geprüft.
+      - Eine fachliche Lesefunktion arbeitet mit den wiederhergestellten Daten.
+      - Dauer und benötigte Zugangsdaten sind im Runbook beschrieben.
+    explanation: Ein Restore-Test prüft mehr als die Existenz eines Archivs. Er macht sichtbar, ob Schlüssel, Metadaten und Anwendungswissen im Ernstfall verfügbar sind.
+    resources:
+      - title: Restic · Restore
+        url: https://restic.readthedocs.io/en/stable/050_restore.html

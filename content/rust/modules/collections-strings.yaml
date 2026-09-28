@@ -1,0 +1,921 @@
+id: collections-strings
+title: Collections & Strings
+level: 2
+minutes: 150
+summary: Vec, String, HashMap und ihre Verwandten – wie sie im Speicher aussehen, warum Strings keine Indizes haben und welche Collection zu welchem Problem passt.
+goals:
+  - Du erklärst, was bei `push` auf einen vollen `Vec` im Speicher passiert und warum das Referenzen ungültig machen würde.
+  - Du wählst bewusst zwischen `v[i]` und `v.get(i)` und zwischen Iteration per Wert, per `&` und per `&mut`.
+  - Du begründest, warum `String` keinen Indexzugriff hat, und schneidest Strings, ohne an Zeichengrenzen zu paniken.
+  - Du zählst und gruppierst Daten mit der Entry-API von `HashMap` und kennst die Folgen der zufälligen Iterationsreihenfolge.
+  - Du wählst für ein gegebenes Problem zwischen `Vec`, `VecDeque`, `HashMap`, `BTreeMap` und `HashSet` und begründest die Wahl.
+resources:
+  - title: The Rust Book · Kapitel 8 – Common Collections
+    url: https://doc.rust-lang.org/book/ch08-00-common-collections.html
+  - title: std::collections – Welche Collection wann?
+    url: https://doc.rust-lang.org/std/collections/index.html#when-should-you-use-which-collection
+  - title: std · String (Abschnitt UTF-8)
+    url: https://doc.rust-lang.org/std/string/struct.String.html#utf-8
+  - title: Rust by Example · HashMap
+    url: https://doc.rust-lang.org/rust-by-example/std/hash.html
+lesson: |
+  Du wertest eine Logdatei aus. Die Zeilen willst du in einer Liste halten, die Anzahl pro HTTP-Status zählen, einen sortierten Bericht ausgeben, nur die letzten hundert Zeilen im Speicher behalten und wissen, wie viele verschiedene IP-Adressen vorkamen. Das sind fünf Aufgaben und fünf verschiedene Datenstrukturen. Wer hier überall `Vec` nimmt, bekommt Code, der bei zehn Zeilen funktioniert und bei zehn Millionen minutenlang rechnet. Wer überall `HashMap` nimmt, bekommt Tests, die mal grün und mal rot sind.
+
+  Dazu kommt Text. Jede Logzeile ist UTF-8, und sobald ein Nutzer „Jürgen“ heißt, stürzt Code ab, der Strings wie Byte-Arrays behandelt. In diesem Modul lernst du die Collections der Standardbibliothek so kennen, dass du weißt, was im Speicher passiert – und damit, welche du wann nimmst.
+
+  ## Vec: ein wachsender Puffer auf dem Heap
+
+  `Vec<T>` ist die Standardliste in Rust: Elemente eines Typs, hintereinander im Speicher, beliebig erweiterbar.
+
+  ```rust
+  fn main() {
+      let mut antwortzeiten: Vec<u32> = Vec::new();
+      antwortzeiten.push(120);
+      antwortzeiten.push(95);
+      antwortzeiten.push(310);
+
+      let letzte = antwortzeiten.pop(); // Some(310), der Vec hat jetzt 2 Elemente
+      println!("{letzte:?} {antwortzeiten:?}");
+
+      let ports = vec![80, 443, 8080]; // Makro für einen Vec mit Startwerten
+      println!("{} Ports, erster: {}", ports.len(), ports[0]);
+  }
+  ```
+
+  `pop` gibt ein `Option<T>` zurück, weil ein leerer Vec nichts zum Herausnehmen hat. Das ist dasselbe Muster wie im Modul Fehlerbehandlung: Rust macht „vielleicht nichts da“ im Typ sichtbar.
+
+  ### Das Denkmodell: Zeiger, Kapazität, Länge
+
+  Ein `Vec` besteht laut Dokumentation aus genau drei Werten: einem Zeiger auf einen Puffer im Heap, der **Kapazität** (wie viele Elemente in den Puffer passen) und der **Länge** (wie viele davon belegt sind) – [„a (pointer, capacity, length) triplet. No more, no less.“](https://doc.rust-lang.org/std/vec/struct.Vec.html#guarantees)
+
+  Solange `len < capacity`, schreibt `push` das Element in den freien Platz. Ist der Puffer voll, fordert der Vec einen größeren Puffer an, verschiebt alle Elemente dorthin und gibt den alten frei. Die konkrete Wachstumsstrategie garantiert Rust nicht, wohl aber, dass `push` im Mittel O(1) kostet ([Capacity and reallocation](https://doc.rust-lang.org/std/vec/struct.Vec.html#capacity-and-reallocation)). Kennst du die Größe vorher, sparst du die Umzüge mit `Vec::with_capacity`:
+
+  ```rust
+  fn main() {
+      let zeilen = ["GET /", "GET /login", "POST /api"];
+
+      // Größe ist bekannt: einmal passend allokieren statt mehrfach umzuziehen
+      let mut pfade: Vec<&str> = Vec::with_capacity(zeilen.len());
+      for zeile in zeilen {
+          pfade.push(zeile.split(' ').nth(1).unwrap_or("?"));
+      }
+      assert!(pfade.capacity() >= 3);
+      println!("len = {}, capacity = {}", pfade.len(), pfade.capacity());
+  }
+  ```
+
+  Der Umzug erklärt eine Fehlermeldung, die dir oft begegnen wird. Hältst du eine Referenz auf ein Element und rufst dann `push` auf, könnte der Puffer umziehen – deine Referenz zeigte danach auf freigegebenen Speicher. Der Borrow Checker verhindert das zur Compile-Zeit mit [E0502](https://doc.rust-lang.org/error_codes/E0502.html):
+
+  ```rust nocheck
+  let mut jobs = vec![String::from("backup")];
+  let erster = &jobs[0];              // unveränderliche Leihe
+  jobs.push(String::from("deploy"));  // braucht &mut jobs – verboten
+  println!("{erster}");               // Leihe wird hier noch benutzt
+  ```
+
+  ```text
+  error[E0502]: cannot borrow `jobs` as mutable because it is also borrowed as immutable
+  ```
+
+  In C++ ist genau das ein bekannter Bug: Iterator-Invalidierung. Rust macht ihn zu einem Compile-Fehler.
+
+  ### Zugriff: Index oder get
+
+  Es gibt zwei Wege an ein Element ([Book: Reading Elements of Vectors](https://doc.rust-lang.org/book/ch08-01-vectors.html#reading-elements-of-vectors)):
+
+  - `v[i]` liefert das Element direkt und **paniert**, wenn `i >= v.len()`: `index out of bounds: the len is 3 but the index is 10`.
+  - `v.get(i)` liefert `Option<&T>`: `Some(&element)` oder `None`.
+
+  ```rust
+  fn main() {
+      let server = vec!["alpha", "beta", "gamma"];
+
+      let index_aus_config = 7; // stell dir vor, der Wert kommt aus einer Datei
+      match server.get(index_aus_config) {
+          Some(name) => println!("verbinde mit {name}"),
+          None => println!("kein Server Nummer {index_aus_config}"),
+      }
+
+      let erster = server[0]; // ok: die Liste ist hier nie leer
+      println!("Standard: {erster}");
+  }
+  ```
+
+  Die Faustregel: Kommt der Index von außen (Nutzereingabe, Datei, Netzwerk), nimm `get` und behandle `None`. Ist ein ungültiger Index ein Programmierfehler, den es nicht geben darf, ist `v[i]` in Ordnung – dann ist die Panic die richtige Reaktion, weil das Programm in einem Zustand ist, den du nicht vorgesehen hast.
+
+  ### Iterieren: per Wert, per Referenz, per veränderlicher Referenz
+
+  Die `for`-Schleife ruft `IntoIterator` auf dem Ausdruck auf. Was du hineingibst, bestimmt, was du bekommst ([std::iter: for-Schleifen](https://doc.rust-lang.org/std/iter/index.html#for-loops-and-intoiterator)):
+
+  | Schleife | Element | Danach |
+  | --- | --- | --- |
+  | `for x in &v` | `&T` | `v` unverändert benutzbar |
+  | `for x in &mut v` | `&mut T` | `v` geändert benutzbar, Zugriff über `*x` |
+  | `for x in v` | `T` | `v` ist verbraucht (move) |
+
+  ```rust
+  fn main() {
+      let mut preise = vec![1999, 4999, 999];
+
+      for p in &preise {          // p: &i32 – nur lesen
+          println!("{p} Cent");
+      }
+      for p in &mut preise {      // p: &mut i32 – ändern über *p
+          *p = *p * 119 / 100;
+      }
+      println!("{preise:?}");     // preise ist weiter benutzbar
+
+      for p in preise {           // p: i32 – der Vec wird verbraucht
+          println!("{p}");
+      }
+      // println!("{preise:?}");  // Fehler E0382: borrow of moved value
+  }
+  ```
+
+  ## String und UTF-8
+
+  Ein `String` ist intern ein `Vec<u8>` mit einer zusätzlichen Garantie: Die Bytes sind **immer gültiges UTF-8** ([String: UTF-8](https://doc.rust-lang.org/std/string/struct.String.html#utf-8)). `&str` ist die geliehene Sicht auf solche Bytes, wie du sie aus dem Ownership-Modul kennst. UTF-8 kodiert jedes Zeichen mit 1 bis 4 Bytes: ASCII mit einem, „ü“ mit zwei, die meisten Emoji mit vier.
+
+  Daraus ergeben sich drei Sichten auf denselben Text ([Book: Bytes, Scalar Values, Grapheme Clusters](https://doc.rust-lang.org/book/ch08-02-strings.html#bytes-scalar-values-and-grapheme-clusters)):
+
+  1. **Bytes** (`s.bytes()`, `s.len()`): was im Speicher liegt.
+  2. **Unicode Scalar Values** (`s.chars()`): das, was Rust `char` nennt, immer 4 Byte groß.
+  3. **Grapheme Cluster**: das, was ein Mensch als ein Zeichen wahrnimmt. Die Standardbibliothek kennt sie nicht; dafür gibt es Crates.
+
+  ```rust
+  fn main() {
+      let gruss = "Grüße";
+      println!("{} Bytes, {} chars", gruss.len(), gruss.chars().count()); // 7 Bytes, 5 chars
+
+      for b in "ü".bytes() {
+          print!("{b:#04x} "); // 0xc3 0xbc – zwei Bytes für ein Zeichen
+      }
+      println!();
+
+      let flagge = "🇩🇪";
+      println!("{} Bytes, {} chars", flagge.len(), flagge.chars().count());
+      // 8 Bytes, 2 chars – für Menschen aber ein einziges Zeichen
+  }
+  ```
+
+  > [!MERKE]
+  > `len()` zählt **Bytes**, nicht Zeichen. Für die Anzahl der `char`s brauchst du `chars().count()` – und das läuft einmal durch den ganzen String.
+
+  ### Warum es kein s[0] gibt
+
+  ```text
+  error[E0277]: the type `str` cannot be indexed by `{integer}`
+  ```
+
+  Der Compiler verweigert `s[0]` aus zwei Gründen ([Book: Indexing into Strings](https://doc.rust-lang.org/book/ch08-02-strings.html#indexing-into-strings)). Erstens ist unklar, was herauskommen soll: Bei „Grüße“ ist Byte 2 nur die erste Hälfte von „ü“, also kein sinnvolles Zeichen. Zweitens erwartet man von Indexzugriff konstante Zeit. Das n-te `char` findet man in UTF-8 aber nur, indem man von vorne zählt. Rust versteckt diese Kosten nicht hinter einer harmlos aussehenden Syntax. Brauchst du das dritte Zeichen, schreibst du `s.chars().nth(2)` und siehst am Code, dass hier iteriert wird.
+
+  ### Slicen nur an Zeichengrenzen
+
+  Mit Byte-Bereichen darfst du schneiden: `&s[0..3]`. Der Bereich muss aber auf **Zeichengrenzen** liegen, sonst paniert das Programm zur Laufzeit ([Book: Slicing Strings](https://doc.rust-lang.org/book/ch08-02-strings.html#slicing-strings)):
+
+  ```rust
+  fn main() {
+      let stadt = String::from("Köln");
+      println!("{}", &stadt[0..3]); // "Kö": Bytes 0, 1 und 2
+
+      println!("{}", stadt.is_char_boundary(2)); // false: mitten im ö
+      println!("{:?}", stadt.get(0..2));       // None statt Panic
+
+      for (byte_pos, zeichen) in stadt.char_indices() {
+          println!("{byte_pos}: {zeichen}"); // 0: K, 1: ö, 3: l, 4: n
+      }
+  }
+  ```
+
+  `&stadt[0..2]` hätte mit `byte index 2 is not a char boundary; it is inside 'ö' (bytes 1..3 of string)` paniert. Sichere Werkzeuge: [`str::get`](https://doc.rust-lang.org/std/primitive.str.html#method.get) liefert `Option<&str>`, [`is_char_boundary`](https://doc.rust-lang.org/std/primitive.str.html#method.is_char_boundary) prüft eine Position, und `char_indices()` liefert zu jedem Zeichen seine Byte-Position.
+
+  > [!WARNING] Kürzen nach Bytes
+  > „Zeige die ersten 20 Zeichen des Titels“ mit `&titel[..20]` besteht jeden Test mit englischen Beispieldaten und stürzt beim ersten „Größenänderung“ in Produktion ab. Kürze mit `titel.chars().take(20).collect::<String>()`.
+
+  ### Strings bauen
+
+  | Werkzeug | Beispiel | Ownership |
+  | --- | --- | --- |
+  | `push_str` | `s.push_str(";role=admin")` | leiht das Argument (`&str`) |
+  | `push` | `s.push(';')` | ein einzelnes `char` |
+  | `format!` | `format!("{host}:{port}")` | leiht alles, erzeugt neuen `String` |
+  | `+` | `a + &b` | **verbraucht** `a`, leiht `b` |
+  | `join` | `["a", "b"].join(",")` | erzeugt neuen `String` |
+
+  ```rust
+  fn main() {
+      let mut zeile = String::from("user=steven");
+      zeile.push_str(";role=admin");
+      zeile.push(';');
+
+      let host = String::from("db01");
+      let port = 5432;
+      let url = format!("postgres://{host}:{port}/app"); // host bleibt benutzbar
+
+      let teil1 = String::from("Hallo, ");
+      let teil2 = String::from("Welt");
+      let satz = teil1 + &teil2; // teil1 wird verbraucht, teil2 nur geliehen
+
+      let tags = ["rust", "cli", "linux"];
+      let csv = tags.join(",");
+
+      println!("{zeile}\n{url}\n{satz} {teil2}\n{csv}");
+  }
+  ```
+
+  Warum verbraucht `+` die linke Seite? Der Operator ruft `fn add(self, s: &str) -> String` auf. Er übernimmt den Puffer von `teil1`, hängt an und gibt ihn zurück – das spart eine Kopie. `teil1 + teil2` ohne `&` scheitert mit `expected &str, found String` ([E0308](https://doc.rust-lang.org/error_codes/E0308.html)). Im Alltag ist `format!` meist lesbarer; in Schleifen, die viel anhängen, ist ein einzelner `String` mit `push_str` sparsamer, weil `format!` jedes Mal einen neuen `String` allokiert.
+
+  ## HashMap: Schlüssel auf Werte abbilden
+
+  ```rust
+  use std::collections::HashMap;
+
+  fn main() {
+      let mut config: HashMap<String, String> = HashMap::new();
+      config.insert(String::from("host"), String::from("localhost"));
+      let alt = config.insert(String::from("host"), String::from("db01"));
+      println!("{alt:?}"); // Some("localhost"): insert liefert den alten Wert
+
+      // Nachschlagen mit &str, obwohl die Schlüssel String sind
+      match config.get("host") {
+          Some(host) => println!("Host: {host}"),
+          None => println!("kein Host konfiguriert"),
+      }
+      println!("{}", config.contains_key("port")); // false
+
+      let entfernt = config.remove("host");
+      println!("{entfernt:?} {}", config.len()); // Some("db01") 0
+  }
+  ```
+
+  Drei Details, die oft übersehen werden:
+
+  - `insert` **überschreibt** und gibt den alten Wert als `Option` zurück.
+  - `get` liefert `Option<&V>`, keine Kopie. Die Map bleibt Besitzerin.
+  - Schlüssel vom Typ `String` wandern beim `insert` in die Map (move). Nachschlagen geht trotzdem mit `&str`, weil `String` den Trait [`Borrow<str>`](https://doc.rust-lang.org/std/borrow/trait.Borrow.html) implementiert.
+
+  ### Keine garantierte Reihenfolge
+
+  Die Iteration über eine `HashMap` liefert die Einträge in „arbitrary order“. Mehr noch: Die Hashfunktion (derzeit SipHash 1-3) wird bei jedem Programmstart **zufällig initialisiert**, um Angriffe mit gezielt kollidierenden Schlüsseln (HashDoS) zu verhindern ([std: HashMap](https://doc.rust-lang.org/std/collections/struct.HashMap.html)). Dieselbe Map kann bei jedem Lauf anders sortiert herauskommen. Brauchst du eine stabile Ausgabe, sortierst du vorher oder nimmst eine `BTreeMap`.
+
+  ### Die Entry-API
+
+  Das häufigste Muster mit Maps: „Wenn der Schlüssel fehlt, lege einen Startwert an; dann ändere den Wert.“ Mit `get` und `insert` bräuchtest du zwei Nachschlagevorgänge und eine Fallunterscheidung. [`entry`](https://doc.rust-lang.org/std/collections/struct.HashMap.html#method.entry) schlägt einmal nach und gibt dir ein [`Entry`](https://doc.rust-lang.org/std/collections/hash_map/enum.Entry.html) zurück – einen Platzhalter, der entweder belegt (`Occupied`) oder frei (`Vacant`) ist:
+
+  ```rust
+  use std::collections::HashMap;
+
+  fn main() {
+      let log = ["ERROR db", "INFO start", "ERROR disk", "WARN slow"];
+
+      let mut anzahl: HashMap<&str, u32> = HashMap::new();
+      let mut texte: HashMap<&str, Vec<&str>> = HashMap::new();
+
+      for zeile in log {
+          let (level, text) = zeile.split_once(' ').unwrap_or((zeile, ""));
+
+          // Zählen: Eintrag holen, notfalls mit 0 anlegen, dann erhöhen
+          *anzahl.entry(level).or_insert(0) += 1;
+
+          // Gruppieren: leeren Vec anlegen, falls nötig, dann anhängen
+          texte.entry(level).or_default().push(text);
+      }
+
+      // Vorhandenen Wert ändern oder neuen Wert setzen
+      anzahl.entry("DEBUG").and_modify(|n| *n += 1).or_insert(1);
+
+      println!("{:?}", anzahl.get("ERROR")); // Some(2)
+      println!("{:?}", texte.get("ERROR"));  // Some(["db", "disk"])
+  }
+  ```
+
+  `or_insert(0)` gibt ein `&mut u32` zurück, das auf den Wert **in der Map** zeigt. Deshalb steht vorne ein `*`: Du erhöhst den Wert, auf den die Referenz zeigt. `or_default()` nimmt `Default::default()` als Startwert (0 für Zahlen, leerer `Vec`, leerer `String`). `and_modify` läuft nur, wenn der Eintrag schon existiert. Der Book-Abschnitt [Updating a Value Based on the Old Value](https://doc.rust-lang.org/book/ch08-03-hash-maps.html#updating-a-value-based-on-the-old-value) zeigt dasselbe Muster beim Wörterzählen.
+
+  ## BTreeMap, HashSet und VecDeque
+
+  Drei weitere Collections decken fast alle übrigen Fälle ab:
+
+  - [`BTreeMap`](https://doc.rust-lang.org/std/collections/struct.BTreeMap.html) hat dieselbe API wie `HashMap`, hält die Schlüssel aber **sortiert**. Iteration liefert immer dieselbe Reihenfolge, und `range` findet alle Schlüssel in einem Bereich. Operationen kosten O(log n) statt im Mittel O(1). Schlüssel brauchen `Ord` statt `Hash + Eq`.
+  - [`HashSet`](https://doc.rust-lang.org/std/collections/struct.HashSet.html) ist eine `HashMap` ohne Werte: Jeder Schlüssel kommt höchstens einmal vor. `insert` gibt `true` zurück, wenn der Wert neu war. `contains` kostet im Mittel O(1) – im Gegensatz zu `Vec::contains`, das die ganze Liste durchläuft.
+  - [`VecDeque`](https://doc.rust-lang.org/std/collections/struct.VecDeque.html) ist ein Ringpuffer. `push_back` und `pop_front` kosten beide O(1). Ein `Vec` kann das vorne nicht: `v.remove(0)` verschiebt alle übrigen Elemente um eine Position.
+
+  ```rust
+  use std::collections::{BTreeMap, HashSet, VecDeque};
+
+  fn main() {
+      let anfragen = [
+          ("10.0.0.2", 404), ("10.0.0.1", 200), ("10.0.0.2", 200),
+          ("10.0.0.3", 500), ("10.0.0.1", 200),
+      ];
+
+      let mut pro_status: BTreeMap<u16, u32> = BTreeMap::new(); // sortiert
+      let mut ips: HashSet<&str> = HashSet::new();              // eindeutig
+      let mut letzte: VecDeque<(&str, u16)> = VecDeque::new();  // Fenster
+
+      for (ip, status) in anfragen {
+          *pro_status.entry(status).or_insert(0) += 1;
+          ips.insert(ip);
+          if letzte.len() == 2 {
+              letzte.pop_front();
+          }
+          letzte.push_back((ip, status));
+      }
+
+      println!("{pro_status:?}");                 // {200: 3, 404: 1, 500: 1}
+      println!("{} verschiedene IPs", ips.len()); // 3
+      println!("{letzte:?}");                     // [("10.0.0.3", 500), ("10.0.0.1", 200)]
+      for (status, n) in pro_status.range(400..) {
+          println!("Fehler {status}: {n}");
+      }
+  }
+  ```
+
+  ## Die richtige Collection wählen
+
+  Die Dokumentation von `std::collections` beginnt mit einem ehrlichen Satz: „you should probably just use Vec or HashMap.“ Die übrigen Collections lohnen sich, wenn eine konkrete Anforderung dafür spricht ([When Should You Use Which Collection?](https://doc.rust-lang.org/std/collections/index.html#when-should-you-use-which-collection)):
+
+  | Anforderung | Collection | Warum |
+  | --- | --- | --- |
+  | Liste, Reihenfolge wichtig, Anhängen am Ende, Stack | `Vec<T>` | kompakt, cache-freundlich, Index in O(1) |
+  | Warteschlange, gleitendes Fenster, vorne und hinten ändern | `VecDeque<T>` | O(1) an beiden Enden |
+  | Nachschlagen per Schlüssel, Cache, Zähler | `HashMap<K, V>` | im Mittel O(1) |
+  | Sortierte Ausgabe, Bereichsabfragen, kleinster/größter Schlüssel | `BTreeMap<K, V>` | sortiert, O(log n) |
+  | „Habe ich das schon gesehen?“, Duplikate entfernen | `HashSet<T>` | `contains` im Mittel O(1) |
+  | Immer das wichtigste Element zuerst (Prioritätswarteschlange) | `BinaryHeap<T>` | größtes Element in O(1) sichtbar |
+
+  Die [Performance-Tabelle](https://doc.rust-lang.org/std/collections/index.html#performance) der Dokumentation listet die Kosten jeder Operation.
+
+  > [!PRAXIS] Was im Code-Review auffällt
+  > - `Vec::contains` in einer Schleife über eine andere Liste: O(n·m). Ein `HashSet` macht daraus O(n + m).
+  > - `v.remove(0)` in einer Schleife: jede Entnahme verschiebt den Rest. Das ist ein `VecDeque`.
+  > - Eine `HashMap` wird direkt als JSON oder Bericht ausgegeben, und ein Snapshot-Test vergleicht den Text. Der Test schlägt sporadisch fehl. Lösung: `BTreeMap` oder vorher sortieren.
+  > - `contains_key` gefolgt von `insert` oder `get_mut`: zwei Nachschlagevorgänge, wo `entry` einen braucht.
+
+  > [!INTERVIEW] „Warum kann man in Rust einen String nicht mit s[0] indizieren?“
+  > Strings sind UTF-8, ein Zeichen belegt 1 bis 4 Bytes. Ein Byte-Index würde oft ein halbes Zeichen liefern, ein Zeichen-Index müsste von vorne zählen und wäre O(n), obwohl `[]` O(1) verspricht. Rust verlangt deshalb, dass du dich entscheidest: `bytes()`, `chars().nth(i)` oder ein Byte-Bereich an Zeichengrenzen. Gute Ergänzung: Was Menschen als ein Zeichen sehen (Grapheme Cluster, etwa 🇩🇪), sind oft mehrere `char`s.
+
+  ## Häufige Fehler
+
+  - **Index außerhalb der Grenzen.** `index out of bounds: the len is 3 but the index is 10` zur Laufzeit. Bei Indizes von außen `get` nehmen und `None` behandeln.
+  - **Referenz halten und dann `push`.** [E0502](https://doc.rust-lang.org/error_codes/E0502.html). Erst fertig lesen, dann ändern – oder den Wert bewusst mit `clone()` herauslösen, wenn du ihn wirklich länger brauchst.
+  - **`len()` für Zeichen halten.** `"Grüße".len()` ist 7. Für Zeichen `chars().count()`.
+  - **Mitten im Zeichen slicen.** `byte index … is not a char boundary`. Mit `chars()`, `char_indices()` oder `str::get` arbeiten.
+  - **`a + b` mit zwei `String`s.** `expected &str, found String`. Richtig: `a + &b` oder `format!("{a}{b}")`.
+  - **Auf die Reihenfolge einer `HashMap` verlassen.** Ausgaben und Tests werden instabil. Sortieren oder `BTreeMap`.
+  - **`*` vergessen.** `map.entry(k).or_insert(0) += 1` scheitert, weil man auf `&mut u32` nicht addieren kann ([E0368](https://doc.rust-lang.org/error_codes/E0368.html)). Richtig: `*map.entry(k).or_insert(0) += 1`.
+
+  ## Zusammenfassung
+
+  - `Vec<T>` ist Zeiger, Kapazität und Länge. `push` kann umziehen; deshalb verbietet der Borrow Checker Referenzen über ein `push` hinweg.
+  - `v[i]` paniert bei ungültigem Index, `v.get(i)` liefert `Option<&T>`.
+  - `for x in &v`, `&mut v` und `v` liefern `&T`, `&mut T` und `T`; die letzte Form verbraucht den Vec.
+  - `String` ist garantiertes UTF-8. `len()` zählt Bytes; Indizes gibt es nicht; Slices müssen an Zeichengrenzen liegen.
+  - `format!` und `push_str` leihen, `+` verbraucht die linke Seite.
+  - `HashMap` hat keine Reihenfolge. Die Entry-API (`or_insert`, `or_default`, `and_modify`) zählt und gruppiert mit einem Nachschlagen.
+  - `BTreeMap` für Sortierung und Bereiche, `HashSet` für Eindeutigkeit, `VecDeque` für Warteschlangen.
+  - Im Zweifel `Vec` oder `HashMap` – und wechseln, sobald eine konkrete Anforderung dagegen spricht.
+exercises:
+  - id: string-index-warum
+    type: choice
+    title: Warum kein s[0]?
+    prompt: |
+      Der Compiler lehnt `let c = name[0];` für `name: String` ab. Welche Aussagen begründen diese Entscheidung? **Mehrere Antworten richtig.**
+    options:
+      - text: Ein Byte-Index würde bei UTF-8 oft nur einen Teil eines Zeichens treffen, etwa das erste von zwei Bytes eines „ü“.
+        correct: true
+        why: UTF-8 kodiert Zeichen mit 1 bis 4 Bytes. Byte 2 von „Grüße“ ist die erste Hälfte von „ü“ und für sich kein sinnvolles Zeichen.
+      - text: Das n-te Zeichen zu finden, erfordert ein Durchlaufen von vorne. `[]` verspricht aber konstante Zeit.
+        correct: true
+        why: Weil Zeichen unterschiedlich breit sind, lässt sich die Byte-Position des n-ten `char` nicht ausrechnen. `chars().nth(n)` macht diese O(n)-Kosten sichtbar.
+      - text: "`String` speichert Text intern als UTF-16, deshalb passen Indizes nicht zu den Zeichen."
+        correct: false
+        why: Rust-Strings sind UTF-8, nicht UTF-16. UTF-16 nutzen etwa Java, Kotlin und JavaScript intern.
+      - text: Indexzugriff ist in Rust nur für Collections erlaubt, deren Elemente `Copy` sind.
+        correct: false
+        why: "`Vec<String>` lässt sich problemlos mit `v[0]` indizieren. Die Sperre betrifft speziell `str` und `String`, weil sie den Trait `Index<usize>` nicht implementieren."
+    explanation: |
+      `str` implementiert `Index` nur für Bereiche (`s[0..3]`), nicht für einzelne Zahlen. Die Fehlermeldung `the type str cannot be indexed by {integer}` verweist genau darauf. Rust will, dass du dich bewusst entscheidest: Bytes (`bytes()`), Zeichen (`chars()`) oder ein Byte-Bereich an Zeichengrenzen.
+    resources:
+      - title: The Rust Book · Indexing into Strings
+        url: https://doc.rust-lang.org/book/ch08-02-strings.html#indexing-into-strings
+      - title: std · String (Abschnitt UTF-8)
+        url: https://doc.rust-lang.org/std/string/struct.String.html#utf-8
+
+  - id: collection-rate-limiter
+    type: choice
+    title: Die passende Struktur für einen Rate-Limiter
+    prompt: |
+      Du baust einen Rate-Limiter. Pro Client-IP merkst du dir die Zeitpunkte der letzten Anfragen. Neue Zeitpunkte kommen hinten dazu, Zeitpunkte älter als 60 Sekunden entfernst du vorne. Pro Anfrage musst du die Liste der passenden IP schnell finden. Welche Struktur passt am besten?
+    options:
+      - text: "`HashMap<IpAddr, VecDeque<Instant>>`"
+        correct: true
+        why: Die HashMap findet die IP im Mittel in O(1). Die VecDeque nimmt neue Zeitpunkte hinten auf und gibt alte vorne in O(1) ab.
+      - text: "`HashMap<IpAddr, Vec<Instant>>`"
+        correct: false
+        why: Funktioniert, aber `remove(0)` verschiebt bei jedem Entfernen alle übrigen Zeitpunkte. Bei vielen Anfragen pro IP kostet das O(n) pro Entnahme.
+      - text: "`BTreeMap<Instant, IpAddr>`"
+        correct: false
+        why: Sortiert nach Zeit, aber um alle Anfragen einer IP zu finden, müsstest du die ganze Map durchlaufen. Zwei Anfragen zum selben `Instant` würden sich außerdem überschreiben.
+      - text: "`HashSet<(IpAddr, Instant)>`"
+        correct: false
+        why: Ein Set hat keine Reihenfolge. Die ältesten Einträge einer IP findest du nur, indem du alles durchsuchst.
+    explanation: |
+      Zwei Zugriffsmuster, zwei Strukturen: Nachschlagen per Schlüssel spricht für `HashMap`, „hinten rein, vorne raus“ für `VecDeque`. Solche Kombinationen sind in echtem Code normal. Die Frage „Welche Operationen brauche ich wie oft?“ entscheidet, nicht die Frage „Welche Collection kenne ich?“.
+    resources:
+      - title: std::collections · When Should You Use Which Collection?
+        url: https://doc.rust-lang.org/std/collections/index.html#when-should-you-use-which-collection
+      - title: std · VecDeque
+        url: https://doc.rust-lang.org/std/collections/struct.VecDeque.html
+
+  - id: woerter-zaehlen-sortieren
+    type: order
+    title: Die zwei häufigsten Wörter
+    prompt: Bring die Zeilen in eine Reihenfolge, die kompiliert und die zwei häufigsten Wörter ausgibt (bei Gleichstand alphabetisch).
+    lang: rust
+    lines: |
+      fn main() {
+          let text = "der hund und der ball und der garten";
+          let mut zaehler = std::collections::HashMap::new();
+          for wort in text.split_whitespace() {
+              *zaehler.entry(wort).or_insert(0) += 1;
+          }
+          let mut liste: Vec<(&str, i32)> = zaehler.into_iter().collect();
+          liste.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+          println!("{:?}", &liste[..2]);
+      }
+    alternatives:
+      - [1, 3, 2, 4, 5, 6, 7, 8, 9, 10]
+    explanation: |
+      Erst zählen, dann sortieren: Eine `HashMap` hat keine Reihenfolge, also wandelt `into_iter().collect()` sie in einen `Vec` von Paaren um, den man sortieren kann. `sort_by` vergleicht zuerst die Anzahl absteigend (`b.1` mit `a.1`) und bei Gleichstand das Wort aufsteigend. Ohne diesen zweiten Vergleich wäre die Reihenfolge bei gleicher Anzahl vom Zufall der Hashfunktion abhängig. Ausgabe: `[("der", 3), ("und", 2)]`.
+    resources:
+      - title: The Rust Book · Updating a Value Based on the Old Value
+        url: https://doc.rust-lang.org/book/ch08-03-hash-maps.html#updating-a-value-based-on-the-old-value
+
+  - id: vec-stapel-ausgabe
+    type: output
+    title: Stapel, get und &mut
+    prompt: Was gibt dieses Programm aus?
+    lang: rust
+    code: |
+      fn main() {
+          let mut stapel = vec![10, 20, 30];
+          stapel.push(40);
+          let oben = stapel.pop();
+          println!("{oben:?}");
+          println!("{:?}", stapel.get(3));
+          for wert in &mut stapel {
+              *wert += 1;
+          }
+          println!("{stapel:?}");
+          let summe: i32 = stapel.iter().sum();
+          println!("{summe} {}", stapel.len());
+      }
+    expected: |
+      Some(40)
+      None
+      [11, 21, 31]
+      63 3
+    hints:
+      - "`pop` entfernt das zuletzt hinzugefügte Element und verpackt es in `Option`."
+      - Nach dem `pop` hat der Vec drei Elemente. Welche Indizes sind gültig?
+    explanation: |
+      `push(40)` hängt hinten an, `pop()` nimmt genau dieses Element wieder heraus und liefert `Some(40)`. Danach hat der Vec drei Elemente mit den Indizes 0 bis 2; `get(3)` liefert deshalb `None` statt zu paniken. `for wert in &mut stapel` gibt `&mut i32` heraus, `*wert += 1` ändert die Elemente im Vec selbst. Die Summe ist 11 + 21 + 31 = 63.
+    resources:
+      - title: std · Vec::get
+        url: https://doc.rust-lang.org/std/vec/struct.Vec.html#method.get
+      - title: The Rust Book · Iterating Over the Values in a Vector
+        url: https://doc.rust-lang.org/book/ch08-01-vectors.html#iterating-over-the-values-in-a-vector
+
+  - id: utf8-ausgabe
+    type: output
+    title: Bytes, chars und ein großes ß
+    prompt: Was gibt dieses Programm aus? Achte auf jede Zahl.
+    lang: rust
+    code: |
+      fn main() {
+          let gruss = String::from("Grüße");
+          println!("{}", gruss.len());
+          println!("{}", gruss.chars().count());
+          println!("{}", &gruss[0..4]);
+          let laut = gruss.to_uppercase();
+          println!("{laut} {}", laut.len());
+          println!("{:?}", gruss.get(0..3));
+      }
+    expected: |
+      7
+      5
+      Grü
+      GRÜSSE 7
+      None
+    hints:
+      - "„ü“ und „ß“ belegen in UTF-8 je zwei Bytes, die übrigen Buchstaben je eines."
+      - Das große ß ist in der Standard-Großschreibung „SS“.
+      - Byte 3 liegt mitten in einem Zeichen. Was macht `get` in diesem Fall?
+    explanation: |
+      „Grüße“ hat 5 `char`s, aber 7 Bytes: G, r und e je 1, ü und ß je 2. `&gruss[0..4]` endet genau hinter dem „ü“ (Bytes 2 und 3) und ist deshalb gültig. `to_uppercase` folgt den Unicode-Regeln und macht aus „ß“ zwei Zeichen „SS“: „GRÜSSE“ hat 6 Zeichen und wieder 7 Bytes. Byte 3 liegt mitten im „ü“; `get(0..3)` meldet das mit `None`, wo `&gruss[0..3]` paniken würde.
+    resources:
+      - title: std · str::get
+        url: https://doc.rust-lang.org/std/primitive.str.html#method.get
+      - title: std · str::to_uppercase
+        url: https://doc.rust-lang.org/std/primitive.str.html#method.to_uppercase
+
+  - id: hashmap-entry-ausgabe
+    type: output
+    title: insert, entry und die Rückgabewerte
+    prompt: Was gibt dieses Programm aus?
+    lang: rust
+    code: |
+      use std::collections::HashMap;
+
+      fn main() {
+          let mut ports: HashMap<&str, u16> = HashMap::new();
+          println!("{:?}", ports.insert("http", 80));
+          println!("{:?}", ports.insert("http", 8080));
+          *ports.entry("https").or_insert(443) += 1;
+          ports.entry("http").and_modify(|p| *p = 80).or_insert(0);
+          ports.entry("ssh").or_default();
+          let mut eintraege: Vec<_> = ports.into_iter().collect();
+          eintraege.sort();
+          println!("{eintraege:?}");
+      }
+    expected: |
+      None
+      Some(80)
+      [("http", 80), ("https", 444), ("ssh", 0)]
+    hints:
+      - "`insert` gibt den **vorherigen** Wert des Schlüssels zurück."
+      - "`and_modify` läuft nur, wenn der Schlüssel existiert; `or_insert` nur, wenn nicht."
+    explanation: |
+      Das erste `insert` findet keinen alten Wert (`None`), das zweite überschreibt 80 und gibt ihn zurück (`Some(80)`). `entry("https").or_insert(443)` legt 443 an und liefert ein `&mut u16`, über das `+= 1` auf 444 erhöht. Für „http“ existiert der Eintrag, also setzt `and_modify` ihn zurück auf 80; `or_insert(0)` greift nicht. `or_default()` legt „ssh“ mit `u16::default()`, also 0, an. Das `sort()` vor der Ausgabe ist nötig, weil die Map selbst keine Reihenfolge garantiert.
+    resources:
+      - title: std · Entry::and_modify
+        url: https://doc.rust-lang.org/std/collections/hash_map/enum.Entry.html#method.and_modify
+      - title: std · HashMap::insert
+        url: https://doc.rust-lang.org/std/collections/struct.HashMap.html#method.insert
+
+  - id: strings-bauen
+    type: gap
+    title: Logzeilen zusammenbauen
+    prompt: Ergänze die Methoden und das Makro, sodass das Programm `2026-09-28;WARN;Speicher knapp` und `[WARN] Speicher knapp` ausgibt.
+    lang: rust
+    code: |
+      fn csv_zeile(felder: &[&str]) -> String {
+          felder.⟦join⟧(";")
+      }
+
+      fn markiere(level: &str) -> String {
+          let mut s = String::with_capacity(level.len() + 2);
+          s.⟦push⟧('[');
+          s.⟦push_str⟧(level);
+          s.push(']');
+          s
+      }
+
+      fn main() {
+          let felder = ["2026-09-28", "WARN", "Speicher knapp"];
+          println!("{}", csv_zeile(&felder));
+          let zeile = ⟦format!⟧("{} {}", markiere(felder[1]), felder[2]);
+          println!("{zeile}");
+      }
+    gaps:
+      - label: Slice zu String verbinden
+        hint: Die Methode auf Slices, die Elemente mit einem Trennzeichen verbindet.
+        accept: ["concat"]
+      - label: Ein char anhängen
+        hint: "`'['` ist ein `char`, kein `&str`."
+      - label: Einen &str anhängen
+        hint: Der Name sagt, dass ein String-Slice angehängt wird.
+      - label: String formatieren
+        hint: Ein Makro, das wie `println!` arbeitet, aber einen `String` zurückgibt.
+    explanation: |
+      `join` verbindet die Elemente eines Slices mit einem Trenner zu einem neuen `String`. `push` hängt ein einzelnes `char` an, `push_str` einen `&str` – beide ändern den vorhandenen Puffer, der dank `with_capacity` nicht umziehen muss. `format!` baut einen neuen `String` und leiht seine Argumente nur. `concat` wird hier nicht akzeptiert, weil es keinen Trenner nimmt: `concat(";")` kompiliert nicht.
+    resources:
+      - title: std · slice::join
+        url: https://doc.rust-lang.org/std/primitive.slice.html#method.join
+      - title: The Rust Book · Updating a String
+        url: https://doc.rust-lang.org/book/ch08-02-strings.html#updating-a-string
+
+  - id: entry-zaehlen-gruppieren
+    type: gap
+    title: Zählen und Gruppieren mit entry
+    prompt: |
+      Zähle die Logzeilen pro Level in `anzahl` und sammle die Texte pro Level in `nach_level`. Nutze in beiden Fällen die Entry-API. Die zweite Ausgabe soll `{"ERROR": ["db timeout", "disk full"], "INFO": ["start"], "WARN": ["slow query"]}` sein.
+    lang: rust
+    code: |
+      use std::collections::{BTreeMap, HashMap};
+
+      fn main() {
+          let log = ["ERROR db timeout", "INFO start", "ERROR disk full", "WARN slow query"];
+          let mut anzahl: HashMap<&str, u32> = HashMap::new();
+          let mut nach_level: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+          for zeile in log {
+              let (level, text) = zeile.split_once(' ').unwrap();
+              ⟦*anzahl.entry(level).or_insert(0) += 1⟧;
+              nach_level.entry(level).⟦or_default()⟧.push(text);
+          }
+          println!("{:?}", anzahl.get("ERROR"));
+          println!("{nach_level:?}");
+      }
+    gaps:
+      - label: Zähler erhöhen (ganze Anweisung)
+        hint: "`or_insert(0)` gibt ein `&mut u32` zurück. Wie erhöhst du den Wert, auf den es zeigt?"
+        accept:
+          - "*anzahl.entry(level).or_default() += 1"
+          - "anzahl.entry(level).and_modify(|n| *n += 1).or_insert(1)"
+          - "anzahl.entry(level).and_modify(|c| *c += 1).or_insert(1)"
+      - label: Leeren Vec bei Bedarf anlegen
+        hint: Ein leerer `Vec` ist der `Default`-Wert für `Vec<T>`.
+        accept: ["or_insert_with(Vec::new)", "or_insert(Vec::new())", "or_insert(vec![])"]
+    explanation: |
+      `entry` schlägt den Schlüssel einmal nach. `or_insert(0)` legt bei Bedarf 0 an und gibt in jedem Fall ein `&mut u32` auf den Wert in der Map zurück; `*… += 1` ändert diesen Wert. Beim Gruppieren liefert `or_default()` ein `&mut Vec<&str>`, auf dem `push` direkt arbeitet. `or_insert_with(Vec::new)` ist gleichwertig und legt den Vec nur an, wenn er fehlt; `or_insert(Vec::new())` erzeugt den leeren Vec bei jedem Aufruf, was hier nichts kostet, weil ein leerer Vec nicht allokiert. Die `BTreeMap` sorgt für die alphabetische Ausgabe.
+    resources:
+      - title: std · Entry::or_default
+        url: https://doc.rust-lang.org/std/collections/hash_map/enum.Entry.html#method.or_default
+      - title: std::collections · Entries
+        url: https://doc.rust-lang.org/std/collections/index.html#entries
+
+  - id: tail-mit-vecdeque
+    type: gap
+    title: tail -n mit VecDeque
+    prompt: |
+      `letzte_zeilen` soll wie `tail -n` die letzten `n` Zeilen liefern, ohne je mehr als `n` Zeilen im Speicher zu halten. Ergänze die beiden Operationen auf dem Ringpuffer. Erwartete Ausgabe: `["db ok", "warnung", "fehler"]`.
+    lang: rust
+    code: |
+      use std::collections::VecDeque;
+
+      fn letzte_zeilen(text: &str, n: usize) -> Vec<&str> {
+          if n == 0 {
+              return Vec::new();
+          }
+          let mut puffer: VecDeque<&str> = VecDeque::with_capacity(n);
+          for zeile in text.lines() {
+              if puffer.len() == n {
+                  puffer.⟦pop_front()⟧;
+              }
+              puffer.⟦push_back(zeile)⟧;
+          }
+          puffer.into_iter().collect()
+      }
+
+      fn main() {
+          let log = "boot\nnetz ok\ndb ok\nwarnung\nfehler";
+          println!("{:?}", letzte_zeilen(log, 3));
+      }
+    gaps:
+      - label: Älteste Zeile verwerfen
+        hint: Die älteste Zeile liegt vorne.
+      - label: Neue Zeile aufnehmen
+        hint: Neue Zeilen kommen hinten dazu.
+    explanation: |
+      Ein `VecDeque` ist ein Ringpuffer: `pop_front` und `push_back` kosten beide O(1), egal wie groß der Puffer ist. Mit einem `Vec` müsstest du `remove(0)` aufrufen, das bei jeder Zeile alle übrigen Elemente verschiebt. Die Prüfung auf `n == 0` am Anfang ist nötig: Sonst wäre `puffer.len() == 0` beim ersten Durchlauf wahr, `pop_front` täte nichts, und die Funktion gäbe trotzdem Zeilen zurück.
+    resources:
+      - title: std · VecDeque
+        url: https://doc.rust-lang.org/std/collections/struct.VecDeque.html
+
+  - id: titel-kuerzen-bug
+    type: bug
+    title: Absturz bei „Grüße“
+    prompt: |
+      `kuerze` soll einen Titel auf höchstens `max` **Zeichen** kürzen und dann „…“ anhängen. Titel, die kurz genug sind, sollen unverändert zurückkommen. Mit ASCII-Titeln klappt alles. `kuerze("Grüße", 5)` stürzt aber ab:
+
+      ```text
+      end byte index 5 is not a char boundary; it is inside 'ß' (bytes 4..6 of string)
+      ```
+
+      Dabei hat „Grüße“ genau fünf Zeichen und hätte unverändert zurückkommen müssen. Finde **beide** fehlerhaften Zeilen und korrigiere sie.
+    lang: rust
+    code: |
+      fn kuerze(titel: &str, max: usize) -> String {
+          if titel.len() <= max {
+              return titel.to_string();
+          }
+          let gekuerzt = &titel[..max];
+          format!("{gekuerzt}…")
+      }
+
+      fn main() {
+          println!("{}", kuerze("Rechnung März", 8));
+          println!("{}", kuerze("Grüße", 5));
+          println!("{}", kuerze("Grüße aus Köln", 3));
+      }
+    lines: [2, 5]
+    fix:
+      - line: 2
+        answers:
+          - "if titel.chars().count() <= max {"
+      - line: 5
+        answers:
+          - "let gekuerzt: String = titel.chars().take(max).collect();"
+          - "let gekuerzt = titel.chars().take(max).collect::<String>();"
+    hints:
+      - Was zählt `len()` – Bytes oder Zeichen?
+      - Ein Slice `&titel[..max]` schneidet nach Bytes. Wie nimmst du die ersten `max` Zeichen?
+    explanation: |
+      Zwei Stellen verwechseln Bytes mit Zeichen. `titel.len()` ist für „Grüße“ 7, deshalb glaubt die Funktion, kürzen zu müssen. `&titel[..max]` schneidet dann bei Byte 5 – mitten im zweibytigen „ß“ – und paniert. `chars().count()` zählt Zeichen, `chars().take(max).collect()` baut einen neuen `String` aus den ersten `max` Zeichen. Wer Kombinationszeichen oder Emoji-Sequenzen korrekt behandeln muss, braucht Grapheme Cluster, etwa über das Crate `unicode-segmentation`.
+    resources:
+      - title: The Rust Book · Slicing Strings
+        url: https://doc.rust-lang.org/book/ch08-02-strings.html#slicing-strings
+      - title: std · str::chars
+        url: https://doc.rust-lang.org/std/primitive.str.html#method.chars
+
+  - id: push-waehrend-leihe
+    type: bug
+    title: Die Warteschlange kompiliert nicht
+    prompt: |
+      Das Programm soll den nächsten Job merken, einen weiteren Job anhängen und dann beides ausgeben. Der Compiler meldet:
+
+      ```text
+      error[E0502]: cannot borrow `jobs` as mutable because it is also borrowed as immutable
+      ```
+
+      Korrigiere die Zeile, die das Problem verursacht, sodass `naechster` den Wert unabhängig vom Vec besitzt.
+    lang: rust
+    code: |
+      fn main() {
+          let mut jobs = vec![String::from("backup"), String::from("deploy")];
+          let naechster = &jobs[0];
+          jobs.push(String::from("cleanup"));
+          println!("Als Nächstes: {naechster}");
+          println!("{} Jobs in der Warteschlange", jobs.len());
+      }
+    lines: [3]
+    fix:
+      - line: 3
+        answers:
+          - "let naechster = jobs[0].clone();"
+          - "let naechster = jobs[0].to_string();"
+          - "let naechster = jobs[0].to_owned();"
+          - "let naechster = String::from(&jobs[0]);"
+    hints:
+      - "`naechster` ist eine Referenz in den Puffer des Vec. Was kann `push` mit diesem Puffer tun?"
+      - Wenn `naechster` den String selbst besitzt, hängt er nicht mehr am Vec.
+    explanation: |
+      `&jobs[0]` zeigt in den Heap-Puffer des Vec. `push` braucht `&mut jobs` und darf den Puffer bei voller Kapazität an eine neue Adresse verschieben. Die Referenz würde dann ins Leere zeigen, deshalb lehnt der Borrow Checker die Kombination ab. `jobs[0].clone()` kopiert den String bewusst heraus. Oft gibt es eine bessere Lösung ohne Kopie: den Wert vollständig benutzen, bevor du den Vec änderst, also die `println!`-Zeile vor das `push` ziehen.
+    resources:
+      - title: Error-Index · E0502
+        url: https://doc.rust-lang.org/error_codes/E0502.html
+      - title: The Rust Book · Reading Elements of Vectors
+        url: https://doc.rust-lang.org/book/ch08-01-vectors.html#reading-elements-of-vectors
+
+  - id: eindeutig-erklaeren
+    type: explain
+    title: Duplikate entfernen, Reihenfolge behalten
+    prompt: Erkläre, wie `eindeutig` arbeitet, warum sie die ursprüngliche Reihenfolge erhält und warum sie schneller ist als eine Variante mit `ergebnis.contains(s)`.
+    lang: rust
+    code: |
+      use std::collections::HashSet;
+
+      fn eindeutig(eingabe: &[String]) -> Vec<String> {
+          let mut gesehen: HashSet<&str> = HashSet::new();
+          let mut ergebnis = Vec::new();
+          for s in eingabe {
+              if gesehen.insert(s.as_str()) {
+                  ergebnis.push(s.clone());
+              }
+          }
+          ergebnis
+      }
+    points:
+      - "`HashSet::insert` gibt `true` zurück, wenn der Wert neu war – Prüfen und Merken sind ein einziger Aufruf."
+      - Die Reihenfolge bleibt erhalten, weil über den Eingabe-Slice iteriert wird, nicht über das Set.
+      - Das Set speichert nur `&str`-Leihen in die Eingabe; kopiert wird nur, was ins Ergebnis kommt.
+      - "`contains` auf einem `Vec` durchläuft die Liste, insgesamt O(n²); das Set prüft im Mittel in O(1), insgesamt O(n)."
+    explanation: |
+      Die Funktion läuft einmal über die Eingabe. Für jeden String versucht sie, ihn ins `HashSet` einzufügen. `insert` liefert `true`, wenn der Wert noch nicht drin war – dann wird eine Kopie ins Ergebnis übernommen, sonst wird der String übersprungen. Weil die Schleife über den Slice läuft, erscheinen die Strings in der Reihenfolge ihres ersten Auftretens; das Set dient nur als Gedächtnis. Es speichert `&str`-Leihen in die Eingabe, also keine Kopien. Mit `ergebnis.contains(s)` würde jede Prüfung das bisherige Ergebnis durchlaufen: O(n²). Das Set prüft im Mittel in konstanter Zeit, insgesamt O(n). Die Alternative `sort()` + `dedup()` wäre auch schnell, zerstört aber die Reihenfolge.
+    resources:
+      - title: std · HashSet::insert
+        url: https://doc.rust-lang.org/std/collections/struct.HashSet.html#method.insert
+      - title: Rust by Example · HashSet
+        url: https://doc.rust-lang.org/rust-by-example/std/hash/hashset.html
+
+  - id: wortstatistik
+    type: practice
+    title: Wortstatistik für Texte
+    prompt: |
+      Schreibe `wort_statistik(text: &str) -> Vec<(String, usize)>`. Sie liefert jedes Wort mit seiner Häufigkeit, sortiert nach Häufigkeit absteigend und bei Gleichstand alphabetisch.
+
+      Regeln:
+
+      - Wörter trennst du an beliebigem Leerraum.
+      - Groß- und Kleinschreibung spielt keine Rolle: „Der“ und „der“ sind dasselbe Wort, im Ergebnis kleingeschrieben.
+      - Satzzeichen am Anfang und Ende eines Worts gehören nicht dazu: „Server.“ zählt als „server“. Umlaute bleiben erhalten.
+      - Was nach dem Entfernen der Satzzeichen leer ist (etwa „–“), wird nicht gezählt.
+
+      `main` gibt die drei häufigsten Wörter aus. Die Tests im Startcode laufen im Rust Playground über **Test** oder lokal mit `cargo test`.
+    lang: rust
+    starter: |
+      use std::collections::HashMap;
+
+      fn wort_statistik(text: &str) -> Vec<(String, usize)> {
+          todo!()
+      }
+
+      fn main() {
+          let text = "Der Server startet. Der Server stoppt – und der Admin schläft.";
+          for (wort, n) in wort_statistik(text).iter().take(3) {
+              println!("{wort}: {n}");
+          }
+      }
+
+      #[cfg(test)]
+      mod tests {
+          use super::*;
+
+          #[test]
+          fn ignoriert_gross_klein_und_satzzeichen() {
+              let stat = wort_statistik("Der Server. der server!");
+              assert_eq!(stat, vec![("der".to_string(), 2), ("server".to_string(), 2)]);
+          }
+
+          #[test]
+          fn umlaute_bleiben_erhalten() {
+              assert_eq!(wort_statistik("Übung übung"), vec![("übung".to_string(), 2)]);
+          }
+
+          #[test]
+          fn gleichstand_alphabetisch() {
+              let stat = wort_statistik("b a c a");
+              assert_eq!(stat[0], ("a".to_string(), 2));
+              assert_eq!(stat[1].0, "b");
+              assert_eq!(stat[2].0, "c");
+          }
+
+          #[test]
+          fn nur_satzzeichen_und_leerraum() {
+              assert!(wort_statistik("  – ... ! ").is_empty());
+          }
+      }
+    solution: |
+      use std::collections::HashMap;
+
+      fn normalisiere(wort: &str) -> String {
+          wort.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase()
+      }
+
+      fn wort_statistik(text: &str) -> Vec<(String, usize)> {
+          let mut zaehler: HashMap<String, usize> = HashMap::new();
+          for roh in text.split_whitespace() {
+              let wort = normalisiere(roh);
+              if wort.is_empty() {
+                  continue;
+              }
+              *zaehler.entry(wort).or_insert(0) += 1;
+          }
+          let mut liste: Vec<(String, usize)> = zaehler.into_iter().collect();
+          liste.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+          liste
+      }
+
+      fn main() {
+          let text = "Der Server startet. Der Server stoppt – und der Admin schläft.";
+          for (wort, n) in wort_statistik(text).iter().take(3) {
+              println!("{wort}: {n}");
+          }
+      }
+
+      #[cfg(test)]
+      mod tests {
+          use super::*;
+
+          #[test]
+          fn ignoriert_gross_klein_und_satzzeichen() {
+              let stat = wort_statistik("Der Server. der server!");
+              assert_eq!(stat, vec![("der".to_string(), 2), ("server".to_string(), 2)]);
+          }
+
+          #[test]
+          fn umlaute_bleiben_erhalten() {
+              assert_eq!(wort_statistik("Übung übung"), vec![("übung".to_string(), 2)]);
+          }
+
+          #[test]
+          fn gleichstand_alphabetisch() {
+              let stat = wort_statistik("b a c a");
+              assert_eq!(stat[0], ("a".to_string(), 2));
+              assert_eq!(stat[1].0, "b");
+              assert_eq!(stat[2].0, "c");
+          }
+
+          #[test]
+          fn nur_satzzeichen_und_leerraum() {
+              assert!(wort_statistik("  – ... ! ").is_empty());
+          }
+      }
+    checklist:
+      - Du trennst mit `split_whitespace()`, nicht mit `split(' ')` (mehrfache Leerzeichen erzeugen sonst leere Wörter).
+      - "Du entfernst Satzzeichen nur am Rand, zum Beispiel mit `trim_matches(|c: char| !c.is_alphanumeric())`, und nicht per Byte-Slicing."
+      - Du zählst mit `*map.entry(wort).or_insert(0) += 1` (oder `or_default()`), nicht mit `get` + `insert`.
+      - Deine Sortierung hat einen zweiten Schlüssel für Gleichstand, sodass die Ausgabe bei jedem Lauf gleich ist.
+      - "Alle vier Tests laufen grün, und `main` gibt `der: 3`, `server: 2`, `admin: 1` aus."
+    hints:
+      - "`str::to_lowercase` arbeitet mit Unicode und kommt mit Umlauten zurecht."
+      - "Zum Sortieren: `into_iter().collect::<Vec<_>>()` und dann `sort_by` mit `b.1.cmp(&a.1)` für absteigend."
+    explanation: |
+      Die Lösung trennt die Aufgabe in Normalisieren (ein Wort → Schlüssel) und Zählen. `trim_matches` mit einer Bedingung entfernt Zeichen nur an den Rändern und arbeitet auf `char`s, kann also nicht mitten in einem Umlaut schneiden. Die Entry-API zählt mit einem Nachschlagen pro Wort. Weil die `HashMap` keine Reihenfolge hat, kommt das Ergebnis in einen `Vec`; `sort_by` vergleicht erst die Anzahl absteigend und bei Gleichstand das Wort – ohne diesen zweiten Schlüssel würde der Test `gleichstand_alphabetisch` zufällig mal bestehen und mal nicht. Den Vergleich mit Closures (`|a, b| …`) behandelt das Modul Closures & Iteratoren genauer.
+    resources:
+      - title: The Rust Book · Updating a Value Based on the Old Value
+        url: https://doc.rust-lang.org/book/ch08-03-hash-maps.html#updating-a-value-based-on-the-old-value
+      - title: std · str::trim_matches
+        url: https://doc.rust-lang.org/std/primitive.str.html#method.trim_matches
+      - title: std · slice::sort_by
+        url: https://doc.rust-lang.org/std/primitive.slice.html#method.sort_by

@@ -1,0 +1,416 @@
+id: web-datenbanken
+title: Web & Datenbanken
+level: 3
+minutes: 190
+summary: HTTP-Antworten prüfen, API-Grenzen sauber schneiden und Daten mit SQLite, Parametern und Transaktionen
+  verlässlich speichern.
+goals:
+- Du unterscheidest Transport, HTTP-Status, JSON-Syntax und fachliche Validierung.
+- Du benutzt SQL-Parameter statt Stringinterpolation.
+- Du erklärst Transaktionsgrenzen, Constraints und den Lebenszyklus einer Verbindung.
+- Du testest Web- und Datenzugriff ohne einen echten externen Dienst.
+resources:
+- &id001
+  title: Python · sqlite3
+  url: https://docs.python.org/3/library/sqlite3.html
+- title: HTTPX · QuickStart
+  url: https://www.python-httpx.org/quickstart/
+- title: SQLite · Transactions
+  url: https://www.sqlite.org/lang_transaction.html
+- title: FastAPI · First Steps
+  url: https://fastapi.tiangolo.com/tutorial/first-steps/
+lesson: |
+  Eine Aufgaben-App lädt Datensätze von einer API und speichert sie lokal. Ein erfolgreicher HTTP-Aufruf beweist noch nicht, dass die Antwort zur erwarteten Struktur passt. Eine korrekt geparste Antwort beweist wiederum nicht, dass alle Datensätze erfolgreich gespeichert wurden. Zwischen Netzwerk, Python-Objekten und Datenbank liegen eigene Verträge und Fehlerquellen.
+
+  Dieses Modul verfolgt einen kleinen Import durch diese Grenzen. Du lernst die Mechanismen ohne einen ganzen Webstack aufzubauen. Die Browserbeispiele nutzen SQLite im Speicher und injizierte Abrufer. Echte HTTP-Aufrufe und ein FastAPI-Server sind als lokale Beispiele gekennzeichnet und werden hier nicht im Browser gestartet.
+
+  ## HTTP liefert mehr als einen JSON-Text
+
+  Ein HTTP-Austausch enthält Methode, URL, Header, Status und optional einen Körper. GET dient dem Lesen, während etwa POST typischerweise eine Aktion oder neue Ressource anfordert. Der genaue Vertrag kommt von der API. Behandle insbesondere ein erneutes POST nach Timeout nicht automatisch wie eine gefahrlose Wiederholung: Der Server könnte die erste Anfrage bereits verarbeitet haben.
+
+  Mit [HTTPX](https://www.python-httpx.org/quickstart/) kannst du Parameter getrennt vom URL-Text übergeben und Statusfehler sichtbar machen. Das folgende Beispiel benötigt lokal das Paket und Netzwerkkonnektivität.
+
+  ```python
+  import httpx
+  with httpx.Client(timeout=10.0) as client:
+      antwort = client.get("https://example.org/api/tasks", params={"limit": 50})
+      antwort.raise_for_status()
+      daten = antwort.json()
+  ```
+
+  Hier passieren drei getrennte Prüfungen: Der Transport muss funktionieren, der Status muss akzeptabel sein und der Körper muss als JSON lesbar sein. Danach fehlt noch die Fachprüfung. Ein `200 OK` mit `{"items": "kaputt"}` ist weiterhin kein gültiger Aufgabenimport. HTTPX unterscheidet außerdem [verschiedene Timeout-Arten](https://www.python-httpx.org/advanced/timeouts/); ein Wert ersetzt nicht zwangsläufig eine übergeordnete Gesamtlaufzeitgrenze.
+
+  ```python run
+  import json
+  antwort = json.loads('{"items": [{"id": 1, "title": "Testen"}]}')
+  if not isinstance(antwort.get("items"), list):
+      raise ValueError("items muss eine Liste sein")
+  print(antwort["items"][0]["title"])
+  ```
+
+  Validiere an der Eingangsgrenze und arbeite danach mit einem klaren internen Modell. Unbekannte Zusatzfelder können erlaubt sein; fehlende oder falsch typisierte Pflichtfelder brauchen eine definierte Reaktion. Logge IDs und Fehlerklassen, keine Authentifizierungsheader oder kompletten personenbezogenen Antworten.
+
+  ## Fachlogik von Transport trennen
+
+  Eine Funktion muss nicht gleichzeitig HTTP ausführen, JSON prüfen und SQL schreiben. Eine kleine Abhängigkeit wie `hole(kennung)` lässt sich im Test kontrollieren. Das ist keine Aufforderung, für jeden Ausdruck eine Klasse zu bauen. Es macht die relevante Grenze sichtbar.
+
+  ```python run
+  def titel_laden(kennung, hole):
+      daten = hole(kennung)
+      titel = daten.get("title")
+      if not isinstance(titel, str) or not titel.strip():
+          raise ValueError("title fehlt")
+      return titel.strip()
+
+  print(titel_laden(7, lambda kennung: {"id": kennung, "title": "  Prüfen  "}))
+  ```
+
+  Ein Test kann jetzt Timeout, ungültige Daten und korrekte Antworten ohne Netz erzeugen. Zusätzlich brauchst du später einen kleinen Integrationstest, der die wirkliche API-Schnittstelle prüft. Ein Fake beweist nur, dass dein Code unter den modellierten Annahmen funktioniert.
+
+  Ein Webserver stellt die andere Seite der Grenze bereit. [FastAPI](https://fastapi.tiangolo.com/tutorial/first-steps/) registriert Routen an einem Anwendungsobjekt. Dieses lokale Minimalbeispiel liefert einen festen Gesundheitsstatus.
+
+  ```python
+  from fastapi import FastAPI
+  app = FastAPI()
+
+  @app.get("/health")
+  def health():
+      return {"status": "ok"}
+  ```
+
+  Ein antwortender Health-Endpunkt beweist nicht automatisch Datenbankzugriff oder alle Fachfunktionen. Definiere, was eine Gesundheitsprüfung tatsächlich prüft. Themen wie Authentifizierung, Migrationen und Deployment verdienen eine eigene bewusste Umsetzung; dieser Einstieg macht daraus keine fertige Produktionsarchitektur.
+
+  ## Relationale Daten und sichere Parameter
+
+  Eine SQLite-Datenbank speichert Tabellen mit Zeilen und Spalten. Constraints beschreiben Regeln, die unabhängig vom jeweiligen Aufrufer gelten. Ein Primary Key identifiziert eine Zeile; `NOT NULL` verhindert fehlende Werte. Die [sqlite3-Dokumentation](https://docs.python.org/3/library/sqlite3.html) erklärt Verbindung, Cursor und Parameterbindung.
+
+  ```python run
+  import sqlite3
+  con = sqlite3.connect(":memory:")
+  try:
+      con.execute("CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT NOT NULL)")
+      con.execute("INSERT INTO tasks (id, title) VALUES (?, ?)", (1, "Testen"))
+      print(con.execute("SELECT id, title FROM tasks ORDER BY id").fetchall())
+  finally:
+      con.close()
+  ```
+
+  `?` ist ein Platzhalter für einen **Wert**. Python übergibt Werte separat, und die Datenbank behandelt Anführungszeichen im Titel als Daten. Ein f-String würde Daten mit SQL-Syntax vermischen und kann zu SQL-Injection führen. Auch ein einzelner Parameter muss als Sequenz übergeben werden: `(kennung,)` ist ein Tupel, `(kennung)` lediglich der geklammerte Wert.
+
+  ```python run
+  import sqlite3
+  con = sqlite3.connect(":memory:")
+  try:
+      con.execute("CREATE TABLE notes (text TEXT)")
+      text = "Ada's Notiz"
+      con.execute("INSERT INTO notes VALUES (?)", (text,))
+      print(con.execute("SELECT text FROM notes").fetchone()[0])
+  finally:
+      con.close()
+  ```
+
+  Tabellen- und Spaltennamen sind keine normalen Werteparameter. Wenn eine Sortierspalte aus einer Benutzerauswahl kommt, übersetze sie über eine feste erlaubte Zuordnung in SQL. Baue keine beliebigen Namen aus Eingaben zusammen. Ein `ORDER BY` ist außerdem nötig, wenn eine bestimmte Ergebnisreihenfolge zum Vertrag gehört.
+
+  ## Transaktionen halten Änderungen zusammen
+
+  Eine Transaktion gruppiert Änderungen zu einer Einheit. Entweder werden alle bestätigt oder bei einem Fehler zurückgenommen. Das ist beispielsweise wichtig, wenn ein Import mehrere Zeilen schreiben und anschließend einen Importstatus setzen soll. Die SQLite-Dokumentation beschreibt [Transaktionen und Sperren](https://www.sqlite.org/lang_transaction.html).
+
+  Für neuen Python-Code wählst du die [Transaktionssteuerung](https://docs.python.org/3/library/sqlite3.html#transaction-control) ausdrücklich. `autocommit=False` nutzt das von Python dokumentierte DB-API-Verhalten. Der Connection-Kontextmanager bestätigt bei Erfolg und rollt bei einer Exception zurück; er schließt die Verbindung aber nicht.
+
+  ```python run
+  import sqlite3
+  con = sqlite3.connect(":memory:", autocommit=False)
+  try:
+      con.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, title TEXT NOT NULL)")
+      con.commit()
+      try:
+          with con:
+              con.execute("INSERT INTO items VALUES (?, ?)", (1, "erstes"))
+              con.execute("INSERT INTO items VALUES (?, ?)", (1, "doppeltes"))
+      except sqlite3.IntegrityError:
+          print("zurückgerollt")
+      print(con.execute("SELECT COUNT(*) FROM items").fetchone()[0])
+  finally:
+      con.close()
+  ```
+
+  Die Tabelle wurde vor dem Import bestätigt. Daher bleibt sie nach dem Rollback vorhanden, während beide Importzeilen fehlen. Würdest du die Exception innerhalb des `with`-Blocks verschlucken, sähe der Kontextmanager einen normalen Ausgang und könnte Teiländerungen bestätigen. Fehlerbehandlung und Transaktionsgrenze müssen zusammenpassen.
+
+  ## Ergebnisse, Indizes und Ressourcen
+
+  `fetchone` liefert eine Zeile oder `None`; `fetchall` materialisiert alle restlichen Zeilen. Für große Mengen kannst du einen Cursor iterieren. Mit `sqlite3.Row` werden Spaltennamen statt numerischer Positionen verfügbar. Das verbessert Lesbarkeit, ersetzt aber kein Schema und keine Validierung.
+
+  ```python run
+  import sqlite3
+  con = sqlite3.connect(":memory:")
+  try:
+      con.row_factory = sqlite3.Row
+      row = con.execute("SELECT ? AS title, ? AS done", ("Lernen", 0)).fetchone()
+      print(row["title"], row["done"])
+  finally:
+      con.close()
+  ```
+
+  Ein Index kann häufige Filter oder Sortierungen beschleunigen, kostet aber Platz und Arbeit beim Schreiben. Wähle ihn anhand echter Abfragen und prüfe den Plan mit [`EXPLAIN QUERY PLAN`](https://www.sqlite.org/eqp.html). „Auf jede Spalte ein Index“ ist keine allgemeine Optimierung.
+
+  > [!PRAXIS]
+  > Teste einen Import mit einem absichtlich ungültigen Datensatz in der Mitte. Prüfe anschließend den Datenbestand, nicht nur die Exception. So zeigt der Test, ob die zugesagte Atomarität wirklich gilt.
+
+  ## Häufige Fehler
+
+  F-Strings in SQL, ein fehlendes Komma im Parametertupel und ungeprüftes `fetchone()[0]` sind häufige Fehler. Prüfe bei leerem Ergebnis zuerst, ob die Zeile fehlen darf. Bei „database is locked“ suche lange Transaktionen oder konkurrierende Schreiber; erhöhe nicht blind nur die Wartezeit. Halte Netzwerkaufrufe möglichst außerhalb kurzer Schreibtransaktionen.
+
+  > [!INTERVIEW]
+  > „Warum reicht try/except beim Import nicht?“ Weil das Fangen einer Exception keine vorherigen Schreiboperationen zurücknimmt. Erst eine passende Transaktion verbindet den fachlichen Vertrag mit atomarem Datenbankverhalten.
+
+  > [!MERKE]
+  > Transporterfolg, gültige Daten und bestätigte Speicherung sind drei verschiedene Erfolgsaussagen.
+
+  ## Zusammenfassung
+
+  - Prüfe Transport, Status, Syntax und Fachschema getrennt.
+  - Trenne testbare Logik von externem Transport.
+  - Binde SQL-Werte als Parameter.
+  - Definiere Constraints und Ergebnisreihenfolge ausdrücklich.
+  - Transaktionen schützen zusammengehörige Änderungen.
+  - Schließe Verbindungen unabhängig vom Commit-Verhalten.
+exercises:
+- id: sql-werte
+  type: choice
+  title: Daten von SQL trennen
+  prompt: Welche Variante bindet den Titel sicher?
+  options:
+  - text: execute('INSERT INTO tasks(title) VALUES (?)', (titel,))
+    correct: true
+    why: Der Titel wird separat als Datenwert gebunden.
+  - text: execute(f"INSERT INTO tasks(title) VALUES ('{titel}')")
+    correct: false
+    why: Der f-String vermischt Eingabe und SQL-Syntax.
+  - text: Alle Apostrophe in der Eingabe löschen.
+    correct: false
+    why: Das verändert fachliche Daten und ersetzt keine Parameterbindung.
+  explanation: Parameterbindung übergibt Werte außerhalb des SQL-Texts. Sie erhält auch legitime Apostrophe und
+    verhindert deren Interpretation als Syntax.
+  resources:
+  - *id001
+- id: import-ablauf
+  type: order
+  title: Importgrenzen ordnen
+  prompt: Ordne diesen beschriebenen Ablauf für einen Import, dessen Daten vollständig vor dem Schreiben validiert
+    werden.
+  lang: python
+  lines: |-
+    # Antwort vom Dienst holen
+    # HTTP-Status und JSON-Syntax prüfen
+    # Alle Datensätze fachlich validieren
+    # Schreibtransaktion beginnen
+    # Datensätze speichern und Transaktion bestätigen
+  explanation: Die teure und fehleranfällige Vorbereitung liegt vor der Schreibtransaktion. Damit bleibt die Sperrzeit
+    kurz und ungültige Eingabe verändert keine Daten.
+  resources:
+  - *id001
+- id: sql-sortiert
+  type: output
+  title: Reihenfolge ausdrücklich wählen
+  prompt: Welche Ausgabe erzeugt dieses Programm?
+  lang: python
+  code: |-
+    import sqlite3
+    c = sqlite3.connect(":memory:")
+    c.execute("CREATE TABLE n (v INTEGER)")
+    c.executemany("INSERT INTO n VALUES (?)", [(3,), (1,), (2,)])
+    print(c.execute("SELECT v FROM n ORDER BY v DESC").fetchall())
+    c.close()
+  expected: '[(3,), (2,), (1,)]'
+  explanation: ORDER BY DESC definiert absteigende Reihenfolge. Ohne ORDER BY wäre eine beobachtete Reihenfolge
+    kein verlässlicher Vertrag.
+  resources:
+  - *id001
+- id: fehlende-zeile
+  type: output
+  title: Kein Treffer
+  prompt: Welche Ausgabe erzeugt dieses Programm?
+  lang: python
+  code: |-
+    import sqlite3
+    c = sqlite3.connect(":memory:")
+    c.execute("CREATE TABLE t (id INTEGER)")
+    print(c.execute("SELECT id FROM t").fetchone())
+    c.close()
+  expected: None
+  explanation: fetchone liefert None, wenn keine weitere Zeile existiert. Direktes Indexieren ohne Prüfung wäre
+    hier ein TypeError.
+  resources:
+  - *id001
+- id: titel-pruefen
+  type: code
+  title: Eine API-Grenze validieren
+  prompt: 'Schreibe `titel(daten)`: Liefere den bereinigten, nichtleeren String unter title. Fehlende, leere oder
+    nicht-string Werte müssen ValueError auslösen. daten ist ein Dictionary.'
+  lang: python
+  starter: |-
+    def titel(daten):
+        ...
+  solution: |-
+    def titel(daten):
+        wert = daten.get("title")
+        if not isinstance(wert, str) or not wert.strip():
+            raise ValueError("title fehlt")
+        return wert.strip()
+  tests:
+  - name: Normal
+    code: 'assert titel({"title": "  Lernen  "}) == "Lernen"'
+  - name: Zusatzfelder
+    code: 'assert titel({"title": "x", "id": 7}) == "x"'
+  - name: Ungültig
+    code: |-
+      for d in ({}, {"title": " "}, {"title": 3}):
+          try:
+              titel(d)
+          except ValueError:
+              pass
+          else:
+              assert False, f"muss scheitern: {d!r}"
+  explanation: Validierung an der Grenze hält ungeprüfte Formen aus der Fachlogik fern. Zusatzfelder werden bewusst
+    toleriert, weil nur title zum benötigten Vertrag gehört.
+  resources:
+  - *id001
+- id: sql-suchen
+  type: code
+  title: Notiz mit Parametern finden
+  prompt: 'Schreibe `finde(con, titel)`: Suche in notes(id INTEGER, title TEXT) nach exakter Titelgleichheit. Liefere
+    die nach id aufsteigend sortierte Liste der IDs.'
+  lang: python
+  starter: |-
+    def finde(con, titel):
+        ...
+  solution: |-
+    def finde(con, titel):
+        return [row[0] for row in con.execute("SELECT id FROM notes WHERE title = ? ORDER BY id", (titel,))]
+  tests:
+  - name: Titel
+    code: assert finde(db, "Lernen") == [1, 3]
+  - name: Apostroph
+    code: assert finde(db, "Ada's Notiz") == [2]
+  - name: Kein Treffer
+    code: assert finde(db, "' OR 1=1 --") == []
+  explanation: Der Platzhalter hält auch scheinbare SQL-Fragmente als gewöhnlichen Titelwert fest. ORDER BY macht
+    die Liste unabhängig vom Abfrageplan.
+  setup: |-
+    import sqlite3
+    db = sqlite3.connect(":memory:")
+    db.execute("CREATE TABLE notes (id INTEGER, title TEXT)")
+    db.executemany("INSERT INTO notes VALUES (?, ?)", [(3, "Lernen"), (2, "Ada's Notiz"), (1, "Lernen")])
+  resources:
+  - *id001
+- id: parameter-tupel
+  type: gap
+  title: Ein einzelner Parameter
+  prompt: Ergänze ein Tupel mit genau dem Wert kennung.
+  lang: python
+  code: zeile = con.execute("SELECT title FROM tasks WHERE id = ?", ⟦(kennung,)⟧).fetchone()
+  explanation: Das Komma erzeugt das einelementige Tupel. Klammern allein ändern nicht den Typ des Wertes.
+  resources:
+  - *id001
+  gaps:
+  - label: Ein einzelner Parameter
+    hint: Bei einem einzelnen Tupel-Element ist das abschließende Komma entscheidend.
+- id: fake-import
+  type: code
+  title: Abrufer als Abhängigkeit
+  prompt: Schreibe `lade_ids(hole)`. Rufe hole genau einmal ohne Argumente auf; es liefert eine Liste von Dictionaries
+    mit id. Liefere die eindeutigen IDs aufsteigend sortiert.
+  lang: python
+  starter: |-
+    def lade_ids(hole):
+        ...
+  solution: |-
+    def lade_ids(hole):
+        return sorted({item["id"] for item in hole()})
+  tests:
+  - name: Doppelte
+    code: 'assert lade_ids(lambda: [{"id": 3}, {"id": 1}, {"id": 3}]) == [1, 3]'
+  - name: Leer
+    code: 'assert lade_ids(lambda: []) == []'
+  - name: Ein Abruf
+    code: |-
+      from unittest.mock import Mock
+      hole = Mock(return_value=[{"id": 5}])
+      assert lade_ids(hole) == [5]
+      hole.assert_called_once_with()
+  explanation: Die fachliche Transformation braucht keine Netzwerkbibliothek. Ein Test kann daher Ergebnis und Zahl
+    der Abrufe deterministisch prüfen.
+  resources:
+  - *id001
+- id: sql-injection
+  type: bug
+  title: Ein Apostroph zerstört den Import
+  prompt: Ein Titel mit Apostroph erzeugt einen SQL-Syntaxfehler. Ersetze die unsichere Schreibanweisung durch Parameterbindung.
+  lang: python
+  code: |-
+    def speichern(con, titel):
+        con.execute(f"INSERT INTO notes(title) VALUES ('{titel}')")
+  lines:
+  - 2
+  fix:
+  - line: 2
+    answers:
+    - con.execute("INSERT INTO notes(title) VALUES (?)", (titel,))
+  explanation: Die Datenbank muss den Titel als Wert erhalten. Das behebt sowohl legitime Sonderzeichen als auch
+    die Möglichkeit, zusätzliche SQL-Syntax einzuschleusen.
+  resources:
+  - *id001
+- id: kontextmanager
+  type: explain
+  title: Commit ist nicht close
+  prompt: Erkläre die zwei Ressourcenregeln in diesem Ausschnitt.
+  lang: python
+  code: |-
+    con = sqlite3.connect("app.db", autocommit=False)
+    try:
+        with con:
+            con.execute("INSERT INTO tasks(title) VALUES (?)", ("Testen",))
+    finally:
+        con.close()
+  points:
+  - with con bestätigt bei Erfolg und rollt bei Fehler zurück.
+  - close wird vom Connection-Kontextmanager nicht übernommen.
+  - finally schließt auch beim Fehler die Verbindung.
+  - Die Eingabe wird separat als SQL-Parameter gebunden.
+  explanation: Die Transaktion und die Verbindung besitzen verschiedene Lebenszyklen. Der innere Kontext schützt
+    die Änderung, der äußere finally-Block beendet die Ressource unabhängig vom Ausgang.
+  resources:
+  - *id001
+- id: atomarer-import
+  type: practice
+  title: Ein Import mit Rollback
+  prompt: Baue lokal einen SQLite-Import für tasks(id PRIMARY KEY, title NOT NULL). Zwei gleiche IDs in einer Charge
+    sollen die ganze Charge zurücknehmen.
+  lang: python
+  solution: |-
+    import sqlite3
+
+    def importiere(con, daten):
+        with con:
+            con.executemany("INSERT INTO tasks VALUES (?, ?)", daten)
+
+    con = sqlite3.connect(":memory:", autocommit=False)
+    try:
+        con.execute("CREATE TABLE tasks(id INTEGER PRIMARY KEY, title TEXT NOT NULL)")
+        con.commit()
+        try:
+            importiere(con, [(1, "a"), (1, "b")])
+        except sqlite3.IntegrityError:
+            assert con.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+    finally:
+        con.close()
+  checklist:
+  - Schema ist vor dem Import bestätigt.
+  - Doppelte IDs lösen eine IntegrityError aus.
+  - Nach dem Fehler sind null Importzeilen vorhanden.
+  - Eine gültige Charge wird vollständig bestätigt.
+  - Die Verbindung wird in beiden Fällen geschlossen.
+  explanation: Der Test prüft den Zustand nach dem Fehler. Genau das unterscheidet eine nachgewiesene atomare Operation
+    vom bloßen Fangen einer Exception.
+  resources:
+  - *id001

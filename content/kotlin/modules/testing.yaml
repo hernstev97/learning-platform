@@ -1,0 +1,864 @@
+id: testing
+title: "Testing: ViewModels, Coroutines, Room und Compose"
+level: 3
+minutes: 170
+summary: Wie du eine Android-App so testest, dass Tests schnell, stabil und aussagekräftig sind – mit Fakes statt Mocks, virtueller Zeit für Coroutines, In-Memory-Datenbanken und Compose-UI-Tests.
+goals:
+  - Du ordnest Tests in die Testpyramide ein und entscheidest, ob ein Test lokal auf der JVM oder instrumentiert auf dem Gerät läuft.
+  - Du schreibst Fakes für Repositories und begründest, warum Google Fakes gegenüber Mocks bevorzugt.
+  - Du testest Coroutines mit `runTest`, erklärst den Unterschied zwischen `StandardTestDispatcher` und `UnconfinedTestDispatcher` und ersetzt `Dispatchers.Main` über eine Rule.
+  - Du testest ViewModels über ihren `StateFlow` und Flows mit Turbine.
+  - Du schreibst Compose-UI-Tests mit Findern, Aktionen und Assertions und nutzt `testTag`, wo Texte nicht eindeutig sind.
+resources:
+  - title: Fundamentals of testing Android apps
+    url: https://developer.android.com/training/testing/fundamentals
+  - title: Testing Kotlin coroutines on Android
+    url: https://developer.android.com/kotlin/coroutines/test
+  - title: Testing Kotlin flows on Android
+    url: https://developer.android.com/kotlin/flow/test
+  - title: Test your Compose layout
+    url: https://developer.android.com/develop/ui/compose/testing
+  - title: Use test doubles in Android
+    url: https://developer.android.com/training/testing/fundamentals/test-doubles
+lesson: |
+  In Bear gibt es eine Funktion, die entscheidet, welcher Gedanke im kleinen Widget steht: alle vier Stunden ein anderer, zufällig, aber nie zweimal hintereinander derselbe. Wie prüfst du, dass das stimmt? Vier Stunden warten und aufs Handy schauen? Bear hat stattdessen `WidgetPickTest` – sieben Tests, die in Millisekunden laufen und jeden Randfall abdecken, auch 3:59 Uhr gegen 4:00 Uhr.
+
+  Tests sind kein Pflichtprogramm für die Code-Coverage-Statistik. Sie sind das, was dir erlaubt, Code zu ändern, ohne Angst zu haben. Und sie sind das Erste, worauf Reviewer bei einer Take-Home-Aufgabe schauen: Gibt es Tests, testen sie Verhalten statt Implementierung, laufen sie stabil? Dieses Modul baut auf den Modulen „App-Architektur“ und „Daten & Netzwerk“ auf: Weil dort alle Abhängigkeiten über Konstruktoren hereinkommen, kannst du sie hier durch Test-Doubles ersetzen.
+
+  ## Die Testpyramide auf Android
+
+  Android unterscheidet Tests zuerst danach, **wo** sie laufen:
+
+  | | Lokale Tests | Instrumentierte Tests |
+  | --- | --- | --- |
+  | Ordner | `src/test/` | `src/androidTest/` |
+  | Läuft auf | JVM deines Rechners | Gerät oder Emulator |
+  | Android-Framework | nicht vorhanden (außer mit Robolectric) | echt |
+  | Geschwindigkeit | Millisekunden | Sekunden bis Minuten |
+  | Gradle-Task | `testDebugUnitTest` | `connectedDebugAndroidTest` |
+
+  Die [Testpyramide](https://developer.android.com/training/testing/fundamentals/strategies#testing-pyramid) sagt, wie viele du wovon schreibst: viele kleine, schnelle Unit-Tests (Domain-Logik, ViewModels, Repositories mit Fakes), weniger mittlere Integrationstests (Room mit echter Datenbank, ein Bildschirm mit echtem ViewModel) und wenige große End-to-End-Tests über mehrere Bildschirme. Je höher ein Test in der Pyramide steht, desto realistischer ist er – und desto langsamer, teurer und wackeliger. Die [offiziellen Empfehlungen](https://developer.android.com/topic/architecture/recommendations#testing) nennen als Minimum: Unit-Tests für ViewModels samt Flows, Unit-Tests für die Datenschicht und Navigationstests für die UI.
+
+  > [!MERKE]
+  > Teste Logik dort, wo sie am billigsten zu testen ist. Alles, was kein Android-Framework braucht, gehört in einen lokalen Test.
+
+  ## Lokale Unit-Tests mit JUnit
+
+  Ein Unit-Test ist eine Funktion mit `@Test`, die Code aufruft und das Ergebnis prüft. Die Struktur heißt **Arrange – Act – Assert**: vorbereiten, ausführen, prüfen.
+
+  ```kotlin
+  class BearNameTest {
+      @Test
+      fun cleanCollapsesSpacesAndTrims() {
+          // Arrange
+          val input = "  Herr   Brummbär  "
+          // Act
+          val result = BearName.clean(input)
+          // Assert
+          assertEquals("Herr Brummbär", result)
+      }
+
+      @Test
+      fun cleanReturnsNullForOnlySpaces() {
+          assertNull(BearName.clean("   "))
+      }
+  }
+  ```
+
+  Drei Gewohnheiten machen Tests wertvoll. Erstens: **Der Name beschreibt das Verhalten**, nicht die Methode – `cleanReturnsNullForOnlySpaces` sagt dir im roten Testbericht sofort, was kaputt ist. Zweitens: `assertEquals(erwartet, tatsächlich)` in genau dieser Reihenfolge, sonst ist die Fehlermeldung verdreht. Drittens: **Nicht-Determinismus hereinreichen.** `WidgetPick.pick` bekommt die Uhrzeit und einen `Random` als Parameter, statt `LocalDateTime.now()` und `Random.Default` selbst aufzurufen. Im Test übergibst du `Random(42)` und bekommst jedes Mal dasselbe Ergebnis.
+
+  ## Test-Doubles: Fakes statt Mocks
+
+  Ein ViewModel braucht ein Repository, das Repository eine Datenbank und eine API. Im Unit-Test ersetzt du diese Abhängigkeiten durch [Test-Doubles](https://developer.android.com/training/testing/fundamentals/test-doubles#types). Die zwei wichtigsten Arten:
+
+  - Ein **Fake** ist eine funktionierende, vereinfachte Implementierung – etwa ein Repository, das Gedanken in einer Liste statt in Room hält.
+  - Ein **Mock** ist ein von einer Bibliothek erzeugtes Objekt, dem du sagst, was es auf welchen Aufruf zurückgeben soll, und bei dem du prüfst, welche Aufrufe passiert sind.
+
+  ```kotlin
+  class FakeThoughtRepository : ThoughtRepository {
+      val captured = mutableListOf<String>()
+      private val thoughts = MutableStateFlow<List<Thought>>(emptyList())
+      var failWith: Exception? = null
+
+      override fun observeThoughts(): Flow<List<Thought>> = thoughts
+
+      override suspend fun capture(text: String) {
+          failWith?.let { throw it }
+          captured += text
+          thoughts.update { it + Thought(id = "t${it.size + 1}", text = text) }
+      }
+
+      override suspend fun resendPending() = Unit
+  }
+  ```
+
+  Google [empfiehlt Fakes](https://developer.android.com/topic/architecture/recommendations#testing) als „strongly recommended“. Der Grund ist ein Denkmodell: Ein Test mit Fake prüft **Zustand** („nach dem Speichern steht der Gedanke in der Liste“), ein Test mit Mock prüft **Interaktion** („`capture` wurde genau einmal mit diesem Argument aufgerufen“). Interaktionstests brechen bei jedem Refactoring, das das Verhalten nicht ändert – etwa wenn das ViewModel künftig `captureAll(listOf(text))` aufruft. Ein Fake ist außerdem wiederverwendbar: Einmal geschrieben, dient er in Dutzenden Tests und sogar in Compose-Previews.
+
+  Mocks haben trotzdem ihren Platz: wenn du genau eine Interaktion prüfen willst, die keinen beobachtbaren Zustand hinterlässt – zum Beispiel ein Analytics-Event. In Kotlin ist [MockK](https://mockk.io/) üblich:
+
+  ```kotlin
+  val analytics = mockk<Analytics>(relaxed = true)        // alle Aufrufe erlaubt
+  val api = mockk<TopicApi>()
+  coEvery { api.topics() } throws IOException("offline") // suspend-Funktion stubben
+
+  // … Code unter Test ausführen …
+
+  verify(exactly = 1) { analytics.track("refresh_failed") }
+  ```
+
+  `every`/`verify` sind für normale Funktionen, `coEvery`/`coVerify` für Suspend-Funktionen.
+
+  ## Coroutines testen: virtuelle Zeit
+
+  Suspend-Funktionen brauchen eine Coroutine, und `delay(30_000)` soll einen Test nicht 30 Sekunden aufhalten. Beides löst [`runTest`](https://developer.android.com/kotlin/coroutines/test) aus `kotlinx-coroutines-test`: Es startet den Testkörper in einer Coroutine auf einem `TestDispatcher` mit **virtueller Zeit**. Ein `delay` wartet nicht wirklich, sondern stellt die virtuelle Uhr vor.
+
+  Der Kern ist der Unterschied zwischen den zwei Test-Dispatchern:
+
+  - **`StandardTestDispatcher`** (Standard in `runTest`) stellt neue Coroutines in eine Warteschlange. Sie laufen erst, wenn der Test die Kontrolle abgibt: mit `advanceUntilIdle()` (alles bis nichts mehr ansteht), `runCurrent()` (nur, was zur aktuellen virtuellen Zeit fällig ist) oder `advanceTimeBy(ms)`.
+  - **`UnconfinedTestDispatcher`** startet neue Coroutines sofort und lässt sie laufen, bis sie das erste Mal suspendieren.
+
+  ```kotlin
+  @Test
+  fun registersBothUsers() = runTest {
+      val repository = UserRepository()
+      launch { repository.register("Alice") }
+      launch { repository.register("Bob") }
+      advanceUntilIdle()   // ohne diese Zeile: beide launch-Blöcke sind noch nicht gelaufen
+      assertEquals(listOf("Alice", "Bob"), repository.all())
+  }
+  ```
+
+  `StandardTestDispatcher` ist realistischer, weil er die Reihenfolge sichtbar macht und du Zwischenzustände wie „lädt gerade“ prüfen kannst. `UnconfinedTestDispatcher` ist bequemer für Code, bei dem Reihenfolge keine Rolle spielt. Wichtig: Alle Test-Dispatcher eines Tests müssen **denselben** `TestCoroutineScheduler` teilen, sonst laufen zwei virtuelle Uhren nebeneinander.
+
+  Ein Problem bleibt: `viewModelScope` nutzt `Dispatchers.Main`, und den gibt es auf der JVM nicht. Die Lösung ist eine JUnit-Rule, die `Main` für jeden Test durch einen Test-Dispatcher ersetzt. Ist `Main` ersetzt, übernehmen alle später erzeugten Test-Dispatcher – auch der von `runTest` – dessen Scheduler automatisch:
+
+  ```kotlin
+  class MainDispatcherRule(
+      val testDispatcher: TestDispatcher = UnconfinedTestDispatcher(),
+  ) : TestWatcher() {
+      override fun starting(description: Description) {
+          Dispatchers.setMain(testDispatcher)
+      }
+
+      override fun finished(description: Description) {
+          Dispatchers.resetMain()
+      }
+  }
+  ```
+
+  Für andere Dispatcher gilt dieselbe Regel wie für jede Abhängigkeit: hereinreichen. Eine Data Source, die `withContext(Dispatchers.IO)` fest einbaut, lässt sich nicht deterministisch testen; eine, die `ioDispatcher: CoroutineDispatcher` im Konstruktor bekommt, schon.
+
+  ## ViewModels und Flows testen
+
+  Mit Rule und Fake ist ein ViewModel-Test kurz. Die [Flow-Testanleitung](https://developer.android.com/kotlin/flow/test#stateflows) empfiehlt, einen `StateFlow` als Datenhalter zu behandeln und seinen `value` zu prüfen – das ist unabhängig davon, ob Zwischenwerte konflatiert wurden:
+
+  ```kotlin
+  class CaptureViewModelTest {
+      @get:Rule
+      val mainDispatcherRule = MainDispatcherRule()
+
+      private val repository = FakeThoughtRepository()
+      private val viewModel = CaptureViewModel(repository)
+
+      @Test
+      fun savingStoresTextAndClearsField() = runTest {
+          viewModel.onTextChange("Milch kaufen")
+          viewModel.onSaveClicked()
+
+          assertEquals(listOf("Milch kaufen"), repository.captured)
+          assertEquals("", viewModel.uiState.value.text)
+          assertEquals("Gespeichert", viewModel.uiState.value.userMessage)
+      }
+  }
+  ```
+
+  Ein Stolperstein: Entsteht der Zustand mit `stateIn(…, WhileSubscribed(5_000), …)`, startet der Upstream erst, wenn jemand sammelt. Ohne Collector bleibt `value` für immer beim Anfangswert. Im Test startest du deshalb einen leeren Collector im `backgroundScope`, den `runTest` am Ende automatisch abbricht:
+
+  ```kotlin
+  @Test
+  fun showsThoughtsFromRepository() = runTest {
+      val viewModel = ThoughtsViewModel(repository)
+      backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+          viewModel.uiState.collect {}
+      }
+      repository.capture("Milch kaufen")
+      assertEquals("Milch kaufen", (viewModel.uiState.value as ThoughtsUiState.Content).thoughts.single().text)
+  }
+  ```
+
+  Willst du die **Folge** von Werten prüfen – etwa bei einem Flow aus der Datenschicht –, ist [Turbine](https://github.com/cashapp/turbine) das Standardwerkzeug. `test { }` sammelt den Flow, `awaitItem()` wartet auf den nächsten Wert, und am Ende des Blocks schlägt der Test fehl, wenn unerwartete Werte übrig sind:
+
+  ```kotlin
+  @Test
+  fun observeThoughtsEmitsNewThought() = runTest {
+      repository.observeThoughts().test {
+          assertEquals(emptyList<Thought>(), awaitItem())
+          repository.capture("Milch kaufen")
+          assertEquals("Milch kaufen", awaitItem().single().text)
+          cancelAndIgnoreRemainingEvents()
+      }
+  }
+  ```
+
+  > [!INTERVIEW] „Wie testest du ein ViewModel mit Coroutines?“
+  > Abhängigkeiten über den Konstruktor, im Test durch Fakes ersetzt. `Dispatchers.Main` über eine `MainDispatcherRule` durch einen `TestDispatcher` ersetzt, der Test läuft in `runTest` mit virtueller Zeit. Ich rufe die öffentlichen Funktionen des ViewModels auf und prüfe `uiState.value`; bei `stateIn` mit `WhileSubscribed` starte ich einen Collector im `backgroundScope`. Für Folgen von Werten nehme ich Turbine. Mit `StandardTestDispatcher` und `advanceUntilIdle()` oder `runCurrent()` kann ich auch Zwischenzustände wie „lädt“ prüfen.
+
+  ## Room-Tests mit In-Memory-Datenbank
+
+  DAOs enthalten SQL, und SQL kann falsch sein. Diese Tests laufen gegen eine echte SQLite-Datenbank, die nur im Speicher existiert und nach dem Test verschwindet. Die [Room-Testanleitung](https://developer.android.com/training/data-storage/room/testing-db#android) empfiehlt dafür instrumentierte Tests; mit Room KMP und dem `BundledSQLiteDriver` können sie auch lokal auf der JVM laufen.
+
+  ```kotlin
+  @RunWith(AndroidJUnit4::class)
+  class ThoughtDaoTest {
+      private lateinit var db: BearDatabase
+      private lateinit var dao: ThoughtDao
+
+      @Before
+      fun createDb() {
+          val context = ApplicationProvider.getApplicationContext<Context>()
+          db = Room.inMemoryDatabaseBuilder<BearDatabase>(context)
+              .setDriver(BundledSQLiteDriver())
+              .build()
+          dao = db.thoughts()
+      }
+
+      @After
+      fun closeDb() = db.close()
+
+      @Test
+      fun observeAllReturnsNewestFirst() = runTest {
+          dao.upsert(ThoughtEntity("a", "alt", createdAt = 1, state = ThoughtState.Local))
+          dao.upsert(ThoughtEntity("b", "neu", createdAt = 2, state = ThoughtState.Local))
+          assertEquals(listOf("b", "a"), dao.observeAll().first().map { it.id })
+      }
+  }
+  ```
+
+  Migrationen testest du mit `MigrationTestHelper`: Er legt eine Datenbank im alten Schema an, füllt sie, führt die Migration aus und prüft das neue Schema – genau der Test, der den Absturz aus dem Modul „Daten & Netzwerk“ vor dem Release gefunden hätte.
+
+  ## Compose-UI-Tests
+
+  Compose-Tests sprechen die UI nicht über Views an, sondern über den **Semantics-Baum**: eine Beschreibung der Oberfläche mit Texten, Rollen, Zuständen und Aktionen, die auch Screenreader nutzen. Ein [Test](https://developer.android.com/develop/ui/compose/testing) findet einen Knoten, führt eine Aktion aus und prüft eine Eigenschaft:
+
+  ```kotlin
+  class CaptureScreenTest {
+      @get:Rule
+      val composeTestRule = createComposeRule()
+
+      @Test
+      fun saveButtonIsDisabledWhileSaving() {
+          composeTestRule.setContent {
+              CaptureScreen(
+                  uiState = CaptureUiState(text = "Milch kaufen", isSaving = true),
+                  onTextChange = {},
+                  onSave = {},
+              )
+          }
+          composeTestRule.onNodeWithTag("save-button").assertIsNotEnabled()
+      }
+
+      @Test
+      fun typingCallsOnTextChange() {
+          var typed = ""
+          composeTestRule.setContent {
+              CaptureScreen(uiState = CaptureUiState(), onTextChange = { typed = it }, onSave = {})
+          }
+          composeTestRule.onNodeWithTag("thought-input").performTextInput("Milch")
+          assertEquals("Milch", typed)
+      }
+  }
+  ```
+
+  Hier zahlt sich die Trennung aus dem Architektur-Modul aus: `CaptureScreen` ist zustandslos und bekommt `uiState` und Lambdas. Der Test braucht kein ViewModel und kann jeden Zustand direkt herstellen.
+
+  Die [APIs](https://developer.android.com/develop/ui/compose/testing/apis) folgen einem Muster: **Finder** (`onNodeWithText`, `onNodeWithTag`, `onNodeWithContentDescription`, `onAllNodesWithText`), **Aktionen** (`performClick`, `performTextInput`, `performScrollTo`) und **Assertions** (`assertIsDisplayed`, `assertExists`, `assertDoesNotExist`, `assertIsEnabled`, `assertTextEquals`). Suche bevorzugt so, wie ein Nutzer sucht – nach sichtbarem Text oder Beschreibung. Ist das nicht eindeutig (derselbe Text im Titel und auf dem Button) oder ändert sich der Text mit der Sprache, setzt du `Modifier.testTag("save-button")` und suchst mit `onNodeWithTag`. Wenn ein Finder nichts oder zu viel findet, zeigt `composeTestRule.onRoot().printToLog("TEST")` den Semantics-Baum in Logcat.
+
+  Compose-Tests synchronisieren sich automatisch: Vor jeder Assertion wartet das Framework, bis Recomposition und Animationen zur Ruhe gekommen sind. `createComposeRule()` braucht zusätzlich `ui-test-manifest` als `debugImplementation`.
+
+  > [!NOTE] Compose-Test-APIs v2
+  > Neuere Compose-Versionen bringen im Paket `androidx.compose.ui.test.junit4.v2` eigene Varianten von `createComposeRule`, die wie `runTest` einen `StandardTestDispatcher` nutzen statt eines `UnconfinedTestDispatcher`. Coroutines in Effekten laufen dann erst, wenn die Zeit vorgerückt wird – im Test hilft `composeTestRule.waitForIdle()`. Die [Migrationsanleitung](https://developer.android.com/develop/ui/compose/testing/migrate-v2) beschreibt den Umstieg.
+
+  ## Instrumentiert, Robolectric oder Screenshot?
+
+  Compose-UI-Tests laufen standardmäßig instrumentiert. [Robolectric](https://developer.android.com/training/testing/local-tests/robolectric) simuliert das Android-Framework auf der JVM, sodass viele dieser Tests auch lokal laufen – schneller und ohne Emulator, aber nicht mit allen Details eines echten Geräts. Viele Teams lassen UI-Tests in CI mit Robolectric laufen und nur wenige kritische Abläufe auf echten Geräten. Für Room rät die Doku von Robolectric ab und empfiehlt die JVM-Variante mit `BundledSQLiteDriver`.
+
+  **Screenshot-Tests** vergleichen ein gerendertes Bild einer Composable mit einer gespeicherten Referenz und fangen visuelle Regressionen, die keine Assertion bemerkt: verschobene Abstände, falsche Farben im Dark Mode. Google bietet dafür [Compose Preview Screenshot Testing](https://developer.android.com/studio/preview/compose-screenshot-testing), das aus `@Preview`-Funktionen Referenzbilder erzeugt; verbreitet sind auch die Bibliotheken Roborazzi und Paparazzi. Für ein Portfolio-Projekt ist das ein Pluspunkt, kein Muss.
+
+  > [!PRAXIS] Was Reviewer in Take-Home-Aufgaben sehen wollen
+  > Keine hundert Prozent Coverage, sondern die richtigen Tests: Domain-Logik mit Randfällen, ViewModels mit Fakes (Erfolg, Fehler, leere Eingabe), mindestens ein DAO-Test gegen eine echte Datenbank und ein, zwei Compose-Tests für den wichtigsten Ablauf. Dazu eine CI, die `./gradlew testDebugUnitTest` bei jedem Push ausführt. Tests, die Mocks für jede Klasse aufsetzen und nur Aufrufe zählen, wirken dagegen wie Pflichtübung.
+
+  ## Häufige Fehler
+
+  - **`Dispatchers.Main` nicht ersetzt.** Symptom: `IllegalStateException: Module with the Main dispatcher is missing`. Lösung: `MainDispatcherRule`.
+  - **Neue Coroutines nicht laufen lassen.** Mit `StandardTestDispatcher` ist nach `launch` noch nichts passiert. Symptom: Die Assertion sieht den alten Zustand. Lösung: `advanceUntilIdle()`.
+  - **Mehrere Scheduler.** Ein `StandardTestDispatcher()` ohne `testScheduler` hat eine eigene Uhr; `advanceUntilIdle()` bewegt sie nicht.
+  - **`stateIn` ohne Collector.** `value` bleibt beim Anfangswert. Lösung: Collector im `backgroundScope`.
+  - **Geteilter Zustand zwischen Tests**, etwa ein Fake als `object`. Tests bestehen einzeln und scheitern zusammen – abhängig von der Reihenfolge.
+  - **`Thread.sleep` oder echte Zeit in Tests.** Langsam und wackelig. Lösung: virtuelle Zeit, Uhrzeit hereinreichen.
+  - **Nach Implementierungsdetails suchen**, etwa nach dem dritten Kind eines `Column`. Lösung: nach Text, Beschreibung oder `testTag` suchen.
+
+  ## Zusammenfassung
+
+  - Lokale Tests (`src/test`, JVM) sind schnell und bilden die Basis der Pyramide; instrumentierte Tests (`src/androidTest`, Gerät) sind realistischer und seltener.
+  - Arrange – Act – Assert, sprechende Testnamen, `assertEquals(erwartet, tatsächlich)`; Uhrzeit und Zufall als Parameter hereinreichen.
+  - Fakes prüfen Zustand und überleben Refactorings; Mocks (MockK) nur für reine Interaktionen.
+  - `runTest` nutzt virtuelle Zeit. `StandardTestDispatcher` stellt Coroutines in eine Warteschlange (`advanceUntilIdle`, `runCurrent`), `UnconfinedTestDispatcher` startet sie sofort. Ein Scheduler pro Test.
+  - `MainDispatcherRule` ersetzt `Dispatchers.Main`; ViewModels prüfst du über `uiState.value`, `stateIn` braucht einen Collector, Folgen prüft Turbine.
+  - Room testest du mit einer In-Memory-Datenbank, Migrationen mit `MigrationTestHelper`.
+  - Compose-Tests arbeiten auf dem Semantics-Baum: Finder, Aktion, Assertion; `testTag`, wenn Text nicht eindeutig ist. Robolectric und Screenshot-Tests ergänzen die Pyramide.
+exercises:
+  - id: fake-oder-mock
+    type: choice
+    title: Welcher Test ist robuster?
+    prompt: |
+      Ein ViewModel speichert Gedanken über `ThoughtRepository.capture(text)`. Welche Aussagen über Test-Doubles stimmen? Mehrere Antworten sind richtig.
+    options:
+      - text: Ein Fake-Repository hält Gedanken in einer Liste; der Test prüft danach, was in der Liste steht.
+        correct: true
+        why: Genau so sieht ein zustandsbasierter Test mit Fake aus – er prüft das Ergebnis, nicht den Weg dorthin.
+      - text: Ein Test, der mit MockK prüft, dass `capture` genau einmal aufgerufen wurde, bricht, wenn das ViewModel künftig `captureAll(listOf(text))` nutzt – obwohl das Verhalten gleich bleibt.
+        correct: true
+        why: Interaktionstests hängen an Implementierungsdetails. Deshalb bricht ein Refactoring sie, auch wenn der Nutzer keinen Unterschied merkt.
+      - text: Google empfiehlt Mocks, weil sie weniger Code brauchen als Fakes.
+        correct: false
+        why: Die Architektur-Empfehlungen stufen „Prefer fakes to mocks“ als „strongly recommended“ ein.
+      - text: Ein Fake lässt sich in vielen Tests und in Compose-Previews wiederverwenden.
+        correct: true
+        why: Ein Fake ist eine echte, einfache Implementierung des Interfaces und kann überall eingesetzt werden, wo das Interface verlangt ist.
+      - text: Für ein Analytics-Event, das keinen beobachtbaren Zustand hinterlässt, ist ein Mock mit `verify` unangemessen.
+        correct: false
+        why: Gerade hier passt ein Mock – es gibt keinen Zustand, den man prüfen könnte, nur die Interaktion selbst.
+    explanation: |
+      Fakes prüfen Zustand, Mocks prüfen Interaktion. Zustandsbasierte Tests überleben Refactorings, weil sie nur das Ergebnis betrachten; deshalb bevorzugt Google Fakes. Mocks bleiben das richtige Werkzeug, wenn die Interaktion selbst das Verhalten ist – etwa ein gesendetes Analytics-Event.
+    resources:
+      - title: Test doubles · Types
+        url: https://developer.android.com/training/testing/fundamentals/test-doubles#types
+      - title: Architecture recommendations · Testing
+        url: https://developer.android.com/topic/architecture/recommendations#testing
+  - id: viewmodel-test-ordnen
+    type: order
+    title: Ein ViewModel-Test, Zeile für Zeile
+    prompt: |
+      Bring die Zeilen des Tests in eine lauffähige Reihenfolge nach Arrange – Act – Assert.
+    lang: kotlin
+    lines: |
+      @get:Rule val mainDispatcherRule = MainDispatcherRule()
+      @Test fun savingStoresText() = runTest {
+          val repository = FakeThoughtRepository()
+          val viewModel = CaptureViewModel(repository)
+          viewModel.onTextChange("Milch kaufen")
+          viewModel.onSaveClicked()
+          assertEquals(listOf("Milch kaufen"), repository.captured)
+          assertEquals("", viewModel.uiState.value.text)
+      }
+    alternatives:
+      - [1, 2, 3, 4, 5, 6, 8, 7, 9]
+    explanation: |
+      Die Rule ist eine Property der Testklasse und steht vor dem Test. Im Test kommt zuerst Arrange (Fake, dann ViewModel, das den Fake braucht), dann Act (erst Text setzen, dann speichern – sonst wird ein leerer Text gespeichert), dann Assert. Die beiden Assertions sind unabhängig voneinander und dürfen in beliebiger Reihenfolge stehen.
+    resources:
+      - title: Setting the Main dispatcher
+        url: https://developer.android.com/kotlin/coroutines/test
+  - id: virtuelle-zeit
+    type: output
+    title: Wann läuft was?
+    prompt: |
+      Was gibt dieser Test aus? `runTest` nutzt hier seinen Standard-Dispatcher.
+    lang: kotlin
+    code: |
+      @Test
+      fun order() = runTest {
+          println("1")
+          launch {
+              println("3")
+              delay(1_000)
+              println("5")
+          }
+          println("2")
+          runCurrent()
+          println("4")
+          advanceUntilIdle()
+          println("6 bei ${testScheduler.currentTime} ms")
+      }
+    expected: |
+      1
+      2
+      3
+      4
+      5
+      6 bei 1000 ms
+    hints:
+      - Der Standard-Dispatcher von `runTest` ist ein `StandardTestDispatcher`.
+      - "`runCurrent()` führt nur aus, was zur aktuellen virtuellen Zeit fällig ist."
+    explanation: |
+      `launch` stellt die Coroutine nur in die Warteschlange; deshalb kommt „2“ vor „3“. `runCurrent()` führt aus, was jetzt fällig ist: Die Coroutine gibt „3“ aus und suspendiert im `delay`, der für Zeitpunkt 1000 geplant ist. „4“ folgt im Testkörper. `advanceUntilIdle()` rückt die virtuelle Uhr auf 1000 vor und lässt die Coroutine „5“ ausgeben. Die Uhr steht danach bei 1000 ms, obwohl in Wirklichkeit kaum Zeit vergangen ist.
+    resources:
+      - title: Advancing time and running coroutines
+        url: https://developer.android.com/kotlin/coroutines/test
+      - title: runTest (API-Referenz)
+        url: https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-test/kotlinx.coroutines.test/run-test.html
+  - id: unconfined-sofort
+    type: output
+    title: Sofort oder später?
+    prompt: |
+      Derselbe Aufbau, aber mit `UnconfinedTestDispatcher`. Was wird ausgegeben?
+    lang: kotlin
+    code: |
+      @Test
+      fun unconfined() = runTest(UnconfinedTestDispatcher()) {
+          val log = mutableListOf<String>()
+          launch {
+              log += "A"
+              delay(10)
+              log += "C"
+          }
+          log += "B"
+          println(log)
+          advanceUntilIdle()
+          println(log)
+      }
+    expected: |
+      [A, B]
+      [A, B, C]
+    hints:
+      - "`UnconfinedTestDispatcher` startet neue Coroutines sofort – bis zum ersten Suspend-Punkt."
+    explanation: |
+      Mit `UnconfinedTestDispatcher` läuft der `launch`-Block sofort los und schreibt „A“, bis er im `delay` suspendiert. Danach geht es im Testkörper mit „B“ weiter. Erst `advanceUntilIdle()` rückt die Uhr um 10 ms vor, und „C“ kommt dazu. Mit dem `StandardTestDispatcher` wäre die erste Zeile `[B]` gewesen und die zweite `[B, A, C]` – derselbe Code, eine andere Reihenfolge. Deshalb musst du wissen, welcher Dispatcher in deinem Test läuft.
+    resources:
+      - title: UnconfinedTestDispatcher (API-Referenz)
+        url: https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-test/kotlinx.coroutines.test/-unconfined-test-dispatcher.html
+  - id: main-dispatcher-rule
+    type: gap
+    title: Main ersetzen
+    prompt: |
+      Ergänze die JUnit4-Rule, die `Dispatchers.Main` für jeden Test ersetzt und danach zurücksetzt.
+    lang: kotlin
+    code: |
+      class MainDispatcherRule(
+          val testDispatcher: TestDispatcher = ⟦UnconfinedTestDispatcher()⟧,
+      ) : ⟦TestWatcher()⟧ {
+          override fun ⟦starting⟧(description: Description) {
+              ⟦Dispatchers.setMain(testDispatcher)⟧
+          }
+
+          override fun ⟦finished⟧(description: Description) {
+              ⟦Dispatchers.resetMain()⟧
+          }
+      }
+
+      class ThoughtsViewModelTest {
+          ⟦@get:Rule⟧
+          val mainDispatcherRule = MainDispatcherRule()
+      }
+    gaps:
+      - label: Standard-Dispatcher
+        hint: Der Dispatcher, der neue Coroutines sofort startet.
+        accept: ["StandardTestDispatcher()"]
+      - label: Basisklasse
+        hint: Eine JUnit4-Rule mit Hooks für Start und Ende eines Tests.
+      - label: Hook vor dem Test
+        hint: Wird aufgerufen, bevor der Test beginnt.
+      - label: Main ersetzen
+        hint: Eine Funktion aus `kotlinx.coroutines.test`.
+      - label: Hook nach dem Test
+        hint: Wird immer nach dem Test aufgerufen, auch wenn er fehlschlägt.
+      - label: Zurücksetzen
+        hint: Das Gegenstück zu `setMain`.
+      - label: Rule-Annotation
+        hint: In Kotlin muss die Annotation auf dem Getter landen.
+    explanation: |
+      `TestWatcher` bietet Hooks um jeden Test herum. `starting` ersetzt `Dispatchers.Main`, damit `viewModelScope` im Test läuft, und `finished` stellt ihn zurück – auch nach einem fehlgeschlagenen Test, sonst beeinflusst ein Test den nächsten. `@get:Rule` ist nötig, weil JUnit die Rule über einen öffentlichen Getter findet; ein bloßes `@Rule` landet in Kotlin auf dem privaten Feld und JUnit meldet einen Fehler. `UnconfinedTestDispatcher` als Standard macht einfache ViewModel-Tests bequem; wer Zwischenzustände prüfen will, übergibt einen `StandardTestDispatcher`.
+    resources:
+      - title: Setting the Main dispatcher
+        url: https://developer.android.com/kotlin/coroutines/test
+      - title: kotlinx-coroutines-test (API-Referenz)
+        url: https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-test/
+  - id: turbine-repository
+    type: gap
+    title: Eine Folge von Werten prüfen
+    prompt: |
+      Teste mit Turbine, dass `observeTopics()` die Entities aus dem DAO in Domain-Modelle umwandelt – erst die leere Liste, dann nach einer Änderung das neue Thema. Der Fake-DAO hält seine Daten in einem `MutableStateFlow`.
+    lang: kotlin
+    code: |
+      class FakeTopicDao : TopicDao {
+          val topics = MutableStateFlow<List<TopicEntity>>(emptyList())
+          override fun observeAll(): Flow<List<TopicEntity>> = topics
+          override suspend fun replaceAll(topics: List<TopicEntity>) { this.topics.value = topics }
+      }
+
+      class OfflineFirstTopicRepositoryTest {
+          private val dao = FakeTopicDao()
+          private val repository = OfflineFirstTopicRepository(FakeTopicApi(), dao)
+
+          @Test
+          fun observeTopicsMapsEntities() = ⟦runTest⟧ {
+              repository.observeTopics().⟦test⟧ {
+                  assertEquals(emptyList<Topic>(), ⟦awaitItem()⟧)
+                  dao.topics.value = listOf(TopicEntity(issueId = "BOX-1", title = "Milch"))
+                  assertEquals(listOf(Topic(id = "BOX-1", title = "Milch")), awaitItem())
+                  ⟦cancelAndIgnoreRemainingEvents()⟧
+              }
+          }
+      }
+    gaps:
+      - label: Coroutine-Testbuilder
+        hint: Startet den Test in einer Coroutine mit virtueller Zeit.
+      - label: Turbine starten
+        hint: Die Erweiterungsfunktion von Turbine auf `Flow`.
+      - label: Nächster Wert
+        hint: Suspendiert, bis der Flow den nächsten Wert liefert.
+      - label: Aufräumen
+        hint: Beendet die Sammlung und ignoriert, was noch kommen könnte.
+    explanation: |
+      `runTest` liefert die Coroutine, `test { }` sammelt den Flow in einer eigenen Coroutine und stellt jedes Element in eine Warteschlange. `awaitItem()` holt das nächste Element und schlägt nach einer Zeitüberschreitung fehl, wenn keins kommt. Weil ein `StateFlow` nie endet, beendest du die Sammlung mit `cancelAndIgnoreRemainingEvents()`; ohne diesen Aufruf prüft Turbine am Ende, dass keine unverarbeiteten Werte übrig sind. Der Fake-DAO ersetzt Room vollständig – der Test prüft nur das Mapping des Repositorys.
+    resources:
+      - title: Using Turbine
+        url: https://developer.android.com/kotlin/flow/test#turbine
+      - title: Turbine (GitHub)
+        url: https://github.com/cashapp/turbine
+  - id: compose-test-schreiben
+    type: gap
+    title: Ein Compose-Test
+    prompt: |
+      Ergänze den UI-Test für den Eingabebildschirm: Text eingeben, auf den Button mit dem Tag `save-button` tippen, prüfen, dass `onSave` aufgerufen wurde, und dass die Überschrift „Neuer Gedanke“ sichtbar ist.
+    lang: kotlin
+    code: |
+      class CaptureScreenTest {
+          @get:Rule
+          val composeTestRule = ⟦createComposeRule()⟧
+
+          @Test
+          fun savingCallsOnSave() {
+              var saved = false
+              var text = ""
+              composeTestRule.⟦setContent⟧ {
+                  CaptureScreen(
+                      uiState = CaptureUiState(text = text),
+                      onTextChange = { text = it },
+                      onSave = { saved = true },
+                  )
+              }
+
+              composeTestRule.onNodeWithText("Neuer Gedanke").⟦assertIsDisplayed()⟧
+              composeTestRule.onNodeWithTag("thought-input").⟦performTextInput("Milch kaufen")⟧
+              composeTestRule.⟦onNodeWithTag("save-button")⟧.⟦performClick()⟧
+              assertTrue(saved)
+          }
+      }
+
+      // in CaptureScreen:
+      Button(onClick = onSave, modifier = Modifier.⟦testTag("save-button")⟧) { Text("Speichern") }
+    gaps:
+      - label: Rule
+        hint: Erzeugt eine leere Compose-Umgebung ohne eigene Activity.
+      - label: Inhalt setzen
+        hint: Wie in einer Activity – nur auf der Rule.
+      - label: Sichtbarkeit prüfen
+        hint: Eine Assertion, dass der Knoten auf dem Bildschirm zu sehen ist.
+      - label: Text eingeben
+        hint: Eine Aktion für Textfelder mit dem einzugebenden Text.
+      - label: Finder
+        hint: Sucht den Knoten über seinen Test-Tag.
+      - label: Tippen
+        hint: Die Aktion für einen Klick.
+      - label: Tag setzen
+        hint: Ein Modifier, der dem Knoten eine ID für Tests gibt.
+    explanation: |
+      `createComposeRule()` startet eine Compose-Umgebung, `setContent` zeigt die zustandslose `CaptureScreen` mit Test-Lambdas. Danach folgt jeder Schritt dem Muster Finder – Aktion oder Assertion: `onNodeWithText(...).assertIsDisplayed()`, `onNodeWithTag(...).performTextInput(...)`, `onNodeWithTag(...).performClick()`. Der Test prüft über die Lambdas, was die UI melden würde, ohne ein ViewModel zu brauchen. `Modifier.testTag` macht den Button unabhängig von Beschriftung und Sprache auffindbar.
+    resources:
+      - title: Compose testing APIs
+        url: https://developer.android.com/develop/ui/compose/testing/apis
+      - title: Compose testing cheatsheet
+        url: https://developer.android.com/develop/ui/compose/testing/testing-cheatsheet
+  - id: einen-test-starten
+    type: command
+    title: Nur diese eine Testklasse
+    prompt: |
+      Du arbeitest an der Rundenauswahl. Führe im Modul `app` nur die lokalen Unit-Tests der Debug-Variante aus, und davon nur die Klasse `app.kiumu.bear.domain.RoundSelectionTest`.
+    context: Du bist im Wurzelverzeichnis des Android-Projekts (`~/projects/bear/android`).
+    answers:
+      - ./gradlew :app:testDebugUnitTest --tests app.kiumu.bear.domain.RoundSelectionTest
+      - ./gradlew testDebugUnitTest --tests app.kiumu.bear.domain.RoundSelectionTest
+      - "./gradlew :app:testDebugUnitTest --tests 'app.kiumu.bear.domain.RoundSelectionTest'"
+      - ./gradlew :app:testDebugUnitTest --tests *RoundSelectionTest
+      - "./gradlew :app:testDebugUnitTest --tests '*RoundSelectionTest'"
+      - "./gradlew :app:testDebugUnitTest --tests \"*RoundSelectionTest\""
+    output: |
+      > Task :app:testDebugUnitTest
+
+      BUILD SUCCESSFUL in 6s
+      27 actionable tasks: 4 executed, 23 up-to-date
+    explanation: |
+      Lokale Unit-Tests laufen über den Task `test<Variante>UnitTest`, hier `testDebugUnitTest`; mit `:app:` davor nur im Modul `app`. Die Option `--tests` filtert nach Klasse, Methode oder Muster, etwa `--tests '*RoundSelectionTest'` oder `--tests 'app.kiumu.bear.domain.RoundSelectionTest.pickSkipsStuckTopics'`. Den Bericht findest du danach unter `app/build/reports/tests/testDebugUnitTest/index.html`. Beim Sammel-Task `test`, der alle Varianten ausführt, funktioniert `--tests` nicht – nimm den Task einer konkreten Variante.
+    resources:
+      - title: Test from the command line
+        url: https://developer.android.com/studio/test/command-line
+  - id: instrumentiert-starten
+    type: command
+    title: Auf dem Gerät testen
+    prompt: |
+      Führe alle instrumentierten Tests (`src/androidTest`) der Debug-Variante im Modul `app` auf dem angeschlossenen Pixel aus.
+    context: Das Pixel ist per USB verbunden, `adb devices` zeigt es an.
+    answers:
+      - ./gradlew :app:connectedDebugAndroidTest
+      - ./gradlew connectedDebugAndroidTest
+    output: |
+      > Task :app:connectedDebugAndroidTest
+      Starting 6 tests on Pixel 10 Pro - 17
+
+      BUILD SUCCESSFUL in 1m 12s
+    explanation: |
+      `connected<Variante>AndroidTest` baut die App und das Test-APK, installiert beide auf allen verbundenen Geräten und führt die Tests aus `src/androidTest` dort aus. `connectedAndroidTest` ohne Variante läuft für alle Varianten. Das dauert deutlich länger als lokale Tests – ein Grund mehr, möglichst viel Logik lokal zu testen. Mehrere Geräte angeschlossen? Mit der Umgebungsvariable `ANDROID_SERIAL` legst du fest, welches Gerät genutzt wird.
+    resources:
+      - title: Test from the command line
+        url: https://developer.android.com/studio/test/command-line
+      - title: Build instrumented tests
+        url: https://developer.android.com/training/testing/instrumented-tests
+  - id: geteilter-fake
+    type: bug
+    title: Einzeln grün, zusammen rot
+    prompt: |
+      Jeder der beiden Tests besteht, wenn du ihn einzeln startest. Startest du die ganze Klasse, schlägt `blankTextIsNotSaved` fehl: `expected:<[]> but was:<[Milch kaufen]>`. Finde die zwei Zeilen, die das verursachen, und korrigiere sie.
+    lang: kotlin
+    code: |
+      object FakeThoughtRepository : ThoughtRepository {
+          val captured = mutableListOf<String>()
+          override suspend fun capture(text: String) { captured += text }
+      }
+
+      class CaptureViewModelTest {
+          @get:Rule
+          val mainDispatcherRule = MainDispatcherRule()
+          private val repository = FakeThoughtRepository
+
+          @Test
+          fun savingStoresText() = runTest {
+              val viewModel = CaptureViewModel(repository)
+              viewModel.onTextChange("Milch kaufen")
+              viewModel.onSaveClicked()
+              assertEquals(listOf("Milch kaufen"), repository.captured)
+          }
+
+          @Test
+          fun blankTextIsNotSaved() = runTest {
+              val viewModel = CaptureViewModel(repository)
+              viewModel.onTextChange("   ")
+              viewModel.onSaveClicked()
+              assertEquals(emptyList<String>(), repository.captured)
+          }
+      }
+    lines: [1, 9]
+    fix:
+      - line: 1
+        answers: ["class FakeThoughtRepository : ThoughtRepository {"]
+      - line: 9
+        answers: ["private val repository = FakeThoughtRepository()"]
+    hints:
+      - JUnit erzeugt für jeden Test eine neue Instanz der Testklasse. Gilt das auch für `repository`?
+      - Wie viele Instanzen gibt es von einem Kotlin-`object`?
+    explanation: |
+      Ein `object` ist ein Singleton: Es gibt genau eine Instanz im ganzen Testlauf. Läuft `savingStoresText` zuerst, bleibt „Milch kaufen“ in `captured` stehen, und `blankTextIsNotSaved` sieht es. Einzeln gestartet fällt das nicht auf – ein klassischer reihenfolgeabhängiger Test. Als `class` mit `FakeThoughtRepository()` in der Property bekommt jeder Test einen frischen Fake, weil JUnit für jeden Test eine neue Instanz der Testklasse erzeugt. Faustregel: Tests teilen keinen veränderlichen Zustand.
+    resources:
+      - title: Test doubles · Example using a fake
+        url: https://developer.android.com/training/testing/fundamentals/test-doubles#example-fake
+      - title: Object declarations (Kotlin-Doku)
+        url: https://kotlinlang.org/docs/object-declarations.html
+  - id: zwei-knoten
+    type: bug
+    title: Zwei Knoten, ein Klick
+    prompt: |
+      `CaptureScreen` hat eine Top-App-Bar mit dem Titel „Speichern“ und darunter einen Button, ebenfalls mit „Speichern“ beschriftet; der Button trägt `Modifier.testTag("save-button")`. Der Test bricht ab mit: `Expected exactly '1' node but found '2' nodes that satisfy: (Text + InputText + EditableText contains 'Speichern' (ignoreCase: false))`. Finde die fehlerhafte Zeile und korrigiere sie so, dass eindeutig der Button getroffen wird.
+    lang: kotlin
+    code: |
+      @Test
+      fun saveButtonCallsOnSave() {
+          var saved = false
+          composeTestRule.setContent {
+              CaptureScreen(
+                  uiState = CaptureUiState(text = "Milch kaufen"),
+                  onTextChange = {},
+                  onSave = { saved = true },
+              )
+          }
+          composeTestRule.onNodeWithText("Speichern").performClick()
+          assertTrue(saved)
+      }
+    lines: [11]
+    fix:
+      - line: 11
+        answers:
+          - "composeTestRule.onNodeWithTag(\"save-button\").performClick()"
+          - "composeTestRule.onNode(hasText(\"Speichern\") and hasClickAction()).performClick()"
+          - "composeTestRule.onNode(hasTestTag(\"save-button\")).performClick()"
+    hints:
+      - Der Button hat eine Eigenschaft, die der Titel nicht hat.
+    explanation: |
+      `onNodeWithText` erwartet genau einen Treffer; hier passen Titel und Button. Die robusteste Lösung ist der Test-Tag, den der Button schon trägt: `onNodeWithTag("save-button")`. Alternativ kombinierst du Matcher: `hasText("Speichern") and hasClickAction()` trifft nur den klickbaren Knoten. `onAllNodesWithText(...)[1]` würde auch funktionieren, hängt aber an der Reihenfolge im Baum und bricht beim nächsten Layout-Umbau.
+    resources:
+      - title: Compose testing APIs · Finders
+        url: https://developer.android.com/develop/ui/compose/testing/apis#finders
+      - title: Semantics in Compose tests
+        url: https://developer.android.com/develop/ui/compose/testing/semantics
+  - id: widget-pick-test-erklaeren
+    type: explain
+    title: Bears WidgetPickTest
+    prompt: |
+      Das sind echte Tests aus Bear (Auszug) und die getestete Funktion. Erkläre, was an diesen Tests gut gemacht ist: Wie werden Zeit und Zufall testbar gemacht, welche Randfälle sind abgedeckt, und warum laufen die Zufallstests in einer Schleife?
+    lang: kotlin
+    code: |
+      object WidgetPick {
+          const val HOURS = 4
+          fun slot(now: LocalDateTime): Long =
+              now.toLocalDate().toEpochDay() * (24 / HOURS) + now.hour / HOURS
+
+          fun pick(ids: List<String>, current: String?, currentSlot: Long?, slot: Long, random: Random = Random.Default): String? {
+              if (current != null && currentSlot == slot && current in ids) return current
+              if (ids.isEmpty()) return null
+              return ids.filter { it != current }.ifEmpty { ids }.random(random)
+          }
+      }
+
+      class WidgetPickTest {
+          private val ids = listOf("a", "b", "c", "d")
+
+          @Test fun slotsStartEveryFourHours() {
+              val day = LocalDateTime.of(2026, 9, 27, 0, 0)
+              assertEquals(WidgetPick.slot(day), WidgetPick.slot(day.withHour(3).withMinute(59)))
+              assertEquals(WidgetPick.slot(day) + 1, WidgetPick.slot(day.withHour(4)))
+              assertEquals(WidgetPick.slot(day) + 6, WidgetPick.slot(day.plusDays(1)))
+          }
+
+          @Test fun aNewSlotBringsAnotherEntry() {
+              repeat(50) { assertNotEquals("b", WidgetPick.pick(ids, "b", 7, 8, Random(it))) }
+          }
+
+          @Test fun aSingleEntryStaysAndNoEntryGivesNothing() {
+              assertEquals("a", WidgetPick.pick(listOf("a"), "a", 7, 8))
+              assertNull(WidgetPick.pick(emptyList(), "a", 7, 8))
+          }
+      }
+    points:
+      - Zeit und Zufall kommen als Parameter herein (`LocalDateTime`, `Random`) statt über `now()` und `Random.Default` – die Funktion ist rein und deterministisch testbar.
+      - Die Grenzen sind exakt getestet – 3:59 gehört noch zum alten Slot, 4:00 zum neuen, Mitternacht zum nächsten Tag.
+      - "`repeat(50)` mit `Random(it)` prüft die Eigenschaft über 50 verschiedene, aber reproduzierbare Seeds – ein Fehler wäre bei jedem Lauf gleich sichtbar."
+      - Randfälle wie ein einziger Eintrag und eine leere Liste sind eigene Tests.
+      - Die Testnamen beschreiben Verhalten in ganzen Sätzen, sodass ein roter Test sofort sagt, welche Regel verletzt ist.
+    explanation: |
+      Die wichtigste Entscheidung steckt im Produktionscode: `pick` und `slot` bekommen Uhrzeit und Zufallsgenerator als Parameter. Dadurch sind sie reine Funktionen, und die Tests brauchen weder Warten noch Mocks. `slotsStartEveryFourHours` prüft genau die Grenzen, an denen Off-by-one-Fehler entstehen: 3:59 gegen 4:00 und Mitternacht. Die Zufallstests laufen mit 50 festen Seeds; das ist ein kleiner eigenschaftsbasierter Test („bei neuem Slot nie derselbe Eintrag“), der trotzdem bei jedem Lauf dasselbe Ergebnis liefert – wackelige Tests sind ausgeschlossen. Der leere und der einelementige Fall haben eigene Assertions, weil dort `ifEmpty { ids }` und `return null` greifen. Und die Namen lesen sich wie Anforderungen: Schlägt `aNewSlotBringsAnotherEntry` fehl, weißt du ohne Blick in den Code, welche Regel gebrochen ist.
+    resources:
+      - title: Build local unit tests
+        url: https://developer.android.com/training/testing/local-tests
+      - title: kotlin.random.Random (API-Referenz)
+        url: https://kotlinlang.org/api/core/kotlin-stdlib/kotlin.random/-random/
+  - id: capture-viewmodel-testen
+    type: practice
+    title: Tests für das Capture-ViewModel
+    prompt: |
+      Schreibe die Tests für das `CaptureViewModel` aus dem Modul „App-Architektur“ (Übung „Das Capture-ViewModel“). Zur Erinnerung: `onSaveClicked()` ignoriert leeren Text und setzt eine Meldung, sperrt sich mit `isSaving` gegen doppelte Tipps, leert nach dem Speichern das Feld und setzt „Gespeichert“; `userMessageShown()` setzt die Meldung auf `null`.
+
+      Anforderungen:
+
+      - Ein `FakeThoughtRepository`, das gespeicherte Texte in einer Liste sammelt und dessen `capture` sich per `CompletableDeferred` anhalten lässt.
+      - Mindestens diese Tests: Speichern speichert den getrimmten Text und leert das Feld; leerer Text wird nicht gespeichert und erzeugt eine Meldung; ein zweiter Tipp während des Speicherns speichert nicht doppelt; `userMessageShown()` entfernt die Meldung.
+      - `MainDispatcherRule` und `runTest`; keine Mocks, kein `Thread.sleep`.
+    lang: kotlin
+    starter: |
+      class FakeThoughtRepository : ThoughtRepository {
+          // captured, gate
+      }
+
+      class CaptureViewModelTest {
+          // Rule, Tests
+      }
+    solution: |
+      import kotlinx.coroutines.CompletableDeferred
+      import kotlinx.coroutines.test.advanceUntilIdle
+      import kotlinx.coroutines.test.runTest
+      import org.junit.Assert.assertEquals
+      import org.junit.Assert.assertFalse
+      import org.junit.Assert.assertNull
+      import org.junit.Assert.assertTrue
+      import org.junit.Rule
+      import org.junit.Test
+
+      class FakeThoughtRepository : ThoughtRepository {
+          val captured = mutableListOf<String>()
+          /** Wenn gesetzt, wartet capture, bis der Test das Gate öffnet. */
+          var gate: CompletableDeferred<Unit>? = null
+
+          override suspend fun capture(text: String) {
+              gate?.await()
+              captured += text
+          }
+      }
+
+      class CaptureViewModelTest {
+          @get:Rule
+          val mainDispatcherRule = MainDispatcherRule()
+
+          private val repository = FakeThoughtRepository()
+          private val viewModel = CaptureViewModel(repository)
+
+          @Test
+          fun savingStoresTrimmedTextAndClearsField() = runTest {
+              viewModel.onTextChange("  Milch kaufen ")
+              viewModel.onSaveClicked()
+              advanceUntilIdle()
+
+              assertEquals(listOf("Milch kaufen"), repository.captured)
+              assertEquals("", viewModel.uiState.value.text)
+              assertEquals("Gespeichert", viewModel.uiState.value.userMessage)
+              assertFalse(viewModel.uiState.value.isSaving)
+          }
+
+          @Test
+          fun blankTextIsNotSavedAndShowsMessage() = runTest {
+              viewModel.onTextChange("   ")
+              viewModel.onSaveClicked()
+              advanceUntilIdle()
+
+              assertTrue(repository.captured.isEmpty())
+              assertEquals("Leerer Gedanke – nichts gespeichert", viewModel.uiState.value.userMessage)
+          }
+
+          @Test
+          fun secondTapWhileSavingDoesNotSaveTwice() = runTest {
+              val gate = CompletableDeferred<Unit>()
+              repository.gate = gate
+              viewModel.onTextChange("Milch kaufen")
+
+              viewModel.onSaveClicked()
+              assertTrue(viewModel.uiState.value.isSaving)
+              viewModel.onSaveClicked()
+
+              gate.complete(Unit)
+              advanceUntilIdle()
+
+              assertEquals(listOf("Milch kaufen"), repository.captured)
+              assertFalse(viewModel.uiState.value.isSaving)
+          }
+
+          @Test
+          fun userMessageShownClearsMessage() = runTest {
+              viewModel.onTextChange("Milch kaufen")
+              viewModel.onSaveClicked()
+              advanceUntilIdle()
+
+              viewModel.userMessageShown()
+
+              assertNull(viewModel.uiState.value.userMessage)
+          }
+      }
+    checklist:
+      - Der Fake ist eine `class`, keine `object`-Deklaration; jeder Test bekommt eine frische Instanz.
+      - "`capture` im Fake wartet auf ein `CompletableDeferred`, sodass der Test den Zustand „speichert gerade“ festhalten kann."
+      - Die Tests nutzen `@get:Rule val mainDispatcherRule = MainDispatcherRule()` und `runTest`.
+      - Jeder Test prüft Zustand (`uiState.value`, `repository.captured`), nicht Aufrufe.
+      - Der Doppeltipp-Test prüft `isSaving` zwischen den beiden Tipps und die Anzahl gespeicherter Texte danach.
+      - Die Testnamen beschreiben das erwartete Verhalten.
+    explanation: |
+      Der Fake ist der Schlüssel: Er sammelt Texte (Zustand statt Aufrufzählung), und das `CompletableDeferred` hält `capture` an, bis der Test es freigibt. So lässt sich der Moment „speichert gerade“ einfrieren und der zweite Tipp genau dort ausführen. Mit der `MainDispatcherRule` und ihrem `UnconfinedTestDispatcher` läuft der `launch` im ViewModel sofort bis zum `await`; `advanceUntilIdle()` nach `complete` lässt ihn zu Ende laufen. Die Tests prüfen nur, was ein Nutzer bemerken würde: was gespeichert wurde, was im Feld steht, welche Meldung erscheint. Deshalb überleben sie jedes Refactoring des ViewModels, das dieses Verhalten beibehält.
+    resources:
+      - title: Testing Kotlin coroutines on Android
+        url: https://developer.android.com/kotlin/coroutines/test
+      - title: CompletableDeferred (API-Referenz)
+        url: https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines/-completable-deferred/

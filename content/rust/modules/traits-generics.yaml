@@ -1,0 +1,1103 @@
+id: traits-generics
+title: Traits & Generics
+level: 2
+minutes: 180
+summary: Generischer Code ohne Laufzeitkosten, gemeinsames Verhalten über Traits und die Wahl zwischen statischer und dynamischer Dispatch – das Werkzeug, mit dem Rust-Bibliotheken ihre APIs bauen.
+goals:
+  - Du schreibst generische Funktionen, Structs und `impl`-Blöcke und erklärst, was Monomorphisierung kostet und bringt.
+  - "Du definierst Traits mit Pflicht- und Default-Methoden und formulierst Trait Bounds mit `T: Trait`, `+` und `where`."
+  - Du entscheidest begründet zwischen `impl Trait`, Generics und `dyn Trait` und erklärst, was eine vtable ist.
+  - Du leitest die wichtigsten Standard-Traits per `derive` ab und implementierst `Display`, `From` und `Add` von Hand.
+  - Du erklärst die Orphan Rule und umgehst sie mit dem Newtype-Muster.
+resources:
+  - title: The Rust Book · Kapitel 10 – Generic Types, Traits, and Lifetimes
+    url: https://doc.rust-lang.org/book/ch10-00-generics.html
+  - title: The Rust Book · Using Trait Objects
+    url: https://doc.rust-lang.org/book/ch18-02-trait-objects.html
+  - title: The Rust Reference · Traits
+    url: https://doc.rust-lang.org/reference/items/traits.html
+  - title: Rust by Example · Traits
+    url: https://doc.rust-lang.org/rust-by-example/trait.html
+lesson: |
+  Dein Monitoring-Tool prüft Festplatten, Dienste und Zertifikate. Jede Prüfung hat einen Namen und ein Ergebnis, aber jede ermittelt es anders. Später sollen Benachrichtigungen per Mail, Slack oder in eine Datei gehen – je nach Konfiguration. In TypeScript würdest du dafür Interfaces schreiben, in Kotlin ebenfalls. In Rust heißen sie **Traits**. Dazu kommen **Generics**: Funktionen und Typen, die für viele konkrete Typen funktionieren, ohne dass du sie für jeden Typ kopierst.
+
+  Das Besondere an Rust: Du entscheidest selbst, ob der Compiler für jeden konkreten Typ eigenen Maschinencode erzeugt (schnell, größeres Binary) oder ob zur Laufzeit über eine Tabelle von Funktionszeigern aufgerufen wird (flexibel, ein indirekter Sprung). Diese Entscheidung zu verstehen, trennt Leute, die Rust-Code schreiben können, von Leuten, die Rust-APIs entwerfen können.
+
+  ## Generics: ein Stück Code für viele Typen
+
+  Eine Funktion, die das größte Element eines Slices findet, sieht für `i32`, `f64` und `&str` gleich aus. Mit einem Typparameter `T` schreibst du sie einmal:
+
+  ```rust
+  fn groesstes<T: PartialOrd>(liste: &[T]) -> Option<&T> {
+      let mut max = liste.first()?;
+      for wert in liste {
+          if wert > max {
+              max = wert;
+          }
+      }
+      Some(max)
+  }
+
+  fn main() {
+      println!("{:?}", groesstes(&[3, 17, 8]));           // Some(17)
+      println!("{:?}", groesstes(&[0.5, -1.0]));          // Some(0.5)
+      println!("{:?}", groesstes(&["beta", "alpha"]));    // Some("beta")
+      println!("{:?}", groesstes::<u8>(&[]));             // None
+  }
+  ```
+
+  `T: PartialOrd` ist ein **Trait Bound**: `T` darf jeder Typ sein, der sich mit `<` und `>` vergleichen lässt. Ohne diesen Bound weiß der Compiler nicht, ob `>` für `T` existiert, und meldet [E0369](https://doc.rust-lang.org/error_codes/E0369.html): `binary operation > cannot be applied to type &T`. Das ist der zentrale Unterschied zu C++-Templates: Rust prüft den generischen Code **einmal gegen die Bounds**, nicht erst beim Einsetzen jedes Typs. Was im Bound steht, darfst du benutzen – mehr nicht.
+
+  Structs und Enums können ebenfalls generisch sein. `Option<T>` und `Result<T, E>` kennst du schon. In `impl`-Blöcken kannst du Methoden für alle `T` anbieten oder nur für bestimmte Typen:
+
+  ```rust
+  #[derive(Debug)]
+  struct Messwert<T> {
+      wert: T,
+      einheit: &'static str,
+  }
+
+  impl<T: std::fmt::Display> Messwert<T> {
+      fn anzeigen(&self) -> String {
+          format!("{} {}", self.wert, self.einheit)
+      }
+  }
+
+  impl Messwert<f64> {
+      fn in_prozent(&self) -> f64 {
+          self.wert * 100.0
+      }
+  }
+
+  fn main() {
+      let temp = Messwert { wert: 21.5, einheit: "°C" };
+      let anfragen = Messwert { wert: 1200_u32, einheit: "req/s" };
+      let quote = Messwert { wert: 0.25, einheit: "" };
+      println!("{} | {}", temp.anzeigen(), anfragen.anzeigen());
+      println!("{}", quote.in_prozent()); // nur für Messwert<f64> vorhanden
+  }
+  ```
+
+  ### Monomorphisierung: was der Compiler daraus macht
+
+  Rust erzeugt für jeden konkreten Typ, mit dem du eine generische Funktion aufrufst, eine eigene Kopie: `groesstes::<i32>`, `groesstes::<f64>`, `groesstes::<&str>`. Das heißt **Monomorphisierung** ([Book: Performance of Code Using Generics](https://doc.rust-lang.org/book/ch10-01-syntax.html#performance-of-code-using-generics)). Jede Kopie ist so schnell wie handgeschriebener Code für genau diesen Typ; der Optimierer kann Aufrufe inlinen. Der Preis: längere Compile-Zeiten und ein größeres Binary, wenn eine große generische Funktion mit vielen Typen benutzt wird.
+
+  ## Traits: gemeinsames Verhalten beschreiben
+
+  Ein Trait legt fest, welche Methoden ein Typ anbieten muss. Methoden mit Rumpf sind **Default-Methoden**: Jeder Typ bekommt sie geschenkt und darf sie überschreiben. Default-Methoden dürfen die Pflichtmethoden aufrufen – so baust du viel Verhalten auf wenig Implementierungsaufwand ([Book: Default Implementations](https://doc.rust-lang.org/book/ch10-02-traits.html#using-default-implementations)).
+
+  ```rust
+  trait Benachrichtigung {
+      // Pflichtmethode: jeder Typ muss sie implementieren
+      fn kanal(&self) -> String;
+
+      // Default-Methode: darf überschrieben werden, nutzt die Pflichtmethode
+      fn senden(&self, text: &str) -> String {
+          format!("[{}] {text}", self.kanal())
+      }
+  }
+
+  struct Email {
+      an: String,
+  }
+
+  struct Slack {
+      channel: String,
+  }
+
+  impl Benachrichtigung for Email {
+      fn kanal(&self) -> String {
+          format!("mail:{}", self.an)
+      }
+  }
+
+  impl Benachrichtigung for Slack {
+      fn kanal(&self) -> String {
+          format!("slack:#{}", self.channel)
+      }
+      fn senden(&self, text: &str) -> String {
+          format!("[{}] :rotating_light: {text}", self.kanal())
+      }
+  }
+
+  fn main() {
+      let mail = Email { an: String::from("ops@firma.de") };
+      let slack = Slack { channel: String::from("alerts") };
+      println!("{}", mail.senden("Backup fehlgeschlagen"));
+      println!("{}", slack.senden("Backup fehlgeschlagen"));
+  }
+  ```
+
+  Anders als bei Interfaces in Kotlin steht die Implementierung in einem **eigenen** `impl Trait for Typ`-Block, nicht in der Typdefinition. Deshalb kannst du eigene Traits auch für fremde Typen wie `Vec<u8>` oder `i32` implementieren – mit einer Einschränkung, der Orphan Rule, weiter unten.
+
+  ### Trait Bounds: T: Trait, + und where
+
+  Es gibt vier Schreibweisen, die dasselbe ausdrücken können ([Book: Traits as Parameters](https://doc.rust-lang.org/book/ch10-02-traits.html#using-traits-as-parameters)):
+
+  ```rust
+  use std::fmt::{Debug, Display};
+
+  // 1. Trait Bound direkt am Typparameter
+  fn protokolliere<T: Display>(wert: T) {
+      println!("LOG {wert}");
+  }
+
+  // 2. Mehrere Bounds mit +
+  fn pruefe<T: Display + PartialOrd>(wert: T, grenze: T) {
+      if wert > grenze {
+          println!("{wert} liegt über {grenze}");
+      }
+  }
+
+  // 3. where-Klausel, wenn die Signatur sonst unleserlich wird
+  fn bericht<K, V>(eintraege: &[(K, V)]) -> String
+  where
+      K: Display,
+      V: Debug,
+  {
+      let mut s = String::new();
+      for (k, v) in eintraege {
+          s.push_str(&format!("{k}={v:?} "));
+      }
+      s
+  }
+
+  // 4. impl Trait in Argument-Position: Kurzform für Variante 1
+  fn protokolliere_kurz(wert: impl Display) {
+      println!("LOG {wert}");
+  }
+
+  fn main() {
+      protokolliere(42);
+      pruefe(95.5, 90.0);
+      println!("{}", bericht(&[("port", 8080), ("workers", 4)]));
+      protokolliere_kurz("fertig");
+  }
+  ```
+
+  `impl Display` im Argument ist laut Referenz ein [anonymer Typparameter](https://doc.rust-lang.org/reference/types/impl-trait.html#anonymous-type-parameters): Die Funktion bleibt generisch und wird monomorphisiert. Unterschied zur Langform: Der Aufrufer kann den Typ nicht per Turbofish (`protokolliere::<i32>(…)`) angeben, und zwei `impl Display`-Parameter dürfen verschiedene Typen haben, während `fn f<T: Display>(a: T, b: T)` denselben Typ erzwingt.
+
+  ### impl Trait als Rückgabetyp
+
+  In Rückgabe-Position bedeutet `impl Trait` etwas anderes: „Ich gebe **einen** bestimmten Typ zurück, verrate aber nicht welchen“ ([Reference: Abstract return types](https://doc.rust-lang.org/reference/types/impl-trait.html#abstract-return-types)). Das ist ideal für Typen, die man nicht hinschreiben kann oder will, etwa Iteratoren mit Closures:
+
+  ```rust
+  fn gerade_zahlen(bis: u32) -> impl Iterator<Item = u32> {
+      (0..=bis).filter(|n| n % 2 == 0)
+  }
+
+  fn main() {
+      let summe: u32 = gerade_zahlen(10).sum();
+      println!("{summe}"); // 30
+  }
+  ```
+
+  Der Haken: Es bleibt **ein** konkreter Typ. Gibt ein `if` im einen Zweig `Json` und im anderen `Klartext` zurück, scheitert das mit `if and else have incompatible types` – auch wenn beide denselben Trait implementieren. Dafür brauchst du dynamische Dispatch.
+
+  ## dyn Trait: dynamische Dispatch
+
+  Manchmal steht der Typ erst zur Laufzeit fest: Die Konfiguration entscheidet, ob JSON oder Klartext geloggt wird. Oder du willst Werte verschiedener Typen in einem `Vec` sammeln. Dafür gibt es **Trait-Objekte**: `&dyn Trait` oder `Box<dyn Trait>` ([Book: Trait Objects](https://doc.rust-lang.org/book/ch18-02-trait-objects.html)).
+
+  ```rust
+  trait Pruefung {
+      fn name(&self) -> &str;
+      fn ok(&self) -> bool;
+  }
+
+  struct Festplatte { frei_prozent: u8 }
+  struct Dienst { name: String, laeuft: bool }
+
+  impl Pruefung for Festplatte {
+      fn name(&self) -> &str { "festplatte" }
+      fn ok(&self) -> bool { self.frei_prozent >= 10 }
+  }
+
+  impl Pruefung for Dienst {
+      fn name(&self) -> &str { &self.name }
+      fn ok(&self) -> bool { self.laeuft }
+  }
+
+  fn main() {
+      // Verschiedene Typen in einem Vec: nur als Trait-Objekte möglich
+      let pruefungen: Vec<Box<dyn Pruefung>> = vec![
+          Box::new(Festplatte { frei_prozent: 4 }),
+          Box::new(Dienst { name: String::from("nginx"), laeuft: true }),
+      ];
+
+      for p in &pruefungen {
+          let status = if p.ok() { "OK" } else { "FEHLER" };
+          println!("{:<12} {status}", p.name()); // Aufruf über die vtable
+      }
+  }
+  ```
+
+  Was passiert im Speicher? Ein `&dyn Pruefung` ist ein **Fat Pointer** aus zwei Zeigern: einer auf die Daten, einer auf eine **vtable** ([Reference: Trait objects](https://doc.rust-lang.org/reference/types/trait-object.html)). Die vtable erzeugt der Compiler einmal pro Kombination aus konkretem Typ und Trait. Sie enthält die Adressen der Methoden, dazu Größe, Ausrichtung und den Destruktor des Typs. `p.ok()` liest die Adresse aus der vtable und springt dorthin. Der konkrete Typ ist hinter dem Zeiger „vergessen“ – deshalb braucht ein `dyn Trait` immer einen Zeiger wie `&` oder `Box`: Seine Größe ist zur Compile-Zeit unbekannt.
+
+  > [!DEEP] Dyn compatibility
+  > Nicht jeder Trait taugt für `dyn`. Die vtable braucht für jede Methode genau eine Adresse. Eine generische Methode `fn f<T>(&self, t: T)` hätte unendlich viele Varianten, und eine Methode, die `Self` zurückgibt, bräuchte die unbekannte Größe von `Self`. Solche Traits sind nicht **dyn compatible** (früher „object safe“), der Compiler meldet [E0038](https://doc.rust-lang.org/error_codes/E0038.html). Die genauen Regeln stehen in der [Referenz](https://doc.rust-lang.org/reference/items/traits.html#dyn-compatibility). `Clone` ist aus diesem Grund nicht dyn compatible.
+
+  ### Statisch oder dynamisch?
+
+  | | Generics / `impl Trait` | `dyn Trait` |
+  | --- | --- | --- |
+  | Auflösung | zur Compile-Zeit | zur Laufzeit über die vtable |
+  | Laufzeitkosten | keine, Inlining möglich | ein indirekter Aufruf, kein Inlining über die Grenze |
+  | Code-Größe | eine Kopie pro Typ | eine Kopie insgesamt |
+  | Verschiedene Typen in einer Collection | nein | ja |
+  | Typ steht erst zur Laufzeit fest | nein | ja |
+  | Einschränkungen | keine | Trait muss dyn compatible sein |
+
+  Faustregel: Generics sind der Standard. `dyn` nimmst du, wenn du heterogene Collections brauchst, der Typ von der Laufzeit abhängt oder ein Plugin-artiges System ohne Code-Explosion entstehen soll. Die Kosten eines vtable-Aufrufs sind in den meisten Anwendungen nicht messbar – die Entscheidung ist meist eine Design-Frage, keine Performance-Frage.
+
+  > [!INTERVIEW] „Was ist der Unterschied zwischen impl Trait und dyn Trait?“
+  > `impl Trait` ist statische Dispatch: Der Compiler kennt den konkreten Typ und erzeugt passenden Code (Monomorphisierung). In Rückgabe-Position steht es für genau einen verborgenen Typ. `dyn Trait` ist dynamische Dispatch: ein Fat Pointer aus Datenzeiger und vtable-Zeiger, der Methodenaufruf geht zur Laufzeit über die vtable. Damit kann eine Funktion je nach Laufzeitbedingung verschiedene Typen zurückgeben oder ein `Vec` verschiedene Typen halten. Kosten: ein indirekter Aufruf und meist eine Heap-Allokation für `Box`.
+
+  ## Die wichtigsten Traits der Standardbibliothek
+
+  Viele Traits der Standardbibliothek lassen sich mit `#[derive(…)]` automatisch implementieren ([Rust by Example: Derive](https://doc.rust-lang.org/rust-by-example/trait/derive.html)):
+
+  | Trait | Bedeutung | Anmerkung |
+  | --- | --- | --- |
+  | `Debug` | Ausgabe mit `{:?}` für Entwickler | fast immer ableiten |
+  | `Clone` | explizite Kopie mit `.clone()` | kann teuer sein (Heap) |
+  | `Copy` | implizite Bit-Kopie statt Move | nur für Typen ohne Heap-Daten, verlangt `Clone` |
+  | `PartialEq` / `Eq` | `==` | `Eq` verspricht Reflexivität, `f64` ist wegen `NaN` nur `PartialEq` |
+  | `PartialOrd` / `Ord` | `<`, `>`, `sort()` | abgeleitet: Felder von oben nach unten, Varianten in Deklarationsreihenfolge |
+  | `Hash` | als Schlüssel in `HashMap`/`HashSet` | muss zu `Eq` passen |
+  | `Default` | Standardwert mit `Default::default()` | Zahlen 0, `String` leer, `Option` `None` |
+
+  `Display` (Ausgabe mit `{}` für Menschen) lässt sich **nicht** ableiten – wie ein Wert für Nutzer aussieht, musst du entscheiden. Wer `Display` implementiert, bekommt `.to_string()` geschenkt, weil die Standardbibliothek `ToString` für jedes `T: Display` implementiert.
+
+  ```rust
+  use std::collections::HashSet;
+  use std::fmt;
+
+  #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+  enum Level {
+      #[default]
+      Info,
+      Warn,
+      Error,
+  }
+
+  #[derive(Debug, Clone, PartialEq)]
+  struct Ereignis {
+      level: Level,
+      text: String,
+  }
+
+  impl fmt::Display for Ereignis {
+      fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+          write!(f, "{:?}: {}", self.level, self.text)
+      }
+  }
+
+  fn main() {
+      let e = Ereignis { level: Level::Error, text: String::from("Platte voll") };
+      println!("{e}");     // Display: Error: Platte voll
+      println!("{e:?}");   // Debug: Ereignis { level: Error, text: "Platte voll" }
+      println!("{}", Level::Error > Level::Warn); // true: Reihenfolge der Varianten
+      println!("{:?}", Level::default());         // Info
+
+      let mut gesehen = HashSet::new();           // braucht Hash + Eq
+      gesehen.insert(Level::Warn);
+      println!("{}", gesehen.contains(&Level::Warn));
+  }
+  ```
+
+  > [!WARNING] Hash und Eq müssen zusammenpassen
+  > Wenn `a == b`, dann muss auch `hash(a) == hash(b)` gelten ([std: Hash and Eq](https://doc.rust-lang.org/std/hash/trait.Hash.html#hash-and-eq)). Implementierst du `PartialEq` von Hand (etwa ohne Groß-/Kleinschreibung), aber leitest `Hash` ab, findet eine `HashMap` gleiche Schlüssel nicht wieder. Entweder beide ableiten oder beide von Hand schreiben.
+
+  ### Konvertierungen: From, Into und AsRef
+
+  Implementierst du [`From<A> for B`](https://doc.rust-lang.org/std/convert/trait.From.html), bekommst du `Into<B> for A` automatisch – die Standardbibliothek hat dafür eine generische Implementierung. Deshalb implementiert man immer `From` und benutzt in Signaturen gern `Into`. [`AsRef`](https://doc.rust-lang.org/std/convert/trait.AsRef.html) ist die billige Variante: eine geliehene Sicht ohne Kopie.
+
+  ```rust
+  use std::path::Path;
+
+  struct Port(u16);
+
+  impl From<u16> for Port {
+      fn from(n: u16) -> Self {
+          Port(n)
+      }
+  }
+
+  struct Server {
+      name: String,
+  }
+
+  impl Server {
+      // akzeptiert &str und String – dank Into<String>
+      fn new(name: impl Into<String>) -> Self {
+          Server { name: name.into() }
+      }
+  }
+
+  // akzeptiert &str, String, &Path, PathBuf …
+  fn endung<P: AsRef<Path>>(pfad: P) -> Option<String> {
+      let ext = pfad.as_ref().extension()?;
+      Some(ext.to_string_lossy().into_owned())
+  }
+
+  fn main() {
+      let p = Port::from(8080);
+      let q: Port = 443.into(); // Into gibt es gratis, weil From implementiert ist
+      let a = Server::new("alpha");
+      let b = Server::new(String::from("beta"));
+      println!("{} {} {} {}", p.0, q.0, a.name, b.name);
+      println!("{:?}", endung("config.toml")); // Some("toml")
+  }
+  ```
+
+  Auch `Iterator` ist ein Trait mit einer Pflichtmethode (`next`) und Dutzenden Default-Methoden wie `map`, `filter` und `sum`. Ihm ist das Modul Closures & Iteratoren gewidmet.
+
+  ## Orphan Rule und Operator-Überladung
+
+  Du darfst `impl Trait for Typ` nur schreiben, wenn der **Trait oder der Typ aus deinem Crate** stammt ([Reference: Orphan rules](https://doc.rust-lang.org/reference/items/implementations.html#orphan-rules)). `impl Display for Vec<u8>` scheitert mit [E0117](https://doc.rust-lang.org/error_codes/E0117.html), weil beide aus der Standardbibliothek stammen. Der Grund heißt **Kohärenz**: Gäbe es zwei Crates, die beide `Display for Vec<u8>` implementieren, wüsste der Compiler nicht, welche Implementierung gilt – und ein Update einer Abhängigkeit könnte deinen Code brechen.
+
+  Der übliche Ausweg ist ein **Newtype**: ein Tupel-Struct mit einem Feld, das den fremden Typ einpackt ([Book: Newtype Pattern](https://doc.rust-lang.org/book/ch20-02-advanced-traits.html#implementing-external-traits-with-the-newtype-pattern)). Der Newtype ist dein Typ, also darfst du jeden Trait für ihn implementieren.
+
+  Operatoren wie `+` sind in Rust Traits aus [`std::ops`](https://doc.rust-lang.org/std/ops/index.html). `a + b` ist Syntax für `Add::add(a, b)`. Wer `Add` implementiert, bekommt `+` für seinen Typ:
+
+  ```rust
+  use std::fmt;
+  use std::ops::Add;
+
+  #[derive(Debug, Clone, Copy, PartialEq)]
+  struct Cent(u64);
+
+  impl Add for Cent {
+      type Output = Cent;
+
+      fn add(self, rhs: Cent) -> Cent {
+          Cent(self.0 + rhs.0)
+      }
+  }
+
+  // Newtype: eigener Typ um Vec<String>, damit Display erlaubt ist
+  struct Tags(Vec<String>);
+
+  impl fmt::Display for Tags {
+      fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+          write!(f, "#{}", self.0.join(" #"))
+      }
+  }
+
+  fn main() {
+      let summe = Cent(1999) + Cent(500);
+      println!("{summe:?}"); // Cent(2499)
+      let tags = Tags(vec![String::from("rust"), String::from("cli")]);
+      println!("{tags}");    // #rust #cli
+  }
+  ```
+
+  `type Output` ist ein **assoziierter Typ**: Der Implementierer legt fest, welcher Typ bei `a + b` herauskommt. `add` nimmt `self` per Wert, deshalb ist `Cent` hier `Copy` – sonst wäre `a` nach `a + b` verbraucht, wie beim `String`-Plus aus dem Collections-Modul.
+
+  > [!PRAXIS] Newtypes als Werkzeug für Korrektheit
+  > In echten Codebasen sind Newtypes nicht nur ein Trick gegen die Orphan Rule. `struct Cent(u64)`, `struct UserId(u64)` und `struct OrderId(u64)` machen Verwechslungen zu Compile-Fehlern: Eine Funktion `fn storniere(id: OrderId)` nimmt keine `UserId` an. Zur Laufzeit kostet das nichts, der Newtype hat dieselbe Größe wie der eingepackte Wert. In Code-Reviews ist „nackter `u64` für Geld“ ein häufiger Kommentar.
+
+  ## Häufige Fehler
+
+  - **Bound vergessen.** `binary operation > cannot be applied to type &T` ([E0369](https://doc.rust-lang.org/error_codes/E0369.html)) oder `T doesn't implement Display` ([E0277](https://doc.rust-lang.org/error_codes/E0277.html)). Die Hilfe des Compilers schlägt den fehlenden Bound meist wörtlich vor.
+  - **Verschiedene Typen hinter `impl Trait` zurückgeben.** `if and else have incompatible types`. Lösung: `Box<dyn Trait>`, oder ein Enum, wenn die Varianten feststehen.
+  - **`dyn Trait` ohne Zeiger.** `Vec<dyn Pruefung>` geht nicht, weil die Größe unbekannt ist. Richtig: `Vec<Box<dyn Pruefung>>`.
+  - **Trait nicht dyn compatible.** [E0038](https://doc.rust-lang.org/error_codes/E0038.html). Die generische Methode in einen eigenen Trait auslagern oder mit `where Self: Sized` aus der vtable ausnehmen.
+  - **Fremder Trait für fremden Typ.** [E0117](https://doc.rust-lang.org/error_codes/E0117.html). Newtype drumherum bauen.
+  - **`Into` statt `From` implementieren.** Funktioniert, verschenkt aber die automatische Gegenrichtung. Immer `From` implementieren.
+  - **Blind alles ableiten.** `Copy` auf einem großen Struct macht jede Übergabe zur Kopie; `Default` auf einem Typ ohne sinnvollen Standardwert lädt zu ungültigen Zuständen ein.
+
+  ## Zusammenfassung
+
+  - Generics werden monomorphisiert: eine Kopie pro konkretem Typ, keine Laufzeitkosten, dafür mehr Compile-Zeit und Binary-Größe.
+  - Trait Bounds (`T: Trait`, `+`, `where`) legen fest, was generischer Code mit `T` tun darf. Rust prüft den generischen Code gegen die Bounds, nicht gegen jeden Typ einzeln.
+  - Traits haben Pflicht- und Default-Methoden; Implementierungen stehen in eigenen `impl Trait for Typ`-Blöcken.
+  - `impl Trait` im Argument ist ein anonymer Typparameter, in der Rückgabe genau ein verborgener Typ.
+  - `dyn Trait` ist ein Fat Pointer mit vtable: flexibel zur Laufzeit, ein indirekter Aufruf, nur für dyn-compatible Traits.
+  - `derive` liefert `Debug`, `Clone`, `Copy`, `PartialEq`, `Eq`, `PartialOrd`, `Ord`, `Hash`, `Default`; `Display` schreibst du selbst.
+  - `From` implementieren, `Into` benutzen; `AsRef` für billige Sichten.
+  - Orphan Rule: Trait oder Typ muss lokal sein. Newtypes lösen das und machen Code typsicherer.
+exercises:
+  - id: dispatch-aussagen
+    type: choice
+    title: Statisch oder dynamisch?
+    prompt: |
+      Welche Aussagen über `fn melde(p: &impl Pruefung)` und `fn melde(p: &dyn Pruefung)` stimmen? **Mehrere Antworten richtig.**
+    options:
+      - text: Die `impl`-Variante wird für jeden konkreten Typ, mit dem sie aufgerufen wird, einzeln kompiliert.
+        correct: true
+        why: "`impl Trait` im Argument ist ein anonymer Typparameter. Der Compiler monomorphisiert die Funktion pro Typ."
+      - text: "`p` ist in der `dyn`-Variante ein Zeiger aus zwei Teilen: Datenzeiger und vtable-Zeiger."
+        correct: true
+        why: So sieht ein Fat Pointer auf ein Trait-Objekt aus. Die vtable enthält die Methodenadressen des konkreten Typs.
+      - text: Die `dyn`-Variante funktioniert mit jedem Trait, auch mit einem, der eine generische Methode hat.
+        correct: false
+        why: Traits mit generischen Methoden sind nicht dyn compatible (E0038), weil die vtable für jede Methode genau eine Adresse braucht.
+      - text: Die `impl`-Variante erlaubt es, in einem `Vec` Werte verschiedener Typen zu sammeln.
+        correct: false
+        why: Ein `Vec<T>` hat genau einen Elementtyp. Für verschiedene Typen brauchst du `Vec<Box<dyn Pruefung>>`.
+      - text: Die `dyn`-Variante erzeugt beim Aufruf automatisch eine Heap-Allokation.
+        correct: false
+        why: "`&dyn Pruefung` ist nur eine Referenz auf einen vorhandenen Wert. Eine Heap-Allokation entsteht erst, wenn du selbst `Box::new` aufrufst."
+    explanation: |
+      Beide Varianten akzeptieren jeden Typ, der `Pruefung` implementiert. Der Unterschied liegt im erzeugten Code: `impl` bzw. Generics lösen den Methodenaufruf zur Compile-Zeit auf (statische Dispatch, pro Typ eine Kopie), `dyn` zur Laufzeit über die vtable (dynamische Dispatch, eine Kopie für alle). Dafür erlaubt nur `dyn` heterogene Collections und Typen, die erst zur Laufzeit feststehen.
+    resources:
+      - title: The Rust Book · Performing Dynamic Dispatch
+        url: https://doc.rust-lang.org/book/ch18-02-trait-objects.html#performing-dynamic-dispatch
+      - title: The Rust Reference · Trait objects
+        url: https://doc.rust-lang.org/reference/types/trait-object.html
+
+  - id: orphan-rule
+    type: choice
+    title: Welche Implementierung ist erlaubt?
+    prompt: |
+      Du schreibst ein Crate mit `struct Kunde(String);` und `trait Beschreibbar`. Welche Implementierungen akzeptiert der Compiler? **Mehrere Antworten richtig.**
+    options:
+      - text: "`impl fmt::Display for Kunde`"
+        correct: true
+        why: Der Trait ist fremd, aber der Typ `Kunde` ist lokal. Das reicht.
+      - text: "`impl Beschreibbar for Vec<u8>`"
+        correct: true
+        why: Der Typ ist fremd, aber der Trait ist lokal. Auch das reicht.
+      - text: "`impl fmt::Display for Vec<u8>`"
+        correct: false
+        why: Trait und Typ stammen beide aus der Standardbibliothek. Der Compiler meldet E0117. Ausweg ist ein Newtype.
+      - text: "`impl From<Kunde> for String`"
+        correct: true
+        why: "`String` und `From` sind fremd, aber der Typparameter `Kunde` ist lokal. Die Orphan Rule verlangt nur, dass irgendwo in der Implementierung ein lokaler Typ an der richtigen Stelle vorkommt."
+    explanation: |
+      Die Orphan Rule sichert Kohärenz: Für jede Kombination aus Trait und Typ darf es weltweit höchstens eine Implementierung geben. Das garantiert der Compiler, indem er verlangt, dass dein Crate an der Implementierung „beteiligt“ ist – als Besitzer des Traits, des Typs oder eines lokalen Typs in den Typparametern des Traits. Die vierte Option überrascht viele, ist aber gängige Praxis: So lässt sich ein eigener Typ in einen `String` umwandeln.
+    resources:
+      - title: The Rust Reference · Orphan rules
+        url: https://doc.rust-lang.org/reference/items/implementations.html#orphan-rules
+      - title: Error-Index · E0117
+        url: https://doc.rust-lang.org/error_codes/E0117.html
+
+  - id: vtable-ablauf
+    type: order
+    title: Ein Aufruf über die vtable
+    prompt: |
+      `let p: &dyn Pruefung = &platte;` und danach `p.ok()`. Bring die Schritte in die Reihenfolge, in der sie passieren – vom Kompilieren bis zum Aufruf.
+    lang: text
+    lines: |
+      Der Compiler erzeugt für die Kombination Festplatte + Pruefung eine vtable mit den Methodenadressen.
+      Beim Zuweisen an p entsteht ein Fat Pointer aus der Adresse von platte und der Adresse der vtable.
+      Beim Aufruf p.ok() liest das Programm den vtable-Zeiger aus dem Fat Pointer.
+      Aus der vtable holt es die Adresse der Methode ok an ihrer festen Position.
+      Es springt zu dieser Adresse und übergibt den Datenzeiger als self.
+    explanation: |
+      Die vtable entsteht zur Compile-Zeit, einmal pro Paar aus konkretem Typ und Trait. Zur Laufzeit wird nur noch der Fat Pointer gebaut (beim Umwandeln von `&Festplatte` in `&dyn Pruefung`) und beim Aufruf über die Tabelle indirekt gesprungen. Deshalb kostet dynamische Dispatch pro Aufruf einen zusätzlichen Speicherzugriff und verhindert Inlining, aber keine Suche nach Methodennamen wie in dynamischen Sprachen.
+    resources:
+      - title: The Rust Reference · Trait objects
+        url: https://doc.rust-lang.org/reference/types/trait-object.html
+
+  - id: default-methoden-ausgabe
+    type: output
+    title: Default-Methode oder eigene?
+    prompt: Was gibt dieses Programm aus?
+    lang: rust
+    code: |
+      trait Gruss {
+          fn name(&self) -> String;
+          fn hallo(&self) -> String {
+              format!("Hallo, {}!", self.name())
+          }
+      }
+
+      struct Nutzer;
+      struct Admin;
+
+      impl Gruss for Nutzer {
+          fn name(&self) -> String {
+              String::from("Nutzer")
+          }
+      }
+
+      impl Gruss for Admin {
+          fn name(&self) -> String {
+              String::from("Admin")
+          }
+          fn hallo(&self) -> String {
+              format!("Willkommen zurück, {}.", self.name())
+          }
+      }
+
+      fn begruesse(g: &dyn Gruss) {
+          println!("{}", g.hallo());
+      }
+
+      fn main() {
+          begruesse(&Nutzer);
+          begruesse(&Admin);
+          let alle: Vec<Box<dyn Gruss>> = vec![Box::new(Admin), Box::new(Nutzer)];
+          for g in &alle {
+              println!("{}", g.name());
+          }
+      }
+    expected: |
+      Hallo, Nutzer!
+      Willkommen zurück, Admin.
+      Admin
+      Nutzer
+    hints:
+      - "`Nutzer` implementiert `hallo` nicht selbst. Welche Version bekommt er?"
+      - Die vtable eines Typs enthält seine überschriebenen Methoden.
+    explanation: |
+      `Nutzer` bekommt die Default-Methode `hallo`, die intern `self.name()` aufruft – und dieses `name` ist die Implementierung von `Nutzer`. `Admin` überschreibt `hallo`, also enthält die vtable von `Admin` dessen eigene Version. Obwohl `begruesse` nur `&dyn Gruss` sieht, landet jeder Aufruf bei der richtigen Implementierung. Der `Vec` behält die Einfügereihenfolge.
+    resources:
+      - title: The Rust Book · Default Implementations
+        url: https://doc.rust-lang.org/book/ch10-02-traits.html#using-default-implementations
+
+  - id: derive-ord-ausgabe
+    type: output
+    title: Wie sortiert derive(Ord)?
+    prompt: Was gibt dieses Programm aus?
+    lang: rust
+    code: |
+      #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+      enum Prio {
+          Hoch,
+          Mittel,
+          Niedrig,
+      }
+
+      #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+      struct Ticket {
+          prio: Prio,
+          nummer: u32,
+      }
+
+      fn main() {
+          println!("{}", Prio::Hoch < Prio::Niedrig);
+          let mut tickets = vec![
+              Ticket { prio: Prio::Niedrig, nummer: 1 },
+              Ticket { prio: Prio::Hoch, nummer: 7 },
+              Ticket { prio: Prio::Hoch, nummer: 3 },
+          ];
+          tickets.sort();
+          for t in &tickets {
+              println!("{:?} #{}", t.prio, t.nummer);
+          }
+          println!("{:?}", tickets.iter().max().map(|t| t.nummer));
+      }
+    expected: |
+      true
+      Hoch #3
+      Hoch #7
+      Niedrig #1
+      Some(1)
+    hints:
+      - Abgeleitetes `Ord` auf einem Enum vergleicht die Position der Varianten in der Deklaration, nicht ihre Bedeutung.
+      - Bei Structs vergleicht es Feld für Feld, von oben nach unten.
+    explanation: |
+      Für Enums ordnet `derive(PartialOrd, Ord)` die Varianten nach ihrer Reihenfolge im Quelltext: `Hoch` ist die erste und damit die **kleinste**. Das Wort „Hoch“ hat für den Compiler keine Bedeutung. Structs werden lexikografisch verglichen: erst `prio`, bei Gleichstand `nummer`. Deshalb stehen die beiden `Hoch`-Tickets vorne, sortiert nach Nummer. `max()` liefert das größte Ticket, also das mit `Niedrig`. Wer „höchste Priorität zuerst“ meint, muss die Varianten entsprechend anordnen oder `Ord` von Hand implementieren.
+    resources:
+      - title: std · Ord (Abschnitt Derivable)
+        url: https://doc.rust-lang.org/std/cmp/trait.Ord.html
+      - title: Rust by Example · Derive
+        url: https://doc.rust-lang.org/rust-by-example/trait/derive.html
+
+  - id: add-from-ausgabe
+    type: output
+    title: Plus, From und into
+    prompt: Was gibt dieses Programm aus?
+    lang: rust
+    code: |
+      use std::ops::Add;
+
+      #[derive(Debug, Clone, Copy, PartialEq)]
+      struct Dauer {
+          sekunden: u32,
+      }
+
+      impl Add for Dauer {
+          type Output = Dauer;
+          fn add(self, rhs: Dauer) -> Dauer {
+              Dauer { sekunden: self.sekunden + rhs.sekunden }
+          }
+      }
+
+      impl From<u32> for Dauer {
+          fn from(minuten: u32) -> Self {
+              Dauer { sekunden: minuten * 60 }
+          }
+      }
+
+      fn main() {
+          let a = Dauer { sekunden: 30 };
+          let b: Dauer = 2.into();
+          let c = a + b;
+          println!("{}", c.sekunden);
+          println!("{}", a == Dauer::from(0) + a);
+          println!("{:?}", b + b + a);
+      }
+    expected: |
+      150
+      true
+      Dauer { sekunden: 270 }
+    hints:
+      - "`2.into()` ruft hier `Dauer::from(2)` auf. Was macht `from` mit der Zahl?"
+      - Weil `Dauer` `Copy` ist, bleiben `a` und `b` nach `+` benutzbar.
+    explanation: |
+      `2.into()` nutzt die automatische `Into`-Implementierung, die aus `From<u32> for Dauer` entsteht; `from` interpretiert die Zahl als Minuten, also 120 Sekunden. `a + b` ruft `Add::add` auf: 30 + 120 = 150. `Dauer::from(0)` ist 0 Sekunden, plus `a` ergibt wieder `a`, und das abgeleitete `PartialEq` vergleicht feldweise. `b + b + a` ist 120 + 120 + 30 = 270. Ohne `Copy` wären `a` und `b` nach dem ersten `+` verbraucht, weil `add` `self` per Wert nimmt.
+    resources:
+      - title: std · Add
+        url: https://doc.rust-lang.org/std/ops/trait.Add.html
+      - title: Rust by Example · From and Into
+        url: https://doc.rust-lang.org/rust-by-example/conversion/from_into.html
+
+  - id: bounds-ergaenzen
+    type: gap
+    title: Die richtigen Bounds
+    prompt: |
+      Ergänze die Trait Bounds so, dass beide Funktionen kompilieren – nicht mehr als nötig. `zusammenfassen` braucht `to_string()`, `hoechster_wert` vergleicht mit `>` und kopiert Werte aus dem Slice.
+    lang: rust
+    code: |
+      use std::fmt::Display;
+
+      fn zusammenfassen<T>(werte: &[T], trenner: &str) -> String
+      ⟦where⟧
+          T: ⟦Display⟧,
+      {
+          let mut teile = Vec::new();
+          for w in werte {
+              teile.push(w.to_string());
+          }
+          teile.join(trenner)
+      }
+
+      fn hoechster_wert<T: ⟦PartialOrd + Copy⟧>(werte: &[T]) -> Option<T> {
+          let mut max = *werte.first()?;
+          for &w in werte {
+              if w > max {
+                  max = w;
+              }
+          }
+          Some(max)
+      }
+
+      fn main() {
+          println!("{}", zusammenfassen(&[200, 404, 500], ", "));
+          println!("{:?}", hoechster_wert(&[1.5, 9.25, 3.0]));
+      }
+    gaps:
+      - label: Schlüsselwort für die Bound-Klausel
+        hint: Die Klausel zwischen Signatur und Rumpf.
+      - label: Bound für to_string
+        hint: "`to_string()` gibt es für jeden Typ, der sich mit `{}` ausgeben lässt."
+      - label: Bounds für > und das Kopieren
+        hint: "Zwei Traits, verbunden mit `+`. Welcher erlaubt `>`, welcher `*werte.first()?` und `for &w`?"
+        accept: ["Copy + PartialOrd"]
+    explanation: |
+      `to_string()` stammt aus `ToString`, das die Standardbibliothek für jedes `T: Display` implementiert – der Bound `Display` genügt also. `>` braucht `PartialOrd`; `Ord` wäre zu streng, weil `f64` es wegen `NaN` nicht implementiert und der Aufruf mit `[1.5, 9.25, 3.0]` dann scheitern würde. `*werte.first()?` und das Muster `for &w` kopieren Werte aus dem Slice heraus, dafür braucht es `Copy`. Die `where`-Klausel ist gleichwertig zu `<T: Display>` und lohnt sich, sobald Bounds lang werden.
+    resources:
+      - title: The Rust Book · Clearer Trait Bounds with where Clauses
+        url: https://doc.rust-lang.org/book/ch10-02-traits.html#clearer-trait-bounds-with-where-clauses
+      - title: Rust by Example · Bounds
+        url: https://doc.rust-lang.org/rust-by-example/generics/bounds.html
+
+  - id: display-und-from
+    type: gap
+    title: Display und From für eine Version
+    prompt: |
+      `Version` soll sich als `v1.98.1` ausgeben lassen und aus einem Tupel `(u32, u32, u32)` per `.into()` entstehen. Ergänze die Trait-Namen und das Makro.
+    lang: rust
+    code: |
+      use std::fmt;
+
+      struct Version {
+          major: u32,
+          minor: u32,
+          patch: u32,
+      }
+
+      impl fmt::⟦Display⟧ for Version {
+          fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+              ⟦write!⟧(f, "v{}.{}.{}", self.major, self.minor, self.patch)
+          }
+      }
+
+      impl ⟦From<(u32, u32, u32)>⟧ for Version {
+          fn from(t: (u32, u32, u32)) -> Self {
+              Version { major: t.0, minor: t.1, patch: t.2 }
+          }
+      }
+
+      fn main() {
+          let v: Version = (1, 98, 1).into();
+          println!("{v}");
+          let text = v.to_string();
+          println!("{}", text.len());
+      }
+    gaps:
+      - label: Trait für {}
+        hint: Der Trait für Ausgaben, die Menschen lesen.
+      - label: In den Formatter schreiben
+        hint: Wie `format!`, aber mit einem Ziel als erstem Argument.
+      - label: Konvertierungs-Trait
+        hint: Implementiere die Richtung „Version aus Tupel“; die Gegenrichtung `into` entsteht automatisch. Der Typparameter ist das Tupel.
+    explanation: |
+      `Display` bestimmt, was `{}` ausgibt, und schenkt dir über die generische `ToString`-Implementierung `to_string()`. `write!` schreibt formatiert in den `Formatter` und gibt das nötige `fmt::Result` zurück. `From<(u32, u32, u32)> for Version` erzeugt automatisch `Into<Version> for (u32, u32, u32)`; deshalb funktioniert `(1, 98, 1).into()`, sobald der Zieltyp bekannt ist. `Into` direkt zu implementieren wäre möglich, verschenkt aber diese Symmetrie.
+    resources:
+      - title: std · Display
+        url: https://doc.rust-lang.org/std/fmt/trait.Display.html
+      - title: std · From
+        url: https://doc.rust-lang.org/std/convert/trait.From.html
+
+  - id: add-implementieren
+    type: gap
+    title: Punkte addieren
+    prompt: "Implementiere `+` für `Punkt`. Erwartete Ausgabe `Punkt { x: 21, y: 0 }`."
+    lang: rust
+    code: |
+      use std::ops::Add;
+
+      #[derive(Debug, Clone, Copy, PartialEq)]
+      struct Punkt {
+          x: i32,
+          y: i32,
+      }
+
+      impl ⟦Add⟧ for Punkt {
+          type ⟦Output⟧ = Punkt;
+
+          fn ⟦add⟧(self, rhs: Punkt) -> Self::Output {
+              Punkt { x: self.x + rhs.x, y: self.y + rhs.y }
+          }
+      }
+
+      fn main() {
+          let start = Punkt { x: 1, y: 2 };
+          let schritt = Punkt { x: 10, y: -1 };
+          println!("{:?}", start + schritt + schritt);
+      }
+    gaps:
+      - label: Trait aus std::ops
+        hint: Er steht schon im `use`.
+      - label: Assoziierter Typ
+        hint: Der Typ des Ergebnisses von `a + b`.
+      - label: Methodenname
+        hint: Klein geschrieben, wie der Trait.
+    explanation: |
+      `a + b` ist Syntax für `Add::add(a, b)`. Der assoziierte Typ `Output` legt fest, was dabei herauskommt – er muss nicht `Self` sein, `Instant + Duration` ergibt etwa wieder ein `Instant`. Weil `add` `self` per Wert nimmt, braucht `start + schritt + schritt` den `Copy`-Derive: Ohne ihn wäre `schritt` nach dem ersten `+` verbraucht.
+    resources:
+      - title: The Rust Book · Operator Overloading
+        url: https://doc.rust-lang.org/book/ch20-02-advanced-traits.html#using-default-generic-parameters-and-operator-overloading
+      - title: Rust by Example · Operator Overloading
+        url: https://doc.rust-lang.org/rust-by-example/trait/ops.html
+
+  - id: fehlender-bound
+    type: bug
+    title: Generisch, aber nicht vergleichbar
+    prompt: |
+      `groesstes` soll für Zahlen und Strings funktionieren. Der Compiler meldet:
+
+      ```text
+      error[E0369]: binary operation `>` cannot be applied to type `&T`
+      ```
+
+      Finde die Zeile, die den Fehler verursacht (nicht die Zeile, auf die die Meldung zeigt), und korrigiere sie.
+    lang: rust
+    code: |
+      fn groesstes<T>(liste: &[T]) -> &T {
+          let mut max = &liste[0];
+          for wert in liste {
+              if wert > max {
+                  max = wert;
+              }
+          }
+          max
+      }
+
+      fn main() {
+          println!("{}", groesstes(&[3, 17, 8]));
+          println!("{}", groesstes(&["beta", "alpha"]));
+      }
+    lines: [1]
+    fix:
+      - line: 1
+        answers:
+          - "fn groesstes<T: PartialOrd>(liste: &[T]) -> &T {"
+          - "fn groesstes<T: std::cmp::PartialOrd>(liste: &[T]) -> &T {"
+          - "fn groesstes<T: Ord>(liste: &[T]) -> &T {"
+    hints:
+      - Der Vergleich in Zeile 4 ist korrekt geschrieben. Was weiß der Compiler über `T`?
+    explanation: |
+      Rust prüft generischen Code gegen seine Bounds. Ohne Bound darf `T` jeder Typ sein, auch einer ohne Vergleichsoperator – also lehnt der Compiler `>` ab, obwohl die konkreten Aufrufe mit `i32` und `&str` vergleichbar wären. `T: PartialOrd` verspricht den Operator. `Ord` funktioniert für diese beiden Aufrufe auch, schließt aber `f64` aus. Die Meldung zeigt auf Zeile 4, die Ursache steht in der Signatur: ein typisches Muster bei Bound-Fehlern.
+    resources:
+      - title: Error-Index · E0369
+        url: https://doc.rust-lang.org/error_codes/E0369.html
+      - title: The Rust Book · Trait Bound Syntax
+        url: https://doc.rust-lang.org/book/ch10-02-traits.html#trait-bound-syntax
+
+  - id: impl-trait-zwei-typen
+    type: bug
+    title: Formatierer je nach Flag
+    prompt: |
+      Mit `--json` soll das Programm JSON loggen, sonst Klartext. Der Compiler meldet:
+
+      ```text
+      error[E0308]: `if` and `else` have incompatible types
+        expected `Json`, found `Klartext`
+      ```
+
+      Beide Typen implementieren `Formatierer`. Finde die drei Zeilen, die geändert werden müssen, und korrigiere sie so, dass die Auswahl zur Laufzeit funktioniert.
+    lang: rust
+    code: |
+      trait Formatierer {
+          fn formatiere(&self, meldung: &str) -> String;
+      }
+
+      struct Json;
+      struct Klartext;
+
+      impl Formatierer for Json {
+          fn formatiere(&self, meldung: &str) -> String {
+              format!("{{\"msg\":\"{meldung}\"}}")
+          }
+      }
+
+      impl Formatierer for Klartext {
+          fn formatiere(&self, meldung: &str) -> String {
+              format!("msg={meldung}")
+          }
+      }
+
+      fn waehle(json: bool) -> impl Formatierer {
+          if json {
+              Json
+          } else {
+              Klartext
+          }
+      }
+
+      fn main() {
+          let f = waehle(std::env::args().any(|a| a == "--json"));
+          println!("{}", f.formatiere("gestartet"));
+      }
+    lines: [20, 22, 24]
+    fix:
+      - line: 20
+        answers: ["fn waehle(json: bool) -> Box<dyn Formatierer> {"]
+      - line: 22
+        answers: ["Box::new(Json)"]
+      - line: 24
+        answers: ["Box::new(Klartext)"]
+    hints:
+      - "`impl Formatierer` in der Rückgabe heißt: genau **ein** konkreter Typ."
+      - Welcher Typ kann zur Laufzeit mal ein `Json` und mal ein `Klartext` enthalten?
+    explanation: |
+      `impl Trait` als Rückgabetyp steht für genau einen verborgenen Typ, den der Compiler aus dem Rumpf ableitet. Zwei verschiedene Typen passen nicht hinein, auch wenn beide den Trait implementieren. `Box<dyn Formatierer>` ist ein Trait-Objekt: Zeiger auf den Heap plus vtable. Jetzt dürfen die Zweige verschiedene Typen liefern, solange beide in eine Box gepackt werden. Steht die Menge der Varianten fest, ist ein `enum Formatierer { Json, Klartext }` mit `match` eine Alternative ohne Heap und vtable.
+    resources:
+      - title: The Rust Book · Returning Types That Implement Traits
+        url: https://doc.rust-lang.org/book/ch10-02-traits.html#returning-types-that-implement-traits
+      - title: Rust by Example · Returning Traits with dyn
+        url: https://doc.rust-lang.org/rust-by-example/trait/dyn.html
+
+  - id: blanket-impl-erklaeren
+    type: explain
+    title: Ein Trait für alle Typen
+    prompt: Erkläre, was die `impl`-Zeile bewirkt, warum `42.protokoll()` ohne eigene Implementierung für `i32` funktioniert und was passiert, wenn du zusätzlich `impl Protokoll for i32 { … }` schreibst.
+    lang: rust
+    code: |
+      use std::fmt::Display;
+
+      trait Protokoll {
+          fn protokoll(&self) -> String;
+      }
+
+      impl<T: Display + ?Sized> Protokoll for T {
+          fn protokoll(&self) -> String {
+              format!("LOG: {self}")
+          }
+      }
+
+      fn main() {
+          println!("{}", 42.protokoll());
+          println!("{}", "start".protokoll());
+      }
+    points:
+      - Das ist eine Blanket Implementation – `Protokoll` gilt für jeden Typ `T`, der `Display` implementiert.
+      - "`i32` und `str` implementieren `Display`, deshalb haben sie die Methode automatisch; `?Sized` schließt unsized Typen wie `str` ein."
+      - "Die Standardbibliothek nutzt dasselbe Muster, um `to_string()` für jedes `T: Display` anzubieten."
+      - Eine zweite Implementierung für `i32` scheitert mit E0119 (conflicting implementations), weil `i32` schon abgedeckt ist.
+    explanation: |
+      `impl<T: Display + ?Sized> Protokoll for T` ist eine Blanket Implementation: eine Implementierung für alle Typen, die den Bound erfüllen. `42` ist ein `i32`, `"start"` ein `&str` und damit ein Zeiger auf `str` – beide implementieren `Display`, also haben sie `protokoll()`. `?Sized` hebt den impliziten Bound `Sized` auf, damit auch `str` selbst gemeint ist. Genauso implementiert die Standardbibliothek `ToString` für jedes `T: Display`, weshalb du `to_string()` nie selbst schreibst. Weil `i32` schon abgedeckt ist, würde `impl Protokoll for i32` eine zweite Implementierung für dieselbe Kombination erzeugen – der Compiler lehnt das als `conflicting implementations` (E0119) ab. Aufgerufen wird statisch: Pro Typ entsteht eine monomorphisierte Kopie.
+    resources:
+      - title: std · ToString (Blanket Implementation)
+        url: https://doc.rust-lang.org/std/string/trait.ToString.html#impl-ToString-for-T
+      - title: Error-Index · E0119
+        url: https://doc.rust-lang.org/error_codes/E0119.html
+
+  - id: rabatt-regeln
+    type: practice
+    title: Rabattregeln für einen Shop
+    prompt: |
+      Ein Shop berechnet Endpreise in Cent. Baue ein kleines Regelwerk:
+
+      - Trait `Rabatt` mit der Pflichtmethode `fn anwenden(&self, cent: u64) -> u64` und der Default-Methode `fn beschreibung(&self) -> String`, die `"Rabatt"` liefert.
+      - `Prozent(u8)`: zieht den Prozentsatz ab (Werte über 100 wie 100 behandeln). Beschreibung `"10 %"`.
+      - `Festbetrag(u64)`: zieht einen Betrag in Cent ab, der Preis wird nie negativ. Beschreibung `"-2,50 €"` für 250.
+      - `Kette(Vec<Box<dyn Rabatt>>)`: wendet alle Regeln nacheinander an und implementiert selbst `Rabatt`. Beschreibung: die Einzelbeschreibungen, verbunden mit `", dann "`.
+      - `fn endpreis(cent: u64, regel: &dyn Rabatt) -> u64`.
+
+      Die Tests zeigen das erwartete Verhalten. Lass sie im Playground über **Test** laufen.
+    lang: rust
+    starter: |
+      trait Rabatt {
+          // Pflichtmethode und Default-Methode
+      }
+
+      struct Prozent(u8);
+      struct Festbetrag(u64);
+      struct Kette(Vec<Box<dyn Rabatt>>);
+
+      fn endpreis(cent: u64, regel: &dyn Rabatt) -> u64 {
+          todo!()
+      }
+
+      fn main() {
+          let aktion = Kette(vec![Box::new(Prozent(10)), Box::new(Festbetrag(500))]);
+          println!("{}: {} Cent", aktion.beschreibung(), endpreis(10_000, &aktion));
+      }
+
+      #[cfg(test)]
+      mod tests {
+          use super::*;
+
+          #[test]
+          fn prozent_rabatt() {
+              assert_eq!(Prozent(20).anwenden(5_000), 4_000);
+          }
+
+          #[test]
+          fn festbetrag_nie_negativ() {
+              assert_eq!(Festbetrag(1_000).anwenden(300), 0);
+          }
+
+          #[test]
+          fn kette_in_reihenfolge() {
+              let erst_prozent = Kette(vec![Box::new(Prozent(10)), Box::new(Festbetrag(500))]);
+              let erst_betrag = Kette(vec![Box::new(Festbetrag(500)), Box::new(Prozent(10))]);
+              assert_eq!(endpreis(10_000, &erst_prozent), 8_500);
+              assert_eq!(endpreis(10_000, &erst_betrag), 8_550);
+          }
+
+          #[test]
+          fn beschreibung_der_kette() {
+              let k = Kette(vec![Box::new(Prozent(10)), Box::new(Festbetrag(250))]);
+              assert_eq!(k.beschreibung(), "10 %, dann -2,50 €");
+          }
+
+          #[test]
+          fn leere_kette_aendert_nichts() {
+              assert_eq!(Kette(Vec::new()).anwenden(999), 999);
+          }
+      }
+    solution: |
+      trait Rabatt {
+          fn anwenden(&self, cent: u64) -> u64;
+
+          fn beschreibung(&self) -> String {
+              String::from("Rabatt")
+          }
+      }
+
+      struct Prozent(u8);
+      struct Festbetrag(u64);
+      struct Kette(Vec<Box<dyn Rabatt>>);
+
+      impl Rabatt for Prozent {
+          fn anwenden(&self, cent: u64) -> u64 {
+              let prozent = u64::from(self.0.min(100));
+              cent - cent * prozent / 100
+          }
+          fn beschreibung(&self) -> String {
+              format!("{} %", self.0)
+          }
+      }
+
+      impl Rabatt for Festbetrag {
+          fn anwenden(&self, cent: u64) -> u64 {
+              cent.saturating_sub(self.0)
+          }
+          fn beschreibung(&self) -> String {
+              format!("-{},{:02} €", self.0 / 100, self.0 % 100)
+          }
+      }
+
+      impl Rabatt for Kette {
+          fn anwenden(&self, cent: u64) -> u64 {
+              let mut preis = cent;
+              for regel in &self.0 {
+                  preis = regel.anwenden(preis);
+              }
+              preis
+          }
+          fn beschreibung(&self) -> String {
+              let mut teile = Vec::new();
+              for regel in &self.0 {
+                  teile.push(regel.beschreibung());
+              }
+              teile.join(", dann ")
+          }
+      }
+
+      fn endpreis(cent: u64, regel: &dyn Rabatt) -> u64 {
+          regel.anwenden(cent)
+      }
+
+      fn main() {
+          let aktion = Kette(vec![Box::new(Prozent(10)), Box::new(Festbetrag(500))]);
+          println!("{}: {} Cent", aktion.beschreibung(), endpreis(10_000, &aktion));
+      }
+
+      #[cfg(test)]
+      mod tests {
+          use super::*;
+
+          #[test]
+          fn prozent_rabatt() {
+              assert_eq!(Prozent(20).anwenden(5_000), 4_000);
+          }
+
+          #[test]
+          fn festbetrag_nie_negativ() {
+              assert_eq!(Festbetrag(1_000).anwenden(300), 0);
+          }
+
+          #[test]
+          fn kette_in_reihenfolge() {
+              let erst_prozent = Kette(vec![Box::new(Prozent(10)), Box::new(Festbetrag(500))]);
+              let erst_betrag = Kette(vec![Box::new(Festbetrag(500)), Box::new(Prozent(10))]);
+              assert_eq!(endpreis(10_000, &erst_prozent), 8_500);
+              assert_eq!(endpreis(10_000, &erst_betrag), 8_550);
+          }
+
+          #[test]
+          fn beschreibung_der_kette() {
+              let k = Kette(vec![Box::new(Prozent(10)), Box::new(Festbetrag(250))]);
+              assert_eq!(k.beschreibung(), "10 %, dann -2,50 €");
+          }
+
+          #[test]
+          fn leere_kette_aendert_nichts() {
+              assert_eq!(Kette(Vec::new()).anwenden(999), 999);
+          }
+      }
+    checklist:
+      - "`Rabatt` hat genau eine Pflichtmethode; `beschreibung` hat einen Default-Rumpf."
+      - "`Festbetrag` kann nicht unter 0 fallen – du nutzt `saturating_sub` oder eine Prüfung, keine Subtraktion, die bei `u64` paniken würde."
+      - "`Kette` hält `Vec<Box<dyn Rabatt>>` und implementiert selbst `Rabatt` – eine Kette kann also wieder in einer Kette stecken."
+      - "`endpreis` nimmt `&dyn Rabatt` und funktioniert mit einzelnen Regeln und mit Ketten."
+      - Alle fünf Tests laufen grün.
+    hints:
+      - "`u64::from(self.0)` wandelt das `u8` verlustfrei um; `self.0.min(100)` begrenzt vorher."
+      - "`format!(\"{:02}\", 5)` ergibt `05`."
+    explanation: |
+      Die Aufgabe kombiniert beide Dispatch-Arten sinnvoll: Die Regeln kennen ihren Typ, die `Kette` sammelt verschiedene Typen und braucht deshalb `Box<dyn Rabatt>`. Weil `Kette` selbst `Rabatt` implementiert, lassen sich Regeln beliebig verschachteln – das Composite-Muster, in Rust über Traits statt Vererbung. Der Test `kette_in_reihenfolge` zeigt, warum die Reihenfolge fachlich zählt: 10 % von 100 € und dann 5 € ergibt 85 €, umgekehrt 85,50 €. `saturating_sub` verhindert einen Überlauf bei `u64`, der im Debug-Build paniken würde.
+    resources:
+      - title: The Rust Book · Using Trait Objects
+        url: https://doc.rust-lang.org/book/ch18-02-trait-objects.html
+      - title: std · u64::saturating_sub
+        url: https://doc.rust-lang.org/std/primitive.u64.html#method.saturating_sub

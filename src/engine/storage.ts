@@ -45,7 +45,7 @@ export function sanitize(data: unknown): AreaProgress {
   if (record(data.projects)) for (const [id, steps] of Object.entries(data.projects)) {
     if (record(steps)) progress.projects[id] = Object.fromEntries(Object.entries(steps).filter(([, v]) => v === true));
   }
-  if (typeof data.last === 'string' && data.last.startsWith('/')) progress.last = data.last;
+  if (typeof data.last === 'string' && /^\/[a-z0-9-]+(?:\/[a-z0-9-]+){0,2}$/.test(data.last)) progress.last = data.last;
   return progress;
 }
 
@@ -106,7 +106,10 @@ export function mergeProgress(local: AreaProgress, incoming: AreaProgress): Area
   for (const [id, value] of Object.entries(incoming.drafts)) if (!(id in merged.drafts)) merged.drafts[id] = value;
   Object.assign(merged.revealed, incoming.revealed);
   for (const [id, value] of Object.entries(incoming.read)) if (!merged.read[id]) merged.read[id] = value;
-  for (const [id, value] of Object.entries(incoming.cards)) if (!merged.cards[id] || (merged.cards[id].last ?? '') < (value.last ?? '')) merged.cards[id] = value;
+  for (const [id, value] of Object.entries(incoming.cards)) {
+    const existing = merged.cards[id];
+    if (!existing || (existing.last ?? '') < (value.last ?? '') || ((existing.last ?? '') === (value.last ?? '') && value.seen > existing.seen)) merged.cards[id] = value;
+  }
   for (const [id, steps] of Object.entries(incoming.projects)) merged.projects[id] = { ...steps, ...merged.projects[id] };
   merged.last ??= incoming.last;
   return merged;

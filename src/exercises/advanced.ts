@@ -104,8 +104,10 @@ export const code: ExerciseRenderer<CodeExercise, string> = (exercise, ctx) => (
     const editor = $<HTMLTextAreaElement>('#editor', root);
     const runButton = $<HTMLButtonElement>('#run', root);
     const stateLabel = $('#runner-state', root);
+    let active = true;
     autosize(editor, 6);
     const run = async () => {
+      if (runButton.disabled) return;
       runButton.disabled = true;
       const out = $('#run-output', root);
       out.hidden = true;
@@ -113,6 +115,7 @@ export const code: ExerciseRenderer<CodeExercise, string> = (exercise, ctx) => (
       ctx.feedback('info', 'Tests laufen …');
       try {
         const result = await runExercise(exercise.setup, editor.value, exercise.tests);
+        if (!active) return;
         let passed = 0;
         result.tests.forEach((t, i) => {
           const li = $(`#test-${i}`, root);
@@ -126,6 +129,7 @@ export const code: ExerciseRenderer<CodeExercise, string> = (exercise, ctx) => (
         else if (passed === exercise.tests.length) ctx.complete();
         else ctx.feedback('partial', `${passed} von ${exercise.tests.length} Tests bestanden.`);
       } catch (error) {
+        if (!active) return;
         out.hidden = false;
         out.className = 'run-output standalone error';
         out.textContent = (error as Error).message;
@@ -141,9 +145,10 @@ export const code: ExerciseRenderer<CodeExercise, string> = (exercise, ctx) => (
       ctx.save(editor.value);
       editor.dispatchEvent(new Event('input'));
     });
-    return onRunnerState((state) => {
+    const unsubscribe = onRunnerState((state) => {
       stateLabel.textContent = state === 'loading' ? 'Python wird geladen (einmalig ca. 12 MB) …' : state === 'running' ? 'Läuft …' : 'Strg + Enter · läuft direkt im Browser';
     });
+    return () => { active = false; unsubscribe(); };
   },
 });
 

@@ -91,6 +91,7 @@ export function enhanceCode(root: ParentNode): () => void {
       run.type = 'button';
       run.innerHTML = `${icons.play} Ausführen`;
       const execute = async () => {
+        if (run.disabled) return;
         run.disabled = true;
         output.hidden = false;
         output.className = 'run-output';

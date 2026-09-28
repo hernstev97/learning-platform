@@ -1,0 +1,380 @@
+id: zeitsteuerung
+title: Jobs zeitgesteuert ausführen
+level: 3
+minutes: 160
+summary: Kalenderzeit, Intervalle und Jobzustand unterscheiden; cron und systemd-Timer mit Zeitzonen, Nachholen
+  und Überschneidungsschutz einsetzen.
+goals:
+- Du unterscheidest Kalendertermine von verstrichener Dauer.
+- Du arbeitest mit zeitzonenbewussten Datumswerten und einer injizierten Uhr.
+- Du konfigurierst einen nachvollziehbaren systemd-Timer oder cron-Aufruf.
+- Du behandelst verpasste Läufe, Überschneidungen und wiederholte Ausführung bewusst.
+resources:
+- &id001
+  title: systemd · systemd.timer
+  url: https://www.freedesktop.org/software/systemd/man/latest/systemd.timer.html
+- title: Python · datetime
+  url: https://docs.python.org/3/library/datetime.html
+- title: Python · zoneinfo
+  url: https://docs.python.org/3/library/zoneinfo.html
+- title: crontab · Linux manual
+  url: https://man7.org/linux/man-pages/man5/crontab.5.html
+lesson: |
+  Ein Bericht soll jeden Morgen um acht Uhr bereitstehen. Dein Laptop ist aber manchmal ausgeschaltet, das Netzwerk fehlt und ein vorheriger Import dauert länger als erwartet. Eine Schleife mit `sleep(86400)` beantwortet diese Betriebsfragen nicht. Zeitsteuerung verbindet einen Zeitplan mit einem ausführbaren Job und dessen beobachtbarem Zustand.
+
+  Definiere zuerst, was „täglich“ bedeutet: eine Uhrzeit in einer bestimmten Zeitzone, mindestens ein erfolgreicher Lauf pro Kalendertag oder ein Abstand von 24 Stunden seit dem letzten Abschluss? Diese Regeln unterscheiden sich bei Sommerzeit, Ausfällen und langen Laufzeiten. Der Scheduler kann nur die Regel umsetzen, die du tatsächlich konfigurierst.
+
+  ## Kalenderzeit und Dauer sind unterschiedliche Größen
+
+  Für Zeitpunkte nutze zeitzonenbewusste `datetime`-Werte. Für Zeitdifferenzen gibt es `timedelta`. Die [datetime-Dokumentation](https://docs.python.org/3/library/datetime.html#aware-and-naive-objects) unterscheidet naive Werte ohne eindeutigen Zeitzonenbezug und aware Werte. Mische beide nicht unbemerkt in Vergleichen oder Speicherung.
+
+  ```python run
+  from datetime import datetime, timezone, timedelta
+  jetzt = datetime(2026, 9, 28, 6, 0, tzinfo=timezone.utc)
+  spaeter = jetzt + timedelta(minutes=15)
+  print(jetzt.isoformat())
+  print((spaeter - jetzt).total_seconds())
+  ```
+
+  UTC ist eine geeignete gemeinsame Darstellung für gespeicherte Zeitpunkte. Eine lokale Ausführungsregel kann trotzdem `Europe/Berlin` verlangen. Mit [`zoneinfo`](https://docs.python.org/3/library/zoneinfo.html) lässt sich derselbe Zeitpunkt in einer IANA-Zeitzone darstellen.
+
+  ```python run
+  from datetime import datetime, timezone
+  from zoneinfo import ZoneInfo
+  zeitpunkt = datetime(2026, 9, 28, 6, 0, tzinfo=timezone.utc)
+  print(zeitpunkt.astimezone(ZoneInfo("Europe/Berlin")).isoformat())
+  ```
+
+  Bei Zeitumstellungen können lokale Uhrzeiten fehlen oder doppelt auftreten. Ein fester UTC-Zeitpunkt ist eindeutig, eine lokale Regel um 02:30 Uhr nicht immer. Wähle eine passende Uhrzeit und dokumentiere, was bei diesen Grenzen passieren soll. Für einen täglichen Bericht ist oft eine weniger problematische Tageszeit sinnvoller als komplizierte Sonderlogik.
+
+  Für Laufzeitmessung ist [`time.monotonic`](https://docs.python.org/3/library/time.html#time.monotonic) geeignet, weil Änderungen der Systemuhr seine Differenzen nicht zurücksetzen. Speichere solche Werte aber nicht als portable Kalenderzeitpunkte. Sie gehören zur Messung innerhalb einer laufenden Umgebung.
+
+  ## Ein Job muss ohne interaktive Shell funktionieren
+
+  Ein Scheduler startet mit einem anderen Kontext als dein Terminal. Er kennt möglicherweise deine Shellkonfiguration, aktive virtuelle Umgebung und relativen Pfade nicht. Ein Job braucht deshalb einen reproduzierbaren Interpreter, ein definiertes Arbeitsverzeichnis und ausdrücklich bereitgestellte Konfiguration.
+
+  ```python run
+  from pathlib import Path
+  projekt = Path("/opt/bericht")
+  print(projekt / "config.toml")
+  ```
+
+  Das ist eine reine Pfadberechnung. Der reale Dienst muss Zugriff auf den Pfad haben; hart kodierte Systempfade gehören in Installationsanweisungen oder Konfiguration, nicht in beliebige Fachfunktionen. Stelle sicher, dass der Job einen passenden Exit-Code liefert. Ein gefangener Fehler mit abschließendem Exit-Code 0 täuscht dem Scheduler Erfolg vor.
+
+  Ein guter erster Test führt exakt den geplanten Befehl manuell aus einem neutralen Arbeitsverzeichnis aus. Wenn er dort scheitert, repariere den Job, bevor du den Zeitplan aktivierst. Schedulerdiagnose wird deutlich einfacher, wenn die Fachfunktion schon separat überprüft ist.
+
+  ## cron für einen klar begrenzten Zeitplan
+
+  Eine klassische Benutzer-crontab beschreibt Minute, Stunde, Tag des Monats, Monat und Wochentag, gefolgt vom Befehl. Die [crontab-Manpage](https://man7.org/linux/man-pages/man5/crontab.5.html) dokumentiert die Felder und Besonderheiten der jeweiligen Implementierung.
+
+  ```text
+  0 8 * * * /opt/bericht/.venv/bin/python /opt/bericht/job.py >> /opt/bericht/job.log 2>&1
+  ```
+
+  Das bedeutet einen täglichen Aufruf um 08:00 in der vom Cron-Dienst verwendeten Zeitinterpretation. Es ist keine Garantie, dass der Rechner läuft, das Netzwerk verfügbar ist oder der Auftrag erfolgreich endet. Klassisches cron holt verpasste Termine während eines ausgeschalteten Rechners nicht automatisch nach.
+
+  Nutze absolute Pfade und überprüfe Schreibrechte für die Logdatei. Die einfache Umleitung wächst unbegrenzt; für Dauerbetrieb brauchst du eine Rotationsstrategie. Auch Überschneidungen verhindert eine gewöhnliche Cron-Zeile nicht. Startet alle fünf Minuten ein zehnminütiger Job, können mehrere Instanzen gleichzeitig arbeiten.
+
+  ## systemd trennt Dienst und Zeitplan
+
+  Ein systemd-Timer aktiviert eine Service-Unit. Der Dienst beschreibt, **was** ausgeführt wird; der Timer beschreibt, **wann**. Für einen persönlichen Job sind User-Units im eigenen Konfigurationsverzeichnis eine naheliegende Variante. Sie unterliegen dem Lebenszyklus des User-Managers; ein Lauf ohne Anmeldung ist damit nicht automatisch garantiert.
+
+  ```ini
+  [Unit]
+  Description=Täglichen Bericht erzeugen
+
+  [Service]
+  Type=oneshot
+  WorkingDirectory=%h/bericht
+  ExecStart=%h/bericht/.venv/bin/python %h/bericht/job.py
+  ```
+
+  Speichere das als `bericht.service` unter `~/.config/systemd/user/`. `%h` ist ein systemd-Specifier für das Home-Verzeichnis. `ExecStart` ist keine allgemeine Shellzeile; Pipes und Umleitungen gehören nicht ungeprüft hinein. Details zu Dienstparametern stehen in [`systemd.service`](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html).
+
+  ```ini
+  [Unit]
+  Description=Bericht morgens planen
+
+  [Timer]
+  OnCalendar=*-*-* 08:00:00 Europe/Berlin
+  Persistent=true
+
+  [Install]
+  WantedBy=timers.target
+  ```
+
+  `Persistent=true` kann bei Kalender-Timern einen während Inaktivität verpassten Termin nachholen, wenn der Timer wieder aktiv wird. Es startet nicht rückwirkend jeden ausgelassenen Tageslauf einzeln. Die [Timer-Dokumentation](https://www.freedesktop.org/software/systemd/man/latest/systemd.timer.html) beschreibt außerdem Genauigkeit und optional verteilte Startverzögerungen. Prüfe Kalenderausdrücke mit `systemd-analyze calendar`, statt ihre nächste Auslösung zu erraten.
+
+  ```console
+  $ systemd-analyze calendar '*-*-* 08:00:00 Europe/Berlin'
+  $ systemctl --user daemon-reload
+  $ systemctl --user start bericht.service
+  $ systemctl --user enable --now bericht.timer
+  $ systemctl --user list-timers
+  $ journalctl --user -u bericht.service
+  ```
+
+  Der manuelle Dienststart prüft die Ausführung vor der dauerhaften Timeraktivierung. Für eine reine Intervallregel bieten Timer monotone Einstellungen wie `OnUnitInactiveSec`, die sich am Abschluss beziehungsweise inaktiven Zustand orientieren können. Kalenderregel und Abschlussabstand sind verschiedene Produkteigenschaften.
+
+  ## Überschneidung und verpasste Arbeit fachlich lösen
+
+  Ein Timer aktiviert einen bereits aktiven Dienst nicht als zweite gleichnamige Instanz. Das verhindert jedoch nicht jeden anderen Startweg, etwa einen parallel manuell gestarteten Python-Prozess. Wenn mehrere Startquellen möglich sind, brauche einen gemeinsamen Lock oder eine Datenbankregel. Eine Datei bloß auf Existenz zu prüfen und danach anzulegen ist zwischen zwei Prozessen nicht atomar.
+
+  ```python run
+  def faellig(letzter_erfolg, jetzt, intervall):
+      return letzter_erfolg is None or jetzt - letzter_erfolg >= intervall
+  print(faellig(100, 159, 60))
+  print(faellig(100, 160, 60))
+  ```
+
+  Die Funktion zeigt die Fachentscheidung getrennt von der Uhr. Ein echter Job speichert den **erfolgreichen Abschluss**, nicht nur den Start. Nach einem Teilfehler muss er wiederaufnehmen oder gefahrlos wiederholen können. Für Tagesberichte kann ein stabiler Periodenschlüssel wie `bericht:2026-09-28` doppelte Ergebnisse verhindern.
+
+  > [!PRAXIS]
+  > Protokolliere Start, Abschluss, Dauer, verarbeitete Menge und Periodenschlüssel. Ein aktiver Timer beweist nur, dass der Zeitplan eingerichtet ist. Den fachlichen Erfolg zeigt erst ein erfolgreicher Lauf mit geprüftem Ergebnis.
+
+  ## Häufige Fehler und Tests
+
+  Die häufigsten Fehler sind relative Pfade, fehlende Umgebungsvariablen, überlappende Läufe und naive Datumswerte. Teste die Entscheidungslogik mit einer injizierten Uhr statt realen Wartezeiten. Prüfe „kurz vor der Grenze“, „genau auf der Grenze“ und „lange nach der Grenze“. Ergänze einen Neustartfall mit gespeichertem letzten Erfolg.
+
+  > [!INTERVIEW]
+  > „Warum kein endloser Python-Prozess mit sleep?“ Ein Betriebssystem-Scheduler übernimmt Start, Beobachtung und Prozesslebensdauer. Die Fachfunktion kann kurzlebig und wiederholbar bleiben. Ein dauernder Prozess ist möglich, verlangt aber eigene Wiederanlauf- und Betriebslogik.
+
+  > [!TIP]
+  > Lege vor dem Aktivieren fest, wie der Timer wieder gestoppt wird: `systemctl --user disable --now bericht.timer`. So bleibt ein Testzeitplan kontrollierbar.
+
+  ## Zusammenfassung
+
+  - Kalenderregeln und Zeitabstände sind verschiedene Verträge.
+  - Speichere eindeutige Zeitpunkte und konvertiere zur Anzeige.
+  - Ein Job benötigt einen vollständigen, nichtinteraktiven Startkontext.
+  - Service und Timer trennen Ausführung von Zeitplan.
+  - Nachholen ersetzt keine fachliche Wiederaufnahme.
+  - Prüfe tatsächliche Ergebnisse und mögliche Überschneidungen.
+exercises:
+- id: kalender
+  type: choice
+  title: Täglich ist nicht immer 24 Stunden
+  prompt: Welche Aussage stimmt?
+  options:
+  - text: 08:00 in Europe/Berlin und alle 24 Stunden sind bei Zeitumstellungen nicht dieselbe Regel.
+    correct: true
+    why: Die lokale Uhr verschiebt ihren Bezug zu UTC.
+  - text: Ein aktiver Timer beweist einen erfolgreichen Bericht.
+    correct: false
+    why: Er zeigt nur den eingerichteten Zeitplan.
+  - text: Persistent=true spielt jeden verpassten Tag einzeln nach.
+    correct: false
+    why: Ein verpasster Kalendertermin kann einen Nachholstart auslösen, keine vollständige Tageshistorie.
+  explanation: Die fachliche Frequenz muss vor der Konfiguration geklärt werden. Der Scheduler kann keinen nicht
+    formulierten Nachholvertrag erraten.
+  resources:
+  - *id001
+- id: aktivierung
+  type: order
+  title: Erst den Job prüfen
+  prompt: Ordne den Ablauf einer User-Timer-Installation.
+  lang: python
+  lines: |-
+    # Service und Timer im User-Verzeichnis anlegen
+    # User-Manager mit daemon-reload neu einlesen lassen
+    # Service manuell starten
+    # Ergebnis und Journal prüfen
+    # Timer aktivieren und nächste Auslösung kontrollieren
+  explanation: Die manuelle Ausführung isoliert Fehler des Jobs von Fehlern des Zeitplans. Erst nach einem überprüften
+    Ergebnis ist die Aktivierung sinnvoll.
+  resources:
+  - *id001
+- id: utc-lokal
+  type: output
+  title: Derselbe Zeitpunkt
+  prompt: Welche Ausgabe erzeugt dieses Programm?
+  lang: python
+  code: |-
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+    t = datetime(2026, 9, 28, 6, 0, tzinfo=timezone.utc)
+    print(t.astimezone(ZoneInfo("Europe/Berlin")).strftime("%H:%M %z"))
+  expected: 08:00 +0200
+  explanation: Am angegebenen Septemberdatum gilt in Berlin UTC+2. astimezone ändert die Darstellung, nicht den
+    absoluten Zeitpunkt.
+  resources:
+  - *id001
+- id: intervall
+  type: output
+  title: Die genaue Grenze
+  prompt: Welche Ausgabe erzeugt dieses Programm?
+  lang: python
+  code: |-
+    letzter = 100
+    print(159 - letzter >= 60)
+    print(160 - letzter >= 60)
+  expected: |-
+    False
+    True
+  explanation: Das Intervall ist ab der Gleichheitsgrenze abgelaufen. Ein striktes > würde den vereinbarten Zeitpunkt
+    ausschließen.
+  resources:
+  - *id001
+- id: faellig
+  type: code
+  title: Fälligkeit als reine Funktion
+  prompt: Schreibe `faellig(letzter, jetzt, intervall)`. None bedeutet noch nie erfolgreich; sonst ist ein Job fällig,
+    wenn jetzt-letzter >= intervall. intervall ist positiv.
+  lang: python
+  starter: |-
+    def faellig(letzter, jetzt, intervall):
+        ...
+  solution: |-
+    def faellig(letzter, jetzt, intervall):
+        return letzter is None or jetzt - letzter >= intervall
+  tests:
+  - name: Erstlauf
+    code: assert faellig(None, 0, 60) is True
+  - name: Vor Grenze
+    code: assert faellig(100, 159, 60) is False
+  - name: Grenze
+    code: assert faellig(100, 160, 60) is True
+  - name: Null ist gespeichert
+    code: assert faellig(0, 30, 60) is False
+  explanation: None wird ausdrücklich geprüft, weil der Zeitstempel 0 ein gültiger Wert ist. Die injizierte Zeit
+    macht alle Grenzfälle ohne Schlafen testbar.
+  resources:
+  - *id001
+- id: periodenschluessel
+  type: code
+  title: Ein Berliner Berichtstag
+  prompt: Schreibe `tagesschluessel(zeitpunkt)`. Der aware datetime-Wert soll nach Europe/Berlin umgerechnet werden;
+    liefere bericht:YYYY-MM-DD.
+  lang: python
+  starter: |-
+    def tagesschluessel(zeitpunkt):
+        ...
+  solution: |-
+    from zoneinfo import ZoneInfo
+    def tagesschluessel(zeitpunkt):
+        return "bericht:" + zeitpunkt.astimezone(ZoneInfo("Europe/Berlin")).date().isoformat()
+  tests:
+  - name: Normal
+    code: |-
+      from datetime import datetime, timezone
+      assert tagesschluessel(datetime(2026,9,28,6,tzinfo=timezone.utc)) == "bericht:2026-09-28"
+  - name: Lokaler Folgetag
+    code: |-
+      from datetime import datetime, timezone
+      assert tagesschluessel(datetime(2026,9,28,23,tzinfo=timezone.utc)) == "bericht:2026-09-29"
+  - name: Winter
+    code: |-
+      from datetime import datetime, timezone
+      assert tagesschluessel(datetime(2026,1,1,0,tzinfo=timezone.utc)) == "bericht:2026-01-01"
+  explanation: Der Tagesbezug wird vor dem Kürzen auf date hergestellt. Direktes Abschneiden des UTC-Datums würde
+    nahe Mitternacht die falsche Berichtsperiode wählen.
+  resources:
+  - *id001
+- id: journal
+  type: command
+  title: Den letzten Dienstlauf untersuchen
+  prompt: Zeige das Journal der User-Unit bericht.service.
+  answers:
+  - journalctl --user -u bericht.service
+  - journalctl --user --unit bericht.service
+  - journalctl --user --unit=bericht.service
+  explanation: Das Journal zeigt die tatsächlichen Dienstläufe und ihre Ausgaben. list-timers allein beantwortet
+    nicht, ob die Fachaufgabe erfolgreich war.
+  resources:
+  - *id001
+- id: offene-perioden
+  type: code
+  title: Nur fehlende Tage planen
+  prompt: Schreibe `offene_tage(tage, erledigt)`. Liefere die erste Erscheinung jedes noch nicht erledigten Tages
+    in Eingabereihenfolge. Beide Eingaben enthalten YYYY-MM-DD-Strings.
+  lang: python
+  starter: |-
+    def offene_tage(tage, erledigt):
+        ...
+  solution: |-
+    def offene_tage(tage, erledigt):
+        gesehen = set(erledigt)
+        offen = []
+        for tag in tage:
+            if tag not in gesehen:
+                gesehen.add(tag)
+                offen.append(tag)
+        return offen
+  tests:
+  - name: Fehlend
+    code: assert offene_tage(["2026-09-27","2026-09-28"], {"2026-09-27"}) == ["2026-09-28"]
+  - name: Duplikate
+    code: assert offene_tage(["2026-09-28","2026-09-28"], set()) == ["2026-09-28"]
+  - name: Leer
+    code: assert offene_tage([], set()) == []
+  explanation: Die Planungsfunktion dedupliziert sowohl bereits erfolgreiche als auch in diesem Plan vorgemerkte
+    Perioden. Die dauerhafte Erfolgsspeicherung erfolgt erst nach tatsächlichem Abschluss.
+  resources:
+  - *id001
+- id: nullzeit
+  type: bug
+  title: Zeitstempel null wird ignoriert
+  prompt: letzter=0 ist ein gespeicherter Erfolg, aber die Funktion meldet immer fällig. Korrigiere nur die Bedingung
+    für einen Erstlauf.
+  lang: python
+  code: |-
+    def faellig(letzter, jetzt, intervall):
+        if not letzter:
+            return True
+        return jetzt - letzter >= intervall
+  lines:
+  - 2
+  fix:
+  - line: 2
+    answers:
+    - 'if letzter is None:'
+  explanation: Ein Timestamp von null ist falsy, aber fachlich vorhanden. Die Prüfung auf None unterscheidet fehlende
+    Information von einem gültigen Zahlenwert.
+  resources:
+  - *id001
+- id: erfolg-start
+  type: explain
+  title: Welchen Zeitpunkt speichern?
+  prompt: Erkläre, warum letzter_erfolg erst nach job aktualisiert wird.
+  lang: python
+  code: |-
+    start = uhr()
+    job()
+    letzter_erfolg = uhr()
+    speichere(letzter_erfolg)
+  points:
+  - Der Start beweist keinen fachlichen Abschluss.
+  - Wenn job scheitert, wird kein neuer Erfolg gespeichert.
+  - Die nächste Planung kann einen fehlgeschlagenen Lauf erneut berücksichtigen.
+  - Wiederholungen benötigen trotzdem Idempotenz oder Wiederaufnahme.
+  explanation: 'Der gespeicherte Wert beschreibt eine belegte Eigenschaft: erfolgreichen Abschluss. Eine frühere
+    Speicherung könnte einen fehlgeschlagenen Auftrag bis zum nächsten Intervall unsichtbar machen.'
+  resources:
+  - *id001
+- id: timer
+  type: practice
+  title: Einen eigenen Testtimer betreiben
+  prompt: Lege lokal eine User-Service-Unit für ein ungefährliches Skript an, das einen Zeitstempel in eine eigene
+    Testdatei schreibt. Ergänze einen Kalender-Timer und deaktiviere ihn nach dem Nachweis wieder.
+  lang: ini
+  solution: |-
+    [Unit]
+    Description=Testzeitplan
+
+    [Timer]
+    OnCalendar=*-*-* 08:00:00 Europe/Berlin
+    Persistent=true
+    Unit=bericht.service
+
+    [Install]
+    WantedBy=timers.target
+  checklist:
+  - Service läuft manuell erfolgreich.
+  - Kalenderausdruck wird mit systemd-analyze geprüft.
+  - Journal und Ergebnisdatei belegen einen Lauf.
+  - User-Manager-Lebensdauer ist dokumentiert.
+  - Der Testtimer wird anschließend deaktiviert.
+  explanation: Der Timer ist nur die Auslösung. Die Abnahme kombiniert Konfiguration, tatsächlichen Prozesslauf
+    und geprüftes Ergebnis; die abschließende Deaktivierung verhindert einen vergessenen Testjob.
+  resources:
+  - *id001

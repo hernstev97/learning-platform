@@ -1,0 +1,810 @@
+id: nebenlaeufigkeit
+title: Nebenläufigkeit mit Threads
+level: 3
+minutes: 180
+summary: Threads, Channels, Mutex und Atomics – und warum Rust Data Races schon beim Übersetzen verhindert, Deadlocks und Race Conditions aber nicht.
+goals:
+  - Du startest Threads mit `thread::spawn` und `thread::scope`, sammelst Ergebnisse über `join` ein und erklärst, warum `spawn` `move` und `'static` verlangt.
+  - Du verteilst Arbeit über `mpsc`-Channels und sorgst dafür, dass Empfangsschleifen enden.
+  - Du teilst Zustand mit `Arc<Mutex<T>>`, `RwLock` und Atomics und hältst Lock-Guards so kurz wie möglich.
+  - Du erklärst `Send` und `Sync` und begründest, warum `Rc` nicht `Send` und `RefCell` nicht `Sync` ist.
+  - Du unterscheidest Data Races von Race Conditions und vermeidest Deadlocks durch eine feste Lock-Reihenfolge.
+resources:
+  - title: The Rust Book · Kapitel 16 – Fearless Concurrency
+    url: https://doc.rust-lang.org/book/ch16-00-concurrency.html
+  - title: std::thread
+    url: https://doc.rust-lang.org/std/thread/index.html
+  - title: std::sync
+    url: https://doc.rust-lang.org/std/sync/index.html
+  - title: The Rustonomicon · Data Races and Race Conditions
+    url: https://doc.rust-lang.org/nomicon/races.html
+  - title: The Rustonomicon · Send and Sync
+    url: https://doc.rust-lang.org/nomicon/send-and-sync.html
+lesson: |
+  Dein Log-Werkzeug soll 40 Logdateien auswerten, und dein Rechner hat 16 Kerne. Sequenziell arbeitet einer davon, der Rest wartet. Ein Webdienst soll gleichzeitig Anfragen beantworten und im Hintergrund Metriken sammeln. Beides ist Nebenläufigkeit – und in den meisten Sprachen der Bereich, in dem die schwersten Fehler entstehen: Zwei Threads schreiben gleichzeitig in dieselbe Liste, und einmal pro Woche stürzt der Dienst ab, ohne dass sich der Fehler lokal nachstellen lässt.
+
+  Rust nennt seinen Ansatz **Fearless Concurrency** ([Rust Book, Kap. 16](https://doc.rust-lang.org/book/ch16-00-concurrency.html)). Gemeint ist: Das Ownership-System und zwei Marker-Traits, `Send` und `Sync`, verhindern **Data Races** beim Übersetzen. Code, der ungeschützt geteilten Speicher aus mehreren Threads verändert, kompiliert nicht. Was Rust nicht verhindert, sind Deadlocks und logische Race Conditions. Diese Grenze solltest du im Interview klar benennen können.
+
+  ## Threads starten und einsammeln
+
+  `thread::spawn` startet einen Betriebssystem-Thread und gibt ein `JoinHandle<T>` zurück. `join()` wartet auf das Ende des Threads und liefert dessen Rückgabewert – als `Result`, denn der Thread könnte mit einer Panic abgebrochen sein ([std::thread](https://doc.rust-lang.org/std/thread/index.html#spawning-a-thread)).
+
+  ```rust
+  use std::thread;
+
+  fn main() {
+      let zeilen = vec!["INFO start", "ERROR db", "ERROR netz", "WARN platte"];
+
+      let handle = thread::spawn(move || {
+          zeilen.iter().filter(|z| z.starts_with("ERROR")).count()
+      });
+
+      // Hier könnte main parallel etwas anderes tun.
+      let fehler = handle.join().expect("Zähl-Thread ist abgestürzt");
+      println!("{fehler} Fehler");
+  }
+  ```
+
+  Zwei Details sind wichtig:
+
+  - **`move`**: Der Closure übernimmt den Besitz von `zeilen`. Ohne `move` würde er `zeilen` nur ausleihen, und der Compiler lehnt ab: ``error[E0373]: closure may outlive the current function, but it borrows `zeilen` ``. Der Grund steht in der Signatur: `spawn` verlangt `F: Send + 'static`. Ein Thread kann länger laufen als die Funktion, die ihn gestartet hat; eine Ausleihe auf ihre lokalen Variablen könnte dann ins Leere zeigen ([Rust Book, Kap. 16.1](https://doc.rust-lang.org/book/ch16-01-threads.html#using-move-closures-with-threads)).
+  - **`join`**: Endet `main`, endet der ganze Prozess – laufende Threads werden ohne Aufräumen abgebrochen. Ein Thread, dessen `JoinHandle` du nicht joinst, arbeitet deshalb vielleicht nie zu Ende ([Kap. 16.1](https://doc.rust-lang.org/book/ch16-01-threads.html#waiting-for-all-threads-to-finish)).
+
+  Eine Panic in einem Thread reißt nicht das ganze Programm mit. Sie beendet nur diesen Thread, und `join()` liefert `Err`. Ob du das weiterreichst (`unwrap`) oder behandelst, entscheidest du.
+
+  ## Scoped Threads: ausleihen statt verschieben
+
+  Oft willst du Daten nicht verschieben, sondern nur parallel lesen. Seit Rust 1.63 gibt es dafür [`thread::scope`](https://doc.rust-lang.org/std/thread/fn.scope.html): Alle darin gestarteten Threads werden automatisch gejoint, bevor `scope` zurückkehrt. Deshalb dürfen sie lokale Daten ausleihen – der Compiler weiß, dass die Ausleihe den Scope nicht überlebt.
+
+  ```rust
+  use std::thread;
+
+  fn main() {
+      let zeilen: Vec<String> = (1..=1000)
+          .map(|i| if i % 7 == 0 { format!("ERROR {i}") } else { format!("INFO {i}") })
+          .collect();
+
+      let fehler: usize = thread::scope(|s| {
+          let handles: Vec<_> = zeilen
+              .chunks(250)
+              .map(|teil| s.spawn(move || teil.iter().filter(|z| z.starts_with("ERROR")).count()))
+              .collect();
+          handles.into_iter().map(|h| h.join().unwrap()).sum()
+      });
+
+      println!("{fehler} Fehler, {} Zeilen", zeilen.len()); // zeilen gehört weiter main
+  }
+  ```
+
+  `move` bezieht sich hier nur auf `teil`, eine Referenz vom Typ `&[String]`. Die Daten selbst bleiben bei `main`. Für „Arbeit aufteilen, Teilergebnisse zusammenführen“ ist `thread::scope` meist die einfachste und sicherste Wahl.
+
+  ## Message Passing mit Channels
+
+  „Do not communicate by sharing memory; instead, share memory by communicating“ – das Rust Book zitiert diesen Leitsatz aus der Go-Welt ([Kap. 16.2](https://doc.rust-lang.org/book/ch16-02-message-passing.html)). Ein Channel aus [`std::sync::mpsc`](https://doc.rust-lang.org/std/sync/mpsc/index.html) (multiple producer, single consumer) hat zwei Enden: `Sender` und `Receiver`. `send` **verschiebt** den Wert in den Channel. Danach gehört er dem Empfänger, und der Sender kann ihn nicht mehr anfassen – ein Data Race ist so schon vom Typsystem her ausgeschlossen.
+
+  ```rust
+  use std::sync::mpsc;
+  use std::thread;
+
+  fn main() {
+      let (tx, rx) = mpsc::channel();
+
+      for datei in ["api.log", "db.log", "auth.log"] {
+          let tx = tx.clone(); // jeder Producer bekommt seinen eigenen Sender
+          thread::spawn(move || {
+              let ergebnis = format!("{datei}: geprüft");
+              tx.send(ergebnis).unwrap();
+          });
+      }
+      drop(tx); // den ursprünglichen Sender schließen
+
+      let mut ergebnisse: Vec<String> = rx.iter().collect();
+      ergebnisse.sort(); // Ankunftsreihenfolge ist nicht festgelegt
+      println!("{ergebnisse:?}");
+  }
+  ```
+
+  Das Denkmodell: Die Schleife `for x in rx` (oder `rx.iter()`) läuft, **bis alle Sender gedroppt sind** und der Channel leer ist ([Disconnection](https://doc.rust-lang.org/std/sync/mpsc/index.html#disconnection)). Vergisst du `drop(tx)` für den ursprünglichen Sender, wartet der Empfänger ewig auf eine Nachricht, die nie kommt. Das Programm hängt, ohne Fehlermeldung.
+
+  `mpsc::channel()` ist unbegrenzt: Ein schneller Producer kann den Speicher füllen. `mpsc::sync_channel(n)` hat einen Puffer von `n` Nachrichten, und `send` blockiert, wenn er voll ist. So entsteht Gegendruck (backpressure), wenn der Verbraucher nicht hinterherkommt.
+
+  ## Geteilter Zustand: `Mutex`, `RwLock` und `Arc`
+
+  Manchmal müssen mehrere Threads dieselben Daten verändern, zum Beispiel eine gemeinsame Statistik. Ein [`Mutex<T>`](https://doc.rust-lang.org/std/sync/struct.Mutex.html) schützt einen Wert so, dass immer nur ein Thread zugreift. Der Wert liegt **im** Mutex; an ihn heranzukommen geht nur über `lock()`. Vergessen kann man das Sperren also nicht.
+
+  ```rust
+  use std::collections::HashMap;
+  use std::sync::{Arc, Mutex};
+  use std::thread;
+
+  fn main() {
+      let statistik = Arc::new(Mutex::new(HashMap::new()));
+      let mut handles = Vec::new();
+
+      for (datei, level) in [("api.log", "ERROR"), ("db.log", "WARN"), ("auth.log", "ERROR")] {
+          let statistik = Arc::clone(&statistik);
+          handles.push(thread::spawn(move || {
+              println!("werte {datei} aus"); // Arbeit ohne Lock
+              let mut karte = statistik.lock().unwrap();
+              *karte.entry(level).or_insert(0) += 1;
+          })); // Guard `karte` endet hier, der Mutex ist wieder frei
+      }
+      for handle in handles {
+          handle.join().unwrap();
+      }
+      let karte = statistik.lock().unwrap();
+      println!("ERROR: {}, WARN: {}", karte["ERROR"], karte["WARN"]);
+  }
+  ```
+
+  Die Bausteine:
+
+  - **`Arc<T>`** sorgt für mehrere Besitzer über Threads hinweg (das thread-sichere `Rc` aus dem letzten Modul). `Mutex` allein reicht nicht, denn jeder Thread braucht einen eigenen Besitzanteil.
+  - **`lock()`** blockiert, bis der Mutex frei ist, und liefert einen `MutexGuard`. Der Guard verhält sich wie `&mut T` und gibt die Sperre in seinem `Drop` frei. Die Sperre dauert also so lange wie der Guard lebt – halte ihn kurz.
+  - **Poisoning**: Stirbt ein Thread mit einer Panic, während er den Guard hält, markiert der Mutex sich als „vergiftet“. Spätere `lock()`-Aufrufe liefern `Err(PoisonError)`, weil die Daten halb verändert sein könnten ([Poisoning](https://doc.rust-lang.org/std/sync/struct.Mutex.html#poisoning)). `unwrap()` reicht die Panic weiter; das ist in den meisten Programmen die richtige Reaktion.
+
+  [`RwLock<T>`](https://doc.rust-lang.org/std/sync/struct.RwLock.html) erlaubt beliebig viele gleichzeitige Leser (`read()`) oder genau einen Schreiber (`write()`). Das lohnt sich bei Daten, die oft gelesen und selten geschrieben werden, etwa einer Konfiguration, die zur Laufzeit neu geladen wird.
+
+  > [!WARNING] Wie lange lebt der Guard?
+  > `let wert = *zaehler.lock().unwrap();` sperrt nur für diese eine Anweisung: Der Guard ist ein Temporärwert. `let guard = zaehler.lock().unwrap();` sperrt bis zum Blockende. Und im Ausdruck hinter `match` lebt ein Guard durch den **ganzen** `match` hindurch. Wer dort im Arm denselben Mutex noch einmal sperrt, blockiert sich selbst.
+
+  ## Atomics: Zähler ohne Lock
+
+  Für einzelne Zahlen und Flags ist ein Mutex zu schwer. [Atomare Typen](https://doc.rust-lang.org/std/sync/atomic/index.html) wie `AtomicUsize` oder `AtomicBool` bieten Operationen, die die Hardware unteilbar ausführt: `fetch_add` liest, addiert und schreibt in einem Schritt, ohne dass ein anderer Thread dazwischenkommt.
+
+  ```rust
+  use std::sync::atomic::{AtomicUsize, Ordering};
+  use std::thread;
+
+  static ANFRAGEN: AtomicUsize = AtomicUsize::new(0);
+
+  fn main() {
+      thread::scope(|s| {
+          for _ in 0..4 {
+              s.spawn(|| {
+                  for _ in 0..10_000 {
+                      ANFRAGEN.fetch_add(1, Ordering::Relaxed);
+                  }
+              });
+          }
+      });
+      println!("{}", ANFRAGEN.load(Ordering::Relaxed)); // immer 40000
+  }
+  ```
+
+  Jede atomare Operation bekommt eine [`Ordering`](https://doc.rust-lang.org/std/sync/atomic/enum.Ordering.html). Sie legt fest, welche **anderen** Speicherzugriffe um die Operation herum für andere Threads sichtbar geordnet sind. Für den Alltag reicht:
+
+  - **`Relaxed`**: nur die Operation selbst ist atomar. Richtig für reine Zähler und Statistiken, bei denen kein anderer Wert von diesem abhängt.
+  - **`Release`/`Acquire`**: für „Daten vorbereiten, dann ein Flag setzen“. Wer das Flag mit `Acquire` gesetzt sieht, sieht auch alles, was vor dem `Release` geschrieben wurde.
+  - **`SeqCst`**: stärkste Garantie, eine globale Reihenfolge aller `SeqCst`-Operationen. Wenn du unsicher bist, ist sie die sichere Wahl – sie kostet etwas Leistung, ist aber nie falsch, wo schwächere Orderings richtig wären.
+
+  Mehr musst du für den Einstieg nicht wissen. Eigene Lock-Algorithmen aus Atomics zu bauen, ist Spezialistenarbeit ([Rustonomicon: Atomics](https://doc.rust-lang.org/nomicon/atomics.html)).
+
+  ## `Send` und `Sync`: wie der Compiler Data Races verhindert
+
+  Zwei Marker-Traits ohne Methoden tragen die ganze Sicherheit ([Rust Book, Kap. 16.4](https://doc.rust-lang.org/book/ch16-04-extensible-concurrency-sync-and-send.html)):
+
+  - **`Send`**: Ein Wert dieses Typs darf an einen anderen Thread **übergeben** werden.
+  - **`Sync`**: Ein Wert dieses Typs darf von mehreren Threads gleichzeitig über `&T` **benutzt** werden. Genauer: `T` ist `Sync`, wenn `&T` `Send` ist.
+
+  Der Compiler leitet beide automatisch ab: Ein Struct ist `Send`, wenn alle seine Felder `Send` sind. `thread::spawn` verlangt `Send` für den Closure und alles, was er einfängt – so kommt die Prüfung überall hin.
+
+  | Typ | `Send` | `Sync` | Warum |
+  | --- | --- | --- | --- |
+  | `i32`, `String`, `Vec<T>` | ja | ja | gewöhnliche Daten (sofern `T` es ist) |
+  | `Rc<T>` | nein | nein | nicht-atomarer Zähler |
+  | `Arc<T>` | ja | ja | atomarer Zähler (wenn `T: Send + Sync`) |
+  | `Cell<T>`, `RefCell<T>` | ja | nein | nicht synchronisierte Veränderung über `&` |
+  | `Mutex<T>` | ja | ja | Sperre synchronisiert den Zugriff (wenn `T: Send`) |
+  | `MutexGuard<T>` | nein | ja | muss im sperrenden Thread freigegeben werden |
+
+  Warum ist `Rc` nicht `Send`? Zwei Threads, die gleichzeitig `Rc::clone` aufrufen, lesen beide den Zähler 1, erhöhen beide auf 2 und schreiben 2 zurück. Ein Inkrement ist verloren. Beim Droppen fällt der Zähler dann zu früh auf null, der Wert wird freigegeben, während noch jemand ihn benutzt – Use-after-free. Genau das verhindert `!Send`. Warum ist `RefCell` nicht `Sync`? Ihr Ausleihzähler ist ebenfalls nicht atomar. Zwei Threads könnten gleichzeitig `borrow_mut()` erfolgreich aufrufen. Für Threads nimmst du deshalb `Arc` statt `Rc` und `Mutex` oder `RwLock` statt `RefCell`.
+
+  > [!INTERVIEW] „Was bedeutet ‚Fearless Concurrency‘ – und was nicht?“
+  > Rust garantiert in sicherem Code, dass es keine **Data Races** gibt: keinen gleichzeitigen Zugriff zweier Threads auf dieselbe Speicherstelle, bei dem mindestens einer schreibt und nichts synchronisiert. Das erzwingen Ownership, Borrowing und `Send`/`Sync` beim Übersetzen. **Nicht** garantiert sind Freiheit von Deadlocks und von Race Conditions in der Logik – etwa „prüfen, dann handeln“ mit zwei getrennten Sperren. Beispiel nennen, Grenze nennen, dann bist du über dem Durchschnitt der Antworten.
+
+  ## Was Rust nicht verhindert: Race Conditions und Deadlocks
+
+  Das [Rustonomicon](https://doc.rust-lang.org/nomicon/races.html) trennt sauber: Ein **Data Race** ist undefiniertes Verhalten und in sicherem Rust unmöglich. Eine **Race Condition** ist ein Logikfehler, bei dem das Ergebnis von der zeitlichen Abfolge abhängt – der ist in jeder Sprache möglich.
+
+  ```rust
+  use std::sync::Mutex;
+
+  // Kompiliert, ist frei von Data Races – und trotzdem falsch:
+  fn abheben(konto: &Mutex<i64>, betrag: i64) -> bool {
+      let stand = *konto.lock().unwrap(); // Sperre 1 endet am Semikolon
+      if stand >= betrag {
+          *konto.lock().unwrap() = stand - betrag; // Sperre 2: stand ist evtl. veraltet
+          true
+      } else {
+          false
+      }
+  }
+
+  fn main() {
+      let konto = Mutex::new(100);
+      println!("{}", abheben(&konto, 30));
+  }
+  ```
+
+  Zwischen den beiden Sperren kann ein anderer Thread abheben. Beide sehen 100, beide ziehen ab, eine Abbuchung geht verloren. Die Lösung: Prüfen und Ändern unter **einer** Sperre – `let mut stand = konto.lock().unwrap();` und dann nur noch über diesen Guard arbeiten.
+
+  Ein **Deadlock** entsteht, wenn Threads im Kreis aufeinander warten. Klassisch: Thread A sperrt `konto_a` und wartet auf `konto_b`, Thread B sperrt `konto_b` und wartet auf `konto_a`. Beide warten für immer. Regeln, die das verhindern:
+
+  - Mehrere Locks immer in derselben, festen Reihenfolge sperren (zum Beispiel nach Konto-ID).
+  - Guards kurz halten und keinen fremden Code (Callbacks, Channel-`send` an volle Puffer, I/O) aufrufen, während du einen Lock hältst.
+  - Denselben `Mutex` im selben Thread nie zweimal sperren. `std` legt das Verhalten nicht fest; der zweite `lock()` kehrt jedenfalls nicht zurück (Deadlock oder Panic).
+  - Wo es geht, Zustand nicht teilen: Channels oder `thread::scope` mit eigenen Teilergebnissen pro Thread.
+
+  > [!PRAXIS] Welches Werkzeug in echten Projekten?
+  > Für CPU-lastige Datenverarbeitung nutzen Rust-Projekte meist [rayon](https://docs.rs/rayon/latest/rayon/): `use rayon::prelude::*;` und aus `zeilen.iter()` wird `zeilen.par_iter()` – rayon verteilt die Arbeit auf einen Thread-Pool, und die Typen erzwingen weiterhin `Send`/`Sync`. Für I/O-lastige Dienste mit vielen gleichzeitigen Verbindungen ist `async` mit Tokio üblich (nächstes Modul). Rohe `thread::spawn`-Aufrufe siehst du vor allem für langlebige Hintergrund-Threads; `Arc<Mutex<T>>` für geteilten Zustand ist in beiden Welten Alltag.
+
+  ## Häufige Fehler
+
+  - **`move` vergessen.** `E0373` bei `thread::spawn`: Der Closure leiht lokale Variablen aus. `move` davor oder `thread::scope` benutzen.
+  - **`Rc` in einem Thread.** ``error[E0277]: `Rc<…>` cannot be sent between threads safely`` – auf `Arc` umstellen.
+  - **Nicht gejoint.** `main` endet, bevor die Threads fertig sind; Ausgaben oder Schreibvorgänge fehlen.
+  - **Sender nicht gedroppt.** `for x in rx` endet nie. `drop(tx)` nach dem Verteilen der Klone. Achtung: `let _ = tx;` droppt `tx` **nicht** – ein `_`-Muster bindet und verschiebt nichts.
+  - **Guard zu lange gehalten.** Arbeit ohne Sperre erledigen, dann kurz sperren; Guards nicht über `match`, Schleifen oder Aufrufe von fremdem Code halten.
+  - **Lesen und Schreiben unter getrennten Sperren.** Führt zu verlorenen Updates. Bei Atomics: `fetch_add` statt `load` und `store`.
+  - **Ergebnisse in Ankunftsreihenfolge erwartet.** Threads laufen in beliebiger Reihenfolge; sortieren oder über `JoinHandle`s in fester Reihenfolge einsammeln.
+
+  ## Zusammenfassung
+
+  - `thread::spawn` verlangt `Send + 'static`, deshalb `move`; `join()` liefert das Ergebnis als `Result`.
+  - `thread::scope` erlaubt Threads, die lokale Daten ausleihen, und joint automatisch.
+  - Channels verschieben Werte zwischen Threads; die Empfangsschleife endet erst, wenn alle Sender gedroppt sind.
+  - `Arc<Mutex<T>>` teilt veränderbaren Zustand; der Guard hält die Sperre bis zu seinem Drop. `RwLock` für leselastige Daten.
+  - Atomics für Zähler und Flags; `Relaxed` für reine Zähler, `SeqCst` im Zweifel.
+  - `Send` und `Sync` machen Data Races zu Compilerfehlern. `Rc` ist `!Send`, `RefCell` ist `!Sync`.
+  - Deadlocks und Race Conditions bleiben deine Verantwortung: feste Lock-Reihenfolge, Prüfen und Ändern unter einer Sperre, möglichst wenig geteilter Zustand.
+exercises:
+  - id: was-rust-verhindert
+    type: choice
+    title: Was fängt der Compiler ab?
+    prompt: Welche dieser Probleme verhindert Rust in sicherem Code (ohne `unsafe`) schon beim Übersetzen?
+    options:
+      - text: Zwei Threads schreiben ohne Synchronisation gleichzeitig in denselben `Vec`.
+        correct: true
+        why: Das ist ein Data Race. Um den `Vec` in zwei Threads zu verändern, bräuchtest du zweimal `&mut` oder ein `Rc<RefCell<…>>` – beides lehnt der Compiler über Borrowing bzw. `Send`/`Sync` ab.
+      - text: Ein `Rc<String>` wird an `thread::spawn` übergeben.
+        correct: true
+        why: "`Rc` ist `!Send`; `spawn` verlangt `Send`. Ergebnis: `error[E0277]`."
+      - text: Thread A sperrt erst `a`, dann `b`; Thread B sperrt erst `b`, dann `a`.
+        correct: false
+        why: Das ist ein möglicher Deadlock. Der Code ist typsicher und kompiliert; ob er hängt, hängt vom Timing ab.
+      - text: Ein Kontostand wird unter einer Sperre gelesen und unter einer zweiten Sperre geschrieben; dazwischen ändert ihn ein anderer Thread.
+        correct: false
+        why: Das ist eine Race Condition in der Logik. Jeder einzelne Zugriff ist synchronisiert, also gibt es keinen Data Race – das Ergebnis ist trotzdem falsch.
+    explanation: |
+      „Fearless Concurrency“ heißt: keine Data Races in sicherem Rust. Ownership, Borrowing und die Traits `Send` und `Sync` machen ungeschützten gemeinsamen Schreibzugriff zu einem Compilerfehler. Deadlocks und Race Conditions sind dagegen Fehler in der Abfolge und Logik – die muss dein Design verhindern.
+    resources:
+      - title: Rustonomicon · Data Races and Race Conditions
+        url: https://doc.rust-lang.org/nomicon/races.html
+      - title: Rust Book · Fearless Concurrency
+        url: https://doc.rust-lang.org/book/ch16-00-concurrency.html
+  - id: send-sync-begruenden
+    type: choice
+    title: Rc, Arc und die Threads
+    prompt: "Warum ist `Rc<T>` nicht `Send`, `Arc<T>` aber schon (für `T: Send + Sync`)?"
+    options:
+      - text: "`Rc` erhöht und verringert seinen Zähler mit gewöhnlichen, nicht-atomaren Operationen. Gleichzeitige Klone aus zwei Threads könnten Updates verlieren und den Wert zu früh freigeben. `Arc` nutzt atomare Operationen."
+        correct: true
+        why: Genau darin unterscheiden sich die beiden. Die API ist gleich, nur die Zählung ist bei `Arc` thread-sicher – und deshalb etwas teurer.
+      - text: "`Rc` liegt auf dem Stack, `Arc` auf dem Heap."
+        correct: false
+        why: Beide legen Zähler und Wert gemeinsam auf den Heap. Der Ort ist nicht der Unterschied.
+      - text: "`Arc` sperrt beim Zugriff auf den Wert automatisch einen Mutex."
+        correct: false
+        why: "`Arc` gibt nur `&T` heraus und sperrt nichts. Für veränderbaren Zugriff kombinierst du es mit `Mutex` oder `RwLock`."
+      - text: "`Rc` ist nur aus historischen Gründen nicht `Send`; mit `unsafe impl Send` kann man es gefahrlos nachrüsten."
+        correct: false
+        why: "`!Send` ist bei `Rc` eine echte Sicherheitsgarantie. Ein nachgerüstetes `Send` würde Use-after-free möglich machen."
+    explanation: |
+      `Send` und `Sync` beschreiben, was ein Typ über Thread-Grenzen hinweg sicher kann. `Rc` spart sich die Kosten atomarer Operationen und ist deshalb auf einen Thread beschränkt. Der Compiler setzt diese Grenze automatisch durch, weil `thread::spawn` `Send` verlangt.
+    resources:
+      - title: Rust Book · Extensible Concurrency with Send and Sync
+        url: https://doc.rust-lang.org/book/ch16-04-extensible-concurrency-sync-and-send.html
+      - title: std::sync::Arc · Thread Safety
+        url: https://doc.rust-lang.org/std/sync/struct.Arc.html#thread-safety
+  - id: worker-mit-channel
+    type: order
+    title: Ein Worker meldet sich
+    prompt: Bring die Zeilen in eine Reihenfolge, in der das Programm kompiliert, alle drei Meldungen ausgibt und sauber endet.
+    lang: rust
+    lines: |
+      use std::sync::mpsc;
+      use std::thread;
+      fn main() {
+          let (tx, rx) = mpsc::channel();
+          let handle = thread::spawn(move || {
+              for datei in ["a.log", "b.log", "c.log"] {
+                  tx.send(format!("{datei} geprüft")).unwrap();
+              }
+          });
+          for nachricht in rx {
+              println!("{nachricht}");
+          }
+          handle.join().unwrap();
+      }
+    alternatives:
+      - [2, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+      - [1, 2, 3, 4, 5, 6, 7, 8, 9, 13, 10, 11, 12, 14]
+      - [2, 1, 3, 4, 5, 6, 7, 8, 9, 13, 10, 11, 12, 14]
+    explanation: |
+      Der Channel muss existieren, bevor der Thread ihn benutzt. `move` verschiebt `tx` in den Worker; wenn der Worker fertig ist, wird `tx` gedroppt – und weil es der einzige Sender war, endet danach `for nachricht in rx`. Das `join` darf vor oder nach der Empfangsschleife stehen: Der Channel ist unbegrenzt, der Worker blockiert beim Senden also nie.
+    resources:
+      - title: Rust Book · Sending Multiple Values
+        url: https://doc.rust-lang.org/book/ch16-02-message-passing.html#sending-multiple-values
+  - id: join-und-panic
+    type: output
+    title: Ein Thread stürzt ab
+    prompt: Was gibt dieses Programm auf der **Standardausgabe** aus? (Die Panic-Meldung des Threads landet auf stderr und zählt hier nicht.)
+    lang: rust
+    code: |
+      use std::thread;
+
+      fn main() {
+          let zeilen = vec!["INFO a", "ERROR b", "ERROR c", "WARN d"];
+          let zaehler = thread::spawn(move || {
+              zeilen.iter().filter(|z| z.starts_with("ERROR")).count()
+          });
+          let pruefer = thread::spawn(|| -> u32 { "zwölf".parse().unwrap() });
+
+          println!("Fehler: {}", zaehler.join().unwrap());
+          match pruefer.join() {
+              Ok(wert) => println!("Wert: {wert}"),
+              Err(_) => println!("Prüfer abgestürzt"),
+          }
+          println!("main läuft weiter");
+      }
+    expected: |
+      Fehler: 2
+      Prüfer abgestürzt
+      main läuft weiter
+    explanation: |
+      Die Ausgaben stehen alle in `main` und hängen jeweils von einem `join()` ab, deshalb ist die Reihenfolge fest. `"zwölf".parse::<u32>()` schlägt fehl, `unwrap()` löst im Prüfer-Thread eine Panic aus. Die beendet nur diesen Thread; `join()` liefert `Err` mit der Panic-Nutzlast, und `main` kann reagieren. Hätte `main` `pruefer.join().unwrap()` geschrieben, wäre die Panic in den Hauptthread weitergereicht worden.
+    resources:
+      - title: std::thread::JoinHandle::join
+        url: https://doc.rust-lang.org/std/thread/struct.JoinHandle.html#method.join
+      - title: Rust Book · Waiting for All Threads to Finish
+        url: https://doc.rust-lang.org/book/ch16-01-threads.html#waiting-for-all-threads-to-finish
+  - id: channel-schliesst
+    type: output
+    title: Wann ist der Channel leer?
+    prompt: Was gibt dieses Programm aus?
+    lang: rust
+    code: |
+      use std::sync::mpsc;
+      use std::thread;
+
+      fn main() {
+          let (tx, rx) = mpsc::channel();
+          let mut handles = Vec::new();
+          for id in 1..=3 {
+              let tx = tx.clone();
+              handles.push(thread::spawn(move || {
+                  tx.send(id * 10).unwrap();
+              }));
+          }
+          drop(tx);
+
+          let mut werte: Vec<i32> = rx.iter().collect();
+          werte.sort();
+          println!("{werte:?}");
+          println!("{}", rx.recv().is_err());
+          for handle in handles {
+              handle.join().unwrap();
+          }
+      }
+    expected: |
+      [10, 20, 30]
+      true
+    explanation: |
+      Jeder Worker bekommt einen geklonten Sender und droppt ihn, sobald sein Closure endet. Nach `drop(tx)` existiert kein Sender mehr außerhalb der Worker. `rx.iter()` liefert alle drei Werte und endet, sobald der letzte Sender weg und der Channel leer ist. Die Ankunftsreihenfolge ist zufällig, `sort` macht die Ausgabe deterministisch. Ein weiteres `recv()` liefert sofort `Err(RecvError)` statt zu blockieren, weil der Channel getrennt ist.
+    resources:
+      - title: std::sync::mpsc · Disconnection
+        url: https://doc.rust-lang.org/std/sync/mpsc/index.html#disconnection
+      - title: Rust Book · Creating Multiple Producers
+        url: https://doc.rust-lang.org/book/ch16-02-message-passing.html#creating-multiple-producers
+  - id: guard-lebensdauer
+    type: output
+    title: Solange der Guard lebt
+    prompt: Was gibt dieses Programm aus? `try_lock` wartet nicht, sondern liefert sofort `Err`, wenn der Mutex gerade gesperrt ist.
+    lang: rust
+    code: |
+      use std::sync::Mutex;
+
+      fn main() {
+          let zaehler = Mutex::new(0);
+          {
+              let mut guard = zaehler.lock().unwrap();
+              *guard += 1;
+              println!("{}", zaehler.try_lock().is_err());
+          }
+          println!("{}", zaehler.try_lock().is_ok());
+          *zaehler.lock().unwrap() += 1;
+          println!("{}", zaehler.into_inner().unwrap());
+      }
+    expected: |
+      true
+      true
+      2
+    explanation: |
+      Die Sperre gehört dem Guard. Solange `guard` lebt, ist der Mutex gesperrt – auch für denselben Thread, deshalb schlägt `try_lock` fehl. Am Blockende wird `guard` gedroppt und gibt die Sperre frei. In `*zaehler.lock().unwrap() += 1` ist der Guard ein Temporärwert und lebt nur bis zum Semikolon. `into_inner` verbraucht den Mutex und gibt den Wert heraus. Ein zweites `lock()` statt `try_lock()` im inneren Block hätte das Programm für immer blockiert oder eine Panic ausgelöst.
+    resources:
+      - title: std::sync::Mutex::try_lock
+        url: https://doc.rust-lang.org/std/sync/struct.Mutex.html#method.try_lock
+      - title: Rust Book · The API of Mutex<T>
+        url: https://doc.rust-lang.org/book/ch16-03-shared-state.html#the-api-of-mutext
+  - id: scoped-threads
+    type: gap
+    title: Parallel zählen ohne move der Daten
+    prompt: Ergänze den Code so, dass vier Threads je 250 Zeilen **ausleihen**, ihre Fehler zählen und `main` die Summe (`142`) ausgibt. `zeilen` soll `main` gehören bleiben.
+    lang: rust
+    code: |
+      use std::thread;
+
+      fn main() {
+          let zeilen: Vec<String> = (1..=1000)
+              .map(|i| if i % 7 == 0 { format!("ERROR {i}") } else { format!("INFO {i}") })
+              .collect();
+
+          let fehler: usize = ⟦thread::scope⟧(|s| {
+              let handles: Vec<_> = zeilen
+                  .chunks(250)
+                  .map(|teil| ⟦s.spawn⟧(move || teil.iter().filter(|z| z.starts_with("ERROR")).count()))
+                  .collect();
+              handles.into_iter().map(|h| ⟦h.join().unwrap()⟧).sum()
+          });
+
+          println!("{fehler} Fehler in {} Zeilen", zeilen.len());
+      }
+    gaps:
+      - label: Scope öffnen
+        hint: Die Funktion aus `std::thread`, deren Threads lokale Daten ausleihen dürfen.
+      - label: Thread im Scope starten
+        hint: Gestartet wird über das Scope-Objekt `s`, nicht über `thread::spawn`.
+      - label: Ergebnis eines Threads
+        hint: Auf das Ende warten und den `Result` auspacken.
+        accept: ["h.join().expect(\"Thread abgestürzt\")"]
+    explanation: |
+      `thread::scope` garantiert, dass alle mit `s.spawn` gestarteten Threads beendet sind, bevor die Funktion zurückkehrt. Deshalb dürfen sie `&[String]`-Stücke von `zeilen` ausleihen, ohne dass `'static` nötig ist. `move` verschiebt nur die Referenz `teil` in den Closure. Mit `thread::spawn` statt `s.spawn` lehnte der Compiler die Ausleihe ab, weil `spawn` `'static` verlangt.
+    resources:
+      - title: std::thread::scope
+        url: https://doc.rust-lang.org/std/thread/fn.scope.html
+      - title: std::thread::Scope::spawn
+        url: https://doc.rust-lang.org/std/thread/struct.Scope.html#method.spawn
+  - id: arc-mutex-statistik
+    type: gap
+    title: Eine Statistik für alle Threads
+    prompt: Ergänze den geteilten Zustand, den Besitzanteil pro Thread und das Sperren, sodass beide Threads in dieselbe `HashMap` zählen.
+    lang: rust
+    code: |
+      use std::collections::HashMap;
+      use std::sync::{Arc, Mutex};
+      use std::thread;
+
+      fn main() {
+          let statistik = ⟦Arc::new(Mutex::new(HashMap::new()))⟧;
+          let mut handles = Vec::new();
+
+          for datei in ["api.log", "db.log"] {
+              let statistik = ⟦Arc::clone(&statistik)⟧;
+              handles.push(thread::spawn(move || {
+                  let mut karte = ⟦statistik.lock().unwrap()⟧;
+                  *karte.entry(datei).or_insert(0) += 1;
+              }));
+          }
+
+          for handle in handles {
+              handle.join().unwrap();
+          }
+          println!("{} Dateien", statistik.lock().unwrap().len());
+      }
+    gaps:
+      - label: Geteilter Zustand
+        hint: Von außen nach innen – thread-sicherer Mehrfachbesitz, darin die Sperre, darin die Daten.
+      - label: Anteil für den Thread
+        hint: Ein weiterer Zeiger auf dieselbe Allokation, kein neuer Mutex.
+        accept: ["statistik.clone()"]
+      - label: Sperren
+        hint: Sperre anfordern und das `Result` (Poisoning) auspacken.
+        accept: ["statistik.lock().expect(\"Mutex vergiftet\")"]
+    explanation: |
+      `Arc` gibt jedem Thread einen Besitzanteil, `Mutex` sorgt dafür, dass immer nur einer die `HashMap` verändert. `Arc::clone` erhöht nur den atomaren Zähler. `lock()` liefert ein `Result`, weil der Mutex vergiftet sein kann; der `MutexGuard` in `karte` gibt die Sperre am Ende des Closures frei. Ein `Rc` statt `Arc` oder eine `RefCell` statt `Mutex` würde an `Send` bzw. `Sync` scheitern.
+    resources:
+      - title: Rust Book · Atomic Reference Counting with Arc<T>
+        url: https://doc.rust-lang.org/book/ch16-03-shared-state.html#atomic-reference-counting-with-arct
+      - title: std::sync::Mutex
+        url: https://doc.rust-lang.org/std/sync/struct.Mutex.html
+  - id: atomarer-zaehler
+    type: gap
+    title: Anfragen zählen ohne Mutex
+    prompt: Ergänze einen globalen, atomaren Zähler. Vier Threads erhöhen ihn je 1 000-mal, danach soll `4000` erscheinen. Es handelt sich um einen reinen Zähler, von dem keine anderen Daten abhängen.
+    lang: rust
+    code: |
+      use std::sync::atomic::{AtomicUsize, Ordering};
+      use std::thread;
+
+      static ANFRAGEN: ⟦AtomicUsize⟧ = AtomicUsize::new(0);
+
+      fn main() {
+          thread::scope(|s| {
+              for _ in 0..4 {
+                  s.spawn(|| {
+                      for _ in 0..1000 {
+                          ANFRAGEN.⟦fetch_add(1, Ordering::Relaxed)⟧;
+                      }
+                  });
+              }
+          });
+          println!("{}", ANFRAGEN.⟦load(Ordering::Relaxed)⟧);
+      }
+    gaps:
+      - label: Typ des Zählers
+        hint: Ein atomarer, vorzeichenloser Integer in Zeigerbreite.
+      - label: Atomar erhöhen
+        hint: Lesen, addieren und schreiben in einer unteilbaren Operation. Für reine Zähler reicht die schwächste Ordering.
+        accept: ["fetch_add(1, Ordering::SeqCst)", "fetch_add(1, Ordering::AcqRel)"]
+      - label: Wert lesen
+        hint: Die Lese-Operation eines Atomics, ebenfalls mit Ordering.
+        accept: ["load(Ordering::SeqCst)", "load(Ordering::Acquire)"]
+    explanation: |
+      Ein `static` braucht einen Typ, der ohne `mut` über `&` veränderbar und `Sync` ist – genau das ist `AtomicUsize`. `fetch_add` ist ein unteilbares Read-Modify-Write, deshalb geht kein Inkrement verloren. `Relaxed` genügt, weil nur die Zahl selbst zählt; `SeqCst` wäre ebenfalls korrekt, nur minimal teurer. Das Ergebnis ist trotz `Relaxed` garantiert 4000: `thread::scope` joint alle Threads, und das Join stellt die nötige Ordnung her.
+    resources:
+      - title: std::sync::atomic
+        url: https://doc.rust-lang.org/std/sync/atomic/index.html
+      - title: std::sync::atomic::Ordering
+        url: https://doc.rust-lang.org/std/sync/atomic/enum.Ordering.html
+  - id: sender-nicht-gedroppt
+    type: bug
+    title: Das Programm hängt nach der dritten Meldung
+    prompt: |
+      Erwartet: drei Meldungen der Worker, danach `alle fertig`. Tatsächlich erscheinen die drei Meldungen, dann hängt das Programm, bis man es mit Strg+C abbricht. Es gibt keine Fehlermeldung. Finde die Zeile und korrigiere sie.
+    lang: rust
+    code: |
+      use std::sync::mpsc;
+      use std::thread;
+
+      fn main() {
+          let (tx, rx) = mpsc::channel();
+          for id in 0..3 {
+              let tx = tx.clone();
+              thread::spawn(move || {
+                  tx.send(format!("Worker {id} fertig")).unwrap();
+              });
+          }
+          let _ = tx; // Sender freigeben, damit die Schleife endet
+
+          for nachricht in rx {
+              println!("{nachricht}");
+          }
+          println!("alle fertig");
+      }
+    lines: [12]
+    fix:
+      - line: 12
+        answers: ["drop(tx);", "std::mem::drop(tx);"]
+    explanation: |
+      `for nachricht in rx` endet erst, wenn **alle** Sender gedroppt sind. Die Klone in den Workern verschwinden mit deren Ende, das Original `tx` lebt aber in `main` weiter. `let _ = tx;` sieht aus wie ein Freigeben, tut es aber nicht: Das Muster `_` bindet nichts, also wird `tx` weder verschoben noch gedroppt – nach dieser Zeile ist `tx` sogar noch benutzbar. Erst `drop(tx)` beendet den Besitz. Alternativ kannst du den Klon für den letzten Worker weglassen und `tx` selbst hineinverschieben.
+    resources:
+      - title: Rust Book · Creating Multiple Producers
+        url: https://doc.rust-lang.org/book/ch16-02-message-passing.html#creating-multiple-producers
+      - title: Reference · Wildcard pattern
+        url: https://doc.rust-lang.org/reference/patterns.html#wildcard-pattern
+  - id: verlorene-updates
+    type: bug
+    title: 40 000 Anfragen, 31 874 gezählt
+    prompt: |
+      Vier Threads bearbeiten je 10 000 Anfragen und zählen sie mit. Das Programm kompiliert ohne Warnung, aber die Ausgabe schwankt von Lauf zu Lauf, zum Beispiel `31874` oder `38090`. Nur selten stimmt sie. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: rust
+    code: |
+      use std::sync::atomic::{AtomicUsize, Ordering};
+      use std::thread;
+
+      static ANFRAGEN: AtomicUsize = AtomicUsize::new(0);
+
+      fn bearbeite_anfrage() {
+          // … eigentliche Arbeit …
+          ANFRAGEN.store(ANFRAGEN.load(Ordering::SeqCst) + 1, Ordering::SeqCst);
+      }
+
+      fn main() {
+          thread::scope(|s| {
+              for _ in 0..4 {
+                  s.spawn(|| {
+                      for _ in 0..10_000 {
+                          bearbeite_anfrage();
+                      }
+                  });
+              }
+          });
+          println!("{}", ANFRAGEN.load(Ordering::SeqCst));
+      }
+    lines: [8]
+    fix:
+      - line: 8
+        answers:
+          - ANFRAGEN.fetch_add(1, Ordering::SeqCst);
+          - ANFRAGEN.fetch_add(1, Ordering::Relaxed);
+          - ANFRAGEN.fetch_add(1, Ordering::AcqRel);
+    explanation: |
+      `load` und `store` sind jeweils atomar, die Kombination aber nicht. Zwei Threads können denselben Wert lesen, beide `+ 1` rechnen und beide dasselbe Ergebnis schreiben – ein Inkrement geht verloren. Das ist kein Data Race (jeder Zugriff ist synchronisiert, `SeqCst` sogar maximal), sondern eine Race Condition in der Logik, die Rust nicht verhindern kann. `fetch_add` macht Lesen, Addieren und Schreiben zu einer unteilbaren Operation. Dasselbe Muster gibt es mit `Mutex`: Wer unter einer Sperre liest und unter einer zweiten schreibt, verliert Updates.
+    resources:
+      - title: std::sync::atomic::AtomicUsize
+        url: https://doc.rust-lang.org/std/sync/atomic/type.AtomicUsize.html
+      - title: Rustonomicon · Data Races and Race Conditions
+        url: https://doc.rust-lang.org/nomicon/races.html
+  - id: worker-pool-erklaeren
+    type: explain
+    title: Ein Worker-Pool aus Bordmitteln
+    prompt: |
+      So startet ein kleiner Webserver seine Worker (angelehnt an das Abschlussprojekt des Rust Books). Erkläre: Warum steckt der `Receiver` in `Arc<Mutex<…>>`? Wie lange hält ein Worker die Sperre? Warum die Schranken `Send + 'static` am Job-Typ? Und wie beendet man den Pool sauber?
+    lang: rust
+    code: |
+      use std::sync::{mpsc, Arc, Mutex};
+      use std::thread;
+
+      type Job = Box<dyn FnOnce() + Send + 'static>;
+
+      fn starte_worker(anzahl: usize) -> (mpsc::Sender<Job>, Vec<thread::JoinHandle<()>>) {
+          let (tx, rx) = mpsc::channel::<Job>();
+          let rx = Arc::new(Mutex::new(rx));
+          let handles = (0..anzahl)
+              .map(|_| {
+                  let rx = Arc::clone(&rx);
+                  thread::spawn(move || loop {
+                      let job = rx.lock().unwrap().recv();
+                      match job {
+                          Ok(job) => job(),
+                          Err(_) => break,
+                      }
+                  })
+              })
+              .collect();
+          (tx, handles)
+      }
+    points:
+      - Ein `mpsc`-Channel hat genau einen Empfänger, der sich nicht klonen lässt; damit mehrere Worker aus derselben Queue ziehen, wird er über `Arc` geteilt und mit `Mutex` geschützt.
+      - Der `MutexGuard` in `rx.lock().unwrap().recv()` ist ein Temporärwert und wird am Ende der `let`-Anweisung freigegeben – der Job läuft also ohne Sperre, andere Worker können parallel Jobs holen.
+      - "`Send + 'static` ist nötig, weil der Job an einen anderen Thread übergeben wird und unbestimmt lange leben kann; `Box<dyn FnOnce()>` erlaubt beliebige Closures, die genau einmal laufen."
+      - "Sauberes Beenden: den `Sender` droppen, dann liefert `recv()` `Err`, jeder Worker verlässt die Schleife, und die `JoinHandle`s werden gejoint."
+    explanation: |
+      Der Channel ist die Job-Queue. Weil `mpsc` nur einen Empfänger kennt und `Receiver` nicht `Sync` ist, teilen sich die Worker ihn über `Arc<Mutex<Receiver<Job>>>`: `Arc` für mehrere Besitzer, `Mutex` dafür, dass immer nur einer gleichzeitig `recv` aufruft. Entscheidend ist, dass die Sperre nur für `recv` gehalten wird. Der Guard ist ein Temporärwert der `let`-Anweisung und verschwindet am Semikolon, deshalb läuft `job()` ohne Lock. Hätte man `while let Ok(job) = rx.lock().unwrap().recv()` geschrieben, lebte der Guard durch den ganzen Schleifenrumpf, und die Worker würden nacheinander statt parallel arbeiten. `Box<dyn FnOnce() + Send + 'static>` ist ein beliebiger Closure, der einmal läuft, an einen anderen Thread übergeben werden darf und keine kurzlebigen Ausleihen enthält. Zum Herunterfahren droppt man den Sender: `recv` liefert dann `Err`, jeder Worker bricht aus der Schleife aus, und man joint die Handles.
+    resources:
+      - title: Rust Book · Kapitel 21 – Turning Our Single-Threaded Server into a Multithreaded Server
+        url: https://doc.rust-lang.org/book/ch21-02-multithreaded.html
+      - title: std::sync::mpsc::Receiver::recv
+        url: https://doc.rust-lang.org/std/sync/mpsc/struct.Receiver.html#method.recv
+  - id: parallele-log-analyse
+    type: practice
+    title: Log-Level parallel zählen
+    prompt: |
+      Schreibe `zaehle_parallel(zeilen: &[&str], threads: usize) -> HashMap<String, usize>`. Sie zählt, wie oft jedes Log-Level (das erste Wort jeder Zeile) vorkommt, und verteilt die Arbeit auf `threads` Threads.
+
+      Vorgaben:
+
+      1. Nutze `thread::scope`, damit die Threads `zeilen` ausleihen können.
+      2. Jeder Thread zählt in **seine eigene** `HashMap`; zusammengeführt wird erst nach dem `join`. Kein `Mutex`.
+      3. Das Ergebnis ist identisch mit der sequenziellen Funktion `zaehle_level`.
+      4. Randfälle: leere Eingabe, mehr Threads als Zeilen, `threads == 0`.
+      5. Schreibe Tests für diese Fälle.
+
+      Zusatzfrage: Warum ist „jeder Thread zählt für sich, dann zusammenführen“ hier besser als eine gemeinsame `Arc<Mutex<HashMap>>`?
+    lang: rust
+    starter: |
+      use std::collections::HashMap;
+      use std::thread;
+
+      fn zaehle_level(zeilen: &[&str]) -> HashMap<String, usize> {
+          let mut karte = HashMap::new();
+          for zeile in zeilen {
+              if let Some(level) = zeile.split_whitespace().next() {
+                  *karte.entry(level.to_string()).or_insert(0) += 1;
+              }
+          }
+          karte
+      }
+
+      fn zaehle_parallel(zeilen: &[&str], threads: usize) -> HashMap<String, usize> {
+          todo!()
+      }
+
+      fn main() {
+          let log = ["INFO start", "ERROR db", "WARN platte", "ERROR netz", "INFO ende"];
+          println!("{:?}", zaehle_parallel(&log, 2));
+      }
+    solution: |
+      use std::collections::HashMap;
+      use std::thread;
+
+      fn zaehle_level(zeilen: &[&str]) -> HashMap<String, usize> {
+          let mut karte = HashMap::new();
+          for zeile in zeilen {
+              if let Some(level) = zeile.split_whitespace().next() {
+                  *karte.entry(level.to_string()).or_insert(0) += 1;
+              }
+          }
+          karte
+      }
+
+      fn zaehle_parallel(zeilen: &[&str], threads: usize) -> HashMap<String, usize> {
+          let threads = threads.max(1);
+          let teilgroesse = zeilen.len().div_ceil(threads).max(1);
+          thread::scope(|s| {
+              let handles: Vec<_> = zeilen
+                  .chunks(teilgroesse)
+                  .map(|teil| s.spawn(move || zaehle_level(teil)))
+                  .collect();
+              let mut gesamt = HashMap::new();
+              for handle in handles {
+                  for (level, anzahl) in handle.join().expect("Zähl-Thread abgestürzt") {
+                      *gesamt.entry(level).or_insert(0) += anzahl;
+                  }
+              }
+              gesamt
+          })
+      }
+
+      fn main() {
+          let log = ["INFO start", "ERROR db", "WARN platte", "ERROR netz", "INFO ende"];
+          let mut ergebnis: Vec<_> = zaehle_parallel(&log, 2).into_iter().collect();
+          ergebnis.sort();
+          println!("{ergebnis:?}");
+      }
+
+      #[cfg(test)]
+      mod tests {
+          use super::*;
+
+          fn beispiel() -> Vec<&'static str> {
+              (0..1000)
+                  .map(|i| match i % 5 {
+                      0 => "ERROR kaputt",
+                      1 | 2 => "INFO ok",
+                      3 => "WARN langsam",
+                      _ => "",
+                  })
+                  .collect()
+          }
+
+          #[test]
+          fn gleich_wie_sequenziell() {
+              let zeilen = beispiel();
+              for threads in [1, 2, 3, 7, 16] {
+                  assert_eq!(zaehle_parallel(&zeilen, threads), zaehle_level(&zeilen), "threads = {threads}");
+              }
+          }
+
+          #[test]
+          fn leere_eingabe() {
+              assert!(zaehle_parallel(&[], 4).is_empty());
+          }
+
+          #[test]
+          fn mehr_threads_als_zeilen() {
+              let ergebnis = zaehle_parallel(&["ERROR a", "INFO b"], 8);
+              assert_eq!(ergebnis["ERROR"], 1);
+              assert_eq!(ergebnis["INFO"], 1);
+          }
+
+          #[test]
+          fn null_threads_heisst_einer() {
+              assert_eq!(zaehle_parallel(&["WARN x"], 0)["WARN"], 1);
+          }
+      }
+    checklist:
+      - "`thread::scope` statt `thread::spawn`; `zeilen` wird nur ausgeliehen, nicht geklont."
+      - Jeder Thread gibt seine eigene `HashMap` zurück; `main` führt sie nach dem `join` zusammen. Kein `Mutex`, kein `Arc`.
+      - Die Teilgröße wird aufgerundet (`div_ceil`) und ist mindestens 1 – `chunks(0)` würde eine Panic auslösen.
+      - "`threads == 0` wird wie 1 behandelt, leere Eingabe liefert eine leere Map."
+      - Ein Test vergleicht das Ergebnis für mehrere Thread-Zahlen mit `zaehle_level`.
+      - Du kannst die Zusatzfrage beantworten.
+    explanation: |
+      Die Lösung teilt die Daten, nicht den Zustand. Jeder Thread arbeitet ohne jede Synchronisation auf seinem eigenen Stück und seiner eigenen Map; synchronisiert wird nur einmal, beim `join`. Eine gemeinsame `Arc<Mutex<HashMap>>` wäre ebenfalls korrekt, aber jeder Thread müsste für jede Zeile die Sperre holen – die Threads würden sich gegenseitig ausbremsen, und im schlimmsten Fall wäre die parallele Version langsamer als die sequenzielle. Diese Form („map, dann reduce“) ist genau das, was `rayon` mit `par_iter().fold(…).reduce(…)` automatisiert. Die Randfälle sind keine Kosmetik: `chunks(0)` löst eine Panic aus, und `len / threads` ohne Aufrunden würde bei 5 Zeilen und 2 Threads drei statt zwei Stücke erzeugen – nicht falsch, aber nicht das, was der Aufrufer wollte.
+    resources:
+      - title: std::thread::scope
+        url: https://doc.rust-lang.org/std/thread/fn.scope.html
+      - title: slice::chunks
+        url: https://doc.rust-lang.org/std/primitive.slice.html#method.chunks

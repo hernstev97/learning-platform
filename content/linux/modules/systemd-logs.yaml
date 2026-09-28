@@ -1,0 +1,651 @@
+id: systemd-logs
+title: systemd, Dienste & Logs
+level: 2
+minutes: 160
+summary: Vom Bootvorgang bis zum eigenen Dienst – wie du mit systemd Programme zuverlässig betreibst, mit Timern planst und mit journalctl die Ursache eines Fehlers findest.
+goals:
+  - Du beschreibst den Bootvorgang von der Firmware bis zu systemd als PID 1.
+  - Du steuerst Dienste mit `systemctl` und unterscheidest `start` von `enable`, `restart` von `reload` und `reload` von `daemon-reload`.
+  - Du schreibst eine Service-Unit mit `Type=`, `ExecStart=`, `Restart=`, `User=`, Umgebung und Abhängigkeiten und passt fremde Units per Drop-in an.
+  - Du ersetzt Cronjobs durch Timer mit `OnCalendar=` und `Persistent=` und prüfst Zeitangaben mit `systemd-analyze calendar`.
+  - Du findest mit `journalctl` gezielt die Meldungen eines Dienstes, eines Boots oder einer Priorität.
+resources:
+  - title: systemd.service(5)
+    url: https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html
+  - title: systemctl(1)
+    url: https://www.freedesktop.org/software/systemd/man/latest/systemctl.html
+  - title: journalctl(1)
+    url: https://www.freedesktop.org/software/systemd/man/latest/journalctl.html
+  - title: ArchWiki · systemd
+    url: https://wiki.archlinux.org/title/Systemd
+lesson: |
+  Deine kleine Shop-API läuft auf einem VPS. Gestartet hast du sie mit `nohup gunicorn … &`. Nach einem nächtlichen Kernel-Update startet der Server neu, und die API ist weg. Eine Woche später stürzt sie wegen eines Speicherlecks ab, und niemand merkt es bis zum Morgen. Die Logs liegen in einer `nohup.out`, die inzwischen 4 GB groß ist.
+
+  Für genau diese Probleme gibt es **systemd**: Es startet Dienste beim Booten in der richtigen Reihenfolge, startet sie nach Abstürzen neu, sammelt ihre Ausgaben im Journal und stoppt sie geordnet. Auf Debian, Ubuntu, Fedora, Arch und CachyOS ist es gleichermaßen der Standard. Wer im Betrieb oder als Backend-Entwickler arbeitet, braucht die Werkzeuge aus diesem Modul jede Woche.
+
+  ## Vom Einschalten bis PID 1
+
+  Der Bootvorgang läuft in Etappen, und jede hat ihre eigene Fehlerklasse ([bootup(7)](https://www.freedesktop.org/software/systemd/man/latest/bootup.html), [ArchWiki · Arch boot process](https://wiki.archlinux.org/title/Arch_boot_process)):
+
+  1. **Firmware (UEFI).** Sie initialisiert die Hardware und startet einen Bootloader von der EFI-Systempartition.
+  2. **Bootloader** (systemd-boot, GRUB oder auf CachyOS oft Limine). Er lädt den Kernel und die **initramfs** in den Speicher und übergibt die Kernel-Kommandozeile, etwa `root=…`.
+  3. **Kernel.** Er initialisiert Speicher, CPU und die eingebauten Treiber, entpackt die initramfs in ein temporäres Root-Dateisystem und startet darin das erste Programm ([ramfs, rootfs and initramfs](https://docs.kernel.org/filesystems/ramfs-rootfs-initramfs.html)).
+  4. **initramfs.** Ein Mini-System mit genau den Treibern und Werkzeugen, die nötig sind, um das echte Root-Dateisystem zu finden: Module für NVMe, LUKS-Entschlüsselung, btrfs-Subvolumes. Danach wechselt es per `switch_root` auf das echte Root-Dateisystem.
+  5. **systemd als PID 1.** Es liest seine Unit-Dateien, bestimmt das Ziel `default.target` (auf Desktops `graphical.target`, auf Servern `multi-user.target`) und startet alles, was dafür nötig ist – so parallel wie die Abhängigkeiten erlauben.
+
+  ```console
+  $ systemd-analyze
+  Startup finished in 9.129s (firmware) + 6.028s (loader) + 937ms (kernel) + 2.532s (initrd) + 19.136s (userspace) = 37.764s
+  graphical.target reached after 19.136s in userspace.
+  $ systemd-analyze blame | head -3
+  $ systemd-analyze critical-chain
+  ```
+
+  [`systemd-analyze`](https://www.freedesktop.org/software/systemd/man/latest/systemd-analyze.html) zeigt dieselben Etappen mit Zeiten. `blame` listet die langsamsten Units, `critical-chain` die Kette, die den Boot tatsächlich aufgehalten hat. Das Denkmodell für die Fehlersuche: Bleibt der Rechner vor dem Kernel hängen, liegt es an Firmware oder Bootloader; landet er in einer Notfall-Shell der initramfs, findet er sein Root-Dateisystem nicht; bootet er, aber ein Dienst fehlt, ist es ein Fall für `systemctl` und `journalctl`.
+
+  ## Units und systemctl
+
+  systemd verwaltet **Units**: Konfigurationsdateien im INI-Stil, deren Endung den Typ angibt ([systemd.unit(5)](https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html)).
+
+  | Typ | Wofür | Beispiel |
+  | --- | --- | --- |
+  | `.service` | ein Prozess oder ein einmaliger Befehl | `nginx.service` |
+  | `.timer` | startet eine andere Unit zeitgesteuert | `logrotate.timer` |
+  | `.socket` | lauscht auf einem Socket und startet den Dienst erst bei der ersten Verbindung | `sshd.socket` |
+  | `.target` | Gruppe von Units, ein Synchronisationspunkt | `multi-user.target` |
+  | `.mount` | ein Einhängepunkt (auch aus `/etc/fstab` erzeugt) | `home.mount` |
+  | `.path` | startet eine Unit, wenn sich eine Datei ändert | `cups.path` |
+
+  Unit-Dateien liegen an drei Orten, und der spätere gewinnt: `/usr/lib/systemd/system/` gehört den Paketen (nie dort ändern, das nächste Update überschreibt es), `/run/systemd/system/` enthält Laufzeit-Units, `/etc/systemd/system/` gehört dir. Auf Debian liegen die Paket-Units zum Teil noch unter `/lib/systemd/system/`.
+
+  ```console
+  $ systemctl status nginx              # Zustand, PID, letzte Logzeilen
+  $ sudo systemctl start nginx          # jetzt starten
+  $ sudo systemctl stop nginx           # jetzt stoppen (SIGTERM, nach Timeout SIGKILL)
+  $ sudo systemctl restart nginx        # stoppen und neu starten
+  $ sudo systemctl reload nginx         # Konfiguration neu lesen, Prozess läuft weiter
+  $ sudo systemctl enable nginx         # beim Booten starten
+  $ sudo systemctl enable --now nginx   # beim Booten starten und sofort starten
+  $ sudo systemctl disable --now nginx  # nicht mehr beim Booten, und sofort stoppen
+  $ systemctl is-active nginx           # active / inactive / failed
+  $ systemctl is-enabled nginx          # enabled / disabled / static / masked
+  $ systemctl list-units --failed       # alles, was fehlgeschlagen ist
+  $ systemctl cat nginx                 # Unit-Datei samt aller Drop-ins anzeigen
+  ```
+
+  Die wichtigste Unterscheidung: **`start` wirkt jetzt, `enable` wirkt beim nächsten Boot.** `enable` liest den Abschnitt `[Install]` der Unit und legt einen symbolischen Link an, etwa `/etc/systemd/system/multi-user.target.wants/nginx.service`. Damit „will“ `multi-user.target` den Dienst, und er startet bei jedem Boot mit. Laufen muss er deshalb noch lange nicht – `enable --now` erledigt beides. Units ohne `[Install]`-Abschnitt sind `static`: Sie werden nur als Abhängigkeit anderer Units gestartet.
+
+  Die zweite Unterscheidung: `reload` bittet den **Dienst**, seine Konfiguration neu zu lesen (bei nginx per `SIGHUP`, wie im Modul zu Prozessen), und funktioniert nur, wenn die Unit `ExecReload=` definiert. `daemon-reload` dagegen lässt **systemd selbst** alle Unit-Dateien neu einlesen. Das brauchst du jedes Mal, nachdem du eine Unit-Datei von Hand geändert hast; sonst arbeitet systemd mit der alten Fassung weiter und meldet in `systemctl status` einen Hinweis, dass sich die Datei auf der Platte geändert hat.
+
+  **Fremde Units anpassen.** Willst du an `nginx.service` etwas ändern, kopierst du nicht die ganze Datei, sondern legst einen **Drop-in** an:
+
+  ```console
+  $ sudo systemctl edit nginx
+  ```
+
+  Das öffnet einen Editor für `/etc/systemd/system/nginx.service.d/override.conf`, führt danach automatisch `daemon-reload` aus und behält alle Einstellungen des Pakets bei, die du nicht überschreibst. Kommt mit dem nächsten Update eine verbesserte Paket-Unit, profitierst du davon. `systemctl edit --full` erzeugt dagegen eine vollständige Kopie unter `/etc`, die künftige Paketänderungen verdeckt ([systemctl · edit](https://www.freedesktop.org/software/systemd/man/latest/systemctl.html#edit%20UNIT%E2%80%A6)).
+
+  ## Eine eigene Service-Unit schreiben
+
+  So sieht eine solide Unit für eine Python-Web-App aus:
+
+  ```ini title=/etc/systemd/system/shop.service
+  [Unit]
+  Description=Shop API (Gunicorn)
+  After=network-online.target postgresql.service
+  Wants=network-online.target
+
+  [Service]
+  Type=exec
+  User=shop
+  Group=shop
+  WorkingDirectory=/srv/shop
+  Environment=PYTHONUNBUFFERED=1
+  EnvironmentFile=/etc/shop/shop.env
+  ExecStart=/srv/shop/.venv/bin/gunicorn --workers 4 --bind 127.0.0.1:8000 shop.wsgi:application
+  Restart=on-failure
+  RestartSec=5
+
+  [Install]
+  WantedBy=multi-user.target
+  ```
+
+  **`[Unit]`** beschreibt Beziehungen ([systemd.unit(5) · Wants=](https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html#Wants=)). Hier steckt ein häufiges Missverständnis: `Wants=` (und das strengere `Requires=`) legt fest, **dass** eine andere Unit mitgestartet wird. `After=` legt nur fest, **in welcher Reihenfolge**. Die beiden sind unabhängig: `Wants=` ohne `After=` startet beide parallel, `After=` ohne `Wants=` wartet nur, falls die andere Unit ohnehin gestartet wird. `network-online.target` ist erreicht, wenn das Netz konfiguriert ist; `network.target` bedeutet nur, dass die Netzwerkverwaltung läuft ([systemd.io · Network online](https://systemd.io/NETWORK_ONLINE/)).
+
+  **`[Service]`** beschreibt den Prozess ([systemd.service(5)](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html#Type=), [systemd.exec(5)](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#User=)):
+
+  | Typ | systemd hält den Start für abgeschlossen, … | Geeignet für |
+  | --- | --- | --- |
+  | `simple` | sobald der Prozess geforkt ist | Standard ohne `Type=`; Fehler beim `exec` fallen erst später auf |
+  | `exec` | sobald das Programm per `execve` gestartet ist | lang laufende Server, die im Vordergrund bleiben – meist die bessere Wahl |
+  | `oneshot` | wenn der Prozess sich beendet hat | Skripte, Backups, Migrationen |
+  | `notify` | wenn der Dienst selbst „bereit“ meldet | Dienste mit `sd_notify`-Unterstützung |
+  | `forking` | wenn der Startprozess sich beendet hat | alte Daemons, die sich selbst in den Hintergrund schicken |
+
+  Der Dienst darf sich **nicht** selbst in den Hintergrund schicken, außer bei `Type=forking`. Er läuft im Vordergrund und schreibt auf stdout/stderr – systemd leitet beides ins Journal. `PYTHONUNBUFFERED=1` sorgt dafür, dass Python die Ausgabe nicht puffert und die Zeilen sofort erscheinen.
+
+  - `User=`/`Group=`: Der Dienst läuft nicht als root. Lege dafür einen Systembenutzer ohne Login an.
+  - `WorkingDirectory=`: das Arbeitsverzeichnis; ohne Angabe ist es `/`.
+  - `Environment=` setzt einzelne Variablen, `EnvironmentFile=` liest `KEY=value`-Zeilen aus einer Datei – ideal für Secrets mit Rechten `600`, die nicht in der Unit stehen sollen. Mit `-` davor (`EnvironmentFile=-/etc/shop/shop.env`) ist eine fehlende Datei kein Fehler.
+  - `ExecStart=` braucht den Programmpfad und die Argumente – **ohne Shell**. Umleitungen (`>`), Pipes (`|`), `&&` oder `cd` funktionieren nicht; systemd übergibt solche Zeichen als gewöhnliche Argumente. Brauchst du wirklich Shell-Logik, schreibst du ein Skript oder rufst `/bin/sh -c '…'` auf.
+  - `Restart=on-failure` startet neu, wenn der Prozess mit einem Fehlercode endet, durch ein Signal stirbt oder ein Timeout greift – aber nicht nach einem sauberen `exit 0` oder einem `systemctl stop`. `Restart=always` startet auch nach Exit-Code 0 neu. Startet ein Dienst zu oft hintereinander (Standard: fünfmal in zehn Sekunden), gibt systemd auf und meldet `start request repeated too quickly`.
+
+  **`[Install]`** wird nur von `enable` gelesen: `WantedBy=multi-user.target` heißt „starte mich, wenn das System normal hochfährt“.
+
+  > [!TIP] Units prüfen, bevor du sie aktivierst
+  > `systemd-analyze verify /etc/systemd/system/shop.service` meldet Tippfehler in Direktiven und fehlende Programme. Danach: `sudo systemctl daemon-reload`, `sudo systemctl enable --now shop`, `systemctl status shop`.
+
+  > [!INTERVIEW] „Wie betreibst du eine App auf einem Linux-Server?“
+  > Als systemd-Service: eigener Systembenutzer, `ExecStart` mit absolutem Pfad zur App im Vordergrund, `Restart=on-failure`, Konfiguration und Secrets per `EnvironmentFile` mit restriktiven Rechten, `After=`/`Wants=` für Abhängigkeiten wie die Datenbank. Logs gehen auf stdout und landen im Journal, `enable --now` sorgt für den Start beim Booten. Davor sitzt ein Reverse Proxy wie nginx, der TLS terminiert. Wer mag, ergänzt Härtung wie `NoNewPrivileges=yes` oder `ProtectSystem=strict`.
+
+  ## Timer statt cron
+
+  Ein **Timer** startet eine andere Unit zu bestimmten Zeiten, standardmäßig die Service-Unit mit demselben Namen ([systemd.timer(5)](https://www.freedesktop.org/software/systemd/man/latest/systemd.timer.html)). Die Arbeit selbst beschreibt eine `oneshot`-Unit:
+
+  ```ini title=/etc/systemd/system/db-backup.service
+  [Unit]
+  Description=PostgreSQL-Backup der Shop-Datenbank
+
+  [Service]
+  Type=oneshot
+  User=postgres
+  ExecStart=/usr/local/bin/db-backup.sh
+  ```
+
+  ```ini title=/etc/systemd/system/db-backup.timer
+  [Unit]
+  Description=Tägliches Datenbank-Backup um 03:00
+
+  [Timer]
+  OnCalendar=*-*-* 03:00:00
+  Persistent=true
+  RandomizedDelaySec=10min
+
+  [Install]
+  WantedBy=timers.target
+  ```
+
+  Aktiviert wird der **Timer**, nicht der Service: `sudo systemctl enable --now db-backup.timer`. `OnCalendar=` hat ein eigenes Format `Wochentag Jahr-Monat-Tag Stunde:Minute:Sekunde`, nicht die fünf Felder von cron ([systemd.time(7) · Calendar Events](https://www.freedesktop.org/software/systemd/man/latest/systemd.time.html#Calendar%20Events)). Ob du es richtig geschrieben hast, prüfst du, bevor du dich darauf verlässt:
+
+  ```console
+  $ systemd-analyze calendar "Mon..Fri 9:00"
+    Original form: Mon..Fri 9:00
+  Normalized form: Mon..Fri *-*-* 09:00:00
+      Next elapse: Tue 2026-09-29 09:00:00 CEST
+         From now: 14h left
+  $ systemctl list-timers
+  NEXT                         LEFT LAST                         PASSED UNIT             ACTIVATES
+  Tue 2026-09-29 03:04:12 CEST   8h Mon 2026-09-28 03:02:51 CEST    15h db-backup.timer  db-backup.service
+  ```
+
+  Warum Timer statt cron? `Persistent=true` holt einen verpassten Lauf nach, wenn der Rechner zur geplanten Zeit aus war – für Laptops und Desktops entscheidend. Jeder Lauf landet mit Exit-Status im Journal (`journalctl -u db-backup`), statt in einer Mail an root, die niemand liest. Ein laufendes Backup startet nicht doppelt, und der Service lässt sich zum Testen jederzeit per `systemctl start db-backup.service` von Hand auslösen. `RandomizedDelaySec=` verteilt Last, wenn viele Server zur selben Minute starten würden.
+
+  ### User-Units und Lingering
+
+  Dienste nur für deinen Benutzer brauchen kein root. Du legst sie unter `~/.config/systemd/user/` ab und steuerst sie mit `systemctl --user` und `journalctl --user` – für Desktop-Aufgaben wie ein Backup deiner Notizen genau richtig ([ArchWiki · systemd/User](https://wiki.archlinux.org/title/Systemd/User)). Die User-Instanz von systemd läuft, solange du angemeldet bist. Sollen deine User-Units auch ohne Login laufen, etwa auf einem Server, aktivierst du **Lingering**: `sudo loginctl enable-linger steven` ([loginctl(1)](https://www.freedesktop.org/software/systemd/man/latest/loginctl.html)).
+
+  ## Logs mit journalctl
+
+  `systemd-journald` sammelt die Ausgaben aller Dienste, Kernel-Meldungen und Syslog-Nachrichten in einem strukturierten, indizierten Journal. Jede Zeile trägt Metadaten: Unit, PID, Priorität, Boot-ID. Deshalb kannst du danach filtern ([journalctl(1)](https://www.freedesktop.org/software/systemd/man/latest/journalctl.html)):
+
+  | Befehl | Zeigt |
+  | --- | --- |
+  | `journalctl -u shop` | alle Meldungen einer Unit |
+  | `journalctl -u shop -f` | live mitlesen, wie `tail -f` |
+  | `journalctl -b` | alles seit dem aktuellen Boot |
+  | `journalctl -b -1` | alles aus dem vorigen Boot – nach einem Absturz Gold wert |
+  | `journalctl --since "1 hour ago"` | Zeitfenster, auch `--since today`, `--until "2026-09-28 10:00"` |
+  | `journalctl -p err` | Priorität `err` und schwerer (`crit`, `alert`, `emerg`) |
+  | `journalctl -u shop -o cat` | nur die Nachrichten, ohne Zeitstempel und Hostname |
+  | `journalctl -u shop -o json` | jede Zeile als JSON mit allen Feldern, gut für `jq` |
+  | `journalctl -k` | nur Kernel-Meldungen |
+  | `journalctl --disk-usage` | wie viel Platz das Journal belegt |
+
+  Die Filter lassen sich kombinieren: `journalctl -u shop -b -p warning --since "10:00"` zeigt Warnungen und Schlimmeres der Shop-API seit zehn Uhr im aktuellen Boot. Die Prioritäten folgen syslog: `emerg` (0), `alert`, `crit`, `err`, `warning`, `notice`, `info`, `debug` (7) ([journalctl · -p](https://www.freedesktop.org/software/systemd/man/latest/journalctl.html#-p)). Achtung: Zeilen, die ein Dienst auf stdout oder stderr schreibt, bekommen standardmäßig die Priorität `info` – ein `-p err` blendet also auch Fehlermeldungen deiner App aus, wenn sie nur als Text `ERROR` enthalten. Dann hilft die Textsuche `journalctl -u shop -g ERROR`.
+
+  Zwei Details aus dem Betrieb: `-b -1` funktioniert nur, wenn das Journal **persistent** ist. Mit der Standardeinstellung `Storage=auto` ist das der Fall, sobald das Verzeichnis `/var/log/journal` existiert; sonst liegt das Journal nur im RAM unter `/run/log/journal` und ist nach dem Neustart weg ([journald.conf(5)](https://www.freedesktop.org/software/systemd/man/latest/journald.conf.html)). Und die Größe begrenzt journald selbst (standardmäßig auf einen Anteil des Dateisystems); einmalig aufräumen kannst du mit `sudo journalctl --vacuum-time=2weeks` oder `--vacuum-size=500M`.
+
+  > [!PRAXIS] Der Weg vom Alarm zur Ursache
+  > Ein Dienst ist ausgefallen. Die Reihenfolge, die sich im Betrieb bewährt: `systemctl list-units --failed` (was ist kaputt?), `systemctl status shop` (Exit-Code, letzte Zeilen), `journalctl -u shop -b -e` (springt ans Ende der Meldungen seit dem Boot), bei Bedarf `journalctl -b -p err` für das ganze System. Der Exit-Status in `status` verrät oft schon die Richtung: `status=203/EXEC` heißt, das Programm aus `ExecStart=` ließ sich nicht starten; `status=217/USER`, dass der Benutzer aus `User=` nicht existiert ([systemd.exec · Process Exit Codes](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#Process%20Exit%20Codes)).
+
+  ## Häufige Fehler
+
+  - **Unit geändert, `daemon-reload` vergessen.** Der Dienst startet mit der alten Definition. Nach Handarbeit an Unit-Dateien immer `sudo systemctl daemon-reload`; `systemctl edit` erledigt das selbst.
+  - **Paket-Unit unter `/usr/lib/systemd/system` bearbeitet.** Das nächste Update überschreibt die Änderung. Nutze `systemctl edit`.
+  - **Shell-Syntax in `ExecStart=`.** `cd /srv/app && npm start` oder `> app.log` funktionieren nicht. Setze `WorkingDirectory=` und lass Logs ins Journal gehen.
+  - **Dienst schickt sich selbst in den Hintergrund** (etwa `--daemon`) bei `Type=simple` oder `exec`. systemd hält den Dienst für beendet und räumt die übrigen Prozesse ab. Den Vordergrund-Modus des Programms nutzen.
+  - **`enable` ohne `--now`** und wundern, dass nichts läuft – oder `start` ohne `enable` und wundern, dass nach dem Reboot nichts läuft.
+  - **`After=network.target`** für einen Dienst, der beim Start eine entfernte Datenbank erreichen muss. Richtig: `Wants=` und `After=network-online.target`.
+  - **Cron-Syntax in `OnCalendar=`.** `0 3 * * *` ist ungültig; `systemd-analyze calendar` deckt das vor dem Einsatz auf.
+  - **Den Service statt den Timer aktivieren.** `enable db-backup.service` hat ohne `[Install]`-Abschnitt keine Wirkung; aktiviert wird `db-backup.timer`.
+
+  ## Zusammenfassung
+
+  - Boot: Firmware → Bootloader → Kernel → initramfs (findet das Root-Dateisystem) → systemd als PID 1 → `default.target`.
+  - Units sind INI-Dateien; eigene gehören nach `/etc/systemd/system`, Anpassungen fremder Units als Drop-in per `systemctl edit`.
+  - `start`/`stop` wirken jetzt, `enable`/`disable` beim Boot, `--now` verbindet beides. `reload` betrifft den Dienst, `daemon-reload` systemd selbst.
+  - Eine gute Service-Unit hat `Type=exec` (oder `oneshot` für Jobs), einen eigenen `User=`, `WorkingDirectory=`, `EnvironmentFile=` für Secrets, `Restart=on-failure` und passende `Wants=`/`After=`.
+  - `ExecStart=` ist keine Shell: keine Umleitungen, Pipes oder `&&`.
+  - Timer ersetzen cron: `OnCalendar=`, `Persistent=true`, Timer aktivieren, Zeitangaben mit `systemd-analyze calendar` prüfen, Überblick mit `list-timers`.
+  - `journalctl -u`, `-b`, `-b -1`, `-p err`, `--since`, `-f`, `-o cat/json` beantworten fast jede Frage nach dem Warum.
+  - User-Units liegen unter `~/.config/systemd/user`; mit Lingering laufen sie auch ohne Login.
+exercises:
+  - id: reload-restart-daemon-reload
+    type: choice
+    title: Drei Arten von „neu laden“
+    prompt: Welche Aussagen stimmen?
+    options:
+      - text: "`systemctl reload nginx` lässt nginx seine Konfiguration neu lesen, ohne den Dienst zu stoppen – vorausgesetzt, die Unit definiert `ExecReload=`."
+        correct: true
+        why: "`reload` führt `ExecReload=` aus; bei nginx schickt das ein `SIGHUP` an den Masterprozess. Offene Verbindungen bleiben bestehen."
+      - text: "`systemctl daemon-reload` lädt die Konfigurationsdateien aller laufenden Dienste neu, also auch `/etc/nginx/nginx.conf`."
+        correct: false
+        why: "`daemon-reload` lässt nur systemd seine eigenen Unit-Dateien neu einlesen. Die Dienste selbst merken davon nichts."
+      - text: Nachdem du `/etc/systemd/system/shop.service` mit einem Editor geändert hast, brauchst du `daemon-reload`, bevor `restart` die Änderung übernimmt.
+        correct: true
+        why: systemd hält Unit-Definitionen im Speicher. Ohne `daemon-reload` startet `restart` den Dienst mit der alten Fassung.
+      - text: "`restart` ist immer die schonendere Wahl als `reload`, weil der Dienst frisch startet."
+        correct: false
+        why: "`restart` stoppt den Dienst vollständig – laufende Anfragen brechen ab, und bei einem Konfigurationsfehler startet er nicht wieder. `reload` ist schonender, wenn der Dienst es unterstützt."
+    explanation: |
+      Es gibt zwei Ebenen: den **Dienst** mit seiner eigenen Konfiguration (`reload`, `restart`) und **systemd** mit den Unit-Dateien (`daemon-reload`). Wer eine Unit ändert, braucht `daemon-reload`; wer die Konfiguration des Programms ändert, braucht `reload` oder `restart`. Bei nginx gehört vorher `nginx -t` dazu, damit ein Tippfehler nicht den laufenden Dienst trifft.
+    resources:
+      - title: systemctl(1) – daemon-reload
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemctl.html#daemon-reload
+
+  - id: bootvorgang-ordnen
+    type: order
+    title: Vom Einschalten bis zum Login
+    prompt: Bring die Etappen des Bootvorgangs eines UEFI-Systems in die richtige Reihenfolge.
+    lang: text
+    lines: |
+      Die UEFI-Firmware initialisiert die Hardware und startet den Bootloader von der EFI-Systempartition.
+      Der Bootloader lädt Kernel und initramfs in den Speicher und übergibt die Kernel-Kommandozeile.
+      Der Kernel initialisiert CPU, Speicher und eingebaute Treiber und entpackt die initramfs.
+      Die initramfs lädt Module, entschlüsselt bei Bedarf die Platte und hängt das echte Root-Dateisystem ein.
+      Per switch_root wird das echte Root-Dateisystem zur Wurzel, systemd läuft dort als PID 1.
+      systemd startet alle Units, die default.target braucht, so parallel wie möglich.
+      Der Login-Manager oder die Konsole zeigt die Anmeldung.
+    explanation: |
+      Jede Etappe bereitet die nächste vor: Die Firmware kennt nur die EFI-Partition, der Bootloader nur Kernel und initramfs, und die initramfs existiert, weil der Kernel für das echte Root-Dateisystem womöglich Treiber oder eine Passphrase braucht, die er noch nicht hat. Erst dann übernimmt systemd als PID 1 und arbeitet die Abhängigkeiten von `default.target` ab. Wo ein Boot hängen bleibt, verrät dir, in welcher Etappe du suchen musst.
+    resources:
+      - title: bootup(7)
+        url: https://www.freedesktop.org/software/systemd/man/latest/bootup.html
+      - title: ArchWiki · Arch boot process
+        url: https://wiki.archlinux.org/title/Arch_boot_process
+
+  - id: wants-after
+    type: choice
+    title: Wer wartet auf wen?
+    prompt: |
+      Eine Unit enthält:
+
+      ```ini
+      [Unit]
+      After=postgresql.service
+      Wants=network-online.target
+      ```
+
+      Welche Aussagen stimmen?
+    options:
+      - text: "`After=postgresql.service` startet PostgreSQL nicht mit; es regelt nur die Reihenfolge, falls PostgreSQL ohnehin gestartet wird."
+        correct: true
+        why: "`After=` ist eine reine Ordnungsbeziehung. Mitgestartet wird eine Unit erst durch `Wants=` oder `Requires=`."
+      - text: "`Wants=network-online.target` zieht das Ziel mit, aber ohne `After=network-online.target` kann die Unit trotzdem starten, bevor das Netz bereit ist."
+        correct: true
+        why: Ohne Ordnung startet systemd beide Units parallel. Deshalb stehen `Wants=` und `After=` für `network-online.target` fast immer zusammen.
+      - text: "Mit `After=network.target` statt `network-online.target` wäre garantiert, dass IP-Adresse und DNS funktionieren."
+        correct: false
+        why: "`network.target` heißt nur, dass die Netzwerkverwaltung gestartet ist. Für ein konfiguriertes Netz ist `network-online.target` gedacht."
+      - text: Stürzt eine per `Wants=` gezogene Unit ab, stoppt systemd auch die Unit, die sie haben wollte.
+        correct: false
+        why: "`Wants=` ist die schwache Abhängigkeit – ein Ausfall der anderen Unit bleibt folgenlos. Stärkere Kopplung bieten `Requires=` und `BindsTo=`."
+    explanation: |
+      Abhängigkeit (`Wants=`, `Requires=`) und Reihenfolge (`After=`, `Before=`) sind in systemd zwei getrennte Achsen. Ein Dienst, der beim Start eine Datenbank braucht, benötigt beides. Das ist eine häufige Ursache für Dienste, die beim manuellen Start funktionieren, beim Booten aber scheitern: Sie starten schneller als ihre Abhängigkeit.
+    resources:
+      - title: systemd.unit(5) – Wants=
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html#Wants=
+      - title: systemd.io · Running Services After the Network Is Up
+        url: https://systemd.io/NETWORK_ONLINE/
+
+  - id: enabled-aber-inaktiv
+    type: output
+    title: Aktiviert heißt nicht aktiv
+    prompt: |
+      Auf einem frisch eingerichteten Server hat jemand `sudo systemctl enable nginx` ausgeführt, aber weder `start` noch einen Neustart. Was geben die drei Befehle aus?
+    lang: console
+    code: |
+      $ systemctl is-enabled nginx
+      $ systemctl is-active nginx
+      $ systemctl is-active --quiet nginx && echo "läuft" || echo "läuft nicht"
+    expected: |
+      enabled
+      inactive
+      läuft nicht
+    explanation: |
+      `enable` hat nur den Symlink für den nächsten Boot angelegt, deshalb meldet `is-enabled` `enabled`. Gestartet wurde nichts, also `inactive`. `is-active --quiet` gibt nichts aus, liefert aber den Exit-Status 0 nur für `active` – deshalb landet die Kette im `||`-Zweig. Genau diese Kombination nutzt man in Skripten und Healthchecks.
+    resources:
+      - title: systemctl(1) – is-enabled
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemctl.html#is-enabled%20UNIT%E2%80%A6
+
+  - id: calendar-normalisiert
+    type: output
+    title: Wie systemd Zeitangaben liest
+    prompt: Was steht bei den drei Aufrufen jeweils in der Zeile `Normalized form:`? Gib nur die drei normalisierten Ausdrücke aus, einen pro Zeile.
+    lang: console
+    code: |
+      $ systemd-analyze calendar "03:00"
+      $ systemd-analyze calendar "Mon..Fri 9:00"
+      $ systemd-analyze calendar weekly
+    expected: |
+      *-*-* 03:00:00
+      Mon..Fri *-*-* 09:00:00
+      Mon *-*-* 00:00:00
+    explanation: |
+      Die vollständige Form ist `Wochentag Jahr-Monat-Tag Stunde:Minute:Sekunde`. Fehlende Teile ergänzt systemd: Ein fehlendes Datum wird zu `*-*-*` (jeden Tag), fehlende Sekunden zu `:00`. `weekly` ist eine Abkürzung für Montag 00:00 Uhr. Wer die normalisierte Form liest, erkennt Fehler sofort – etwa dass `weekly` nicht „alle sieben Tage ab jetzt“ bedeutet.
+    resources:
+      - title: systemd.time(7) – Calendar Events
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemd.time.html#Calendar%20Events
+
+  - id: enable-now
+    type: command
+    title: Jetzt und bei jedem Boot
+    prompt: Sorge mit **einem** Befehl dafür, dass `nginx` sofort startet und außerdem bei jedem Boot gestartet wird.
+    context: Du bist als normaler Benutzer mit sudo-Rechten angemeldet.
+    answers:
+      - sudo systemctl enable --now nginx
+      - sudo systemctl enable --now nginx.service
+      - sudo systemctl --now enable nginx
+      - sudo systemctl --now enable nginx.service
+      - sudo systemctl enable nginx --now
+      - sudo systemctl enable nginx.service --now
+    output: |
+      Created symlink '/etc/systemd/system/multi-user.target.wants/nginx.service' → '/usr/lib/systemd/system/nginx.service'.
+    explanation: |
+      `enable` legt anhand von `WantedBy=` im `[Install]`-Abschnitt einen Symlink an, `--now` startet die Unit zusätzlich sofort. Ohne `--now` würde nginx erst beim nächsten Boot laufen. Die Kombination aus zwei Befehlen, `sudo systemctl enable nginx && sudo systemctl start nginx`, bewirkt dasselbe; gefragt war hier ein einziger Befehl. Das Gegenstück ist `disable --now`.
+    resources:
+      - title: systemctl(1) – enable
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemctl.html#enable%20UNIT%E2%80%A6
+
+  - id: journal-fehler-seit-boot
+    type: command
+    title: Nur die Warnungen seit dem Boot
+    prompt: Zeige alle Meldungen der Unit `shop` seit dem **aktuellen Boot**, aber nur mit Priorität `warning` oder schwerer. Nutze die Kurzoptionen und das Schlüsselwort `warning`.
+    context: Die Shop-API hat heute Nacht mehrfach neu gestartet. Du willst nicht durch Tausende Info-Zeilen scrollen.
+    answers:
+      - journalctl -u shop -b -p warning
+      - journalctl -u shop -p warning -b
+      - journalctl -b -u shop -p warning
+      - journalctl -b -p warning -u shop
+      - journalctl -p warning -u shop -b
+      - journalctl -p warning -b -u shop
+      - journalctl -u shop.service -b -p warning
+      - journalctl -u shop.service -p warning -b
+      - journalctl -b -u shop.service -p warning
+      - journalctl -b -p warning -u shop.service
+      - journalctl -p warning -u shop.service -b
+      - journalctl -p warning -b -u shop.service
+      - sudo journalctl -u shop -b -p warning
+      - sudo journalctl -b -u shop -p warning
+      - sudo journalctl -u shop -p warning -b
+    output: |
+      Sep 28 02:14:09 web01 systemd[1]: shop.service: Main process exited, code=killed, status=9/KILL
+      Sep 28 02:14:09 web01 systemd[1]: shop.service: Failed with result 'signal'.
+    explanation: |
+      `-u` filtert nach Unit, `-b` ohne Argument auf den aktuellen Boot, `-p warning` auf `warning` und alle schwereren Stufen (`err`, `crit`, `alert`, `emerg`). Die Beispielausgabe zeigt, wie viel das bringt: Der Hauptprozess wurde per `SIGKILL` beendet (Status 9), sehr wahrscheinlich vom OOM-Killer – `journalctl -k -b` würde die Kernel-Meldung dazu zeigen. Beachte: Was ein Dienst auf stdout/stderr schreibt, speichert das Journal standardmäßig mit Priorität `info`, auch wenn in der Zeile `[ERROR]` steht. Ein Prioritätsfilter zeigt deshalb vor allem die Meldungen von systemd selbst; die Fehlermeldungen der App findest du mit `journalctl -u shop -b` oder einer Textsuche wie `-g ERROR`. Normale Benutzer sehen die Meldungen von System-Units, wenn sie in der Gruppe `systemd-journal` (auf Arch auch `wheel`) sind; sonst braucht es `sudo`.
+    resources:
+      - title: journalctl(1) – -p
+        url: https://www.freedesktop.org/software/systemd/man/latest/journalctl.html#-p
+
+  - id: drop-in-anlegen
+    type: command
+    title: Anpassen, ohne zu kopieren
+    prompt: Du willst für die vom Paket installierte Unit `shop.service` nur `RestartSec=` ändern. Öffne mit einem Befehl einen Editor für einen **Drop-in**, der die Originaldatei unangetastet lässt.
+    context: Du bist als normaler Benutzer mit sudo-Rechten angemeldet.
+    answers:
+      - sudo systemctl edit shop
+      - sudo systemctl edit shop.service
+      - sudo systemctl edit --drop-in=override.conf shop
+    output: |
+      ### Editing /etc/systemd/system/shop.service.d/override.conf
+      ### Anything between here and the comment below will become the contents of the drop-in file
+
+      [Service]
+      RestartSec=10
+
+      ### Edits below this comment will be discarded
+    explanation: |
+      `systemctl edit` legt `/etc/systemd/system/shop.service.d/override.conf` an und führt nach dem Speichern selbst `daemon-reload` aus. Im Drop-in stehen nur der Abschnitt und die Direktiven, die du ändern willst; alles andere erbt die Unit aus der Paketdatei. `systemctl cat shop` zeigt danach Original und Drop-in untereinander. Mit `--full` würdest du stattdessen eine vollständige Kopie anlegen, die spätere Verbesserungen des Pakets verdeckt. Für den Neustart mit der neuen Einstellung folgt noch `sudo systemctl restart shop`.
+    resources:
+      - title: systemctl(1) – edit
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemctl.html#edit%20UNIT%E2%80%A6
+
+  - id: service-unit-luecken
+    type: gap
+    title: Eine Unit für die Shop-API
+    prompt: |
+      Ergänze die Unit. Anforderungen: Der Dienst startet erst, wenn das Netz konfiguriert ist; systemd soll den Start als gescheitert melden, wenn sich das Programm nicht ausführen lässt; er läuft als Benutzer `shop`; Secrets kommen aus `/etc/shop/shop.env`; nach einem Absturz startet er neu, nach einem sauberen Beenden nicht; er startet beim normalen Hochfahren des Servers.
+    lang: ini
+    code: |
+      [Unit]
+      Description=Shop API (Gunicorn)
+      ⟦After⟧=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=⟦exec⟧
+      User=⟦shop⟧
+      WorkingDirectory=/srv/shop
+      ⟦EnvironmentFile⟧=/etc/shop/shop.env
+      ExecStart=/srv/shop/.venv/bin/gunicorn --workers 4 --bind 127.0.0.1:8000 shop.wsgi:application
+      Restart=⟦on-failure⟧
+      RestartSec=5
+
+      [Install]
+      WantedBy=⟦multi-user.target⟧
+    gaps:
+      - label: Reihenfolge
+        hint: "`Wants=` zieht das Ziel nur mit. Welche Direktive legt fest, dass gewartet wird?"
+      - label: Starttyp
+        hint: Der Typ, bei dem systemd auf ein erfolgreiches `execve` wartet.
+      - label: Benutzer
+        hint: Steht in der Aufgabe.
+      - label: Secrets aus Datei
+        hint: "`Environment=` setzt einzelne Variablen; diese Direktive liest eine Datei."
+      - label: Neustart-Regel
+        hint: Nicht `always` – nach `exit 0` soll nichts passieren.
+      - label: Ziel beim normalen Hochfahren
+        hint: Das Ziel für einen Server ohne grafische Oberfläche.
+    explanation: |
+      `Wants=` plus `After=network-online.target` ist das Paar für „erst starten, wenn das Netz da ist“. `Type=exec` meldet einen Fehler schon bei `systemctl start`, wenn das Programm fehlt oder der Benutzer nicht existiert – bei `simple` würde `start` Erfolg melden. `EnvironmentFile=` hält Secrets aus der Unit heraus, die jeder mit `systemctl cat` lesen kann. `Restart=on-failure` reagiert auf Exit-Codes ungleich 0, Signale und Timeouts, nicht auf ein sauberes Ende. `WantedBy=multi-user.target` wird von `enable` gelesen.
+    resources:
+      - title: systemd.service(5) – Type=
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html#Type=
+      - title: systemd.exec(5) – EnvironmentFile=
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#EnvironmentFile=
+
+  - id: execstart-umleitung
+    type: bug
+    title: Gunicorn versteht die Argumente nicht
+    prompt: |
+      Nach `sudo systemctl start shop` bleibt der Dienst im Zustand `failed`. `journalctl -u shop -o cat` zeigt:
+
+      ```text
+      usage: gunicorn [OPTIONS] [APP_MODULE]
+      gunicorn: error: unrecognized arguments: >> /var/log/shop/gunicorn.log 2>&1
+      ```
+
+      Von Hand gestartet funktioniert derselbe Befehl in der Shell. Finde die fehlerhafte Zeile und korrigiere sie so, dass die Ausgaben ins Journal gehen.
+    lang: ini
+    code: |
+      [Unit]
+      Description=Shop API (Gunicorn)
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=exec
+      User=shop
+      WorkingDirectory=/srv/shop
+      EnvironmentFile=/etc/shop/shop.env
+      ExecStart=/srv/shop/.venv/bin/gunicorn --workers 4 --bind 127.0.0.1:8000 shop.wsgi:application >> /var/log/shop/gunicorn.log 2>&1
+      Restart=on-failure
+
+      [Install]
+      WantedBy=multi-user.target
+    lines: [11]
+    fix:
+      - line: 11
+        answers:
+          - ExecStart=/srv/shop/.venv/bin/gunicorn --workers 4 --bind 127.0.0.1:8000 shop.wsgi:application
+    explanation: |
+      `ExecStart=` wird nicht von einer Shell ausgeführt. systemd zerlegt die Zeile nur in Wörter und übergibt `>>`, den Pfad und `2>&1` als gewöhnliche Argumente an Gunicorn, das sie nicht kennt. In der Shell funktioniert derselbe Befehl, weil dort die Shell die Umleitung vorher auswertet. Die Lösung: Umleitung weglassen. stdout und stderr landen automatisch im Journal, mit Zeitstempel, Rotation und Filterbarkeit. Wer trotzdem eine Datei braucht, nutzt `StandardOutput=append:/var/log/shop/gunicorn.log` in einer eigenen Zeile.
+    resources:
+      - title: systemd.service(5) – Command lines
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html
+      - title: systemd.exec(5) – StandardOutput=
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html
+
+  - id: timer-cron-syntax
+    type: bug
+    title: Das Backup läuft nie
+    prompt: |
+      `sudo systemctl enable --now db-backup.timer` bricht mit `Unit db-backup.timer has a bad unit file setting` ab. `journalctl -b` enthält:
+
+      ```text
+      systemd[1]: /etc/systemd/system/db-backup.timer:5: Failed to parse calendar specification, ignoring: 0 3 * * *
+      systemd[1]: db-backup.timer: Timer unit lacks value setting. Refusing.
+      ```
+
+      Das Backup soll täglich um 03:00 Uhr laufen und einen verpassten Lauf nachholen. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: ini
+    code: |
+      [Unit]
+      Description=Tägliches Datenbank-Backup
+
+      [Timer]
+      OnCalendar=0 3 * * *
+      Persistent=true
+
+      [Install]
+      WantedBy=timers.target
+    lines: [5]
+    fix:
+      - line: 5
+        answers:
+          - OnCalendar=*-*-* 03:00:00
+          - OnCalendar=*-*-* 03:00
+          - OnCalendar=03:00
+          - OnCalendar=03:00:00
+          - OnCalendar=*-*-* 3:00
+          - OnCalendar=3:00
+    explanation: |
+      `0 3 * * *` ist die Crontab-Schreibweise (Minute, Stunde, Tag, Monat, Wochentag). systemd kennt ein eigenes Format, `Wochentag Jahr-Monat-Tag Stunde:Minute:Sekunde`, in dem fehlende Teile ergänzt werden – `03:00` genügt. systemd ignoriert die ungültige Zeile und verweigert dann den Timer, weil er keine Zeitangabe mehr hat – die Unit landet im Ladezustand `bad-setting`, und jeder Start scheitert. Die Lehre: jede neue Zeitangabe vorher mit `systemd-analyze calendar "…"` prüfen und nach dem Aktivieren in `systemctl list-timers` die Spalte `NEXT` ansehen.
+    resources:
+      - title: systemd.time(7) – Calendar Events
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemd.time.html#Calendar%20Events
+      - title: systemd.timer(5) – OnCalendar=
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemd.timer.html#OnCalendar=
+
+  - id: status-203-erklaeren
+    type: explain
+    title: Was sagt dieser Status?
+    prompt: Ein Kollege schickt dir diese Ausgabe mit der Frage „Warum läuft die API nicht?“. Erkläre Zeile für Zeile, was du daraus liest, und nenne die wahrscheinliche Ursache.
+    lang: console
+    code: |
+      $ systemctl status shop
+      × shop.service - Shop API (Gunicorn)
+           Loaded: loaded (/etc/systemd/system/shop.service; enabled; preset: disabled)
+          Drop-In: /etc/systemd/system/shop.service.d
+                   └─override.conf
+           Active: failed (Result: exit-code) since Mon 2026-09-28 09:14:03 CEST; 2min ago
+         Duration: 3ms
+          Process: 48231 ExecStart=/srv/shop/.venv/bin/gunicorn --workers 4 --bind 127.0.0.1:8000 shop.wsgi:application (code=exited, status=203/EXEC)
+         Main PID: 48231 (code=exited, status=203/EXEC)
+
+      Sep 28 09:14:03 web01 (gunicorn)[48231]: shop.service: Unable to locate executable '/srv/shop/.venv/bin/gunicorn': No such file or directory
+      Sep 28 09:14:03 web01 (gunicorn)[48231]: shop.service: Failed at step EXEC spawning /srv/shop/.venv/bin/gunicorn: No such file or directory
+      Sep 28 09:14:03 web01 systemd[1]: shop.service: Start request repeated too quickly.
+      Sep 28 09:14:03 web01 systemd[1]: shop.service: Failed with result 'exit-code'.
+      Sep 28 09:14:03 web01 systemd[1]: Failed to start shop.service - Shop API (Gunicorn).
+    points:
+      - Die Unit ist geladen und `enabled`, startet also beim Boot; es gibt zusätzlich einen Drop-in, der Einstellungen überschreiben könnte.
+      - "`failed` mit `status=203/EXEC` heißt: Das Programm aus `ExecStart=` ließ sich gar nicht starten – der Code der App lief nie."
+      - Die Journalzeilen nennen die Ursache – die Datei `/srv/shop/.venv/bin/gunicorn` existiert nicht, etwa weil das virtuelle Environment fehlt, neu angelegt oder an einen anderen Ort verschoben wurde.
+      - "`Restart=` hat mehrmals neu versucht; nach zu vielen Starts in kurzer Zeit hat systemd aufgegeben (`Start request repeated too quickly`)."
+      - "Nächste Schritte: venv prüfen bzw. neu anlegen, `systemctl cat shop` auf den Drop-in ansehen, dann `systemctl reset-failed shop` und `systemctl start shop`."
+    explanation: |
+      Die Unit ist korrekt geladen und für den Boot aktiviert, und ein Drop-in in `shop.service.d` ergänzt sie – den würde ich mir mit `systemctl cat shop` ansehen, weil er `ExecStart` überschreiben könnte. Der Dienst ist `failed`, und der Exit-Status `203/EXEC` ist kein Fehler der App, sondern von systemd: Der `execve`-Aufruf ist gescheitert. Die Journalzeilen sagen, warum – die Gunicorn-Datei im venv existiert nicht. Typisch ist ein Deployment, das das venv gelöscht und nicht neu gebaut hat, oder ein anderer Pfad. `Restart=on-failure` hat es mehrfach versucht, bis das Startlimit griff. Ich würde das venv wiederherstellen (`python -m venv` und Abhängigkeiten installieren), den Zähler mit `systemctl reset-failed shop` zurücksetzen und den Dienst neu starten.
+    resources:
+      - title: systemd.exec(5) – Process Exit Codes
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#Process%20Exit%20Codes
+
+  - id: notizen-backup-timer
+    type: practice
+    title: Ein Backup-Timer für deine Notizen
+    prompt: |
+      Richte auf deinem CachyOS als **User-Units** (ohne root) ein tägliches Backup ein:
+
+      - `notizen-backup.service` spiegelt `~/Notizen/` mit `rsync -a --delete` nach `~/Backups/Notizen/`.
+      - `notizen-backup.timer` startet es täglich um 18:00 Uhr und holt verpasste Läufe nach, wenn der Rechner aus war.
+
+      Prüfe die Zeitangabe, löse das Backup einmal von Hand aus, lies das Ergebnis im Journal, aktiviere den Timer und kontrolliere die nächste Ausführung. Tipp: In Unit-Dateien steht `%h` für dein Home-Verzeichnis.
+    lang: ini
+    starter: |
+      # ~/.config/systemd/user/notizen-backup.service
+      [Unit]
+      Description=
+
+      [Service]
+
+
+      # ~/.config/systemd/user/notizen-backup.timer
+      [Unit]
+      Description=
+
+      [Timer]
+
+
+      [Install]
+    solution: |
+      # ~/.config/systemd/user/notizen-backup.service
+      [Unit]
+      Description=Notizen nach ~/Backups/Notizen spiegeln
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/bin/rsync -a --delete %h/Notizen/ %h/Backups/Notizen/
+
+      # ~/.config/systemd/user/notizen-backup.timer
+      [Unit]
+      Description=Notizen täglich um 18:00 sichern
+
+      [Timer]
+      OnCalendar=*-*-* 18:00:00
+      Persistent=true
+
+      [Install]
+      WantedBy=timers.target
+
+      # Befehle (fish oder bash):
+      # mkdir -p ~/.config/systemd/user ~/Backups
+      # systemd-analyze calendar "*-*-* 18:00:00"
+      # systemctl --user daemon-reload
+      # systemctl --user start notizen-backup.service
+      # journalctl --user -u notizen-backup -e
+      # systemctl --user enable --now notizen-backup.timer
+      # systemctl --user list-timers
+    checklist:
+      - Der Service hat `Type=oneshot` und kein `[Install]`-Abschnitt – aktiviert wird nur der Timer.
+      - "`ExecStart=` nutzt absolute Pfade bzw. `%h` und keine Shell-Syntax wie `~` oder `>`."
+      - Der Timer hat `OnCalendar=` für 18:00 Uhr, `Persistent=true` und `WantedBy=timers.target`.
+      - Du hast die Zeitangabe mit `systemd-analyze calendar` geprüft und nach dem Anlegen `systemctl --user daemon-reload` ausgeführt.
+      - Ein manueller Start per `systemctl --user start notizen-backup.service` war erfolgreich, und `journalctl --user -u notizen-backup` zeigt den Lauf.
+      - "`systemctl --user list-timers` zeigt für `notizen-backup.timer` die nächste Ausführung um 18:00."
+    explanation: |
+      Die Aufteilung in Service (was) und Timer (wann) ist das Grundmuster aller systemd-Timer. `Type=oneshot` passt, weil `rsync` endet, sobald die Arbeit getan ist. `~` versteht systemd nicht, weil keine Shell beteiligt ist; der Specifier `%h` liefert das Home-Verzeichnis. Der abschließende Schrägstrich hinter `Notizen/` bewirkt, dass `rsync` den **Inhalt** spiegelt statt eines Unterordners – mehr dazu im Netzwerk-Modul. `Persistent=true` holt das Backup nach, wenn der Rechner um 18:00 Uhr aus war. Weil es User-Units sind, laufen sie, solange du angemeldet bist; auf einem Server ohne Login bräuchte es `loginctl enable-linger`.
+    resources:
+      - title: ArchWiki · systemd/Timers
+        url: https://wiki.archlinux.org/title/Systemd/Timers
+      - title: systemd.timer(5) – Persistent=
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemd.timer.html#Persistent=

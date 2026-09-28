@@ -1,0 +1,922 @@
+id: smart-pointer
+title: Smart Pointer
+level: 3
+minutes: 150
+summary: Box, Rc, RefCell, Cell, Weak und Arc – wann Rusts Ein-Besitzer-Modell nicht reicht, welcher Zeiger das Problem löst und welchen Preis du dafür zahlst.
+goals:
+  - Du setzt `Box<T>` für rekursive Typen und Trait-Objekte ein und erklärst, warum es dort nötig ist.
+  - Du erklärst, was `Deref` und `Drop` leisten, und sagst die Drop-Reihenfolge eines Programms vorher.
+  - Du teilst Besitz mit `Rc<T>` und liest `strong_count` und `weak_count` richtig.
+  - Du nutzt `RefCell<T>` und `Cell<T>` für Interior Mutability und erkennst Code, der zur Laufzeit mit „already borrowed“ abstürzt.
+  - Du vermeidest Referenzzyklen mit `Weak<T>`, etwa in Bäumen mit Elternzeigern.
+  - Du wählst begründet zwischen `Box`, `Rc`, `Arc`, `RefCell`, `Cell` und einer Umgestaltung ohne Smart Pointer.
+resources:
+  - title: The Rust Book · Kapitel 15 – Smart Pointers
+    url: https://doc.rust-lang.org/book/ch15-00-smart-pointers.html
+  - title: std::rc – Referenzzählung
+    url: https://doc.rust-lang.org/std/rc/index.html
+  - title: std::cell – Shareable mutable containers
+    url: https://doc.rust-lang.org/std/cell/index.html
+  - title: The Rust Reference · Destructors
+    url: https://doc.rust-lang.org/reference/destructors.html
+  - title: Rust by Example · Rc
+    url: https://doc.rust-lang.org/rust-by-example/std/rc.html
+lesson: |
+  Das Ownership-Modell aus den ersten Modulen hat eine klare Form: Jeder Wert hat genau einen Besitzer, Referenzen leben kürzer als ihr Ziel, und veränderbarer Zugriff ist exklusiv. Daraus entstehen Bäume von Besitz. Echte Daten sind aber nicht immer Bäume. Ein Ausdrucksparser braucht einen Typ, der sich selbst enthält. Eine Konfiguration wird von fünf Komponenten gelesen, und keine davon ist „die“ Besitzerin. Ein Verzeichnisbaum soll vom Kind zum Elternordner navigieren können. Ein Test-Mock soll Aufrufe mitschreiben, obwohl die Schnittstelle nur `&self` erlaubt.
+
+  In TypeScript löst der Garbage Collector all das stillschweigend: Jedes Objekt ist eine geteilte Referenz, und irgendwann wird aufgeräumt. Rust hat keinen Garbage Collector. Stattdessen gibt es **Smart Pointer**: Structs, die Daten besitzen, sich über `Deref` wie Referenzen benutzen lassen und über `Drop` beim Verlassen des Gültigkeitsbereichs aufräumen ([Rust Book, Kap. 15](https://doc.rust-lang.org/book/ch15-00-smart-pointers.html)). Jeder davon löst genau ein Problem – und jeder hat Kosten, die du kennen solltest.
+
+  ## `Box<T>`: ein Besitzer, Daten auf dem Heap
+
+  `Box::new(wert)` legt den Wert auf dem Heap ab. Auf dem Stack bleibt nur ein Zeiger, der immer gleich groß ist (auf 64-Bit-Systemen 8 Byte). Der Besitz bleibt eindeutig: Die Box gehört genau einer Variable, und wenn diese ungültig wird, gibt `Drop` den Heap-Speicher frei. Zur Laufzeit kostet eine Box eine Allokation, sonst nichts.
+
+  Wofür braucht man das? Hauptsächlich für zwei Fälle.
+
+  **Rekursive Typen.** Der Compiler muss die Größe jedes Typs kennen. Ein Typ, der sich direkt selbst enthält, wäre unendlich groß:
+
+  ```rust nocheck
+  enum Ausdruck {
+      Zahl(f64),
+      Plus(Ausdruck, Ausdruck), // error[E0072]: recursive type `Ausdruck` has infinite size
+  }
+  ```
+
+  Mit einer Box enthält `Plus` nur zwei Zeiger fester Größe ([Rust Book, Kap. 15.1](https://doc.rust-lang.org/book/ch15-01-box.html#enabling-recursive-types-with-boxes)):
+
+  ```rust
+  enum Ausdruck {
+      Zahl(f64),
+      Plus(Box<Ausdruck>, Box<Ausdruck>),
+      Mal(Box<Ausdruck>, Box<Ausdruck>),
+  }
+
+  use Ausdruck::{Mal, Plus, Zahl};
+
+  fn auswerten(a: &Ausdruck) -> f64 {
+      match a {
+          Zahl(n) => *n,
+          Plus(l, r) => auswerten(l) + auswerten(r),
+          Mal(l, r) => auswerten(l) * auswerten(r),
+      }
+  }
+
+  fn main() {
+      // (2 + 3) * 4
+      let a = Mal(
+          Box::new(Plus(Box::new(Zahl(2.0)), Box::new(Zahl(3.0)))),
+          Box::new(Zahl(4.0)),
+      );
+      println!("{}", auswerten(&a)); // 20
+  }
+  ```
+
+  **Trait-Objekte.** Verschiedene Typen, die denselben Trait implementieren, haben unterschiedliche Größen. In einem `Vec` brauchen alle Elemente dieselbe Größe – also speicherst du Zeiger: `Box<dyn Trait>`. Aufrufe laufen dann über eine vtable (dynamic dispatch).
+
+  ```rust
+  trait Regel {
+      fn pruefe(&self, passwort: &str) -> Result<(), String>;
+  }
+
+  struct MindestLaenge(usize);
+  struct EnthaeltZiffer;
+
+  impl Regel for MindestLaenge {
+      fn pruefe(&self, passwort: &str) -> Result<(), String> {
+          if passwort.chars().count() >= self.0 { Ok(()) } else { Err(format!("mindestens {} Zeichen", self.0)) }
+      }
+  }
+
+  impl Regel for EnthaeltZiffer {
+      fn pruefe(&self, passwort: &str) -> Result<(), String> {
+          if passwort.chars().any(|c| c.is_ascii_digit()) { Ok(()) } else { Err("mindestens eine Ziffer".into()) }
+      }
+  }
+
+  fn main() {
+      let regeln: Vec<Box<dyn Regel>> = vec![Box::new(MindestLaenge(12)), Box::new(EnthaeltZiffer)];
+      for regel in &regeln {
+          if let Err(fehler) = regel.pruefe("geheim") {
+              println!("{fehler}");
+          }
+      }
+  }
+  ```
+
+  Außerhalb dieser Fälle brauchst du selten eine Box. `Vec`, `String` und `HashMap` liegen ohnehin auf dem Heap.
+
+  ## `Deref` und `Drop`: was einen Smart Pointer ausmacht
+
+  **`Deref`** erlaubt `*zeiger` und – wichtiger im Alltag – **Deref-Coercion**: Wo eine `&Ziel`-Referenz erwartet wird, wandelt der Compiler `&Box<String>` automatisch über `&String` in `&str` um ([Rust Book, Kap. 15.2](https://doc.rust-lang.org/book/ch15-02-deref.html#using-deref-coercion-in-functions-and-methods)). Deshalb funktioniert `auswerten(l)` oben, obwohl `l` den Typ `&Box<Ausdruck>` hat. Die Umwandlung passiert beim Übersetzen und kostet nichts zur Laufzeit.
+
+  **`Drop`** enthält Code, der läuft, wenn ein Wert seinen Gültigkeitsbereich verlässt: Speicher freigeben, Dateien schließen, Locks lösen. Die Regeln für die Reihenfolge stehen in der [Reference](https://doc.rust-lang.org/reference/destructors.html#drop-scopes):
+
+  - Lokale Variablen werden am Ende ihres Blocks in **umgekehrter Deklarationsreihenfolge** gedroppt.
+  - Felder eines Structs werden danach in **Deklarationsreihenfolge** gedroppt.
+  - Ein verschobener Wert wird nicht am alten Ort gedroppt, sondern dort, wo er dann lebt.
+  - `drop(wert)` (aus `std::mem`, im Prelude) droppt früher. `wert.drop()` direkt aufzurufen ist verboten (`error[E0040]`), sonst liefe `Drop` doppelt.
+
+  ```rust
+  struct Verbindung(&'static str);
+
+  impl Drop for Verbindung {
+      fn drop(&mut self) {
+          println!("schließe {}", self.0);
+      }
+  }
+
+  fn main() {
+      let _db = Verbindung("Datenbank");
+      let cache = Verbindung("Cache");
+      let _log = Verbindung("Log");
+      drop(cache);
+      println!("main endet");
+  }
+  // Ausgabe: schließe Cache / main endet / schließe Log / schließe Datenbank
+  ```
+
+  Dieses Muster heißt **RAII**: Eine Ressource ist an die Lebensdauer eines Werts gebunden. `MutexGuard`, `File` und `Box` funktionieren alle so.
+
+  ## `Rc<T>`: geteilter Besitz mit Referenzzählung
+
+  Manchmal gibt es keinen einzelnen Besitzer. `Rc<T>` (reference counted) legt den Wert zusammen mit einem Zähler auf den Heap. `Rc::clone(&rc)` kopiert **nicht** die Daten, sondern erhöht den Zähler und liefert einen weiteren Zeiger auf denselben Wert. Jeder Drop verringert ihn; bei null wird der Wert freigegeben ([Rust Book, Kap. 15.4](https://doc.rust-lang.org/book/ch15-04-rc.html)).
+
+  ```rust
+  use std::rc::Rc;
+
+  struct Konfiguration {
+      api_url: String,
+      timeout_s: u64,
+  }
+
+  struct HttpClient {
+      config: Rc<Konfiguration>,
+  }
+
+  struct Uploader {
+      config: Rc<Konfiguration>,
+  }
+
+  fn main() {
+      let config = Rc::new(Konfiguration { api_url: "https://api.example.com".into(), timeout_s: 30 });
+      let client = HttpClient { config: Rc::clone(&config) };
+      println!("{}", Rc::strong_count(&config)); // 2
+      {
+          let uploader = Uploader { config: Rc::clone(&config) };
+          println!("{} / {} s", Rc::strong_count(&config), uploader.config.timeout_s); // 3 / 30 s
+      }
+      println!("{}", Rc::strong_count(&config)); // 2
+      println!("{}", client.config.api_url);
+  }
+  ```
+
+  Zwei Einschränkungen gehören zum Denkmodell:
+
+  - `Rc<T>` gibt nur **geteilte** Referenzen (`&T`) heraus. Mehrere Besitzer, die alle schreiben dürften, würden die Borrowing-Regeln brechen.
+  - Der Zähler ist nicht atomar. `Rc` ist deshalb `!Send` und kann nicht an einen anderen Thread übergeben werden – der Compiler meldet ``error[E0277]: `Rc<…>` cannot be sent between threads safely``.
+
+  > [!TIP] `Rc::clone(&a)` statt `a.clone()`
+  > Beides tut dasselbe. Die Schreibweise `Rc::clone(&a)` zeigt beim Lesen sofort, dass hier nur ein Zähler erhöht wird und keine tiefe Kopie entsteht. Das Rust Book empfiehlt diese Konvention.
+
+  ## `RefCell<T>` und `Cell<T>`: Interior Mutability
+
+  Manchmal musst du etwas verändern, obwohl du nur `&self` hast. Das klassische Beispiel ist ein Mock in Tests: Die Schnittstelle schreibt `fn sende(&self, …)` vor, der Mock will jede Nachricht mitschreiben ([Rust Book, Kap. 15.5](https://doc.rust-lang.org/book/ch15-05-interior-mutability.html#testing-with-mock-objects)).
+
+  `RefCell<T>` verschiebt die Borrowing-Regeln vom Compiler in die **Laufzeit**. `borrow()` liefert einen `Ref<T>`-Guard (geteilte Ausleihe), `borrow_mut()` einen `RefMut<T>`-Guard (exklusive Ausleihe). Die `RefCell` zählt aktive Guards. Wird eine Regel verletzt, gibt es keinen Compilerfehler, sondern eine **Panic**.
+
+  ```rust
+  use std::cell::RefCell;
+
+  trait Benachrichtiger {
+      fn sende(&self, nachricht: &str);
+  }
+
+  struct TestBenachrichtiger {
+      gesendet: RefCell<Vec<String>>,
+  }
+
+  impl Benachrichtiger for TestBenachrichtiger {
+      fn sende(&self, nachricht: &str) {
+          self.gesendet.borrow_mut().push(nachricht.to_string());
+      }
+  }
+
+  fn pruefe_kontingent(b: &dyn Benachrichtiger, genutzt: u32, limit: u32) {
+      if genutzt * 100 >= limit * 90 {
+          b.sende("Über 90 % des Kontingents verbraucht");
+      }
+  }
+
+  fn main() {
+      let mock = TestBenachrichtiger { gesendet: RefCell::new(Vec::new()) };
+      pruefe_kontingent(&mock, 95, 100);
+      assert_eq!(mock.gesendet.borrow().len(), 1);
+      println!("{:?}", mock.gesendet.borrow());
+  }
+  ```
+
+  Und so sieht der Laufzeitfehler aus:
+
+  ```rust
+  use std::cell::RefCell;
+
+  fn main() {
+      let log = RefCell::new(vec![String::from("start")]);
+      let erste = log.borrow();          // Ref-Guard lebt bis zum Ende von main
+      log.borrow_mut().push("x".into()); // Panic: "RefCell already borrowed"
+      println!("{}", erste[0]);
+  }
+  ```
+
+  Umgekehrt meldet `borrow()` während eines aktiven `borrow_mut()` die Panic „RefCell already mutably borrowed“. Wer nicht abstürzen will, nutzt [`try_borrow_mut`](https://doc.rust-lang.org/std/cell/struct.RefCell.html#method.try_borrow_mut), das ein `Result` liefert.
+
+  > [!MERKE]
+  > `RefCell` hebt die Borrowing-Regeln nicht auf. Sie prüft dieselben Regeln – nur später, zur Laufzeit, und mit einer Panic statt einer Fehlermeldung beim Übersetzen.
+
+  **`Cell<T>`** ist die leichtere Variante für kleine `Copy`-Werte wie Zähler und Flags. Sie gibt nie Referenzen auf ihren Inhalt heraus, sondern kopiert Werte hinein und heraus (`get`, `set`, `replace`). Deshalb braucht sie keine Buchführung über Ausleihen und löst keine Panic aus ([std::cell](https://doc.rust-lang.org/std/cell/index.html#cellt)).
+
+  ```rust
+  use std::cell::Cell;
+
+  struct Api {
+      aufrufe: Cell<u32>,
+  }
+
+  impl Api {
+      fn hole(&self, pfad: &str) -> String {
+          self.aufrufe.set(self.aufrufe.get() + 1);
+          format!("GET {pfad}")
+      }
+  }
+
+  fn main() {
+      let api = Api { aufrufe: Cell::new(0) };
+      api.hole("/status");
+      api.hole("/nutzer");
+      println!("{} Aufrufe", api.aufrufe.get());
+  }
+  ```
+
+  Beide Typen sind `!Sync`: Zwei Threads dürfen nicht gleichzeitig auf dieselbe `Cell` oder `RefCell` zugreifen, weil deren Buchführung nicht synchronisiert ist. Die thread-sicheren Gegenstücke heißen `Mutex`, `RwLock` und Atomics – Thema des nächsten Moduls.
+
+  ## `Rc<RefCell<T>>`: geteilt und veränderbar
+
+  Kombiniert ergibt sich ein Wert mit mehreren Besitzern, die ihn alle verändern können ([Rust Book, Kap. 15.5](https://doc.rust-lang.org/book/ch15-05-interior-mutability.html#allowing-multiple-owners-of-mutable-data)):
+
+  ```rust
+  use std::cell::RefCell;
+  use std::rc::Rc;
+
+  struct Warenkorb {
+      positionen: Vec<(String, u32)>,
+  }
+
+  fn main() {
+      let korb = Rc::new(RefCell::new(Warenkorb { positionen: Vec::new() }));
+      let fuer_ansicht = Rc::clone(&korb);
+
+      korb.borrow_mut().positionen.push(("Tastatur".into(), 8_999));
+      korb.borrow_mut().positionen.push(("Maus".into(), 2_499));
+
+      let summe: u32 = fuer_ansicht.borrow().positionen.iter().map(|(_, cent)| cent).sum();
+      println!("Summe: {summe} Cent");
+  }
+  ```
+
+  Das Muster funktioniert, hat aber einen Preis: Zählerpflege bei jedem Klonen und Droppen, eine Prüfung bei jedem `borrow`, mögliche Panics statt Compilerfehlern und Code, in dem nicht mehr sichtbar ist, wer wann was ändert. Wenn du `Rc<RefCell<T>>` überall verteilst, schreibst du im Grunde Java mit Laufzeitprüfungen.
+
+  > [!PRAXIS] Erst umgestalten, dann Rc<RefCell<T>>
+  > In Code-Reviews ist `Rc<RefCell<T>>` ein Signal, genauer hinzusehen. Oft geht es ohne: den Zustand an einer Stelle besitzen und `&mut` gezielt hineinreichen, Nachrichten statt geteilter Objekte verschicken oder Knoten in einem `Vec` halten und über Indizes (IDs) verknüpfen. Für Bäume, GUIs und Graphen mit echten Mehrfachbesitzern ist das Muster aber legitim – dann gehört es sauber gekapselt hinter eine kleine API.
+
+  ## `Weak<T>` und Referenzzyklen
+
+  Referenzzählung hat eine Schwäche: Zeigen zwei Werte über `Rc` aufeinander, fällt keiner der Zähler je auf null. Der Speicher wird nie freigegeben – ein Leck. Das ist in Rust ausdrücklich „sicher“ (kein undefiniertes Verhalten), aber trotzdem ein Fehler ([Rust Book, Kap. 15.6](https://doc.rust-lang.org/book/ch15-06-reference-cycles.html)).
+
+  Die Lösung ist `Weak<T>`: ein Zeiger, der **nicht** besitzt. `Rc::downgrade(&rc)` erzeugt ihn und erhöht nur den `weak_count`. Bevor du zugreifst, fragst du mit `upgrade()` nach, ob der Wert noch lebt; du bekommst `Option<Rc<T>>`. Die Faustregel: Besitz zeigt in eine Richtung (Eltern besitzen Kinder), Rückverweise sind `Weak`.
+
+  ```rust
+  use std::cell::RefCell;
+  use std::rc::{Rc, Weak};
+
+  struct Ordner {
+      name: String,
+      eltern: RefCell<Weak<Ordner>>,
+      kinder: RefCell<Vec<Rc<Ordner>>>,
+  }
+
+  fn neuer_ordner(name: &str) -> Rc<Ordner> {
+      Rc::new(Ordner { name: name.into(), eltern: RefCell::new(Weak::new()), kinder: RefCell::new(Vec::new()) })
+  }
+
+  fn main() {
+      let wurzel = neuer_ordner("/");
+      let home = neuer_ordner("home");
+
+      *home.eltern.borrow_mut() = Rc::downgrade(&wurzel);
+      wurzel.kinder.borrow_mut().push(Rc::clone(&home));
+
+      if let Some(eltern) = home.eltern.borrow().upgrade() {
+          println!("{} liegt in {}", home.name, eltern.name);
+      }
+      println!("wurzel: strong={} weak={}", Rc::strong_count(&wurzel), Rc::weak_count(&wurzel)); // 1, 1
+      println!("home: strong={} weak={}", Rc::strong_count(&home), Rc::weak_count(&home));       // 2, 0
+      println!("{} Kind(er)", wurzel.kinder.borrow().len());
+  }
+  ```
+
+  Endet `main`, wird zuerst `home` gedroppt (Zähler 2 → 1, das Kind lebt im Vektor weiter), dann `wurzel` (1 → 0). Die Wurzel wird freigegeben, dabei ihr Vektor und damit das letzte `Rc` auf `home`. Mit einem `Rc` als Elternzeiger stünde die Wurzel auf 2 und bliebe für immer im Speicher.
+
+  > [!DEEP] Was genau auf dem Heap liegt
+  > Eine `Rc`-Allokation enthält den Strong-Zähler, den Weak-Zähler und den Wert. Fällt der Strong-Zähler auf null, wird der **Wert** gedroppt; die Allokation selbst bleibt bestehen, bis auch alle `Weak` weg sind. Deshalb kann `upgrade()` gefahrlos `None` liefern ([std::rc](https://doc.rust-lang.org/std/rc/index.html)).
+
+  ## `Arc<T>`: die thread-sichere Variante
+
+  `Arc<T>` (atomically reference counted) hat dieselbe API wie `Rc<T>`, zählt aber mit atomaren Operationen. Das ist etwas teurer, dafür darf ein `Arc` zwischen Threads geteilt werden, sofern `T` selbst thread-sicher ist ([std::sync::Arc](https://doc.rust-lang.org/std/sync/struct.Arc.html#thread-safety)).
+
+  ```rust
+  use std::sync::Arc;
+  use std::thread;
+
+  fn main() {
+      let config = Arc::new(String::from("https://api.example.com"));
+      let handles: Vec<_> = (0..3)
+          .map(|i| {
+              let config = Arc::clone(&config);
+              thread::spawn(move || format!("Worker {i} nutzt {config}"))
+          })
+          .collect();
+      for handle in handles {
+          println!("{}", handle.join().unwrap());
+      }
+  }
+  ```
+
+  Wie `Rc` gibt `Arc` nur `&T` heraus. Für veränderbaren geteilten Zustand zwischen Threads kombinierst du es mit `Mutex` oder `RwLock` statt mit `RefCell`: `Arc<Mutex<T>>` ist das thread-sichere Gegenstück zu `Rc<RefCell<T>>`.
+
+  ## Welcher Zeiger wann?
+
+  | Situation | Werkzeug | Prüfung | Kosten |
+  | --- | --- | --- | --- |
+  | Rekursiver Typ, Trait-Objekt, großer Wert mit einem Besitzer | `Box<T>` | Compiler | eine Allokation |
+  | Mehrere Besitzer, nur lesen, ein Thread | `Rc<T>` | Compiler | Zähler |
+  | Mehrere Besitzer, nur lesen, mehrere Threads | `Arc<T>` | Compiler | atomarer Zähler |
+  | Verändern hinter `&self`, kleiner `Copy`-Wert | `Cell<T>` | keine nötig | fast keine |
+  | Verändern hinter `&self`, beliebiger Typ | `RefCell<T>` | Laufzeit (Panic) | Ausleihzähler |
+  | Mehrere Besitzer, verändern, ein Thread | `Rc<RefCell<T>>` | Laufzeit | Zähler + Ausleihzähler |
+  | Mehrere Besitzer, verändern, mehrere Threads | `Arc<Mutex<T>>` | Laufzeit (Sperre) | atomarer Zähler + Lock |
+  | Rückverweis, Cache, Beobachter ohne Besitz | `Weak<T>` | `upgrade()` | Weak-Zähler |
+
+  Die erste Frage ist immer: Brauche ich das wirklich? Eine gewöhnliche Referenz oder ein klarer einzelner Besitzer ist fast immer einfacher zu lesen und zu testen.
+
+  > [!INTERVIEW] „Was ist der Unterschied zwischen `Rc<RefCell<T>>` und `Arc<Mutex<T>>`?“
+  > Beide erlauben mehrere Besitzer eines veränderbaren Werts. `Rc<RefCell<T>>` ist für einen Thread: nicht-atomarer Zähler, Ausleihprüfung zur Laufzeit, Verstoß führt zur Panic. `Arc<Mutex<T>>` ist für mehrere Threads: atomarer Zähler, und statt einer Panic wartet ein zweiter Zugriff, bis die Sperre frei ist. Der Compiler erzwingt die Wahl über `Send` und `Sync` – `Rc` in einem Thread kompiliert nicht.
+
+  ## Häufige Fehler
+
+  - **`Rc<T>` und Veränderung erwartet.** `Rc` gibt nur `&T` heraus; `rc.push(…)` scheitert mit „cannot borrow data in an `Rc` as mutable“. Brauchst du wirklich geteilten veränderbaren Zustand, kommt eine `RefCell` hinein.
+  - **Guard zu lange gehalten.** Ein `let daten = zelle.borrow();` lebt bis zum Ende des Blocks. Jedes spätere `borrow_mut()` im selben Block löst eine Panic aus. Guards möglichst in einem Ausdruck benutzen oder den Block eng fassen.
+  - **Guards in `if let` und `while let`.** Temporäre Werte im Ausdruck hinter `if let`/`while let` leben im gesamten Rumpf weiter. `while let Some(x) = zelle.borrow_mut().pop() { … }` hält den `RefMut` also während jedes Durchlaufs.
+  - **Zyklen mit `Rc`.** Elternzeiger, Beobachterlisten und Caches als `Weak` anlegen, sonst entsteht ein Leck.
+  - **`let _ = wert;`** droppt einen neu erzeugten Wert sofort. `let _guard = wert;` hält ihn bis zum Blockende. Bei Guards und RAII-Typen ist das ein großer Unterschied.
+  - **`Box` aus Gewohnheit.** `Box<Vec<T>>` oder `Box<String>` bringen nur eine zusätzliche Indirektion.
+
+  ## Zusammenfassung
+
+  - Smart Pointer sind Structs, die Daten besitzen und `Deref` und `Drop` implementieren.
+  - `Box<T>`: ein Besitzer, Daten auf dem Heap; nötig für rekursive Typen und `dyn Trait`.
+  - `Drop` läuft in umgekehrter Deklarationsreihenfolge; `drop(x)` räumt früher auf.
+  - `Rc<T>`: mehrere Besitzer, nur lesen, nur ein Thread. `Rc::clone` erhöht den Zähler, kopiert keine Daten.
+  - `RefCell<T>` prüft die Borrowing-Regeln zur Laufzeit und löst bei Verstößen eine Panic aus; `Cell<T>` tauscht `Copy`-Werte ohne Referenzen.
+  - `Weak<T>` besitzt nicht und bricht Zyklen; `upgrade()` liefert `Option<Rc<T>>`.
+  - `Arc<T>` ist das thread-sichere `Rc`; mit `Mutex` ersetzt es `Rc<RefCell<T>>` über Thread-Grenzen.
+  - Vor jedem Smart Pointer steht die Frage, ob eine klarere Besitzstruktur das Problem ohne ihn löst.
+exercises:
+  - id: warum-box
+    type: choice
+    title: Unendlich groß?
+    prompt: Warum lehnt der Compiler diesen Typ ab, und warum behebt `Box` das Problem?
+    lang: rust
+    code: |
+      enum Liste {
+          Knoten(i32, Liste),
+          Ende,
+      }
+    options:
+      - text: Der Compiler muss die Größe von `Liste` kennen. Ohne Indirektion enthält eine `Liste` eine `Liste`, die eine `Liste` enthält … – die Größe wäre unendlich. Eine `Box<Liste>` ist nur ein Zeiger fester Größe.
+        correct: true
+        why: Genau das meldet `error[E0072]` mit dem Hinweis „recursive without indirection“. Der eigentliche Inhalt wandert auf den Heap.
+      - text: Enums dürfen sich grundsätzlich nicht selbst enthalten. `Box` umgeht dieses Verbot, weil der Compiler nicht in eine Box hineinschaut.
+        correct: false
+        why: Selbstbezug ist erlaubt, nur eben über eine Indirektion. Der Compiler kennt den Typ in der Box genau; er muss nur ihre Größe nicht aus dem Inhalt berechnen.
+      - text: Der Stack ist zu klein für verschachtelte Werte. `Box` legt die Liste auf den Heap, weil dort mehr Platz ist.
+        correct: false
+        why: Das Problem tritt schon beim Übersetzen auf, nicht zur Laufzeit. Es geht um eine unbestimmbare Größe, nicht um zu wenig Speicher.
+      - text: "`Liste` bräuchte eine Lifetime-Angabe. `Box` macht die Lifetime `'static`."
+        correct: false
+        why: Hier kommen keine Referenzen vor, also auch keine Lifetimes. `Box<T>` besitzt ihren Inhalt, sie ist keine Referenz mit Lifetime.
+    explanation: |
+      Jeder Typ braucht eine zur Übersetzungszeit bekannte Größe, damit der Compiler Speicher auf dem Stack und in umgebenden Structs reservieren kann. Eine direkte Rekursion macht das unmöglich. `Box<Liste>`, `Rc<Liste>` oder `Vec<Liste>` haben dagegen eine feste Größe, weil sie nur auf Heap-Speicher zeigen.
+    resources:
+      - title: Rust Book · Enabling Recursive Types with Boxes
+        url: https://doc.rust-lang.org/book/ch15-01-box.html#enabling-recursive-types-with-boxes
+      - title: Rust Error Codes · E0072
+        url: https://doc.rust-lang.org/error_codes/E0072.html
+  - id: elternzeiger-waehlen
+    type: choice
+    title: Der Weg zurück zum Elternknoten
+    prompt: |
+      Ein Verzeichnisbaum: Jeder Ordner besitzt seine Unterordner als `RefCell<Vec<Rc<Ordner>>>`. Jetzt soll jeder Ordner zusätzlich seinen Elternordner kennen. Welcher Typ passt für das Feld `eltern`?
+    options:
+      - text: "`RefCell<Weak<Ordner>>`"
+        correct: true
+        why: Der Elternzeiger besitzt nicht. Die Wurzel wird freigegeben, sobald niemand sie mehr besitzt, und `upgrade()` zeigt, ob der Elternordner noch lebt.
+      - text: "`RefCell<Rc<Ordner>>`"
+        correct: false
+        why: Eltern und Kind hielten sich gegenseitig über starke Zähler am Leben. Kein Zähler fiele je auf null, der ganze Baum würde nie freigegeben.
+      - text: "`Box<Ordner>`"
+        correct: false
+        why: Eine Box besitzt ihren Inhalt exklusiv. Der Elternordner gehört aber schon seinem eigenen Elternteil oder der Wurzelvariable – er kann nicht zusätzlich in jedem Kind stecken.
+      - text: "`&'a Ordner` mit einer Lifetime-Angabe am Struct"
+        correct: false
+        why: Die Kinder liegen in einem `Rc` im Elternordner. Eine Referenz auf den Elternordner, gespeichert in dessen eigenem Inhalt, lässt der Borrow Checker so nicht zu – der Baum würde sich selbst ausleihen.
+    explanation: |
+      Die Faustregel für Bäume und Graphen mit Referenzzählung: Besitz zeigt in eine Richtung, von oben nach unten. Alle Rückverweise sind `Weak`. Die `RefCell` braucht es, weil der Elternzeiger erst gesetzt wird, nachdem beide Knoten schon in `Rc` stecken.
+    resources:
+      - title: Rust Book · Preventing Reference Cycles Using Weak<T>
+        url: https://doc.rust-lang.org/book/ch15-06-reference-cycles.html#preventing-reference-cycles-using-weakt
+      - title: std::rc::Weak
+        url: https://doc.rust-lang.org/std/rc/struct.Weak.html
+  - id: drop-reihenfolge
+    type: output
+    title: Wer schließt wann?
+    prompt: Was gibt dieses Programm aus? Achte besonders auf die Zeile mit `let _`.
+    lang: rust
+    code: |
+      struct Verbindung(&'static str);
+
+      impl Drop for Verbindung {
+          fn drop(&mut self) {
+              println!("schließe {}", self.0);
+          }
+      }
+
+      fn main() {
+          let _db = Verbindung("Datenbank");
+          let _ = Verbindung("Metriken");
+          let cache = Verbindung("Cache");
+          {
+              let _tmp = Verbindung("Temp");
+              println!("Block endet");
+          }
+          drop(cache);
+          println!("main endet");
+      }
+    expected: |
+      schließe Metriken
+      Block endet
+      schließe Temp
+      schließe Cache
+      main endet
+      schließe Datenbank
+    explanation: |
+      `let _ = …` bindet den Wert an **keine** Variable; der neu erzeugte Wert ist ein Temporärwert und wird am Ende der Anweisung sofort gedroppt. `_tmp` lebt bis zum Ende des inneren Blocks, `drop(cache)` räumt vorzeitig auf, und `_db` ist die letzte verbliebene Variable von `main`. Für Guards gilt deshalb: `let _guard = …` hält, `let _ = …` gibt sofort frei.
+    resources:
+      - title: Rust Book · Running Code on Cleanup with the Drop Trait
+        url: https://doc.rust-lang.org/book/ch15-03-drop.html
+      - title: Reference · Drop scopes
+        url: https://doc.rust-lang.org/reference/destructors.html#drop-scopes
+  - id: zaehler-lesen
+    type: output
+    title: Starke und schwache Zeiger zählen
+    prompt: Was gibt dieses Programm aus?
+    lang: rust
+    code: |
+      use std::rc::Rc;
+
+      fn main() {
+          let a = Rc::new(String::from("Konfiguration"));
+          let b = Rc::clone(&a);
+          let w = Rc::downgrade(&a);
+          println!("{} {}", Rc::strong_count(&a), Rc::weak_count(&a));
+          {
+              let c = a.clone();
+              println!("{} {}", Rc::strong_count(&c), Rc::ptr_eq(&a, &c));
+          }
+          drop(a);
+          println!("{} {}", Rc::strong_count(&b), w.upgrade().is_some());
+          drop(b);
+          println!("{:?}", w.upgrade());
+      }
+    expected: |
+      2 1
+      3 true
+      1 true
+      None
+    explanation: |
+      `a` und `b` sind zwei starke Zeiger, `w` ist ein schwacher: `2 1`. `a.clone()` auf einem `Rc` ist dasselbe wie `Rc::clone(&a)`: kein neuer String, sondern ein dritter Zeiger auf **denselben** Wert, deshalb `ptr_eq` → `true`. Nach dem Block und `drop(a)` bleibt nur `b`; der Wert lebt, `upgrade()` gelingt. Nach `drop(b)` ist der Strong-Zähler null, der String ist freigegeben, und `upgrade()` liefert `None`.
+    resources:
+      - title: std::rc::Rc::strong_count
+        url: https://doc.rust-lang.org/std/rc/struct.Rc.html#method.strong_count
+      - title: std::rc::Weak::upgrade
+        url: https://doc.rust-lang.org/std/rc/struct.Weak.html#method.upgrade
+  - id: ausleihen-zur-laufzeit
+    type: output
+    title: RefCell führt Buch
+    prompt: Was gibt dieses Programm aus?
+    lang: rust
+    code: |
+      use std::cell::RefCell;
+
+      fn main() {
+          let warteschlange = RefCell::new(vec![1, 2]);
+          {
+              let lesend = warteschlange.borrow();
+              println!("{}", lesend.len());
+              println!("{}", warteschlange.try_borrow_mut().is_err());
+              println!("{}", warteschlange.try_borrow().is_ok());
+          }
+          warteschlange.borrow_mut().push(3);
+          let summe: i32 = warteschlange.borrow().iter().sum();
+          println!("{summe}");
+      }
+    expected: |
+      2
+      true
+      true
+      6
+    explanation: |
+      Solange der Guard `lesend` lebt, ist eine geteilte Ausleihe aktiv. Eine exklusive Ausleihe schlägt fehl (`try_borrow_mut` → `Err`), eine weitere geteilte ist erlaubt – dieselben Regeln wie beim Borrow Checker. Mit dem Blockende wird `lesend` gedroppt. Der `RefMut` in `warteschlange.borrow_mut().push(3)` ist ein Temporärwert und lebt nur bis zum Ende dieser Anweisung, deshalb gelingt danach `borrow()`.
+    resources:
+      - title: Rust Book · Keeping Track of Borrows at Runtime
+        url: https://doc.rust-lang.org/book/ch15-05-interior-mutability.html#tracking-borrows-at-runtime
+      - title: std::cell::RefCell::try_borrow_mut
+        url: https://doc.rust-lang.org/std/cell/struct.RefCell.html#method.try_borrow_mut
+  - id: box-liste
+    type: gap
+    title: Eine verkettete Liste mit Box
+    prompt: Ergänze den Typ des rekursiven Felds, den Aufruf im rekursiven Fall und den Aufbau der Liste `1 → 2 → Ende`. Das Programm soll `3` ausgeben.
+    lang: rust
+    code: |
+      enum Liste {
+          Knoten(u32, ⟦Box<Liste>⟧),
+          Ende,
+      }
+
+      use Liste::{Ende, Knoten};
+
+      fn summe(liste: &Liste) -> u32 {
+          match liste {
+              Knoten(wert, rest) => wert + summe(⟦rest⟧),
+              Ende => 0,
+          }
+      }
+
+      fn main() {
+          let liste = Knoten(1, ⟦Box::new(Knoten(2, Box::new(Ende)))⟧);
+          println!("{}", summe(&liste));
+      }
+    gaps:
+      - label: Rekursives Feld
+        hint: Ein Zeiger mit einem einzigen Besitzer, der auf den Heap zeigt.
+      - label: Argument für den rekursiven Aufruf
+        hint: "`rest` hat den Typ `&Box<Liste>`, `summe` erwartet `&Liste`. Deref-Coercion erledigt den Rest."
+        accept: ["&rest", "&**rest", "rest.as_ref()"]
+      - label: Rest der Liste
+        hint: Jede Ebene braucht ihr eigenes `Box::new(…)`, die innerste enthält `Ende`.
+    explanation: |
+      `Box<Liste>` gibt dem rekursiven Feld eine feste Größe. Im Match ist `rest` eine `&Box<Liste>`; weil `Box` `Deref<Target = Liste>` implementiert, wandelt der Compiler sie beim Aufruf automatisch in `&Liste` um. `&**rest` schreibt dieselbe Umwandlung von Hand aus. Beim Aufbau braucht jeder Knoten außer dem äußersten eine eigene Box.
+    resources:
+      - title: Rust Book · Using Box<T> to Point to Data on the Heap
+        url: https://doc.rust-lang.org/book/ch15-01-box.html
+      - title: Rust Book · Deref Coercion
+        url: https://doc.rust-lang.org/book/ch15-02-deref.html#using-deref-coercion-in-functions-and-methods
+  - id: eigener-smart-pointer
+    type: gap
+    title: Ein eigener Smart Pointer
+    prompt: |
+      `Messung<T>` soll sich wie eine Referenz auf den eingepackten Wert benutzen lassen und beim Aufräumen „Import fertig“ ausgeben. Ergänze die fehlenden Teile von `Deref` und `Drop`.
+    lang: rust
+    code: |
+      use std::ops::Deref;
+
+      struct Messung<T> {
+          name: &'static str,
+          wert: T,
+      }
+
+      impl<T> ⟦Deref⟧ for Messung<T> {
+          type Target = ⟦T⟧;
+
+          fn deref(&self) -> &T {
+              ⟦&self.wert⟧
+          }
+      }
+
+      impl<T> Drop for Messung<T> {
+          fn ⟦drop(&mut self)⟧ {
+              println!("{} fertig", self.name);
+          }
+      }
+
+      fn zeichen(text: &str) -> usize {
+          text.chars().count()
+      }
+
+      fn main() {
+          let m = Messung { name: "Import", wert: String::from("daten.csv") };
+          println!("{}", zeichen(&m));
+      }
+    gaps:
+      - label: Trait
+        hint: Der Trait aus `std::ops`, der `*` und Deref-Coercion ermöglicht.
+      - label: Zieltyp
+        hint: Worauf soll `*m` zeigen?
+      - label: Rückgabe von deref
+        hint: Eine Referenz auf das eingepackte Feld.
+      - label: Signatur von drop
+        hint: "`drop` bekommt den Wert veränderbar ausgeliehen."
+    explanation: |
+      `Deref` mit `type Target = T` sagt dem Compiler, dass `&Messung<T>` bei Bedarf zu `&T` wird. Im Aufruf `zeichen(&m)` geht er zwei Schritte: `&Messung<String>` → `&String` → `&str`. `drop(&mut self)` läuft automatisch, wenn `m` am Ende von `main` ungültig wird – nach der Ausgabe der Länge. Genau so arbeiten `Box`, `String` und `MutexGuard`.
+    resources:
+      - title: Rust Book · Implementing the Deref Trait
+        url: https://doc.rust-lang.org/book/ch15-02-deref.html#implementing-the-deref-trait
+      - title: std::ops::Drop
+        url: https://doc.rust-lang.org/std/ops/trait.Drop.html
+  - id: guard-zu-lange
+    type: bug
+    title: „RefCell already borrowed“
+    prompt: |
+      `abarbeiten` soll den ersten Auftrag ausgeben und aus der Warteschlange entfernen. Das Programm übersetzt, bricht aber zur Laufzeit ab:
+
+      ```text
+      bearbeite backup
+      thread 'main' panicked at src/main.rs:12:24:
+      RefCell already borrowed
+      ```
+
+      Finde die beiden Zeilen, die zusammen das Problem verursachen, und korrigiere sie so, dass nur **eine** Ausleihe nötig ist.
+    lang: rust
+    code: |
+      use std::cell::RefCell;
+
+      struct Warteschlange {
+          auftraege: RefCell<Vec<String>>,
+      }
+
+      impl Warteschlange {
+          fn abarbeiten(&self) -> Option<String> {
+              let auftraege = self.auftraege.borrow();
+              let erster = auftraege.first()?.clone();
+              println!("bearbeite {erster}");
+              self.auftraege.borrow_mut().remove(0);
+              Some(erster)
+          }
+      }
+
+      fn main() {
+          let w = Warteschlange { auftraege: RefCell::new(vec!["backup".into(), "report".into()]) };
+          w.abarbeiten();
+          println!("{:?}", w.auftraege.borrow());
+      }
+    lines: [9, 12]
+    fix:
+      - line: 9
+        answers: ["let mut auftraege = self.auftraege.borrow_mut();"]
+      - line: 12
+        answers: ["auftraege.remove(0);"]
+    explanation: |
+      Zeile 9 erzeugt einen `Ref`-Guard, der bis zum Ende der Funktion lebt. Zeile 12 fordert währenddessen eine exklusive Ausleihe an – dieselbe Regel, die der Borrow Checker bei `&` und `&mut` durchsetzt, nur prüft `RefCell` sie erst zur Laufzeit und löst eine Panic aus. Mit einem einzigen `RefMut`-Guard von Anfang an gibt es nur eine Ausleihe. Eine andere korrekte Lösung: den ersten Auftrag in **einer** Anweisung lesen (`let erster = self.auftraege.borrow().first()?.clone();`), dann ist der Guard am Ende dieser Anweisung schon wieder weg.
+    resources:
+      - title: std::cell::RefCell::borrow_mut
+        url: https://doc.rust-lang.org/std/cell/struct.RefCell.html#method.borrow_mut
+      - title: Rust Book · Enforcing Borrowing Rules at Runtime
+        url: https://doc.rust-lang.org/book/ch15-05-interior-mutability.html#enforcing-borrowing-rules-at-runtime
+  - id: zyklus-leck
+    type: bug
+    title: Der Baum wird nie freigegeben
+    prompt: |
+      Beim Programmende sollte für jeden Knoten `… freigegeben` erscheinen. Tatsächlich endet das Programm ohne jede Ausgabe, und in einem Langzeitdienst wächst der Speicherverbrauch mit jedem Baum. Finde die beiden Zeilen, die das Leck verursachen, und korrigiere sie. Die nötigen Importe sind vorhanden.
+    lang: rust
+    code: |
+      use std::cell::RefCell;
+      use std::rc::{Rc, Weak};
+
+      struct Knoten {
+          name: String,
+          eltern: RefCell<Option<Rc<Knoten>>>,
+          kinder: RefCell<Vec<Rc<Knoten>>>,
+      }
+
+      impl Drop for Knoten {
+          fn drop(&mut self) {
+              println!("{} freigegeben", self.name);
+          }
+      }
+
+      fn knoten(name: &str) -> Rc<Knoten> {
+          Rc::new(Knoten { name: name.into(), eltern: RefCell::new(None), kinder: RefCell::new(Vec::new()) })
+      }
+
+      fn main() {
+          let wurzel = knoten("wurzel");
+          let blatt = knoten("blatt");
+          *blatt.eltern.borrow_mut() = Some(Rc::clone(&wurzel));
+          wurzel.kinder.borrow_mut().push(Rc::clone(&blatt));
+      }
+    lines: [6, 23]
+    fix:
+      - line: 6
+        answers: ["eltern: RefCell<Option<Weak<Knoten>>>,"]
+      - line: 23
+        answers: ["*blatt.eltern.borrow_mut() = Some(Rc::downgrade(&wurzel));"]
+    explanation: |
+      Die Wurzel besitzt das Blatt (über `kinder`), und das Blatt besitzt über `eltern` die Wurzel. Am Ende von `main` fallen beide Zähler nur von 2 auf 1 – keiner erreicht null, `Drop` läuft nie, der Speicher bleibt belegt. Mit `Weak` als Elternzeiger zählt der Rückverweis nicht als Besitz: Die Wurzel fällt auf 0 und wird freigegeben, dabei ihr Vektor und damit das letzte `Rc` auf das Blatt. Die Ausgabe lautet dann `wurzel freigegeben`, `blatt freigegeben`. Zugriff auf die Eltern geht künftig über `upgrade()`.
+    resources:
+      - title: Rust Book · Reference Cycles Can Leak Memory
+        url: https://doc.rust-lang.org/book/ch15-06-reference-cycles.html
+      - title: std::rc::Rc::downgrade
+        url: https://doc.rust-lang.org/std/rc/struct.Rc.html#method.downgrade
+  - id: warenkorb-erklaeren
+    type: explain
+    title: Ein geteilter Warenkorb
+    prompt: |
+      Eine Kollegin hat den Warenkorb einer Desktop-App so gebaut. Erkläre wie im Code-Review, was `Rc` und `RefCell` hier jeweils leisten, wann Ausleihen beginnen und enden, welchen Preis das Muster hat und was du als Alternative vorschlagen würdest.
+    lang: rust
+    code: |
+      use std::cell::RefCell;
+      use std::rc::Rc;
+
+      type Geteilt<T> = Rc<RefCell<T>>;
+
+      struct Warenkorb {
+          positionen: Vec<(String, u32)>,
+      }
+
+      struct Steuerung {
+          korb: Geteilt<Warenkorb>,
+      }
+
+      struct Ansicht {
+          korb: Geteilt<Warenkorb>,
+      }
+
+      impl Steuerung {
+          fn hinzufuegen(&self, artikel: &str, cent: u32) {
+              self.korb.borrow_mut().positionen.push((artikel.to_string(), cent));
+          }
+      }
+
+      impl Ansicht {
+          fn summe(&self) -> u32 {
+              self.korb.borrow().positionen.iter().map(|(_, cent)| cent).sum()
+          }
+      }
+    points:
+      - "`Rc` erlaubt, dass `Steuerung` und `Ansicht` denselben Warenkorb besitzen; er lebt, bis der letzte Besitzer weg ist."
+      - "`RefCell` erlaubt Veränderung über `&self`, weil `Rc` nur geteilte Referenzen herausgibt."
+      - Die Guards aus `borrow()` und `borrow_mut()` leben nur bis zum Ende der jeweiligen Anweisung; zwei überlappende Ausleihen würden zur Laufzeit eine Panic auslösen, statt beim Übersetzen aufzufallen.
+      - "Preis: Zähler- und Ausleihprüfungen zur Laufzeit, versteckter Datenfluss, nur ein Thread (`Rc` ist `!Send`; für Threads `Arc<Mutex<T>>`)."
+      - "Alternative: einen Besitzer für den Warenkorb festlegen (etwa die App) und `&mut Warenkorb` bzw. `&Warenkorb` gezielt an `hinzufuegen` und `summe` übergeben."
+    explanation: |
+      `Rc` löst das Besitzproblem: Steuerung und Ansicht halten beide einen starken Zeiger, der Warenkorb verschwindet erst mit dem letzten. Weil `Rc` nur `&Warenkorb` herausgibt, braucht es für `hinzufuegen` die `RefCell`, die Veränderung hinter einer geteilten Referenz erlaubt. Die Guards sind hier Temporärwerte und leben nur bis zum Ende ihrer Anweisung, deshalb kollidiert nichts. Würde aber zum Beispiel die Ansicht während einer Iteration eine Methode der Steuerung aufrufen, gäbe es eine Panic zur Laufzeit – der Compiler hilft nicht mehr. Dazu kommen Laufzeitkosten und die Beschränkung auf einen Thread. Ich würde prüfen, ob die App den Warenkorb allein besitzen und `&mut Warenkorb` an die Steuerung sowie `&Warenkorb` an die Ansicht übergeben kann. Wenn nicht, ist das Muster in Ordnung, aber gekapselt hinter wenigen Methoden.
+    resources:
+      - title: Rust Book · Allowing Multiple Owners of Mutable Data
+        url: https://doc.rust-lang.org/book/ch15-05-interior-mutability.html#allowing-multiple-owners-of-mutable-data
+      - title: std::cell · When to choose interior mutability
+        url: https://doc.rust-lang.org/std/cell/index.html#when-to-choose-interior-mutability
+  - id: ereignis-bus
+    type: practice
+    title: Ein Ereignis-Bus mit schwachen Abonnenten
+    prompt: |
+      Baue einen kleinen Ereignis-Bus für eine Desktop-App. Komponenten abonnieren Ereignisse, aber der Bus soll sie **nicht** am Leben halten: Wird eine Komponente geschlossen (gedroppt), bekommt sie keine Ereignisse mehr und verschwindet aus der Liste.
+
+      1. Trait `Abonnent` mit `fn empfange(&self, ereignis: &str)`.
+      2. `Bus` speichert `RefCell<Vec<Weak<dyn Abonnent>>>`.
+      3. `fn abonnieren<A: Abonnent + 'static>(&self, abonnent: &Rc<A>)`.
+      4. `fn veroeffentlichen(&self, ereignis: &str) -> usize` räumt tote Einträge weg, stellt das Ereignis allen lebenden Abonnenten zu und gibt deren Anzahl zurück.
+      5. Ein `Protokoll`-Abonnent schreibt empfangene Ereignisse in ein `RefCell<Vec<String>>`.
+      6. Tests: Zustellung an zwei Abonnenten; nach `drop` eines Abonnenten nur noch einer.
+
+      Zusatzfrage: Was passiert in deiner Lösung, wenn ein Abonnent **während** `empfange` selbst `bus.abonnieren(…)` aufruft?
+    lang: rust
+    starter: |
+      use std::cell::RefCell;
+      use std::rc::{Rc, Weak};
+
+      trait Abonnent {
+          fn empfange(&self, ereignis: &str);
+      }
+
+      #[derive(Default)]
+      struct Bus {
+          abonnenten: RefCell<Vec<Weak<dyn Abonnent>>>,
+      }
+
+      impl Bus {
+          // abonnieren und veroeffentlichen
+      }
+
+      fn main() {
+          let bus = Bus::default();
+          // Abonnenten anlegen, Ereignisse veröffentlichen
+      }
+    solution: |
+      use std::cell::RefCell;
+      use std::rc::{Rc, Weak};
+
+      trait Abonnent {
+          fn empfange(&self, ereignis: &str);
+      }
+
+      #[derive(Default)]
+      struct Bus {
+          abonnenten: RefCell<Vec<Weak<dyn Abonnent>>>,
+      }
+
+      impl Bus {
+          fn abonnieren<A: Abonnent + 'static>(&self, abonnent: &Rc<A>) {
+              let schwach: Weak<A> = Rc::downgrade(abonnent);
+              self.abonnenten.borrow_mut().push(schwach);
+          }
+
+          fn veroeffentlichen(&self, ereignis: &str) -> usize {
+              // Erst lebende Abonnenten einsammeln, dann den Guard loslassen,
+              // damit Abonnenten während `empfange` wieder abonnieren dürfen.
+              let lebende: Vec<Rc<dyn Abonnent>> = {
+                  let mut liste = self.abonnenten.borrow_mut();
+                  liste.retain(|w| w.strong_count() > 0);
+                  liste.iter().filter_map(Weak::upgrade).collect()
+              };
+              for abonnent in &lebende {
+                  abonnent.empfange(ereignis);
+              }
+              lebende.len()
+          }
+      }
+
+      #[derive(Default)]
+      struct Protokoll {
+          eintraege: RefCell<Vec<String>>,
+      }
+
+      impl Abonnent for Protokoll {
+          fn empfange(&self, ereignis: &str) {
+              self.eintraege.borrow_mut().push(ereignis.to_string());
+          }
+      }
+
+      fn main() {
+          let bus = Bus::default();
+          let statusleiste = Rc::new(Protokoll::default());
+          let verlauf = Rc::new(Protokoll::default());
+          bus.abonnieren(&statusleiste);
+          bus.abonnieren(&verlauf);
+
+          println!("{}", bus.veroeffentlichen("Datei gespeichert"));
+          drop(verlauf);
+          println!("{}", bus.veroeffentlichen("Export fertig"));
+          println!("{:?}", statusleiste.eintraege.borrow());
+      }
+
+      #[cfg(test)]
+      mod tests {
+          use super::*;
+
+          #[test]
+          fn stellt_an_alle_lebenden_zu() {
+              let bus = Bus::default();
+              let a = Rc::new(Protokoll::default());
+              let b = Rc::new(Protokoll::default());
+              bus.abonnieren(&a);
+              bus.abonnieren(&b);
+              assert_eq!(bus.veroeffentlichen("start"), 2);
+              assert_eq!(*a.eintraege.borrow(), vec!["start"]);
+              assert_eq!(*b.eintraege.borrow(), vec!["start"]);
+          }
+
+          #[test]
+          fn vergisst_gedroppte_abonnenten() {
+              let bus = Bus::default();
+              let a = Rc::new(Protokoll::default());
+              let b = Rc::new(Protokoll::default());
+              bus.abonnieren(&a);
+              bus.abonnieren(&b);
+              drop(b);
+              assert_eq!(bus.veroeffentlichen("x"), 1);
+              assert_eq!(bus.abonnenten.borrow().len(), 1);
+              assert_eq!(Rc::strong_count(&a), 1);
+          }
+      }
+    checklist:
+      - Der Bus speichert nur `Weak`-Zeiger; `Rc::strong_count` eines Abonnenten bleibt nach dem Abonnieren bei 1.
+      - "`Weak<A>` wird beim Einfügen in den Vektor automatisch zu `Weak<dyn Abonnent>` (Unsizing-Coercion)."
+      - "`veroeffentlichen` entfernt tote Einträge (`retain` mit `strong_count() > 0` oder über `upgrade()`)."
+      - Der `RefMut`-Guard auf die Abonnentenliste ist freigegeben, bevor `empfange` aufgerufen wird.
+      - Beide Tests laufen grün, und `main` gibt `2`, dann `1` aus.
+      - Du kannst die Zusatzfrage beantworten.
+    explanation: |
+      `Weak` ist hier genau richtig: Der Bus beobachtet nur, er besitzt nicht. Ohne `Weak` bliebe eine geschlossene Komponente im Speicher, solange der Bus lebt – ein typisches Leck bei Beobachter-Mustern. Die wichtigste Detailentscheidung ist der Block in `veroeffentlichen`: Er sammelt die lebenden Abonnenten als `Rc` ein und gibt den `RefMut`-Guard frei, **bevor** Code von außen läuft. Würde die Schleife den Guard halten und ein Abonnent in `empfange` erneut `abonnieren` aufrufen, gäbe es „RefCell already borrowed“. Die eingesammelten `Rc` halten die Abonnenten zudem für die Dauer der Zustellung sicher am Leben.
+    resources:
+      - title: std::rc::Weak
+        url: https://doc.rust-lang.org/std/rc/struct.Weak.html
+      - title: std::rc::Rc::downgrade
+        url: https://doc.rust-lang.org/std/rc/struct.Rc.html#method.downgrade

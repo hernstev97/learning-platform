@@ -2,7 +2,7 @@
 import catalog from 'virtual:catalog';
 import loaders from 'virtual:area-loaders';
 import type { Area, AreaSummary } from './content/types.ts';
-import { freshProgress, readProgress, writeProgress, type AreaProgress } from './engine/storage.ts';
+import { exportAll, freshProgress, readProgress, writeProgress, type AreaProgress, type Backup } from './engine/storage.ts';
 
 export { catalog };
 const areas = new Map<string, Area>();
@@ -57,8 +57,16 @@ export function replaceProgress(area: string, value: AreaProgress): void {
   progress.set(area, value);
   save(area);
 }
-export function forgetCachedProgress(): void {
-  progress.clear();
+/** Include unsaved work even when localStorage is blocked or full. */
+export function backupProgress(): Backup {
+  let backup: Backup = { app: 'learn.kiumu.app', exported: new Date().toISOString(), areas: {} };
+  const store = storage();
+  if (store) {
+    try { backup = exportAll(store); } catch { /* the in-memory state below is still recoverable */ }
+  }
+  for (const area of catalog.areas) backup.areas[area.id] = progressOf(area.id);
+  for (const [id, value] of progress) backup.areas[id] = value;
+  return backup;
 }
 
 export const getStorageWarning = () => storageWarning;

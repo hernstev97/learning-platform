@@ -1,0 +1,340 @@
+id: container
+title: Container mit Docker & Podman
+level: 3
+minutes: 190
+summary: Du verpackst einen kleinen Dienst reproduzierbar, trennst Laufzeitdaten vom Image und prüfst Netzwerk, Startbereitschaft und Rechte.
+goals:
+  - Du erklärst Container als isolierte Prozesse mit gemeinsamem Kernel.
+  - Du unterscheidest Images, Container, Volumes und Bind-Mounts.
+  - Du schreibst ein Dockerfile und eine Compose-Datei mit überprüfbaren Betriebsanforderungen.
+  - Du diagnostizierst Start-, Port- und Berechtigungsfehler und kennst die Grenzen der Isolation.
+resources:
+  - title: Docker · Dockerfile reference
+    url: https://docs.docker.com/reference/dockerfile/
+  - title: Docker · Running containers
+    url: https://docs.docker.com/engine/containers/run/
+  - title: Docker · Compose specification
+    url: https://docs.docker.com/reference/compose-file/
+  - title: Docker · Volumes
+    url: https://docs.docker.com/engine/storage/volumes/
+  - title: Podman · Quadlet
+    url: https://docs.podman.io/en/latest/markdown/podman-systemd.unit.5.html
+lesson: |
+  Auf deinem Rechner läuft die App, auf dem Server fehlen eine Bibliothek und die richtige Laufzeit. Ein Container-Image beschreibt einen gemeinsamen Auslieferungsstand. Damit verschwinden jedoch nicht alle Betriebsfragen: Daten müssen Neustarts überleben, Ports müssen an der richtigen Stelle lauschen und der Prozess braucht genau die benötigten Rechte.
+
+  Wir bauen einen kleinen statischen Testserver. Er ist bewusst kein Produktions-Webserver, sondern ein überschaubares Beispiel für Verpackung und Betrieb. Für praktische Containerübungen verwendest du eine eigene Entwicklungsumgebung oder VM. Die Plattform bewertet Konfigurationen und deine überprüfbaren Nachweise; sie startet keinen Docker-Daemon im Browser.
+
+  ## Container sind Prozesse, keine kleinen vollständigen Rechner
+
+  Ein Linux-Container nutzt den Kernel des Hosts. **Namespaces** geben Prozessen getrennte Sichten auf Ressourcen wie Prozessnummern, Mounts und Netzwerk. **cgroups** gruppieren Prozesse und können Ressourcenverbrauch begrenzen beziehungsweise messen. Ein geschichtetes Dateisystem stellt Imageinhalt und eine beschreibbare Containerschicht zusammen. Eine VM hat dagegen einen eigenen Gastkernel und virtualisierte Hardware ([namespaces(7)](https://man7.org/linux/man-pages/man7/namespaces.7.html), [Kernel · cgroup v2](https://docs.kernel.org/admin-guide/cgroup-v2.html)).
+
+  Die Trennung erleichtert Betrieb und Verpackung, ist aber keine absolute Sicherheitsgrenze. Ein privilegierter Container, weitreichende Host-Mounts oder Zugriff auf den Docker-Socket können große Hostrechte eröffnen. Root im Container und Root auf dem Host sind insbesondere ohne User-Namespace nicht sauber gleichzusetzen mit „harmlos isoliert“. Begrenze Rechte und Datenzugänge entsprechend dem Bedrohungsmodell.
+
+  Ein **Image** ist eine Vorlage aus Dateischichten und Metadaten. Ein **Container** ist eine konkrete Instanz mit Prozesszustand, Konfiguration und beschreibbarer Schicht. Mehrere Container können dasselbe Image nutzen und trotzdem verschiedene Daten erzeugen. Entfernst du den Container, ist seine beschreibbare Schicht kein verlässlicher Aufbewahrungsort mehr. Deshalb liegen dauerhafte Daten außerhalb dieser Schicht.
+
+  Registries verteilen Images. Ein Tag wie `python:3.14-slim` ist ein veränderbarer Name, kein kryptografisch eindeutiger Stand. `latest` bedeutet nicht automatisch „neueste sichere Version“. Ein Digest identifiziert den konkreten Inhalt. Für reproduzierbare Releases dokumentierst du einen geprüften Digest und hast trotzdem einen Prozess, ihn bei Sicherheitsupdates zu ersetzen ([Docker · Image references](https://docs.docker.com/reference/cli/docker/image/pull/)).
+
+  ## Lebenszyklus und Portzuordnung
+
+  Für das später gebaute lokale Image `learn-web:1.0` startet dieser Befehl einen Container im Hintergrund und veröffentlicht den Containerport 8000 ausschließlich an der Loopback-Adresse des Hosts:
+
+  ```bash
+  docker run -d --name learn-web \
+    -p 127.0.0.1:8080:8000 \
+    --restart unless-stopped \
+    learn-web:1.0
+  ```
+
+  `-d` löst die Terminalbindung, `--name` vergibt einen Namen, `-p` hat hier die Reihenfolge Hostadresse:Hostport:Containerport. Ein eigener Netzwerk-Namespace bedeutet, dass `127.0.0.1` innerhalb des Containers den Container selbst bezeichnet. Der Dienst muss dort auf einer geeigneten Adresse wie `0.0.0.0:8000` lauschen, damit die Veröffentlichung ihn erreicht ([Docker · Port publishing](https://docs.docker.com/engine/network/port-publishing/)).
+
+  ```bash
+  docker ps
+  docker ps -a
+  docker logs --tail 50 learn-web
+  docker inspect learn-web
+  docker exec learn-web id
+  docker stop learn-web
+  docker rm learn-web
+  ```
+
+  `ps` zeigt laufende Container, `ps -a` auch beendete. `logs` liest die über den Logging-Treiber erfassten Prozessausgaben; eine App, die nur in interne Dateien schreibt, macht dadurch nicht automatisch hilfreiche Logs verfügbar. `exec` startet einen zusätzlichen Prozess im laufenden Container und verändert nicht die Imagevorlage. Verwende es zur Diagnose, nicht als undokumentierten Ersatz für einen reproduzierbaren Build.
+
+  `stop` sendet das konfigurierte Stoppsignal und kann nach einer Wartezeit gewaltsam beenden. Die Anwendung braucht deshalb funktionierende Signalbehandlung. `--rm` ist für kurzlebige Testcontainer nützlich, die nach dem Ende entfernt werden sollen; kombiniere es nicht mit einer dauerhaften Restart-Policy. `-e NAME=WERT` übergibt Umgebungswerte, ist aber kein geeigneter Ort für öffentlich dokumentierte Secrets ([Docker · Running containers](https://docs.docker.com/engine/containers/run/)).
+
+  ## Ein kleines Dockerfile verstehen
+
+  Lege eine harmlose `site/index.html` an. Das folgende Dockerfile liefert ausschließlich diese statischen Inhalte aus. Der numerische Benutzer braucht dafür keinen Login und kein Home-Verzeichnis. Der Prozess arbeitet auf einem unprivilegierten Port.
+
+  ```dockerfile
+  FROM python:3.14-slim
+  WORKDIR /app
+  COPY --chown=10001:10001 site/ ./
+  USER 10001:10001
+  EXPOSE 8000
+  CMD ["python", "-m", "http.server", "8000", "--bind", "0.0.0.0"]
+  ```
+
+  `FROM` legt die Basis fest. `WORKDIR` bestimmt das Arbeitsverzeichnis nachfolgender Schritte und des Standardprozesses. `COPY` übernimmt Dateien aus dem Build-Kontext. `USER` wählt die Laufzeitidentität. `EXPOSE` dokumentiert einen Port, veröffentlicht ihn aber nicht. `CMD` legt den Standardstart fest ([Dockerfile reference](https://docs.docker.com/reference/dockerfile/)).
+
+  ```bash
+  docker build -t learn-web:1.0 .
+  docker run --rm -p 127.0.0.1:8080:8000 learn-web:1.0
+  ```
+
+  Der Punkt bezeichnet den Build-Kontext. Alles, was das Buildsystem daraus erhält, sollte bewusst gewählt sein. Eine `.dockerignore` hält Git-Daten, lokale Umgebungen und Secrets aus dem Kontext. Sie ist eine zusätzliche Grenze; kopiere nur benötigte Unterverzeichnisse statt pauschal das ganze Repository.
+
+  ```text
+  .git
+  .env
+  .env.*
+  .venv
+  __pycache__
+  ```
+
+  `RUN` führt einen Buildschritt aus, etwa das Installieren von Abhängigkeiten. `CMD` läuft beim Start, nicht beim Build. Die JSON-ähnliche **Exec-Form** vermeidet eine zusätzliche Shell und macht die Argumentliste ausdrücklich. Sie expandiert allerdings keine Shellvariable: `CMD ["echo", "$PORT"]` gibt den Text `$PORT` an das Programm weiter.
+
+  `ENTRYPOINT` legt üblicherweise das feste Programm fest; `CMD` kann seine Standardargumente liefern. Bei `ENTRYPOINT ["python", "-m", "http.server"]` und `CMD ["8000"]` ersetzt `docker run image 9000` die Standardargumente durch `9000`. Dokumentiere dieses Überschreibungsverhalten, damit jemand beim Start keine falsche Annahme über den tatsächlichen Prozess trifft.
+
+  ## Cache und getrennte Buildstufen
+
+  Docker kann unveränderte Buildschritte aus dem Cache wiederverwenden. Kopiere selten geänderte Abhängigkeitsdefinitionen vor häufig geändertem Quellcode. Sonst führt jede kleine Quelländerung erneut zur Installation sämtlicher Pakete. Ein Cache ist eine Beschleunigung, keine automatische Aktualisierung: Eine unveränderte Anweisung kann weiterhin einen älteren bereits gebauten Stand verwenden ([Docker · Cache optimization](https://docs.docker.com/build/cache/optimize/)).
+
+  ```dockerfile
+  FROM python:3.14-slim AS build
+  WORKDIR /build
+  RUN python -m venv /opt/venv
+  COPY requirements.txt ./
+  RUN /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
+
+  FROM python:3.14-slim
+  WORKDIR /app
+  COPY --from=build /opt/venv /opt/venv
+  COPY app.py ./
+  ENV PATH="/opt/venv/bin:$PATH"
+  USER 10001:10001
+  CMD ["python", "app.py"]
+  ```
+
+  Dieses Muster setzt eine eigene `app.py` und geprüfte Abhängigkeiten voraus; es ersetzt nicht das vorherige statische Beispiel. Die Runtime enthält nur die benötigten Ergebnisse. Native Erweiterungen können zusätzliche Systembibliotheken erfordern; Build- und Laufzeitumgebung müssen zusammenpassen. Bei kompilierten Anwendungen kopierst du entsprechend Binärdateien und nötige Laufzeitdateien ([Docker · Multi-stage builds](https://docs.docker.com/build/building/multi-stage/)).
+
+  Ein kleineres Image hat weniger mitgelieferte Bestandteile, ist aber nicht allein deshalb sicher. Prüfe Herkunft, Updatepfad, benötigte Laufzeitbibliotheken und verfügbare Diagnosemöglichkeiten. Secrets gehören nicht in `ARG`, `ENV` oder eine kopierte Datei, die erst in einem späteren Layer gelöscht wird. Für benötigte Buildzugänge gibt es gezielte Secret-Mounts ([Docker · Build secrets](https://docs.docker.com/build/building/secrets/)).
+
+  ## Daten und Netzwerke unabhängig vom Container
+
+  Ein **Bind-Mount** bindet einen konkreten Hostpfad ein. Das ist hilfreich für lokale Entwicklung, koppelt den Container aber an das Hostlayout und dessen Rechte. Mit `readonly` kann eine Konfiguration lesend eingebunden werden. Ein **Named Volume** wird von der Runtime verwaltet und eignet sich für persistenten Anwendungszustand. Beide brauchen Backups; ein Volume ist noch keine Sicherung ([Docker · Bind mounts](https://docs.docker.com/engine/storage/bind-mounts/), [Docker · Volumes](https://docs.docker.com/engine/storage/volumes/)).
+
+  ```bash
+  docker volume create report-data
+  docker run --rm \
+    --mount type=bind,src="$PWD/site",dst=/app,readonly \
+    -p 127.0.0.1:8080:8000 learn-web:1.0
+  docker volume inspect report-data
+  ```
+
+  Der Mount verdeckt den Inhalt des Imageverzeichnisses am Ziel. Unix-Rechte gelten weiterhin. Ein Prozess mit UID 10001 kann nicht automatisch einen root-eigenen schreibgeschützten Hostpfad verändern. Rootless-Runtimes verwenden außerdem User-Namespace-Zuordnungen; gleiche Zahlen innen und außen müssen nicht dieselbe Hostidentität bedeuten. Korrigiere Eigentümer und Mountkonzept gezielt, statt alles auf 777 zu setzen.
+
+  In einem benutzerdefinierten Bridge-Netz können Container über ihre Namen kommunizieren. Ein Backend muss seine Datenbank nicht auf einen Hostport veröffentlichen, damit ein anderer Container im selben Netz sie erreicht. Ein Hostport ist nur für Verkehr vom Host beziehungsweise von außen nötig. Halte Netzzuordnung, interne Ports und Veröffentlichungen im Architekturdiagramm auseinander ([Docker · Networking](https://docs.docker.com/engine/network/)).
+
+  ## Compose beschreibt den gemeinsamen Betrieb
+
+  Compose hält die Startkonfiguration mehrerer Dienste in `compose.yaml` fest. Die aktuelle Spezifikation braucht kein oberstes `version`-Feld. Für unser statisches Beispiel genügt ein Dienst mit Build, lokaler Veröffentlichung und einem Healthcheck, dessen Werkzeug bereits im Image vorhanden ist ([Compose specification](https://docs.docker.com/reference/compose-file/)).
+
+  ```yaml title=compose.yaml
+  services:
+    web:
+      build: .
+      image: learn-web:1.0
+      ports:
+        - "127.0.0.1:8080:8000"
+      restart: unless-stopped
+      healthcheck:
+        test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/', timeout=2)"]
+        interval: 10s
+        timeout: 3s
+        retries: 3
+  ```
+
+  ```bash
+  docker compose config
+  docker compose up -d --build
+  docker compose ps
+  docker compose logs --tail 50 web
+  docker compose down
+  ```
+
+  `config` prüft und rendert die Konfiguration, kann dabei aber interpolierte Werte zeigen: Nutze die Ausgabe nicht unbereinigt in öffentlichen Berichten. `down` entfernt die Compose-Container und zugehörigen Standardnetze; mit `-v` würdest du zusätzlich verwaltete Volumes entfernen. Behandle diese Option als bewusst destruktive Datenentscheidung.
+
+  `environment` und `env_file` übergeben Umgebungswerte an Prozesse. Die `.env` für Compose-Interpolation und eine als `env_file` referenzierte Datei erfüllen unterschiedliche Aufgaben. Ein Eintrag in der ersten Datei ist nicht automatisch ein Umgebungswert im Container. Für Secrets verwendest du passende Secret-Mechanismen und vermeidest Werte im Repository ([Compose · Environment variables](https://docs.docker.com/compose/how-tos/environment-variables/)).
+
+  Für eine eigene API mit Datenbank kann ein Ausschnitt `depends_on: { db: { condition: service_healthy } }` auf den Healthcheck des Datenbankdienstes warten. Ein bloßes `depends_on: [db]` garantiert nur eine Startreihenfolge. Auch mit Healthcheck braucht die App Wiederverbindung und Fehlerbehandlung, weil die Datenbank später ausfallen kann. Eine Restart-Policy startet beendete Prozesse neu; ein Healthcheck allein startet einen lediglich ungesunden Container nicht automatisch neu ([Compose · Startup order](https://docs.docker.com/compose/how-tos/startup-order/)).
+
+  ## Rootless-Betrieb, Fehlerbilder und Zusammenfassung
+
+  Podman kann Container ohne zentralen privilegierten Daemon und rootless unter einem Benutzer betreiben. Viele Basisbefehle sind Docker ähnlich, die Laufzeitumgebung und einzelne Optionen sind dennoch nicht identisch. Für dauerhafte systemd-Integration beschreibt **Quadlet** Container in deklarativen Unitdateien. Die erzeugten Services verwaltest du mit systemd. Rootless-Benutzerdienste nach Logout oder Boot erfordern eine passend eingerichtete Benutzersitzung beziehungsweise Linger-Konfiguration ([Podman · Quadlet](https://docs.podman.io/en/latest/markdown/podman-systemd.unit.5.html)).
+
+  > [!PRAXIS]
+  > Dokumentiere Image-Digest, Portabbildung, Datenpfade, Laufzeitbenutzer und die genaue Restore-Probe. „Läuft in Docker“ beantwortet keine dieser Betriebsfragen.
+
+  Bei einem beendeten Container prüfst du zuerst `ps -a`, Status und Logs. Bei einem unerreichbaren Port prüfst du Prozessbindung im Container, Veröffentlichung und Host-Firewall. Bei fehlenden Daten prüfst du Mounts und UID-Zuordnung. Scans liefern Hinweise auf bekannte Schwachstellen in enthaltenen Komponenten; ein grüner Scan beweist weder sichere Anwendungskonfiguration noch korrekte Zugriffskontrolle.
+
+  > [!INTERVIEW]
+  > „Warum ist der Container trotz `EXPOSE 8000` nicht erreichbar?“ – EXPOSE dokumentiert den Port. Es fehlen möglicherweise die Veröffentlichung, eine passende Bind-Adresse, ein laufender Prozess oder eine erlaubende Netzregel.
+
+  - Container teilen den Hostkernel und isolieren bestimmte Ressourcen.
+  - Images sind Vorlagen, Container sind laufende oder beendete Instanzen.
+  - Exec-Form, Nicht-Root-Benutzer und kleine Kontexte machen Builds klarer.
+  - Laufzeitdaten brauchen externe Speicherung und getestete Backups.
+  - Interner Port, Hostport und Bind-Adresse sind verschiedene Werte.
+  - Compose beschreibt Konfiguration; Healthchecks ersetzen keine Fehlerbehandlung.
+  - Rootless und Scans ergänzen ein begründetes Sicherheitskonzept.
+exercises:
+  - id: kernel
+    type: choice
+    title: Was wird geteilt?
+    prompt: Welche Aussage beschreibt einen gewöhnlichen Linux-Container korrekt?
+    options:
+      - text: Er läuft mit dem Hostkernel und verwendet unter anderem Namespaces und cgroups.
+        correct: true
+        why: Die Isolation findet für Prozesse und Ressourcen innerhalb desselben Kernels statt.
+      - text: Er bootet grundsätzlich einen eigenen Linux-Kernel wie eine VM.
+        correct: false
+        why: Ein separater Gastkernel ist gerade das typische VM-Modell.
+      - text: Er erhält automatisch unveränderliche Daten und ein Backup.
+        correct: false
+        why: Laufzeitdaten und Sicherung müssen ausdrücklich entworfen werden.
+    explanation: Das Prozessmodell erklärt geringe Startkosten und gemeinsame Kernelabhängigkeit. Es begrenzt gleichzeitig, welche Isolation man ohne weitere Maßnahmen erwarten darf.
+    resources:
+      - title: namespaces(7)
+        url: https://man7.org/linux/man-pages/man7/namespaces.7.html
+  - id: port-argumente
+    type: output
+    title: Eine Veröffentlichung als Argumentliste
+    prompt: Welche Ausgabe erzeugt diese sichere Vorbereitung eines Containerbefehls? Es wird kein Container gestartet.
+    lang: bash
+    code: |
+      optionen=(-p '127.0.0.1:8080:8000' --name web)
+      printf '<%s>\n' "${optionen[@]}"
+    expected: |
+      <-p>
+      <127.0.0.1:8080:8000>
+      <--name>
+      <web>
+    verify: true
+    explanation: Die Portzuordnung ist genau ein Argument. Sie verbindet Host-Loopback Port 8080 mit Port 8000 im Container.
+  - id: entrypoint-ausgabe
+    type: output
+    title: Welche Argumentliste startet?
+    prompt: Das Image heißt `web-demo`. Du startest `docker run web-demo 9000`. Welche effektive Programmzeile ergibt sich aus diesem Dockerfile-Ausschnitt? Schreibe sie ohne Quotes in einer Zeile. Die Plattform vergleicht deine Herleitung und startet keinen Container.
+    lang: dockerfile
+    code: |
+      ENTRYPOINT ["python", "-m", "http.server"]
+      CMD ["8000"]
+    expected: python -m http.server 9000
+    verify: false
+    explanation: Die Argumente nach dem Imagenamen ersetzen CMD. Der Exec-ENTRYPOINT bleibt bestehen und erhält diese neuen Argumente.
+    resources:
+      - title: Dockerfile · ENTRYPOINT
+        url: https://docs.docker.com/reference/dockerfile/#entrypoint
+  - id: build-befehl
+    type: command
+    title: Das Image benennen
+    prompt: Baue mit Docker das Dockerfile im aktuellen Verzeichnis und vergib den Tag `learn-web:1.0`.
+    answers: ["docker build -t learn-web:1.0 .", "docker build --tag learn-web:1.0 .", "docker image build -t learn-web:1.0 ."]
+    explanation: Der Tag benennt das Ergebnis und der Punkt bestimmt den Build-Kontext. Die Dateien im Kontext werden durch .dockerignore und gezielte COPY-Anweisungen begrenzt.
+    resources:
+      - title: Docker · Build context
+        url: https://docs.docker.com/build/building/context/
+  - id: compose-pruefung
+    type: command
+    title: Konfiguration rendern
+    prompt: Prüfe und rendere die Compose-Konfiguration im aktuellen Verzeichnis mit dem Docker-Compose-Plugin, ohne Dienste zu starten.
+    answers: ["docker compose config"]
+    explanation: Die Ausgabe zeigt das aufgelöste Konfigurationsmodell. Sie beweist noch keinen funktionierenden Imagebuild und kann interpolierte Geheimnisse enthalten.
+    resources:
+      - title: docker compose config
+        url: https://docs.docker.com/reference/cli/docker/compose/config/
+  - id: logs
+    type: command
+    title: Die letzten Startmeldungen
+    prompt: Zeige mit Docker die letzten 50 Logzeilen des Containers `learn-web`, ohne dauerhaft zu folgen.
+    answers: ["docker logs --tail 50 learn-web", "docker container logs --tail 50 learn-web", "docker logs --tail=50 learn-web"]
+    explanation: Eine begrenzte Logmenge liefert Startkontext ohne unüberschaubare Ausgabe. Sie enthält nur die vom Logging-Pfad erfassten Meldungen.
+  - id: nicht-root
+    type: gap
+    title: Laufzeitidentität festlegen
+    prompt: Ergänze die Dockerfile-Anweisung, die den nachfolgenden Standardprozess mit UID und GID 10001 laufen lässt.
+    lang: dockerfile
+    code: |
+      FROM python:3.14-slim
+      WORKDIR /app
+      COPY site/ ./
+      ⟦USER⟧ 10001:10001
+      CMD ["python", "-m", "http.server", "8000"]
+    gaps:
+      - label: Identität
+        hint: Vier Großbuchstaben legen den Laufzeitbenutzer fest.
+    explanation: USER setzt die Identität für nachfolgende Schritte und den Standardprozess. Benötigte Schreibpfade müssen unabhängig davon passende Rechte besitzen.
+    resources:
+      - title: Dockerfile · USER
+        url: https://docs.docker.com/reference/dockerfile/#user
+  - id: port-verdreht
+    type: bug
+    title: Der veröffentlichte Port erreicht nichts
+    prompt: Die App lauscht im Container auf 8000. Auf dem Host soll sie ausschließlich unter 127.0.0.1:8080 erreichbar sein. Korrigiere die vertauschte Portzuordnung.
+    lang: bash
+    code: |
+      docker run --rm -p 127.0.0.1:8000:8080 learn-web:1.0
+    lines: [1]
+    fix:
+      - line: 1
+        answers: ["docker run --rm -p 127.0.0.1:8080:8000 learn-web:1.0"]
+    explanation: Nach der optionalen Hostadresse kommt der Hostport, danach der Containerport. Der veröffentlichte Zielport muss mit der tatsächlich lauschenden Anwendung übereinstimmen.
+    resources:
+      - title: Docker · Port publishing
+        url: https://docs.docker.com/engine/network/port-publishing/
+  - id: bereitschaft
+    type: explain
+    title: Startreihenfolge und Bereitschaft
+    prompt: Erkläre diesen Ausschnitt. Der Dienst db besitzt einen passenden Healthcheck. Welche Störung muss die API trotzdem selbst behandeln?
+    lang: yaml
+    code: |
+      services:
+        api:
+          depends_on:
+            db:
+              condition: service_healthy
+    points:
+      - Compose wartet beim Start auf den erfolgreichen Healthcheck von db.
+      - Ohne service_healthy wäre Startreihenfolge kein Nachweis der Bereitschaft.
+      - Ein späterer Datenbankausfall bleibt möglich.
+      - Die API braucht Wiederverbindung, sinnvolle Fehlerantworten und begrenzte Wiederholungen.
+    explanation: Der Healthcheck reduziert eine Start-Race-Condition. Er ist keine dauerhafte Verfügbarkeitsgarantie und repariert keine bereits offenen Datenbankverbindungen.
+    resources:
+      - title: Compose · Startup order
+        url: https://docs.docker.com/compose/how-tos/startup-order/
+  - id: web-container
+    type: practice
+    title: Eine kleine Website reproduzierbar ausliefern
+    prompt: Erzeuge site/index.html, Dockerfile, .dockerignore und compose.yaml nach dem statischen Beispiel. Teste Build, Loopback-Erreichbarkeit, Healthcheck, Laufzeitbenutzer und Neustart. Python http.server dient hier nur als Lernserver.
+    lang: yaml
+    solution: |
+      services:
+        web:
+          build: .
+          image: learn-web:1.0
+          ports: ["127.0.0.1:8080:8000"]
+          restart: unless-stopped
+          healthcheck:
+            test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/', timeout=2)"]
+            interval: 10s
+            timeout: 3s
+            retries: 3
+    checklist:
+      - Dockerfile kopiert nur site und startet die Anwendung per Exec-Form.
+      - Der Prozess läuft als UID 10001 statt root.
+      - docker compose config und der Imagebuild gelingen.
+      - localhost Port 8080 liefert die eigene index.html aus.
+      - Der Container erreicht healthy und bleibt nach einem kontrollierten Neustart nutzbar.
+      - .dockerignore schließt Git-Daten und Secrets aus.
+      - README nennt Start, Prüfung und Aufräumen ohne pauschales Löschen von Volumes.
+    explanation: Die Aufgabe verbindet Buildbeschreibung mit Betriebsnachweisen. Eine vorhandene compose.yaml allein belegt weder richtige Portbindung noch einen gesunden Prozess.

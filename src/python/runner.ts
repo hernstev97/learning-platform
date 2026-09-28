@@ -11,6 +11,8 @@ let worker: Worker | null = null;
 let booted = false;
 let nextId = 1;
 let state: RunnerState = 'idle';
+let queue: Promise<unknown> = Promise.resolve();
+let booting: Promise<void> | null = null;
 const listeners = new Set<(state: RunnerState) => void>();
 const pending = new Map<number, { resolve: (value: any) => void; reject: (error: Error) => void }>();
 
@@ -64,17 +66,33 @@ function send<T>(job: Omit<Job, 'id'> | { kind: 'boot' }, limit: number | null):
 /** Loads Pyodide (about 12 MB, cached by the browser afterwards). */
 export async function ensurePython(): Promise<void> {
   if (booted) return;
-  if (state !== 'loading') setState('loading');
-  await send({ kind: 'boot' }, null);
-  booted = true;
-  setState('ready');
+  if (!booting) booting = (async () => {
+    setState('loading');
+    try {
+      await send({ kind: 'boot' }, 60_000);
+      booted = true;
+      setState('ready');
+    } catch (error) {
+      worker?.terminate();
+      worker = null;
+      booted = false;
+      setState('idle');
+      throw error;
+    } finally { booting = null; }
+  })();
+  await booting;
 }
 
-async function run<T>(job: Omit<Job, 'id'>): Promise<T> {
-  await ensurePython();
-  setState('running');
-  try { return await send<T>(job, TIME_LIMIT); }
-  finally { if (state === 'running') setState('ready'); }
+function run<T>(job: Omit<Job, 'id'>): Promise<T> {
+  // Pyodide and the harness share globals/cwd/stdout. Async snippets must never overlap.
+  const result = queue.then(async () => {
+    await ensurePython();
+    setState('running');
+    try { return await send<T>(job, TIME_LIMIT); }
+    finally { if (state === 'running') setState('ready'); }
+  });
+  queue = result.catch(() => {});
+  return result;
 }
 export const runExercise = (setup: string, code: string, tests: { name: string; code: string }[]) => run<ExerciseResult>({ kind: 'exercise', setup, code, tests });
 export const runSnippet = (code: string) => run<SnippetResult>({ kind: 'snippet', code });

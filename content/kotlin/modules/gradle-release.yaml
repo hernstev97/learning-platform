@@ -1,0 +1,777 @@
+id: gradle-release
+title: "Gradle, Signieren und Release"
+level: 3
+minutes: 160
+summary: Wie aus Quellcode ein signiertes, optimiertes App Bundle wird, das über Testspuren und gestaffelte Rollouts in den Play Store kommt – automatisch gebaut und getestet in GitHub Actions.
+goals:
+  - Du liest und änderst `settings.gradle.kts`, Build-Dateien und einen Version Catalog und erklärst, was Plugins und Tasks sind.
+  - Du konfigurierst Build Types, Product Flavors und `BuildConfig`-Felder und sagst voraus, welche Varianten daraus entstehen.
+  - Du aktivierst R8 für Release-Builds und schreibst eine Keep-Regel, wenn Code per Reflection geladen wird.
+  - Du erklärst Upload Key und App Signing Key bei Play App Signing und hältst Keystores und Passwörter aus dem Repository heraus.
+  - Du planst einen Release über Testspuren und gestaffelten Rollout und automatisierst Tests, Lint und signierte Builds mit GitHub Actions.
+resources:
+  - title: Gradle build overview
+    url: https://developer.android.com/build/gradle-build-overview
+  - title: Configure build variants
+    url: https://developer.android.com/build/build-variants
+  - title: Sign your app
+    url: https://developer.android.com/studio/publish/app-signing
+  - title: Enable app optimization with R8
+    url: https://developer.android.com/topic/performance/app-optimization/enable-app-optimization
+  - title: Gradle version catalogs
+    url: https://docs.gradle.org/current/userguide/version_catalogs.html
+lesson: |
+  Bis hierhin hast du die App in Android Studio mit dem grünen Play-Knopf gestartet. Für einen Arbeitgeber ist das der Anfang, nicht das Ende: Die App muss reproduzierbar gebaut werden – auf deinem Rechner, auf dem Rechner einer Kollegin und in der CI –, sie muss signiert, verkleinert und versioniert sein, und sie muss so in den Play Store, dass ein Fehler nicht sofort alle Nutzer trifft. Genau das fragen Hiring-Teams ab, wenn sie „Erfahrung mit dem Release-Prozess“ in die Stellenanzeige schreiben.
+
+  Du kennst das Problem aus Bear: Der Debug-Build ist eine eigene App mit eigener ID, der Release-Build wird mit Bears eigenem Schlüssel signiert. Dieses Modul erklärt die Werkzeuge dahinter: Gradle und seine Kotlin DSL, Version Catalogs, Build-Varianten, R8, das Signieren, das App Bundle, die Testspuren der Play Console und eine CI mit GitHub Actions.
+
+  ## Gradle: Projekt, Module, Plugins, Tasks
+
+  [Gradle](https://developer.android.com/build/gradle-build-overview#happens-when) arbeitet in zwei Phasen. In der **Konfigurationsphase** führt es die Build-Skripte aus und baut daraus einen Graphen von **Tasks** – kleine Arbeitsschritte wie „Kotlin kompilieren“, „Ressourcen packen“, „APK signieren“. In der **Ausführungsphase** führt es nur die Tasks aus, die für dein Ziel nötig und nicht schon aktuell sind. Deshalb ist der zweite Build schneller: Unveränderte Tasks sind `UP-TO-DATE`.
+
+  Ein Android-Projekt hat drei Arten von Build-Dateien:
+
+  ```kotlin title=settings.gradle.kts
+  pluginManagement {
+      repositories {
+          google()
+          mavenCentral()
+          gradlePluginPortal()
+      }
+  }
+  dependencyResolutionManagement {
+      repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+      repositories {
+          google()
+          mavenCentral()
+      }
+  }
+  rootProject.name = "Bear"
+  include(":app")
+  ```
+
+  `settings.gradle.kts` legt fest, **welche Module** es gibt und woher Plugins und Bibliotheken kommen. Die `build.gradle.kts` im Wurzelverzeichnis deklariert Plugins meist nur mit `apply false`, damit alle Module dieselbe Version nutzen. Die `build.gradle.kts` jedes Moduls wendet Plugins an und konfiguriert das Modul. Ein **Plugin** bringt Tasks und DSL mit: `com.android.application` macht aus einem Modul eine App und stellt den `android { }`-Block bereit.
+
+  Die Skripte sind Kotlin – die [Kotlin DSL](https://docs.gradle.org/current/userguide/kotlin_dsl.html) gibt dir Autovervollständigung und Typprüfung in Android Studio. `isMinifyEnabled = true` ist eine gewöhnliche Property-Zuweisung, `buildTypes { … }` ein Lambda mit Receiver, wie du es aus dem Modul „Funktionen & Lambdas“ kennst.
+
+  Den Build startest du mit dem **Gradle Wrapper** `./gradlew`. Er lädt genau die Gradle-Version, die in `gradle/wrapper/gradle-wrapper.properties` steht – so baut jeder mit derselben Version. Wrapper-Skripte und `gradle-wrapper.jar` gehören ins Git.
+
+  > [!NOTE] AGP 9 und eingebautes Kotlin
+  > Seit dem Android Gradle Plugin 9.0 ist die Kotlin-Unterstützung [eingebaut](https://developer.android.com/build/releases/agp-9-0-0-release-notes): Das Plugin `org.jetbrains.kotlin.android` wird nicht mehr angewendet. Für Compose brauchst du weiterhin das Compose-Compiler-Plugin `org.jetbrains.kotlin.plugin.compose`, für Room und Hilt KSP. Ältere Projekte und viele Tutorials zeigen noch `kotlin("android")` – beim Upgrade entfernst du es.
+
+  ## Version Catalogs: Versionen an einer Stelle
+
+  Früher standen Versionsnummern verstreut in jeder Build-Datei. Ein [Version Catalog](https://developer.android.com/build/migrate-to-catalogs) sammelt sie in `gradle/libs.versions.toml`:
+
+  ```toml title=gradle/libs.versions.toml
+  [versions]
+  agp = "9.4.0"
+  kotlin = "2.4.20"
+  ksp = "2.3.12"
+  composeBom = "2026.09.00"
+  room = "3.0.3"
+
+  [libraries]
+  androidx-compose-bom = { group = "androidx.compose", name = "compose-bom", version.ref = "composeBom" }
+  androidx-compose-material3 = { group = "androidx.compose.material3", name = "material3" }
+  androidx-room-runtime = { group = "androidx.room3", name = "room3-runtime", version.ref = "room" }
+  androidx-room-compiler = { group = "androidx.room3", name = "room3-compiler", version.ref = "room" }
+  junit = { group = "junit", name = "junit", version = "4.13.2" }
+
+  [plugins]
+  android-application = { id = "com.android.application", version.ref = "agp" }
+  kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
+  ksp = { id = "com.google.devtools.ksp", version.ref = "ksp" }
+  ```
+
+  Gradle erzeugt daraus typsichere Accessoren: Aus `androidx-room-runtime` wird `libs.androidx.room.runtime`, aus dem Plugin `kotlin-compose` wird `libs.plugins.kotlin.compose`. Die Compose-BOM („Bill of Materials“) legt die Versionen aller Compose-Bibliotheken fest, deshalb hat `material3` keine eigene Version. Die Versionsnummern oben sind der Stand September 2026; in deinem Projekt aktualisierst du sie mit dem Upgrade-Assistenten von Android Studio oder einem Bot wie Dependabot oder Renovate.
+
+  ```kotlin title=app/build.gradle.kts
+  plugins {
+      alias(libs.plugins.android.application)
+      alias(libs.plugins.kotlin.compose)
+      alias(libs.plugins.ksp)
+  }
+
+  dependencies {
+      implementation(platform(libs.androidx.compose.bom))
+      implementation(libs.androidx.compose.material3)
+      implementation(libs.androidx.room.runtime)
+      ksp(libs.androidx.room.compiler)
+      testImplementation(libs.junit)
+  }
+  ```
+
+  Die Konfiguration entscheidet, wo eine Abhängigkeit landet: `implementation` in der App, `ksp` nur im Code-Generator, `testImplementation` nur in lokalen Tests, `androidTestImplementation` nur in instrumentierten Tests.
+
+  ## Build Types, Product Flavors und BuildConfig
+
+  Aus einem Quellcode entstehen mehrere [Build-Varianten](https://developer.android.com/build/build-variants). **Build Types** beschreiben, *wie* gebaut wird: `debug` (debugbar, mit Debug-Schlüssel signiert) und `release` (optimiert, mit deinem Schlüssel signiert). **Product Flavors** beschreiben, *was* gebaut wird: etwa `staging` gegen einen Testserver und `production` gegen den echten. Jede Kombination ist eine Variante mit eigenen Tasks: `assembleStagingDebug`, `bundleProductionRelease`.
+
+  ```kotlin title=app/build.gradle.kts
+  android {
+      namespace = "app.kiumu.bear"
+      compileSdk {
+          version = release(36)
+      }
+
+      defaultConfig {
+          applicationId = "app.kiumu.bear"
+          minSdk {
+              version = release(26)
+          }
+          targetSdk {
+              version = release(36)
+          }
+          versionCode = 12
+          versionName = "1.3.0"
+      }
+
+      buildFeatures {
+          compose = true
+          buildConfig = true
+      }
+
+      buildTypes {
+          debug {
+              applicationIdSuffix = ".debug"   // eigene App neben der Release-Version
+          }
+          release {
+              optimization {
+                  enable = true               // R8: Code und Ressourcen optimieren
+              }
+              signingConfig = signingConfigs.getByName("release")
+          }
+      }
+
+      flavorDimensions += "environment"
+      productFlavors {
+          create("staging") {
+              dimension = "environment"
+              applicationIdSuffix = ".staging"
+              buildConfigField("String", "API_URL", "\"https://staging.example.com/\"")
+          }
+          create("production") {
+              dimension = "environment"
+              buildConfigField("String", "API_URL", "\"https://api.example.com/\"")
+          }
+      }
+  }
+  ```
+
+  Die neue Schreibweise `compileSdk { version = release(36) }` stammt aus AGP 9; viele Projekte schreiben noch kurz `compileSdk = 36`. `compileSdk` bestimmt, gegen welche API du kompilierst, `targetSdk`, welches Verhalten des Systems deine App erwartet. Google Play verlangt für neue Apps und Updates ein [aktuelles `targetSdk`](https://developer.android.com/google/play/requirements/target-sdk) – derzeit Android 16 (API 36) – und hebt die Grenze jährlich an.
+
+  `buildConfigField` erzeugt eine Konstante in der generierten Klasse `BuildConfig`, die du im Code liest: `BuildConfig.API_URL`, dazu automatisch `BuildConfig.DEBUG`. Seit AGP 8 musst du `buildConfig = true` ausdrücklich einschalten. Der dritte Parameter ist Java-Quelltext, deshalb die maskierten Anführungszeichen.
+
+  > [!WARNING] BuildConfig ist kein Tresor
+  > Alles in `BuildConfig`, in Ressourcen oder im Code steckt im ausgelieferten App Bundle und lässt sich mit einem Decompiler auslesen – auch nach R8. API-Schlüssel, die geheim bleiben müssen, gehören auf einen Server, nicht in die App. Bear lässt den Nutzer deshalb seinen eigenen Linear-Schlüssel eingeben und speichert ihn verschlüsselt im Keystore des Geräts.
+
+  ## R8: kleiner, schneller, schwerer zu lesen
+
+  Im Release-Build läuft [R8](https://developer.android.com/topic/performance/app-optimization/enable-app-optimization#enable). Es entfernt ungenutzten Code und ungenutzte Ressourcen (Shrinking), optimiert (Inlining, Entfernen toter Zweige) und benennt Klassen und Methoden in kurze Namen um (Obfuscation). Das Ergebnis ist kleiner und schneller. Seit AGP 9.3 schaltest du alles mit `optimization { enable = true }` ein; ältere Projekte nutzen die bisherige Schreibweise:
+
+  ```kotlin
+  release {
+      isMinifyEnabled = true
+      isShrinkResources = true
+      proguardFiles(
+          getDefaultProguardFile("proguard-android-optimize.txt"),
+          "proguard-rules.pro",
+      )
+  }
+  ```
+
+  R8 entscheidet anhand statischer Analyse, was benutzt wird. Code, der nur per **Reflection** erreicht wird – etwa eine Klasse, die über ihren Namen als String geladen wird –, sieht es nicht und entfernt oder umbenennt ihn. Das Symptom: Die App läuft im Debug-Build und stürzt im Release-Build mit `ClassNotFoundException` oder `NoSuchMethodException` ab. Die Lösung ist eine [Keep-Regel](https://developer.android.com/topic/performance/app-optimization/add-keep-rules#keep-option). Mit dem neuen DSL liegen eigene Regeln in Dateien wie `src/main/keepRules/app.keep`, mit dem alten in `proguard-rules.pro`:
+
+  ```text
+  # Exporter werden per Class.forName(name) geladen
+  -keep class app.kiumu.bear.export.** implements app.kiumu.bear.export.Exporter {
+      <init>();
+  }
+  ```
+
+  Bibliotheken wie Room, kotlinx.serialization oder WorkManager bringen ihre eigenen Regeln mit. Für Stacktraces aus dem Release erzeugt R8 eine `mapping.txt`; lädst du sie in die Play Console hoch, zeigt Android vitals lesbare Stacktraces. Teste Release-Builds deshalb immer auf einem echten Gerät, bevor sie an Nutzer gehen.
+
+  ## Signieren: Upload Key und App Signing Key
+
+  Android installiert nur signierte Apps, und ein Update wird nur installiert, wenn es mit demselben Schlüssel signiert ist wie die installierte Version. Wer den Schlüssel verliert, kann keine Updates mehr ausliefern; wer ihn stiehlt, kann Updates im Namen der App ausliefern.
+
+  Bei [Play App Signing](https://developer.android.com/studio/publish/app-signing#app-signing-google-play) gibt es deshalb zwei Schlüssel:
+
+  | | App Signing Key | Upload Key |
+  | --- | --- | --- |
+  | Wer hat ihn? | Google, in seiner Schlüsselverwaltung | du, in deinem Keystore |
+  | Wofür? | signiert die APKs, die Nutzer installieren | signiert, was du in die Play Console lädst |
+  | Verloren? | kann nicht passieren | beim Support zurücksetzen lassen |
+
+  Google prüft deine Upload-Signatur, entfernt sie und signiert mit dem App Signing Key neu. Verlierst du den Upload Key, lässt du ihn [zurücksetzen](https://developer.android.com/studio/publish/app-signing#reset_upload_key) – ohne dass Nutzer etwas merken. Für neue Apps ist das App Bundle und damit Play App Signing Pflicht.
+
+  Einen Upload Key erzeugst du in Android Studio („Generate Signed App Bundle“) oder mit `keytool` aus dem JDK. Die Build-Datei liest Pfad und Passwörter aus Umgebungsvariablen, nie aus dem Repository:
+
+  ```kotlin
+  android {
+      signingConfigs {
+          create("release") {
+              storeFile = System.getenv("UPLOAD_KEYSTORE_PATH")?.let { file(it) }
+              storePassword = System.getenv("UPLOAD_KEYSTORE_PASSWORD")
+              keyAlias = System.getenv("UPLOAD_KEY_ALIAS")
+              keyPassword = System.getenv("UPLOAD_KEY_PASSWORD")
+          }
+      }
+  }
+  ```
+
+  > [!WARNING] Keystores und Passwörter gehören nie ins Git
+  > `*.jks`, `*.keystore` und Dateien mit Passwörtern kommen in `.gitignore`, bevor du den Schlüssel erzeugst. Ein einmal gepushtes Geheimnis ist kompromittiert, auch wenn du den Commit später löschst – Forks, Caches und Klone haben es schon. Bewahre den Keystore und seine Passwörter an zwei sicheren Orten auf, etwa im Passwort-Manager und auf einem verschlüsselten Backup.
+
+  ## App Bundle, Versionen und Testspuren
+
+  In den Play Store lädst du ein [Android App Bundle](https://developer.android.com/guide/app-bundle) (`.aab`), kein APK. Das Bundle enthält Code und Ressourcen für alle Geräte; Google Play erzeugt daraus für jedes Gerät optimierte APKs – nur die passende Bildschirmdichte, CPU-Architektur und Sprache. Nutzer laden weniger herunter. APKs brauchst du weiterhin, um direkt zu installieren, etwa per `adb install` auf dem eigenen Pixel.
+
+  Jeder Upload braucht eine [Version](https://developer.android.com/studio/publish/versioning#appversioning): `versionCode` ist eine ganze Zahl, die mit jedem Upload steigen muss – Play lehnt einen bereits verwendeten Code ab, und Android installiert keine Version mit kleinerem Code über eine größere. `versionName` ist der Text, den Nutzer sehen („1.3.0“); für das System spielt er keine Rolle. Viele Teams leiten den `versionCode` in der CI aus der Build-Nummer ab.
+
+  In der Play Console durchläuft ein Release [Testspuren](https://support.google.com/googleplay/android-developer/answer/9845334):
+
+  - **Internal testing:** bis zu 100 Tester, in wenigen Minuten verfügbar – für dich und dein Team.
+  - **Closed testing:** eingeladene Tester, etwa per E-Mail-Liste. Neue private Entwicklerkonten müssen hier mindestens 12 Tester 14 Tage lang testen lassen, bevor sie Zugang zu Production bekommen.
+  - **Open testing:** jeder kann über den Store beitreten.
+  - **Production:** alle Nutzer.
+
+  In Production rollst du [gestaffelt](https://support.google.com/googleplay/android-developer/answer/6346149) aus: erst 5 oder 10 Prozent der Nutzer, dann mehr. Zeigen Android vitals mehr Abstürze, hältst du den Rollout an. Zurückrollen kannst du nicht – Nutzer, die das Update haben, behalten es. Die Korrektur ist ein neues Release mit höherem `versionCode`.
+
+  > [!INTERVIEW] „Wie sieht bei euch ein Release aus?“
+  > Eine gute Antwort beschreibt einen Ablauf: Version hochzählen, CI baut aus einem Tag ein signiertes App Bundle mit R8, Unit-Tests und Lint müssen grün sein. Upload in den Internal Track, Smoke-Test auf echten Geräten, dann Closed Testing oder direkt Production mit gestaffeltem Rollout, etwa 10 Prozent. Android vitals und Crash-Reports beobachten, bei Problemen Rollout anhalten und einen Fix mit höherem `versionCode` nachschieben. Dazu gehört der Satz: „Wir nutzen Play App Signing; unser Upload Key liegt als Secret in der CI, nicht im Repository.“
+
+  ## CI mit GitHub Actions
+
+  Eine Continuous-Integration-Pipeline baut und testet jeden Push und jeden Pull Request auf einem frischen Rechner. Sie beantwortet die Frage „Läuft es nur bei mir?“, bevor jemand anderes sie stellt. Mit GitHub Actions liegt die Pipeline als YAML in `.github/workflows/`:
+
+  ```yaml title=.github/workflows/android.yml
+  name: Android CI
+
+  on:
+    push:
+      branches: [main]
+      tags: ["v*"]
+    pull_request:
+
+  jobs:
+    check:
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v7
+        - uses: actions/setup-java@v6
+          with:
+            distribution: temurin
+            java-version: 17
+        - uses: gradle/actions/setup-gradle@v6
+        - run: ./gradlew testDebugUnitTest lintDebug assembleDebug
+
+    release:
+      if: startsWith(github.ref, 'refs/tags/v')
+      needs: check
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v7
+        - uses: actions/setup-java@v6
+          with:
+            distribution: temurin
+            java-version: 17
+        - uses: gradle/actions/setup-gradle@v6
+        - name: Upload-Keystore aus dem Secret herstellen
+          run: echo "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/upload.jks"
+          env:
+            KEYSTORE_BASE64: ${{ secrets.UPLOAD_KEYSTORE_BASE64 }}
+        - name: Signiertes App Bundle bauen
+          run: ./gradlew bundleRelease
+          env:
+            UPLOAD_KEYSTORE_PATH: ${{ runner.temp }}/upload.jks
+            UPLOAD_KEYSTORE_PASSWORD: ${{ secrets.UPLOAD_KEYSTORE_PASSWORD }}
+            UPLOAD_KEY_ALIAS: ${{ secrets.UPLOAD_KEY_ALIAS }}
+            UPLOAD_KEY_PASSWORD: ${{ secrets.UPLOAD_KEY_PASSWORD }}
+        - uses: actions/upload-artifact@v7
+          with:
+            name: app-release
+            path: app/build/outputs/bundle/release/app-release.aab
+  ```
+
+  Der Job `check` läuft bei jedem Push und Pull Request: Unit-Tests, Lint und ein Debug-Build. `setup-gradle` cacht Gradle-Downloads zwischen Läufen. Der Job `release` läuft nur für Tags wie `v1.3.0` und erst, wenn `check` grün ist. Der Keystore liegt als Base64-Text in einem [verschlüsselten Secret](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-secrets) und wird nur für diesen Lauf in ein temporäres Verzeichnis außerhalb des Repositorys geschrieben. GitHub maskiert Secrets in den Logs; ausgeben solltest du sie trotzdem nie. Den Upload in die Play Console kann ein weiterer Schritt über die Play Developer API übernehmen, etwa mit Gradle Play Publisher oder fastlane.
+
+  > [!PRAXIS] Was in einer Take-Home-Aufgabe auffällt
+  > Ein Repository mit grünem CI-Badge, einem Version Catalog, einer `.gitignore`, die `local.properties` und Keystores ausschließt, und einem README-Abschnitt „Bauen und Testen“ mit `./gradlew testDebugUnitTest` wirkt professionell, bevor jemand eine Zeile Kotlin gelesen hat. Ein eingecheckter Keystore oder ein Passwort in `build.gradle.kts` ist dagegen ein Ausschlusskriterium.
+
+  ## Ausblick: Baseline Profiles
+
+  Beim ersten Start nach der Installation führt Android Code zunächst interpretiert oder just-in-time kompiliert aus; Startzeit und erstes Scrollen leiden. Ein [Baseline Profile](https://developer.android.com/topic/performance/baselineprofiles/overview) listet die Klassen und Methoden, die beim Start und in wichtigen Abläufen gebraucht werden. Es wird mit der App ausgeliefert, und das System kompiliert diese Teile schon bei der Installation vorab. Erzeugt wird es mit einem Macrobenchmark-Test und dem Gradle-Plugin `androidx.baselineprofile`. Für den Einstieg reicht es zu wissen, dass es das gibt und wofür – in Interviews für Mid-Level-Stellen fällt der Begriff bei Fragen zur Startzeit.
+
+  ## Häufige Fehler
+
+  - **Keystore oder Passwort im Repository.** Behebung: Schlüssel als kompromittiert behandeln, Upload Key zurücksetzen lassen, `.gitignore` ergänzen, Secrets nutzen.
+  - **`versionCode` nicht erhöht.** Symptom: Die Play Console lehnt den Upload ab, weil der Code schon verwendet wurde.
+  - **Release-Build nie getestet.** Symptom: Absturz nur im Release, `ClassNotFoundException` nach R8. Behebung: Keep-Regel, Release-Build vor jedem Rollout auf einem Gerät testen.
+  - **Geheimnisse in `BuildConfig`.** Sie sind im Bundle lesbar.
+  - **Versionen in jeder Build-Datei.** Unterschiedliche Module nutzen verschiedene Versionen derselben Bibliothek. Behebung: Version Catalog.
+  - **Gradle-Wrapper nicht eingecheckt oder `gradle` statt `./gradlew`.** Jeder baut mit einer anderen Gradle-Version.
+  - **Direkt 100 Prozent Production.** Ein Absturz trifft alle Nutzer auf einmal. Behebung: Internal Track, dann gestaffelter Rollout.
+
+  ## Zusammenfassung
+
+  - Gradle konfiguriert erst einen Task-Graphen und führt dann nur nötige Tasks aus. `settings.gradle.kts` listet Module und Repositories, Modul-Build-Dateien wenden Plugins an; gebaut wird mit `./gradlew`.
+  - Der Version Catalog `gradle/libs.versions.toml` hält alle Versionen; Accessoren wie `libs.androidx.room.runtime` und `libs.plugins.ksp` ersetzen Strings.
+  - Build Types (wie) × Product Flavors (was) = Varianten mit eigenen Tasks. `buildConfigField` erzeugt Konstanten, aber keine Geheimnisse.
+  - R8 verkleinert, optimiert und verschleiert den Release-Build; Reflection braucht Keep-Regeln, `mapping.txt` macht Stacktraces lesbar.
+  - Play App Signing: Google hält den App Signing Key, du den Upload Key. Keystores und Passwörter bleiben außerhalb des Repositorys.
+  - Hochgeladen wird ein App Bundle mit steigendem `versionCode`, über Internal, Closed und Open Testing bis zum gestaffelten Rollout in Production.
+  - GitHub Actions baut und testet jeden Push; ein Tag löst einen signierten Release-Build mit Secrets aus.
+exercises:
+  - id: zwei-schluessel
+    type: choice
+    title: Wer signiert was?
+    prompt: |
+      Bear nutzt Play App Signing. Welche Aussagen stimmen? Mehrere Antworten sind richtig.
+    options:
+      - text: Die APKs, die Nutzer aus dem Play Store installieren, sind mit dem App Signing Key signiert, den Google verwaltet.
+        correct: true
+        why: Google entfernt die Upload-Signatur und signiert die ausgelieferten APKs mit dem App Signing Key.
+      - text: Verliert Steven seinen Upload Key, kann er nie wieder ein Update für Bear veröffentlichen.
+        correct: false
+        why: Genau dafür ist die Trennung da – ein verlorener oder kompromittierter Upload Key lässt sich über die Play Console zurücksetzen.
+      - text: Der Keystore mit dem Upload Key darf ins private Git-Repository, solange das Passwort nicht darin steht.
+        correct: false
+        why: Auch private Repositories werden geklont, gesichert und geteilt. Keystores gehören in `.gitignore` und in der CI in ein Secret.
+      - text: Ein Update wird auf dem Gerät nur installiert, wenn es mit demselben Schlüssel signiert ist wie die installierte Version.
+        correct: true
+        why: Android prüft die Signatur; deshalb ist der App Signing Key so wertvoll und bei Google sicher aufgehoben.
+      - text: Der Debug-Build von Bear kann nicht über die Play-Version installiert werden, auch wenn er dieselbe Application ID hätte.
+        correct: true
+        why: Debug-Builds sind mit dem lokalen Debug-Schlüssel signiert – ein anderer Schlüssel, also verweigert Android das Update. Eine eigene ID über `applicationIdSuffix` lässt beide nebeneinander laufen.
+    explanation: |
+      Die Signatur beweist, dass ein Update vom selben Absender kommt. Play App Signing trennt die zwei Aufgaben: Der wertvolle App Signing Key liegt bei Google und kann nicht verloren gehen; der Upload Key weist dich gegenüber Google aus und ist ersetzbar. Beide Schlüssel bleiben außerhalb des Repositorys.
+    resources:
+      - title: Play App Signing
+        url: https://developer.android.com/studio/publish/app-signing#app-signing-google-play
+      - title: Use Play App Signing (Play Console Help)
+        url: https://support.google.com/googleplay/android-developer/answer/9842756
+  - id: release-ablauf
+    type: order
+    title: Vom Commit zum Nutzer
+    prompt: |
+      Bring die Schritte eines sorgfältigen Releases von Bear in die richtige Reihenfolge.
+    lang: text
+    lines: |
+      versionCode von 12 auf 13 erhöhen und versionName auf 1.3.1 setzen
+      Tag v1.3.1 pushen; die CI führt Tests und Lint aus
+      Die CI baut das signierte App Bundle mit R8
+      Bundle in den Internal Track laden und auf dem eigenen Pixel testen
+      Release in Production mit 10 Prozent Rollout starten
+      Android vitals beobachten und den Rollout auf 100 Prozent erhöhen
+    explanation: |
+      Die Version kommt zuerst, weil jeder Upload einen neuen `versionCode` braucht. Der Tag löst die Pipeline aus; der signierte Build entsteht erst, wenn Tests und Lint grün sind. Der Internal Track ist der schnellste Weg, genau das Bundle zu testen, das Nutzer bekommen – inklusive R8. Production startet gestaffelt; erst wenn die Absturzraten unauffällig sind, geht der Rollout auf 100 Prozent.
+    resources:
+      - title: Staged rollouts (Play Console Help)
+        url: https://support.google.com/googleplay/android-developer/answer/6346149
+      - title: Set up testing tracks (Play Console Help)
+        url: https://support.google.com/googleplay/android-developer/answer/9845334
+  - id: varianten-vorhersagen
+    type: output
+    title: Welche Varianten entstehen?
+    prompt: |
+      Dieses Programm bildet nach, wie AGP Variantennamen und Application IDs zusammensetzt: Build Types `debug` (Suffix `.debug`) und `release`, Flavors `staging` (Suffix `.staging`) und `production`. Der Suffix des Flavors kommt vor dem des Build Types. Was gibt es aus?
+    lang: kotlin
+    code: |
+      fun main() {
+          val flavors = listOf("staging" to ".staging", "production" to "")
+          val buildTypes = listOf("debug" to ".debug", "release" to "")
+          for ((flavor, flavorSuffix) in flavors) {
+              for ((type, typeSuffix) in buildTypes) {
+                  val variant = flavor + type.replaceFirstChar { it.uppercase() }
+                  println("$variant: app.kiumu.bear$flavorSuffix$typeSuffix")
+              }
+          }
+      }
+    expected: |
+      stagingDebug: app.kiumu.bear.staging.debug
+      stagingRelease: app.kiumu.bear.staging
+      productionDebug: app.kiumu.bear.debug
+      productionRelease: app.kiumu.bear
+    hints:
+      - Zwei Flavors mal zwei Build Types – wie viele Varianten?
+      - Der Variantenname beginnt mit dem Flavor; der Build Type folgt mit großem Anfangsbuchstaben.
+    explanation: |
+      Varianten sind das Kreuzprodukt aus Flavors und Build Types: 2 × 2 = 4. Der Name beginnt mit dem Flavor, dann folgt der Build Type – deshalb heißen die Tasks `assembleStagingDebug` oder `bundleProductionRelease`. Die Suffixe hängen sich an die `applicationId` an, erst der des Flavors, dann der des Build Types. Weil alle vier IDs verschieden sind, können alle vier Varianten gleichzeitig auf einem Gerät installiert sein – praktisch, um Staging und Production nebeneinander zu testen.
+    resources:
+      - title: Configure build variants
+        url: https://developer.android.com/build/build-variants
+  - id: versioncode-vergleich
+    type: output
+    title: Ist 1.10 größer als 1.9?
+    prompt: |
+      Ein Team leitet den `versionCode` aus dem `versionName` ab. Was gibt das Programm aus?
+    lang: kotlin
+    code: |
+      fun code(name: String): Int {
+          val (major, minor, patch) = name.split(".").map { it.toInt() }
+          return major * 10_000 + minor * 100 + patch
+      }
+
+      fun main() {
+          println("1.10.0" > "1.9.0")
+          println(code("1.10.0") > code("1.9.0"))
+          println(code("1.9.0"))
+          println(code("1.10.0"))
+      }
+    expected: |
+      false
+      true
+      10900
+      11000
+    hints:
+      - Strings werden Zeichen für Zeichen verglichen. Wo unterscheiden sich „1.10.0“ und „1.9.0“ zum ersten Mal?
+    explanation: |
+      Der String-Vergleich ist lexikografisch: An der dritten Stelle steht `1` gegen `9`, also ist „1.10.0“ *kleiner* als „1.9.0“. Genau deshalb nutzt Android einen ganzzahligen `versionCode` für die Reihenfolge und behandelt den `versionName` als reinen Anzeigetext. Das Schema `major * 10 000 + minor * 100 + patch` liefert 10900 und 11000 und damit die richtige Reihenfolge – solange minor und patch unter 100 bleiben. Viele Teams nehmen stattdessen die fortlaufende Build-Nummer der CI.
+    resources:
+      - title: Version your app
+        url: https://developer.android.com/studio/publish/versioning#versionvalues
+  - id: version-catalog
+    type: gap
+    title: Ein Eintrag im Katalog
+    prompt: |
+      Ergänze den Version Catalog um WorkManager und nutze ihn in der Build-Datei. Die Version soll im Abschnitt `[versions]` stehen und per Referenz genutzt werden.
+    lang: toml
+    code: |
+      [versions]
+      agp = "9.4.0"
+      work = "2.11.0"
+
+      ⟦[libraries]⟧
+      androidx-work-runtime = { group = "androidx.work", name = "work-runtime-ktx", ⟦version.ref = "work"⟧ }
+
+      [plugins]
+      android-application = { ⟦id = "com.android.application"⟧, version.ref = "agp" }
+
+      # app/build.gradle.kts
+      # plugins { alias(⟦libs.plugins.android.application⟧) }
+      # dependencies { implementation(⟦libs.androidx.work.runtime⟧) }
+    gaps:
+      - label: Abschnitt
+        hint: Die Tabelle für Bibliotheken.
+      - label: Versionsreferenz
+        hint: Verweist auf einen Schlüssel aus `[versions]`.
+      - label: Plugin-ID
+        hint: Die ID des Plugins für Android-Apps.
+      - label: Plugin-Accessor
+        hint: Bindestriche werden zu Punkten, Plugins liegen unter `plugins`.
+      - label: Bibliotheks-Accessor
+        hint: "`androidx-work-runtime` als Accessor."
+    explanation: |
+      Ein Katalog hat die Tabellen `[versions]`, `[libraries]`, `[plugins]` (und optional `[bundles]`). `version.ref` verweist auf eine Version, damit mehrere Bibliotheken dieselbe Nummer teilen. Gradle erzeugt daraus Accessoren, in denen Bindestriche zu Punkten werden: `androidx-work-runtime` → `libs.androidx.work.runtime`, Plugins unter `libs.plugins`. Tippfehler fallen so schon beim Synchronisieren auf, nicht erst beim Auflösen der Abhängigkeit.
+    resources:
+      - title: Migrate to version catalogs
+        url: https://developer.android.com/build/migrate-to-catalogs#create-version
+      - title: Version catalogs (Gradle-Doku)
+        url: https://docs.gradle.org/current/userguide/version_catalogs.html
+  - id: build-types-konfigurieren
+    type: gap
+    title: Debug neben Release
+    prompt: |
+      Ergänze die Build-Konfiguration: Der Debug-Build soll als eigene App mit der ID `app.kiumu.bear.debug` neben der Release-Version installierbar sein, der Release-Build soll mit R8 optimiert (neues DSL ab AGP 9.3) und mit der Signaturkonfiguration `release` signiert werden. Beide Builds bekommen die Konstante `LINEAR_URL`.
+    lang: kotlin
+    code: |
+      android {
+          defaultConfig {
+              applicationId = "app.kiumu.bear"
+              ⟦buildConfigField⟧("String", "LINEAR_URL", "\"https://api.linear.app/graphql\"")
+          }
+
+          buildFeatures {
+              ⟦buildConfig = true⟧
+          }
+
+          buildTypes {
+              debug {
+                  ⟦applicationIdSuffix = ".debug"⟧
+              }
+              release {
+                  ⟦optimization⟧ {
+                      enable = true
+                  }
+                  signingConfig = ⟦signingConfigs.getByName("release")⟧
+              }
+          }
+      }
+    gaps:
+      - label: Konstante erzeugen
+        hint: Eine Funktion mit Typ, Name und Wert als Java-Quelltext.
+      - label: BuildConfig aktivieren
+        hint: Seit AGP 8 ist die Generierung standardmäßig aus.
+      - label: Eigene ID für Debug
+        hint: Wird an die `applicationId` angehängt.
+      - label: R8-Block
+        hint: Der neue Block für Code- und Ressourcenoptimierung.
+      - label: Signatur
+        hint: Die Konfiguration aus `signingConfigs` mit dem Namen `release`.
+        accept: ["signingConfigs[\"release\"]"]
+    explanation: |
+      `buildConfigField` in `defaultConfig` gilt für alle Varianten; erzeugt wird die Klasse aber nur mit `buildConfig = true`. `applicationIdSuffix` gibt dem Debug-Build eine eigene ID – Bear macht genau das, damit Debug- und Release-Version nebeneinander auf dem Pixel laufen und sich nicht gegenseitig überschreiben. `optimization { enable = true }` schaltet R8 samt Ressourcen-Shrinking ein und bringt die Standardregeln mit, die früher `proguard-android-optimize.txt` hießen. Die Signatur verweist auf eine Konfiguration, deren Passwörter aus Umgebungsvariablen kommen.
+    resources:
+      - title: Build types
+        url: https://developer.android.com/build/build-variants
+      - title: Enable optimization
+        url: https://developer.android.com/topic/performance/app-optimization/enable-app-optimization#enable
+  - id: ci-workflow
+    type: gap
+    title: Grün bei jedem Pull Request
+    prompt: |
+      Ergänze den Workflow: Er soll bei Pull Requests und Pushes auf `main` laufen, JDK 17 von Temurin einrichten, Gradle cachen und Unit-Tests, Lint und einen Debug-Build ausführen.
+    lang: yaml
+    code: |
+      name: Android CI
+
+      on:
+        push:
+          branches: [main]
+        ⟦pull_request⟧:
+
+      jobs:
+        check:
+          ⟦runs-on⟧: ubuntu-latest
+          steps:
+            - uses: ⟦actions/checkout@v7⟧
+            - uses: actions/setup-java@v6
+              with:
+                distribution: temurin
+                java-version: ⟦17⟧
+            - uses: ⟦gradle/actions/setup-gradle@v6⟧
+            - run: ⟦./gradlew testDebugUnitTest lintDebug assembleDebug⟧
+    gaps:
+      - label: Auslöser
+        hint: Das Ereignis für Pull Requests.
+      - label: Runner
+        hint: Auf welchem Rechnertyp der Job läuft.
+      - label: Quellcode holen
+        hint: Die offizielle Action, die das Repository auscheckt, Version 7.
+      - label: JDK-Version
+        hint: Die Mindestversion für AGP 9.
+        accept: ["\"17\"", "'17'"]
+      - label: Gradle einrichten
+        hint: Die Action aus `gradle/actions`, die Gradle einrichtet und cacht.
+      - label: Gradle-Aufruf
+        hint: Drei Tasks – lokale Unit-Tests, Lint und Debug-Build, jeweils für die Debug-Variante.
+        accept: ["./gradlew testDebugUnitTest lintDebug assembleDebug --stacktrace", "./gradlew lintDebug testDebugUnitTest assembleDebug", "./gradlew assembleDebug testDebugUnitTest lintDebug"]
+    explanation: |
+      `on` legt die Auslöser fest; ein leerer `pull_request:` reagiert auf alle Pull Requests. Jeder Job läuft auf einem frischen Runner, deshalb holt `actions/checkout` zuerst den Code und `setup-java` das JDK. `gradle/actions/setup-gradle` richtet Gradle ein und cacht Abhängigkeiten zwischen Läufen – das spart Minuten pro Lauf. Ein einzelner `./gradlew`-Aufruf mit mehreren Tasks nutzt einen gemeinsamen Gradle-Daemon und ist schneller als drei getrennte Schritte. Scheitert ein Task, ist der Job rot und der Pull Request zeigt es an.
+    resources:
+      - title: gradle/actions (GitHub)
+        url: https://github.com/gradle/actions
+      - title: Test from the command line
+        url: https://developer.android.com/studio/test/command-line
+  - id: bundle-bauen
+    type: command
+    title: Das Bundle für den Play Store
+    prompt: |
+      Baue im Modul `app` das signierte App Bundle der Release-Variante. Die Umgebungsvariablen für den Keystore sind gesetzt.
+    context: Du bist im Wurzelverzeichnis des Android-Projekts.
+    answers:
+      - ./gradlew :app:bundleRelease
+      - ./gradlew bundleRelease
+    output: |
+      > Task :app:minifyReleaseWithR8
+      > Task :app:signReleaseBundle
+      > Task :app:bundleRelease
+
+      BUILD SUCCESSFUL in 1m 48s
+      $ ls app/build/outputs/bundle/release/
+      app-release.aab
+    explanation: |
+      `bundle<Variante>` erzeugt ein App Bundle (`.aab`), `assemble<Variante>` ein APK. Für den Play Store brauchst du das Bundle; das Ergebnis liegt unter `app/build/outputs/bundle/release/`. In der Ausgabe siehst du, dass R8 (`minifyReleaseWithR8`) und das Signieren Teil des Tasks sind. Gibt es Product Flavors, heißt der Task zum Beispiel `bundleProductionRelease`.
+    resources:
+      - title: Build your app from the command line
+        url: https://developer.android.com/build/building-cmdline
+  - id: signing-report
+    type: command
+    title: Welcher Schlüssel ist das?
+    prompt: |
+      Linear-OAuth, Google-APIs und Firebase verlangen den SHA-256-Fingerabdruck deines Signaturzertifikats. Lass Gradle für alle Varianten des Moduls `app` anzeigen, mit welchem Keystore, Alias und Fingerabdruck signiert wird.
+    context: Du bist im Wurzelverzeichnis des Android-Projekts.
+    answers:
+      - ./gradlew :app:signingReport
+      - ./gradlew signingReport
+    output: |
+      > Task :app:signingReport
+      Variant: debug
+      Config: debug
+      Store: /home/steven/.android/debug.keystore
+      Alias: AndroidDebugKey
+      SHA-256: 3B:9F:…:A1
+    explanation: |
+      `signingReport` listet für jede Variante Keystore, Alias und die MD5-, SHA-1- und SHA-256-Fingerabdrücke. Der Debug-Keystore liegt unter `~/.android/debug.keystore` und ist auf jedem Rechner ein anderer – deshalb brauchen Dienste oft mehrere Fingerabdrücke. Für die Play-Version gilt der Fingerabdruck des App Signing Keys; den zeigt die Play Console unter „App-Integrität“, nicht dein lokaler Build.
+    resources:
+      - title: Run a signing report
+        url: https://developer.android.com/studio/publish/app-signing#signing_report
+  - id: passwort-im-build
+    type: bug
+    title: Ein Review-Kommentar mit Ausrufezeichen
+    prompt: |
+      Im Pull Request „Release-Signierung einrichten“ schreibt die Reviewerin: „Bitte so nicht mergen – das Repository ist für das ganze Team und die CI lesbar.“ Die CI setzt die Variablen `UPLOAD_KEYSTORE_PATH`, `UPLOAD_KEYSTORE_PASSWORD`, `UPLOAD_KEY_ALIAS` und `UPLOAD_KEY_PASSWORD`. Finde die zwei problematischen Zeilen und korrigiere sie.
+    lang: kotlin
+    code: |
+      android {
+          signingConfigs {
+              create("release") {
+                  storeFile = System.getenv("UPLOAD_KEYSTORE_PATH")?.let { file(it) }
+                  storePassword = "br4unB4er!2026"
+                  keyAlias = System.getenv("UPLOAD_KEY_ALIAS")
+                  keyPassword = "br4unB4er!2026"
+              }
+          }
+      }
+    lines: [5, 7]
+    fix:
+      - line: 5
+        answers:
+          - "storePassword = System.getenv(\"UPLOAD_KEYSTORE_PASSWORD\")"
+          - "storePassword = providers.environmentVariable(\"UPLOAD_KEYSTORE_PASSWORD\").orNull"
+      - line: 7
+        answers:
+          - "keyPassword = System.getenv(\"UPLOAD_KEY_PASSWORD\")"
+          - "keyPassword = providers.environmentVariable(\"UPLOAD_KEY_PASSWORD\").orNull"
+    hints:
+      - Pfad und Alias kommen schon aus der Umgebung. Was nicht?
+    explanation: |
+      Die Passwörter stehen im Klartext in einer Datei, die ins Repository geht. Jeder mit Lesezugriff – heute oder in fünf Jahren, auch über Forks und Backups – kann damit zusammen mit dem Keystore Updates signieren. Richtig ist, sie wie Pfad und Alias aus Umgebungsvariablen zu lesen, die in der CI aus Secrets kommen. Weil der Commit mit dem Passwort schon existiert, reicht das Korrigieren allein nicht: Das Passwort gilt als kompromittiert und muss geändert werden, bevor der Branch gemergt wird.
+    resources:
+      - title: Remove signing information from your build files
+        url: https://developer.android.com/studio/publish/app-signing#secure-shared-keystore
+      - title: Using secrets in GitHub Actions
+        url: https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-secrets
+  - id: gitignore-tippfehler
+    type: bug
+    title: Warum ist der Keystore im Commit?
+    prompt: |
+      Steven hat mit `keytool` die Datei `upload-keystore.jks` im Projektordner erzeugt. Er war sicher, dass Keystores ignoriert werden. Trotzdem zeigt `git status` die Datei als neu und unversioniert an, und ein `git add .` hätte sie mitgenommen. Finde die fehlerhafte Zeile in der `.gitignore` und korrigiere sie.
+    lang: text
+    code: |
+      .gradle/
+      build/
+      local.properties
+      *.jsk
+      *.keystore
+      keystore.properties
+    lines: [4]
+    fix:
+      - line: 4
+        answers: ["*.jks"]
+    hints:
+      - Vergleiche die Dateiendung im Muster mit der Dateiendung der erzeugten Datei, Buchstabe für Buchstabe.
+    explanation: |
+      Das Muster `*.jsk` passt nicht auf `upload-keystore.jks` – ein Buchstabendreher, und Git ignoriert nichts. Mit `*.jks` wird jeder Java-Keystore in jedem Unterordner ignoriert. Prüfen kannst du das mit `git check-ignore -v upload-keystore.jks`, das die zuständige Regel anzeigt. Sicherer ist ohnehin, den Keystore gar nicht im Projektordner abzulegen, sondern etwa unter `~/.keystores/`, und den Pfad per Umgebungsvariable zu übergeben.
+    resources:
+      - title: Keep your key secure
+        url: https://developer.android.com/studio/publish/app-signing#secure_key
+      - title: gitignore (Git-Doku)
+        url: https://git-scm.com/docs/gitignore
+  - id: release-job-erklaeren
+    type: explain
+    title: Der Release-Job
+    prompt: |
+      Erkläre diesen Job aus einem GitHub-Actions-Workflow wie im Code-Review: Wann läuft er, wie kommt der Schlüssel in den Build, warum liegt der Keystore in `$RUNNER_TEMP`, und was passiert mit dem Ergebnis?
+    lang: yaml
+    code: |
+      release:
+        if: startsWith(github.ref, 'refs/tags/v')
+        needs: check
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v7
+          - uses: actions/setup-java@v6
+            with:
+              distribution: temurin
+              java-version: 17
+          - uses: gradle/actions/setup-gradle@v6
+          - name: Upload-Keystore aus dem Secret herstellen
+            run: echo "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/upload.jks"
+            env:
+              KEYSTORE_BASE64: ${{ secrets.UPLOAD_KEYSTORE_BASE64 }}
+          - name: Signiertes App Bundle bauen
+            run: ./gradlew bundleRelease
+            env:
+              UPLOAD_KEYSTORE_PATH: ${{ runner.temp }}/upload.jks
+              UPLOAD_KEYSTORE_PASSWORD: ${{ secrets.UPLOAD_KEYSTORE_PASSWORD }}
+              UPLOAD_KEY_ALIAS: ${{ secrets.UPLOAD_KEY_ALIAS }}
+              UPLOAD_KEY_PASSWORD: ${{ secrets.UPLOAD_KEY_PASSWORD }}
+          - uses: actions/upload-artifact@v7
+            with:
+              name: app-release
+              path: app/build/outputs/bundle/release/app-release.aab
+    points:
+      - Der Job läuft nur für Tags, die mit `v` beginnen, und erst, wenn der Job `check` (Tests, Lint) erfolgreich war.
+      - Der Keystore liegt als Base64-Text in einem verschlüsselten Secret, weil Secrets Text sind; ein Schritt dekodiert ihn zurück in eine Binärdatei.
+      - Die Datei landet in `$RUNNER_TEMP`, außerhalb des Repositorys – sie kann weder versehentlich committet noch als Artefakt hochgeladen werden und verschwindet mit dem Runner.
+      - Passwörter und Alias kommen als Umgebungsvariablen nur in den Schritt, der sie braucht; die Build-Datei liest sie mit `System.getenv`.
+      - Das signierte App Bundle wird als Artefakt gespeichert und kann heruntergeladen oder in einem weiteren Schritt in die Play Console geladen werden.
+    explanation: |
+      Der Job ist die Release-Hälfte der Pipeline. Die Bedingung `startsWith(github.ref, 'refs/tags/v')` lässt ihn nur für Versions-Tags laufen, und `needs: check` macht ihn von grünen Tests und grünem Lint abhängig – ein Release mit roten Tests ist ausgeschlossen. Weil GitHub-Secrets Text sind, wird der binäre Keystore vorher mit `base64` kodiert und als Secret hinterlegt; der Schritt dekodiert ihn in `$RUNNER_TEMP`. Dieses Verzeichnis liegt außerhalb des Checkouts, wird nach dem Job gelöscht und gerät deshalb nicht in Commits oder Artefakte. Die Passwörter bekommt nur der Build-Schritt als Umgebungsvariablen – Prinzip der minimalen Rechte –, und GitHub maskiert sie in den Logs. Am Ende liegt das signierte `.aab` als Artefakt am Lauf; ein Upload-Schritt über die Play Developer API könnte es direkt in den Internal Track schieben.
+    resources:
+      - title: Using secrets in GitHub Actions
+        url: https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-secrets
+      - title: Configure the build process to automatically sign your app
+        url: https://developer.android.com/studio/publish/app-signing#sign-auto
+  - id: release-einrichten
+    type: practice
+    title: Release-Setup für ein Portfolio-Projekt
+    prompt: |
+      Richte für eine eigene Android-App (oder einen Fork eines Beispielprojekts) einen vollständigen Release-Prozess ein. Arbeite in dieser Reihenfolge:
+
+      1. `.gitignore` um Keystores und Passwortdateien ergänzen und committen.
+      2. Einen Upload-Keystore außerhalb des Projektordners erzeugen, etwa mit `keytool -genkeypair -v -keystore ~/.keystores/upload.jks -alias upload -keyalg RSA -keysize 2048 -validity 10000`, und Passwörter im Passwort-Manager ablegen.
+      3. In `app/build.gradle.kts` eine Signaturkonfiguration `release` anlegen, die alle vier Werte aus Umgebungsvariablen liest; R8 für `release` aktivieren; `debug` mit `applicationIdSuffix` versehen.
+      4. Lokal `./gradlew bundleRelease` mit gesetzten Variablen ausführen und das Bundle mit `./gradlew :app:signingReport` gegenprüfen.
+      5. Einen Workflow mit den Jobs `check` (Tests, Lint, Debug-Build) und `release` (nur für Tags, signiertes Bundle als Artefakt) anlegen; die vier Secrets im Repository hinterlegen.
+      6. Tag `v1.0.0` pushen und prüfen, dass das Artefakt entsteht.
+
+      Schreibe hier die Build-Konfiguration aus Schritt 3.
+    lang: kotlin
+    starter: |
+      android {
+          // signingConfigs, buildTypes
+      }
+    solution: |
+      android {
+          signingConfigs {
+              create("release") {
+                  storeFile = System.getenv("UPLOAD_KEYSTORE_PATH")?.let { file(it) }
+                  storePassword = System.getenv("UPLOAD_KEYSTORE_PASSWORD")
+                  keyAlias = System.getenv("UPLOAD_KEY_ALIAS")
+                  keyPassword = System.getenv("UPLOAD_KEY_PASSWORD")
+              }
+          }
+
+          buildTypes {
+              debug {
+                  applicationIdSuffix = ".debug"
+                  versionNameSuffix = "-debug"
+              }
+              release {
+                  optimization {
+                      enable = true
+                  }
+                  signingConfig = signingConfigs.getByName("release")
+              }
+          }
+      }
+    checklist:
+      - "`.gitignore` enthält `*.jks` und `*.keystore`, und `git check-ignore -v` bestätigt es, bevor der Keystore existiert."
+      - Der Keystore liegt außerhalb des Repositorys; Keystore- und Schlüsselpasswort stehen im Passwort-Manager und in einem zweiten Backup.
+      - Keine Zeile der Build-Dateien enthält ein Passwort, einen Alias oder einen absoluten Pfad zum Keystore.
+      - "`optimization { enable = true }` (oder `isMinifyEnabled` und `isShrinkResources` bei AGP < 9.3) ist nur im Build Type `release` aktiv."
+      - Debug- und Release-Build lassen sich gleichzeitig auf einem Gerät installieren.
+      - Der Release-Build läuft auf einem echten Gerät ohne Absturz, bevor er irgendwohin hochgeladen wird.
+      - Der Workflow hat einen Job für Pull Requests und einen, der nur für Tags läuft und von ersterem abhängt (`needs`).
+      - Das signierte `.aab` erscheint als Artefakt am Workflow-Lauf, und im Log ist kein Secret im Klartext zu sehen.
+    explanation: |
+      Die Reihenfolge ist Absicht: Erst die `.gitignore`, dann der Schlüssel – so kann er gar nicht erst in einen Commit geraten. Die Build-Konfiguration kennt nur die Namen der Umgebungsvariablen; lokal setzt du sie in deiner Shell-Sitzung (in fish mit `set -x`), in der CI kommen sie aus Secrets. Fehlen die Variablen, schlägt nur der Release-Build fehl, Debug-Builds und Tests laufen weiter. Mit diesem Setup kannst du im Vorstellungsgespräch den kompletten Weg vom Commit bis zum signierten Bundle vorführen – ein starkes Argument für ein Portfolio-Projekt.
+    resources:
+      - title: Generate an upload key and keystore
+        url: https://developer.android.com/studio/publish/app-signing#generate-key
+      - title: keytool (JDK-Doku)
+        url: https://docs.oracle.com/en/java/javase/21/docs/specs/man/keytool.html

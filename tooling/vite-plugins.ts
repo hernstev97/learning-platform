@@ -10,10 +10,11 @@ const AREA = 'virtual:area/';
 /** Serves content/ as virtual modules: a small catalog plus one lazily loaded chunk per area. */
 export function content(): Plugin {
   let cache: Loaded | null = null;
+  let building = false;
   const load = (): Loaded => {
     if (cache) return cache;
     // CONTENT_LENIENT=1 (local work in progress): report problems but serve what is valid.
-    const lenient = !!process.env.CONTENT_LENIENT;
+    const lenient = !building && !!process.env.CONTENT_LENIENT;
     const loaded = loadContent(undefined, undefined, { allowMissing: lenient });
     // CONTENT_FIXTURES=1 (browser tests): also serve tooling/fixtures, which covers every exercise type.
     if (process.env.CONTENT_FIXTURES) {
@@ -30,6 +31,7 @@ export function content(): Plugin {
   let server: ViteDevServer | null = null;
   return {
     name: 'learning-content',
+    configResolved(config) { building = config.command === 'build'; },
     resolveId(id) {
       if (id === CATALOG || id === LOADERS || id.startsWith(AREA)) return `\0${id}`;
     },

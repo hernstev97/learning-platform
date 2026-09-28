@@ -1,0 +1,1042 @@
+id: cli-werkzeuge
+title: Kommandozeilen-Werkzeuge bauen
+level: 2
+minutes: 210
+summary: Aus einem Skript ein Werkzeug machen, das sich wie ein echtes Unix-Programm verhält – mit argparse, Exit-Codes, stdin/stdout/stderr, Konfiguration mit klarem Vorrang, sauberem Logging und Installation als Befehl.
+goals:
+  - Du definierst mit `argparse` Positionsargumente, Optionen, Typen, `choices`, `nargs`, Schalter und Unterbefehle und testest den Parser mit `parse_args([...])`.
+  - Du trennst Daten (stdout) von Meldungen (stderr), liest aus stdin und lieferst aussagekräftige Exit-Codes.
+  - Du lädst Einstellungen aus TOML, Umgebungsvariablen und Argumenten mit dem Vorrang CLI > Umgebung > Datei > Standard.
+  - Du konfigurierst `logging` einmal zentral, mit Stufen über `-v`/`-q`, und erklärst, warum Bibliotheken nichts konfigurieren.
+  - Du ordnest Typer, Click und Rich ein und installierst ein eigenes Werkzeug mit `[project.scripts]` und `uv tool install`.
+resources:
+  - title: Argparse Tutorial
+    url: https://docs.python.org/3/howto/argparse.html
+  - title: argparse – Parser for command-line options
+    url: https://docs.python.org/3/library/argparse.html
+  - title: Logging HOWTO
+    url: https://docs.python.org/3/howto/logging.html
+  - title: tomllib – Parse TOML files
+    url: https://docs.python.org/3/library/tomllib.html
+  - title: Typer
+    url: https://typer.tiangolo.com/
+lesson: |
+  Dein Aufräumskript aus den letzten Modulen funktioniert. Dann fragt ein Kollege, ob er es auch benutzen kann – mit einem anderen Ordner, ohne Trockenlauf, und bitte so, dass es in seine Pipeline mit `jq` passt. Plötzlich reicht „Pfad oben im Code ändern“ nicht mehr. Ein **Werkzeug** braucht eine Hilfe, verständliche Fehlermeldungen, Konfiguration, Logging und ein Verhalten, auf das sich Shell-Skripte, cron und CI verlassen können.
+
+  Diese Lektion zeigt, wie ein Python-Programm zu einem guten Bürger der Kommandozeile wird: Argumente mit `argparse`, die drei Standardströme, Exit-Codes, Konfiguration mit klarem Vorrang, Logging und am Ende die Installation als eigener Befehl.
+
+  ## argparse: vom Aufruf zum Namespace
+
+  [`argparse`](https://docs.python.org/3/library/argparse.html) übersetzt die Liste der Argumente in ein `Namespace`-Objekt, erzeugt `--help` und meldet Fehler. Das [Argparse Tutorial](https://docs.python.org/3/howto/argparse.html) führt Schritt für Schritt hinein; hier das Denkmodell an einem vollständigen Beispiel:
+
+  ```python run
+  import argparse
+  from pathlib import Path
+
+  parser = argparse.ArgumentParser(prog="konvert", description="Konvertiert Exporte.")
+  parser.add_argument("dateien", nargs="+", type=Path, help="Eingabedateien")
+  parser.add_argument("-f", "--format", choices=["csv", "json"], default="csv")
+  parser.add_argument("-o", "--ausgabe", type=Path, help="Zieldatei (Standard: stdout)")
+  parser.add_argument("-n", "--dry-run", action="store_true", help="nichts schreiben")
+  parser.add_argument("-v", "--verbose", action="count", default=0, help="mehr Ausgaben, mehrfach möglich")
+  parser.add_argument("--limit", type=int, help="höchstens so viele Zeilen")
+
+  args = parser.parse_args(["export.json", "-vv", "--format", "json", "--dry-run"])
+  print(args.dateien, args.format, args.dry_run, args.verbose, args.limit)
+  parser.print_help()
+  ```
+
+  Die Regeln dahinter:
+
+  - **Positionsargumente** (ohne `-`) sind Pflicht und werden über ihre Position zugeordnet. **Optionen** (mit `-` oder `--`) sind optional und haben einen Standardwert – ohne `default` ist er `None`.
+  - Aus `--dry-run` wird das Attribut `dry_run`: Bindestriche werden zu Unterstrichen, der lange Name gewinnt.
+  - [`type`](https://docs.python.org/3/library/argparse.html#type) ist eine Funktion, die den String umwandelt: `int`, `float`, `Path` oder eine eigene. Wirft sie `ValueError` oder `argparse.ArgumentTypeError`, meldet argparse einen Fehler.
+  - [`nargs`](https://docs.python.org/3/library/argparse.html#nargs): `"+"` heißt mindestens eins, `"*"` beliebig viele, `"?"` höchstens eins. Das Ergebnis ist eine Liste (außer bei `"?"`).
+  - [`action`](https://docs.python.org/3/library/argparse.html#action): `store_true` für Schalter, `count` für `-vvv`, `append` für wiederholbare Optionen wie `--tag a --tag b`.
+  - `choices` begrenzt die erlaubten Werte und erscheint automatisch in der Hilfe.
+
+  Bei einem Fehler schreibt argparse die Kurzhilfe und die Meldung nach stderr und beendet das Programm mit **Exit-Code 2** – über `SystemExit`. Im Test fängst du das mit `pytest.raises(SystemExit)` oder `try`/`except SystemExit`. Dateinamen, die mit `-` beginnen, trennst du mit `--` ab: `konvert -- -seltsam.csv`.
+
+  > [!NOTE] `argparse.FileType` ist veraltet
+  > Ältere Tutorials öffnen Dateien direkt mit `type=argparse.FileType("r")`. Seit Python 3.14 gilt das als veraltet: Die Datei wird geöffnet, bevor feststeht, ob die übrigen Argumente gültig sind, und nie sauber geschlossen. Nimm `type=Path` und öffne die Datei selbst mit `with`.
+
+  ### Unterbefehle
+
+  Werkzeuge wie `git` oder `uv` haben Unterbefehle mit eigenen Optionen. [`add_subparsers`](https://docs.python.org/3/library/argparse.html#argparse.ArgumentParser.add_subparsers) liefert dafür ein Objekt, an dem du pro Befehl einen eigenen Parser anlegst. Mit `set_defaults(func=…)` hängst du an jeden Befehl die Funktion, die ihn ausführt:
+
+  ```python run
+  import argparse
+
+  def cmd_neu(args: argparse.Namespace) -> int:
+      print("neu:", " ".join(args.text), args.tags)
+      return 0
+
+  def cmd_liste(args: argparse.Namespace) -> int:
+      print("liste, limit", args.limit)
+      return 0
+
+  parser = argparse.ArgumentParser(prog="notiz")
+  parser.add_argument("-v", "--verbose", action="count", default=0)
+  befehle = parser.add_subparsers(dest="befehl", required=True)
+
+  neu = befehle.add_parser("neu", help="Notiz anlegen")
+  neu.add_argument("text", nargs="+")
+  neu.add_argument("--tag", action="append", dest="tags", default=[])
+  neu.set_defaults(func=cmd_neu)
+
+  liste = befehle.add_parser("liste", help="Notizen zeigen")
+  liste.add_argument("--limit", type=int, default=10)
+  liste.set_defaults(func=cmd_liste)
+
+  for argv in (["neu", "Milch", "kaufen", "--tag", "einkauf"], ["-v", "liste"]):
+      args = parser.parse_args(argv)
+      print(args.befehl, args.verbose, "->", args.func(args))
+  ```
+
+  `required=True` sorgt dafür, dass `notiz` ohne Befehl einen Fehler meldet, statt still nichts zu tun. Globale Optionen wie `-v` stehen **vor** dem Unterbefehl.
+
+  ## stdout, stderr, stdin und Exit-Codes
+
+  Jeder Prozess hat drei Standardströme. Wer sie richtig benutzt, bekommt Pipes, Umleitungen und Automatisierung geschenkt:
+
+  | Strom | Wofür | Beispiel |
+  | --- | --- | --- |
+  | stdin | Eingabedaten | `cat export.json \| konvert -` |
+  | stdout | **nur** die eigentlichen Ergebnisse | `konvert a.json > a.csv` |
+  | stderr | Meldungen, Fortschritt, Warnungen, Fehler | `konvert a.json 2> fehler.log` |
+
+  Das Prinzip: **stdout gehört den Daten.** Schreibst du „Lese Datei a.json …“ mit `print` nach stdout, landet der Satz mitten in der CSV-Datei oder bringt `jq` zum Absturz. Meldungen gehen nach stderr – mit `print(..., file=sys.stderr)` oder über `logging`, das standardmäßig nach stderr schreibt.
+
+  Damit Code mit Strömen testbar bleibt, übergib sie als Parameter, statt direkt `sys.stdin` zu lesen. Im Test ersetzt [`io.StringIO`](https://docs.python.org/3/library/io.html#io.StringIO) die echten Ströme:
+
+  ```python run
+  import io
+  import sys
+  from typing import TextIO
+
+  def zaehle(eingabe: TextIO, ausgabe: TextIO, fehler: TextIO) -> int:
+      zeilen = 0
+      leer = 0
+      for zeile in eingabe:
+          if zeile.strip():
+              zeilen += 1
+          else:
+              leer += 1
+      print(zeilen, file=ausgabe)                     # Ergebnis -> stdout
+      if leer:
+          print(f"{leer} leere Zeile(n) übersprungen", file=fehler)   # Meldung -> stderr
+      return 0
+
+  code = zaehle(io.StringIO("a\n\nb\nc\n"), sys.stdout, sys.stderr)
+  print("Exit-Code:", code)
+  ```
+
+  Die übliche Konvention für Dateiargumente: `-` bedeutet stdin. So funktioniert das Werkzeug sowohl mit `konvert daten.json` als auch in einer Pipe. Ob stdin ein Terminal ist (also niemand etwas hineinleitet), verrät `sys.stdin.isatty()`.
+
+  **Exit-Codes** sind die Antwort an den Aufrufer. [`sys.exit`](https://docs.python.org/3/library/sys.html#sys.exit) setzt ihn:
+
+  | Code | Bedeutung |
+  | --- | --- |
+  | `0` | Erfolg |
+  | `1` | allgemeiner Fehler (auch bei einer unbehandelten Exception) |
+  | `2` | falscher Aufruf – so beendet sich `argparse` |
+  | `130` | abgebrochen mit Strg+C (128 + Signal 2) |
+
+  Manche Werkzeuge nutzen weitere Codes mit eigener Bedeutung – `grep` liefert `1`, wenn nichts gefunden wurde. Wenn du das tust, dokumentiere es in der Hilfe.
+
+  > [!INTERVIEW] „Warum gehören Logmeldungen nach stderr?“
+  > Weil stdout der Datenkanal ist. Wer `tool | jq` oder `tool > ergebnis.csv` benutzt, will nur die Daten. Meldungen auf stderr erscheinen trotzdem im Terminal, stören aber keine Pipe und lassen sich getrennt umleiten (`2> fehler.log`). Dazu ein Exit-Code ungleich `0` bei Fehlern, damit Skripte mit `set -e` oder `&&` reagieren können.
+
+  ## Konfiguration: CLI > Umgebung > Datei > Standard
+
+  Ein Werkzeug hat Einstellungen, die man nicht bei jedem Aufruf tippen will: Zielordner, API-Adressen, Schwellwerte. Bewährt hat sich eine feste **Rangfolge**, von stark nach schwach:
+
+  1. **Kommandozeile** – gilt nur für diesen Aufruf.
+  2. **Umgebungsvariablen** – pro Shell, pro cron-Job, pro CI-Lauf; der richtige Ort für Geheimnisse wie Tokens.
+  3. **Konfigurationsdatei** – dauerhafte persönliche Einstellungen, unter Linux üblicherweise `~/.config/<werkzeug>/config.toml`.
+  4. **Standardwerte im Code.**
+
+  [`tomllib`](https://docs.python.org/3/library/tomllib.html) liest TOML seit Python 3.11 (nur lesen, nicht schreiben). Die Datei muss **binär** geöffnet werden. Umgebungsvariablen liest du über [`os.environ`](https://docs.python.org/3/library/os.html#os.environ) – ihre Werte sind **immer Strings**. [`collections.ChainMap`](https://docs.python.org/3/library/collections.html#collections.ChainMap) setzt die Rangfolge in einer Zeile um: Es sucht einen Schlüssel der Reihe nach in mehreren Dictionaries.
+
+  ```python run
+  import tomllib
+  from collections import ChainMap
+
+  STANDARD = {"ziel": "~/Sortiert", "max_tage": 30, "apply": False}
+
+  aus_datei = tomllib.loads('ziel = "/mnt/nas/sortiert"\nmax_tage = 14\n')
+  # mit einer echten Datei: with open(pfad, "rb") as f: aus_datei = tomllib.load(f)
+
+  umgebung = {"SORTIERE_MAX_TAGE": "7", "HOME": "/home/steven"}
+  aus_env = {k.removeprefix("SORTIERE_").lower(): v for k, v in umgebung.items() if k.startswith("SORTIERE_")}
+  aus_env["max_tage"] = int(aus_env["max_tage"])      # Strings umwandeln!
+
+  cli = {"ziel": None, "max_tage": None, "apply": True}  # None = nicht angegeben
+  aus_cli = {k: v for k, v in cli.items() if v is not None}
+
+  einstellungen = ChainMap(aus_cli, aus_env, aus_datei, STANDARD)
+  print(dict(einstellungen))
+  ```
+
+  Der Trick für die Kommandozeile: Optionen bekommen in argparse **keinen** eigenen Standardwert, sondern `None`. Nur so erkennst du, ob jemand `--max-tage` wirklich angegeben hat oder ob der Wert aus der Datei gelten soll. Der Standard wandert in das unterste Dictionary.
+
+  > [!WARNING] Geheimnisse nicht als Argument
+  > Ein Passwort in `--token geheim` steht in der Shell-History und ist für andere Benutzer desselben Rechners über `ps` sichtbar. Tokens gehören in Umgebungsvariablen (etwa aus einer `.env`-Datei, die nicht im Repository liegt) oder in eine Datei mit Rechten `600`.
+
+  ## Logging richtig
+
+  [`logging`](https://docs.python.org/3/library/logging.html) wirkt anfangs umständlicher als `print`, löst aber genau die Probleme von Werkzeugen: Stufen (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`), einheitliches Format mit Zeitstempel, Ausgabe nach stderr oder in Dateien und An- und Abschalten ohne Codeänderung. Das [Logging HOWTO](https://docs.python.org/3/howto/logging.html) beschreibt die Architektur: **Logger** nehmen Meldungen an, **Handler** schreiben sie irgendwohin, **Formatter** bestimmen das Aussehen.
+
+  Drei Regeln reichen für fast alles:
+
+  1. Jedes Modul holt sich mit `log = logging.getLogger(__name__)` einen eigenen Logger und ruft nur `log.info(...)` usw. auf.
+  2. **Konfiguriert wird genau einmal**, in `main()` – nie beim Import eines Moduls. Bibliotheken konfigurieren gar nichts; das HOWTO erklärt das im Abschnitt [Configuring Logging for a Library](https://docs.python.org/3/howto/logging.html#configuring-logging-for-a-library).
+  3. Argumente werden **nicht** vorformatiert: `log.info("verschiebe %s", datei)` statt `log.info(f"verschiebe {datei}")`. Das `%s` wird nur ausgewertet, wenn die Meldung tatsächlich ausgegeben wird.
+
+  ```python run
+  import logging
+
+  log = logging.getLogger("sortiere")
+
+  def konfiguriere(verbose: int, quiet: bool) -> None:
+      if quiet:
+          stufe = logging.ERROR
+      else:
+          stufe = {0: logging.WARNING, 1: logging.INFO}.get(verbose, logging.DEBUG)
+      logging.basicConfig(level=stufe, format="%(levelname)-7s %(name)s: %(message)s", force=True)
+
+  konfiguriere(verbose=1, quiet=False)       # entspricht -v
+  log.debug("unsichtbar bei -v")
+  log.info("verschiebe %s", "rechnung.pdf")
+  log.warning("Ziel %s existiert, übersprungen", "foto.jpg")
+  try:
+      1 / 0
+  except ZeroDivisionError:
+      log.exception("Berechnung fehlgeschlagen")   # ERROR mit Traceback
+  ```
+
+  Die Standardstufe `WARNING` passt gut zu Werkzeugen: Ohne Optionen sieht man nur Probleme, mit `-v` den Ablauf, mit `-vv` alle Details, mit `-q` nur Fehler. [`basicConfig`](https://docs.python.org/3/library/logging.html#logging.basicConfig) wirkt nur beim ersten Aufruf; `force=True` ersetzt eine vorhandene Konfiguration. Sollen Meldungen zusätzlich in eine Datei, übergibst du mehrere Handler: `handlers=[logging.StreamHandler(), logging.FileHandler("sortiere.log", encoding="utf-8")]`.
+
+  ## Typer, Click und Rich
+
+  `argparse` ist in der Standardbibliothek und reicht für die meisten Werkzeuge. Zwei Bibliotheken sind trotzdem weit verbreitet:
+
+  - [Click](https://click.palletsprojects.com/) definiert Befehle über Dekoratoren (`@click.command()`, `@click.option(...)`) und bringt Unterbefehle, Eingabeaufforderungen, Farben und Test-Hilfen mit.
+  - [Typer](https://typer.tiangolo.com/) baut auf Click auf und leitet die Kommandozeile aus **Typannotationen** ab. Parameter ohne Standardwert werden Argumente, Parameter mit Standardwert Optionen, `bool` wird zu `--flag/--no-flag`.
+
+  ```python
+  from pathlib import Path
+  from typing import Annotated
+
+  import typer
+
+  def main(
+      ordner: Path,
+      apply: Annotated[bool, typer.Option(help="wirklich verschieben")] = False,
+      max_tage: int = 30,
+  ) -> None:
+      """Sortiert Dateien aus ORDNER in Unterordner."""
+      typer.echo(f"{ordner} apply={apply} max_tage={max_tage}")
+
+  if __name__ == "__main__":
+      typer.run(main)     # sortiere.py ~/Downloads --apply --max-tage 7
+  ```
+
+  [Rich](https://rich.readthedocs.io/en/stable/) sorgt für farbige Ausgaben, Tabellen und Fortschrittsbalken; Typer nutzt es automatisch für schönere Hilfe und Tracebacks, wenn es installiert ist. Die Abwägung: argparse kommt ohne Abhängigkeit aus – ideal für Skripte, die auf jedem Server mit Python laufen sollen. Typer spart bei größeren Werkzeugen Code und liefert eine bessere Oberfläche, kostet aber eine Abhängigkeit. Die Prinzipien dieser Lektion – stdout für Daten, Exit-Codes, Konfiguration, Logging – gelten mit jeder Bibliothek.
+
+  ## Als Werkzeug installieren
+
+  Damit aus `python3 ~/projekte/sortiere/sortiere.py` einfach `sortiere` wird, beschreibst du in `pyproject.toml` einen [Einstiegspunkt](https://packaging.python.org/en/latest/guides/writing-pyproject-toml/#creating-executable-scripts):
+
+  ```toml title=pyproject.toml
+  [project]
+  name = "sortiere"
+  version = "0.1.0"
+  requires-python = ">=3.12"
+  dependencies = []
+
+  [project.scripts]
+  sortiere = "sortiere.cli:main"
+
+  [build-system]
+  requires = ["hatchling"]
+  build-backend = "hatchling.build"
+  ```
+
+  `sortiere = "sortiere.cli:main"` heißt: Beim Installieren entsteht ein Befehl `sortiere`, der `main()` aus dem Modul `sortiere/cli.py` aufruft und ihren Rückgabewert als Exit-Code benutzt. Installiert wird mit [`uv tool install .`](https://docs.astral.sh/uv/guides/tools/) oder [`pipx install .`](https://pipx.pypa.io/stable/): Beide legen eine eigene, isolierte Umgebung an und verlinken den Befehl nach `~/.local/bin`. So kollidieren die Abhängigkeiten verschiedener Werkzeuge nie miteinander oder mit dem System-Python von CachyOS.
+
+  Für einzelne Skripte mit Abhängigkeiten gibt es eine leichtere Variante: [Inline-Metadaten](https://docs.astral.sh/uv/guides/scripts/) nach PEP 723. Ein Kommentarblock am Anfang des Skripts nennt die Abhängigkeiten, und `uv run skript.py` besorgt sie in einer temporären Umgebung.
+
+  ```python
+  # /// script
+  # requires-python = ">=3.12"
+  # dependencies = ["typer", "rich"]
+  # ///
+  import typer
+  ```
+
+  > [!PRAXIS] Was Kollegen von einem internen Werkzeug erwarten
+  > `--help` erklärt jede Option in einem Satz. Fehler sind eine Zeile auf stderr, kein Traceback – den gibt es mit `-v`. Destruktive Befehle haben einen Trockenlauf. Ergebnisse sind maschinenlesbar (`--format json`). Konfiguration folgt der Rangfolge oben, Geheimnisse kommen aus der Umgebung. Und ein `README` zeigt drei typische Aufrufe. Genau das wird in Code-Reviews interner Tools angemerkt.
+
+  ## Häufige Fehler
+
+  - **`type=bool`.** `bool("False")` ist `True` – jeder nicht leere String ist wahr. Für Schalter `action="store_true"` oder `argparse.BooleanOptionalAction` (`--farbe/--no-farbe`).
+  - **Zahlen ohne `type=int`.** Symptom: `TypeError: '>' not supported between instances of 'str' and 'int'` weit weg vom Parser.
+  - **`parse_args()` in Tests ohne Liste.** Dann liest argparse die Argumente von pytest. Immer `main(argv)` mit Liste testen.
+  - **Meldungen mit `print` nach stdout.** Symptom: kaputte CSV-Dateien, `jq`-Fehler. Lösung: `logging` oder `file=sys.stderr`.
+  - **`logging.basicConfig` auf Modulebene.** Symptom: Wer das Modul importiert, bekommt deine Konfiguration aufgezwungen; spätere `basicConfig`-Aufrufe wirken nicht. Lösung: nur in `main()`.
+  - **Handler bei jedem Aufruf hinzufügen.** Symptom: Jede Meldung erscheint doppelt, dreifach … Lösung: einmal konfigurieren oder vorher `logger.handlers.clear()`.
+  - **Umgebungsvariablen nicht umwandeln.** `"0"` ist als String wahr, `"7" > 30` ist ein `TypeError`.
+  - **`BrokenPipeError` bei `tool | head`.** Wenn `head` die Pipe schließt, scheitert der nächste Schreibversuch. Die Doku zu [SIGPIPE](https://docs.python.org/3/library/signal.html#note-on-sigpipe) zeigt, wie man das sauber abfängt.
+
+  ## Zusammenfassung
+
+  - `argparse`: Positionsargumente sind Pflicht, Optionen haben Standardwerte; `type`, `choices`, `nargs`, `store_true`, `count`, `append` decken fast alles ab.
+  - Unterbefehle mit `add_subparsers(dest=..., required=True)` und `set_defaults(func=...)`.
+  - `main(argv) -> int` mit `parse_args(argv)` macht jedes Werkzeug ohne Prozess testbar; Ströme als Parameter ebenso.
+  - stdout nur für Daten, stderr für Meldungen, `-` für stdin.
+  - Exit-Codes: `0` Erfolg, `1` Fehler, `2` falscher Aufruf, `130` Strg+C.
+  - Konfiguration: CLI > Umgebung > Datei > Standard; argparse-Optionen mit `None` als Standard; Umgebungswerte sind Strings.
+  - Logging einmal in `main` konfigurieren, `getLogger(__name__)` überall, `%s` statt f-Strings, `-v`/`-q` steuern die Stufe.
+  - Installation als Befehl über `[project.scripts]` und `uv tool install .` oder `pipx install .`.
+exercises:
+  - id: stroeme-und-codes
+    type: choice
+    title: Ströme und Exit-Codes
+    prompt: Welche Aussagen über ein gut gebautes Kommandozeilen-Werkzeug stimmen?
+    options:
+      - text: Fortschrittsmeldungen wie „Lese Datei 3 von 10“ gehören nach stderr.
+        correct: true
+        why: stdout ist der Datenkanal. Meldungen auf stderr bleiben im Terminal sichtbar, landen aber nicht in `> ergebnis.csv` oder in einer Pipe.
+      - text: Wenn argparse ein ungültiges Argument findet, wirft `parse_args` eine `ValueError`.
+        correct: false
+        why: argparse gibt Kurzhilfe und Fehlermeldung auf stderr aus und beendet das Programm über `SystemExit` mit Code `2`.
+      - text: Ein Skript, das Fehler loggt und dann normal endet, liefert Exit-Code `0` – cron und CI halten den Lauf für erfolgreich.
+        correct: true
+        why: Loggen allein ändert den Exit-Code nicht. Wer Fehler zählt, muss am Ende `1` (oder einen anderen Code ungleich `0`) zurückgeben.
+      - text: "`parser.add_argument(\"--farbe\", type=bool)` macht aus `--farbe False` den Wert `False`."
+        correct: false
+        why: "`bool(\"False\")` ist `True`, weil jeder nicht leere String wahr ist. Für Schalter gibt es `store_true` oder `BooleanOptionalAction`."
+    explanation: |
+      Die Kommandozeile hat klare Verträge: stdout für Daten, stderr für Menschen, Exit-Code für Programme. argparse hält sich daran – Fehler gehen nach stderr, der Exit-Code ist `2`. Die häufigsten Verstöße sind Meldungen auf stdout, verschluckte Fehler mit Exit-Code `0` und `type=bool`, das nie `False` liefert.
+    resources:
+      - title: argparse · Exiting methods
+        url: https://docs.python.org/3/library/argparse.html#exiting-methods
+      - title: sys.stderr
+        url: https://docs.python.org/3/library/sys.html#sys.stderr
+
+  - id: parse-args-vorhersagen
+    type: output
+    title: Was macht argparse daraus?
+    prompt: Was gibt dieses Programm unter Linux aus?
+    lang: python
+    code: |
+      import argparse
+      from pathlib import Path
+
+      parser = argparse.ArgumentParser(prog="konvert")
+      parser.add_argument("dateien", nargs="+", type=Path)
+      parser.add_argument("-f", "--format", choices=["csv", "json"], default="csv")
+      parser.add_argument("-v", "--verbose", action="count", default=0)
+      parser.add_argument("--dry-run", action="store_true")
+      parser.add_argument("--limit", type=int)
+
+      a = parser.parse_args(["a.json", "b.json", "-vv", "--format", "json"])
+      print(a.dateien, a.format, a.verbose, a.dry_run, a.limit)
+      b = parser.parse_args(["--limit", "5", "x.csv", "--dry-run"])
+      print(b.dateien[0].suffix, b.limit + 1, b.dry_run, b.verbose, b.format)
+      c = parser.parse_args(["--", "-v"])
+      print(c.dateien, c.verbose)
+    expected: |
+      [PosixPath('a.json'), PosixPath('b.json')] json 2 False None
+      .csv 6 True 0 csv
+      [PosixPath('-v')] 0
+    explanation: |
+      `type=Path` wird auf jedes Element von `nargs="+"` angewendet, deshalb entsteht eine Liste von `PosixPath`. `-vv` zählt zwei, `--dry-run` wird zu `dry_run` und ist ohne Angabe `False`. `--limit` hat keinen Standard und ist `None`; mit `type=int` ist `"5"` eine Zahl, mit der man rechnen kann. Optionen und Positionsargumente dürfen gemischt werden. Nach `--` gilt nichts mehr als Option – so lassen sich Dateinamen übergeben, die mit `-` beginnen.
+    resources:
+      - title: argparse · nargs
+        url: https://docs.python.org/3/library/argparse.html#nargs
+      - title: argparse · dest
+        url: https://docs.python.org/3/library/argparse.html#dest
+
+  - id: vorrang-vorhersagen
+    type: output
+    title: Wer gewinnt?
+    prompt: Was gibt dieses Programm aus?
+    lang: python
+    code: |
+      import tomllib
+      from collections import ChainMap
+
+      STANDARD = {"ziel": "~/Sortiert", "max_tage": 30, "farbe": True, "apply": False}
+      datei = tomllib.loads('ziel = "/mnt/nas"\nmax_tage = 14\nfarbe = false\n')
+      umgebung = {"SORTIERE_MAX_TAGE": "7", "SORTIERE_ZIEL": "", "USER": "steven"}
+      aus_env = {k.removeprefix("SORTIERE_").lower(): v
+                 for k, v in umgebung.items() if k.startswith("SORTIERE_") and v}
+      cli = {"ziel": None, "max_tage": None, "farbe": None, "apply": True}
+      aus_cli = {k: v for k, v in cli.items() if v is not None}
+
+      e = ChainMap(aus_cli, aus_env, datei, STANDARD)
+      print(e["ziel"])
+      print(repr(e["max_tage"]))
+      print(e["farbe"], e["apply"])
+      print(sorted(e))
+    expected: |
+      /mnt/nas
+      '7'
+      False True
+      ['apply', 'farbe', 'max_tage', 'ziel']
+    explanation: |
+      `ChainMap` sucht jeden Schlüssel von links nach rechts. `SORTIERE_ZIEL` ist leer und wird durch `and v` herausgefiltert, deshalb gilt die Datei: `/mnt/nas`. `max_tage` kommt aus der Umgebung – und ist dort ein **String** `'7'`, nicht die Zahl 7. Genau diesen Fehler musst du beim Einlesen von Umgebungsvariablen abfangen. `farbe` ist in der CLI `None` (nicht angegeben), die Datei sagt `false`. `apply` kommt aus der CLI. `sorted` über einen `ChainMap` liefert die Vereinigung aller Schlüssel.
+    resources:
+      - title: collections.ChainMap
+        url: https://docs.python.org/3/library/collections.html#collections.ChainMap
+      - title: tomllib.loads
+        url: https://docs.python.org/3/library/tomllib.html#tomllib.loads
+
+  - id: unterbefehle-luecken
+    type: gap
+    title: Ein Werkzeug mit Unterbefehlen
+    prompt: |
+      Ergänze den Parser für `backup`. Ohne Unterbefehl soll ein Fehler kommen. `run` nimmt mindestens einen Ordner, `--stufe` ist eine ganze Zahl von 1 bis 9 mit Standard 6. `prune` hat `--behalten` (ganze Zahl) und einen Schalter `--apply`. Jeder Unterbefehl hängt seine Funktion an.
+    lang: python
+    code: |
+      parser = argparse.ArgumentParser(prog="backup")
+      befehle = parser.⟦add_subparsers⟧(dest="befehl", required=True)
+
+      run = befehle.⟦add_parser⟧("run", help="Backup erstellen")
+      run.add_argument("ordner", nargs=⟦"+"⟧, type=Path)
+      run.add_argument("--stufe", type=int, choices=⟦range(1, 10)⟧, default=6)
+      run.set_defaults(func=cmd_run)
+
+      prune = befehle.add_parser("prune", help="alte Backups löschen")
+      prune.add_argument("--behalten", ⟦type=int⟧, default=7)
+      prune.add_argument("--apply", ⟦action="store_true"⟧)
+      prune.⟦set_defaults⟧(func=cmd_prune)
+    gaps:
+      - label: Unterbefehle anlegen
+        hint: Eine Methode des Parsers, die ein Objekt für Unterbefehle liefert.
+      - label: Einen Unterbefehl anlegen
+        hint: Eine Methode dieses Objekts, die einen neuen Parser liefert.
+      - label: Mindestens einer
+        hint: Das `nargs`-Zeichen für „ein oder mehr“.
+      - label: 1 bis 9
+        hint: Ein `range`, dessen Ende nicht enthalten ist.
+        accept:
+          - list(range(1, 10))
+          - "[1, 2, 3, 4, 5, 6, 7, 8, 9]"
+      - label: Ganze Zahl
+        hint: Ein Schlüsselwort-Argument, das den String umwandelt.
+      - label: Schalter
+        hint: Eine Aktion, die ohne Wert `True` speichert.
+      - label: Funktion anhängen
+        hint: Dieselbe Methode wie bei `run`.
+    explanation: |
+      `add_subparsers(dest="befehl", required=True)` legt den Unterbefehl in `args.befehl` ab und verlangt einen. Jeder Unterbefehl ist ein eigener Parser mit eigenen Optionen. `choices=range(1, 10)` funktioniert, weil argparse nur `in` prüft – nach der Umwandlung durch `type=int`. `set_defaults(func=...)` erspart eine `if`-Kette: In `main` genügt `return args.func(args)`.
+    resources:
+      - title: argparse · add_subparsers
+        url: https://docs.python.org/3/library/argparse.html#argparse.ArgumentParser.add_subparsers
+      - title: argparse · choices
+        url: https://docs.python.org/3/library/argparse.html#choices
+
+  - id: umleiten
+    type: command
+    title: Daten und Meldungen trennen
+    prompt: Starte `export.py` mit `python3` so, dass die Daten (stdout) in `daten.csv` und die Meldungen (stderr) in `fehler.log` landen.
+    context: "`export.py` schreibt CSV nach stdout und Logmeldungen nach stderr."
+    answers:
+      - python3 export.py > daten.csv 2> fehler.log
+      - python3 export.py >daten.csv 2>fehler.log
+      - python3 export.py > daten.csv 2>fehler.log
+      - python3 export.py >daten.csv 2> fehler.log
+      - python3 export.py 2> fehler.log > daten.csv
+      - python3 export.py 2>fehler.log >daten.csv
+      - python3 export.py 1> daten.csv 2> fehler.log
+      - python3 export.py 1>daten.csv 2>fehler.log
+    explanation: |
+      `>` (kurz für `1>`) leitet Dateideskriptor 1, also stdout, um; `2>` leitet Deskriptor 2, stderr, um. Weil das Werkzeug beides sauber trennt, enthält `daten.csv` nur CSV. In fish funktioniert dieselbe Schreibweise. Würde das Skript Meldungen mit `print` nach stdout schreiben, stünden sie mitten in der CSV-Datei.
+    resources:
+      - title: Bash Reference Manual · Redirections
+        url: https://www.gnu.org/software/bash/manual/bash.html#Redirections
+
+  - id: werkzeug-installieren
+    type: command
+    title: Als Befehl installieren
+    prompt: Installiere das Projekt im aktuellen Ordner mit `uv` als globales Kommandozeilen-Werkzeug, sodass danach `sortiere --help` in jeder Shell funktioniert.
+    context: Du bist im Projektordner. Die `pyproject.toml` enthält `[project.scripts]` mit `sortiere = "sortiere.cli:main"`.
+    answers:
+      - uv tool install .
+      - uv tool install ./
+    output: |
+      Resolved 1 package in 3ms
+      Installed 1 executable: sortiere
+    explanation: |
+      `uv tool install` baut das Paket, legt dafür eine eigene virtuelle Umgebung an und verlinkt die Befehle aus `[project.scripts]` nach `~/.local/bin`. Die isolierte Umgebung verhindert Konflikte mit anderen Werkzeugen und mit dem System-Python. Das Gegenstück mit pipx ist `pipx install .`. Liegt `~/.local/bin` nicht im `PATH`, hilft `uv tool update-shell`.
+    resources:
+      - title: uv · Using tools
+        url: https://docs.astral.sh/uv/guides/tools/
+      - title: Writing pyproject.toml · Creating executable scripts
+        url: https://packaging.python.org/en/latest/guides/writing-pyproject-toml/#creating-executable-scripts
+
+  - id: notiz-parser
+    type: code
+    title: Ein Parser mit Unterbefehlen
+    prompt: |
+      Schreibe `baue_parser()` für das Werkzeug `notiz`. Sie gibt einen `argparse.ArgumentParser` zurück:
+
+      - Globale Option `-v`/`--verbose`, zählbar (`-vv`), Standard `0`.
+      - Unterbefehle in `args.befehl`, einer ist Pflicht:
+        - `neu`: Positionsargument `text` (mindestens ein Wort, Liste), wiederholbare Option `--tag` mit Ziel `tags` (Standard: leere Liste).
+        - `liste`: `--tag` (einzelner Wert, Standard `None`), `--limit` (ganze Zahl, Standard `10`).
+        - `loesche`: Positionsargument `id` (ganze Zahl), Schalter `--force`.
+    lang: python
+    starter: |
+      import argparse
+
+      def baue_parser() -> argparse.ArgumentParser:
+          parser = argparse.ArgumentParser(prog="notiz")
+          ...
+          return parser
+    solution: |
+      import argparse
+
+      def baue_parser() -> argparse.ArgumentParser:
+          parser = argparse.ArgumentParser(prog="notiz")
+          parser.add_argument("-v", "--verbose", action="count", default=0)
+          befehle = parser.add_subparsers(dest="befehl", required=True)
+
+          neu = befehle.add_parser("neu")
+          neu.add_argument("text", nargs="+")
+          neu.add_argument("--tag", action="append", dest="tags", default=[])
+
+          liste = befehle.add_parser("liste")
+          liste.add_argument("--tag")
+          liste.add_argument("--limit", type=int, default=10)
+
+          loesche = befehle.add_parser("loesche")
+          loesche.add_argument("id", type=int)
+          loesche.add_argument("--force", action="store_true")
+          return parser
+    tests:
+      - name: neu mit Text und Tags
+        code: |
+          a = baue_parser().parse_args(["neu", "Milch", "kaufen", "--tag", "einkauf", "--tag", "heute"])
+          assert a.befehl == "neu", f"befehl: {a.befehl!r}"
+          assert a.text == ["Milch", "kaufen"], f"text: {a.text!r}"
+          assert a.tags == ["einkauf", "heute"], f"tags: {a.tags!r}"
+      - name: neu ohne Tags
+        code: |
+          a = baue_parser().parse_args(["neu", "Idee"])
+          assert a.tags == [], f"tags ohne --tag: {a.tags!r}"
+      - name: liste mit Standardwerten
+        code: |
+          a = baue_parser().parse_args(["liste"])
+          assert (a.befehl, a.tag, a.limit, a.verbose) == ("liste", None, 10, 0), f"bekommen {vars(a)}"
+          b = baue_parser().parse_args(["-vv", "liste", "--limit", "3"])
+          assert (b.limit, b.verbose) == (3, 2), f"bekommen {vars(b)}"
+      - name: loesche wandelt die ID um
+        code: |
+          a = baue_parser().parse_args(["loesche", "42", "--force"])
+          assert a.id == 42 and a.force is True, f"bekommen {vars(a)}"
+          assert baue_parser().parse_args(["loesche", "7"]).force is False
+      - name: Ungültige Aufrufe enden mit Code 2
+        code: |
+          for argv in ([], ["loesche", "abc"], ["neu"], ["liste", "--limit", "viele"]):
+              try:
+                  baue_parser().parse_args(argv)
+              except SystemExit as exc:
+                  assert exc.code == 2, f"{argv}: Exit-Code {exc.code}"
+              else:
+                  raise AssertionError(f"{argv} hätte einen Fehler auslösen sollen")
+    hints:
+      - "`befehle = parser.add_subparsers(dest=\"befehl\", required=True)`, dann pro Befehl `befehle.add_parser(\"neu\")`."
+      - "Wiederholbar: `action=\"append\", dest=\"tags\", default=[]`. Zählbar: `action=\"count\", default=0`."
+      - "Umwandeln mit `type=int` – argparse meldet dann bei `abc` selbst einen Fehler."
+    explanation: |
+      Unterbefehle sind eigene Parser; ihre Optionen landen im selben `Namespace` wie die globalen. `append` sammelt wiederholte Optionen in einer Liste. Das `default=[]` ist hier unbedenklich, weil argparse die Liste vor dem Anhängen kopiert. `type=int` sorgt dafür, dass `loesche abc` mit einer klaren Meldung und Exit-Code `2` endet, statt später mit einem `ValueError` tief im Programm. Der Test ruft `parse_args` mit Listen auf – genau so testest du jedes Werkzeug, ohne einen Prozess zu starten.
+    resources:
+      - title: argparse · action
+        url: https://docs.python.org/3/library/argparse.html#action
+      - title: argparse · add_subparsers
+        url: https://docs.python.org/3/library/argparse.html#argparse.ArgumentParser.add_subparsers
+
+  - id: logging-konfigurieren
+    type: code
+    title: Logging mit -v und -q
+    prompt: |
+      Schreibe `konfiguriere_logging(verbose, quiet, stream)`. Sie richtet den Logger `"werkzeug"` ein und gibt ihn zurück:
+
+      - Stufe: `quiet` → `ERROR`; sonst `verbose == 0` → `WARNING`, `1` → `INFO`, ab `2` → `DEBUG`.
+      - Genau **ein** `StreamHandler`, der in `stream` schreibt, Format `"%(levelname)s: %(message)s"`.
+      - Mehrfaches Aufrufen darf keine zusätzlichen Handler anhängen (sonst erscheinen Meldungen doppelt).
+      - `propagate = False`, damit Meldungen nicht zusätzlich über den Root-Logger ausgegeben werden.
+    lang: python
+    starter: |
+      import logging
+      from typing import TextIO
+
+      def konfiguriere_logging(verbose: int, quiet: bool, stream: TextIO) -> logging.Logger:
+          logger = logging.getLogger("werkzeug")
+          handler = logging.StreamHandler(stream)
+          logger.addHandler(handler)
+          return logger
+    solution: |
+      import logging
+      from typing import TextIO
+
+      def konfiguriere_logging(verbose: int, quiet: bool, stream: TextIO) -> logging.Logger:
+          if quiet:
+              stufe = logging.ERROR
+          elif verbose >= 2:
+              stufe = logging.DEBUG
+          elif verbose == 1:
+              stufe = logging.INFO
+          else:
+              stufe = logging.WARNING
+          logger = logging.getLogger("werkzeug")
+          logger.handlers.clear()
+          handler = logging.StreamHandler(stream)
+          handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+          logger.addHandler(handler)
+          logger.setLevel(stufe)
+          logger.propagate = False
+          return logger
+    tests:
+      - name: Standard zeigt nur Warnungen
+        code: |
+          import io
+          puffer = io.StringIO()
+          log = konfiguriere_logging(0, False, puffer)
+          log.info("unsichtbar")
+          log.warning("Platte fast voll")
+          assert puffer.getvalue() == "WARNING: Platte fast voll\n", f"Ausgabe: {puffer.getvalue()!r}"
+      - name: -v zeigt INFO, -vv DEBUG
+        code: |
+          import io
+          puffer = io.StringIO()
+          log = konfiguriere_logging(1, False, puffer)
+          log.debug("details")
+          log.info("verschiebe a.pdf")
+          assert puffer.getvalue() == "INFO: verschiebe a.pdf\n", f"-v: {puffer.getvalue()!r}"
+          puffer2 = io.StringIO()
+          konfiguriere_logging(3, False, puffer2).debug("x=%d", 42)
+          assert puffer2.getvalue() == "DEBUG: x=42\n", f"-vvv: {puffer2.getvalue()!r}"
+      - name: -q zeigt nur Fehler
+        code: |
+          import io
+          puffer = io.StringIO()
+          log = konfiguriere_logging(2, True, puffer)
+          log.warning("still")
+          log.error("kaputt")
+          assert puffer.getvalue() == "ERROR: kaputt\n", f"Ausgabe: {puffer.getvalue()!r}"
+      - name: Zweimal konfigurieren, einmal ausgeben
+        code: |
+          import io
+          puffer = io.StringIO()
+          konfiguriere_logging(0, False, puffer)
+          log = konfiguriere_logging(0, False, puffer)
+          log.error("nur einmal")
+          assert puffer.getvalue() == "ERROR: nur einmal\n", f"Ausgabe: {puffer.getvalue()!r}"
+          assert len(log.handlers) == 1, f"{len(log.handlers)} Handler statt einem"
+          assert log.propagate is False, "propagate soll False sein"
+    hints:
+      - "Die Stufe zuerst als `if`/`elif`-Kette bestimmen und mit `logger.setLevel(stufe)` setzen."
+      - "Vor dem Hinzufügen alte Handler entfernen: `logger.handlers.clear()`."
+      - "`handler.setFormatter(logging.Formatter(\"%(levelname)s: %(message)s\"))`"
+    explanation: |
+      Logger sind global: `getLogger("werkzeug")` liefert bei jedem Aufruf **dasselbe** Objekt. Wer bei jedem Aufruf einen Handler anhängt, bekommt doppelte Ausgaben – ein Klassiker in Tests und Notebooks. `handlers.clear()` macht die Konfiguration idempotent. Die Stufe wird am Logger gesetzt; Meldungen darunter werden verworfen, bevor sie formatiert werden. `propagate = False` verhindert, dass dieselbe Meldung zusätzlich an die Handler des Root-Loggers geht. Den Strom als Parameter zu übergeben macht das Ganze testbar – im echten Programm übergibst du `sys.stderr`.
+    resources:
+      - title: Logging HOWTO · Loggers, Handlers, Formatters
+        url: https://docs.python.org/3/howto/logging.html#advanced-logging-tutorial
+      - title: logging.Logger.propagate
+        url: https://docs.python.org/3/library/logging.html#logging.Logger.propagate
+
+  - id: einstellungen-laden
+    type: code
+    title: Einstellungen mit Vorrang
+    prompt: |
+      Schreibe `lade_einstellungen(cli, env, toml_text)`. Ergebnis ist ein `dict` mit den Schlüsseln aus `STANDARD`. Vorrang: `cli` > `env` > `toml_text` > `STANDARD`.
+
+      - `cli`: Werte aus argparse; `None` heißt „nicht angegeben“.
+      - `env`: Umgebungsvariablen. Relevant sind `SORTIERE_ZIEL`, `SORTIERE_MAX_TAGE` und `SORTIERE_APPLY`; leere Werte werden ignoriert. `MAX_TAGE` wird zu `int`. `APPLY` wird zu `True` bei `1`, `true`, `yes`, `on` und zu `False` bei `0`, `false`, `no`, `off` (Groß- und Kleinschreibung egal); andere Werte lösen `ValueError` aus.
+      - `toml_text`: Inhalt einer TOML-Datei mit denselben Schlüsseln wie `STANDARD` (kann leer sein). Ein unbekannter Schlüssel löst `ValueError` aus – das fängt Tippfehler in der Konfiguration ab.
+    lang: python
+    starter: |
+      import tomllib
+
+      STANDARD = {"ziel": "Sortiert", "max_tage": 30, "apply": False}
+
+      def lade_einstellungen(cli: dict, env: dict, toml_text: str) -> dict:
+          ergebnis = dict(STANDARD)
+          ergebnis.update(cli)
+          return ergebnis
+    solution: |
+      import tomllib
+
+      STANDARD = {"ziel": "Sortiert", "max_tage": 30, "apply": False}
+      WAHR = {"1", "true", "yes", "on"}
+      FALSCH = {"0", "false", "no", "off"}
+
+      def als_bool(text: str) -> bool:
+          wert = text.strip().lower()
+          if wert in WAHR:
+              return True
+          if wert in FALSCH:
+              return False
+          raise ValueError(f"kein Wahrheitswert: {text!r}")
+
+      def lade_einstellungen(cli: dict, env: dict, toml_text: str) -> dict:
+          aus_datei = tomllib.loads(toml_text)
+          unbekannt = set(aus_datei) - set(STANDARD)
+          if unbekannt:
+              raise ValueError(f"unbekannte Einstellung: {', '.join(sorted(unbekannt))}")
+
+          aus_env = {}
+          if env.get("SORTIERE_ZIEL"):
+              aus_env["ziel"] = env["SORTIERE_ZIEL"]
+          if env.get("SORTIERE_MAX_TAGE"):
+              aus_env["max_tage"] = int(env["SORTIERE_MAX_TAGE"])
+          if env.get("SORTIERE_APPLY"):
+              aus_env["apply"] = als_bool(env["SORTIERE_APPLY"])
+
+          aus_cli = {k: v for k, v in cli.items() if v is not None}
+
+          ergebnis = dict(STANDARD)
+          for quelle in (aus_datei, aus_env, aus_cli):   # schwach -> stark
+              ergebnis.update(quelle)
+          return ergebnis
+    tests:
+      - name: Nur Standardwerte
+        code: |
+          ergebnis = lade_einstellungen({"ziel": None, "max_tage": None, "apply": None}, {}, "")
+          assert ergebnis == {"ziel": "Sortiert", "max_tage": 30, "apply": False}, f"bekommen {ergebnis!r}"
+      - name: Datei schlägt Standard
+        code: |
+          ergebnis = lade_einstellungen({}, {}, 'ziel = "/mnt/nas"\nmax_tage = 14\n')
+          assert ergebnis == {"ziel": "/mnt/nas", "max_tage": 14, "apply": False}, f"bekommen {ergebnis!r}"
+      - name: Umgebung schlägt Datei, Werte werden umgewandelt
+        code: |
+          env = {"SORTIERE_MAX_TAGE": "7", "SORTIERE_APPLY": "Yes", "SORTIERE_ZIEL": "", "HOME": "/home/steven"}
+          ergebnis = lade_einstellungen({"max_tage": None}, env, 'ziel = "/mnt/nas"\nmax_tage = 14\n')
+          assert ergebnis == {"ziel": "/mnt/nas", "max_tage": 7, "apply": True}, f"bekommen {ergebnis!r}"
+      - name: CLI schlägt alles, None zählt nicht
+        code: |
+          env = {"SORTIERE_MAX_TAGE": "7", "SORTIERE_APPLY": "1"}
+          ergebnis = lade_einstellungen({"ziel": "/tmp/x", "max_tage": None, "apply": False}, env, "max_tage = 14\n")
+          assert ergebnis == {"ziel": "/tmp/x", "max_tage": 7, "apply": False}, f"bekommen {ergebnis!r}"
+      - name: Fehler werden erkannt
+        code: |
+          for cli, env, text in [({}, {}, "max_tag = 3\n"), ({}, {"SORTIERE_APPLY": "vielleicht"}, "")]:
+              try:
+                  lade_einstellungen(cli, env, text)
+              except ValueError:
+                  pass
+              else:
+                  raise AssertionError(f"Erwartet ValueError für env={env!r}, toml={text!r}")
+    hints:
+      - "Baue drei Dictionaries (Datei, Umgebung, CLI ohne `None`) und wende sie mit `update` von schwach nach stark auf eine Kopie von `STANDARD` an."
+      - "Unbekannte Schlüssel: `set(aus_datei) - set(STANDARD)`."
+      - "Für `APPLY` eine kleine Hilfsfunktion mit zwei Mengen erlaubter Werte schreiben; `\"Yes\".lower()` nicht vergessen."
+    explanation: |
+      Die Rangfolge lässt sich als Folge von `update`-Aufrufen von schwach nach stark ausdrücken – oder mit `ChainMap` von stark nach schwach. Der entscheidende Teil ist die Grenze zur Außenwelt: Umgebungsvariablen sind Strings, `"0"` wäre als String wahr, und ein Tippfehler wie `max_tag` in der Datei würde ohne Prüfung still ignoriert. `None` in der CLI bedeutet „nicht angegeben“ – deshalb setzt man in argparse für diese Optionen keinen eigenen Standardwert. Ein ausdrückliches `--no-apply` (also `False`) schlägt dagegen die Umgebung.
+    resources:
+      - title: tomllib
+        url: https://docs.python.org/3/library/tomllib.html
+      - title: os.environ
+        url: https://docs.python.org/3/library/os.html#os.environ
+
+  - id: log-filter-main
+    type: code
+    title: Ein Filter für Pipes
+    prompt: |
+      Schreibe `main(argv, stdin, stdout, stderr) -> int` für das Werkzeug `nurfehler`, das Logzeilen filtert: `journalctl -o cat | nurfehler --level WARNING`.
+
+      - Jede Eingabezeile hat die Form `STUFE Nachricht`, z. B. `ERROR db: Verbindung verloren`. Stufen in aufsteigender Reihenfolge: `DEBUG`, `INFO`, `WARNING`, `ERROR`.
+      - Option `--level` (eine der vier Stufen, Standard `ERROR`): Zeilen mit dieser oder einer höheren Stufe werden **unverändert** nach `stdout` geschrieben.
+      - Leere Zeilen werden übersprungen. Zeilen mit unbekannter Stufe werden nicht ausgegeben; stattdessen schreibt das Werkzeug `zeile N: unbekannte Stufe` nach `stderr` (N zählt ab 1 über alle Eingabezeilen).
+      - Rückgabe: `0`, wenn alle nicht leeren Zeilen lesbar waren, sonst `1`. Ungültige Argumente beendet argparse wie üblich mit Code `2`.
+    lang: python
+    starter: |
+      import argparse
+      from typing import TextIO
+
+      STUFEN = ["DEBUG", "INFO", "WARNING", "ERROR"]
+
+      def main(argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
+          for zeile in stdin:
+              print(zeile, end="", file=stdout)
+          return 0
+    solution: |
+      import argparse
+      from typing import TextIO
+
+      STUFEN = ["DEBUG", "INFO", "WARNING", "ERROR"]
+
+      def main(argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
+          parser = argparse.ArgumentParser(prog="nurfehler")
+          parser.add_argument("--level", choices=STUFEN, default="ERROR")
+          args = parser.parse_args(argv)
+          minimum = STUFEN.index(args.level)
+
+          code = 0
+          for nummer, zeile in enumerate(stdin, start=1):
+              if not zeile.strip():
+                  continue
+              stufe = zeile.split(maxsplit=1)[0]
+              if stufe not in STUFEN:
+                  print(f"zeile {nummer}: unbekannte Stufe", file=stderr)
+                  code = 1
+                  continue
+              if STUFEN.index(stufe) >= minimum:
+                  stdout.write(zeile if zeile.endswith("\n") else zeile + "\n")
+          return code
+    setup: |
+      import io
+      LOG = (
+          "INFO start\n"
+          "DEBUG cache warm\n"
+          "WARNING Platte zu 91 % voll\n"
+          "\n"
+          "ERROR db: Verbindung verloren\n"
+          "kaputte Zeile\n"
+          "ERROR retry fehlgeschlagen"
+      )
+      def lauf(argv):
+          aus, err = io.StringIO(), io.StringIO()
+          code = main(argv, io.StringIO(LOG), aus, err)
+          return code, aus.getvalue(), err.getvalue()
+    tests:
+      - name: Standard filtert ERROR
+        code: |
+          code, aus, err = lauf([])
+          assert aus == "ERROR db: Verbindung verloren\nERROR retry fehlgeschlagen\n", f"stdout: {aus!r}"
+      - name: --level WARNING
+        code: |
+          code, aus, err = lauf(["--level", "WARNING"])
+          assert aus.splitlines() == ["WARNING Platte zu 91 % voll", "ERROR db: Verbindung verloren", "ERROR retry fehlgeschlagen"], f"stdout: {aus!r}"
+      - name: Meldungen nach stderr, Exit-Code 1
+        code: |
+          code, aus, err = lauf(["--level", "DEBUG"])
+          assert "kaputte" not in aus, "Unlesbare Zeilen gehören nicht nach stdout"
+          assert err == "zeile 6: unbekannte Stufe\n", f"stderr: {err!r}"
+          assert code == 1, f"Exit-Code {code}, erwartet 1"
+      - name: Saubere Eingabe ergibt 0
+        code: |
+          import io
+          aus = io.StringIO()
+          code = main(["--level", "INFO"], io.StringIO("INFO a\nDEBUG b\n"), aus, io.StringIO())
+          assert (code, aus.getvalue()) == (0, "INFO a\n"), f"bekommen {(code, aus.getvalue())!r}"
+      - name: Ungültige Stufe ist ein Aufruffehler
+        code: |
+          try:
+              lauf(["--level", "LAUT"])
+          except SystemExit as exc:
+              assert exc.code == 2, f"Exit-Code {exc.code}"
+          else:
+              raise AssertionError("--level LAUT hätte argparse mit Code 2 beenden sollen")
+    hints:
+      - "`choices=STUFEN` erledigt die Prüfung von `--level`; die Rangfolge liefert `STUFEN.index(stufe)`."
+      - "`enumerate(stdin, start=1)` zählt die Zeilen; die Stufe ist `zeile.split(maxsplit=1)[0]`."
+      - "Die letzte Zeile hat kein `\\n` – ergänze es beim Schreiben, damit jede Ausgabezeile endet."
+    explanation: |
+      Das ist das Grundmuster jedes Unix-Filters: Eingabe zeilenweise lesen, Treffer nach stdout, Probleme nach stderr, Exit-Code als Zusammenfassung. Weil `main` die Ströme als Parameter bekommt, kann der Test mit `StringIO` arbeiten; im echten Programm steht unten `sys.exit(main(sys.argv[1:], sys.stdin, sys.stdout, sys.stderr))`. Die Zeilen werden unverändert weitergereicht, damit das Werkzeug mit anderen kombinierbar bleibt. Zeilenweises Lesen hält den Speicherbedarf klein – auch bei Gigabytes aus `journalctl`.
+    resources:
+      - title: sys.stdin
+        url: https://docs.python.org/3/library/sys.html#sys.stdin
+      - title: io.StringIO
+        url: https://docs.python.org/3/library/io.html#io.StringIO
+
+  - id: repariere-backup-parser
+    type: code
+    title: Repariere den Backup-Parser
+    prompt: |
+      Der Parser des Werkzeugs `backup` hat drei Fehler:
+
+      - `backup` ohne Ordner läuft ohne Fehlermeldung durch und sichert nichts. Mindestens ein Ordner soll Pflicht sein.
+      - `backup ~/docs --komprimieren` meldet „expected one argument“, und `--komprimieren False` schaltet die Kompression ein. `--komprimieren` soll ein Schalter ohne Wert sein.
+      - `--stufe 12` wird angenommen, und `args.stufe` ist ein String. Erlaubt sind ganze Zahlen von 1 bis 9, Standard 6.
+
+      Repariere `baue_parser`.
+    lang: python
+    starter: |
+      import argparse
+      from pathlib import Path
+
+      def baue_parser() -> argparse.ArgumentParser:
+          parser = argparse.ArgumentParser(prog="backup")
+          parser.add_argument("quellen", nargs="*", type=Path)
+          parser.add_argument("--komprimieren", type=bool, default=False)
+          parser.add_argument("--stufe", default=6)
+          return parser
+    solution: |
+      import argparse
+      from pathlib import Path
+
+      def baue_parser() -> argparse.ArgumentParser:
+          parser = argparse.ArgumentParser(prog="backup")
+          parser.add_argument("quellen", nargs="+", type=Path)
+          parser.add_argument("--komprimieren", action="store_true")
+          parser.add_argument("--stufe", type=int, choices=range(1, 10), default=6)
+          return parser
+    tests:
+      - name: Normaler Aufruf
+        code: |
+          a = baue_parser().parse_args(["docs", "bilder"])
+          assert a.quellen == [Path("docs"), Path("bilder")], f"quellen: {a.quellen!r}"
+          assert a.komprimieren is False and a.stufe == 6, f"bekommen {vars(a)}"
+      - name: Ohne Ordner ist ein Fehler
+        code: |
+          try:
+              baue_parser().parse_args([])
+          except SystemExit as exc:
+              assert exc.code == 2
+          else:
+              raise AssertionError("backup ohne Ordner muss mit Code 2 enden")
+      - name: --komprimieren ist ein Schalter
+        code: |
+          a = baue_parser().parse_args(["docs", "--komprimieren"])
+          assert a.komprimieren is True, f"komprimieren: {a.komprimieren!r}"
+      - name: --stufe ist eine Zahl von 1 bis 9
+        code: |
+          a = baue_parser().parse_args(["docs", "--stufe", "9"])
+          assert a.stufe == 9, f"stufe: {a.stufe!r} ({type(a.stufe).__name__})"
+          for falsch in ["12", "0", "hoch"]:
+              try:
+                  baue_parser().parse_args(["docs", "--stufe", falsch])
+              except SystemExit:
+                  pass
+              else:
+                  raise AssertionError(f"--stufe {falsch} hätte abgelehnt werden müssen")
+    hints:
+      - "`nargs=\"*\"` erlaubt null Werte – für „mindestens einer“ gibt es ein anderes Zeichen."
+      - "`type=bool` ruft `bool(\"False\")` auf. Schalter brauchen eine `action`."
+      - "`type=int, choices=range(1, 10)`"
+    explanation: |
+      Alle drei Fehler sind typische argparse-Missverständnisse. `nargs="*"` erlaubt eine leere Liste; ein Backup ohne Quelle sollte aber laut scheitern. `type=bool` macht aus der Option eine Option **mit** Wert, und `bool()` liefert für jeden nicht leeren String `True`. Ohne `type=int` bleibt jede Zahl ein String – Vergleiche wie `args.stufe > 5` scheitern dann erst später mit `TypeError`. `choices` prüft nach der Umwandlung, deshalb funktioniert `range(1, 10)`.
+    resources:
+      - title: argparse · nargs
+        url: https://docs.python.org/3/library/argparse.html#nargs
+      - title: argparse · type
+        url: https://docs.python.org/3/library/argparse.html#type
+
+  - id: print-in-pipe
+    type: bug
+    title: jq mag die Ausgabe nicht
+    prompt: |
+      `./auswertung.py *.csv > ergebnis.json` erzeugt eine Datei, die kein gültiges JSON ist, und `./auswertung.py *.csv | jq .` bricht mit einem Parse-Fehler ab. Das JSON aus `json.dump` selbst ist korrekt. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: python
+    code: |
+      def main(argv: list[str] | None = None) -> int:
+          args = parse_args(argv)
+          ergebnisse = []
+          for datei in args.dateien:
+              print(f"lese {datei}")
+              ergebnisse.append(auswerten(datei))
+          json.dump(ergebnisse, sys.stdout, indent=2, ensure_ascii=False)
+          sys.stdout.write("\n")
+          return 0
+    lines: [5]
+    fix:
+      - line: 5
+        answers:
+          - print(f"lese {datei}", file=sys.stderr)
+          - log.info("lese %s", datei)
+          - logging.info("lese %s", datei)
+          - log.info(f"lese {datei}")
+          - sys.stderr.write(f"lese {datei}\n")
+    explanation: |
+      Die Fortschrittsmeldung landet mit `print` auf stdout – vor dem JSON. Für die Datei und für `jq` ist `lese a.csv` der Anfang des Dokuments, und das ist kein JSON. Meldungen gehören nach stderr: `print(..., file=sys.stderr)` oder besser `log.info(...)`, denn `logging` schreibt standardmäßig nach stderr und lässt sich mit `-q` abschalten. Im Terminal sieht man beides; umgeleitet wird nur stdout.
+    resources:
+      - title: print() · file
+        url: https://docs.python.org/3/library/functions.html#print
+      - title: Logging HOWTO · When to use logging
+        url: https://docs.python.org/3/howto/logging.html#when-to-use-logging
+
+  - id: typer-erklaeren
+    type: explain
+    title: Eine Typer-App lesen
+    prompt: |
+      Erkläre, welche Kommandozeile Typer aus diesem Code erzeugt: welche Befehle, Argumente und Optionen es gibt, wie `sortiere --help` aussehen wird und woher Typer die Informationen nimmt. Was passiert bei `sortiere statistik ~/Downloads`, und was bei `sortiere sortiere ~/Downloads --max-tage -1`?
+    lang: python
+    code: |
+      from pathlib import Path
+      from typing import Annotated
+
+      import typer
+
+      app = typer.Typer(help="Hält den Downloads-Ordner sauber.")
+
+      @app.command()
+      def sortiere(
+          ordner: Annotated[Path, typer.Argument(help="Ordner, der sortiert wird")],
+          apply: Annotated[bool, typer.Option(help="wirklich verschieben")] = False,
+          max_tage: Annotated[int, typer.Option(min=0, help="nur ältere Dateien")] = 30,
+      ) -> None:
+          """Sortiert Dateien nach Endung in Unterordner."""
+          fehler = verschiebe_alles(ordner, apply=apply, max_tage=max_tage)
+          if fehler:
+              raise typer.Exit(code=1)
+
+      @app.command()
+      def statistik(ordner: Path) -> None:
+          """Zeigt, wie viele Dateien welcher Art im Ordner liegen."""
+          for kategorie, anzahl in zaehle(ordner).items():
+              typer.echo(f"{kategorie}: {anzahl}")
+
+      if __name__ == "__main__":
+          app()
+    points:
+      - Jede mit `@app.command()` markierte Funktion wird ein Unterbefehl mit ihrem Namen; der Docstring wird zum Hilfetext.
+      - Parameter ohne Standardwert werden Positionsargumente, Parameter mit Standardwert Optionen; aus `max_tage` wird `--max-tage`.
+      - "Die Typannotationen steuern Umwandlung und Prüfung: `Path`, `int` mit `min=0` (deshalb wird `-1` mit einer Fehlermeldung abgelehnt), `bool` wird zum Schalterpaar `--apply/--no-apply`."
+      - "`typer.Exit(code=1)` beendet das Programm mit Exit-Code 1; `typer.echo` schreibt die Ergebnisse nach stdout."
+      - Typer baut auf Click auf und erzeugt Hilfe und Fehlermeldungen automatisch – dasselbe, was man mit argparse von Hand konfigurieren würde.
+    explanation: |
+      Typer liest die Signaturen der Funktionen. Die App hat zwei Unterbefehle, `sortiere` und `statistik`, weil zwei Funktionen mit `@app.command()` markiert sind; ihre Docstrings erscheinen in `sortiere --help` als Beschreibungen. In `sortiere` ist `ordner` ohne Standardwert ein Pflicht-Argument, `apply` und `max_tage` haben Standardwerte und werden zu Optionen – Unterstriche werden zu Bindestrichen, also `--max-tage`. Ein `bool` wird zum Paar `--apply/--no-apply`. `typer.Option(min=0)` prüft den Wertebereich, deshalb endet `--max-tage -1` mit einer Fehlermeldung und Exit-Code `2`, bevor die Funktion überhaupt läuft. `sortiere statistik ~/Downloads` wandelt das Argument in einen `Path` um und gibt pro Kategorie eine Zeile nach stdout aus. `raise typer.Exit(code=1)` ist das Gegenstück zu `return 1` in einem argparse-`main`. Unter der Haube erzeugt Typer Click-Befehle.
+    resources:
+      - title: Typer · Tutorial
+        url: https://typer.tiangolo.com/tutorial/
+      - title: Click · Documentation
+        url: https://click.palletsprojects.com/
+
+  - id: werkzeug-paketieren
+    type: practice
+    title: Dein Werkzeug installierbar machen
+    prompt: |
+      Mache aus dem Downloads-Sortierer des letzten Moduls ein installierbares Werkzeug:
+
+      1. Lege die Struktur `sortiere/pyproject.toml`, `sortiere/src/sortiere/__init__.py` und `sortiere/src/sortiere/cli.py` an. `cli.py` enthält `main(argv: list[str] | None = None) -> int`.
+      2. Beschreibe in `pyproject.toml` den Befehl `sortiere` als Einstiegspunkt.
+      3. Ergänze `-v`/`-q` für Logging und eine optionale Konfigurationsdatei `~/.config/sortiere/config.toml` mit dem Vorrang CLI > Umgebung > Datei > Standard.
+      4. Installiere mit `uv tool install .` und prüfe `sortiere --help` und `sortiere ~/Downloads` (Trockenlauf) in einer neuen Shell.
+
+      Die Musterlösung zeigt die `pyproject.toml`.
+    lang: toml
+    solution: |
+      [project]
+      name = "sortiere"
+      version = "0.1.0"
+      description = "Sortiert den Downloads-Ordner nach Dateityp."
+      readme = "README.md"
+      requires-python = ">=3.12"
+      dependencies = []
+
+      [project.scripts]
+      sortiere = "sortiere.cli:main"
+
+      [build-system]
+      requires = ["hatchling"]
+      build-backend = "hatchling.build"
+    checklist:
+      - "`sortiere --help` zeigt Beschreibung, alle Optionen und je einen Hilfesatz."
+      - "`main` gibt einen Exit-Code zurück; der installierte Befehl liefert `0` im Erfolgsfall und `1` bei Fehlern (`echo $status` in fish)."
+      - "`sortiere ~/Downloads -v > /dev/null` zeigt die Logmeldungen trotzdem – sie gehen nach stderr."
+      - Ein Wert aus der Konfigurationsdatei wird durch eine Umgebungsvariable und diese durch eine Option überschrieben.
+      - Das Werkzeug läuft in einer eigenen Umgebung (`uv tool list` zeigt es) und nicht im System-Python.
+    explanation: |
+      `[project.scripts]` ist der Standardweg, Python-Code als Befehl auszuliefern: Beim Installieren entsteht in `~/.local/bin` ein kleines Startprogramm, das `sortiere.cli:main` importiert und `sys.exit(main())` aufruft. Der `src`-Aufbau stellt sicher, dass du immer die installierte Version testest und nicht zufällig Dateien aus dem Arbeitsverzeichnis importierst. Mit `uv tool install` bekommt das Werkzeug eine eigene Umgebung – Updates anderer Pakete oder von CachyOS brechen es nicht.
+    resources:
+      - title: Writing your pyproject.toml
+        url: https://packaging.python.org/en/latest/guides/writing-pyproject-toml/
+      - title: uv · Using tools
+        url: https://docs.astral.sh/uv/guides/tools/

@@ -1,0 +1,336 @@
+id: troubleshooting
+title: Systematische Fehlersuche
+level: 3
+minutes: 190
+summary: Du führst Symptome auf überprüfbare Ursachen zurück, trennst Messung von Vermutung und belegst eine Reparatur mit dem betroffenen Lern- oder Betriebsablauf.
+goals:
+  - Du formulierst ein enges Symptom und testbare Hypothesen.
+  - Du unterscheidest CPU-Auslastung, Last, I/O-Wartezeit und Speicherdruck.
+  - Du untersuchst Dienste, Speicher, Netzwerk und Rechte schrittweise.
+  - Du dokumentierst Eingriffe, Verifikation und ein kurzes sachliches Postmortem.
+resources:
+  - title: Brendan Gregg · USE Method
+    url: https://www.brendangregg.com/usemethod.html
+  - title: systemctl
+    url: https://www.freedesktop.org/software/systemd/man/latest/systemctl.html
+  - title: journalctl
+    url: https://www.freedesktop.org/software/systemd/man/latest/journalctl.html
+  - title: Kernel · PSI
+    url: https://docs.kernel.org/accounting/psi.html
+  - title: strace
+    url: https://strace.io/
+lesson: |
+  Die Meldung „Der Server ist langsam“ ist ein Anfang, aber noch keine Diagnose. Langsam beim Login, beim Laden einer Seite oder beim Schreiben einer Datei? Seit wann? Für alle Benutzer oder nur einen? Ein guter nächster Schritt reduziert Unsicherheit, ohne die Beweislage durch hektische Neustarts und mehrere gleichzeitige Änderungen zu zerstören.
+
+  Dieses Modul verbindet die bisherigen Werkzeuge. Wir behandeln eine eigene Testumgebung und dokumentierte Beispielausgaben. In einem echten System prüfst du vor Eingriffen Zuständigkeit, gespeicherte Arbeit und betroffene Nutzer. Die technische Methode bleibt gleich: Symptom eingrenzen, eine Hypothese formulieren, passend messen, eine begrenzte Änderung vornehmen und den ursprünglichen Ablauf erneut prüfen.
+
+  ## Vom Symptom zur widerlegbaren Hypothese
+
+  Ein brauchbarer Fehlerbericht lautet etwa: „GET /health liefert seit 14:20 von einem zweiten Rechner HTTP 502; lokal auf Port 8000 kommt connection refused.“ Er enthält Zeit, betroffenen Weg, beobachtetes Ergebnis und Erwartung. „Nginx kaputt“ ist dagegen schon eine unbewiesene Ursache. Trenne Beobachtung und Interpretation in deinen Notizen.
+
+  Schreibe zu jeder Hypothese eine Messung und ein Ergebnis, das sie widerlegen würde. „Die API läuft nicht“ lässt sich mit Dienststatus und Socket prüfen. „DNS zeigt auf den falschen Host“ lässt sich mit aufgelöster Adresse und einem gezielten Test zum erwarteten Host prüfen. Ein positiver `ping` widerlegt keine kaputte TLS-Konfiguration, weil er eine andere Schicht untersucht.
+
+  ```text
+  Zeit: 14:24, Zeitzone Europe/Berlin
+  Symptom: HTTPS /health -> 502 von Client A
+  Hypothese: Backend auf 127.0.0.1:8000 fehlt
+  Messung: ss -ltnp und systemctl status app.service
+  Befund: kein Listener; app.service ist failed
+  Nächste Frage: Warum startet app.service nicht?
+  ```
+
+  Wiederhole Messungen während des Symptoms. Eine unauffällige Momentaufnahme nach dem Ende einer Störung belegt nur diesen späteren Zeitpunkt. Vergleiche nach Möglichkeit mit einem früheren gesunden Zustand oder einem gesunden Nachbarsystem. Notiere zugleich Grenzen: fehlende Prozessrechte, lückenhafte Logs oder eine nur lokale Prüfung.
+
+  Die **USE-Methode** betrachtet pro Ressource Utilization, Saturation und Errors: Wie stark wird sie genutzt, warten Aufgaben auf sie und treten Fehler auf? Hohe Nutzung allein ist nicht immer schlecht. Eine CPU kann sinnvoll ausgelastet sein; eine Warteschlange mit steigender Antwortzeit deutet eher auf einen Engpass hin ([Brendan Gregg · USE Method](https://www.brendangregg.com/usemethod.html)).
+
+  > [!MERKE]
+  > Eine Messung beantwortet eine bestimmte Frage. Ein grünes Signal darf nicht stillschweigend zum Nachweis einer anderen Schicht werden.
+
+  ## Ein Dienst startet nicht oder erreicht seinen Port nicht
+
+  Beginne beim Dienstzustand und den Meldungen des aktuellen Boots. `status` ist eine kurze Übersicht, das Journal liefert den Verlauf. Ein Exit-Code sagt, dass ein Prozess scheiterte; häufig benennt erst die vorherige Anwendungszeile den konkreten Grund ([systemctl](https://www.freedesktop.org/software/systemd/man/latest/systemctl.html), [journalctl](https://www.freedesktop.org/software/systemd/man/latest/journalctl.html)).
+
+  ```bash
+  systemctl status app.service
+  journalctl -u app.service -b -n 100 --no-pager
+  journalctl -xeu app.service
+  systemctl cat app.service
+  ss -ltnp 'sport = :8000'
+  ```
+
+  `journalctl -xeu` kann erklärende Hinweise und das Ende des Logs zeigen; für einen vollständigen zeitlichen Verlauf brauchst du zusätzlich ein gezieltes Zeitfenster. `systemctl cat` zeigt Paketunit und Drop-ins. Ein erfolgreicher manueller Start in deiner Shell beweist wenig, wenn die Unit ein anderes Arbeitsverzeichnis, einen anderen Benutzer oder andere Umgebungswerte verwendet.
+
+  Häufige Ursachen sind ein falscher `ExecStart`-Pfad, eine fehlende Konfiguration, ein belegter Port oder fehlende Rechte. Eine Meldung „address already in use“ passt zur Portprüfung mit `ss`; töte den gefundenen Prozess nicht, bevor du weißt, wem er gehört und weshalb er diesen Port verwendet. Vielleicht läuft bereits die richtige Instanz und nur eine doppelte startet.
+
+  ```bash
+  nginx -t
+  sudo sshd -t
+  namei -l /srv/app/config.ini
+  ```
+
+  Werkzeugspezifische Konfigurationstests prüfen vor einem Reload. Sie benötigen unter Umständen die Rechte, mit denen auch die echte Konfiguration gelesen wird. Ein `nginx -t` als unprivilegierter Benutzer kann an einer geschützten Datei scheitern, obwohl die privilegierte Dienstprüfung erfolgreich wäre. Entscheidend ist der passende Kontext, nicht das reflexhafte Anhängen von sudo an jeden Diagnosebefehl ([nginx · Command-line parameters](https://nginx.org/en/docs/switches.html)).
+
+  Nach einer Reparatur prüfst du Status, Listener und den tatsächlichen HTTP-Pfad. Ein laufender Prozess kann weiterhin falsche Inhalte oder Fehlerantworten liefern. Bewahre die relevante Vorher-Meldung und den Nachher-Nachweis im Fehlerbericht auf.
+
+  ## Speicher voll: die betroffene Ressource identifizieren
+
+  Finde zuerst den Mount des fehlschlagenden Pfads. Danach prüfst du Datenblöcke und, wenn sinnvoll, Inodes. Erst dann suchst du große Verbraucher innerhalb dieses Dateisystems. So vermeidest du, dass eine große, aber unbeteiligte externe Platte die Aufmerksamkeit bindet.
+
+  ```bash
+  findmnt -T /var/lib/app
+  df -h /var/lib/app
+  df -i /var/lib/app
+  du -xhd1 /var/lib
+  lsof +L1
+  journalctl --disk-usage
+  ```
+
+  `du` kann ohne ausreichende Leserechte unvollständig sein und erzeugt selbst I/O. `ncdu` bietet eine interaktive Ansicht, verändert aber beim Lesen ebenso nicht die grundlegende Messmethode. `lsof +L1` zeigt offene Dateien mit weniger als einem Link; große gelöschte Logs können deshalb weiterhin Platz belegen. Geordnete Logrotation oder ein abgestimmter Neustart des zuständigen Dienstes schließt solche Dateien besser als zufälliges Löschen weiterer Daten ([unlink(2)](https://man7.org/linux/man-pages/man2/unlink.2.html)).
+
+  Das Journal kann mit Aufbewahrungsregeln begrenzt werden. `journalctl --vacuum-time=7d` entfernt geeignete archivierte Journaldateien und ist eine echte Löschoperation. Es löscht nicht zwingend die aktive Journaldatei und ersetzt keine Prüfung des gewünschten Aufbewahrungszeitraums. Sichere benötigte Incident-Belege zuerst und plane künftig passende Limits ([journald.conf](https://www.freedesktop.org/software/systemd/man/latest/journald.conf.html)).
+
+  Wenn das Dateisystem auf read-only gewechselt ist, suche nach Kernel- und Hardwaremeldungen. Mehr Platz oder ein Neustart repariert keine zugrunde liegende I/O-Störung. Bei Btrfs prüfst du zusätzlich dessen eigene Statistik und Snapshotbelegung. Datenrettung und Dateisystemreparatur sind eigene Aufgaben; experimentiere nicht mit Repair-Optionen auf der einzigen Datenkopie.
+
+  ## Hohe Last ist nicht dasselbe wie volle CPU
+
+  Linux Load Average zählt grob lauffähige und bestimmte ununterbrechbar wartende Aufgaben über verschiedene Zeitfenster. Sie ist keine CPU-Prozentzahl. Last 8 bedeutet auf einem System mit vielen Kernen etwas anderes als auf einem kleinen System, und wartende I/O-Aufgaben können die Last bei geringer CPU-Auslastung erhöhen ([proc_loadavg(5)](https://man7.org/linux/man-pages/man5/proc_loadavg.5.html)).
+
+  ```bash
+  uptime
+  top
+  vmstat 1 5
+  iostat -xz 1 5
+  pidstat -u -d -r 1 5
+  ```
+
+  `vmstat` verbindet Warteschlangen, Speicher, Swap, I/O und CPU-Zeiten. Die erste Zeile fasst normalerweise die Zeit seit dem Boot zusammen; die folgenden Zeilen zeigen die angegebenen Intervalle. Verwechsele diesen Langzeitdurchschnitt nicht mit der akuten Störung. `iostat` und `pidstat` gehören gewöhnlich zum Paket sysstat und sind nicht überall vorinstalliert ([vmstat(8)](https://man7.org/linux/man-pages/man8/vmstat.8.html), [sysstat-Dokumentation](https://sysstat.github.io/)).
+
+  Betrachte mehrere Signale: CPU-Arbeit, Laufwarteschlange, I/O-Latenz, Durchsatz und betroffene Prozesse. `iowait` ist kein präziser Prozentsatz „des langsamen Datenträgers“. Ebenso ist ein hoher `%util`-Wert je nach Gerät und Parallelität kein vollständiger Sättigungsbeweis. Eine kurze Messreihe unter Last und der Bezug zur Antwortzeit sind hilfreicher als ein einzelner Grenzwert aus einem fremden System.
+
+  Der Kernel stellt mit **PSI** Pressure Stall Information bereit. Die Dateien unter `/proc/pressure` beschreiben, wie viel Zeit Aufgaben wegen Ressourcenmangels warten. Das ergänzt reine Auslastungswerte. Die Werte hängen von Zeitraum und Ressource ab; notiere die konkrete Datei und das Fenster ([Kernel · PSI](https://docs.kernel.org/accounting/psi.html)).
+
+  ```bash
+  cat /proc/pressure/cpu
+  cat /proc/pressure/memory
+  cat /proc/pressure/io
+  ```
+
+  > [!PRAXIS]
+  > Ein plausibler Engpassbericht verbindet „Antwortzeit steigt“ mit „diese Ressource staut sich“ und „dieser Prozess erzeugt die Last“. Eine einzelne hohe Zahl ist zunächst nur ein Messwert.
+
+  ## Speicherdruck, offene Dateien und Systemaufrufe
+
+  `free -h` zeigt unter anderem `available`: eine Schätzung, wie viel RAM ohne Swapping für neue Anwendungen verfügbar ist. Wenig völlig freier RAM ist unter Linux wegen Dateicaches allein kein Fehler. Speicherdruck erkennst du besser an available, Swapaktivität, PSI und dem betroffenen Prozessverlauf.
+
+  ```bash
+  free -h
+  swapon --show
+  journalctl -k -b --no-pager
+  systemctl show app.service -p MemoryCurrent -p MemoryMax
+  ```
+
+  Ein vom OOM-Killer beendeter Prozess muss nicht bedeuten, dass der gesamte Host keinen RAM mehr hatte. Eine cgroup kann ein eigenes Limit erreichen. Prüfe Kernelmeldungen, Unitgrenzen und Zeitverlauf. Ein größeres Limit kann eine akute Begrenzung verschieben, beweist aber nicht, dass ein Speicherleck repariert ist ([Kernel · cgroup v2 Memory](https://docs.kernel.org/admin-guide/cgroup-v2.html#memory)).
+
+  `lsof -p PID` zeigt offene Dateien, Sockets und andere Ressourcen. `strace` beobachtet Systemaufrufe eines Prozesses und hilft bei Fragen wie „welcher Pfad fehlt?“ oder „worauf wartet er?“. Es kann Leistung beeinflussen und sensible Daten sichtbar machen. Filtere eng, zeichne kurz auf und verwende es nur für Prozesse, die du untersuchen darfst ([strace-Dokumentation](https://strace.io/)).
+
+  ```bash
+  lsof -p 1234
+  strace -f -e trace=openat,connect -p 1234
+  ```
+
+  `ENOENT` bedeutet meist, dass ein benötigter Pfad nicht gefunden wurde; `EACCES` weist auf eine verweigerte Operation hin. Die erste fehlgeschlagene Suche ist nicht automatisch der Fehler: Programme probieren oft mehrere zulässige Pfade. Lies den Ablauf und die Reaktion der Anwendung. Nach Ctrl+C bei einer angehängten strace-Sitzung prüfst du, dass die Beobachtung beendet ist und der Zielprozess wie erwartet weiterläuft.
+
+  Bei Zugriffsproblemen ergänzt `namei -l` die Pfadprüfung. Wenn Unix-Rechte passen, untersuche ACLs, Mount-Optionen, AppArmor beziehungsweise SELinux und systemd-Sandboxing. „Mit root klappt es“ identifiziert noch nicht, welche dieser Ebenen für den vorgesehenen Dienstbenutzer angepasst werden muss.
+
+  ## Netzwerk nach Schichten untersuchen
+
+  Beginne bei der lokalen Verbindung und arbeite bis zur Anwendung. Prüfe Linkzustand, Adresse, Route, Namensauflösung, erreichbaren Port und schließlich Protokollantwort. Ein fehlgeschlagener ICMP-Test kann an einer Filterregel liegen; er beweist nicht allein, dass HTTP unerreichbar ist.
+
+  ```bash
+  ip -br link
+  ip -br addr
+  ip route get 203.0.113.10
+  getent ahosts app.example
+  dig app.example
+  curl --fail --show-error --silent --max-time 5 https://app.example/health
+  curl -v --max-time 5 https://app.example/health
+  ```
+
+  `getent` folgt der Namensdienstkonfiguration des Systems, `dig` fragt DNS. Unterschiede können durch `/etc/hosts`, Resolverkonfiguration oder Anwendungscaches entstehen. Die Beispieladressen sind Dokumentationswerte; ersetze sie durch die eigene Testumgebung. `curl -v` zeigt Phasen wie Verbindung und TLS. Bereinige Headers und Zugangsdaten, bevor du die Ausgabe teilst ([curl-Handbuch](https://curl.se/docs/manpage.html)).
+
+  „Connection refused“ passt zu einem fehlenden Listener oder einer aktiven Ablehnung. Ein Timeout kann zu Paketverlust, Filterung oder einem nicht antwortenden Dienst passen. HTTP 502 zeigt, dass du bereits einen HTTP-Server erreicht hast; die nächste Frage liegt oft bei dessen Upstream. Eine gültige TLS-Verbindung ist wiederum kein Nachweis, dass Datenbank und fachliche API funktionieren.
+
+  ## Verifikation und ein kurzes Postmortem
+
+  Ändere jeweils eine begrenzte Ursache, wenn das betrieblich möglich ist. Halte Befehl, Zeitpunkt, erwarteten Effekt und Rückweg fest. Wiederhole danach genau den fehlgeschlagenen Nutzerpfad und beobachte einen angemessenen Zeitraum. Eine kurz verschwundene Meldung nach einem Neustart kann nur eine vorübergehende Entlastung sein.
+
+  Ein Postmortem beantwortet: Was war betroffen, wann begann es, welche Belege zeigen die Ursache, welche Maßnahme half und welche Wiederholung soll künftig verhindert werden? Trenne gesicherte Tatsachen von offenen Vermutungen. „Jemand hat nicht aufgepasst“ ist keine technische Erklärung; ein unvalidiertes Konfigurationsfeld oder ein fehlender Alarm ist konkreter und bearbeitbar.
+
+  > [!INTERVIEW]
+  > „Ein Server ist langsam, was machst du?“ – Ich konkretisiere den betroffenen Ablauf und Zeitpunkt, messe Ressourcen samt Wartedruck, ordne Prozesse zu und teste eine Hypothese. Erst danach ändere ich gezielt etwas und prüfe denselben Ablauf erneut.
+
+  ## Zusammenfassung
+
+  - Beobachtung, Hypothese und bestätigte Ursache bleiben getrennt.
+  - Messe während des Symptoms und notiere die Messgrenzen.
+  - Dienststatus, Listener und fachliche Antwort sind eigene Ebenen.
+  - Load Average, CPU-Nutzung und Speicherdruck sind keine Synonyme.
+  - Prüfe Datenblöcke, Inodes, offene gelöschte Dateien und Mounts.
+  - Ändere begrenzt und verifiziere den ursprünglichen Ablauf.
+  - Dokumentiere Ursachen und Folgemaßnahmen sachlich.
+exercises:
+  - id: diagnosefolge
+    type: order
+    title: Von der Meldung zur bestätigten Reparatur
+    prompt: Ordne den Ablauf. Die Messung soll die Hypothese prüfen; die Änderung folgt erst auf den Befund.
+    lang: text
+    lines: |
+      Symptom, Zeitpunkt und erwartetes Verhalten festhalten
+      Eine widerlegbare Hypothese formulieren
+      Eine passende Messung während der Störung durchführen
+      Befund bewerten und eine begrenzte Änderung wählen
+      Änderung samt Rückweg dokumentieren und durchführen
+      Den ursprünglichen Ablauf erneut prüfen
+      Ursache, Grenzen und Folgemaßnahmen festhalten
+    explanation: Der Ablauf verhindert, dass mehrere ungeprüfte Eingriffe die Ursache verdecken. Die abschließende Prüfung muss zum ursprünglichen Symptom passen.
+  - id: load-bedeutung
+    type: choice
+    title: Hohe Last bei wenig CPU-Arbeit
+    prompt: Ein System hat hohe Load Average, niedrige CPU-Nutzung und auffälligen I/O-Druck. Welche Aussage ist belastbar?
+    options:
+      - text: Wartende Aufgaben können zur Last beitragen; I/O und Prozesse müssen gezielt untersucht werden.
+        correct: true
+        why: Load Average umfasst neben lauffähigen auch bestimmte ununterbrechbar wartende Aufgaben.
+      - text: Die CPU ist sicher defekt.
+        correct: false
+        why: Die Messwerte beweisen keinen Hardwaredefekt.
+      - text: Die Load Average ist identisch mit der CPU-Prozentzahl und daher unmöglich.
+        correct: false
+        why: Die beiden Größen messen unterschiedliche Dinge.
+    explanation: Hohe Last lenkt die nächste Messung, legt aber noch keine einzelne Ursache fest. Zeitgleiche Prozess- und I/O-Daten können die Hypothese eingrenzen.
+    resources:
+      - title: proc_loadavg(5)
+        url: https://man7.org/linux/man-pages/man5/proc_loadavg.5.html
+  - id: fehlerrate
+    type: output
+    title: Ein kleines Zeitfenster auswerten
+    prompt: Welche Zahl gibt diese Auswertung des künstlichen Statussamples aus?
+    lang: bash
+    code: |
+      printf '200\n502\n200\n503\n' |
+        awk '$1 >= 500 { fehler++ } END { print fehler+0 }'
+    expected: '2'
+    verify: true
+    explanation: Zwei der vier Antworten sind Serverfehler ab 500. Das ist eine Beobachtung im Sample, kein Beweis über einen längeren Zeitraum oder die technische Ursache.
+  - id: status-festhalten
+    type: output
+    title: Der richtige Zeitpunkt für den Status
+    prompt: Welche Ausgabe entsteht?
+    lang: bash
+    code: |
+      false
+      status=$?
+      printf 'Messung beendet\n'
+      printf 'Originalstatus: %s\n' "$status"
+    expected: |
+      Messung beendet
+      Originalstatus: 1
+    verify: true
+    explanation: Der Status wird direkt nach dem fehlschlagenden Befehl gespeichert. Die spätere Ausgabe kann ihn deshalb nicht mehr überschreiben.
+    resources:
+      - title: Bash · Exit Status
+        url: https://www.gnu.org/software/bash/manual/html_node/Exit-Status.html
+  - id: dienst-journal
+    type: command
+    title: Der aktuelle Boot eines Dienstes
+    prompt: Zeige für `app.service` die letzten 100 Journalzeilen des aktuellen Boots ohne Pager.
+    answers: ["journalctl -u app.service -b -n 100 --no-pager", "journalctl --unit app.service --boot --lines 100 --no-pager"]
+    explanation: Unit, Boot und Zeilenzahl grenzen den Kontext ein. Für eine längere Störung folgt anschließend eine gezielte Zeitfensterabfrage.
+    resources:
+      - title: journalctl
+        url: https://www.freedesktop.org/software/systemd/man/latest/journalctl.html
+  - id: offene-geloeschte
+    type: command
+    title: Unsichtbarer Speicherverbrauch
+    prompt: Zeige mit lsof offene Dateien mit Linkzahl kleiner als eins an. Verwende noch kein sudo und lösche nichts.
+    answers: ["lsof +L1"]
+    explanation: Diese Auswahl findet unter anderem geöffnete gelöschte Dateien. Ohne ausreichende Rechte kann die Ausgabe unvollständig sein; diese Grenze muss im Befund stehen.
+  - id: pfad-diagnose
+    type: command
+    title: Den Weg zur Konfiguration prüfen
+    prompt: Zeige mit namei ausführlich die Rechte aller Komponenten von `/srv/app/config.ini`.
+    answers: ["namei -l /srv/app/config.ini"]
+    explanation: Der Fehler kann an einem Elternverzeichnis liegen. Die letzte Datei allein erlaubt keine vollständige Aussage über den Pfadzugriff.
+    resources:
+      - title: namei(1)
+        url: https://man7.org/linux/man-pages/man1/namei.1.html
+  - id: healthcheck-fehler
+    type: bug
+    title: HTTP 500 wird als Erfolg gemeldet
+    prompt: Dieser Healthcheck endet bei einer vollständig übertragenen HTTP-500-Antwort mit Status 0. Ergänze curl so, dass HTTP-Fehler einen Fehlerstatus liefern; behalte die übrigen Optionen bei.
+    lang: bash
+    code: |
+      curl -sS --max-time 5 https://app.example/health
+    lines: [1]
+    fix:
+      - line: 1
+        answers: ["curl --fail -sS --max-time 5 https://app.example/health", "curl -fsS --max-time 5 https://app.example/health", "curl -sS --fail --max-time 5 https://app.example/health", "curl --fail-with-body -sS --max-time 5 https://app.example/health"]
+    explanation: curl trennt Übertragungserfolg vom HTTP-Status. `--fail` beziehungsweise `--fail-with-body` macht passende HTTP-Fehler für den aufrufenden Ablauf sichtbar.
+    resources:
+      - title: curl · fail
+        url: https://curl.se/docs/manpage.html#--fail
+  - id: oom-kontext
+    type: explain
+    title: Viel Host-RAM und trotzdem OOM
+    prompt: Erkläre den folgenden vereinfachten Befund und die nächsten Prüfungen.
+    lang: text
+    code: |
+      Host: mehrere GiB available
+      app.service: MemoryMax=268435456
+      Kernel: Memory cgroup out of memory: Killed process ... (app)
+    points:
+      - Ein cgroup-Limit kann erreicht sein, obwohl der Host noch RAM besitzt.
+      - Der Dienst ist hier auf 256 MiB begrenzt.
+      - Zeitlicher Verbrauch und Arbeitslast müssen mit der Meldung abgeglichen werden.
+      - Ein größeres Limit beweist keine Reparatur eines möglichen Speicherlecks.
+    explanation: Die Engpassressource ist zunächst der Speicherrahmen dieser Gruppe. Prüfe, ob die normale Arbeitslast mehr benötigt oder der Verbrauch unkontrolliert wächst, bevor du eine Grenze änderst.
+    resources:
+      - title: Kernel · cgroup v2 Memory
+        url: https://docs.kernel.org/admin-guide/cgroup-v2.html#memory
+  - id: upstream
+    type: explain
+    title: Was beweist ein HTTP 502?
+    prompt: Ordne die folgenden drei Beobachtungen ein und benenne eine eng begrenzte nächste Untersuchung.
+    lang: text
+    code: |
+      Client: HTTPS-Zertifikat gültig, Antwort 502
+      Proxy-Log: connect() failed (111: Connection refused) while connecting to upstream
+      ss: kein Listener auf 127.0.0.1:8000
+    points:
+      - Der Client hat den Proxy per HTTPS erreicht.
+      - Der Proxy scheitert beim Verbindungsaufbau zum Backend.
+      - Auf dem geprüften Backendport ist kein Listener sichtbar.
+      - Als Nächstes werden Backend-Unit, Logs und konfigurierte Portzuordnung geprüft.
+    explanation: Die Beobachtungen grenzen die Störung auf den Weg vom Proxy zum Backend ein. Sie beweisen noch nicht, warum das Backend fehlt; ein DNS- oder TLS-Neuentwurf wäre durch diese Belege nicht begründet.
+  - id: incident-runbook
+    type: practice
+    title: Eine Störung nachvollziehbar abschließen
+    prompt: Erzeuge in einer eigenen Testumgebung eine harmlose Fehlkonfiguration eines Demo-Dienstes, etwa einen falschen Konfigurationspfad. Dokumentiere Diagnose, kleinste Reparatur und erneute Nutzung. Verändere keinen fremden produktiven Dienst.
+    lang: text
+    solution: |
+      Symptom: Demo-Dienst startet nach Pfadänderung nicht.
+      Beleg: Unit zeigt /srv/demo/missing.conf; Journal meldet ENOENT.
+      Hypothese: Falscher Pfad verhindert den Start.
+      Prüfung: Vorhandene Testkonfiguration und Unitpfad vergleichen.
+      Änderung: Nur den vorgesehenen Konfigurationspfad korrigieren.
+      Verifikation: Unit geladen, Dienst aktiv, erwarteter Listener,
+      fachlicher Demo-Aufruf erfolgreich, Daten unverändert.
+      Vorbeugung: Konfigurationsprüfung und dokumentierter Smoke-Test.
+    checklist:
+      - Symptom, Zeitpunkt und erwartetes Verhalten sind konkret beschrieben.
+      - Beobachtungen und Hypothesen sind getrennt.
+      - Die Messung belegt die behauptete Ursache.
+      - Die Änderung ist begrenzt und ein Rückweg ist dokumentiert.
+      - Der ursprüngliche Nutzerpfad funktioniert nachweislich wieder.
+      - Das Postmortem benennt mindestens eine passende Vorbeugung und offene Grenzen.
+    explanation: Ein nachvollziehbarer Incident-Bericht ist eine technische Arbeitsprobe. Er zeigt, dass du aus wenigen Signalen eine überprüfbare Erklärung entwickeln und den Erfolg am richtigen Verhalten messen kannst.

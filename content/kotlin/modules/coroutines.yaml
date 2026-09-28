@@ -1,0 +1,701 @@
+id: coroutines
+title: Coroutines
+level: 2
+minutes: 180
+summary: Nebenläufigkeit ohne Callback-Chaos – suspend-Funktionen, Scopes, launch und async, Structured Concurrency, kooperative Cancellation, Dispatcher und Fehlerbehandlung, so wie sie in Android-Apps eingesetzt werden.
+goals:
+  - Du erklärst, was `suspend` bedeutet und was es **nicht** bedeutet (kein Threadwechsel, kein Hintergrund).
+  - Du startest Coroutines mit `launch` und `async` in einem passenden Scope und sagst die Ausführungsreihenfolge voraus.
+  - Du erklärst Structured Concurrency und nutzt `coroutineScope` und `supervisorScope` bewusst.
+  - Du schreibst abbrechbaren Code mit `ensureActive`, `finally` und `NonCancellable` und verschluckst nie eine `CancellationException`.
+  - Du wählst den richtigen Dispatcher, machst Funktionen mit `withContext` main-safe und erkennst typische Fehler wie `GlobalScope` oder blockierende Aufrufe.
+resources:
+  - title: Kotlin Docs · Coroutines basics
+    url: https://kotlinlang.org/docs/coroutines-basics.html
+  - title: Kotlin Docs · Cancellation and timeouts
+    url: https://kotlinlang.org/docs/coroutines-cancellation.html
+  - title: Kotlin Docs · Coroutine exceptions handling
+    url: https://kotlinlang.org/docs/exception-handling.html
+  - title: Android Developers · Kotlin coroutines on Android
+    url: https://developer.android.com/kotlin/coroutines
+  - title: Android Developers · Best practices for coroutines
+    url: https://developer.android.com/kotlin/coroutines/coroutines-best-practices
+lesson: |
+  Auf Android zeichnet der Main Thread etwa alle 16 Millisekunden ein neues Bild. Blockiert ihn etwas länger – ein HTTP-Request, eine Datenbankabfrage, eine große JSON-Datei –, ruckelt die Oberfläche; nach einigen Sekunden zeigt das System den Dialog „App reagiert nicht“ (ANR). Die klassische Lösung waren Callbacks: Request starten, Ergebnis später in einem Lambda bekommen. Drei abhängige Requests ergeben drei verschachtelte Callbacks, und Fehlerbehandlung, Abbruch und Reihenfolge verteilen sich über den ganzen Code.
+
+  Coroutines lösen das anders: Du schreibst Code, der aussieht wie sequenzieller, blockierender Code – aber an jeder Warte-Stelle gibt die Coroutine ihren Thread frei, statt ihn zu blockieren. Bear nutzt das an vielen Stellen: `viewModelScope.launch` beim Speichern eines Gedankens, `suspend`-Funktionen im Repository, ein `CoroutineWorker` für den Upload zu Linear. Diese Lektion baut das Modell dahinter auf, damit du solchen Code nicht nur abschreibst, sondern beurteilen kannst.
+
+  ## suspend: pausieren statt blockieren
+
+  Eine `suspend`-Funktion kann ihre Ausführung unterbrechen und später fortsetzen ([Suspending functions](https://kotlinlang.org/docs/coroutines-basics.html#suspending-functions)):
+
+  ```kotlin
+  suspend fun loadProfile(api: ProfileApi, userId: String): Profile {
+      val user = api.fetchUser(userId)          // suspendiert, Thread ist frei
+      val avatar = api.fetchAvatar(user.avatarId) // suspendiert wieder
+      return Profile(user, avatar)
+  }
+  ```
+
+  Das Denkmodell: Der Compiler verwandelt jede `suspend`-Funktion in eine **Zustandsmaschine**. An jedem Aufruf einer anderen `suspend`-Funktion – einem **Suspension Point** – kann die Funktion ihren Zustand (lokale Variablen, Position) in einem Objekt ablegen und zurückkehren. Der Thread ist dann frei für andere Arbeit, etwa das Zeichnen der Oberfläche. Kommt die Antwort, wird die Funktion an derselben Stelle fortgesetzt, möglicherweise auf einem anderen Thread.
+
+  Daraus folgen zwei Regeln, die in Interviews gern abgefragt werden:
+
+  1. `suspend`-Funktionen lassen sich nur aus einer Coroutine oder einer anderen `suspend`-Funktion aufrufen.
+  2. `suspend` wechselt **nicht** den Thread. Eine `suspend`-Funktion, die `Thread.sleep` oder einen blockierenden HTTP-Client aufruft, blockiert den Thread genauso wie eine normale Funktion. Das Schlüsselwort erlaubt nur, dass die Funktion suspendieren **kann**. Genau darum geht es auch in der Bear-Aufgabe „Blockierendes HTTP auslagern“ im Track [Praxis: Kotlin mit Bear](/kotlin/bear-08).
+
+  > [!DEEP] Continuations
+  > Unter der Haube bekommt jede `suspend`-Funktion einen zusätzlichen, unsichtbaren Parameter vom Typ `Continuation`. Er enthält, wie es nach dem Suspendieren weitergeht. Der Rückgabewert ist entweder das Ergebnis oder die Markierung „suspendiert“. Dieses Verfahren heißt Continuation-Passing Style; es ist der Grund, warum `suspend` ein Sprachschlüsselwort ist und der Rest eine Bibliothek (`kotlinx.coroutines`).
+
+  ## Coroutines starten: Scope, launch und async
+
+  Eine Coroutine startest du mit einem **Coroutine Builder** in einem **CoroutineScope** ([Coroutine builder functions](https://kotlinlang.org/docs/coroutines-basics.html#coroutine-builder-functions)):
+
+  - `launch { … }` startet eine Coroutine für Arbeit ohne Ergebnis („fire and forget“ – aber nicht vergessen, siehe unten) und gibt einen `Job` zurück.
+  - `async { … }` startet eine Coroutine mit Ergebnis und gibt ein `Deferred<T>` zurück. `await()` suspendiert, bis das Ergebnis da ist.
+
+  Code in einer Coroutine läuft **sequenziell**, solange du nichts anderes sagst. Nebenläufig wird es erst, wenn du mehrere Coroutines startest ([Concurrent using async](https://kotlinlang.org/docs/composing-suspending-functions.html#concurrent-using-async)):
+
+  ```kotlin
+  suspend fun loadDashboard(api: Api): Dashboard = coroutineScope {
+      val user = async { api.fetchUser() }       // startet sofort
+      val issues = async { api.fetchIssues() }   // startet sofort, parallel dazu
+      Dashboard(user.await(), issues.await())    // wartet auf beide
+  }
+  ```
+
+  Dauern beide Requests eine Sekunde, braucht diese Funktion etwa eine Sekunde statt zwei. Ohne `async` – also `Dashboard(api.fetchUser(), api.fetchIssues())` – liefen die Requests nacheinander.
+
+  `coroutineScope { … }` erzeugt einen neuen Scope innerhalb einer `suspend`-Funktion und kehrt erst zurück, wenn **alle** darin gestarteten Coroutines fertig sind ([coroutineScope](https://kotlinlang.org/docs/coroutines-basics.html#create-a-coroutine-scope-with-the-coroutinescope-function)). Auf Android bekommst du fertige Scopes: `viewModelScope` lebt so lange wie das ViewModel, `lifecycleScope` so lange wie Activity oder Fragment ([Lifecycle-aware coroutine scopes](https://developer.android.com/topic/libraries/architecture/coroutines#lifecycle-aware)).
+
+  ## Structured Concurrency
+
+  Coroutines bilden einen **Baum**: Jede Coroutine, die in einem Scope gestartet wird, ist Kind des Jobs dieses Scopes ([Structured concurrency](https://kotlinlang.org/docs/coroutines-basics.html#coroutine-scope-and-structured-concurrency)). Daraus folgen drei Garantien:
+
+  1. **Eltern warten auf ihre Kinder.** Ein Scope ist erst fertig, wenn alle Kinder fertig sind. Es gibt keine vergessenen Hintergrund-Coroutines.
+  2. **Abbruch geht nach unten.** Wird ein Elternteil abgebrochen, werden alle Kinder rekursiv abgebrochen. Wird ein ViewModel entfernt, bricht `viewModelScope` alles ab, was darin läuft.
+  3. **Fehler gehen nach oben.** Scheitert ein Kind mit einer Exception, bricht es sein Elternteil ab, das wiederum alle anderen Kinder abbricht. Die Exception kommt beim Aufrufer an.
+
+  ```kotlin
+  suspend fun loadDashboard() = coroutineScope {
+      launch {
+          try {
+              delay(100)
+              println("Profil geladen")        // wird nie erreicht
+          } finally {
+              println("Profil aufgeräumt")     // läuft beim Abbruch
+          }
+      }
+      launch {
+          delay(10)
+          throw IllegalStateException("Feed kaputt")
+      }
+  }
+  ```
+
+  Der zweite `launch` scheitert, der Scope bricht den ersten ab, dessen `finally` läuft, und `loadDashboard()` wirft `IllegalStateException`. Genau dieses Verhalten willst du meistens: Ein Dashboard mit halben Daten ist schlimmer als eine klare Fehlermeldung.
+
+  Wenn Kinder unabhängig voneinander scheitern dürfen, nimmst du `supervisorScope { … }` oder einen Scope mit `SupervisorJob()`. Dort bricht ein scheiterndes Kind weder Eltern noch Geschwister ab ([Supervision](https://kotlinlang.org/docs/exception-handling.html#supervision)). `viewModelScope` ist genau so gebaut: `SupervisorJob` plus `Dispatchers.Main.immediate` ([viewModelScope](https://developer.android.com/reference/kotlin/androidx/lifecycle/package-summary)). Ein gescheiterter Request reißt also nicht alle anderen Coroutines des ViewModels mit.
+
+  > [!MERKE]
+  > Jede Coroutine gehört zu einem Scope, und jeder Scope hat eine Lebensdauer. Wer eine Coroutine startet, muss sagen können, wann sie spätestens endet.
+
+  ## Cancellation ist kooperativ
+
+  `job.cancel()` hält eine Coroutine nicht sofort an. Es setzt sie in den Zustand „abgebrochen“; die Coroutine merkt das erst am nächsten **Suspension Point** – etwa `delay`, `withContext`, `await` –, der dann eine `CancellationException` wirft ([Cancellation is cooperative](https://kotlinlang.org/docs/coroutines-cancellation.html#cancellation-is-cooperative)). Code, der lange rechnet, ohne zu suspendieren, muss selbst nachsehen:
+
+  ```kotlin
+  suspend fun indexNotes(notes: List<Note>): Index = withContext(Dispatchers.Default) {
+      val index = Index()
+      for (note in notes) {
+          ensureActive()              // wirft CancellationException, wenn abgebrochen
+          index.add(note.tokenize())  // CPU-Arbeit ohne Suspension Point
+      }
+      index
+  }
+  ```
+
+  Alternativen sind `isActive` (liefert `false` statt zu werfen) und `yield()` (gibt zusätzlich anderen Coroutines auf demselben Thread eine Chance) ([Check for cancellation explicitly](https://kotlinlang.org/docs/coroutines-cancellation.html#check-for-cancellation-explicitly)).
+
+  Weil Abbruch über eine Exception läuft, gelten drei Regeln:
+
+  - **Nie `CancellationException` verschlucken.** `catch (e: Exception)` fängt sie mit, und die Coroutine läuft weiter, obwohl sie längst tot sein sollte. Fange konkrete Exceptions (`IOException`) oder wirf `CancellationException` weiter. Vorsicht auch bei `runCatching { … }` um `suspend`-Aufrufe – es fängt jeden `Throwable`.
+  - **Aufräumen gehört in `finally`.** Es läuft auch beim Abbruch.
+  - **`suspend`-Aufrufe in `finally` brauchen `withContext(NonCancellable)`.** In einer abgebrochenen Coroutine würde jeder Suspension Point sofort wieder werfen ([Run non-cancelable blocks](https://kotlinlang.org/docs/coroutines-cancellation.html#run-non-cancelable-blocks)).
+
+  ```kotlin
+  try {
+      uploader.sendChunks(file)
+  } finally {
+      withContext(NonCancellable) {
+          uploader.closeSession()   // suspend, muss auch nach Abbruch laufen
+      }
+  }
+  ```
+
+  Für Zeitlimits gibt es `withTimeout` (wirft `TimeoutCancellationException`) und `withTimeoutOrNull` (liefert `null`) ([Timeout](https://kotlinlang.org/docs/coroutines-cancellation.html#timeout)).
+
+  ## Dispatcher und withContext
+
+  Der **Dispatcher** im Coroutine Context bestimmt, auf welchen Threads eine Coroutine läuft ([Dispatchers and threads](https://kotlinlang.org/docs/coroutine-context-and-dispatchers.html#dispatchers-and-threads)):
+
+  | Dispatcher | Threads | Wofür |
+  | --- | --- | --- |
+  | `Dispatchers.Main` | Android-Main-Thread | UI, kurze Arbeit, Aufruf anderer `suspend`-Funktionen |
+  | `Dispatchers.IO` | geteilter Pool, standardmäßig bis 64 Threads (oder so viele wie Kerne, falls mehr) | blockierendes I/O: Dateien, JDBC, blockierende HTTP-Clients |
+  | `Dispatchers.Default` | so viele Threads wie CPU-Kerne (mindestens 2) | CPU-Arbeit: Parsen, Sortieren, Bildbearbeitung |
+
+  `withContext(dispatcher) { … }` führt einen Block auf einem anderen Dispatcher aus, **suspendiert** den Aufrufer so lange und liefert das Ergebnis zurück. Damit machst du eine Funktion **main-safe**: Sie darf vom Main Thread aus aufgerufen werden, weil sie ihre blockierende Arbeit selbst auslagert ([Main-safety](https://developer.android.com/kotlin/coroutines/coroutines-best-practices#main-safe)):
+
+  ```kotlin
+  class NotesFileStore(
+      private val dir: File,
+      private val io: CoroutineDispatcher = Dispatchers.IO,   // injiziert, im Test ersetzbar
+  ) {
+      suspend fun read(name: String): String = withContext(io) {
+          File(dir, name).readText()                          // blockierend, aber nicht auf Main
+      }
+  }
+  ```
+
+  Die Verantwortung liegt bei der Klasse, die die blockierende Arbeit tut – nicht beim Aufrufer. Bibliotheken wie Room und Retrofit sind mit ihren `suspend`-Funktionen bereits main-safe; dort brauchst du kein zusätzliches `withContext`. Dispatcher werden als Konstruktorparameter übergeben statt hart kodiert, damit Tests sie durch einen `TestDispatcher` ersetzen können ([Inject dispatchers](https://developer.android.com/kotlin/coroutines/coroutines-best-practices#inject-dispatchers)) – mehr dazu im Modul „Testing“.
+
+  ## Fehlerbehandlung: launch, async und der Handler
+
+  Wie eine Exception ankommt, hängt vom Builder ab ([Exception propagation](https://kotlinlang.org/docs/exception-handling.html#exception-propagation)):
+
+  - **`launch`** behandelt eine unbehandelte Exception wie einen abgestürzten Thread: Sie geht an das Elternteil und, wenn niemand sie fängt, an den `CoroutineExceptionHandler` oder den Standard-Handler. Auf Android heißt das: App-Absturz.
+  - **`async`** speichert die Exception im `Deferred`; `await()` wirft sie. Als Kind in einem normalen Scope bricht sie trotzdem sofort das Elternteil ab – ein `try` um `await()` allein rettet dich dann nicht.
+
+  Die robuste Regel lautet deshalb: **Fange Fehler dort, wo du sie behandeln kannst – innerhalb der Coroutine**, typischerweise mit `try`/`catch` um den `suspend`-Aufruf, und verwandle sie in Zustand:
+
+  ```kotlin
+  fun refresh() {
+      viewModelScope.launch {
+          _uiState.update { it.copy(isLoading = true) }
+          try {
+              val issues = repository.fetchIssues()
+              _uiState.update { it.copy(isLoading = false, issues = issues) }
+          } catch (e: IOException) {
+              _uiState.update { it.copy(isLoading = false, error = "Keine Verbindung") }
+          }
+      }
+  }
+  ```
+
+  Ein `CoroutineExceptionHandler` ist das letzte Netz: Er wirkt nur auf **Root-Coroutines** (oder direkte Kinder eines Supervisors), nie auf normale Kinder und nie auf `async`. Er kann den Fehler nicht mehr „reparieren“, nur loggen oder melden ([CoroutineExceptionHandler](https://kotlinlang.org/docs/exception-handling.html#coroutineexceptionhandler)).
+
+  > [!PRAXIS] Wo Coroutines in einer App starten
+  > In sauber geschnittenen Apps starten fast alle Coroutines im ViewModel (`viewModelScope.launch`). Repositories und Datenquellen bieten `suspend`-Funktionen für einmalige Aufrufe und `Flow` für Datenströme an, starten aber selbst keine Coroutines ([Best practices](https://developer.android.com/kotlin/coroutines/coroutines-best-practices#coroutines-data-layer)). Muss Arbeit einen Bildschirm überleben – etwa ein Bookmark speichern –, bekommt das Repository einen langlebigen `externalScope` injiziert. Muss sie sogar einen Prozess-Neustart überleben, ist WorkManager das richtige Werkzeug; Bear nutzt dafür einen `CoroutineWorker`. `runBlocking` blockiert den aktuellen Thread und gehört nur in `main`-Funktionen von Kommandozeilenprogrammen oder an Grenzen zu Code, der nicht suspendieren kann. Tests nutzen `runTest` statt `runBlocking`.
+
+  ## Häufige Fehler
+
+  - **`GlobalScope.launch`.** Die Coroutine gehört zu keinem Lebenszyklus, läuft weiter, wenn der Bildschirm längst weg ist, und ist im Test nicht kontrollierbar. Die API ist deshalb als `@DelicateCoroutinesApi` markiert. Lösung: `viewModelScope` oder ein injizierter Scope ([Avoid GlobalScope](https://developer.android.com/kotlin/coroutines/coroutines-best-practices#global-scope)).
+  - **Blockierende Aufrufe ohne Dispatcher-Wechsel.** `Thread.sleep`, `File.readText`, `URL.readText` in einer Coroutine auf `Main` frieren die UI ein; auf Android wirft Netzwerk auf dem Main Thread `NetworkOnMainThreadException`. Lösung: `delay` statt `Thread.sleep`, `withContext(io)` um blockierendes I/O.
+  - **`catch (e: Exception)` um `suspend`-Aufrufe.** Verschluckt die `CancellationException`. Symptom: Schleifen, die nach dem Abbruch weiterlaufen, Logs voller `JobCancellationException`.
+  - **`async` ohne `await`.** Wer kein Ergebnis braucht, nimmt `launch`. Ein `Deferred`, das nie abgewartet wird, versteckt die Absicht.
+  - **Einen neuen `Job()` an `launch` übergeben.** `scope.launch(Job()) { … }` hängt die Coroutine aus dem Baum aus; der Abbruch des Scopes erreicht sie nicht mehr.
+  - **`runBlocking` auf dem Main Thread.** Blockiert die UI und kann mit `Dispatchers.Main` in einen Deadlock laufen.
+
+  > [!INTERVIEW] „Was ist der Unterschied zwischen einem Thread und einer Coroutine?“
+  > Gute Antwort: „Ein Thread ist eine Ressource des Betriebssystems mit eigenem Stack, typischerweise etwa ein Megabyte, und blockiert beim Warten. Eine Coroutine ist eine unterbrechbare Berechnung, die auf Threads **läuft**: Beim Warten suspendiert sie und gibt den Thread frei. Darum kann ich Zehntausende Coroutines auf wenigen Threads laufen lassen. Dazu kommt Structured Concurrency: Coroutines hängen an einem Scope, werden gemeinsam abgebrochen, und Fehler gehen nach oben. Wichtig ist: `suspend` allein wechselt keinen Thread – dafür brauche ich `withContext` mit dem passenden Dispatcher.“
+
+  ## Zusammenfassung
+
+  - `suspend` heißt „kann pausieren, ohne den Thread zu blockieren“ – nicht „läuft im Hintergrund“.
+  - `launch` für Arbeit ohne Ergebnis (`Job`), `async`/`await` für parallele Arbeit mit Ergebnis (`Deferred`).
+  - Structured Concurrency: Eltern warten auf Kinder, Abbruch geht nach unten, Fehler gehen nach oben. `supervisorScope`/`SupervisorJob` entkoppeln Geschwister.
+  - Cancellation ist kooperativ: Suspension Points, `ensureActive`, `isActive`, `yield`. `CancellationException` nie verschlucken, Aufräumen in `finally`, `suspend`-Aufräumen mit `NonCancellable`.
+  - `Main` für UI, `IO` für blockierendes I/O, `Default` für CPU-Arbeit. `withContext` macht Funktionen main-safe; Dispatcher injizieren.
+  - Fehler innerhalb der Coroutine fangen und in UI-State verwandeln. `CoroutineExceptionHandler` ist nur das letzte Netz für Root-Coroutines.
+  - Kein `GlobalScope`, kein `runBlocking` in App-Code. Coroutines starten im ViewModel; überlebende Arbeit gehört in einen injizierten Scope oder zu WorkManager.
+exercises:
+  - id: suspend-bedeutet
+    type: choice
+    title: Was verspricht suspend?
+    prompt: Welche Aussagen über `suspend`-Funktionen stimmen?
+    options:
+      - text: Sie können ihre Ausführung unterbrechen, ohne den Thread zu blockieren, auf dem sie laufen.
+        correct: true
+        why: An jedem Suspension Point kann die Funktion ihren Zustand ablegen und den Thread freigeben. Später geht es an derselben Stelle weiter.
+      - text: Sie lassen sich nur aus einer Coroutine oder einer anderen `suspend`-Funktion aufrufen.
+        correct: true
+        why: Der Compiler braucht eine Continuation, an die er das Ergebnis liefern kann. Die gibt es nur in einem Coroutine-Kontext.
+      - text: "`suspend` verlegt die Ausführung automatisch auf einen Hintergrund-Thread."
+        correct: false
+        why: "`suspend` wechselt keinen Thread. Dafür brauchst du `withContext` mit einem Dispatcher. Eine `suspend`-Funktion ohne `withContext` läuft auf dem Thread des Aufrufers."
+      - text: "`Thread.sleep(1000)` in einer `suspend`-Funktion pausiert nur die Coroutine, nicht den Thread."
+        correct: false
+        why: "`Thread.sleep` ist ein blockierender JVM-Aufruf und blockiert den Thread. Nur `delay` suspendiert."
+    explanation: |
+      `suspend` ist ein Versprechen in eine Richtung: Die Funktion **darf** suspendieren. Ob sie den Thread wirklich freigibt, hängt davon ab, was sie aufruft – `delay`, `withContext`, Room- oder Retrofit-Funktionen suspendieren, `Thread.sleep` oder `File.readText` blockieren. Das erklärt den häufigsten Anfängerfehler: eine `suspend`-Funktion mit blockierendem I/O, die trotzdem die UI einfriert.
+    resources:
+      - title: Kotlin Docs · Suspending functions
+        url: https://kotlinlang.org/docs/coroutines-basics.html#suspending-functions
+  - id: fehler-im-baum
+    type: choice
+    title: Ein Kind scheitert
+    prompt: |
+      In `coroutineScope { launch { A() }; launch { B() } }` wirft `B()` eine `IOException`, während `A()` noch läuft. Was passiert?
+    options:
+      - text: "`A` wird abgebrochen, und `coroutineScope` wirft die `IOException` an den Aufrufer weiter."
+        correct: true
+        why: Ein scheiterndes Kind bricht sein Elternteil ab, das alle anderen Kinder abbricht. Danach wirft `coroutineScope` die ursprüngliche Exception.
+      - text: "`A` läuft zu Ende, danach wirft `coroutineScope` die Exception."
+        correct: false
+        why: So verhält sich `supervisorScope` für die Geschwister – aber dort würde die Exception gar nicht an den Aufrufer gehen, sondern an den Exception-Handler.
+      - text: Die Exception geht verloren, weil `launch` kein Ergebnis zurückgibt.
+        correct: false
+        why: "`launch` hat kein Ergebnis, aber Exceptions gehen in Structured Concurrency immer an das Elternteil. Sie gehen nicht verloren."
+      - text: Ein `CoroutineExceptionHandler` im Kontext des inneren `launch` fängt sie ab, und `A` läuft weiter.
+        correct: false
+        why: Ein Handler in einem Kind wird ignoriert. Kinder delegieren Exceptions immer an das Elternteil; Handler wirken nur auf Root-Coroutines.
+    explanation: |
+      Structured Concurrency behandelt eine Gruppe von Coroutines als Einheit: Scheitert ein Teil, scheitert das Ganze, und nichts läuft unbeobachtet weiter. Wenn Teilaufgaben unabhängig sein sollen – ein kaputtes Wetter-Widget soll das Dashboard nicht abreißen –, nimmst du `supervisorScope` und fängst den Fehler im jeweiligen Kind.
+    resources:
+      - title: Kotlin Docs · Exception propagation
+        url: https://kotlinlang.org/docs/exception-handling.html#exception-propagation
+      - title: Kotlin Docs · Supervision
+        url: https://kotlinlang.org/docs/exception-handling.html#supervision
+  - id: reihenfolge-launch-async
+    type: output
+    title: Wer ist zuerst fertig?
+    prompt: Was gibt das Programm aus? `runBlocking` läuft hier auf einem einzigen Thread; die Zeiten von `delay` bestimmen die Reihenfolge.
+    lang: kotlin
+    code: |
+      import kotlinx.coroutines.*
+
+      fun main() = runBlocking {
+          launch { delay(200); println("Sync fertig") }
+          launch { delay(100); println("Bilder geladen") }
+          println("UI bereit")
+          val count = async { delay(150); 42 }
+          println("Warte auf Zähler")
+          println("Zähler: ${count.await()}")
+          println("main Ende")
+      }
+    expected: |
+      UI bereit
+      Warte auf Zähler
+      Bilder geladen
+      Zähler: 42
+      main Ende
+      Sync fertig
+    explanation: |
+      `launch` und `async` starten Coroutines und kehren sofort zurück – deshalb kommen „UI bereit“ und „Warte auf Zähler“ zuerst. Dann suspendiert `await()`. Nach 100 ms meldet sich die zweite Coroutine, nach 150 ms liefert `async` den Wert, und `main` druckt weiter bis „main Ende“. Der Block ist damit fertig, aber `runBlocking` wartet auf alle Kinder: Nach 200 ms kommt „Sync fertig“. Das ist Structured Concurrency – ein Scope endet erst, wenn alle seine Coroutines fertig sind.
+    resources:
+      - title: Kotlin Docs · CoroutineScope.launch()
+        url: https://kotlinlang.org/docs/coroutines-basics.html#coroutinescope-launch
+      - title: Kotlin Docs · CoroutineScope.async()
+        url: https://kotlinlang.org/docs/coroutines-basics.html#coroutinescope-async
+  - id: geschwister-abbruch
+    type: output
+    title: Ein Feed reißt alles mit
+    prompt: Was gibt das Programm aus?
+    lang: kotlin
+    code: |
+      import kotlinx.coroutines.*
+
+      suspend fun loadDashboard() = coroutineScope {
+          launch {
+              try {
+                  delay(100)
+                  println("Profil geladen")
+              } finally {
+                  println("Profil aufgeräumt")
+              }
+          }
+          launch {
+              delay(10)
+              throw IllegalStateException("Feed kaputt")
+          }
+      }
+
+      fun main() = runBlocking {
+          try {
+              loadDashboard()
+          } catch (e: IllegalStateException) {
+              println("Fehler: ${e.message}")
+          }
+          println("weiter")
+      }
+    expected: |
+      Profil aufgeräumt
+      Fehler: Feed kaputt
+      weiter
+    explanation: |
+      Nach 10 ms scheitert die zweite Coroutine. `coroutineScope` bricht daraufhin die erste ab: Ihr `delay(100)` wirft eine `CancellationException`, „Profil geladen“ wird nie erreicht, aber `finally` läuft. Erst wenn alle Kinder beendet sind, wirft `coroutineScope` die ursprüngliche `IllegalStateException`, die `main` fängt. Hättest du `supervisorScope` statt `coroutineScope` verwendet, wäre das Profil geladen worden, und die Exception wäre als unbehandelt an den Handler gegangen.
+    resources:
+      - title: Kotlin Docs · Cancellation propagation
+        url: https://kotlinlang.org/docs/coroutines-cancellation.html#cancellation-propagation
+  - id: verschluckter-abbruch
+    type: output
+    title: Die Schleife, die nicht sterben will
+    prompt: Was gibt das Programm aus? Der Abbruch passiert nach 250 ms.
+    lang: kotlin
+    code: |
+      import kotlinx.coroutines.*
+
+      fun main() = runBlocking {
+          val job = launch {
+              repeat(5) { i ->
+                  try {
+                      println("tick $i")
+                      delay(100)
+                  } catch (e: Exception) {
+                      println("gefangen: ${e::class.simpleName}")
+                  }
+              }
+          }
+          delay(250)
+          job.cancelAndJoin()
+          println("fertig")
+      }
+    expected: |
+      tick 0
+      tick 1
+      tick 2
+      gefangen: JobCancellationException
+      tick 3
+      gefangen: JobCancellationException
+      tick 4
+      gefangen: JobCancellationException
+      fertig
+    explanation: |
+      Bei 250 ms steckt die Coroutine im dritten `delay`. `cancel()` lässt es mit einer `CancellationException` (konkret der internen Unterklasse `JobCancellationException`) enden – doch `catch (e: Exception)` fängt sie, und die Schleife läuft weiter. Jeder weitere `delay` merkt sofort, dass der Job abgebrochen ist, und wirft wieder. Die Coroutine endet erst, weil `repeat` ausläuft. Mit `while (true)` statt `repeat(5)` liefe sie ewig und würde das Log fluten. Richtig ist, nur erwartete Exceptions wie `IOException` zu fangen oder `CancellationException` weiterzuwerfen.
+    resources:
+      - title: Kotlin Docs · Cancel coroutines
+        url: https://kotlinlang.org/docs/coroutines-cancellation.html#cancel-coroutines
+  - id: parallel-laden
+    type: gap
+    title: Zwei Requests gleichzeitig
+    prompt: |
+      Lade Benutzer und Issues **parallel**. Scheitert einer der beiden Requests, soll der andere abgebrochen werden und die Exception beim Aufrufer ankommen.
+    lang: kotlin
+    code: |
+      import kotlinx.coroutines.*
+
+      data class Dashboard(val user: String, val issues: List<String>)
+
+      interface Api {
+          suspend fun fetchUser(): String
+          suspend fun fetchIssues(): List<String>
+      }
+
+      suspend fun loadDashboard(api: Api): Dashboard = ⟦coroutineScope⟧ {
+          val user = ⟦async⟧ { api.fetchUser() }
+          val issues = async { api.fetchIssues() }
+          Dashboard(user.⟦await()⟧, issues.await())
+      }
+    gaps:
+      - label: Scope in einer suspend-Funktion
+        hint: Erzeugt einen Kind-Scope und wartet auf alle darin gestarteten Coroutines.
+      - label: Builder mit Ergebnis
+        hint: Liefert ein `Deferred<T>`.
+      - label: Ergebnis abwarten
+        hint: Suspendiert, bis das `Deferred` fertig ist.
+        accept: ["await( )"]
+    explanation: |
+      `coroutineScope` verbindet die beiden `async`-Coroutines mit der aufrufenden Coroutine: Scheitert eine, wird die andere abgebrochen und die Exception geworfen. `async` startet sofort, deshalb laufen beide Requests gleichzeitig; `await()` holt die Ergebnisse. `supervisorScope` wäre hier falsch, weil ein Dashboard ohne Benutzer ohnehin nicht angezeigt werden kann. Und `GlobalScope.async` würde die Coroutines vom Aufrufer entkoppeln – bei Abbruch liefen die Requests weiter.
+    resources:
+      - title: Kotlin Docs · Structured concurrency with async
+        url: https://kotlinlang.org/docs/composing-suspending-functions.html#structured-concurrency-with-async
+  - id: dispatcher-waehlen
+    type: gap
+    title: Der richtige Thread-Pool
+    prompt: |
+      Ergänze die Dispatcher: `readExport` liest eine große Datei mit blockierendem I/O, `parseExport` zerlegt den Text rechenintensiv in Einträge. Beide sollen vom Main Thread aus aufrufbar sein.
+    lang: kotlin
+    code: |
+      import java.io.File
+      import kotlinx.coroutines.*
+
+      class ExportReader(
+          private val io: CoroutineDispatcher = Dispatchers.⟦IO⟧,
+          private val cpu: CoroutineDispatcher = Dispatchers.⟦Default⟧,
+      ) {
+          suspend fun readExport(file: File): String = ⟦withContext⟧(io) {
+              file.readText()
+          }
+
+          suspend fun parseExport(text: String): List<List<String>> = withContext(cpu) {
+              text.lines().filter { it.isNotBlank() }.map { it.split(";") }
+          }
+      }
+    gaps:
+      - label: blockierendes I/O
+        hint: Der Pool mit vielen Threads für Warten auf Datenträger oder Netz.
+      - label: CPU-Arbeit
+        hint: Ein Pool mit so vielen Threads wie CPU-Kerne.
+      - label: Kontext wechseln und Ergebnis zurückgeben
+        hint: Führt einen Block auf einem anderen Dispatcher aus und suspendiert den Aufrufer so lange.
+    explanation: |
+      `Dispatchers.IO` ist für Arbeit gedacht, die hauptsächlich wartet – dort dürfen viele Threads gleichzeitig blockieren. `Dispatchers.Default` hat so viele Threads wie Kerne, denn mehr Threads helfen bei reiner Rechenarbeit nicht. `withContext` wechselt für die Dauer des Blocks und kehrt mit dem Ergebnis zurück; der Aufrufer bleibt dabei auf seinem Dispatcher. Die Dispatcher sind Konstruktorparameter mit Standardwert – so ersetzt ein Test sie durch einen `TestDispatcher`.
+    resources:
+      - title: Android Developers · Inject Dispatchers
+        url: https://developer.android.com/kotlin/coroutines/coroutines-best-practices#inject-dispatchers
+      - title: Kotlin Docs · Dispatchers and threads
+        url: https://kotlinlang.org/docs/coroutine-context-and-dispatchers.html#dispatchers-and-threads
+  - id: abbrechbar-rechnen
+    type: gap
+    title: Abbrechbar rechnen, sicher aufräumen
+    prompt: |
+      Der Indexer soll auf Abbruch reagieren, obwohl die Schleife nicht suspendiert. Im `finally` muss eine `suspend`-Funktion auch dann laufen, wenn die Coroutine abgebrochen wurde.
+    lang: kotlin
+    code: |
+      import kotlinx.coroutines.*
+
+      class SearchIndexer(private val store: IndexStore) {
+          suspend fun rebuild(notes: List<String>) = withContext(Dispatchers.Default) {
+              store.beginTransaction()
+              try {
+                  for (note in notes) {
+                      ⟦ensureActive()⟧
+                      store.add(note.lowercase().split(" "))
+                  }
+                  store.commit()
+              } finally {
+                  withContext(⟦NonCancellable⟧) {
+                      store.endTransaction()
+                  }
+              }
+          }
+      }
+
+      interface IndexStore {
+          fun beginTransaction()
+          fun add(tokens: List<String>)
+          fun commit()
+          suspend fun endTransaction()
+      }
+    gaps:
+      - label: Abbruch prüfen
+        hint: Wirft eine `CancellationException`, falls der Job abgebrochen ist.
+        accept: ["coroutineContext.ensureActive()", "yield()"]
+      - label: nicht abbrechbarer Kontext
+        hint: Ein Job, der immer aktiv ist.
+    explanation: |
+      Die Schleife enthält keinen Suspension Point, ein `cancel()` würde also erst nach dem letzten Element bemerkt. `ensureActive()` prüft den Job und wirft bei Abbruch eine `CancellationException`; `yield()` tut dasselbe und lässt zusätzlich andere Coroutines auf den Thread. Im `finally` ist die Coroutine bereits abgebrochen – jede suspendierende Funktion würde sofort wieder werfen. `withContext(NonCancellable)` führt den Block in einem Kontext aus, der nicht abgebrochen ist, sodass `endTransaction()` sicher durchläuft. `NonCancellable` gehört ausschließlich zu `withContext`, nie zu `launch` oder `async`.
+    resources:
+      - title: Kotlin Docs · Check for cancellation explicitly
+        url: https://kotlinlang.org/docs/coroutines-cancellation.html#check-for-cancellation-explicitly
+      - title: Kotlin Docs · Run non-cancelable blocks
+        url: https://kotlinlang.org/docs/coroutines-cancellation.html#run-non-cancelable-blocks
+  - id: polling-endlos
+    type: bug
+    title: Das Postfach fragt ewig
+    prompt: |
+      `pollInbox` läuft in `viewModelScope`. Nach dem Verlassen des Bildschirms sollte es aufhören. Stattdessen läuft der CPU-Lüfter an, und das Log füllt sich endlos mit:
+
+      ```text
+      Abruf fehlgeschlagen: kotlinx.coroutines.JobCancellationException: Job was cancelled
+      ```
+
+      Finde die fehlerhafte Zeile und korrigiere sie so, dass Netzwerkfehler weiter geloggt werden, der Abbruch aber durchkommt.
+    lang: kotlin
+    code: |
+      suspend fun pollInbox(api: InboxApi, onNew: (List<Message>) -> Unit) {
+          while (true) {
+              try {
+                  onNew(api.fetchNew())
+                  delay(30_000)
+              } catch (e: Exception) {
+                  log("Abruf fehlgeschlagen: $e")
+              }
+          }
+      }
+    lines: [6]
+    fix:
+      - line: 6
+        answers:
+          - "} catch (e: IOException) {"
+          - "} catch (e: java.io.IOException) {"
+    explanation: |
+      Abbruch funktioniert über eine `CancellationException`, die am nächsten Suspension Point geworfen wird. `catch (e: Exception)` fängt sie mit, und `while (true)` beginnt die nächste Runde. Weil der Job abgebrochen bleibt, wirft jeder weitere `delay` oder Request sofort wieder – eine Endlosschleife ohne Pause. Fange nur die Fehler, die du wirklich behandeln willst, hier `IOException`. Wenn du doch breit fangen musst, schreibe vorher `catch (e: CancellationException) { throw e }`. Dasselbe Problem entsteht mit `runCatching { … }` um `suspend`-Aufrufe.
+    resources:
+      - title: Kotlin Docs · Cancel coroutines
+        url: https://kotlinlang.org/docs/coroutines-cancellation.html#cancel-coroutines
+      - title: Android Developers · Make your coroutine cancellable
+        url: https://developer.android.com/kotlin/coroutines/coroutines-best-practices#coroutine-cancellable
+  - id: suspend-blockiert
+    type: bug
+    title: suspend und trotzdem Main Thread
+    prompt: |
+      Das ViewModel ruft `repository.load(url)` in `viewModelScope.launch` auf. Die App stürzt ab:
+
+      ```text
+      android.os.NetworkOnMainThreadException
+      ```
+
+      „Aber die Funktion ist doch `suspend`!“, sagt dein Kollege. Finde die Zeile und korrigiere sie so, dass `load` main-safe wird. Nutze den injizierten Dispatcher.
+    lang: kotlin
+    code: |
+      class ReleaseNotesRepository(
+          private val io: CoroutineDispatcher = Dispatchers.IO,
+      ) {
+          suspend fun load(url: String): String {
+              return URI(url).toURL().readText()
+          }
+      }
+    lines: [5]
+    fix:
+      - line: 5
+        answers:
+          - "return withContext(io) { URI(url).toURL().readText() }"
+          - "return withContext(io) { URI(url).toURL().readText() };"
+    explanation: |
+      `suspend` wechselt keinen Thread. `viewModelScope` läuft auf `Dispatchers.Main.immediate`, also führt `load` den blockierenden `readText()`-Aufruf direkt auf dem Main Thread aus – Android verbietet Netzwerk dort. `withContext(io)` verlegt genau den blockierenden Teil auf den IO-Pool, suspendiert den Aufrufer und liefert das Ergebnis zurück. Die Verantwortung liegt bei der Klasse, die blockiert: Aufrufer sollen sich um Threads keine Gedanken machen müssen. Mit Retrofit oder Ktor und deren `suspend`-APIs wäre das `withContext` überflüssig, weil diese Bibliotheken selbst main-safe sind.
+    resources:
+      - title: Android Developers · Suspend functions should be main-safe
+        url: https://developer.android.com/kotlin/coroutines/coroutines-best-practices#main-safe
+      - title: Android Developers · Use coroutines for main-safety
+        url: https://developer.android.com/kotlin/coroutines#use-coroutines-for-main-safety
+  - id: app-scope-erklaeren
+    type: explain
+    title: Ein Scope, der Bildschirme überlebt
+    prompt: |
+      Erkläre im Code-Review, was jede Zutat des `scope` bewirkt, warum `enqueue` keine `suspend`-Funktion ist und welche Grenzen diese Lösung hat.
+    lang: kotlin
+    code: |
+      class SyncManager(
+          private val api: LinearApi,
+          private val outbox: OutboxDao,
+          dispatcher: CoroutineDispatcher = Dispatchers.IO,
+      ) {
+          private val scope = CoroutineScope(
+              SupervisorJob() + dispatcher + CoroutineExceptionHandler { _, e ->
+                  Log.e("Sync", "Upload fehlgeschlagen", e)
+              }
+          )
+
+          fun enqueue(item: OutboxItem) {
+              scope.launch {
+                  api.upload(item)
+                  outbox.delete(item.id)
+              }
+          }
+
+          fun shutdown() = scope.cancel()
+      }
+    points:
+      - "`SupervisorJob` sorgt dafür, dass ein gescheiterter Upload weder den Scope noch andere laufende Uploads abbricht."
+      - Der `CoroutineExceptionHandler` fängt unbehandelte Exceptions dieser Root-Coroutines und loggt sie, statt die App abstürzen zu lassen.
+      - "`enqueue` startet nur eine Coroutine und kehrt sofort zurück; die Arbeit hängt am Scope des `SyncManager`, nicht am Aufrufer."
+      - Weil `delete` erst nach erfolgreichem `upload` läuft, bleibt ein fehlgeschlagener Eintrag in der Outbox.
+      - Grenzen – der Scope lebt nur so lange wie der Prozess; für garantierte Ausführung nach App-Neustart oder ohne Netz braucht es WorkManager, und `shutdown` muss jemand aufrufen.
+    explanation: |
+      Der Scope ist ein eigener Lebenszyklus für Arbeit, die einen Bildschirm überleben soll. `SupervisorJob()` entkoppelt die Kinder: Scheitert ein Upload, laufen die anderen weiter, und der Scope bleibt benutzbar – mit einem normalen `Job()` wäre der Scope nach dem ersten Fehler tot. Der injizierte Dispatcher (Standard `IO`) bestimmt die Threads und ist im Test ersetzbar. Der `CoroutineExceptionHandler` greift, weil die mit `scope.launch` gestarteten Coroutines Root-Coroutines sind; ohne ihn würde eine Exception auf Android die App beenden. `enqueue` ist bewusst nicht `suspend`: Es startet die Arbeit und kehrt zurück, der Aufrufer wartet nicht. Innerhalb der Coroutine läuft alles sequenziell, also wird ein Eintrag nur nach erfolgreichem Upload gelöscht. Die Grenzen: Stirbt der Prozess, ist die Arbeit weg; für „muss irgendwann sicher passieren“ ist WorkManager die richtige Wahl – so macht es Bear mit seinem `CoroutineWorker`. Außerdem braucht es einen Besitzer, der `shutdown` aufruft, sonst läuft der Scope, solange der Prozess lebt.
+    resources:
+      - title: Kotlin Docs · Supervision job
+        url: https://kotlinlang.org/docs/exception-handling.html#supervision-job
+      - title: Android Developers · Creating coroutines in the business and data layer
+        url: https://developer.android.com/kotlin/coroutines/coroutines-best-practices#create-coroutines-data-layer
+  - id: retry-backoff
+    type: practice
+    title: Wiederholen mit Backoff
+    prompt: |
+      Schreibe eine generische Hilfsfunktion, die einen `suspend`-Aufruf bei Netzwerkfehlern wiederholt:
+
+      ```kotlin
+      suspend fun <T> retryWithBackoff(
+          times: Int,
+          initialDelayMs: Long,
+          factor: Double = 2.0,
+          block: suspend () -> T,
+      ): T
+      ```
+
+      - Es gibt höchstens `times` Versuche. Zwischen den Versuchen wartet die Funktion `initialDelayMs`, dann jeweils `factor`-mal so lange.
+      - Nur `IOException` löst eine Wiederholung aus. Andere Exceptions – und vor allem `CancellationException` – gehen sofort durch.
+      - Nach dem letzten Fehlschlag wird die letzte `IOException` geworfen.
+      - Wird die aufrufende Coroutine während des Wartens abgebrochen, endet die Funktion sofort.
+
+      Teste mit dem Startcode. Du kannst ihn in IntelliJ IDEA mit `kotlinx-coroutines-core` als Abhängigkeit oder im [Kotlin Playground](https://play.kotlinlang.org/) ausführen.
+    lang: kotlin
+    starter: |
+      import java.io.IOException
+      import kotlinx.coroutines.*
+
+      suspend fun <T> retryWithBackoff(
+          times: Int,
+          initialDelayMs: Long,
+          factor: Double = 2.0,
+          block: suspend () -> T,
+      ): T {
+          TODO()
+      }
+
+      fun main() = runBlocking {
+          var calls = 0
+          val result = retryWithBackoff(times = 3, initialDelayMs = 100) {
+              calls++
+              println("Versuch $calls")
+              if (calls < 3) throw IOException("Timeout") else "Daten"
+          }
+          println(result)
+
+          val job = launch {
+              retryWithBackoff(times = 5, initialDelayMs = 1_000) {
+                  throw IOException("offline")
+              }
+          }
+          delay(1_500)
+          job.cancelAndJoin()
+          println("abgebrochen: ${job.isCancelled}")
+      }
+    solution: |
+      import java.io.IOException
+      import kotlinx.coroutines.*
+
+      suspend fun <T> retryWithBackoff(
+          times: Int,
+          initialDelayMs: Long,
+          factor: Double = 2.0,
+          block: suspend () -> T,
+      ): T {
+          require(times >= 1) { "times muss mindestens 1 sein" }
+          var currentDelay = initialDelayMs
+          repeat(times - 1) {
+              try {
+                  return block()
+              } catch (e: IOException) {
+                  println("Fehlschlag: ${e.message}, nächster Versuch in $currentDelay ms")
+              }
+              delay(currentDelay)
+              currentDelay = (currentDelay * factor).toLong()
+          }
+          return block()   // letzter Versuch: Exception geht an den Aufrufer
+      }
+
+      fun main() = runBlocking {
+          var calls = 0
+          val result = retryWithBackoff(times = 3, initialDelayMs = 100) {
+              calls++
+              println("Versuch $calls")
+              if (calls < 3) throw IOException("Timeout") else "Daten"
+          }
+          println(result)
+
+          val job = launch {
+              retryWithBackoff(times = 5, initialDelayMs = 1_000) {
+                  throw IOException("offline")
+              }
+          }
+          delay(1_500)
+          job.cancelAndJoin()
+          println("abgebrochen: ${job.isCancelled}")
+      }
+    checklist:
+      - Die Funktion ist generisch und nimmt eine `suspend`-Lambda an, sodass beliebige `suspend`-Aufrufe hineinpassen.
+      - Gefangen wird nur `IOException`; `CancellationException` und andere Fehler gehen unverändert durch.
+      - Gewartet wird mit `delay`, nicht mit `Thread.sleep` – dadurch ist das Warten ein Suspension Point und abbrechbar.
+      - Der letzte Versuch steht außerhalb des `try`, sodass seine Exception beim Aufrufer ankommt.
+      - Die Wartezeit wächst mit `factor` (100, 200, 400 …).
+      - Im Test endet der zweite Job nach 1,5 s mit `abgebrochen: true` – nach dem Abbruch gibt es keinen weiteren Versuch.
+    explanation: |
+      Das Muster ist die Coroutine-Variante eines klassischen Retry mit exponentiellem Backoff. Die Schleife macht `times - 1` Versuche mit Fehlerbehandlung, der letzte Versuch steht außerhalb, damit seine Exception durchkommt. Weil nur `IOException` gefangen wird, bleiben Programmierfehler (`IllegalStateException`) und Abbrüche sichtbar. `delay` ist der Schlüssel zur Abbrechbarkeit: Wird der Job während des Wartens abgebrochen, wirft `delay` eine `CancellationException`, die niemand fängt. Mit `Thread.sleep` würde der Thread blockieren und der Abbruch erst nach dem Schlafen bemerkt. In echten Apps ergänzt man oft Jitter (eine Zufallskomponente), damit viele Clients nicht gleichzeitig wiederholen; für Arbeit, die einen Prozess-Neustart überleben muss, übernimmt WorkManager das Backoff.
+    resources:
+      - title: Kotlin Docs · Suspension points and cancellation
+        url: https://kotlinlang.org/docs/coroutines-cancellation.html#suspension-points-and-cancellation
+      - title: Kotlin Docs · Higher-order functions
+        url: https://kotlinlang.org/docs/lambdas.html

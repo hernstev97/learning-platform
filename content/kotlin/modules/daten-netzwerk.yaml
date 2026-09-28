@@ -1,0 +1,915 @@
+id: daten-netzwerk
+title: "Daten & Netzwerk: Room, DataStore, Retrofit, WorkManager"
+level: 3
+minutes: 180
+summary: Wie eine App Daten lokal speichert, mit einem Server spricht, Fehler sauber unterscheidet und Änderungen auch ohne Netz zuverlässig ausliefert – offline-first mit Room als Single Source of Truth.
+goals:
+  - Du modellierst Tabellen mit Room (Entity, DAO, Database), liest sie als `Flow` und schreibst mit `suspend`-Funktionen und Transaktionen.
+  - Du änderst ein bestehendes Datenbankschema mit einer automatischen oder manuellen Migration, ohne Nutzerdaten zu verlieren.
+  - Du speicherst Einstellungen mit DataStore und begründest, warum nicht mit `SharedPreferences`.
+  - Du sprichst eine REST-API mit Retrofit und kotlinx.serialization an und bildest Netzwerk-, HTTP- und Parsing-Fehler auf fachliche Ergebnisse ab.
+  - Du planst garantierte Hintergrundarbeit mit WorkManager – mit Constraints, Backoff, Unique Work und idempotenten Workern.
+resources:
+  - title: Save data in a local database using Room
+    url: https://developer.android.com/training/data-storage/room
+  - title: DataStore
+    url: https://developer.android.com/topic/libraries/architecture/datastore
+  - title: Build an offline-first app
+    url: https://developer.android.com/topic/architecture/data-layer/offline-first
+  - title: Retrofit
+    url: https://lysine.dev/retrofit/
+  - title: WorkManager – Define work requests
+    url: https://developer.android.com/develop/background-work/background-tasks/persistent/getting-started/define-work
+lesson: |
+  Ein Gedanke in Bear entsteht oft unterwegs: in der U-Bahn, im Funkloch, mit fünf Prozent Akku. Der Nutzer tippt, drückt „Speichern“ und steckt das Handy weg. Ab diesem Moment gilt ein Versprechen: Der Gedanke geht nicht verloren, und er landet irgendwann in Linear – auch wenn die App dazwischen beendet oder das Handy neu gestartet wird.
+
+  Dieses Versprechen einzulösen ist der Kern der Datenschicht, und genau hier trennen sich Demo-Apps von Produktions-Apps. In diesem Modul baust du die Bausteine zusammen: **Room** als lokale Datenbank und Single Source of Truth, **DataStore** für Einstellungen, **Retrofit** mit kotlinx.serialization für die API, eine saubere **Fehlerabbildung** und **WorkManager** für Arbeit, die garantiert ausgeführt werden muss. Die Architektur dazu – Repository, SSOT, UDF – kennst du aus dem Modul „App-Architektur“.
+
+  ## Room: Entity, DAO, Database
+
+  [Room](https://developer.android.com/training/data-storage/room#components) ist eine Schicht über SQLite. Du beschreibst Tabellen und Abfragen mit Annotationen, und ein Code-Generator (KSP) erzeugt zur Compile-Zeit den Code dazu – inklusive Prüfung deiner SQL-Abfragen gegen das Schema. Drei Bausteine:
+
+  ```kotlin
+  enum class ThoughtState { Local, Sending, InLinear, NeedsAttention }
+
+  @Entity(tableName = "thoughts")
+  data class ThoughtEntity(
+      @PrimaryKey val id: String,          // UUID, lokal erzeugt
+      val text: String,
+      val createdAt: Long,
+      val state: ThoughtState,             // Enums speichert Room als Namen
+      val lastError: String? = null,
+  )
+
+  @Dao
+  interface ThoughtDao {
+      @Query("SELECT * FROM thoughts ORDER BY createdAt DESC")
+      fun observeAll(): Flow<List<ThoughtEntity>>
+
+      @Query("SELECT * FROM thoughts WHERE id = :id")
+      suspend fun get(id: String): ThoughtEntity?
+
+      @Upsert
+      suspend fun upsert(thought: ThoughtEntity)
+  }
+
+  @Database(entities = [ThoughtEntity::class], version = 1)
+  abstract class BearDatabase : RoomDatabase() {
+      abstract fun thoughts(): ThoughtDao
+  }
+  ```
+
+  Das wichtigste Denkmodell steckt in den Rückgabetypen: Eine Abfrage mit [`Flow`](https://developer.android.com/training/data-storage/room/async-queries#observable) ist **beobachtbar**. Room merkt sich, welche Tabellen sie liest, und führt sie neu aus, sobald jemand in diese Tabellen schreibt – egal ob UI, Worker oder Sync. Eine `suspend`-Funktion ist eine **einmalige** Abfrage oder ein Schreibvorgang; Room führt sie auf einem eigenen Dispatcher aus, sie ist also main-safe. Genau diese Aufteilung braucht die Datenschicht: Flows für die Anzeige, `suspend` für Aktionen.
+
+  > [!NOTE] Room 3 und Room 2
+  > Seit Room 3.0 liegen die Klassen im Paket `androidx.room3` (Artefakt `androidx.room3:room3-runtime`). Room 3 erzeugt nur noch Kotlin-Code per KSP, verlangt Coroutines – DAO-Funktionen sind `suspend` oder liefern einen `Flow` – und baut die Datenbank über einen `SQLiteDriver`: `Room.databaseBuilder<BearDatabase>(context, "bear.db").setDriver(AndroidSQLiteDriver()).build()`. Bear nutzt noch Room 2 (`androidx.room`). Die Annotationen und Konzepte dieses Moduls sind in beiden Versionen gleich; Details stehen in der [Migrationsanleitung von Room 2 zu 3](https://developer.android.com/training/data-storage/room/migration-2-to-3).
+
+  Room speichert nur Werte, die SQLite kennt: Zahlen, Text, Blobs. Für andere Typen schreibst du einen [`TypeConverter`](https://developer.android.com/training/data-storage/room/referencing-data#type-converters). Bear legt die Merksätze eines Themas als JSON-Text ab:
+
+  ```kotlin
+  class Converters {
+      @TypeConverter
+      fun fromList(list: List<String>): String = Json.encodeToString(list)
+
+      @TypeConverter
+      fun toList(json: String): List<String> = Json.decodeFromString(json)
+  }
+
+  @Database(entities = [TopicEntity::class], version = 2)
+  @TypeConverters(Converters::class)
+  abstract class BearDatabase : RoomDatabase() { /* … */ }
+  ```
+
+  Mehrere Schreibvorgänge, die nur gemeinsam Sinn ergeben, gehören in eine Transaktion. Sonst sieht ein Flow-Collector einen halben Zustand, und ein Absturz dazwischen hinterlässt Datenmüll:
+
+  ```kotlin
+  @Dao
+  abstract class TopicDao {
+      @Upsert
+      abstract suspend fun upsertAll(topics: List<TopicEntity>)
+
+      @Query("DELETE FROM topics WHERE issueId NOT IN (:keep)")
+      abstract suspend fun deleteAllExcept(keep: List<String>)
+
+      @Transaction
+      open suspend fun replaceAll(topics: List<TopicEntity>) {
+          deleteAllExcept(topics.map { it.issueId })
+          upsertAll(topics)
+      }
+  }
+  ```
+
+  ## Migrationen: das Schema ändern, ohne Daten zu verlieren
+
+  Deine App ist auf Tausenden Geräten installiert, jedes mit einer Datenbank im alten Format. Fügst du einer Entity ein Feld hinzu, muss Room beim nächsten Start wissen, wie aus Version 2 Version 3 wird. Fehlt dieser Weg, wirft Room beim Öffnen eine `IllegalStateException` – die App stürzt beim Start ab. Die [Migrations-Doku](https://developer.android.com/training/data-storage/room/migrating-db-versions) beschreibt zwei Wege.
+
+  **Automatische Migration:** Room vergleicht die exportierten Schemas zweier Versionen und erzeugt die SQL-Befehle selbst. Voraussetzung ist, dass Room die Schemas als JSON exportiert (`exportSchema` nicht auf `false`, Schema-Ordner über das Room-Gradle-Plugin) und dass du diese Dateien ins Git eincheckst. Bear macht genau das:
+
+  ```kotlin
+  @Database(
+      entities = [ThoughtEntity::class, TopicEntity::class, RoundLogEntity::class, EditEntity::class],
+      version = 2,
+      exportSchema = true,
+      autoMigrations = [AutoMigration(from = 1, to = 2)],
+  )
+  abstract class BearDatabase : RoomDatabase() { /* … */ }
+  ```
+
+  Für neue Spalten und Tabellen reicht das. Bei Umbenennungen oder gelöschten Spalten kann Room nicht raten, ob `title` gelöscht und `name` neu ist oder ob umbenannt wurde. Dann gibst du eine `AutoMigrationSpec` mit `@RenameColumn` oder `@DeleteColumn` an.
+
+  **Manuelle Migration:** Für alles, was sich nicht aus zwei Schemas ableiten lässt – Daten umrechnen, Tabellen aufteilen – schreibst du das SQL selbst:
+
+  ```kotlin
+  // Entity: @ColumnInfo(defaultValue = "0") val priority: Int = 0
+  val MIGRATION_2_3 = object : Migration(2, 3) {
+      override suspend fun migrate(connection: SQLiteConnection) {
+          connection.executeSQL("ALTER TABLE topics ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
+      }
+  }
+
+  val db = Room.databaseBuilder<BearDatabase>(context, "bear.db")
+      .setDriver(AndroidSQLiteDriver())
+      .addMigrations(MIGRATION_2_3)
+      .build()
+  ```
+
+  Nach der Migration prüft Room, ob das Ergebnis exakt dem Schema der Entities entspricht – Typ, `NOT NULL`, Standardwert. Weicht etwas ab, stürzt die App mit „Migration didn't properly handle …“ ab und zeigt dir erwartetes und gefundenes Schema. In Room 2 heißt der Parameter noch `db: SupportSQLiteDatabase` und der Aufruf `db.execSQL(...)`; die Idee ist dieselbe.
+
+  > [!WARNING] `fallbackToDestructiveMigration()` löscht Nutzerdaten
+  > Mit dieser Option löscht Room die Datenbank und legt sie neu an, wenn eine Migration fehlt. Während der Entwicklung ist das bequem. In einer veröffentlichten App bedeutet es: Jeder noch nicht gesendete Gedanke ist nach dem Update weg. Für Daten, die nur ein Cache des Servers sind, kann es vertretbar sein – für eine Outbox nie.
+
+  ## DataStore statt SharedPreferences
+
+  Für kleine Einstellungen – Name des Bären, Zeitfenster, ob ein Hinweis schon gesehen wurde – ist eine Datenbank zu schwer. Der Klassiker dafür war `SharedPreferences`. Seine Probleme: Die API ist synchron und sieht auf dem Main-Thread harmlos aus, obwohl sie Dateien liest; `apply()` meldet keine Fehler; es gibt keine Transaktionen über mehrere Werte. [DataStore](https://developer.android.com/topic/libraries/architecture/datastore) löst das mit Coroutines: Lesen ist ein `Flow`, Schreiben eine atomare `suspend`-Funktion.
+
+  ```kotlin
+  // Top-Level: genau eine Instanz pro Datei im Prozess
+  private val Context.settingsStore: DataStore<Preferences> by preferencesDataStore(name = "settings")
+
+  class SettingsRepository(private val context: Context) {
+      private val bearNameKey = stringPreferencesKey("bear_name")
+
+      val bearName: Flow<String> = context.settingsStore.data
+          .map { prefs -> prefs[bearNameKey] ?: "Bear" }
+
+      suspend fun setBearName(name: String) {
+          context.settingsStore.edit { prefs -> prefs[bearNameKey] = name }
+      }
+  }
+  ```
+
+  DataStore gibt es in zwei Varianten. **Preferences DataStore** speichert Schlüssel-Wert-Paare wie oben – schnell eingerichtet, aber ohne Schema. **Typisiertes DataStore** speichert ein ganzes unveränderliches Objekt über einen `Serializer`, entweder als JSON mit kotlinx.serialization oder als Protocol Buffers (Proto DataStore). Das lohnt sich, wenn die Einstellungen zusammengehören und typsicher sein sollen. Die [Regeln für korrekte Nutzung](https://developer.android.com/topic/libraries/architecture/datastore#correct_usage) sind kurz: nie mehr als eine Instanz pro Datei im selben Prozess (sonst `IllegalStateException`), und der gespeicherte Typ muss unveränderlich sein. Die Delegate-Property auf Top-Level erfüllt die erste Regel automatisch.
+
+  DataStore ist nicht für große oder relationale Daten gedacht, und es kann keine Teilmengen abfragen: Jede Änderung schreibt die ganze Datei neu. Listen von Gedanken gehören in Room.
+
+  ## Netzwerk mit Retrofit und kotlinx.serialization
+
+  [Retrofit](https://lysine.dev/retrofit/) beschreibt eine HTTP-API als Kotlin-Interface. Aus Annotationen baut es zur Laufzeit die Requests; OkHttp führt sie aus, ein Converter wandelt JSON in Objekte. Für den Converter nimmst du in Kotlin-Projekten [kotlinx.serialization](https://kotlinlang.org/docs/serialization.html) – es arbeitet mit einem Compiler-Plugin statt mit Reflection und kennt Kotlins Nullability und Standardwerte.
+
+  ```kotlin
+  @Serializable
+  data class TopicDto(
+      val id: String,
+      val title: String,
+      @SerialName("updated_at") val updatedAt: String,
+      val sentences: List<String> = emptyList(),
+  )
+
+  interface TopicApi {
+      @GET("topics")
+      suspend fun topics(): List<TopicDto>
+
+      @GET("topics/{id}")
+      suspend fun topic(@Path("id") id: String): TopicDto
+
+      @POST("topics")
+      suspend fun create(@Body topic: NewTopicDto): TopicDto
+  }
+
+  private val json = Json { ignoreUnknownKeys = true }
+
+  val api: TopicApi = Retrofit.Builder()
+      .baseUrl("https://api.example.com/v1/")   // muss mit / enden
+      .addConverterFactory(json.asConverterFactory("application/json".toMediaType()))
+      .build()
+      .create(TopicApi::class.java)
+  ```
+
+  Drei Details, die in Reviews auffallen: `ignoreUnknownKeys = true` sorgt dafür, dass ein neues Feld auf dem Server deine App nicht bricht. Standardwerte wie `sentences = emptyList()` machen fehlende optionale Felder unkritisch. Und der DTO bleibt in der Datenschicht – das Repository bildet ihn auf eine Entity oder ein Domain-Modell ab.
+
+  Die Alternative ist der [Ktor-Client](https://ktor.io/docs/client-create-new-application.html) von JetBrains. Er läuft auch in Kotlin Multiplatform, konfiguriert sich über Plugins (`install(ContentNegotiation) { json() }`) und wirft bei HTTP-Fehlern standardmäßig **keine** Exception, solange du nicht `expectSuccess = true` setzt. Bear nutzt keines von beiden direkt, sondern OkHttp mit kotlinx.serialization, weil die Linear-API GraphQL spricht und nur einen Endpunkt hat.
+
+  ## Fehler unterscheiden und abbilden
+
+  Ein Netzwerkaufruf kann auf drei grundverschiedene Arten scheitern, und jede verlangt eine andere Reaktion:
+
+  | Fehler | Typische Exception | Bedeutung | Reaktion |
+  | --- | --- | --- | --- |
+  | Keine Verbindung, Timeout | `IOException` (z. B. `SocketTimeoutException`) | Die Anfrage kam nicht an oder die Antwort nicht zurück | später wiederholen |
+  | Server antwortet mit 4xx/5xx | `retrofit2.HttpException` mit `code()` | Der Server hat geantwortet, aber abgelehnt | 5xx und 429: wiederholen; 401: neu anmelden; andere 4xx: nicht wiederholen |
+  | Antwort passt nicht zum DTO | `SerializationException` | Server und App sind sich über das Format uneinig | nicht wiederholen, melden und loggen |
+
+  Die UI soll davon nichts wissen. Das Repository fängt die Exceptions an der Grenze und liefert ein fachliches Ergebnis:
+
+  ```kotlin
+  sealed interface RefreshResult {
+      data object Success : RefreshResult
+      data object Offline : RefreshResult
+      data class Rejected(val httpCode: Int) : RefreshResult
+      data class InvalidResponse(val detail: String) : RefreshResult
+  }
+
+  suspend fun refresh(): RefreshResult = try {
+      dao.replaceAll(api.topics().map(TopicDto::toEntity))
+      RefreshResult.Success
+  } catch (e: IOException) {
+      RefreshResult.Offline
+  } catch (e: HttpException) {
+      RefreshResult.Rejected(e.code())
+  } catch (e: SerializationException) {
+      RefreshResult.InvalidResponse(e.message ?: "unbekanntes Format")
+  }
+  ```
+
+  Das ViewModel übersetzt `Offline` in „Keine Verbindung – du siehst den letzten Stand“, ohne je eine `IOException` gesehen zu haben. Der [Data-Layer-Guide](https://developer.android.com/topic/architecture/data-layer#expose-errors) beschreibt beide Wege: eigene Exceptions oder Ergebnistypen. Bear nutzt eine eigene `LinearException(message, retryable)` – eine Exception mit genau der Information, die der Worker braucht.
+
+  > [!WARNING] `catch (e: Exception)` und `runCatching` fangen auch Abbrüche
+  > Wird eine Coroutine abgebrochen, wirft der nächste Suspend-Punkt eine `CancellationException`. Ein pauschales `catch (e: Exception)` oder `runCatching { }` fängt sie mit – die Coroutine läuft dann weiter, obwohl sie längst beendet sein sollte, und schreibt vielleicht noch in die Datenbank. Fang gezielt die Typen aus der Tabelle, oder wirf `CancellationException` sofort weiter. Die Kotlin-Doku zu [Cancellation](https://kotlinlang.org/docs/cancellation-and-timeouts.html) erklärt den Mechanismus.
+
+  ## Offline-first: lokal zuerst, dann synchronisieren
+
+  Die [Offline-first-Anleitung](https://developer.android.com/topic/architecture/data-layer/offline-first#reads) trennt Lesen und Schreiben. **Lesen** kommt immer aus Room; das Netzwerk aktualisiert nur die Datenbank, und der Flow liefert das Ergebnis automatisch an die UI. **Schreiben** geht zuerst lokal – der Nutzer sieht seine Änderung sofort – und wird dann in eine Warteschlange gestellt ([Queued writes](https://developer.android.com/topic/architecture/data-layer/offline-first#queued_writes)).
+
+  Bear setzt das mit einer **Outbox** um: Ein neuer Gedanke landet mit `state = Local` in Room und bekommt sofort einen Sende-Auftrag. Änderungen an Themen landen in einer eigenen Tabelle `edits` – eine Zeile pro Thema, spätere Änderungen verschmelzen hinein, und eine Versionsnummer verhindert, dass eine während des Sendens eingetroffene Änderung verloren geht. Die Zeile wird erst gelöscht, wenn Linear alles hat. Die Outbox ist damit Teil der Single Source of Truth: Die App weiß jederzeit, was noch fehlt, auch nach einem Neustart.
+
+  > [!PRAXIS] Idempotenz: Die verlorene Antwort
+  > Das tückischste Szenario im Mobilnetz: Der Server legt das Issue an, aber die Antwort kommt nie zurück. Für die App sieht das aus wie ein Timeout, also wiederholt sie – und es gibt zwei Issues. Bear verhindert das, indem es das Issue mit einer **selbst erzeugten UUID** anlegt. Scheitert der Aufruf, fragt der Worker zuerst nach, ob es ein Issue mit dieser ID schon gibt. So ist das Senden idempotent: Beliebig oft wiederholt, bleibt das Ergebnis dasselbe. In Vorstellungsgesprächen für Mobile-Stellen ist genau diese Frage beliebt – „Was passiert, wenn die Antwort verloren geht?“
+
+  ## WorkManager: Arbeit, die garantiert passiert
+
+  Eine Coroutine im `viewModelScope` endet mit dem Bildschirm, eine im Application-Scope mit dem Prozess. Für Arbeit, die den Prozesstod und Neustarts überleben muss, gibt es [WorkManager](https://developer.android.com/develop/background-work/background-tasks/persistent/getting-started/define-work): Er speichert Aufträge in einer eigenen Datenbank und führt sie aus, sobald die Bedingungen erfüllt sind.
+
+  ```kotlin
+  class SendThoughtWorker(
+      context: Context,
+      params: WorkerParameters,
+  ) : CoroutineWorker(context, params) {
+      override suspend fun doWork(): Result {
+          val id = inputData.getString(KEY_ID) ?: return Result.failure()
+          return when (send(id)) {
+              SendOutcome.Sent -> Result.success()
+              SendOutcome.TryLater -> Result.retry()     // Backoff, dann erneut
+              SendOutcome.Rejected -> Result.failure()   // endgültig, nicht wiederholen
+          }
+      }
+
+      companion object { const val KEY_ID = "thought_id" }
+  }
+
+  fun enqueueSend(context: Context, id: String) {
+      val request = OneTimeWorkRequestBuilder<SendThoughtWorker>()
+          .setInputData(workDataOf(SendThoughtWorker.KEY_ID to id))
+          .setConstraints(
+              Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()
+          )
+          .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+          .build()
+      WorkManager.getInstance(context)
+          .enqueueUniqueWork("send-$id", ExistingWorkPolicy.KEEP, request)
+  }
+  ```
+
+  Die Bausteine: Ein `CoroutineWorker` führt `doWork()` als Suspend-Funktion aus (standardmäßig auf `Dispatchers.Default`). Das `Result` steuert, was danach passiert: `success()` beendet den Auftrag, `failure()` ebenfalls – ohne Wiederholung –, `retry()` plant ihn nach der [Backoff-Zeit](https://developer.android.com/develop/background-work/background-tasks/persistent/getting-started/define-work#retries_backoff) neu: exponentiell 30 s, 60 s, 120 s … bis zu einer Obergrenze. **Constraints** wie „Netz verbunden“ halten den Auftrag zurück, bis sie erfüllt sind. **Unique Work** verhindert Duplikate: [`enqueueUniqueWork`](https://developer.android.com/develop/background-work/background-tasks/persistent/how-to/manage-work) mit `KEEP` ignoriert einen zweiten Auftrag mit demselben Namen, solange der erste nicht fertig ist; `REPLACE` bricht den alten ab; `APPEND_OR_REPLACE` hängt den neuen hinten an. Bear nutzt für Änderungen `APPEND_OR_REPLACE`, damit eine Änderung, die eintrifft, während der Worker gerade endet, noch ihren eigenen Lauf bekommt. Periodische Arbeit (`PeriodicWorkRequestBuilder`) läuft höchstens alle 15 Minuten.
+
+  WorkManager ist nicht für exakte Zeitpunkte gedacht: Das System bündelt Arbeit, um Akku zu sparen. Für „um 19:30 eine Runde anzeigen“ braucht Bear deshalb zusätzlich einen Alarm.
+
+  > [!INTERVIEW] „Wann nimmst du WorkManager, wann eine Coroutine?“
+  > Nach der Frage: Muss die Arbeit passieren, auch wenn der Nutzer die App schließt oder das Handy neu startet? Wenn ja – Daten hochladen, Outbox senden, periodischer Sync –, WorkManager, weil er Aufträge persistiert und mit Constraints und Backoff ausführt. Wenn die Arbeit nur für den aktuellen Bildschirm zählt, reicht eine Coroutine im `viewModelScope`. Der Data-Layer-Guide nennt das [UI-, App- und Business-orientierte Operationen](https://developer.android.com/topic/architecture/data-layer#data-operation-types).
+
+  ## Häufige Fehler
+
+  - **Netzwerkdaten direkt an die UI.** Offline ist der Bildschirm leer, nach dem Refresh flackert er. Lösung: Netzwerk schreibt in Room, UI liest aus Room.
+  - **Migration vergessen oder falsch.** Symptom: Absturz beim ersten Start nach dem Update, `IllegalStateException` mit „Migration didn't properly handle“ oder fehlendem Migrationspfad. Lösung: Schemas exportieren, Migrationen testen (Modul „Testing“).
+  - **Mehrere DataStore-Instanzen für dieselbe Datei**, etwa durch `preferencesDataStore` in einer Klasse statt auf Top-Level. Symptom: `IllegalStateException` beim Lesen.
+  - **Alle Fehler gleich behandeln.** Ein 400er wird endlos wiederholt, ein Timeout sofort als endgültig gemeldet. Lösung: Fehler nach der Tabelle oben unterscheiden.
+  - **`runCatching` um Suspend-Aufrufe** verschluckt Abbrüche.
+  - **Nicht-idempotente Worker.** Jede Wiederholung legt einen neuen Datensatz auf dem Server an. Lösung: Client-generierte IDs, vor dem Wiederholen nachsehen.
+  - **`enqueue` statt `enqueueUniqueWork`.** Jeder Tipp auf „Senden“ erzeugt einen weiteren Auftrag.
+
+  ## Zusammenfassung
+
+  - Room: Entity beschreibt die Tabelle, DAO die Abfragen, Database fasst alles zusammen. `Flow`-Abfragen sind beobachtbar, `suspend`-Funktionen einmalig und main-safe; zusammengehörige Schreibvorgänge kommen in eine `@Transaction`.
+  - Jede Schemaänderung braucht eine Migration: automatisch bei neuen Spalten (mit exportierten Schemas), manuell per SQL bei allem anderen. Destruktive Fallbacks löschen Nutzerdaten.
+  - DataStore ersetzt `SharedPreferences`: asynchron, transaktional, als `Flow` lesbar; eine Instanz pro Datei.
+  - Retrofit beschreibt die API als Interface, kotlinx.serialization wandelt JSON in DTOs; `ignoreUnknownKeys` und Standardwerte machen die App robust gegen Serveränderungen.
+  - `IOException`, `HttpException` und `SerializationException` sind drei verschiedene Fehler mit drei verschiedenen Reaktionen; das Repository bildet sie auf fachliche Ergebnisse ab. Abbrüche nie verschlucken.
+  - Offline-first: lesen aus Room, schreiben lokal und über eine Outbox synchronisieren.
+  - WorkManager garantiert Ausführung über Prozesstod und Neustart hinweg; Constraints, Backoff, Unique Work und idempotente Worker gehören zusammen.
+exercises:
+  - id: wohin-speichern
+    type: choice
+    title: Wohin damit?
+    prompt: |
+      Welche Zuordnungen von Daten zu Speicherort sind sinnvoll? Mehrere Antworten sind richtig.
+    options:
+      - text: Alle erfassten Gedanken samt Sendestatus → Room
+        correct: true
+        why: Strukturierte, wachsende Daten, die abgefragt und beobachtet werden, sind der Kern von Room – und als Outbox Teil der Single Source of Truth.
+      - text: Name des Bären und gewählte Zeitfenster → Preferences DataStore
+        correct: true
+        why: Wenige kleine Einstellungen ohne Beziehungen sind genau der Einsatzzweck von DataStore.
+      - text: Die Liste aller Themen als JSON-String in einem Preferences-Schlüssel
+        correct: false
+        why: DataStore schreibt bei jeder Änderung die ganze Datei neu und kann weder filtern noch sortieren. Listen mit Abfragen gehören in Room.
+      - text: Den Suchbegriff des gerade offenen Suchbildschirms → Room-Tabelle
+        correct: false
+        why: Flüchtiger Bildschirmzustand gehört in den UI-State und – falls er den Prozesstod überleben soll – in `SavedStateHandle`.
+      - text: Das Senden eines Gedankens an Linear → WorkManager-Auftrag mit Netz-Constraint
+        correct: true
+        why: Die Arbeit muss auch nach Prozesstod und Neustart passieren; WorkManager persistiert den Auftrag und wartet auf Netz.
+    explanation: |
+      Jeder Speicher hat einen Zweck: Room für strukturierte, abfragbare Daten, DataStore für kleine Einstellungen, `SavedStateHandle` für flüchtige UI-Werte und WorkManager für Arbeit, die garantiert passieren muss. Wer DataStore als Datenbank missbraucht oder UI-Zustand in Room schreibt, bezahlt mit Performance oder unnötiger Komplexität.
+    resources:
+      - title: Offline-first · The local data source
+        url: https://developer.android.com/topic/architecture/data-layer/offline-first#local-data
+      - title: DataStore
+        url: https://developer.android.com/topic/libraries/architecture/datastore
+  - id: worker-lebenslauf
+    type: order
+    title: Das Leben eines Sendeauftrags
+    prompt: |
+      Ein Gedanke wird im Funkloch gespeichert. Bring die Ereignisse in die zeitliche Reihenfolge. Der Auftrag hat die Constraint „Netz verbunden“ und exponentiellen Backoff mit 30 Sekunden.
+    lang: text
+    lines: |
+      Das Repository schreibt den Gedanken mit state = Local in Room.
+      enqueueUniqueWork speichert den Auftrag in der WorkManager-Datenbank.
+      Das Handy bekommt wieder Netz; die Constraint ist erfüllt.
+      doWork() läuft, der Request bricht mit SocketTimeoutException ab.
+      Der Worker gibt Result.retry() zurück.
+      WorkManager wartet die Backoff-Zeit von 30 Sekunden ab.
+      doWork() läuft erneut, Linear legt das Issue an.
+      Der Worker setzt state = InLinear und gibt Result.success() zurück.
+    explanation: |
+      Erst lokal speichern, dann den Auftrag persistieren – beides passiert sofort, auch ohne Netz. WorkManager hält den Auftrag zurück, bis die Constraint erfüllt ist. Ein Timeout ist ein `IOException`-Fall, also `retry()`; WorkManager plant den nächsten Versuch nach dem Backoff (danach 60 s, 120 s …). Erst der Erfolg beendet den Auftrag. Stirbt der Prozess irgendwo dazwischen, macht WorkManager nach dem Neustart an derselben Stelle weiter.
+    resources:
+      - title: Retry and backoff policy
+        url: https://developer.android.com/develop/background-work/background-tasks/persistent/getting-started/define-work#retries_backoff
+  - id: fehler-klassifizieren
+    type: output
+    title: Nochmal versuchen oder aufgeben?
+    prompt: |
+      Diese Funktion entscheidet, ob ein Sendeversuch wiederholt wird. Die Exception-Klassen sind vereinfachte Nachbauten, damit das Programm ohne Retrofit läuft; `SocketTimeoutException` ist die echte aus `java.net`. Was wird ausgegeben?
+    lang: kotlin
+    code: |
+      import java.io.IOException
+      import java.net.SocketTimeoutException
+
+      class HttpError(val code: Int) : Exception("HTTP $code")
+      class BadJson(message: String) : IllegalArgumentException(message)
+
+      fun decide(e: Exception): String = when (e) {
+          is IOException -> "retry"
+          is HttpError -> if (e.code >= 500 || e.code == 429) "retry" else "failure"
+          is IllegalArgumentException -> "failure"
+          else -> "unbekannt"
+      }
+
+      fun main() {
+          val errors = listOf(
+              SocketTimeoutException("timeout"),
+              HttpError(503),
+              HttpError(404),
+              HttpError(429),
+              BadJson("title fehlt"),
+              IllegalStateException("?"),
+          )
+          errors.forEach { println(decide(it)) }
+      }
+    expected: |
+      retry
+      retry
+      failure
+      retry
+      failure
+      unbekannt
+    hints:
+      - "`SocketTimeoutException` erbt über `InterruptedIOException` von `IOException`."
+      - "`BadJson` ist eine `IllegalArgumentException`, `IllegalStateException` nicht."
+    explanation: |
+      Ein Timeout ist eine `IOException` – das Netz war das Problem, also lohnt ein neuer Versuch. 503 (Server überlastet) und 429 (zu viele Anfragen) sind vorübergehend, 404 nicht: Eine Wiederholung würde dasselbe Ergebnis liefern. `BadJson` ist eine `IllegalArgumentException` – genau wie die echte `SerializationException` – und ein Formatfehler wird durch Warten nicht besser. `IllegalStateException` passt auf keinen Zweig. Die Reihenfolge der `when`-Zweige zählt: Der erste passende gewinnt.
+    resources:
+      - title: SocketTimeoutException (Java-API)
+        url: https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/net/SocketTimeoutException.html
+      - title: Offline-first · Error handling strategies
+        url: https://developer.android.com/topic/architecture/data-layer/offline-first#error-handling
+  - id: json-dekodieren
+    type: output
+    title: Was versteht der Decoder?
+    prompt: |
+      Was gibt dieses Programm mit kotlinx.serialization aus?
+    lang: kotlin
+    code: |
+      import kotlinx.serialization.Serializable
+      import kotlinx.serialization.SerializationException
+      import kotlinx.serialization.decodeFromString
+      import kotlinx.serialization.json.Json
+
+      @Serializable
+      data class IssueDto(val id: String, val title: String, val priority: Int = 0)
+
+      fun main() {
+          val lenient = Json { ignoreUnknownKeys = true }
+          val a = """{"id":"BOX-1","title":"Milch kaufen","url":"https://linear.app/x"}"""
+          val b = """{"id":"BOX-2"}"""
+
+          println(lenient.decodeFromString<IssueDto>(a))
+          println(runCatching { Json.decodeFromString<IssueDto>(a) }.isFailure)
+          println(runCatching { lenient.decodeFromString<IssueDto>(b) }.exceptionOrNull() is SerializationException)
+      }
+    expected: |
+      IssueDto(id=BOX-1, title=Milch kaufen, priority=0)
+      true
+      true
+    hints:
+      - Welches Feld steht im JSON, aber nicht im DTO – und welches im DTO, aber nicht im JSON?
+      - Ein Feld mit Standardwert ist optional, eines ohne ist Pflicht.
+    explanation: |
+      `lenient` ignoriert das unbekannte Feld `url`, und das fehlende `priority` bekommt seinen Standardwert 0. Das Standard-`Json` ist strikt: Ein unbekannter Schlüssel ist ein Fehler, deshalb schlägt die zweite Zeile fehl. Im dritten Fall fehlt `title`, das keinen Standardwert hat; kotlinx.serialization wirft eine `MissingFieldException`, eine Unterklasse von `SerializationException`. Daraus folgen zwei Regeln für DTOs: `ignoreUnknownKeys = true`, damit neue Serverfelder die App nicht brechen, und Standardwerte für alles, was wirklich optional ist.
+    resources:
+      - title: kotlinx.serialization · JSON configuration
+        url: https://github.com/Kotlin/kotlinx.serialization/blob/master/docs/json.md
+      - title: Serialization (Kotlin-Doku)
+        url: https://kotlinlang.org/docs/serialization.html
+  - id: room-schema
+    type: gap
+    title: Eine Tabelle für Themen
+    prompt: |
+      Ergänze Entity, DAO und Database. Die Liste soll sich automatisch aktualisieren, Einzelabfragen und Schreibvorgänge sind main-safe. Die Datenbank ist in Version 2 und wurde von Version 1 automatisch migriert.
+    lang: kotlin
+    code: |
+      ⟦@Entity⟧(tableName = "topics")
+      data class TopicEntity(
+          ⟦@PrimaryKey⟧ val issueId: String,
+          val title: String,
+          val nextDueEpochDay: Long,
+          @ColumnInfo(defaultValue = "NULL") val description: String? = null,
+      )
+
+      @Dao
+      interface TopicDao {
+          @Query("SELECT * FROM topics ORDER BY nextDueEpochDay, title")
+          fun observeAll(): ⟦Flow<List<TopicEntity>>⟧
+
+          @Query("SELECT * FROM topics WHERE issueId = ⟦:issueId⟧")
+          ⟦suspend⟧ fun get(issueId: String): TopicEntity?
+
+          ⟦@Upsert⟧
+          suspend fun upsert(topic: TopicEntity)
+      }
+
+      @Database(
+          entities = [TopicEntity::class],
+          version = 2,
+          exportSchema = true,
+          autoMigrations = [⟦AutoMigration(from = 1, to = 2)⟧],
+      )
+      abstract class BearDatabase : RoomDatabase() {
+          abstract fun topics(): TopicDao
+      }
+    gaps:
+      - label: Tabelle
+        hint: Markiert die Klasse als Tabelle.
+      - label: Schlüssel
+        hint: Jede Zeile braucht einen eindeutigen Schlüssel.
+      - label: Beobachtbarer Rückgabetyp
+        hint: Ein Strom, der bei jeder Änderung der Tabelle eine neue Liste liefert.
+      - label: Parameter in SQL
+        hint: So verweist eine Room-Abfrage auf den Funktionsparameter.
+      - label: Einmalige Abfrage
+        hint: Ein Schlüsselwort macht die Funktion main-safe.
+      - label: Einfügen oder aktualisieren
+        hint: Eine Annotation, die Insert und Update verbindet.
+      - label: Automatische Migration
+        hint: "Eine Annotation mit `from` und `to`."
+        accept: ["AutoMigration(1, 2)"]
+    explanation: |
+      `@Entity` und `@PrimaryKey` beschreiben die Tabelle. Der `Flow`-Rückgabetyp macht `observeAll()` beobachtbar: Room führt die Abfrage bei jeder Änderung an `topics` erneut aus. `:issueId` bindet den Parameter sicher in die Abfrage – ohne String-Verkettung und damit ohne SQL-Injection. `suspend` macht Einzelabfragen main-safe, `@Upsert` fügt ein oder aktualisiert je nach Primärschlüssel. Die automatische Migration funktioniert nur, weil `exportSchema = true` die Schemas beider Versionen als JSON ablegt; `@ColumnInfo(defaultValue = "NULL")` sagt Room, welchen Wert bestehende Zeilen für die neue Spalte bekommen.
+    resources:
+      - title: Room · Primary components
+        url: https://developer.android.com/training/data-storage/room#components
+      - title: Automated migrations
+        url: https://developer.android.com/training/data-storage/room/migrating-db-versions#automated
+  - id: datastore-einstellungen
+    type: gap
+    title: Der Name des Bären
+    prompt: |
+      Ergänze ein Repository, das den Namen des Bären mit Preferences DataStore liest und schreibt. Fehlt der Wert, gilt „Bear“.
+    lang: kotlin
+    code: |
+      private val Context.settingsStore: DataStore<Preferences> by ⟦preferencesDataStore(name = "settings")⟧
+
+      class SettingsRepository(private val context: Context) {
+          private val bearNameKey = ⟦stringPreferencesKey("bear_name")⟧
+
+          val bearName: Flow<String> = context.settingsStore.⟦data⟧
+              .map { prefs -> prefs[bearNameKey] ⟦?: "Bear"⟧ }
+
+          ⟦suspend⟧ fun setBearName(name: String) {
+              context.settingsStore.⟦edit⟧ { prefs -> prefs[bearNameKey] = name }
+          }
+      }
+    gaps:
+      - label: Delegate
+        hint: Erzeugt die DataStore-Instanz für eine Datei – als Property-Delegate.
+        accept: ["preferencesDataStore(\"settings\")"]
+      - label: Schlüssel
+        hint: Ein typisierter Schlüssel für einen String-Wert.
+      - label: Lesen
+        hint: Die Property, die alle gespeicherten Werte als `Flow` liefert.
+      - label: Standardwert
+        hint: Elvis-Operator.
+      - label: Schreiben ist …
+        hint: Schreiben greift auf die Datei zu und darf den Main-Thread nicht blockieren.
+      - label: Atomar ändern
+        hint: Eine Erweiterungsfunktion, die veränderliche Preferences an einen Block übergibt.
+        accept: ["updateData"]
+    explanation: |
+      Der Delegate auf Top-Level sorgt dafür, dass es pro Datei genau eine DataStore-Instanz gibt – eine der Regeln für korrekte Nutzung. Schlüssel sind typisiert (`stringPreferencesKey`), das Lesen ist ein `Flow` über `data`, und ein fehlender Wert ist `null`, daher der Elvis-Operator. `edit` ist eine `suspend`-Funktion und ändert die Datei atomar: Entweder alle Änderungen im Block werden geschrieben oder keine. Bear nutzt genau dieses Muster in seinem `SettingsStore`.
+    resources:
+      - title: DataStore · Preferences DataStore
+        url: https://developer.android.com/topic/libraries/architecture/datastore#preferences-datastore
+  - id: retrofit-api
+    type: gap
+    title: Die API als Interface
+    prompt: |
+      Ergänze DTO, API-Interface und Retrofit-Aufbau. Das JSON-Feld heißt `updated_at`, unbekannte Felder sollen ignoriert werden.
+    lang: kotlin
+    code: |
+      ⟦@Serializable⟧
+      data class TopicDto(
+          val id: String,
+          val title: String,
+          ⟦@SerialName("updated_at")⟧ val updatedAt: String,
+      )
+
+      interface TopicApi {
+          ⟦@GET("topics/{id}")⟧
+          suspend fun topic(⟦@Path("id")⟧ id: String): TopicDto
+
+          @POST("topics")
+          suspend fun create(⟦@Body⟧ topic: NewTopicDto): TopicDto
+      }
+
+      private val json = Json { ⟦ignoreUnknownKeys = true⟧ }
+
+      val api: TopicApi = Retrofit.Builder()
+          .baseUrl("https://api.example.com/v1/")
+          .addConverterFactory(json.⟦asConverterFactory⟧("application/json".toMediaType()))
+          .build()
+          .create(TopicApi::class.java)
+    gaps:
+      - label: Serialisierbar
+        hint: Aktiviert das Compiler-Plugin von kotlinx.serialization für diese Klasse.
+      - label: Anderer JSON-Name
+        hint: Eine Annotation mit dem Namen im JSON.
+      - label: HTTP-Methode und Pfad
+        hint: Lesen eines einzelnen Themas; die ID steht als Platzhalter im Pfad.
+      - label: Pfadparameter
+        hint: Verbindet den Parameter mit dem Platzhalter.
+      - label: Request-Body
+        hint: Das Objekt wird als JSON im Body gesendet.
+      - label: Json-Konfiguration
+        hint: Unbekannte Felder im JSON sollen kein Fehler sein.
+      - label: Converter
+        hint: Eine Erweiterungsfunktion aus `retrofit2.converter.kotlinx.serialization`.
+    explanation: |
+      `@Serializable` erzeugt zur Compile-Zeit Serializer, `@SerialName` trennt den Kotlin-Namen vom JSON-Namen. In Retrofit bestimmt die Annotation die HTTP-Methode, `{id}` ist ein Platzhalter, den `@Path("id")` füllt, und `@Body` serialisiert das Objekt in den Request. `ignoreUnknownKeys = true` schützt vor neuen Serverfeldern. `asConverterFactory` verbindet Retrofit mit kotlinx.serialization; der Medientyp landet im `Content-Type`-Header. Die `baseUrl` muss mit `/` enden, sonst wirft Retrofit beim Bauen eine `IllegalArgumentException`.
+    resources:
+      - title: Retrofit · API declaration
+        url: https://lysine.dev/retrofit/
+      - title: Retrofit kotlinx.serialization converter
+        url: https://github.com/lysine-dev/retrofit/tree/trunk/retrofit-converters/kotlinx-serialization
+  - id: workmanager-auftrag
+    type: gap
+    title: Senden, sobald Netz da ist
+    prompt: |
+      Ergänze Worker und Auftrag. Netzfehler sollen wiederholt werden; pro Gedanke darf es nur einen offenen Auftrag geben, ein zweiter Aufruf von `enqueueSend` mit derselben ID wird ignoriert.
+    lang: kotlin
+    code: |
+      class SendThoughtWorker(
+          context: Context,
+          params: WorkerParameters,
+          private val thoughts: ThoughtRepository,
+      ) : ⟦CoroutineWorker⟧(context, params) {
+          override suspend fun ⟦doWork⟧(): Result {
+              val id = inputData.getString(KEY_ID) ?: return Result.failure()
+              return try {
+                  thoughts.send(id)
+                  Result.success()
+              } catch (e: IOException) {
+                  ⟦Result.retry()⟧
+              }
+          }
+
+          companion object { const val KEY_ID = "thought_id" }
+      }
+
+      fun enqueueSend(context: Context, id: String) {
+          val request = ⟦OneTimeWorkRequestBuilder<SendThoughtWorker>()⟧
+              .setInputData(workDataOf(SendThoughtWorker.KEY_ID to id))
+              .setConstraints(
+                  Constraints.Builder().setRequiredNetworkType(⟦NetworkType.CONNECTED⟧).build()
+              )
+              .build()
+          WorkManager.getInstance(context)
+              .⟦enqueueUniqueWork⟧("send-$id", ⟦ExistingWorkPolicy.KEEP⟧, request)
+      }
+    gaps:
+      - label: Basisklasse
+        hint: Ein Worker, dessen Arbeit eine Suspend-Funktion ist.
+      - label: Arbeitsfunktion
+        hint: Die Funktion, die WorkManager aufruft.
+      - label: Bei Netzfehler
+        hint: Nach der Backoff-Zeit noch einmal.
+      - label: Einmaliger Auftrag
+        hint: Ein reified Builder für einmalige Arbeit.
+      - label: Constraint
+        hint: Irgendeine Netzverbindung, egal ob WLAN oder mobil.
+      - label: Eindeutige Arbeit
+        hint: Ein Auftrag mit Namen.
+      - label: Richtlinie bei Duplikat
+        hint: Der laufende Auftrag bleibt, der neue wird verworfen.
+    explanation: |
+      `CoroutineWorker` führt `doWork()` als Suspend-Funktion aus. `Result.retry()` bei `IOException` übergibt die Wiederholung an WorkManager, der den Backoff einhält – kein eigenes `delay` und keine Schleife. `NetworkType.CONNECTED` wartet auf irgendeine Verbindung (`UNMETERED` wäre nur WLAN). `enqueueUniqueWork` mit `KEEP` verhindert doppelte Aufträge für denselben Gedanken. Der dritte Konstruktorparameter braucht eine eigene `WorkerFactory` – oder Hilt mit `@HiltWorker` und `@AssistedInject`; Bear umgeht das, indem der Worker sich den `AppContainer` holt.
+    resources:
+      - title: Work constraints
+        url: https://developer.android.com/develop/background-work/background-tasks/persistent/getting-started/define-work#work-constraints
+      - title: Manage work · Unique work
+        url: https://developer.android.com/develop/background-work/background-tasks/persistent/how-to/manage-work
+  - id: migration-falscher-typ
+    type: bug
+    title: Absturz nach dem Update
+    prompt: |
+      Version 3 der App fügt Themen eine Priorität hinzu. Neuinstallationen laufen. Wer aber von Version 2 aktualisiert, sieht beim ersten Start einen Absturz: `IllegalStateException: Migration didn't properly handle: topics(…)`, darunter `Expected: … priority=Column{name='priority', type='INTEGER', notNull=true, … defaultValue='0'}` und `Found: … priority=Column{name='priority', type='TEXT', notNull=false, … defaultValue='undefined'}`. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: kotlin
+    code: |
+      @Entity(tableName = "topics")
+      data class TopicEntity(
+          @PrimaryKey val issueId: String,
+          val title: String,
+          @ColumnInfo(defaultValue = "0") val priority: Int = 0,
+      )
+
+      val MIGRATION_2_3 = object : Migration(2, 3) {
+          override suspend fun migrate(connection: SQLiteConnection) {
+              connection.executeSQL("ALTER TABLE topics ADD COLUMN priority TEXT")
+          }
+      }
+
+      val db = Room.databaseBuilder<BearDatabase>(context, "bear.db")
+          .setDriver(AndroidSQLiteDriver())
+          .addMigrations(MIGRATION_2_3)
+          .build()
+    lines: [10]
+    fix:
+      - line: 10
+        answers:
+          - "connection.executeSQL(\"ALTER TABLE topics ADD COLUMN priority INTEGER NOT NULL DEFAULT 0\")"
+          - "connection.executeSQL(\"ALTER TABLE topics ADD COLUMN priority INTEGER DEFAULT 0 NOT NULL\")"
+          - "connection.executeSQL(\"ALTER TABLE `topics` ADD COLUMN `priority` INTEGER NOT NULL DEFAULT 0\")"
+    hints:
+      - Vergleiche „Expected“ und „Found“ Feld für Feld.
+      - Die Prüfung vergleicht den SQL-Text exakt – schreib Typ, dann `NOT NULL`, dann `DEFAULT 0`.
+    explanation: |
+      Room prüft nach jeder Migration, ob die Tabelle exakt dem Schema der Entity entspricht. Ein Kotlin-`Int` ohne `?` wird zu `INTEGER NOT NULL`, und `@ColumnInfo(defaultValue = "0")` verlangt den Standardwert 0. Die Migration legt aber eine nullable `TEXT`-Spalte ohne Standardwert an – drei Abweichungen, ein Absturz. Richtig ist `ADD COLUMN priority INTEGER NOT NULL DEFAULT 0`; der Standardwert ist bei `NOT NULL` ohnehin Pflicht, weil bestehende Zeilen sonst keinen Wert hätten. Für eine neue Spalte hätte eine `AutoMigration` diesen Fehler ausgeschlossen – und ein Migrationstest hätte ihn vor dem Release gefunden.
+    resources:
+      - title: Manual migrations
+        url: https://developer.android.com/training/data-storage/room/migrating-db-versions#manual
+      - title: Test migrations
+        url: https://developer.android.com/training/data-storage/room/migrating-db-versions#test
+  - id: funkloch-endgueltig
+    type: bug
+    title: Ein Funkloch, für immer verloren
+    prompt: |
+      Ein Tester fährt U-Bahn. Er speichert einen Gedanken kurz vor dem Tunnel; die Verbindung reißt mitten im Request ab. Auch Stunden später, mit bestem WLAN, kommt der Gedanke nie in Linear an. Im App Inspector steht der Auftrag auf `FAILED`. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: kotlin
+    code: |
+      override suspend fun doWork(): Result {
+          val id = inputData.getString(KEY_ID) ?: return Result.failure()
+          val thought = dao.get(id) ?: return Result.success()
+          if (thought.state == ThoughtState.InLinear) return Result.success()
+          return try {
+              val created = api.createIssue(thought.toDto())
+              dao.upsert(thought.copy(state = ThoughtState.InLinear, identifier = created.identifier))
+              Result.success()
+          } catch (e: IOException) {
+              dao.upsert(thought.copy(lastError = e.message))
+              Result.failure()
+          } catch (e: HttpException) {
+              if (e.code() >= 500) Result.retry() else Result.failure()
+          }
+      }
+    lines: [11]
+    fix:
+      - line: 11
+        answers: ["Result.retry()"]
+    hints:
+      - Welche Exception wirft ein abgerissener Request?
+      - Was bedeutet `failure()` für WorkManager – kommt danach noch ein Versuch?
+    explanation: |
+      Ein abgerissener Request endet mit einer `IOException`. Genau dieser Fall ist vorübergehend und sollte wiederholt werden. `Result.failure()` beendet den Auftrag aber endgültig; WorkManager versucht es nie wieder, und die Constraint „Netz verbunden“ hilft nicht mehr. Mit `Result.retry()` plant WorkManager nach dem Backoff einen neuen Versuch. Wiederholt werden darf der Aufruf nur, weil er idempotent ist – in Bear über die selbst erzeugte UUID, nach der der Worker vor einem erneuten Anlegen sucht.
+    resources:
+      - title: Retry and backoff policy
+        url: https://developer.android.com/develop/background-work/background-tasks/persistent/getting-started/define-work#retries_backoff
+  - id: send-thought-worker-erklaeren
+    type: explain
+    title: Bears SendThoughtWorker
+    prompt: |
+      Das ist Bears echter Worker (leicht gekürzt). Erkläre, wie er verhindert, dass ein Gedanke verloren geht oder doppelt in Linear landet, und welche Rolle die Zustände in Room spielen.
+    lang: kotlin
+    code: |
+      /** Sends one thought to INBOX. A lost answer never creates a second issue. */
+      class SendThoughtWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
+          override suspend fun doWork(): Result {
+              val c = (applicationContext as BearApp).container
+              val id = inputData.getString(KEY_ID) ?: return Result.failure()
+              val dao = c.db.thoughts()
+              val thought = dao.get(id) ?: return Result.success()
+              if (thought.state == ThoughtState.InLinear) return Result.success()
+              val key = c.settings.apiKey() ?: return Result.success() // sent later, after connecting
+              dao.upsert(thought.copy(state = ThoughtState.Sending))
+              return try {
+                  val target = inboxTarget(c, key) // INBOX-Team und Triage-Status
+                  val (title, description) = ThoughtText.split(thought.text)
+                  val created = try {
+                      c.linear.createIssue(key, id, target, title, description)
+                  } catch (e: LinearException) {
+                      // The answer may have been lost after Linear created the issue. Look it up by our UUID.
+                      c.linear.issue(key, id)?.let { CreatedIssue(it.identifier, it.url) } ?: throw e
+                  }
+                  dao.upsert(thought.copy(state = ThoughtState.InLinear, identifier = created.identifier, lastError = null))
+                  Result.success()
+              } catch (e: LinearException) {
+                  if (e.retryable) {
+                      dao.upsert(thought.copy(state = ThoughtState.Local, lastError = e.message))
+                      Result.retry()
+                  } else {
+                      dao.upsert(thought.copy(state = ThoughtState.NeedsAttention, lastError = e.message))
+                      Result.failure()
+                  }
+              }
+          }
+      }
+    points:
+      - Der Gedanke steht vorher schon in Room; der Worker liest ihn per ID, und bereits gesendete Gedanken (`InLinear`) oder gelöschte beendet er sofort mit Erfolg – Wiederholungen sind harmlos.
+      - Das Issue wird mit Bears eigener UUID angelegt; scheitert der Aufruf, sucht der Worker per UUID, ob Linear es trotzdem angelegt hat – so entsteht nie ein zweites Issue (Idempotenz).
+      - "`LinearException.retryable` trennt vorübergehende Fehler (`retry()` mit Backoff, Zustand zurück auf `Local`) von endgültigen (`failure()`, Zustand `NeedsAttention` für die UI)."
+      - Die Zustände in Room (`Local`, `Sending`, `InLinear`, `NeedsAttention`) plus `lastError` machen den Sendestatus für die UI sichtbar und überleben einen Prozesstod.
+      - Fehlt der API-Schlüssel, endet der Worker erfolgreich; `connectLinear` stößt das Senden später erneut an – ein Auftrag, der nie erfüllbar wäre, bleibt nicht in der Warteschlange hängen.
+    explanation: |
+      Der Worker ist so gebaut, dass man ihn beliebig oft starten kann. Er liest den Gedanken aus Room, der Single Source of Truth, und beendet sich sofort, wenn es nichts mehr zu tun gibt – ein doppelter Auftrag richtet also keinen Schaden an. Das Herzstück ist die Idempotenz: Das Issue bekommt Bears eigene UUID. Geht die Antwort verloren, nachdem Linear das Issue schon angelegt hat, findet der innere `catch` es über diese UUID wieder, statt ein zweites anzulegen. Der äußere `catch` unterscheidet über `retryable`: Vorübergehende Fehler setzen den Zustand zurück und geben die Wiederholung mit `retry()` an WorkManager ab; endgültige Fehler markieren den Gedanken als `NeedsAttention`, damit die UI den Nutzer um Hilfe bitten kann. Weil jeder Zwischenschritt in Room steht, überlebt der Status auch einen Prozesstod. Fehlt der Schlüssel, endet der Worker mit Erfolg statt endlos zu wiederholen – `connectLinear` sendet später alles Liegengebliebene.
+    resources:
+      - title: WorkManager in offline-first apps
+        url: https://developer.android.com/topic/architecture/data-layer/offline-first#workmanager-offline
+      - title: Queued writes
+        url: https://developer.android.com/topic/architecture/data-layer/offline-first#queued_writes
+  - id: edit-queue-erklaeren
+    type: explain
+    title: Die Outbox mit Versionsnummer
+    prompt: |
+      Bear sammelt Änderungen an Themen in der Tabelle `edits`, bevor sie an Linear gehen. Erkläre, was `record` und `done` tun und welches Problem die Spalte `version` löst. Warum steht `version` in der `WHERE`-Klausel?
+    lang: kotlin
+    code: |
+      @Entity(tableName = "edits")
+      data class EditEntity(
+          @PrimaryKey val issueId: String,
+          val title: String? = null,
+          val block: Boolean = false,
+          val version: Int = 1,
+          val updatedAt: Long,
+      )
+
+      // EditDao
+      /** Removes the row only if nothing new came in while it was being sent. */
+      @Query("DELETE FROM edits WHERE issueId = :issueId AND version = :version")
+      suspend fun done(issueId: String, version: Int): Int
+
+      // EditQueue
+      suspend fun record(issueId: String, title: String? = null, block: Boolean = false) {
+          val old = db.edits().get(issueId)
+          db.edits().upsert(
+              EditEntity(
+                  issueId = issueId,
+                  title = title ?: old?.title,
+                  block = block || old?.block == true,
+                  version = (old?.version ?: 0) + 1,
+                  updatedAt = System.currentTimeMillis(),
+              ),
+          )
+          enqueue(issueId)
+      }
+    points:
+      - Pro Thema gibt es höchstens eine Zeile; `record` verschmilzt neue Änderungen mit den offenen (neuer Titel ersetzt, `block` bleibt gesetzt).
+      - Jede Änderung erhöht `version` und stößt einen Sync-Auftrag an.
+      - Der Worker merkt sich die Version, die er gelesen hat, und löscht nach dem Senden nur, wenn die Zeile noch diese Version hat.
+      - Kommt während des Sendens eine neue Änderung, ist die Version gestiegen; `done` löscht nichts (Rückgabe 0), und die neue Änderung geht nicht verloren.
+      - Die Tabelle ist Teil der Single Source of Truth – nach einem Neustart weiß die App, was noch zu Linear muss.
+    explanation: |
+      `edits` ist eine Outbox: Sie hält fest, was noch nicht bei Linear angekommen ist. `record` liest die offene Zeile und verschmilzt die neue Änderung hinein – ein neuer Titel ersetzt den alten, ein geändertes Merksatz-Feld bleibt markiert –, erhöht `version` und plant einen Sync. Der Worker liest die Zeile, sendet und ruft danach `done(issueId, version)` mit der Version auf, die er gesendet hat. Die Bedingung `version = :version` ist eine optimistische Nebenläufigkeitskontrolle: Hat der Nutzer während des Sendens erneut etwas geändert, ist die Version inzwischen höher, der `DELETE` trifft keine Zeile und liefert 0. Die neue Änderung bleibt stehen und wird im nächsten Lauf gesendet. Ohne diese Bedingung würde der Worker eine Änderung löschen, die er nie gesehen hat.
+    resources:
+      - title: Offline-first · Synchronization and conflict resolution
+        url: https://developer.android.com/topic/architecture/data-layer/offline-first#synchronization-and
+      - title: Room · Query functions
+        url: https://developer.android.com/training/data-storage/room/accessing-data#query
+  - id: offline-first-repository
+    type: practice
+    title: Ein Offline-first-Repository
+    prompt: |
+      Schreibe `OfflineFirstTopicRepository` für eine REST-API. Gegeben sind:
+
+      ```kotlin
+      interface TopicApi { suspend fun topics(): List<TopicDto> }
+
+      @Dao
+      abstract class TopicDao {
+          @Query("SELECT * FROM topics ORDER BY title")
+          abstract fun observeAll(): Flow<List<TopicEntity>>
+          @Transaction
+          open suspend fun replaceAll(topics: List<TopicEntity>) { /* … */ }
+      }
+
+      data class Topic(val id: String, val title: String)
+      ```
+
+      Anforderungen:
+
+      - `observeTopics(): Flow<List<Topic>>` liest ausschließlich aus Room und bildet Entities auf das Domain-Modell ab.
+      - `refresh(): RefreshResult` lädt von der API, schreibt in einer Transaktion in Room und liefert ein fachliches Ergebnis.
+      - `RefreshResult` unterscheidet Erfolg, keine Verbindung, vom Server abgelehnt (mit HTTP-Code) und unlesbare Antwort.
+      - Abbrüche der Coroutine werden nicht verschluckt.
+      - Schreibe die Mapping-Funktionen `TopicDto.toEntity()` und `TopicEntity.toDomain()` als Erweiterungsfunktionen.
+    lang: kotlin
+    starter: |
+      sealed interface RefreshResult {
+          // Fälle
+      }
+
+      class OfflineFirstTopicRepository(
+          private val api: TopicApi,
+          private val dao: TopicDao,
+      ) {
+          fun observeTopics(): Flow<List<Topic>> = TODO()
+
+          suspend fun refresh(): RefreshResult = TODO()
+      }
+    solution: |
+      import kotlinx.coroutines.flow.Flow
+      import kotlinx.coroutines.flow.map
+      import kotlinx.serialization.SerializationException
+      import retrofit2.HttpException
+      import java.io.IOException
+
+      sealed interface RefreshResult {
+          data object Success : RefreshResult
+          data object Offline : RefreshResult
+          data class Rejected(val httpCode: Int) : RefreshResult
+          data class InvalidResponse(val detail: String) : RefreshResult
+      }
+
+      fun TopicDto.toEntity(): TopicEntity = TopicEntity(issueId = id, title = title)
+
+      fun TopicEntity.toDomain(): Topic = Topic(id = issueId, title = title)
+
+      class OfflineFirstTopicRepository(
+          private val api: TopicApi,
+          private val dao: TopicDao,
+      ) {
+          fun observeTopics(): Flow<List<Topic>> =
+              dao.observeAll().map { entities -> entities.map { it.toDomain() } }
+
+          suspend fun refresh(): RefreshResult = try {
+              val remote = api.topics()
+              dao.replaceAll(remote.map { it.toEntity() })
+              RefreshResult.Success
+          } catch (e: IOException) {
+              RefreshResult.Offline
+          } catch (e: HttpException) {
+              RefreshResult.Rejected(e.code())
+          } catch (e: SerializationException) {
+              RefreshResult.InvalidResponse(e.message ?: "unbekanntes Format")
+          }
+      }
+    checklist:
+      - "`observeTopics()` nutzt nur `dao.observeAll()` – kein Netzwerkaufruf im Lesepfad."
+      - "`refresh()` schreibt über `replaceAll` (eine Transaktion) in Room und gibt die Daten nicht direkt zurück."
+      - "`RefreshResult` ist ein Sealed Interface mit vier Fällen; `Success` und `Offline` sind `data object`."
+      - "`IOException`, `HttpException` und `SerializationException` werden getrennt gefangen."
+      - "Es gibt kein `catch (e: Exception)`, kein `catch (e: Throwable)` und kein `runCatching` – `CancellationException` läuft durch."
+      - DTO und Entity verlassen das Repository nicht; nach außen gibt es nur `Topic` und `RefreshResult`.
+    explanation: |
+      Der Lesepfad kommt ausschließlich aus Room, deshalb zeigt die App offline den letzten Stand, und nach einem erfolgreichen `refresh()` liefert der Flow die neue Liste von selbst. `refresh()` gibt keine Daten zurück, sondern nur, ob es geklappt hat – die Daten fließen über die Datenbank. Die drei `catch`-Blöcke entsprechen den drei Fehlerarten; eine `CancellationException` ist keine davon (sie erbt von `IllegalStateException`) und wird deshalb weitergereicht. Das ViewModel übersetzt `RefreshResult` in eine Meldung im UI-State. Im Modul „Testing“ testest du genau dieses Repository mit einem Fake für die API und einer In-Memory-Datenbank.
+    resources:
+      - title: Data layer · Expose errors
+        url: https://developer.android.com/topic/architecture/data-layer#expose-errors
+      - title: Offline-first · Reads
+        url: https://developer.android.com/topic/architecture/data-layer/offline-first#reads

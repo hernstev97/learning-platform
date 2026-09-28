@@ -1,0 +1,745 @@
+id: flow
+title: Flow, StateFlow und SharedFlow
+level: 3
+minutes: 180
+summary: Werte über die Zeit – kalte Flows und ihre Operatoren, Kontext und Fehler, heiße StateFlows und SharedFlows, stateIn mit WhileSubscribed und sicheres Sammeln auf Android.
+goals:
+  - Du erklärst den Unterschied zwischen kalten und heißen Flows und sagst voraus, wann ein Flow-Block ausgeführt wird.
+  - Du baust Pipelines mit `map`, `filter`, `debounce`, `distinctUntilChanged`, `combine` und `flatMapLatest` und behandelst Fehler mit `catch` und `retry`.
+  - Du nutzt `flowOn` statt `withContext` im Flow und erklärst Kontexterhaltung.
+  - Du modellierst UI-Zustand mit `StateFlow`, kennst Konflation und equals-basierte Deduplizierung und vermeidest veränderliche Objekte im State.
+  - Du wandelst kalte Flows mit `stateIn(…, WhileSubscribed(5_000), …)` in UI-Zustand um und sammelst sie lebenszyklusbewusst mit `repeatOnLifecycle` oder `collectAsStateWithLifecycle`.
+resources:
+  - title: Kotlin Docs · Flows
+    url: https://kotlinlang.org/docs/coroutines-flow.html
+  - title: Kotlin Docs · Flow operators
+    url: https://kotlinlang.org/docs/coroutines-flow-operators.html
+  - title: Android Developers · Kotlin flows on Android
+    url: https://developer.android.com/kotlin/flow
+  - title: Android Developers · StateFlow and SharedFlow
+    url: https://developer.android.com/kotlin/flow/stateflow-and-sharedflow
+lesson: |
+  Eine `suspend`-Funktion liefert **einen** Wert, irgendwann. Viele Daten in einer App sind aber keine einzelnen Werte, sondern Ströme: Die Liste der Gedanken in Bears Datenbank ändert sich, sobald du einen neuen speicherst. Der Suchtext ändert sich mit jedem Tastendruck. Die Einstellungen ändern sich, wenn du den Namen des Bären umbenennst. Für all das gibt es `Flow<T>` – eine Folge von Werten, die asynchron über die Zeit eintreffen ([Flows](https://kotlinlang.org/docs/coroutines-flow.html)).
+
+  In Bear siehst du die typische Kette: Room liefert einen `Flow<List<ThoughtEntity>>`, das ViewModel verbindet ihn mit `combine` mit den Einstellungen, macht mit `stateIn` einen `StateFlow<UiState>` daraus, und Compose sammelt ihn. Die Aufgaben im Kapitel „Vom Zustand zur Oberfläche“ des Tracks [Praxis: Kotlin mit Bear](/kotlin/bear-06) rekonstruieren genau diese Zeilen. Diese Lektion liefert das Modell dahinter: Wann läuft welcher Code, auf welchem Thread, was passiert bei Fehlern, und warum steht in fast jeder App `WhileSubscribed(5_000)`?
+
+  ## Kalte Flows: ein Rezept, kein Ergebnis
+
+  Ein Flow, den du mit `flow { … }` baust, ist **kalt**: Der Block läuft erst, wenn jemand `collect` aufruft – und zwar für **jeden** Collector erneut ([Cold flows](https://kotlinlang.org/docs/coroutines-flow.html#cold-flows)).
+
+  ```kotlin
+  val pages: Flow<String> = flow {
+      println("Starte Abruf")
+      for (page in 1..3) {
+          delay(100)            // suspend-Funktionen sind im Block erlaubt
+          emit("Seite $page")   // Wert an den Collector übergeben
+      }
+  }
+
+  suspend fun main() {
+      println("Flow erstellt")  // bisher ist nichts passiert
+      pages.collect { println(it) }
+      pages.collect { println(it) }   // "Starte Abruf" erscheint ein zweites Mal
+  }
+  ```
+
+  Das Denkmodell: `emit` ruft direkt den Lambda-Körper von `collect` auf. Produzent und Konsument laufen in **derselben Coroutine**, abwechselnd. Solange der Collector einen Wert verarbeitet, wartet der Produzent. Das ist dieselbe Idee wie bei Sequences aus dem Modul „Collections“, nur mit `suspend`.
+
+  Für einfache Fälle gibt es `flowOf(1, 2, 3)` und `.asFlow()` auf Ranges und Collections. Room, DataStore, Retrofit (mit Streaming) und Ktor liefern Flows direkt.
+
+  ## Operatoren: Pipelines über die Zeit
+
+  **Intermediate Operatoren** wie `map`, `filter`, `onEach`, `take` oder `transform` geben einen neuen, ebenfalls kalten Flow zurück. **Terminal-Operatoren** starten die Sammlung: `collect`, `first()`, `toList()`, `launchIn(scope)` ([Flow operators](https://kotlinlang.org/docs/coroutines-flow-operators.html)). Anders als bei Collections dürfen die Lambdas `suspend`-Funktionen aufrufen.
+
+  Drei Operatoren tauchen in fast jeder App auf:
+
+  - **`distinctUntilChanged()`** lässt einen Wert nur durch, wenn er sich vom vorherigen unterscheidet.
+  - **`debounce(300)`** wartet, bis 300 ms lang kein neuer Wert kam, und lässt dann den letzten durch – ideal für Suchfelder.
+  - **`flatMapLatest { … }`** startet für jeden Wert einen neuen inneren Flow und **bricht den vorherigen ab**. Tippt jemand „kot“ und dann „kotl“, wird die Suche nach „kot“ abgebrochen.
+
+  ```kotlin
+  @OptIn(FlowPreview::class, ExperimentalCoroutinesApi::class)
+  val results: Flow<List<Issue>> = queryFlow
+      .map { it.trim() }
+      .debounce(300)
+      .distinctUntilChanged()
+      .flatMapLatest { query -> repository.search(query) }
+  ```
+
+  `debounce` ist als `@FlowPreview`, `flatMapLatest` als `@ExperimentalCoroutinesApi` markiert (Stand kotlinx.coroutines 1.11); ohne `@OptIn` warnt der Compiler. Beide werden in der Praxis breit eingesetzt.
+
+  Um mehrere Flows zu verbinden, gibt es zwei Operatoren mit sehr unterschiedlichem Verhalten ([Combining operators](https://kotlinlang.org/docs/coroutines-flow-operators.html#combining-operators)):
+
+  - **`combine(a, b) { x, y -> … }`** rechnet jedes Mal neu, wenn **einer** der Flows einen Wert liefert, mit dem jeweils **neuesten** Wert des anderen. Das ist das Werkzeug für UI-Zustand aus mehreren Quellen.
+  - **`a.zip(b) { x, y -> … }`** paart das erste mit dem ersten, das zweite mit dem zweiten Element und endet, sobald einer der Flows endet.
+
+  ## Kontext, flowOn und Fehler
+
+  Ein Flow läuft im Kontext des **Collectors**. Innerhalb von `flow { … }` darfst du den Kontext nicht mit `withContext` wechseln und dann `emit` aufrufen – das Ergebnis ist eine `IllegalStateException` mit „Flow invariant is violated“. Diese Regel heißt **Kontexterhaltung**. Stattdessen setzt du `flowOn` ein: Es ändert den Kontext nur für den **Upstream**, also alles, was davor steht ([flowOn](https://kotlinlang.org/docs/coroutines-flow.html#change-the-coroutine-context-of-a-cold-flow-with-flowon)):
+
+  ```kotlin
+  fun readRows(file: File): Flow<Row> = flow {
+      file.bufferedReader().useLines { lines ->
+          lines.forEach { emit(parseRow(it)) }     // blockierendes Lesen …
+      }
+  }
+      .flowOn(Dispatchers.IO)                      // … läuft auf IO
+      .map { row -> row.normalize() }              // läuft beim Collector
+  ```
+
+  Fehler behandelst du mit **`catch`**. Es fängt nur Exceptions aus dem **Upstream** und kann einen Ersatzwert emittieren. Exceptions im `collect`-Lambda erreicht es nicht – Code, der pro Wert Fehler werfen kann, gehört deshalb in `onEach` **vor** `catch` ([Handle exceptions in flows](https://kotlinlang.org/docs/coroutines-flow.html#handle-exceptions-in-flows)). **`retry(3) { e -> e is IOException }`** startet den Upstream bei passenden Fehlern neu. Eine `CancellationException` fängt `catch` nicht – Abbruch bleibt Abbruch.
+
+  ```kotlin
+  repository.observeIssues()
+      .map { issues -> UiState.Success(issues) as UiState }
+      .retry(2) { e -> e is IOException }
+      .catch { e -> emit(UiState.Error(e.message ?: "Unbekannter Fehler")) }
+  ```
+
+  ## Heiße Flows: StateFlow und SharedFlow
+
+  Ein **heißer** Flow existiert unabhängig von Collectors. Wer sammelt, wird **Subscriber** und bekommt, was ab dann passiert; der Flow startet nicht neu ([Hot flows](https://kotlinlang.org/docs/coroutines-flow.html#hot-flows)).
+
+  **`StateFlow<T>`** hält immer genau einen aktuellen Wert, lesbar über `.value`. Neue Subscriber bekommen sofort den aktuellen Wert, danach jede Änderung. Zwei Eigenschaften musst du kennen ([StateFlow](https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines.flow/-state-flow/)):
+
+  1. **Deduplizierung über `equals`.** Setzt du einen Wert, der gleich dem aktuellen ist, passiert nichts.
+  2. **Konflation.** Ein langsamer Subscriber sieht nicht jeden Zwischenwert, sondern immer den neuesten. Für UI-Zustand ist das genau richtig – niemand muss veraltete Frames zeichnen.
+
+  ```kotlin
+  class EditorViewModel : ViewModel() {
+      private val _uiState = MutableStateFlow(EditorUiState())
+      val uiState: StateFlow<EditorUiState> = _uiState.asStateFlow()
+
+      fun onTextChange(text: String) {
+          _uiState.update { it.copy(draft = text) }   // atomar: lesen, kopieren, setzen
+      }
+  }
+  ```
+
+  `update { … }` ist wichtig, sobald der neue Zustand vom alten abhängt: `_uiState.value = _uiState.value.copy(…)` ist nicht atomar, und zwei gleichzeitige Updates können sich gegenseitig überschreiben ([update](https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines.flow/update.html)).
+
+  > [!WARNING] Keine veränderlichen Objekte im StateFlow
+  > Steckt eine `MutableList` im `StateFlow` und du rufst `state.value.add(x)` auf, ändert sich das Objekt, aber nicht die Referenz. `StateFlow` merkt nichts, kein Subscriber wird benachrichtigt, die UI bleibt stehen. Speichere unveränderliche Daten (`List`, `data class` mit `val`) und ersetze sie: `update { it + x }`.
+
+  **`SharedFlow<T>`** ist die allgemeinere Form: kein Pflicht-Startwert, keine Deduplizierung, konfigurierbarer `replay` (wie viele alte Werte neue Subscriber bekommen) und Puffer. Er passt für Ereignisströme, die mehrere Empfänger haben, etwa ein globaler „Abmelden“-Tick. Für einmalige UI-Ereignisse wie „Snackbar zeigen“ empfiehlt die Android-Architektur, sie als Zustand zu modellieren – das Modul „Architektur“ geht darauf ein.
+
+  Das Muster „privat `MutableStateFlow`, öffentlich `StateFlow`“ schützt den Zustand vor Schreibzugriffen von außen. Seit Kotlin 2.4 gibt es dafür auch **Explicit Backing Fields** (`val uiState: StateFlow<S>` mit `field = MutableStateFlow(S())`). Sie sparen die zweite Property, liefern aber nicht den read-only Wrapper von `asStateFlow()` ([Explicit backing fields](https://kotlinlang.org/docs/coroutines-flow.html#use-explicit-backing-fields-to-expose-hot-flows)).
+
+  ## stateIn und WhileSubscribed(5_000)
+
+  Meistens entsteht UI-Zustand aus kalten Flows der Datenschicht. `stateIn` macht daraus einen `StateFlow`, der den Upstream in einem Scope **teilt**: Egal wie viele Subscriber, die Datenbankabfrage läuft einmal ([stateIn](https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines.flow/state-in.html)):
+
+  ```kotlin
+  class ThoughtsViewModel(
+      thoughtRepository: ThoughtRepository,
+      settingsRepository: SettingsRepository,
+  ) : ViewModel() {
+      val uiState: StateFlow<ThoughtsUiState> =
+          combine(
+              thoughtRepository.observeThoughts(),
+              settingsRepository.bearName,
+          ) { thoughts, name -> ThoughtsUiState.Ready(name, thoughts) }
+              .stateIn(
+                  scope = viewModelScope,
+                  started = SharingStarted.WhileSubscribed(5_000),
+                  initialValue = ThoughtsUiState.Loading,
+              )
+  }
+  ```
+
+  Die drei Parameter: der **Scope**, in dem der Upstream gesammelt wird, die **Startstrategie** und der **Startwert**, den Subscriber sehen, bis der erste echte Wert da ist. Die Startstrategien ([SharingStarted](https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines.flow/-sharing-started/)):
+
+  - `Eagerly` startet sofort und läuft, bis der Scope endet.
+  - `Lazily` startet beim ersten Subscriber und läuft dann, bis der Scope endet.
+  - `WhileSubscribed(5_000)` startet beim ersten Subscriber und stoppt den Upstream **5 Sekunden nach dem letzten**.
+
+  Warum 5 Sekunden? Bei einer Drehung zerstört Android die Activity und baut sie neu; dazwischen gibt es kurz keinen Subscriber. Das ViewModel überlebt, und dank der Karenzzeit läuft die Datenbankabfrage einfach weiter. Geht die App dagegen in den Hintergrund, stoppt der Upstream nach 5 Sekunden und spart Akku und Datenbankzugriffe. Die Android-Dokumentation nutzt genau diesen Wert in ihren Beispielen ([State production](https://developer.android.com/topic/architecture/ui-layer/state-production)). `shareIn` funktioniert analog und liefert einen `SharedFlow` mit wählbarem `replay`.
+
+  > [!MERKE]
+  > `stateIn` gehört in eine **Property**, die einmal beim Erzeugen des ViewModels ausgewertet wird – nie in eine Funktion, die bei jedem Aufruf einen neuen StateFlow samt neuer Datenbankabfrage anlegt.
+
+  ## Sicher sammeln auf Android
+
+  Heiße Flows enden nicht von selbst. Wer sie sammelt, muss dafür sorgen, dass das Sammeln aufhört, wenn die Oberfläche nicht sichtbar ist. In Compose übernimmt das **`collectAsStateWithLifecycle()`** aus `androidx.lifecycle:lifecycle-runtime-compose`: Es sammelt ab `STARTED` und hört bei `STOPPED` auf ([Lifecycle-aware flow collection](https://developer.android.com/topic/libraries/architecture/coroutines#lifecycle-aware-flow-collection)).
+
+  ```kotlin
+  @Composable
+  fun ThoughtsRoute(viewModel: ThoughtsViewModel = viewModel()) {
+      val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+      ThoughtsScreen(uiState)
+  }
+  ```
+
+  Mit klassischen Views nutzt du `repeatOnLifecycle`: Es startet den Block bei jedem Erreichen von `STARTED` in einer neuen Coroutine und bricht ihn bei `STOPPED` ab ([StateFlow](https://developer.android.com/kotlin/flow/stateflow-and-sharedflow#stateflow)).
+
+  ```kotlin
+  lifecycleScope.launch {
+      repeatOnLifecycle(Lifecycle.State.STARTED) {
+          viewModel.uiState.collect { render(it) }
+      }
+  }
+  ```
+
+  Ein nacktes `lifecycleScope.launch { flow.collect { … } }` sammelt dagegen weiter, solange die Activity existiert – auch im Hintergrund. Weil `WhileSubscribed` dann immer einen Subscriber sieht, läuft auch der Upstream weiter.
+
+  ## Backpressure: buffer, conflate, collectLatest
+
+  Standardmäßig sind Produzent und Collector gekoppelt: Braucht der Collector 200 ms pro Wert, wartet der Produzent so lange. Drei Werkzeuge lösen das unterschiedlich ([Concurrent processing operators](https://kotlinlang.org/docs/coroutines-flow-operators.html#concurrent-processing-operators)):
+
+  | Operator | Verhalten | Typischer Einsatz |
+  | --- | --- | --- |
+  | `buffer(n)` | Produzent läuft in eigener Coroutine bis zu `n` Werte voraus | Produktion und Verarbeitung überlappen, kein Wert geht verloren |
+  | `conflate()` | Puffer der Größe 1, ältere Werte werden verworfen | Sensorwerte, Fortschritt – nur der neueste zählt |
+  | `collectLatest { … }` | Neuer Wert bricht die laufende Verarbeitung ab | Teure Verarbeitung, die bei neuem Input wertlos wird |
+
+  ## Testen: ein Ausblick
+
+  Flows testest du mit `runTest` und am bequemsten mit der Bibliothek [Turbine](https://github.com/cashapp/turbine): `flow.test { assertEquals(Loading, awaitItem()); assertEquals(Ready(…), awaitItem()) }` sammelt den Flow und prüft Wert für Wert. Das Modul „Testing“ zeigt das ausführlich, inklusive des Stolpersteins, dass `stateIn` mit `WhileSubscribed` im Test erst einen Subscriber braucht ([Testing Kotlin flows](https://developer.android.com/kotlin/flow/test)).
+
+  > [!PRAXIS] Die Pipeline im Code-Review
+  > Eine gute ViewModel-Pipeline liest sich von oben nach unten: Quellen (`combine` der Repository-Flows), Transformation (`map` in UI-Modelle), Fehler (`catch` → Fehlerzustand), dann `stateIn(viewModelScope, WhileSubscribed(5_000), Loading)`. Im Review fallen vor allem vier Dinge auf: ein öffentlich sichtbarer `MutableStateFlow`, `stateIn` in einer Funktion statt einer Property, ein nacktes `lifecycleScope.launch { collect }` und veränderliche Collections im State.
+
+  ## Häufige Fehler
+
+  - **`withContext` im `flow { }`-Block.** Symptom: `IllegalStateException: Flow invariant is violated`. Lösung: `flowOn`.
+  - **`catch` hinter der fehlerhaften Stelle erwartet.** `catch` sieht nur den Upstream; Fehler im `collect`-Lambda gehen am `catch` vorbei.
+  - **Mutable State.** Eine `MutableList` im `StateFlow` zu verändern löst keine Emission aus.
+  - **`stateIn` in einer Funktion oder einem Getter.** Jeder Aufruf erzeugt einen neuen StateFlow und startet den Upstream neu.
+  - **Sammeln ohne Lebenszyklus.** `launchIn(lifecycleScope)` oder `lifecycleScope.launch { collect }` sammelt im Hintergrund weiter. Lösung: `repeatOnLifecycle` oder `collectAsStateWithLifecycle`.
+  - **`combine` mit einem Flow, der nie emittiert.** `combine` liefert erst, wenn **jeder** Quell-Flow mindestens einen Wert hatte. Ein leerer Flow blockiert die ganze Pipeline; `onStart { emit(default) }` hilft.
+
+  > [!INTERVIEW] „Was ist der Unterschied zwischen Flow, StateFlow und SharedFlow?“
+  > Gute Antwort: „`Flow` ist kalt: Der Code läuft pro Collector neu, erst beim Sammeln. `StateFlow` und `SharedFlow` sind heiß und werden von allen Subscribern geteilt. `StateFlow` hat immer einen Wert, liefert neuen Subscribern sofort den aktuellen, dedupliziert über `equals` und konfliert – das passt für UI-Zustand. `SharedFlow` hat keinen Startwert, dedupliziert nicht und hat einen konfigurierbaren Replay-Puffer, das passt für Ereignisse mit mehreren Empfängern. Im ViewModel mache ich aus Repository-Flows mit `stateIn(viewModelScope, WhileSubscribed(5_000), initial)` einen StateFlow und sammle ihn in Compose mit `collectAsStateWithLifecycle`.“
+
+  ## Zusammenfassung
+
+  - `Flow` ist kalt: Der Block läuft bei jedem `collect` neu, im Kontext des Collectors, Wert für Wert.
+  - Operatoren: `map`, `filter`, `onEach`, `debounce`, `distinctUntilChanged`, `flatMapLatest` (bricht den vorherigen inneren Flow ab), `combine` (neueste Werte) und `zip` (paarweise).
+  - `flowOn` wechselt den Kontext des Upstreams; `withContext` + `emit` im Flow ist verboten. `catch` fängt nur Upstream-Fehler, `retry` startet neu.
+  - `StateFlow` hält einen Wert, dedupliziert über `equals` und konfliert. Unveränderliche Daten speichern und mit `update { }` atomar ersetzen.
+  - `SharedFlow` für Ereignisse mit mehreren Empfängern, mit `replay` und Puffer.
+  - `stateIn(scope, WhileSubscribed(5_000), initial)` in einer Property: teilt den Upstream, überlebt Drehungen, stoppt im Hintergrund.
+  - Auf Android lebenszyklusbewusst sammeln: `collectAsStateWithLifecycle()` in Compose, `repeatOnLifecycle(STARTED)` bei Views.
+  - Backpressure: `buffer` (vorausproduzieren), `conflate` (nur den neuesten), `collectLatest` (Verarbeitung abbrechen).
+exercises:
+  - id: kalt-oder-heiss
+    type: choice
+    title: Kalt, heiß, geteilt
+    prompt: Welche Aussagen stimmen?
+    options:
+      - text: "Der Block von `flow { … }` läuft für jeden Collector erneut von vorne."
+        correct: true
+        why: Ein kalter Flow ist ein Rezept. Jedes `collect` führt es neu aus, zwei Collector bedeuten also zwei Netzwerkaufrufe.
+      - text: "Ein `StateFlow` benachrichtigt Subscriber nicht, wenn der neue Wert `equals` dem alten ist."
+        correct: true
+        why: "`StateFlow` dedupliziert über `equals`. Darum funktionieren `data class`-Zustände mit `copy` gut – und darum löst das Verändern einer `MutableList` im State nichts aus."
+      - text: "`stateIn` startet den Upstream für jeden Subscriber neu."
+        correct: false
+        why: "`stateIn` teilt eine einzige Upstream-Sammlung im angegebenen Scope zwischen allen Subscribern. Genau das ist sein Zweck."
+      - text: "Ein Subscriber eines `StateFlow` sieht garantiert jeden Zwischenwert, auch wenn er langsam ist."
+        correct: false
+        why: "`StateFlow` ist konfliert: Ein langsamer Subscriber bekommt den jeweils neuesten Wert, Zwischenstände können fehlen."
+    explanation: |
+      Kalte Flows koppeln Produktion an den Collector: Ohne Collector passiert nichts, jeder Collector bekommt seine eigene Ausführung. Heiße Flows existieren unabhängig und werden geteilt. `StateFlow` verhält sich wie eine beobachtbare Variable: immer ein Wert, keine Duplikate, nur der neueste zählt. Genau diese Eigenschaften machen ihn zum Standard für UI-Zustand.
+    resources:
+      - title: Kotlin Docs · Cold flows
+        url: https://kotlinlang.org/docs/coroutines-flow.html#cold-flows
+      - title: Kotlin API · StateFlow
+        url: https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines.flow/-state-flow/
+  - id: while-subscribed
+    type: choice
+    title: Warum fünf Sekunden?
+    prompt: |
+      Ein ViewModel nutzt `stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), Loading)` auf einem Room-Flow. Was bewirkt die `5_000`?
+    options:
+      - text: Nach dem letzten Subscriber läuft die Room-Abfrage noch 5 Sekunden weiter, bevor sie gestoppt wird. So überlebt sie eine Bildschirmdrehung ohne Neustart.
+        correct: true
+        why: Bei einer Drehung gibt es kurz keinen Subscriber, weil die Activity neu gebaut wird. Die Karenzzeit überbrückt diese Lücke; im Hintergrund stoppt der Upstream nach 5 Sekunden.
+      - text: Der erste Wert wird frühestens nach 5 Sekunden an die UI geliefert.
+        correct: false
+        why: Der Upstream startet sofort beim ersten Subscriber. Die Zahl betrifft nur das Stoppen nach dem letzten Subscriber.
+      - text: Der `StateFlow` wird alle 5 Sekunden neu berechnet.
+        correct: false
+        why: "`stateIn` kennt kein Polling. Neue Werte kommen, wenn der Upstream (hier Room) etwas emittiert."
+      - text: Nach 5 Sekunden ohne Subscriber wird `uiState.value` auf `Loading` zurückgesetzt.
+        correct: false
+        why: Standardmäßig behält der `StateFlow` seinen letzten Wert. Zurückgesetzt wird nur, wenn man zusätzlich `replayExpirationMillis` konfiguriert.
+    explanation: |
+      `WhileSubscribed(stopTimeoutMillis)` startet den Upstream beim ersten Subscriber und stoppt ihn `stopTimeoutMillis` nach dem letzten. 5 000 ms sind der Wert aus der Android-Dokumentation: lang genug für eine Konfigurationsänderung, kurz genug, damit eine App im Hintergrund keine Datenbank- oder Netzwerkressourcen verbraucht. Der zuletzt gesammelte Wert bleibt erhalten; kommt ein neuer Subscriber, sieht er ihn sofort, während der Upstream neu startet.
+    resources:
+      - title: Kotlin API · SharingStarted.WhileSubscribed
+        url: https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines.flow/-sharing-started/-companion/-while-subscribed.html
+      - title: Android Developers · State production
+        url: https://developer.android.com/topic/architecture/ui-layer/state-production
+  - id: repeat-on-lifecycle
+    type: order
+    title: Sicher sammeln in einer Activity
+    prompt: |
+      Bring die Zeilen in die richtige Reihenfolge, sodass die Activity den `uiState` nur sammelt, solange sie mindestens `STARTED` ist.
+    lang: kotlin
+    lines: |
+      override fun onCreate(savedInstanceState: Bundle?) {
+          super.onCreate(savedInstanceState)
+          lifecycleScope.launch {
+              repeatOnLifecycle(Lifecycle.State.STARTED) {
+                  viewModel.uiState.collect { state -> render(state) }
+              }
+          }
+      }
+    explanation: |
+      `lifecycleScope.launch` startet eine Coroutine, die lebt, solange die Activity existiert. `repeatOnLifecycle(STARTED)` suspendiert diese Coroutine und startet den inneren Block jedes Mal neu, wenn die Activity sichtbar wird, und bricht ihn ab, wenn sie gestoppt wird. Erst darin wird gesammelt. Die Reihenfolge ist also: äußere Coroutine → Lebenszyklus-Klammer → Sammeln. Ein `collect` direkt in `lifecycleScope.launch` würde auch im Hintergrund weitersammeln. In Compose ersetzt `collectAsStateWithLifecycle()` diese ganze Konstruktion.
+    resources:
+      - title: Android Developers · StateFlow (repeatOnLifecycle)
+        url: https://developer.android.com/kotlin/flow/stateflow-and-sharedflow#stateflow
+  - id: kalter-flow-ausgabe
+    type: output
+    title: Wie oft wird abgerufen?
+    prompt: Was gibt das Programm aus?
+    lang: kotlin
+    code: |
+      import kotlinx.coroutines.*
+      import kotlinx.coroutines.flow.*
+
+      fun main() = runBlocking {
+          val pages = flow {
+              println("Starte Abruf")
+              for (i in 1..2) {
+                  emit("Seite $i")
+              }
+          }
+          println("Flow erstellt")
+          pages.collect { println("A: $it") }
+          println(pages.first())
+      }
+    expected: |
+      Flow erstellt
+      Starte Abruf
+      A: Seite 1
+      A: Seite 2
+      Starte Abruf
+      Seite 1
+    explanation: |
+      `flow { … }` erzeugt nur eine Beschreibung; „Flow erstellt“ kommt deshalb zuerst. `collect` führt den Block aus, jedes `emit` ruft direkt die Collector-Lambda auf. `first()` ist ein zweiter Terminal-Operator und startet den Block **erneut** – „Starte Abruf“ erscheint zweimal. Nach dem ersten Wert bricht `first()` den Flow ab, „Seite 2“ wird nicht mehr produziert. Stünde in dem Block ein Netzwerkaufruf, gäbe es zwei Requests; wer das Ergebnis teilen will, braucht `stateIn` oder `shareIn`.
+    resources:
+      - title: Kotlin Docs · Collect a cold flow
+        url: https://kotlinlang.org/docs/coroutines-flow.html#collect-a-cold-flow
+  - id: stateflow-konflation
+    type: output
+    title: Was sieht der Subscriber?
+    prompt: Was gibt das Programm aus? Alles läuft auf dem einen Thread von `runBlocking`.
+    lang: kotlin
+    code: |
+      import kotlinx.coroutines.*
+      import kotlinx.coroutines.flow.*
+
+      fun main() = runBlocking {
+          val state = MutableStateFlow(0)
+          val job = launch { state.collect { println("gesehen $it") } }
+          delay(10)
+          state.value = 1
+          state.value = 1
+          state.value = 2
+          state.value = 3
+          delay(10)
+          state.value = 3
+          delay(10)
+          job.cancel()
+      }
+    expected: |
+      gesehen 0
+      gesehen 3
+    explanation: |
+      Der Subscriber bekommt beim Start sofort den aktuellen Wert `0`. Die vier Zuweisungen danach laufen ohne Suspension Point hintereinander; der Subscriber kommt erst beim nächsten `delay` wieder an die Reihe und sieht dann nur noch den neuesten Wert `3` – das ist Konflation. Die spätere Zuweisung `3` ist `equals` dem aktuellen Wert und löst gar nichts aus – das ist Deduplizierung. Für UI-Zustand ist das ideal; für Ereignisse, bei denen jeder einzelne Wert zählt, ist `StateFlow` das falsche Werkzeug.
+    resources:
+      - title: Kotlin API · StateFlow (Conflation)
+        url: https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines.flow/-state-flow/
+  - id: catch-position
+    type: output
+    title: Wo landet der Fehler?
+    prompt: Was gibt das Programm aus?
+    lang: kotlin
+    code: |
+      import kotlinx.coroutines.*
+      import kotlinx.coroutines.flow.*
+
+      fun main() = runBlocking {
+          flowOf(1, 2, 3)
+              .map { value ->
+                  check(value != 2) { "kaputt bei $value" }
+                  value * 10
+              }
+              .catch { e ->
+                  println("catch: ${e.message}")
+                  emit(-1)
+              }
+              .collect { println(it) }
+          println("fertig")
+      }
+    expected: |
+      10
+      catch: kaputt bei 2
+      -1
+      fertig
+    explanation: |
+      `1` wird zu `10` und kommt beim Collector an. Bei `2` wirft `check` eine `IllegalStateException` im `map` – das ist Upstream von `catch`. `catch` fängt sie, druckt die Meldung und emittiert `-1` als Ersatzwert. Danach ist der Flow **beendet**: Der Upstream ist durch die Exception abgebrochen, `3` wird nie verarbeitet. Wer nach einem Fehler weitermachen will, braucht `retry` (startet den ganzen Upstream neu) oder behandelt den Fehler innerhalb von `map` selbst.
+    resources:
+      - title: Kotlin Docs · Use the .catch() operator
+        url: https://kotlinlang.org/docs/coroutines-flow.html#use-the-catch-operator-to-handle-upstream-exceptions
+  - id: suche-pipeline
+    type: gap
+    title: Eine Suche, die nicht jeden Tastendruck schickt
+    prompt: |
+      Ergänze die Pipeline: Warte **300 ms** Ruhe ab, ignoriere unveränderte Suchtexte und brich eine laufende Suche ab, sobald ein neuer Suchtext kommt.
+    lang: kotlin
+    code: |
+      @OptIn(FlowPreview::class, ExperimentalCoroutinesApi::class)
+      fun searchResults(
+          query: Flow<String>,
+          repository: IssueRepository,
+      ): Flow<List<Issue>> = query
+          .map { it.trim() }
+          .⟦debounce(300)⟧
+          .⟦distinctUntilChanged()⟧
+          .⟦flatMapLatest⟧ { q -> repository.search(q) }
+    gaps:
+      - label: Ruhephase abwarten
+        hint: Lässt einen Wert erst durch, wenn eine bestimmte Zeit lang kein neuer kam.
+        accept: ["debounce(timeoutMillis = 300)", "debounce(300L)", "debounce(300.milliseconds)"]
+      - label: Duplikate unterdrücken
+        hint: Lässt nur Werte durch, die sich vom vorherigen unterscheiden.
+      - label: vorherige Suche abbrechen
+        hint: Wie `flatMap`, aber nur der neueste innere Flow lebt.
+    explanation: |
+      `debounce(300)` sorgt dafür, dass beim schnellen Tippen von „kotlin“ nicht sechs Anfragen entstehen, sondern eine. `distinctUntilChanged()` steht **nach** `map { it.trim() }` und `debounce`, damit „kotlin“ und „kotlin “ als gleich gelten und keine zweite Suche auslösen. `flatMapLatest` bricht den inneren Flow der vorherigen Suche ab, sobald ein neuer Suchtext kommt – so überschreibt keine langsame alte Antwort eine neuere. `flatMapConcat` würde warten, `flatMapMerge` beide Ergebnisse durcheinander liefern.
+    resources:
+      - title: Kotlin API · debounce
+        url: https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines.flow/debounce.html
+      - title: Kotlin API · flatMapLatest
+        url: https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines.flow/flat-map-latest.html
+  - id: state-in-viewmodel
+    type: gap
+    title: UI-Zustand aus zwei Quellen
+    prompt: |
+      Verbinde die Gedanken aus der Datenbank mit dem Namen des Bären zu einem UI-Zustand. Neu berechnet werden soll, sobald **eine** der Quellen einen neuen Wert liefert. Der Upstream soll 5 Sekunden nach dem letzten Subscriber stoppen.
+    lang: kotlin
+    code: |
+      class ThoughtsViewModel(
+          thoughts: Flow<List<Thought>>,
+          bearName: Flow<String>,
+          scope: CoroutineScope,
+      ) {
+          val uiState: ⟦StateFlow⟧<ThoughtsUiState> =
+              ⟦combine⟧(thoughts, bearName) { list, name ->
+                  ThoughtsUiState.Ready(name, list) as ThoughtsUiState
+              }.⟦stateIn⟧(
+                  scope = scope,
+                  started = SharingStarted.⟦WhileSubscribed(5_000)⟧,
+                  initialValue = ThoughtsUiState.Loading,
+              )
+      }
+    gaps:
+      - label: Typ des Ergebnisses
+        hint: Ein heißer Flow mit immer genau einem aktuellen Wert.
+      - label: neueste Werte verbinden
+        hint: Nicht `zip` – der Operator rechnet bei jeder Änderung mit dem jeweils neuesten Wert der anderen Quelle.
+      - label: kalt → heiß
+        hint: Macht aus einem Flow einen StateFlow mit Scope, Startstrategie und Startwert.
+      - label: Startstrategie
+        hint: Aktiv, solange es Subscriber gibt, plus Karenzzeit in Millisekunden.
+        accept: ["WhileSubscribed(5000)", "WhileSubscribed(stopTimeoutMillis = 5_000)", "WhileSubscribed(stopTimeoutMillis = 5000)"]
+    explanation: |
+      `combine` wartet, bis beide Quellen mindestens einen Wert hatten, und rechnet dann bei jeder neuen Emission mit dem neuesten Wert der jeweils anderen Quelle. `stateIn` teilt diese Pipeline zwischen allen Subscribern und stellt mit `initialValue` sofort einen Zustand bereit. `WhileSubscribed(5_000)` hält den Upstream nach dem letzten Subscriber noch 5 Sekunden am Leben – genug für eine Drehung. Der Cast `as ThoughtsUiState` hilft der Typinferenz, damit das Ergebnis `Flow<ThoughtsUiState>` statt `Flow<Ready>` ist; alternativ gibt man `combine` den Typ explizit an. Im echten ViewModel wäre `scope` der `viewModelScope`.
+    resources:
+      - title: Kotlin API · stateIn
+        url: https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines.flow/state-in.html
+      - title: Kotlin API · combine
+        url: https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines.flow/combine.html
+  - id: flow-on
+    type: gap
+    title: Lesen auf IO, ohne die Regeln zu brechen
+    prompt: |
+      Die Zeilen einer großen Datei sollen auf `Dispatchers.IO` gelesen werden. Die Zuordnung zu `Row` soll im Kontext des Collectors bleiben. Ergänze den Operator.
+    lang: kotlin
+    code: |
+      fun importRows(file: File): Flow<Row> = flow {
+          file.bufferedReader().useLines { lines ->
+              lines.forEach { emit(it) }
+          }
+      }
+          .⟦flowOn⟧(Dispatchers.IO)
+          .map { line -> Row.parse(line) }
+    gaps:
+      - label: Kontext des Upstreams wechseln
+        hint: Ein Operator, der nur beeinflusst, was **vor** ihm steht.
+    explanation: |
+      `flowOn(Dispatchers.IO)` lässt den `flow { … }`-Block – inklusive des blockierenden Lesens – auf dem IO-Pool laufen. Alles danach, hier `map`, läuft weiter im Kontext des Collectors. Intern startet `flowOn` bei einem Dispatcher-Wechsel eine eigene Coroutine und einen Puffer zwischen den beiden Seiten. `withContext(Dispatchers.IO) { … emit(…) }` im Block wäre verboten, weil `emit` dann aus einem fremden Kontext käme; der Flow würde mit „Flow invariant is violated“ abbrechen.
+    resources:
+      - title: Kotlin Docs · Change the coroutine context with .flowOn()
+        url: https://kotlinlang.org/docs/coroutines-flow.html#change-the-coroutine-context-of-a-cold-flow-with-flowon
+  - id: veraenderliche-liste-im-state
+    type: bug
+    title: Der Warenkorb aktualisiert sich nicht
+    prompt: |
+      Nach `add(item)` bleibt die Anzeige des Warenkorbs unverändert. Erst nach einer Drehung erscheinen die neuen Artikel. Es gibt zwei zusammenhängende fehlerhafte Zeilen. Finde und korrigiere beide.
+    lang: kotlin
+    code: |
+      class CartStore {
+          private val _items = MutableStateFlow(mutableListOf<Item>())
+          val items: StateFlow<List<Item>> = _items.asStateFlow()
+
+          fun add(item: Item) {
+              _items.value.add(item)
+          }
+      }
+    lines: [2, 6]
+    fix:
+      - line: 2
+        answers:
+          - "private val _items = MutableStateFlow<List<Item>>(emptyList())"
+          - "private val _items = MutableStateFlow(emptyList<Item>())"
+          - "private val _items = MutableStateFlow(listOf<Item>())"
+          - "private val _items: MutableStateFlow<List<Item>> = MutableStateFlow(emptyList())"
+      - line: 6
+        answers:
+          - "_items.update { it + item }"
+          - "_items.update { current -> current + item }"
+          - "_items.value = _items.value + item"
+          - "_items.value += item"
+    explanation: |
+      `_items.value.add(item)` verändert das Listen-Objekt, das schon im `StateFlow` steckt. Die Referenz bleibt dieselbe, `StateFlow` sieht keinen neuen Wert und benachrichtigt niemanden. Nach einer Drehung liest die neue UI `value` und sieht die veränderte Liste – daher das seltsame Symptom. Die Lösung: unveränderliche `List` speichern und bei jeder Änderung eine neue Liste setzen. `update { it + item }` ist dabei atomar; die Variante mit `value = value + item` funktioniert, kann aber bei gleichzeitigen Aufrufen ein Update verlieren. Zeile 2 muss mitgeändert werden, weil `it + item` eine `List` liefert, keine `MutableList`.
+    resources:
+      - title: Kotlin Docs · Create a StateFlow
+        url: https://kotlinlang.org/docs/coroutines-flow.html#create-a-stateflow
+      - title: Kotlin API · update
+        url: https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines.flow/update.html
+  - id: state-in-in-funktion
+    type: bug
+    title: Die Datenbank wird ständig neu abgefragt
+    prompt: |
+      Der Profiler zeigt, dass bei jeder Recomposition des Profil-Bildschirms eine neue Room-Abfrage startet, und im Speicher sammeln sich `StateFlow`-Objekte. Der Screen ruft `viewModel.uiState().collectAsStateWithLifecycle()` auf. Finde die Zeile und korrigiere sie so, dass es genau **einen** geteilten `StateFlow` gibt. Der Aufrufer wird danach auf `viewModel.uiState` umgestellt.
+    lang: kotlin
+    code: |
+      class ProfileViewModel(
+          private val repository: ProfileRepository,
+          private val scope: CoroutineScope,
+      ) {
+          fun uiState(): StateFlow<ProfileUiState> = repository.observeProfile()
+              .map { ProfileUiState.Ready(it) as ProfileUiState }
+              .stateIn(scope, SharingStarted.WhileSubscribed(5_000), ProfileUiState.Loading)
+      }
+    lines: [5]
+    fix:
+      - line: 5
+        answers:
+          - "val uiState: StateFlow<ProfileUiState> = repository.observeProfile()"
+    explanation: |
+      Eine Funktion wertet ihren Körper bei jedem Aufruf neu aus. Jeder Aufruf von `uiState()` baut also eine neue Pipeline, ruft `stateIn` auf und startet – sobald gesammelt wird – eine neue Room-Abfrage in `scope`. Weil die Sharing-Coroutines im ViewModel-Scope leben, sammeln sie sich an. Als `val` wird der Ausdruck genau einmal beim Erzeugen des ViewModels ausgewertet; alle Subscriber teilen denselben `StateFlow`. Dasselbe Problem entsteht mit einem Getter (`val uiState get() = …stateIn(…)`).
+    resources:
+      - title: Android Developers · State production (stateIn)
+        url: https://developer.android.com/topic/architecture/ui-layer/state-production
+  - id: pipeline-erklaeren
+    type: explain
+    title: Eine Detailansicht, die dem Nutzer folgt
+    prompt: |
+      Erkläre die Pipeline so, wie du sie im Code-Review einem Junior erklären würdest: Was passiert, wenn der Nutzer ein anderes Issue auswählt, wenn die Datenbank sich ändert, wenn ein Fehler auftritt und wenn die App in den Hintergrund geht?
+    lang: kotlin
+    code: |
+      @OptIn(ExperimentalCoroutinesApi::class)
+      class IssueDetailViewModel(
+          private val repository: IssueRepository,
+          scope: CoroutineScope,
+      ) {
+          private val selectedId = MutableStateFlow<String?>(null)
+
+          val uiState: StateFlow<DetailUiState> = selectedId
+              .filterNotNull()
+              .flatMapLatest { id ->
+                  repository.observeIssue(id)
+                      .map<Issue, DetailUiState> { DetailUiState.Ready(it) }
+                      .onStart { emit(DetailUiState.Loading) }
+                      .catch { emit(DetailUiState.Error("Issue konnte nicht geladen werden")) }
+              }
+              .stateIn(scope, SharingStarted.WhileSubscribed(5_000), DetailUiState.Empty)
+
+          fun select(id: String) {
+              selectedId.value = id
+          }
+      }
+    points:
+      - Solange nichts ausgewählt ist, lässt `filterNotNull` nichts durch, und der Zustand bleibt beim Startwert `Empty`.
+      - "`flatMapLatest` bricht bei einer neuen Auswahl die Beobachtung des alten Issues ab und startet die neue, beginnend mit `Loading`."
+      - Ändert sich das Issue in der Datenbank, emittiert `observeIssue` erneut, und die UI bekommt ein neues `Ready`, ohne dass jemand neu lädt.
+      - "`catch` steht im inneren Flow: Ein Fehler beendet nur die Beobachtung dieses Issues und zeigt `Error`, die äußere Pipeline bleibt aktiv und reagiert auf die nächste Auswahl."
+      - "`stateIn` mit `WhileSubscribed(5_000)` teilt die Pipeline und stoppt die Datenbankbeobachtung 5 Sekunden nach dem letzten Subscriber, etwa im Hintergrund."
+    explanation: |
+      `selectedId` ist die Eingabe: ein `MutableStateFlow`, den nur `select` verändert. `filterNotNull` blendet den Anfangszustand `null` aus; bis zur ersten Auswahl zeigt die UI den `initialValue` `Empty`. Bei jeder Auswahl startet `flatMapLatest` einen neuen inneren Flow und bricht den alten ab – eine späte Antwort für das vorherige Issue kann also nie die aktuelle Anzeige überschreiben. Der innere Flow beginnt dank `onStart` mit `Loading` und liefert danach bei jeder Änderung in der Datenbank ein neues `Ready`, weil Room-Flows bei Änderungen erneut emittieren. Entscheidend ist die Position von `catch`: Es steht **innerhalb** von `flatMapLatest`. Scheitert die Beobachtung, wird sie durch `Error` ersetzt, aber die äußere Pipeline lebt weiter und reagiert auf die nächste Auswahl. Stünde `catch` außen, wäre nach dem ersten Fehler die ganze Pipeline beendet. `stateIn` teilt das Ergebnis und stoppt über `WhileSubscribed(5_000)` die Datenbankbeobachtung, wenn niemand mehr zuschaut, etwa weil die App im Hintergrund ist. `select` braucht kein `update`, weil der neue Wert nicht vom alten abhängt.
+    resources:
+      - title: Kotlin API · flatMapLatest
+        url: https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines.flow/flat-map-latest.html
+      - title: Kotlin Docs · Handle exceptions in flows
+        url: https://kotlinlang.org/docs/coroutines-flow.html#handle-exceptions-in-flows
+  - id: such-viewmodel
+    type: practice
+    title: Ein Such-ViewModel mit Flow
+    prompt: |
+      Baue die Zustandslogik einer Suchmaske – ohne Android, damit du sie in IntelliJ IDEA oder im [Kotlin Playground](https://play.kotlinlang.org/) mit `kotlinx-coroutines-core` ausführen kannst. `scope` steht für den `viewModelScope`.
+
+      Anforderungen an `SearchViewModel`:
+
+      - `onQueryChange(text)` setzt den Suchtext. Nach außen gibt es nur `state: StateFlow<SearchState>`.
+      - Suchtexte werden getrimmt, erst nach **300 ms** Ruhe verarbeitet, und unveränderte Texte lösen keine neue Suche aus.
+      - Texte mit weniger als 2 Zeichen ergeben `Idle`, ohne das Repository aufzurufen.
+      - Jede Suche beginnt mit `Loading`; eine neue Eingabe bricht eine laufende Suche ab.
+      - Eine `IOException` aus dem Repository wird zu `Failed("Keine Verbindung")`; die Suche funktioniert danach für neue Eingaben weiter.
+      - `stateIn` mit `WhileSubscribed(5_000)` und Startwert `Idle`.
+
+      Die Ausgabe des Startcodes soll am Ende so aussehen:
+
+      ```text
+      Idle
+      Loading
+      Results(items=[kot-1, kot-2])
+      Loading
+      Failed(message=Keine Verbindung)
+      Anfragen: [kot, offline]
+      ```
+    lang: kotlin
+    starter: |
+      import java.io.IOException
+      import kotlinx.coroutines.*
+      import kotlinx.coroutines.flow.*
+
+      interface SearchRepository {
+          fun search(query: String): Flow<List<String>>
+      }
+
+      sealed interface SearchState {
+          data object Idle : SearchState
+          data object Loading : SearchState
+          data class Results(val items: List<String>) : SearchState
+          data class Failed(val message: String) : SearchState
+      }
+
+      class SearchViewModel(
+          private val repository: SearchRepository,
+          scope: CoroutineScope,
+      ) {
+          // Dein Code: privater Suchtext, öffentlicher state, onQueryChange
+      }
+
+      class FakeRepository : SearchRepository {
+          val requests = mutableListOf<String>()
+          override fun search(query: String): Flow<List<String>> = flow {
+              requests += query
+              delay(100)
+              if (query == "offline") throw IOException("kein Netz")
+              emit(listOf("$query-1", "$query-2"))
+          }
+      }
+
+      fun main() = runBlocking {
+          val repo = FakeRepository()
+          val vmJob = Job()   // steht für den Lebenszyklus des ViewModels
+          val vm = SearchViewModel(repo, this + vmJob)
+          val collector = launch { vm.state.collect { println(it) } }
+          delay(50)
+          vm.onQueryChange("k")
+          vm.onQueryChange("ko")
+          vm.onQueryChange("kot")
+          delay(500)
+          vm.onQueryChange("kot ")
+          delay(500)
+          vm.onQueryChange("offline")
+          delay(500)
+          println("Anfragen: ${repo.requests}")
+          collector.cancel()
+          vmJob.cancel()      // wie onCleared(): beendet die Sharing-Coroutine
+      }
+    solution: |
+      import java.io.IOException
+      import kotlinx.coroutines.*
+      import kotlinx.coroutines.flow.*
+
+      interface SearchRepository {
+          fun search(query: String): Flow<List<String>>
+      }
+
+      sealed interface SearchState {
+          data object Idle : SearchState
+          data object Loading : SearchState
+          data class Results(val items: List<String>) : SearchState
+          data class Failed(val message: String) : SearchState
+      }
+
+      @OptIn(FlowPreview::class, ExperimentalCoroutinesApi::class)
+      class SearchViewModel(
+          private val repository: SearchRepository,
+          scope: CoroutineScope,
+      ) {
+          private val query = MutableStateFlow("")
+
+          val state: StateFlow<SearchState> = query
+              .map { it.trim() }
+              .debounce(300)
+              .distinctUntilChanged()
+              .flatMapLatest { q ->
+                  if (q.length < 2) {
+                      flowOf(SearchState.Idle)
+                  } else {
+                      repository.search(q)
+                          .map<List<String>, SearchState> { SearchState.Results(it) }
+                          .onStart { emit(SearchState.Loading) }
+                          .catch { e ->
+                              if (e is IOException) emit(SearchState.Failed("Keine Verbindung")) else throw e
+                          }
+                  }
+              }
+              .stateIn(scope, SharingStarted.WhileSubscribed(5_000), SearchState.Idle)
+
+          fun onQueryChange(text: String) {
+              query.value = text
+          }
+      }
+
+      class FakeRepository : SearchRepository {
+          val requests = mutableListOf<String>()
+          override fun search(query: String): Flow<List<String>> = flow {
+              requests += query
+              delay(100)
+              if (query == "offline") throw IOException("kein Netz")
+              emit(listOf("$query-1", "$query-2"))
+          }
+      }
+
+      fun main() = runBlocking {
+          val repo = FakeRepository()
+          val vmJob = Job()
+          val vm = SearchViewModel(repo, this + vmJob)
+          val collector = launch { vm.state.collect { println(it) } }
+          delay(50)
+          vm.onQueryChange("k")
+          vm.onQueryChange("ko")
+          vm.onQueryChange("kot")
+          delay(500)
+          vm.onQueryChange("kot ")
+          delay(500)
+          vm.onQueryChange("offline")
+          delay(500)
+          println("Anfragen: ${repo.requests}")
+          collector.cancel()
+          vmJob.cancel()
+      }
+    checklist:
+      - Der Suchtext ist ein privater `MutableStateFlow`; öffentlich ist nur `state` vom Typ `StateFlow`.
+      - Die Reihenfolge `map { trim }` → `debounce(300)` → `distinctUntilChanged()` sorgt dafür, dass „kot“ und „kot “ nur eine Anfrage auslösen.
+      - "`flatMapLatest` bricht eine laufende Suche ab, wenn ein neuer Text kommt."
+      - "`catch` steht **im** inneren Flow, sodass nach einem Fehler neue Eingaben weiter funktionieren; unerwartete Exceptions werden weitergeworfen."
+      - "`onStart { emit(Loading) }` liefert vor jeder Suche einen Ladezustand."
+      - "Die Ausgabe entspricht genau der erwarteten, insbesondere `Anfragen: [kot, offline]`."
+    explanation: |
+      Die Lösung ist eine reine Flow-Pipeline ohne manuell gestartete Coroutines. Die schnell aufeinanderfolgenden Eingaben „k“, „ko“, „kot“ fasst `debounce` zu einer zusammen; „kot “ wird zu „kot“ getrimmt und von `distinctUntilChanged` verworfen – deshalb gibt es nur zwei Anfragen. `flatMapLatest` sorgt dafür, dass nur die Suche zum neuesten Text lebt. Der explizite Typ in `map<List<String>, SearchState>` ist nötig, damit `onStart` und `catch` andere `SearchState`-Varianten emittieren dürfen. Weil `catch` im inneren Flow sitzt, beendet ein Netzwerkfehler nur diese eine Suche. Im Test (Modul „Testing“) würdest du statt echter Verzögerungen `runTest` mit virtueller Zeit und Turbine verwenden.
+    resources:
+      - title: Kotlin Docs · Flow operators
+        url: https://kotlinlang.org/docs/coroutines-flow-operators.html
+      - title: Android Developers · StateFlow and SharedFlow
+        url: https://developer.android.com/kotlin/flow/stateflow-and-sharedflow

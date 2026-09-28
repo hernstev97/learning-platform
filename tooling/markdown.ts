@@ -21,7 +21,7 @@ export function codeBlock(text: string, info = ''): string {
   const [lang = '', ...flags] = info.trim().split(/\s+/);
   const name = languageOf(lang);
   const runnable = flags.includes('run') && name === 'python';
-  const playground = name === 'rust' && /\bfn main\s*\(/.test(text) && !flags.includes('norun');
+  const playground = name === 'rust' && /\bfn main\s*\(/.test(text) && !flags.includes('norun') && !flags.includes('nocheck');
   const title = flags.find((flag) => flag.startsWith('title='))?.slice(6).replace(/_/g, ' ');
   const label = title ?? LABELS[name] ?? (lang || 'Text');
   const attrs = [`data-lang="${escape(name)}"`, runnable ? 'data-run="python"' : '', playground ? 'data-playground="rust"' : ''].filter(Boolean).join(' ');

@@ -1,0 +1,1048 @@
+id: closures-iteratoren
+title: Closures & Iteratoren
+level: 2
+minutes: 180
+summary: Closures fangen ihre Umgebung ein, Iteratoren verarbeiten Daten Schritt für Schritt und erst bei Bedarf – zusammen ergeben sie den idiomatischen, lesbaren und trotzdem schnellen Rust-Stil.
+goals:
+  - Du erklärst, wie eine Closure Variablen einfängt (per `&`, per `&mut`, per Wert) und was `move` daran ändert.
+  - Du wählst für Closure-Parameter den passenden Bound `Fn`, `FnMut` oder `FnOnce` und begründest ihn.
+  - Du gibst Closures als `impl Fn` zurück und speicherst verschiedene Closures als `Box<dyn Fn>`.
+  - Du baust Iterator-Ketten aus Adaptern und Konsumenten, sagst ihr Verhalten dank Laziness vorher und sammelst mit `collect` in `Vec`, `HashMap`, `String` und `Result<Vec<_>, _>`.
+  - Du implementierst `Iterator` für einen eigenen Typ und erklärst, warum Iterator-Ketten eine Zero-Cost Abstraction sind.
+resources:
+  - title: The Rust Book · Kapitel 13 – Iterators and Closures
+    url: https://doc.rust-lang.org/book/ch13-00-functional-features.html
+  - title: std::iter – Modul-Dokumentation
+    url: https://doc.rust-lang.org/std/iter/index.html
+  - title: The Rust Reference · Closure types
+    url: https://doc.rust-lang.org/reference/types/closure.html
+  - title: Rust by Example · Closures
+    url: https://doc.rust-lang.org/rust-by-example/fn/closures.html
+lesson: |
+  Aus einem Access-Log sollen die GET-Anfragen herausgefiltert, ihre Antwortzeiten extrahiert und die langsamsten drei gemeldet werden. Mit Schleifen sind das ein paar verschachtelte `for`s, `if`s und Hilfsvariablen. Mit Iteratoren ist es eine Kette: `filter`, `map`, `sort`, `take`. Du hast solche Ketten in TypeScript mit `.filter().map()` und in Kotlin mit Sequences geschrieben. In Rust sehen sie ähnlich aus, haben aber zwei Eigenschaften, die du verstehen musst: Sie sind **lazy**, und sie sind so schnell wie die handgeschriebene Schleife.
+
+  Die kleinen Funktionen, die du an `filter` und `map` übergibst, sind **Closures**. Sie greifen auf Variablen aus ihrer Umgebung zu – und weil Rust Ownership ernst nimmt, stellt sich sofort die Frage: Leiht die Closure diese Variablen, ändert sie sie, oder übernimmt sie sie? Die Antwort bestimmt, wo du die Closure benutzen darfst.
+
+  ## Closures: Funktionen, die ihre Umgebung einfangen
+
+  Eine Closure ist eine anonyme Funktion, die Variablen aus dem umgebenden Gültigkeitsbereich benutzen kann ([Book: Closures](https://doc.rust-lang.org/book/ch13-01-closures.html)):
+
+  ```rust
+  fn main() {
+      let schwelle = 500; // Millisekunden
+      let ist_langsam = |ms: u32| ms > schwelle; // fängt `schwelle` ein
+
+      let zeiten = [120, 830, 45, 990];
+      let mut langsame = 0;
+      for ms in zeiten {
+          if ist_langsam(ms) {
+              langsame += 1;
+          }
+      }
+      println!("{langsame} langsame Anfragen"); // 2
+
+      let verdopple = |x: i32| -> i32 { x * 2 }; // Typen dürfen angegeben werden
+      println!("{}", verdopple(21));
+  }
+  ```
+
+  Eine `fn` könnte `schwelle` nicht benutzen, eine Closure schon. Parameter- und Rückgabetypen leitet der Compiler meist ab. Jede Closure hat einen eigenen, anonymen Typ, den du nicht hinschreiben kannst – das wird bei Parametern und Rückgabewerten wichtig.
+
+  ### Wie eine Closure einfängt
+
+  Der Compiler schaut in den Rumpf und wählt für jede eingefangene Variable die **schwächste** Form, die reicht ([Book: Capturing References or Moving Ownership](https://doc.rust-lang.org/book/ch13-01-closures.html#capturing-references-or-moving-ownership)):
+
+  ```rust
+  fn main() {
+      // 1. Per Referenz: die Closure liest nur
+      let prefix = String::from("[app]");
+      let log = |text: &str| println!("{prefix} {text}");
+      log("start");
+      println!("prefix ist weiter benutzbar: {prefix}");
+
+      // 2. Per veränderlicher Referenz: die Closure ändert
+      let mut fehler = Vec::new();
+      let mut melde = |text: &str| fehler.push(text.to_string());
+      melde("db timeout");
+      melde("disk full");
+      // Solange `melde` noch benutzt wird, ist `fehler` exklusiv geliehen.
+      println!("{fehler:?}");
+
+      // 3. Per Wert: der Rumpf verbraucht den Wert
+      let bericht = String::from("Tagesbericht");
+      let sende = || {
+          let versendet = bericht; // bericht wird in die Closure verschoben …
+          println!("sende {versendet}");
+          // … und hier freigegeben: die Closure ist nur einmal aufrufbar
+      };
+      sende();
+      // sende();   // Fehler E0382: use of moved value `sende`
+  }
+  ```
+
+  Das sind dieselben Regeln wie bei Referenzen im Ownership-Modul: Eine Closure, die `fehler` per `&mut` hält, ist eine veränderliche Leihe. Solange sie lebt, darfst du `fehler` nicht anderweitig benutzen. Seit Edition 2021 fängt eine Closure bei Structs nur die Felder ein, die sie wirklich benutzt, nicht das ganze Struct ([Edition Guide: Disjoint capture](https://doc.rust-lang.org/edition-guide/rust-2021/disjoint-capture-in-closures.html)).
+
+  ### Fn, FnMut und FnOnce
+
+  Was der Rumpf mit den eingefangenen Werten **tut**, bestimmt, welche Traits die Closure implementiert ([Book: Moving Captured Values Out of Closures](https://doc.rust-lang.org/book/ch13-01-closures.html#moving-captured-values-out-of-closures)):
+
+  | Trait | Die Closure … | Aufrufbar | Beispiel |
+  | --- | --- | --- | --- |
+  | [`FnOnce`](https://doc.rust-lang.org/std/ops/trait.FnOnce.html) | verbraucht Eingefangenes | mindestens einmal | `\|\| drop(bericht)` |
+  | [`FnMut`](https://doc.rust-lang.org/std/ops/trait.FnMut.html) | ändert Eingefangenes | mehrfach, braucht `&mut` | `\|t\| fehler.push(t)` |
+  | [`Fn`](https://doc.rust-lang.org/std/ops/trait.Fn.html) | liest nur (oder fängt nichts ein) | mehrfach, auch gleichzeitig | `\|ms\| ms > schwelle` |
+
+  Die Traits bauen aufeinander auf: Jede `Fn`-Closure ist auch `FnMut`, jede `FnMut` auch `FnOnce`. Für Funktionen, die Closures annehmen, gilt deshalb: **Verlange so wenig wie möglich.** Rufst du die Closure nur einmal auf, verlange `FnOnce` – dann passen alle Closures. Rufst du sie mehrfach auf, verlange `FnMut`. `Fn` brauchst du nur, wenn mehrere Aufrufe gleichzeitig oder über geteilte Referenzen passieren können, etwa aus mehreren Threads.
+
+  ```rust
+  // Ruft `aktion` höchstens `versuche`-mal auf – braucht FnMut
+  fn mit_wiederholung<F>(versuche: u32, mut aktion: F) -> Result<String, String>
+  where
+      F: FnMut(u32) -> Result<String, String>,
+  {
+      let mut letzter_fehler = String::from("keine Versuche");
+      for nr in 1..=versuche {
+          match aktion(nr) {
+              Ok(wert) => return Ok(wert),
+              Err(e) => letzter_fehler = e,
+          }
+      }
+      Err(letzter_fehler)
+  }
+
+  fn main() {
+      let mut protokoll = Vec::new(); // wird von der Closure verändert
+      let ergebnis = mit_wiederholung(3, |nr| {
+          protokoll.push(format!("Versuch {nr}"));
+          if nr < 3 { Err(String::from("timeout")) } else { Ok(String::from("200 OK")) }
+      });
+      println!("{ergebnis:?} nach {protokoll:?}");
+
+      // Option::unwrap_or_else verlangt nur FnOnce: die Closure läuft höchstens einmal
+      let port: Option<u16> = None;
+      let standard = String::from("8080");
+      let p = port.unwrap_or_else(move || standard.parse().unwrap());
+      println!("{p}");
+  }
+  ```
+
+  Die Standardbibliothek folgt dieser Regel: [`Option::unwrap_or_else`](https://doc.rust-lang.org/std/option/enum.Option.html#method.unwrap_or_else) verlangt `FnOnce`, `Iterator::map` verlangt `FnMut`, `thread::spawn` `FnOnce + Send + 'static`.
+
+  ### move-Closures
+
+  `move` zwingt die Closure, **alle** eingefangenen Variablen per Wert zu übernehmen, auch wenn der Rumpf sie nur liest. Das brauchst du, wenn die Closure länger leben soll als der Gültigkeitsbereich, in dem sie entsteht: beim Zurückgeben aus einer Funktion und bei Threads. Ohne `move` meldet der Compiler [E0373](https://doc.rust-lang.org/error_codes/E0373.html): `closure may outlive the current function, but it borrows n`.
+
+  > [!MERKE]
+  > `move` bestimmt, **wie eingefangen** wird (per Wert). `Fn`/`FnMut`/`FnOnce` hängt davon ab, **was der Rumpf tut**. Eine `move`-Closure, die ihre Werte nur liest, ist `Fn` und beliebig oft aufrufbar.
+
+  ### Closures als Parameter und Rückgabewerte
+
+  Weil jede Closure einen eigenen Typ hat, gibt es drei Schreibweisen – dieselben Werkzeuge wie im Modul Traits & Generics:
+
+  - **Generisch** `fn f<F: Fn(i32) -> i32>(g: F)` oder kurz `fn f(g: impl Fn(i32) -> i32)`: statische Dispatch, pro Closure eine Kopie, Inlining möglich. Der Standard.
+  - **Rückgabe** `fn f() -> impl Fn(i32) -> i32`: genau ein Closure-Typ, fast immer mit `move`.
+  - **Trait-Objekt** `Box<dyn Fn(i32) -> i32>`: wenn verschiedene Closures in einer Collection liegen oder zur Laufzeit ausgewählt werden.
+
+  ```rust
+  use std::collections::HashMap;
+
+  // Rückgabe einer Closure: `move` übergibt `faktor` an die Closure
+  fn skalierer(faktor: f64) -> impl Fn(f64) -> f64 {
+      move |x| x * faktor
+  }
+
+  fn main() {
+      let in_prozent = skalierer(100.0);
+      println!("{}", in_prozent(0.25)); // 25
+
+      // Verschiedene Closures in einer Map: jede hat ihren eigenen Typ,
+      // also braucht es Trait-Objekte
+      let mut befehle: HashMap<&str, Box<dyn Fn(&[i64]) -> i64>> = HashMap::new();
+      befehle.insert("summe", Box::new(|z| z.iter().sum()));
+      befehle.insert("max", Box::new(|z| z.iter().copied().max().unwrap_or(0)));
+      let grenze = 10;
+      befehle.insert("gross", Box::new(move |z| z.iter().filter(|&&x| x > grenze).count() as i64));
+
+      let daten = [4, 15, 8, 23];
+      for name in ["summe", "max", "gross"] {
+          println!("{name}: {}", befehle[name](&daten));
+      }
+  }
+  ```
+
+  Closures, die nichts einfangen, lassen sich außerdem in Funktionszeiger `fn(i32) -> i32` umwandeln ([std: fn](https://doc.rust-lang.org/std/primitive.fn.html)).
+
+  ## Das Iterator-Trait
+
+  Ein Iterator ist alles, was [`Iterator`](https://doc.rust-lang.org/std/iter/trait.Iterator.html) implementiert. Der Trait hat genau eine Pflichtmethode ([Book: The Iterator Trait](https://doc.rust-lang.org/book/ch13-02-iterators.html#the-iterator-trait-and-the-next-method)):
+
+  ```rust nocheck
+  pub trait Iterator {
+      type Item;
+      fn next(&mut self) -> Option<Self::Item>;
+      // … und viele Default-Methoden: map, filter, sum, collect, …
+  }
+  ```
+
+  `next` liefert `Some(element)`, solange es Elemente gibt, und danach `None`. `&mut self` zeigt: Ein Iterator hat Zustand und verbraucht sich beim Durchlaufen.
+
+  ```rust
+  fn main() {
+      let dienste = vec![String::from("nginx"), String::from("postgres")];
+
+      let mut it = dienste.iter(); // Iterator über &String
+      println!("{:?}", it.next()); // Some("nginx")
+      println!("{:?}", it.next()); // Some("postgres")
+      println!("{:?}", it.next()); // None
+  }
+  ```
+
+  Eine `for`-Schleife ist genau das: `IntoIterator::into_iter` aufrufen, dann `next` bis `None` ([std::iter: for-Schleifen und IntoIterator](https://doc.rust-lang.org/std/iter/index.html#for-loops-and-intoiterator)). Collections bieten drei Einstiege, passend zur Tabelle aus dem Collections-Modul ([The three forms of iteration](https://doc.rust-lang.org/std/iter/index.html#the-three-forms-of-iteration)):
+
+  ```rust
+  fn main() {
+      let mut ports = vec![80, 443, 8080];
+
+      for p in ports.iter() {       // &i32, wie `for p in &ports`
+          print!("{p} ");
+      }
+      for p in ports.iter_mut() {   // &mut i32, wie `for p in &mut ports`
+          *p += 1;
+      }
+      let summe: i32 = ports.into_iter().sum(); // i32, verbraucht ports
+      println!("\n{summe}");
+  }
+  ```
+
+  ## Adapter und Konsumenten
+
+  Die Default-Methoden fallen in zwei Gruppen ([Book: Methods that Consume / Produce](https://doc.rust-lang.org/book/ch13-02-iterators.html#methods-that-consume-the-iterator)):
+
+  - **Adapter** nehmen einen Iterator und geben einen neuen zurück: `map`, `filter`, `filter_map`, `enumerate`, `zip`, `take`, `skip`, `chain`, `flat_map`, `rev`. Sie tun beim Aufruf **nichts** außer die Kette zu beschreiben.
+  - **Konsumenten** treiben die Kette an, indem sie `next` aufrufen, bis sie fertig sind: `collect`, `sum`, `count`, `fold`, `any`, `all`, `find`, `position`, `max`, `max_by_key`, `for_each`.
+
+  ```rust
+  fn main() {
+      let antwortzeiten = [120, 830, 45, 990, 310];
+
+      // Adapter: beschreiben die Verarbeitung, tun aber noch nichts
+      let langsame = antwortzeiten
+          .iter()
+          .enumerate()                       // (index, &ms)
+          .filter(|&(_, &ms)| ms > 300)      // nur langsame
+          .map(|(i, ms)| format!("#{i}: {ms} ms"));
+
+      // Konsument: erst collect treibt die Kette an
+      let zeilen: Vec<String> = langsame.collect();
+      println!("{zeilen:?}"); // ["#1: 830 ms", "#3: 990 ms", "#4: 310 ms"]
+
+      let gesamt: u32 = antwortzeiten.iter().sum();
+      let anzahl = antwortzeiten.iter().filter(|&&ms| ms > 300).count();
+      let alle_ok = antwortzeiten.iter().all(|&ms| ms < 1000);
+      let erster_langsamer = antwortzeiten.iter().position(|&ms| ms > 500);
+      let max = antwortzeiten.iter().max();
+      println!("{gesamt} {anzahl} {alle_ok} {erster_langsamer:?} {max:?}");
+
+      // fold: allgemeinster Konsument, führt einen Akkumulator mit
+      let summe_quadrate = antwortzeiten.iter().fold(0u64, |acc, &ms| acc + u64::from(ms) * u64::from(ms));
+      println!("{summe_quadrate}");
+  }
+  ```
+
+  Achte auf die Muster in den Closures: `iter()` liefert `&u32`, und `filter` übergibt eine Referenz auf das Element – also `&&u32`. `|&&ms|` entpackt beide Referenzen per Pattern. Alternativ schreibst du `|ms| **ms > 300` oder beginnst mit `.copied()`.
+
+  Weitere Adapter im Überblick. `windows` und `chunks` sind Methoden auf **Slices**, keine Iterator-Adapter, liefern aber Iteratoren ([slice::windows](https://doc.rust-lang.org/std/primitive.slice.html#method.windows)):
+
+  ```rust
+  fn main() {
+      let tage = ["Mo", "Di", "Mi", "Do"];
+      let besucher = [120, 95, 130, 160];
+
+      // zip: zwei Iteratoren paarweise, endet mit dem kürzeren
+      for (tag, n) in tage.iter().zip(besucher.iter()) {
+          print!("{tag}={n} ");
+      }
+      println!();
+
+      // windows: überlappende Fenster auf Slices
+      let veraenderung: Vec<i32> = besucher.windows(2).map(|w| w[1] - w[0]).collect();
+      println!("{veraenderung:?}"); // [-25, 35, 30]
+
+      // chunks: nicht überlappende Blöcke
+      let paare: Vec<i32> = besucher.chunks(2).map(|c| c.iter().sum()).collect();
+      println!("{paare:?}"); // [215, 290]
+
+      // skip, take, rev, chain
+      let mitte: Vec<&str> = tage.iter().skip(1).take(2).copied().collect();
+      let rueckwaerts: Vec<&str> = tage.iter().rev().chain(["So"].iter()).copied().collect();
+      println!("{mitte:?} {rueckwaerts:?}");
+
+      // flat_map: jedes Element wird zu mehreren
+      let tags = ["rust,cli", "linux", "rust,web"];
+      let einzeln: Vec<&str> = tags.iter().flat_map(|t| t.split(',')).collect();
+      println!("{einzeln:?}");
+
+      // max_by_key: das Element mit dem größten Schlüssel
+      let bester = tage.iter().zip(besucher).max_by_key(|&(_, n)| n);
+      println!("{bester:?}"); // Some(("Do", 160))
+  }
+  ```
+
+  ### Laziness
+
+  Adapter arbeiten erst, wenn ein Konsument Elemente anfordert – und dann **Element für Element** durch die ganze Kette, nicht Schritt für Schritt über alle Elemente ([std::iter: Laziness](https://doc.rust-lang.org/std/iter/index.html#laziness)):
+
+  ```rust
+  fn main() {
+      let werte = [1, 2, 3, 4];
+      let kette = werte.iter().map(|x| {
+          println!("map {x}");
+          x * 10
+      });
+      println!("noch nichts passiert");
+      let erster_grosser = kette.filter(|x| *x > 15).next();
+      println!("{erster_grosser:?}");
+  }
+  ```
+
+  ```text
+  noch nichts passiert
+  map 1
+  map 2
+  Some(20)
+  ```
+
+  `map` läuft nur für 1 und 2: Sobald `filter` ein passendes Element gefunden hat, hört `next` auf zu fragen. Deshalb funktionieren Ketten auch auf unendlichen Iteratoren wie `(1..).map(…).take(5)`, und `find`, `any` und `position` brechen früh ab. Die Kehrseite: Eine Kette ohne Konsument tut nichts. Der Compiler warnt dann mit `unused Map that must be used` und dem Hinweis `iterators are lazy and do nothing unless consumed`.
+
+  ### collect: der Zieltyp entscheidet
+
+  [`collect`](https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.collect) baut jede Collection, die [`FromIterator`](https://doc.rust-lang.org/std/iter/trait.FromIterator.html) implementiert. Welche, bestimmst du über die Typannotation oder den Turbofish `collect::<Vec<_>>()`. Fehlt beides, meldet der Compiler `type annotations needed` ([E0283](https://doc.rust-lang.org/error_codes/E0283.html)).
+
+  ```rust
+  use std::collections::{HashMap, HashSet};
+
+  fn main() {
+      let zeilen = ["port=8080", "host=db01", "port=9090"];
+
+      let v: Vec<&str> = zeilen.iter().map(|z| z.split('=').next().unwrap()).collect();
+      let einzigartig: HashSet<&str> = v.iter().copied().collect();
+      let config: HashMap<&str, &str> = zeilen
+          .iter()
+          .filter_map(|z| z.split_once('='))
+          .collect(); // spätere Schlüssel überschreiben frühere
+      let text: String = ["a", "b", "c"].iter().map(|s| s.to_uppercase()).collect();
+      println!("{v:?} {} {:?} {text}", einzigartig.len(), config.get("port"));
+
+      // Result<Vec<_>, _>: bricht beim ersten Fehler ab
+      let ok: Result<Vec<u16>, _> = "80,443".split(',').map(str::parse::<u16>).collect();
+      let kaputt: Result<Vec<u16>, _> = "80,abc,443".split(',').map(str::parse::<u16>).collect();
+      println!("{ok:?}");     // Ok([80, 443])
+      println!("{kaputt:?}"); // Err(ParseIntError { kind: InvalidDigit })
+  }
+  ```
+
+  Das Sammeln in `Result<Vec<T>, E>` ist eines der nützlichsten Muster überhaupt: Aus „einem Iterator von Results“ wird „ein Result mit allen Werten“ oder der erste Fehler. Es passt direkt zu `?` aus dem Modul Fehlerbehandlung ([Rust by Example: Iterating over Results](https://doc.rust-lang.org/rust-by-example/error/iter_result.html)).
+
+  > [!INTERVIEW] „Was bedeutet es, dass Iteratoren in Rust lazy sind?“
+  > Adapter wie `map` und `filter` erzeugen nur neue Iterator-Werte, die die Verarbeitung beschreiben. Gearbeitet wird erst, wenn ein Konsument wie `collect`, `sum` oder `find` `next` aufruft – dann läuft jedes Element einzeln durch die ganze Kette. Folgen: keine Zwischen-Collections, frühes Abbrechen bei `find` und `any`, unendliche Iteratoren sind möglich. Eine Kette ohne Konsument tut nichts; der Compiler warnt davor.
+
+  ## Eigene Iteratoren
+
+  Implementierst du `next`, bekommst du alle Adapter und Konsumenten geschenkt ([std::iter: Implementing Iterator](https://doc.rust-lang.org/std/iter/index.html#implementing-iterator)). Ein realistisches Beispiel: Seiten einer paginierten API durchlaufen.
+
+  ```rust
+  /// Liefert (offset, limit) für jede Seite einer paginierten API
+  struct Seiten {
+      gesamt: u32,
+      pro_seite: u32,
+      offset: u32,
+  }
+
+  impl Iterator for Seiten {
+      type Item = (u32, u32);
+
+      fn next(&mut self) -> Option<Self::Item> {
+          if self.offset >= self.gesamt {
+              return None;
+          }
+          let limit = self.pro_seite.min(self.gesamt - self.offset);
+          let seite = (self.offset, limit);
+          self.offset += limit;
+          Some(seite)
+      }
+  }
+
+  fn main() {
+      let seiten = Seiten { gesamt: 250, pro_seite: 100, offset: 0 };
+      for (offset, limit) in seiten {
+          println!("GET /users?offset={offset}&limit={limit}");
+      }
+
+      // Alle Adapter gibt es gratis dazu
+      let anzahl = Seiten { gesamt: 1000, pro_seite: 100, offset: 0 }.skip(2).take(3).count();
+      println!("{anzahl}"); // 3
+  }
+  ```
+
+  Gibst du einen Iterator aus einer Funktion zurück, schreibst du `-> impl Iterator<Item = T>`. Seit Edition 2024 fängt ein solcher Rückgabetyp automatisch alle Lifetimes der Parameter ein; ein `+ '_` ist nicht mehr nötig ([Edition Guide: RPIT lifetime capture](https://doc.rust-lang.org/edition-guide/rust-2024/rpit-lifetime-capture.html)).
+
+  ## Zero-Cost Abstraction
+
+  Ist die Kette langsamer als die Schleife? Das Book vergleicht beide per Benchmark: gleich schnell, weil Iteratoren zu ungefähr demselben Code kompiliert werden, den du von Hand schreiben würdest ([Book: Comparing Performance](https://doc.rust-lang.org/book/ch13-04-performance.html)). Der Grund liegt in den Modulen davor: Jeder Adapter ist ein generisches Struct, jede Closure ein eigener Typ, und alles wird monomorphisiert. Der Optimierer sieht am Ende eine Schleife ohne Funktionszeiger und kann inlinen, Grenzprüfungen entfernen und teilweise vektorisieren.
+
+  Kosten entstehen dort, wo du sie hinschreibst: Ein `collect()` mitten in der Kette alloziert eine Zwischen-Collection. `Box<dyn Fn>` erzwingt dynamische Dispatch. `.cloned()` kopiert jedes Element.
+
+  > [!PRAXIS] Kette oder Schleife?
+  > In Code-Reviews gilt: Kette, wenn sie sich wie ein Satz liest („nimm die GET-Anfragen, extrahiere die Zeit, summiere“). Schleife, wenn der Rumpf mehrere Dinge gleichzeitig tut, früh mit `?` aussteigen muss oder komplizierten Zustand hat. `for_each` mit langem Rumpf ist meist eine verkleidete Schleife. Häufige Review-Kommentare: `collect::<Vec<_>>().len()` statt `count()`, `collect` nur um danach wieder `iter()` aufzurufen, `filter(…).next()` statt `find(…)`, und `map` mit Seiteneffekten statt `for`.
+
+  ## Häufige Fehler
+
+  - **Kette ohne Konsument.** `unused Map that must be used`. `map` ist kein `forEach`; für Seiteneffekte `for` oder `for_each` nehmen, für Ergebnisse `collect`.
+  - **`Fn` verlangt, `FnMut` übergeben.** `cannot borrow as mutable, as it is a captured variable in a Fn closure` ([E0596](https://doc.rust-lang.org/error_codes/E0596.html)). Den Bound auf `FnMut` lockern und den Parameter `mut` machen.
+  - **`move` vergessen** beim Zurückgeben einer Closure oder bei Threads ([E0373](https://doc.rust-lang.org/error_codes/E0373.html)).
+  - **`collect` ohne Zieltyp** ([E0283](https://doc.rust-lang.org/error_codes/E0283.html)). `let v: Vec<_> = …` oder `collect::<Vec<_>>()`.
+  - **Doppelte Referenzen übersehen.** In `iter().filter(|x| …)` ist `x` ein `&&T`. Mit `|&&x|`, `**x` oder vorher `.copied()` arbeiten.
+  - **`into_iter()` auf einem Vec, der danach noch gebraucht wird.** `use of moved value` ([E0382](https://doc.rust-lang.org/error_codes/E0382.html)). `iter()` nehmen.
+  - **Auf Gleichstände bei `max_by_key` verlassen.** Bei mehreren Maxima liefert es das **letzte**; über eine `HashMap` iteriert ist das zufällig.
+
+  ## Zusammenfassung
+
+  - Closures fangen Variablen per `&`, per `&mut` oder per Wert ein – so schwach wie möglich, gesteuert vom Rumpf.
+  - Jede `Fn`-Closure ist auch `FnMut`, jede `FnMut` auch `FnOnce`. Was der Rumpf tut, bestimmt den Trait. Verlange als Aufrufer den schwächsten Bound, den du brauchst.
+  - `move` erzwingt Übernahme per Wert; nötig, wenn die Closure ihren Gültigkeitsbereich überlebt. Es ändert nicht, ob sie `Fn` ist.
+  - Closures als Parameter: Generics oder `impl Fn`; als Rückgabe: `impl Fn` mit `move`; in Collections: `Box<dyn Fn>`.
+  - `Iterator` hat eine Pflichtmethode `next`. `iter`, `iter_mut` und `into_iter` liefern `&T`, `&mut T` und `T`.
+  - Adapter sind lazy, Konsumenten treiben die Kette an. Elemente laufen einzeln durch die ganze Kette.
+  - `collect` baut, was der Zieltyp verlangt – auch `HashMap`, `String` und `Result<Vec<_>, E>`.
+  - Iterator-Ketten sind durch Monomorphisierung so schnell wie Schleifen; Kosten entstehen durch Zwischen-`collect`, `dyn` und Klone.
+exercises:
+  - id: move-bedeutung
+    type: choice
+    title: Was macht move wirklich?
+    prompt: |
+      Gegeben ist `let name = String::from("steven");` und danach `let f = move || println!("{name}");`. Welche Aussagen stimmen? **Mehrere Antworten richtig.**
+    options:
+      - text: "`f` übernimmt `name` per Wert."
+        correct: true
+        why: Genau das erzwingt `move` – unabhängig davon, dass der Rumpf `name` nur liest.
+      - text: "`name` ist nach dieser Zeile im umgebenden Code nicht mehr benutzbar."
+        correct: true
+        why: "`String` ist nicht `Copy`, also wurde er in die Closure verschoben. Bei einem `i32` wäre er nur kopiert worden."
+      - text: "`f` kann nur einmal aufgerufen werden."
+        correct: false
+        why: Der Rumpf liest `name` nur und verbraucht ihn nicht. Die Closure ist deshalb `Fn` und beliebig oft aufrufbar.
+      - text: "`f` implementiert `Fn`."
+        correct: true
+        why: Welcher Trait gilt, hängt davon ab, was der Rumpf mit dem Eingefangenen tut. Nur lesen heißt `Fn`.
+    explanation: |
+      `move` und die `Fn`-Traits beantworten zwei verschiedene Fragen. `move` entscheidet, **wie** eingefangen wird: per Wert statt per Referenz. Die Traits beschreiben, **wie oft und auf welche Weise** die Closure aufgerufen werden kann, und das hängt nur vom Rumpf ab. Eine `move`-Closure, die ihre Werte nur liest, ist `Fn`. `FnOnce` allein wird eine Closure erst, wenn ihr Rumpf etwas Eingefangenes verbraucht, etwa per `drop(name)` oder durch Zurückgeben.
+    resources:
+      - title: The Rust Book · Capturing References or Moving Ownership
+        url: https://doc.rust-lang.org/book/ch13-01-closures.html#capturing-references-or-moving-ownership
+      - title: std · Keyword move
+        url: https://doc.rust-lang.org/std/keyword.move.html
+
+  - id: passender-bound
+    type: choice
+    title: Der richtige Bound für einen Retry-Helfer
+    prompt: |
+      `mit_wiederholung(versuche, aktion)` ruft `aktion` bis zu `versuche`-mal nacheinander auf, bis sie `Ok` liefert. Aufrufer sollen Closures übergeben können, die zum Beispiel einen Zähler erhöhen. Welcher Bound für `F` passt am besten?
+    lang: rust
+    code: |
+      fn mit_wiederholung<F>(versuche: u32, mut aktion: F) -> Result<String, String>
+      where
+          F: /* ? */(u32) -> Result<String, String>,
+      { /* … */ }
+    options:
+      - text: "`FnMut`"
+        correct: true
+        why: Mehrere Aufrufe nacheinander, und die Closure darf ihren Zustand ändern. Genau das erlaubt `FnMut`.
+      - text: "`FnOnce`"
+        correct: false
+        why: "`FnOnce` erlaubt nur einen Aufruf. Die Funktion ruft `aktion` aber mehrfach auf; der Compiler würde das ablehnen."
+      - text: "`Fn`"
+        correct: false
+        why: Kompiliert, ist aber zu streng. Eine Closure, die einen Zähler erhöht, ist nur `FnMut` und würde abgelehnt.
+      - text: "`fn(u32) -> Result<String, String>` (Funktionszeiger)"
+        correct: false
+        why: Funktionszeiger können nichts einfangen. Closures mit Zähler oder Protokoll wären ausgeschlossen.
+    explanation: |
+      Die Faustregel lautet: so wenig verlangen wie möglich. Die Funktion braucht mehrere Aufrufe, also mindestens `FnMut`. `Fn` würde zusätzlich verlangen, dass die Closure nichts ändert – eine unnötige Einschränkung für Aufrufer. Weil `FnMut::call_mut` `&mut self` nimmt, muss der Parameter `mut aktion` heißen.
+    resources:
+      - title: std · FnMut
+        url: https://doc.rust-lang.org/std/ops/trait.FnMut.html
+      - title: Rust by Example · Closures als Parameter
+        url: https://doc.rust-lang.org/rust-by-example/fn/closures/input_parameters.html
+
+  - id: kette-ordnen
+    type: order
+    title: Summe der GET-Antwortzeiten
+    prompt: |
+      Das Programm soll die Antwortzeiten (letzte Spalte) aller **GET**-Anfragen summieren und `1050` ausgeben. Bring die Zeilen in die richtige Reihenfolge. Achtung: Nur eine Reihenfolge der Adapter liefert das richtige Ergebnis.
+    lang: rust
+    lines: |
+      fn main() {
+          let zeilen = ["GET /a 120", "GET /b 900", "POST /c 450", "GET /d 30"];
+          let summe: u32 = zeilen
+              .iter()
+              .filter(|z| z.starts_with("GET"))
+              .filter_map(|z| z.rsplit(' ').next())
+              .map(|ms| ms.parse::<u32>().unwrap())
+              .sum();
+          println!("{summe}");
+      }
+    explanation: |
+      Die Reihenfolge der Adapter folgt dem Typ, der durch die Kette fließt. Nach `iter()` sind es ganze Zeilen, auf denen `starts_with("GET")` sinnvoll ist. `filter_map` mit `rsplit(' ').next()` macht daraus die letzte Spalte, `map` wandelt sie in `u32`, und erst `sum` konsumiert. Stünde der `filter` nach `filter_map`, würde er „120“ auf „GET“ prüfen und alles verwerfen (Ergebnis 0). Stünde er nach `map`, kompilierte es nicht, weil `u32` kein `starts_with` hat.
+    resources:
+      - title: The Rust Book · Methods that Produce Other Iterators
+        url: https://doc.rust-lang.org/book/ch13-02-iterators.html#methods-that-produce-other-iterators
+
+  - id: lazy-find-ausgabe
+    type: output
+    title: Wie oft läuft map?
+    prompt: Was gibt dieses Programm aus? Achte darauf, welche Closures überhaupt laufen.
+    lang: rust
+    code: |
+      fn main() {
+          let zahlen = [3, 8, 12, 5, 20];
+          let gefunden = zahlen
+              .iter()
+              .map(|n| {
+                  println!("pruefe {n}");
+                  n * 2
+              })
+              .find(|n| *n > 15);
+          println!("{gefunden:?}");
+          let v: Vec<i32> = zahlen.iter().rev().skip(1).take(2).copied().collect();
+          println!("{v:?}");
+          let _ungenutzt = zahlen.iter().map(|n| {
+              println!("nie {n}");
+              n + 1
+          });
+          println!("fertig");
+      }
+    expected: |
+      pruefe 3
+      pruefe 8
+      Some(16)
+      [5, 12]
+      fertig
+    hints:
+      - "`find` hört auf, sobald ein Element passt."
+      - Die letzte Kette hat keinen Konsumenten.
+    explanation: |
+      `find` fordert Elemente einzeln an: 3 wird zu 6 (passt nicht), 8 wird zu 16 (passt) – danach fragt niemand mehr, also läuft `map` für 12, 5 und 20 nie. `rev()` dreht die Reihenfolge um (20, 5, 12, 8, 3), `skip(1)` lässt 20 weg, `take(2)` nimmt 5 und 12. Die letzte Kette wird nur einer Variable zugewiesen und nie konsumiert, deshalb erscheint kein „nie …“. Das ist Laziness: Adapter beschreiben Arbeit, Konsumenten lösen sie aus.
+    resources:
+      - title: std::iter · Laziness
+        url: https://doc.rust-lang.org/std/iter/index.html#laziness
+      - title: std · Iterator::find
+        url: https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.find
+
+  - id: captures-ausgabe
+    type: output
+    title: Zähler, move und Shadowing
+    prompt: Was gibt dieses Programm aus?
+    lang: rust
+    code: |
+      fn main() {
+          let mut zaehler = 0;
+          let mut erhoehe = |schritt: i32| {
+              zaehler += schritt;
+              zaehler
+          };
+          println!("{}", erhoehe(2));
+          println!("{}", erhoehe(3));
+          println!("{zaehler}");
+
+          let basis = 10;
+          let addiere = move |x: i32| x + basis;
+          let basis = 100;
+          println!("{} {basis}", addiere(1));
+
+          let mut namen = vec!["mia", "ben"];
+          let mut sortiere = || namen.sort();
+          sortiere();
+          println!("{namen:?}");
+      }
+    expected: |
+      2
+      5
+      5
+      11 100
+      ["ben", "mia"]
+    hints:
+      - "`erhoehe` hält eine `&mut`-Leihe auf `zaehler`, nicht eine Kopie."
+      - Das zweite `let basis` ist eine neue Variable. Welches `basis` hat die Closure eingefangen?
+    explanation: |
+      `erhoehe` fängt `zaehler` per `&mut` ein und ändert die Variable selbst: 2, dann 5. Nach dem letzten Aufruf endet die Leihe, und `println!` darf `zaehler` wieder lesen – 5. `addiere` hat mit `move` eine Kopie des ersten `basis` (10) übernommen; das spätere `let basis = 100` ist Shadowing und erzeugt eine neue Variable, die die Closure nicht kennt. `sortiere` leiht `namen` veränderlich und sortiert den Vec im Original.
+    resources:
+      - title: Rust by Example · Capturing
+        url: https://doc.rust-lang.org/rust-by-example/fn/closures/capture.html
+
+  - id: adapter-ausgabe
+    type: output
+    title: zip, windows, chunks, chain, flat_map
+    prompt: Was gibt dieses Programm aus?
+    lang: rust
+    code: |
+      fn main() {
+          let tage = ["Mo", "Di", "Mi"];
+          let werte = [12, 15, 11, 18];
+          for (i, (t, w)) in tage.iter().zip(werte.iter()).enumerate() {
+              println!("{i}: {t}={w}");
+          }
+          let diffs: Vec<i32> = werte.windows(2).map(|p| p[1] - p[0]).collect();
+          println!("{diffs:?}");
+          let bloecke: Vec<i32> = werte.chunks(3).map(|c| c.iter().sum()).collect();
+          println!("{bloecke:?}");
+          let alle: Vec<&str> = tage.iter().copied().chain(["Do"]).rev().collect();
+          println!("{alle:?}");
+          let initialen: String = tage.iter().flat_map(|t| t.chars().take(1)).collect();
+          println!("{initialen}");
+      }
+    expected: |
+      0: Mo=12
+      1: Di=15
+      2: Mi=11
+      [3, -4, 7]
+      [38, 18]
+      ["Do", "Mi", "Di", "Mo"]
+      MDM
+    hints:
+      - "`zip` endet, sobald einer der beiden Iteratoren leer ist."
+      - "`windows(2)` liefert überlappende Paare, `chunks(3)` Blöcke von bis zu drei Elementen."
+    explanation: |
+      `zip` paart drei Tage mit den ersten drei Werten; der vierte Wert fällt weg, weil `tage` kürzer ist. `enumerate` zählt ab 0. `windows(2)` liefert [12,15], [15,11], [11,18] – die Differenzen sind 3, -4, 7. `chunks(3)` liefert [12,15,11] und den Rest [18]. `chain` hängt „Do“ an, `rev` dreht die ganze Kette um. `flat_map` macht aus jedem Tag einen Iterator über sein erstes Zeichen und hängt alle aneinander; `collect` in einen `String` fügt die `char`s zusammen.
+    resources:
+      - title: std · slice::windows
+        url: https://doc.rust-lang.org/std/primitive.slice.html#method.windows
+      - title: std · Iterator::zip
+        url: https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.zip
+
+  - id: closures-uebergeben-zurueckgeben
+    type: gap
+    title: Closures annehmen, zurückgeben, speichern
+    prompt: |
+      Ergänze die Bounds und Typen. `wiederhole` ruft die Closure mehrfach auf, und die übergebene Closure ändert einen Vec. `mache_addierer` gibt eine Closure zurück. `regeln` speichert zwei verschiedene Closures. Erwartete Ausgabe: `[0, 1, 4]` und `12`.
+    lang: rust
+    code: |
+      fn wiederhole<F: ⟦FnMut(usize)⟧>(n: usize, mut f: F) {
+          for i in 0..n {
+              f(i);
+          }
+      }
+
+      fn mache_addierer(n: i32) -> ⟦impl Fn(i32) -> i32⟧ {
+          ⟦move⟧ |x| x + n
+      }
+
+      fn main() {
+          let mut gesammelt = Vec::new();
+          wiederhole(3, |i| gesammelt.push(i * i));
+          println!("{gesammelt:?}");
+
+          let plus_fuenf = mache_addierer(5);
+          let regeln: Vec<⟦Box<dyn Fn(i32) -> i32>⟧> = vec![
+              Box::new(plus_fuenf),
+              Box::new(|x| x * 2),
+          ];
+          let mut wert = 1;
+          for regel in &regeln {
+              wert = regel(wert);
+          }
+          println!("{wert}");
+      }
+    gaps:
+      - label: Bound für wiederhole
+        hint: Mehrfach aufrufbar und darf Eingefangenes ändern. Vergiss die Parameterliste nicht.
+      - label: Rückgabetyp
+        hint: Ein verborgener konkreter Typ, der einen `i32` nimmt und einen `i32` liefert.
+        accept: ["impl FnMut(i32) -> i32", "impl FnOnce(i32) -> i32"]
+      - label: Schlüsselwort
+        hint: "`n` lebt nur bis zum Ende von `mache_addierer`."
+      - label: Elementtyp des Vec
+        hint: Zwei verschiedene Closure-Typen in einem Vec – das geht nur mit Trait-Objekten.
+    explanation: |
+      `FnMut(usize)` erlaubt mehrere Aufrufe einer Closure, die ihren Zustand ändert – hier `gesammelt.push`. `impl Fn(i32) -> i32` versteckt den anonymen Closure-Typ. `move` ist nötig, weil die Closure `n` sonst nur leihen würde und `n` beim Verlassen der Funktion freigegeben wird (E0373). `Box<dyn Fn(i32) -> i32>` vereinheitlicht die zwei verschiedenen Closure-Typen hinter einem Trait-Objekt. Die Rechnung: (1 + 5) * 2 = 12. `impl FnMut` als Rückgabe würde hier auch kompilieren, verlangt vom Aufrufer aber unnötig eine `mut`-Bindung.
+    resources:
+      - title: The Rust Book · Returning Closures
+        url: https://doc.rust-lang.org/book/ch20-04-advanced-functions-and-closures.html#returning-closures
+      - title: Rust by Example · Closures als Rückgabewert
+        url: https://doc.rust-lang.org/rust-by-example/fn/closures/output_parameters.html
+
+  - id: konsumenten-und-collect
+    type: gap
+    title: Die richtigen Konsumenten
+    prompt: |
+      Ergänze die fehlenden Iterator-Methoden. Erwartete Ausgabe:
+
+      ```text
+      Ok([80, 443, 8080])
+      Some(1)
+      2 true ["a", "b", "c", "d"]
+      ```
+    lang: rust
+    code: |
+      use std::collections::HashMap;
+
+      fn main() {
+          let eingabe = "80, 443,8080";
+          let ports: Result<Vec<u16>, _> = eingabe.split(',').map(|s| s.trim().parse::<u16>()).⟦collect()⟧;
+          println!("{ports:?}");
+
+          let namen = ["alpha", "beta", "gamma"];
+          let index: HashMap<&str, usize> = namen.iter().⟦enumerate()⟧.map(|(i, n)| (*n, i)).collect();
+          println!("{:?}", index.get("beta"));
+
+          let zeilen = ["INFO a", "ERROR b", "CRIT c", "ERROR d"];
+          let fehler = zeilen.iter().filter(|z| z.starts_with("ERROR")).⟦count()⟧;
+          let kritisch = zeilen.iter().⟦any⟧(|z| z.starts_with("CRIT"));
+          let texte: Vec<&str> = zeilen.iter().⟦map⟧(|z| z.split_once(' ').unwrap().1).collect();
+          println!("{fehler} {kritisch} {texte:?}");
+      }
+    gaps:
+      - label: Results sammeln
+        hint: Der Zieltyp steht links. Welcher Konsument baut ihn?
+        accept: ["collect::<Result<Vec<u16>, _>>()", "collect::<Result<Vec<_>, _>>()"]
+      - label: Index dazunehmen
+        hint: Liefert Paare `(index, element)`.
+      - label: Anzahl
+        hint: Zählt die verbleibenden Elemente.
+      - label: Gibt es mindestens eins?
+        hint: Liefert `bool` und bricht beim ersten Treffer ab.
+      - label: Umwandeln
+        hint: Jedes Element wird zu einem anderen Wert.
+    explanation: |
+      `collect` baut, was der Zieltyp verlangt: Hier ist das `Result<Vec<u16>, _>` – beim ersten Parse-Fehler käme `Err` heraus. `enumerate` liefert `(usize, &&str)`; `(*n, i)` dreht das Paar um, und `collect` in eine `HashMap` nimmt Tupel als Schlüssel-Wert-Paare. `count` zählt nach dem `filter`, ohne eine Collection zu bauen. `any` bricht beim ersten Treffer ab. `map` wandelt jede Zeile in ihren Text um.
+    resources:
+      - title: std · Iterator::collect
+        url: https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.collect
+      - title: Rust by Example · Iterating over Results
+        url: https://doc.rust-lang.org/rust-by-example/error/iter_result.html
+
+  - id: eigener-iterator
+    type: gap
+    title: Ein Countdown als Iterator
+    prompt: |
+      `Countdown { rest: 3 }` soll 3, 2, 1 liefern und dann enden. Ergänze die Implementierung des Traits. Erwartete Ausgabe: `[3, 2, 1]` und `30`.
+    lang: rust
+    code: |
+      struct Countdown {
+          rest: u32,
+      }
+
+      impl ⟦Iterator⟧ for Countdown {
+          type ⟦Item⟧ = u32;
+
+          fn next(⟦&mut self⟧) -> ⟦Option<Self::Item>⟧ {
+              if self.rest == 0 {
+                  None
+              } else {
+                  self.rest -= 1;
+                  Some(self.rest + 1)
+              }
+          }
+      }
+
+      fn main() {
+          let v: Vec<u32> = Countdown { rest: 3 }.collect();
+          println!("{v:?}");
+          let summe: u32 = Countdown { rest: 10 }.filter(|n| n % 2 == 0).sum();
+          println!("{summe}");
+      }
+    gaps:
+      - label: Trait
+        hint: Der Trait mit der Methode `next`.
+      - label: Assoziierter Typ
+        hint: Der Typ der Elemente.
+      - label: Receiver
+        hint: "`next` ändert den Zustand des Iterators."
+      - label: Rückgabetyp
+        hint: Entweder ein Element oder das Ende.
+        accept: ["Option<u32>"]
+    explanation: |
+      `Iterator` verlangt einen assoziierten Typ `Item` und die Methode `next(&mut self) -> Option<Self::Item>`. `&mut self`, weil jeder Aufruf den Zustand weiterschaltet; `None` signalisiert das Ende. Mehr musst du nicht schreiben: `collect`, `filter` und `sum` sind Default-Methoden des Traits. Die Summe der geraden Zahlen von 10 bis 1 ist 10 + 8 + 6 + 4 + 2 = 30.
+    resources:
+      - title: std::iter · Implementing Iterator
+        url: https://doc.rust-lang.org/std/iter/index.html#implementing-iterator
+      - title: Rust by Example · Iterators
+        url: https://doc.rust-lang.org/rust-by-example/trait/iter.html
+
+  - id: fn-statt-fnmut
+    type: bug
+    title: Die Closure darf nichts ändern?
+    prompt: |
+      `fuer_jede_zeile` ruft eine Closure für jede Zeile auf. Der Aufruf in `main` soll die Zeilenlängen sammeln. Der Compiler meldet:
+
+      ```text
+      error[E0596]: cannot borrow `laengen` as mutable, as it is a captured variable in a `Fn` closure
+      ```
+
+      Korrigiere die Zeile, die das Problem verursacht, sodass `main` unverändert bleiben kann.
+    lang: rust
+    code: |
+      fn fuer_jede_zeile<F: Fn(&str)>(text: &str, f: F) {
+          for zeile in text.lines() {
+              f(zeile);
+          }
+      }
+
+      fn main() {
+          let mut laengen = Vec::new();
+          fuer_jede_zeile("boot\nnetz ok\ndb", |z| laengen.push(z.len()));
+          println!("{laengen:?}");
+      }
+    lines: [1]
+    fix:
+      - line: 1
+        answers:
+          - "fn fuer_jede_zeile<F: FnMut(&str)>(text: &str, mut f: F) {"
+          - "fn fuer_jede_zeile(text: &str, mut f: impl FnMut(&str)) {"
+    hints:
+      - Welchen Trait implementiert eine Closure, die `laengen.push` aufruft?
+      - "`FnMut` wird über `&mut self` aufgerufen. Was muss dafür mit dem Parameter `f` passieren?"
+    explanation: |
+      Die Closure ruft `laengen.push` auf, ändert also Eingefangenes und ist damit `FnMut`, nicht `Fn`. Der Bound `Fn` ist zu streng. Mit `F: FnMut(&str)` passt sie, und weil `FnMut` über `&mut self` aufgerufen wird, braucht der Parameter ein `mut`. Die Meldung zeigt auf die Closure in `main`, die Ursache steht in der Signatur – der Compiler sagt es sogar: `change this to accept FnMut instead of Fn`.
+    resources:
+      - title: Error-Index · E0596
+        url: https://doc.rust-lang.org/error_codes/E0596.html
+      - title: The Rust Book · Moving Captured Values Out of Closures
+        url: https://doc.rust-lang.org/book/ch13-01-closures.html#moving-captured-values-out-of-closures
+
+  - id: map-ohne-konsument
+    type: bug
+    title: Die Liste bleibt leer
+    prompt: |
+      Das Programm soll die Pfade aus drei Anfragen sammeln. Es kompiliert, gibt aber `0 Pfade: []` aus. Der Compiler zeigt außerdem eine Warnung `unused Map that must be used`. Korrigiere die fehlerhafte Zeile, sodass `3 Pfade: ["/", "/login", "/api"]` herauskommt.
+    lang: rust
+    code: |
+      fn main() {
+          let zeilen = vec!["GET /", "POST /login", "GET /api"];
+          let mut pfade = Vec::new();
+          zeilen.iter().map(|z| pfade.push(z.split(' ').nth(1).unwrap_or("?")));
+          println!("{} Pfade: {pfade:?}", pfade.len());
+      }
+    lines: [4]
+    fix:
+      - line: 4
+        answers:
+          - "zeilen.iter().for_each(|z| pfade.push(z.split(' ').nth(1).unwrap_or(\"?\")));"
+          - "for z in &zeilen { pfade.push(z.split(' ').nth(1).unwrap_or(\"?\")); }"
+          - "for z in zeilen.iter() { pfade.push(z.split(' ').nth(1).unwrap_or(\"?\")); }"
+    hints:
+      - Was macht `map`, solange niemand Elemente anfordert?
+    explanation: |
+      `map` ist ein Adapter und damit lazy: Es erzeugt nur einen Iterator, der beschreibt, was zu tun wäre. Da kein Konsument ihn antreibt, läuft die Closure nie, und der Vec bleibt leer. `for_each` oder eine `for`-Schleife konsumieren den Iterator. Noch idiomatischer ist, auf den veränderlichen Vec ganz zu verzichten: `let pfade: Vec<&str> = zeilen.iter().map(|z| z.split(' ').nth(1).unwrap_or("?")).collect();` – `map` ohne Seiteneffekt, `collect` als Konsument.
+    resources:
+      - title: std::iter · Laziness
+        url: https://doc.rust-lang.org/std/iter/index.html#laziness
+      - title: std · Iterator::for_each
+        url: https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.for_each
+
+  - id: langsamster-pfad-erklaeren
+    type: explain
+    title: Der langsamste Endpunkt
+    prompt: |
+      Erkläre, was `langsamster_pfad` berechnet und wie die Iterator-Kette am Ende arbeitet. Gehe auch darauf ein, warum die Signatur `'a` braucht und was passiert, wenn zwei Pfade denselben Durchschnitt haben.
+    lang: rust
+    code: |
+      use std::collections::HashMap;
+
+      fn langsamster_pfad<'a>(log: &[(&'a str, u32)]) -> Option<(&'a str, u32)> {
+          let mut summen: HashMap<&str, (u32, u32)> = HashMap::new();
+          for &(pfad, ms) in log {
+              let eintrag = summen.entry(pfad).or_insert((0, 0));
+              eintrag.0 += ms;
+              eintrag.1 += 1;
+          }
+          summen
+              .into_iter()
+              .map(|(pfad, (summe, anzahl))| (pfad, summe / anzahl))
+              .max_by_key(|&(_, schnitt)| schnitt)
+      }
+    points:
+      - Die Schleife summiert pro Pfad Antwortzeit und Anzahl über die Entry-API.
+      - "`into_iter` verbraucht die Map, `map` berechnet lazy den ganzzahligen Durchschnitt, `max_by_key` konsumiert und liefert den Pfad mit dem größten Durchschnitt – ohne Zwischen-Vec."
+      - Bei leerem Log ist die Map leer und das Ergebnis `None`.
+      - Die Signatur braucht `'a`, weil der Parameter zwei Lifetimes enthält (Slice und `&str`) und das Ergebnis aus den Pfad-Strings des Logs stammt, nicht aus dem Slice.
+      - Bei Gleichstand liefert `max_by_key` das letzte Maximum; weil die HashMap keine Reihenfolge hat, ist das Ergebnis dann nicht deterministisch.
+    explanation: |
+      Die Funktion aggregiert zuerst: Für jeden Pfad sammelt sie über `entry(…).or_insert((0, 0))` Summe und Anzahl in einem Tupel. Danach verbraucht `into_iter` die Map, `map` rechnet jeden Eintrag in `(pfad, durchschnitt)` um – mit Ganzzahldivision – und `max_by_key` wählt das Paar mit dem größten Durchschnitt. Weil die Kette lazy ist, entsteht dabei keine Zwischen-Collection. Ein leeres Log führt zu `None`, eine Division durch 0 ist ausgeschlossen, weil jeder Eintrag mindestens einmal gezählt wurde. `'a` ist nötig, weil `&[(&str, u32)]` zwei Eingabe-Lifetimes hat und die Elision nicht weiß, woher die Rückgabe leiht; sie stammt aus den Strings des Logs, nicht aus dem Slice. Die Schwachstelle: `max_by_key` liefert bei mehreren Maxima das letzte, und die Reihenfolge der HashMap ist zufällig. Für ein deterministisches Ergebnis vergleicht man bei Gleichstand zusätzlich den Pfad, etwa mit `max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(a.0)))`, oder nimmt eine `BTreeMap`.
+    resources:
+      - title: std · Iterator::max_by_key
+        url: https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.max_by_key
+      - title: std · Iterator::fold
+        url: https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.fold
+
+  - id: sensordaten
+    type: practice
+    title: Sensordaten auswerten
+    prompt: |
+      Eine Datei enthält Messwerte im Format `sensor;wert`, eine Messung pro Zeile. Leerzeilen und Zeilen, die mit `#` beginnen, werden übersprungen. Schreibe mit Iteratoren und Closures:
+
+      - `parse(text: &str) -> Result<Vec<Messung>, String>`: parst alle Zeilen; beim ersten Fehler kommt `Err` mit einer Meldung, die mit `Zeile <Nr>` beginnt (Zeilennummer ab 1, bezogen auf den ganzen Text). Nutze `collect` in ein `Result`.
+      - `mittelwerte(messungen: &[Messung]) -> BTreeMap<String, f64>`: Durchschnitt pro Sensor, nach Namen sortiert.
+      - `ausreisser(messungen: &[Messung], grenze: f64) -> impl Iterator<Item = &Messung>`: alle Messungen, deren Betrag größer als `grenze` ist – lazy, ohne `Vec`.
+
+      Die Tests im Startcode beschreiben das Verhalten. Lass sie im Playground über **Test** laufen.
+    lang: rust
+    starter: |
+      use std::collections::BTreeMap;
+
+      #[derive(Debug, Clone, PartialEq)]
+      struct Messung {
+          sensor: String,
+          wert: f64,
+      }
+
+      fn parse(text: &str) -> Result<Vec<Messung>, String> {
+          todo!()
+      }
+
+      fn mittelwerte(messungen: &[Messung]) -> BTreeMap<String, f64> {
+          todo!()
+      }
+
+      // fn ausreisser(…) -> impl Iterator<Item = &Messung>
+
+      fn main() {
+          let text = "# sensor;wert\nkueche;21.5\nbad;23.0\nkueche;22.5\n\nkeller;-40.0";
+          println!("{:?}", parse(text));
+      }
+
+      #[cfg(test)]
+      mod tests {
+          use super::*;
+
+          #[test]
+          fn parst_und_ignoriert_kommentare_und_leerzeilen() {
+              let m = parse("# kopf\n\nbad; 23.5\n").unwrap();
+              assert_eq!(m, vec![Messung { sensor: "bad".to_string(), wert: 23.5 }]);
+          }
+
+          #[test]
+          fn erster_fehler_mit_zeilennummer() {
+              let fehler = parse("a;1\nb;zwei\nc\n").unwrap_err();
+              assert!(fehler.starts_with("Zeile 2"), "bekommen: {fehler}");
+          }
+
+          #[test]
+          fn mittelwerte_sortiert_nach_sensor() {
+              let m = parse("z;1\na;2\na;4").unwrap();
+              let mw: Vec<(String, f64)> = mittelwerte(&m).into_iter().collect();
+              assert_eq!(mw, vec![("a".to_string(), 3.0), ("z".to_string(), 1.0)]);
+          }
+
+          #[test]
+          fn ausreisser_nach_betrag() {
+              let m = parse("a;10\nb;-50\nc;45").unwrap();
+              let namen: Vec<&str> = ausreisser(&m, 40.0).map(|m| m.sensor.as_str()).collect();
+              assert_eq!(namen, vec!["b", "c"]);
+          }
+      }
+    solution: |
+      use std::collections::BTreeMap;
+
+      #[derive(Debug, Clone, PartialEq)]
+      struct Messung {
+          sensor: String,
+          wert: f64,
+      }
+
+      fn parse_zeile(nr: usize, zeile: &str) -> Result<Messung, String> {
+          let (sensor, wert) = zeile
+              .split_once(';')
+              .ok_or_else(|| format!("Zeile {nr}: kein ';'"))?;
+          let wert = wert
+              .trim()
+              .parse::<f64>()
+              .map_err(|e| format!("Zeile {nr}: {e}"))?;
+          Ok(Messung { sensor: sensor.trim().to_string(), wert })
+      }
+
+      fn parse(text: &str) -> Result<Vec<Messung>, String> {
+          text.lines()
+              .enumerate()
+              .filter(|(_, z)| !z.trim().is_empty() && !z.starts_with('#'))
+              .map(|(i, z)| parse_zeile(i + 1, z))
+              .collect()
+      }
+
+      fn mittelwerte(messungen: &[Messung]) -> BTreeMap<String, f64> {
+          let mut summen: BTreeMap<String, (f64, u32)> = BTreeMap::new();
+          for m in messungen {
+              let e = summen.entry(m.sensor.clone()).or_insert((0.0, 0));
+              e.0 += m.wert;
+              e.1 += 1;
+          }
+          summen
+              .into_iter()
+              .map(|(sensor, (summe, n))| (sensor, summe / f64::from(n)))
+              .collect()
+      }
+
+      fn ausreisser(messungen: &[Messung], grenze: f64) -> impl Iterator<Item = &Messung> {
+          messungen.iter().filter(move |m| m.wert.abs() > grenze)
+      }
+
+      fn main() {
+          let text = "# sensor;wert\nkueche;21.5\nbad;23.0\nkueche;22.5\n\nkeller;-40.0";
+          match parse(text) {
+              Ok(messungen) => {
+                  for (sensor, schnitt) in mittelwerte(&messungen) {
+                      println!("{sensor}: {schnitt:.1}");
+                  }
+                  let namen: Vec<&str> = ausreisser(&messungen, 30.0).map(|m| m.sensor.as_str()).collect();
+                  println!("Ausreißer: {namen:?}");
+              }
+              Err(e) => eprintln!("{e}"),
+          }
+      }
+
+      #[cfg(test)]
+      mod tests {
+          use super::*;
+
+          #[test]
+          fn parst_und_ignoriert_kommentare_und_leerzeilen() {
+              let m = parse("# kopf\n\nbad; 23.5\n").unwrap();
+              assert_eq!(m, vec![Messung { sensor: "bad".to_string(), wert: 23.5 }]);
+          }
+
+          #[test]
+          fn erster_fehler_mit_zeilennummer() {
+              let fehler = parse("a;1\nb;zwei\nc\n").unwrap_err();
+              assert!(fehler.starts_with("Zeile 2"), "bekommen: {fehler}");
+          }
+
+          #[test]
+          fn mittelwerte_sortiert_nach_sensor() {
+              let m = parse("z;1\na;2\na;4").unwrap();
+              let mw: Vec<(String, f64)> = mittelwerte(&m).into_iter().collect();
+              assert_eq!(mw, vec![("a".to_string(), 3.0), ("z".to_string(), 1.0)]);
+          }
+
+          #[test]
+          fn ausreisser_nach_betrag() {
+              let m = parse("a;10\nb;-50\nc;45").unwrap();
+              let namen: Vec<&str> = ausreisser(&m, 40.0).map(|m| m.sensor.as_str()).collect();
+              assert_eq!(namen, vec!["b", "c"]);
+          }
+      }
+    checklist:
+      - "`parse` nutzt `enumerate` für die Zeilennummer **vor** dem Filtern, sodass die Nummern zum Originaltext passen."
+      - "`parse` sammelt mit `collect()` in `Result<Vec<Messung>, String>` und bricht beim ersten Fehler ab."
+      - "`mittelwerte` liefert eine `BTreeMap`, damit die Ausgabe sortiert und stabil ist."
+      - "`ausreisser` gibt `impl Iterator<Item = &Messung>` zurück und nutzt eine `move`-Closure, damit `grenze` in den Iterator wandert."
+      - Keine Funktion baut einen Zwischen-`Vec`, der nur wieder durchlaufen wird.
+      - Alle vier Tests laufen grün.
+    hints:
+      - "`ok_or_else` macht aus `Option` ein `Result`, `map_err` passt den Fehlertyp an; `?` funktioniert in einer Hilfsfunktion `parse_zeile`."
+      - "Ohne `move` in `ausreisser` meldet der Compiler E0373: Die Closure würde `grenze` nur leihen, der Iterator lebt aber länger als die Funktion."
+    explanation: |
+      Die Lösung zeigt die wichtigsten Muster des Moduls zusammen. `enumerate` vor `filter` hält die echten Zeilennummern fest. `collect` in `Result<Vec<_>, String>` verwandelt einen Iterator von Results in ein einziges Result – der erste Fehler bricht ab, weil `collect` lazy weiterzieht und bei `Err` stoppt. `ausreisser` gibt einen lazy Iterator zurück: Die Closure fängt `grenze` per `move` ein, weil sie die Funktion überlebt; die Lifetime von `messungen` fängt `impl Iterator` in Edition 2024 automatisch ein. Die `BTreeMap` in `mittelwerte` sorgt für eine deterministische Reihenfolge, was der Test prüft.
+    resources:
+      - title: Rust by Example · Iterating over Results
+        url: https://doc.rust-lang.org/rust-by-example/error/iter_result.html
+      - title: Edition Guide · RPIT lifetime capture rules
+        url: https://doc.rust-lang.org/edition-guide/rust-2024/rpit-lifetime-capture.html

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { addDays, convertLegacyBear, exportAll, freshProgress, gradeCard, keyFor, mergeProgress, parseBackup, readProgress, writeProgress } from './storage.ts';
+import { addDays, convertLegacyBear, exportAll, freshProgress, gradeCard, keyFor, mergeProgress, parseBackup, readProgress, sanitize, writeProgress } from './storage.ts';
 
 function memoryStorage(seed: Record<string, string> = {}) {
   const data = new Map(Object.entries(seed));
@@ -56,5 +56,20 @@ describe('progress storage', () => {
     const converted = convertLegacyBear(old, modules);
     expect(converted.done).toEqual({ 'bear-01/bear-001': { at: '2026-09-28', fp: 'f1' } });
     expect(converted.drafts['bear-01/bear-002']).toEqual({ g1: '"Be' });
+  });
+  it('imports the later review on the same day without reverting it on a second import', () => {
+    const older = freshProgress();
+    older.cards.c = gradeCard(undefined, false, '2026-09-28');
+    const newer = freshProgress();
+    newer.cards.c = gradeCard(older.cards.c, true, '2026-09-28');
+    const merged = mergeProgress(older, newer);
+    expect(merged.cards.c).toEqual(newer.cards.c);
+    expect(mergeProgress(merged, older).cards.c).toEqual(newer.cards.c);
+  });
+  it('restores only local learning routes as resume destinations', () => {
+    for (const last of ['//example.com', '/\\example.com', '/%E0%A4%A']) {
+      expect(sanitize({ ...freshProgress(), last }).last).toBeNull();
+    }
+    expect(sanitize({ ...freshProgress(), last: '/python/python-einstieg/2' }).last).toBe('/python/python-einstieg/2');
   });
 });

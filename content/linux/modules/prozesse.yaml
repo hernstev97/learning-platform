@@ -1,0 +1,707 @@
+id: prozesse
+title: Prozesse & Signale
+level: 2
+minutes: 150
+summary: Wie Linux Programme als Prozesse ausführt, wie du sie beobachtest, steuerst und sauber beendest – und warum `kill -9` der letzte Ausweg ist.
+goals:
+  - Du erklärst den Unterschied zwischen Programm und Prozess und das Zusammenspiel von `fork`, `exec` und `wait`.
+  - Du liest `ps`, den Kopf von `top`, die Load Average und `free` richtig und erkennst, ob CPU, Platte oder Speicher der Engpass ist.
+  - Du beendest Prozesse mit dem passenden Signal und begründest, warum `SIGKILL` der letzte Ausweg ist.
+  - Du steuerst Jobs mit `&`, `jobs`, `fg` und `bg` und weißt, warum dauerhafte Dienste in systemd gehören.
+  - Du nutzt Exit-Codes und `/proc/<pid>` für die Fehlersuche und gehst mit Zombies richtig um.
+resources:
+  - title: signal(7) – Überblick über Signale
+    url: https://man7.org/linux/man-pages/man7/signal.7.html
+  - title: ps(1) – Prozesse anzeigen
+    url: https://man7.org/linux/man-pages/man1/ps.1.html
+  - title: proc(5) – das /proc-Dateisystem
+    url: https://man7.org/linux/man-pages/man5/proc.5.html
+  - title: Bash Reference Manual · Job Control
+    url: https://www.gnu.org/software/bash/manual/html_node/Job-Control-Basics.html
+lesson: |
+  Du startest mit `npm run dev` einen Entwicklungsserver, schließt versehentlich das Terminal-Tab, und beim nächsten Start meldet der Server `EADDRINUSE: address already in use :::5173`. Oder ein Test-Runner hängt, `Strg+C` bewirkt nichts, und im Team-Chat schreibt jemand „mach halt `kill -9`“. In beiden Fällen brauchst du dasselbe Wissen: Was ist ein Prozess, wie findest du ihn, und wie beendest du ihn so, dass nichts kaputtgeht?
+
+  Dieses Modul baut das Denkmodell dafür auf. Danach liest du `ps` und `top` wie jemand aus dem Betrieb, unterscheidest `SIGTERM` von `SIGKILL` und kannst begründen, warum ein Dienst nicht mit `nohup … &` auf einem Server laufen sollte.
+
+  ## Lebenszyklus: fork, exec, exit, wait
+
+  Ein **Programm** ist eine Datei auf der Platte, zum Beispiel `/usr/bin/python3`. Ein **Prozess** ist eine laufende Instanz davon – mit eigener **PID** (Process ID), eigenem Speicher, offenen Dateien, Umgebungsvariablen, Arbeitsverzeichnis, Besitzer (UID) und einem Elternprozess (**PPID**). Dasselbe Programm kann gleichzeitig in hundert Prozessen laufen.
+
+  Neue Prozesse entstehen unter Linux in zwei Schritten:
+
+  1. [`fork()`](https://man7.org/linux/man-pages/man2/fork.2.html) klont den aufrufenden Prozess. Das Kind bekommt eine neue PID, ist sonst aber eine Kopie des Elternprozesses: gleicher Speicherinhalt, gleiche offene Dateien, gleiche Umgebung.
+  2. [`execve()`](https://man7.org/linux/man-pages/man2/execve.2.html) ersetzt im Kind das laufende Programm durch ein anderes. Die PID bleibt, Code und Speicher werden ausgetauscht.
+
+  Tippst du `python3 app.py`, forkt die Shell, das Kind lädt per `execve` Python, und die Shell wartet mit [`wait()`](https://man7.org/linux/man-pages/man2/wait.2.html), bis das Kind fertig ist. Daraus folgt eine Regel, die viele Rätsel erklärt: **Ein Kind erbt eine Kopie der Umgebung, kann aber die seines Elternprozesses nie ändern.** Ein Skript, das `cd /srv` oder `export DEBUG=1` ausführt, verändert deshalb nicht deine Shell. Genau darum ist `cd` ein Shell-Builtin und kein eigenes Programm.
+
+  ```console
+  $ echo $$
+  48211
+  $ bash -c 'echo "Ich bin $$, mein Elternprozess ist $PPID"'
+  Ich bin 48530, mein Elternprozess ist 48211
+  $ pstree -p -s $$
+  systemd(1)───systemd(1432)───kitty(2210)───fish(2215)───bash(48211)───pstree(48533)
+  ```
+
+  `$$` ist die PID der aktuellen Shell, `$PPID` die ihres Elternprozesses. Folgst du der Kette nach oben, landest du immer bei PID 1 – auf fast allen aktuellen Distributionen ist das systemd.
+
+  Wenn ein Prozess endet, hinterlässt er einen **Exit-Status** zwischen 0 und 255. `0` bedeutet Erfolg, alles andere einen Fehler; was genau, legt das Programm fest. Die Shell speichert den Status des letzten Befehls in `$?`:
+
+  ```console
+  $ grep -q "ERROR" app.log
+  $ echo $?
+  1
+  $ ls /gibt-es-nicht
+  ls: cannot access '/gibt-es-nicht': No such file or directory
+  $ echo $?
+  2
+  $ gibtsnicht
+  bash: gibtsnicht: command not found
+  $ echo $?
+  127
+  ```
+
+  `grep` liefert `1`, wenn nichts gefunden wurde, und `2` bei echten Fehlern. `127` heißt „Befehl nicht gefunden“, `126` „gefunden, aber nicht ausführbar“. Stirbt ein Prozess an einem Signal, meldet die Shell `128 + Signalnummer` ([Bash Manual · Exit Status](https://www.gnu.org/software/bash/manual/html_node/Exit-Status.html)). Auf Exit-Codes bauen `&&`, `||`, `if` in Skripten und jede CI-Pipeline auf.
+
+  Zwischen dem Ende des Kindes und dem `wait()` des Elternprozesses liegt ein Zwischenzustand: Der Kernel hebt PID und Exit-Status auf, bis jemand sie abholt. So lange ist der Prozess ein **Zombie** (Zustand `Z`, in `ps` als `<defunct>`). Er belegt keinen Speicher und keine CPU mehr, aber einen Eintrag in der Prozesstabelle. Kurzlebige Zombies sind normal. Hunderte Zombies desselben Elternprozesses bedeuten einen Bug: Der Elternprozess ruft nie `wait()` auf. Beenden kannst du einen Zombie nicht – er ist schon tot. Stirbt aber sein Elternprozess, übernimmt PID 1 (oder der nächste sogenannte *Subreaper*, zum Beispiel `systemd --user`) die Kinder und räumt die Zombies ab ([wait(2), Abschnitt NOTES](https://man7.org/linux/man-pages/man2/wait.2.html#NOTES)).
+
+  Das Gegenstück ist der **Waisenprozess** (orphan): ein Kind, das noch läuft, obwohl sein Elternprozess beendet ist. Das ist kein Fehler. Der Kernel hängt es an PID 1 oder einen Subreaper, und die Arbeit geht weiter.
+
+  > [!NOTE] fish und bash
+  > In fish heißen einige Variablen anders: `$fish_pid` statt `$$`, `$status` statt `$?`, `$last_pid` statt `$!` ([fish-Doku · Special variables](https://fishshell.com/docs/current/language.html#special-variables)). Die Beispiele hier nutzen Bash-Syntax, weil Skripte und Server-Shells fast immer Bash sind. Tippe `bash`, um sie auszuprobieren; `exit` bringt dich zurück.
+
+  > [!DEEP] Warum zwei Schritte statt einem?
+  > Zwischen `fork` und `exec` kann das Kind seine Umgebung vorbereiten. Eine Umleitung wie `> log.txt` ist genau das: Das Kind öffnet die Datei, legt sie auf Dateideskriptor 1 und ruft erst dann `execve` auf – das neue Programm schreibt „auf stdout“ und landet in der Datei, ohne davon zu wissen. Damit `fork` billig bleibt, kopiert der Kernel den Speicher nicht sofort, sondern erst beim ersten Schreibzugriff (Copy-on-Write).
+
+  ## Prozesse beobachten: ps, pgrep, top
+
+  [`ps`](https://man7.org/linux/man-pages/man1/ps.1.html) macht eine Momentaufnahme. Zwei Schreibweisen haben sich gehalten, beide zeigen alle Prozesse:
+
+  ```console
+  $ ps aux | head -3
+  USER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
+  root           1  0.0  0.0  22660 16864 ?        Ss   06:02   0:05 /usr/lib/systemd/systemd --switched-root --system
+  root           2  0.0  0.0      0     0 ?        S    06:02   0:00 [kthreadd]
+  $ ps -ef | head -3
+  UID          PID    PPID  C STIME TTY          TIME CMD
+  root           1       0  0 06:02 ?        00:00:05 /usr/lib/systemd/systemd --switched-root --system
+  root           2       0  0 06:02 ?        00:00:00 [kthreadd]
+  ```
+
+  `ps aux` (BSD-Syntax, ohne Bindestrich) zeigt CPU- und Speicheranteil, `RSS` (tatsächlich belegter Arbeitsspeicher in KiB) und den Zustand `STAT`. `ps -ef` (POSIX-Syntax) zeigt dafür die `PPID`. Einträge in eckigen Klammern sind Kernel-Threads. Bei der Fehlersuche wählst du die Spalten besser selbst: `-e` für alle Prozesse, `-o` für die Spalten, `--sort` für die Reihenfolge (Minus = absteigend).
+
+  ```console
+  $ ps -eo pid,ppid,user,stat,rss,cmd --sort=-rss | head -3
+      PID    PPID USER     STAT   RSS CMD
+     3310    2210 steven   Sl   2140332 /usr/lib/firefox/firefox
+     2231       1 app      Sl    88412 /srv/app/.venv/bin/python /srv/app/.venv/bin/gunicorn app:server
+  ```
+
+  Die wichtigsten Zustände in der Spalte `STAT` ([ps(1), PROCESS STATE CODES](https://man7.org/linux/man-pages/man1/ps.1.html#PROCESS_STATE_CODES)):
+
+  | Code | Zustand | Bedeutung |
+  | --- | --- | --- |
+  | `R` | running/runnable | rechnet gerade oder wartet auf einen freien Kern |
+  | `S` | interruptible sleep | wartet auf ein Ereignis (Netzwerk, Eingabe, Timer) – der Normalfall |
+  | `D` | uninterruptible sleep | wartet im Kernel auf I/O und reagiert in der Regel auf kein Signal |
+  | `T` | stopped | angehalten, zum Beispiel mit `Strg+Z` |
+  | `Z` | zombie | beendet, Exit-Status noch nicht abgeholt |
+
+  Dahinter können Zusatzzeichen stehen: `s` (Sitzungsleiter), `l` (mehrere Threads), `+` (Vordergrund-Prozessgruppe eines Terminals), `N` bzw. `<` (niedrige bzw. hohe Priorität). `Sl` heißt also: schläft, hat mehrere Threads.
+
+  Nach Namen suchst du mit [`pgrep`](https://man7.org/linux/man-pages/man1/pgrep.1.html): `pgrep -a nginx` zeigt PID und Kommandozeile aller Prozesse, deren **Name** passt; mit `-f` durchsucht `pgrep` die **ganze Kommandozeile**. Das ist wichtig, weil der Name eines Node- oder Python-Programms `node` bzw. `python3` lautet, nicht der des Skripts.
+
+  [`top`](https://man7.org/linux/man-pages/man1/top.1.html) aktualisiert sich laufend (`htop` ist komfortabler, muss aber meist nachinstalliert werden). Wichtiger als die Prozessliste ist der Kopf:
+
+  ```console
+  $ top -bn1 | head -5
+  top - 14:43:56 up  8:41,  1 user,  load average: 1.31, 1.68, 1.56
+  Tasks: 646 total,   3 running, 639 sleep,   0 d-sleep,   0 stopped,   4 zombie
+  %Cpu(s):  5.6 us,  2.8 sy,  0.6 ni, 90.0 id,  0.6 wa,  0.2 hi,  0.4 si,  0.0 st
+  MiB Mem :  64044.4 total,   7167.2 free,  11635.1 used,  47381.6 buff/cache
+  MiB Swap:  64044.0 total,  64041.8 free,      2.2 used.  52409.3 avail Mem
+  ```
+
+  In der CPU-Zeile bedeuten `us` Zeit in Programmen, `sy` Zeit im Kernel, `ni` Programme mit erhöhtem Nice-Wert, `id` Leerlauf, `wa` Leerlauf *während auf I/O gewartet wird*, `hi`/`si` Interrupts und `st` („steal“) Zeit, die der Hypervisor einer VM entzogen hat ([top(1), SUMMARY Display](https://man7.org/linux/man-pages/man1/top.1.html#2._SUMMARY_Display)).
+
+  ## Load Average und Speicher richtig lesen
+
+  Die drei Zahlen hinter `load average` sind gleitende Mittelwerte über 1, 5 und 15 Minuten. Laut [proc_loadavg(5)](https://man7.org/linux/man-pages/man5/proc_loadavg.5.html) zählen sie Prozesse im Zustand `R` **und** Prozesse, die im Zustand `D` auf Platten-I/O warten. Daraus folgen drei Regeln:
+
+  - Die Zahl sagt nur im Verhältnis zur Anzahl der Kerne etwas aus (`nproc`). Load 4 auf 4 Kernen: voll ausgelastet. Load 4 auf 24 Kernen: entspannt.
+  - Hoher Load heißt nicht automatisch „CPU am Limit“. Ist `wa` hoch und hängen viele Prozesse in `D`, wartet das System auf Platte oder Netzwerkspeicher. Mehr CPU hilft dann nicht.
+  - Die Reihenfolge zeigt den Trend: `6.10, 3.20, 0.90` heißt, die Last ist in den letzten Minuten gestiegen; `0.90, 3.20, 6.10` heißt, sie klingt ab.
+
+  `uptime` zeigt dieselben drei Zahlen. Für den Speicher nimmst du [`free -h`](https://man7.org/linux/man-pages/man1/free.1.html):
+
+  ```console
+  $ free -h
+                 total        used        free      shared  buff/cache   available
+  Mem:            62Gi        11Gi       7.0Gi       1.2Gi        46Gi        51Gi
+  Swap:           62Gi       2.2Mi        62Gi
+  ```
+
+  Linux nutzt ungenutzten Arbeitsspeicher als Cache für Dateien (`buff/cache`) und gibt ihn sofort ab, wenn Programme Speicher brauchen. Aussagekräftig ist deshalb `available`: die Schätzung, wie viel Speicher neue Programme bekommen können, ohne dass das System swappen muss. Wenig `free` bei viel `available` ist gesund.
+
+  > [!MERKE]
+  > Load Average = Prozesse in `R` plus Prozesse in `D`, gemittelt – immer im Verhältnis zu `nproc` lesen. Beim Speicher zählt `available`, nicht `free`.
+
+  ## Signale: höflich bitten, dann erzwingen
+
+  Ein [Signal](https://man7.org/linux/man-pages/man7/signal.7.html) ist eine kurze Nachricht an einen Prozess. Die meisten Signale kann ein Programm abfangen und selbst entscheiden, was passiert. Zwei kann es nicht: `SIGKILL` und `SIGSTOP`.
+
+  | Signal | Nr. | Typischer Auslöser | Standardwirkung | abfangbar |
+  | --- | --- | --- | --- | --- |
+  | `SIGHUP` | 1 | Terminal geschlossen; bei Daemons Konvention für „Konfiguration neu laden“ | beenden | ja |
+  | `SIGINT` | 2 | `Strg+C` | beenden | ja |
+  | `SIGKILL` | 9 | `kill -9` | sofort beenden | nein |
+  | `SIGTERM` | 15 | `kill` ohne Option, systemd beim Stoppen | beenden | ja |
+  | `SIGCONT` | 18 | `fg`, `bg` | fortsetzen | ja |
+  | `SIGSTOP` | 19 | `kill -STOP` | anhalten | nein |
+  | `SIGTSTP` | 20 | `Strg+Z` | anhalten | ja |
+
+  Die Nummern gelten für x86 und ARM; die Namen sind portabel. Verschickt werden Signale mit [`kill`](https://man7.org/linux/man-pages/man1/kill.1.html), `pkill` und `killall`:
+
+  ```console
+  $ kill 4242                   # SIGTERM an PID 4242
+  $ kill -HUP 812               # nginx-Master: Konfiguration neu laden
+  $ kill -s TERM 4242           # dasselbe wie die erste Zeile, ausführlich
+  $ pgrep -af "bin/vite"        # erst ansehen, wen es trifft …
+  $ pkill -f "bin/vite"         # … dann allen passenden Prozessen SIGTERM schicken
+  $ killall firefox             # alle Prozesse mit genau diesem Namen
+  ```
+
+  Warum ist `SIGTERM` der Standard und `SIGKILL` der letzte Ausweg? Bei `SIGTERM` darf das Programm aufräumen: laufende Anfragen zu Ende bearbeiten, Puffer auf die Platte schreiben, Datenbanktransaktionen abschließen, Lock- und PID-Dateien löschen, Kindprozesse beenden. `SIGKILL` entfernt den Prozess, ohne dass er noch eine einzige Zeile Code ausführt. Die Folgen sind halb geschriebene Dateien, verwaiste Lock-Dateien, abgebrochene Uploads und Kindprozesse, die herrenlos weiterlaufen.
+
+  Die richtige Reihenfolge lautet deshalb: `SIGTERM` schicken, einige Sekunden warten, erst dann `SIGKILL`. systemd macht beim Stoppen eines Dienstes genau das – erst das Signal aus `KillSignal=` (Standard `SIGTERM`), nach Ablauf von `TimeoutStopSec=` (Standard 90 Sekunden) `SIGKILL` ([systemd.kill(5)](https://www.freedesktop.org/software/systemd/man/latest/systemd.kill.html)).
+
+  `SIGHUP` hat eine Doppelrolle. Ursprünglich meldete es „die Leitung zum Terminal ist weg“ und beendet deshalb standardmäßig. Viele Daemons ohne Terminal – nginx, sshd, rsyslog – fangen es ab und lesen stattdessen ihre Konfiguration neu ein. Ein Blick in die Doku des Programms klärt, was es mit `SIGHUP` macht.
+
+  > [!INTERVIEW] „Was ist der Unterschied zwischen kill und kill -9?“
+  > `kill` schickt `SIGTERM`: Der Prozess kann das Signal abfangen, aufräumen und sich selbst beenden. `kill -9` schickt `SIGKILL`: Der Kernel entfernt den Prozess sofort, ohne dass dieser reagieren kann – offene Daten gehen verloren, Lock-Dateien bleiben liegen. Deshalb erst `SIGTERM`, ein paar Sekunden warten, dann `SIGKILL`, so wie systemd es beim Stoppen tut. Ergänzung, die Eindruck macht: Ein Prozess im Zustand `D` und ein Zombie reagieren auch auf `SIGKILL` nicht. Und der Exit-Code 137 (128 + 9) in einem Container-Log verrät, dass der Prozess hart getötet wurde, oft vom OOM-Killer.
+
+  ## Jobs, Terminals und warum Dienste in systemd gehören
+
+  Die Shell verwaltet die Prozesse, die du aus ihr startest, als **Jobs** ([Bash Manual · Job Control](https://www.gnu.org/software/bash/manual/html_node/Job-Control-Basics.html)):
+
+  ```console
+  $ ./build.sh
+  ^Z
+  [1]+  Stopped                 ./build.sh
+  $ bg %1
+  [1]+ ./build.sh &
+  $ sleep 600 &
+  [2] 51022
+  $ jobs -l
+  [1]- 50871 Running                 ./build.sh &
+  [2]+ 51022 Running                 sleep 600 &
+  $ fg %1
+  ./build.sh
+  ^C
+  ```
+
+  - `&` am Ende startet einen Befehl im Hintergrund; die Shell nennt Jobnummer und PID und ist sofort wieder bereit. `$!` enthält die PID des zuletzt gestarteten Hintergrundjobs.
+  - `Strg+Z` schickt `SIGTSTP` an den Vordergrundjob: Er wird angehalten (Zustand `T`), läuft also **nicht** weiter.
+  - `bg` setzt einen angehaltenen Job im Hintergrund fort, `fg` holt ihn in den Vordergrund. Beide schicken dafür `SIGCONT`.
+  - `Strg+C` schickt `SIGINT` an den Vordergrundjob.
+  - `%1` ist die Jobnummer, nicht die PID. Die Bash-Builtins `kill`, `fg`, `bg` und `wait` verstehen beides.
+
+  Schließt du das Terminal, bekommt die Shell `SIGHUP` und leitet es an alle ihre Jobs weiter – laufende wie angehaltene ([Bash Manual · Signals](https://www.gnu.org/software/bash/manual/html_node/Signals.html)); fish verhält sich genauso. Deshalb stirbt dein Dev-Server mit dem Tab. Zwei Auswege sind verbreitet: [`nohup befehl &`](https://man7.org/linux/man-pages/man1/nohup.1.html) startet den Befehl so, dass er `SIGHUP` ignoriert, und leitet die Ausgabe nach `nohup.out` um. `disown` entfernt einen schon laufenden Job aus der Jobliste der Shell, sodass sie ihm beim Beenden kein `SIGHUP` schickt.
+
+  Für alles, was dauerhaft laufen soll, sind beide die falsche Lösung. Ein per `nohup` gestarteter Prozess startet nach einem Absturz nicht neu, fehlt nach dem nächsten Reboot, schreibt in eine Logdatei, die niemand rotiert, und außer dir weiß niemand, dass er existiert. systemd erledigt all das: Neustart bei Fehlern, Start beim Booten, Logs im Journal, geordnetes Stoppen mit `SIGTERM` und `SIGKILL`, Ressourcenlimits. Wie du dafür eine Unit schreibst, lernst du im Modul zu systemd. Für einmalige Aufgaben reicht [`systemd-run`](https://www.freedesktop.org/software/systemd/man/latest/systemd-run.html), das einen Befehl als vorübergehende Unit startet:
+
+  ```console
+  $ systemd-run --user --same-dir --unit=import-kunden python3 import.py
+  $ systemctl --user status import-kunden
+  $ journalctl --user -u import-kunden -f
+  ```
+
+  > [!PRAXIS] Der Port ist noch belegt
+  > `EADDRINUSE` nach einem geschlossenen Tab heißt meist: Der alte Dev-Server lebt noch, zum Beispiel weil er per `disown` oder aus einem IDE-Terminal gestartet wurde. Finde ihn mit `pgrep -af vite` (oder mit `ss -ltnp`, das den Port dem Prozess zuordnet – mehr im Netzwerk-Modul) und beende ihn mit `kill <pid>`. Wenn du das oft tust, gehört der Server in einen `tmux`-Pane oder in ein `docker compose`-Setup mit klarem Lebenszyklus.
+
+  ## Werkzeugkasten: nice, renice und /proc
+
+  **Priorität.** Jeder Prozess hat einen Nice-Wert von -20 (höchste Priorität) bis 19 (niedrigste), Standard 0. Je „netter“ ein Prozess ist, desto weniger CPU-Zeit bekommt er, *wenn* andere Prozesse um die CPU konkurrieren. Normale Benutzer dürfen den Wert nur erhöhen; senken darf nur root ([nice(1)](https://man7.org/linux/man-pages/man1/nice.1.html), [renice(1)](https://man7.org/linux/man-pages/man1/renice.1.html)). Der Nice-Wert wirkt nur auf die CPU-Verteilung, nicht auf Platten-I/O – dafür gibt es `ionice`.
+
+  ```console
+  $ nice -n 19 tar -czf backup.tar.gz ~/projekte
+  $ renice -n 10 -p 4242
+  4242 (process ID) old priority 0, new priority 10
+  ```
+
+  **Das /proc-Dateisystem.** Unter `/proc/<pid>/` stellt der Kernel alles über einen Prozess als Dateien bereit ([proc(5)](https://man7.org/linux/man-pages/man5/proc.5.html)). `ps` und `top` lesen genau diese Dateien. Wenn du wissen willst, was ein Prozess gerade tut, schau direkt hinein:
+
+  ```console
+  $ grep -E '^(Name|State|PPid|Threads|VmRSS)' /proc/2231/status
+  Name:   gunicorn
+  State:  S (sleeping)
+  PPid:   1
+  Threads:        1
+  VmRSS:     88412 kB
+  $ tr '\0' ' ' < /proc/2231/cmdline; echo
+  /srv/app/.venv/bin/python /srv/app/.venv/bin/gunicorn app:server
+  $ ls -l /proc/2231/fd
+  lr-x------ 1 app app 64 Sep 28 10:02 0 -> /dev/null
+  l-wx------ 1 app app 64 Sep 28 10:02 1 -> /var/log/app/gunicorn.log
+  l-wx------ 1 app app 64 Sep 28 10:02 2 -> /var/log/app/gunicorn.log
+  lrwx------ 1 app app 64 Sep 28 10:02 5 -> socket:[48213]
+  $ readlink /proc/2231/cwd
+  /srv/app
+  ```
+
+  - [`status`](https://man7.org/linux/man-pages/man5/proc_pid_status.5.html) fasst Zustand, Elternprozess, Threads und Speicher lesbar zusammen.
+  - [`cmdline`](https://man7.org/linux/man-pages/man5/proc_pid_cmdline.5.html) enthält die Argumente, getrennt durch Nullbytes – daher `tr '\0' ' '`.
+  - [`fd/`](https://man7.org/linux/man-pages/man5/proc_pid_fd.5.html) enthält für jeden offenen Dateideskriptor einen symbolischen Link: Dateien, Pipes, Sockets. So findest du heraus, wohin ein Prozess loggt.
+  - `cwd` und `exe` zeigen Arbeitsverzeichnis und Programmdatei; `environ` die Umgebungsvariablen (nur für Besitzer und root lesbar).
+
+  > [!PRAXIS] Die Platte ist voll, obwohl du das Log gelöscht hast
+  > Löschst du eine große Logdatei, die ein Prozess noch offen hält, entfernt `rm` nur den Namen. Der Speicherplatz wird erst frei, wenn der letzte Dateideskriptor geschlossen ist. In `ls -l /proc/<pid>/fd` steht dann `/var/log/app.log (deleted)`. Abhilfe: den Prozess neu starten oder ihn per Signal die Logdatei neu öffnen lassen – und künftig die Datei mit `truncate -s 0` leeren statt löschen oder `logrotate` einsetzen.
+
+  ## Häufige Fehler
+
+  - **`kill -9` als Reflex.** Symptom: Nach dem Neustart meldet die Anwendung „stale lock file“ oder eine kaputte Cache-Datei. Erst `kill`, warten, dann `kill -9`.
+  - **`ps aux | grep app` in Skripten.** Die Ausgabe enthält auch den `grep`-Prozess selbst, und das Muster trifft schnell fremde Prozesse. Nimm `pgrep`/`pkill`, die sich selbst ausschließen, und prüfe vorher mit `pgrep -af muster`, wen es trifft.
+  - **Zu breites Muster bei `pkill -f`.** `pkill -f python` beendet auch den Language Server deiner IDE und fremde Projekte. Wähle ein Muster, das nur den gemeinten Prozess trifft.
+  - **Zombies töten wollen.** `kill -9` auf einen Zombie bewirkt nichts. Die Ursache ist der Elternprozess.
+  - **Load Average ohne Kernzahl bewerten** und hohen Load automatisch für ein CPU-Problem halten, obwohl `wa` hoch ist.
+  - **„Nur noch 300 MB frei!“** Die Spalte `free` ist kein Alarmsignal; `available` ist die relevante Zahl.
+  - **Dienste mit `nohup`, `screen` oder `&` betreiben.** Kein Neustart, keine Logs im Journal, nach dem Reboot weg.
+
+  ## Zusammenfassung
+
+  - Ein Prozess ist eine laufende Instanz eines Programms mit PID, PPID, Speicher, offenen Dateien und Umgebung. Er entsteht durch `fork` (Kopie) und `execve` (neues Programm); der Elternprozess holt den Exit-Status mit `wait` ab.
+  - Exit-Status `0` heißt Erfolg; `127` Befehl nicht gefunden; `128 + n` Tod durch Signal `n` (130, 137, 143).
+  - `ps -eo …`, `pgrep -af` und `pstree -p` zeigen, was läuft; `top` zeigt Load, CPU-Aufteilung und Speicher.
+  - Load Average zählt `R`- und `D`-Prozesse und ist nur im Verhältnis zu `nproc` aussagekräftig; beim Speicher zählt `available`.
+  - Erst `SIGTERM` (Aufräumen möglich), dann nach einer Wartezeit `SIGKILL` (kein Aufräumen). `SIGHUP` lässt viele Daemons ihre Konfiguration neu laden.
+  - Zombies sind tote Prozesse, deren Status niemand abgeholt hat – behandelt wird der Elternprozess. Waisen werden von PID 1 oder einem Subreaper übernommen.
+  - Job Control (`&`, `Strg+Z`, `bg`, `fg`, `jobs`) ist fürs interaktive Arbeiten da; dauerhafte Dienste gehören in systemd.
+  - `/proc/<pid>/status`, `cmdline`, `fd` und `cwd` beantworten die meisten Fragen zu einem laufenden Prozess.
+exercises:
+  - id: fork-exec-aussagen
+    type: choice
+    title: Was ein Kindprozess erbt
+    prompt: Welche Aussagen über `fork()`, `execve()` und Kindprozesse stimmen?
+    options:
+      - text: Nach `execve()` hat der Prozess dieselbe PID wie vorher.
+        correct: true
+        why: "`execve` tauscht nur Programmcode und Speicher aus. PID, PPID und offene Dateideskriptoren (ohne Close-on-exec-Flag) bleiben."
+      - text: "`fork()` lädt ein neues Programm von der Platte und startet es als Kind."
+        correct: false
+        why: "`fork` klont den aufrufenden Prozess. Ein anderes Programm lädt erst `execve`."
+      - text: Ein Kindprozess bekommt eine Kopie der Umgebungsvariablen und des Arbeitsverzeichnisses seines Elternprozesses.
+        correct: true
+        why: Das Kind startet als Kopie des Elternprozesses und behält Umgebung und Arbeitsverzeichnis über `execve` hinweg.
+      - text: Ein Skript, das `cd /srv/app` ausführt, wechselt danach auch das Verzeichnis der Shell, aus der du es gestartet hast.
+        correct: false
+        why: Das Skript läuft in einem Kindprozess. Es ändert nur seine eigene Kopie; die aufrufende Shell bleibt, wo sie war. Deshalb ist `cd` ein Shell-Builtin.
+    explanation: |
+      `fork` erzeugt eine Kopie mit neuer PID, `execve` ersetzt im selben Prozess das Programm. Weil das Kind mit einer *Kopie* der Umgebung arbeitet, kann es seinen Elternprozess nicht beeinflussen. Das erklärt, warum `export` oder `cd` in einem Skript deine Shell nicht verändern – außer du lädst das Skript mit `source` in die laufende Shell.
+    resources:
+      - title: fork(2)
+        url: https://man7.org/linux/man-pages/man2/fork.2.html
+      - title: execve(2)
+        url: https://man7.org/linux/man-pages/man2/execve.2.html
+
+  - id: lebenszyklus-ordnen
+    type: order
+    title: Vom Tippen bis zum Prompt
+    prompt: Du tippst in Bash `python3 app.py` und drückst Enter. Bring die Schritte in die richtige Reihenfolge.
+    lang: text
+    lines: |
+      Die Shell liest die Zeile und zerlegt sie in das Kommando python3 und das Argument app.py.
+      Die Shell ruft fork() auf: Es entsteht ein Kind, eine Kopie der Shell mit neuer PID.
+      Das Kind ruft execve() auf und lädt /usr/bin/python3 – die PID bleibt dieselbe.
+      Python führt app.py aus und beendet sich mit Exit-Status 0.
+      Bis der Status abgeholt ist, bleibt vom Kind nur ein Eintrag in der Prozesstabelle (Zombie).
+      wait() in der Shell kehrt zurück, der Status landet in $? und der Zombie verschwindet.
+      Die Shell zeigt den nächsten Prompt.
+    explanation: |
+      Die Shell muss erst wissen, was sie starten soll (Zerlegen), dann klont sie sich (`fork`), das Kind wird per `execve` zu Python. Nach dem Ende hält der Kernel den Exit-Status bereit, bis der Elternprozess ihn mit `wait` abholt – dieser kurze Moment ist der Zombie-Zustand. Erst danach ist `$?` gesetzt und der Prompt erscheint.
+    resources:
+      - title: wait(2) – Zombies im Abschnitt NOTES
+        url: https://man7.org/linux/man-pages/man2/wait.2.html#NOTES
+
+  - id: zombie-flut
+    type: choice
+    title: 340 Zombies
+    prompt: |
+      Das Monitoring meldet steigende Prozesszahlen. Du findest Folgendes:
+
+      ```console
+      $ ps -eo pid,ppid,stat,cmd | awk '$3 ~ /^Z/' | head -3
+        40211    2231 Z    [python3] <defunct>
+        40219    2231 Z    [python3] <defunct>
+        40240    2231 Z    [python3] <defunct>
+      $ ps -eo pid,ppid,stat,cmd | awk '$3 ~ /^Z/' | wc -l
+      340
+      $ ps -o pid,ppid,cmd -p 2231
+          PID    PPID CMD
+         2231       1 python3 /srv/scheduler/scheduler.py
+      ```
+
+      Was ist der richtige nächste Schritt?
+    options:
+      - text: Alle 340 Zombie-PIDs mit `kill -9` beenden.
+        correct: false
+        why: Zombies sind bereits beendet. Sie führen keinen Code mehr aus, auch `SIGKILL` bewirkt nichts.
+      - text: Den Elternprozess 2231 untersuchen und neu starten; nach seinem Ende übernimmt PID 1 die Zombies und räumt sie ab. Danach den fehlenden `wait()`-Aufruf im Scheduler beheben.
+        correct: true
+        why: Der Elternprozess holt die Exit-Status seiner Kinder nicht ab. Stirbt er, erbt PID 1 die Zombies und ruft `wait` für sie auf. Der eigentliche Fehler sitzt im Code des Schedulers.
+      - text: Nichts tun – Zombies verbrauchen weder CPU noch Speicher.
+        correct: false
+        why: Jeder Zombie belegt eine PID und einen Eintrag in der Prozesstabelle. Wächst die Zahl weiter, können irgendwann keine neuen Prozesse mehr starten.
+      - text: Den Server sofort neu starten, weil Zombies Speicherlecks verursachen.
+        correct: false
+        why: Zombies belegen kaum Speicher. Ein Reboot beseitigt das Symptom, trifft aber alle Dienste und behebt den Bug im Scheduler nicht.
+    explanation: |
+      Ein Zombie ist ein toter Prozess, dessen Exit-Status noch niemand abgeholt hat. Behandelt wird deshalb immer der **Elternprozess**: Er muss `wait()` aufrufen (bei Python etwa `subprocess.Popen.wait()` oder ein Handler für `SIGCHLD`). Endet der Elternprozess, übernimmt PID 1 die Waisen und räumt sie ab.
+    resources:
+      - title: wait(2) – NOTES
+        url: https://man7.org/linux/man-pages/man2/wait.2.html#NOTES
+
+  - id: exit-status-vorhersagen
+    type: output
+    title: Was steht in $?
+    prompt: Was gibt dieses Bash-Skript aus? Fehlermeldungen auf stderr sind unterdrückt.
+    lang: bash
+    code: |
+      ls /gibt-es-nicht 2>/dev/null
+      echo "ls: $?"
+      gibtsnicht 2>/dev/null
+      echo "unbekannt: $?"
+      grep -q root /etc/passwd
+      echo "grep: $?"
+      false | true
+      echo "pipe: $?"
+    expected: |
+      ls: 2
+      unbekannt: 127
+      grep: 0
+      pipe: 0
+    verify: true
+    explanation: |
+      GNU `ls` meldet `2`, wenn ein Argument auf der Kommandozeile nicht existiert („serious trouble“). `127` setzt die Shell, wenn sie das Kommando nicht findet. `grep -q` liefert `0`, weil `root` in `/etc/passwd` steht. Bei einer Pipeline zählt ohne `set -o pipefail` nur der Status des **letzten** Kommandos – `true` –, das `false` davor geht verloren. Das ist ein Grund, warum robuste Skripte `set -o pipefail` setzen.
+    resources:
+      - title: Bash Manual · Exit Status
+        url: https://www.gnu.org/software/bash/manual/html_node/Exit-Status.html
+      - title: Bash Manual · Pipelines
+        url: https://www.gnu.org/software/bash/manual/html_node/Pipelines.html
+
+  - id: term-oder-kill
+    type: output
+    title: Aufräumen oder nicht?
+    prompt: |
+      `starte_worker` startet einen Hintergrundprozess, der auf `SIGTERM` mit Aufräumen reagiert. Er wird zweimal gestartet: einmal mit `SIGTERM` und einmal mit `SIGKILL` beendet. Was steht auf stdout?
+    lang: bash
+    code: |
+      starte_worker() {
+        ( trap 'echo "SIGTERM: speichere Daten"; exit 0' TERM
+          while true; do sleep 0.1; done ) &
+        pid=$!
+        sleep 0.5
+      }
+
+      starte_worker
+      kill -TERM "$pid"
+      wait "$pid"
+      echo "Exit-Status: $?"
+
+      starte_worker
+      kill -KILL "$pid"
+      wait "$pid"
+      echo "Exit-Status: $?"
+    expected: |
+      SIGTERM: speichere Daten
+      Exit-Status: 0
+      Exit-Status: 137
+    verify: true
+    explanation: |
+      Beim ersten Mal fängt der `trap` das `SIGTERM` ab: Der Worker räumt auf und beendet sich selbst mit `exit 0`, also meldet `wait` den Status `0`. `SIGKILL` lässt sich nicht abfangen – der Kernel entfernt den Prozess, der Trap läuft nie, und `wait` meldet `128 + 9 = 137`. Genau deshalb schickt man zuerst `SIGTERM`: Nur dann hat das Programm die Chance, Daten zu sichern.
+    hints:
+      - Welches der beiden Signale kann ein Programm abfangen?
+      - Ein Prozess, der durch Signal `n` stirbt, liefert den Status `128 + n`.
+    resources:
+      - title: signal(7) – Standard signals
+        url: https://man7.org/linux/man-pages/man7/signal.7.html#DESCRIPTION
+      - title: Bash Manual · Signals
+        url: https://www.gnu.org/software/bash/manual/html_node/Signals.html
+
+  - id: ps-spalten
+    type: command
+    title: Nur die Spalten, die du brauchst
+    prompt: Zeige für den Prozess mit der PID `4242` genau die Spalten `pid,ppid,stat,cmd` in dieser Reihenfolge an.
+    context: Ein Worker verhält sich seltsam. Du willst wissen, wer ihn gestartet hat und in welchem Zustand er ist.
+    answers:
+      - ps -o pid,ppid,stat,cmd -p 4242
+      - ps -p 4242 -o pid,ppid,stat,cmd
+      - ps -o pid,ppid,stat,cmd 4242
+      - ps -o pid,ppid,stat,cmd -q 4242
+      - ps -q 4242 -o pid,ppid,stat,cmd
+      - ps -o pid,ppid,stat,cmd --pid 4242
+      - ps --pid 4242 -o pid,ppid,stat,cmd
+      - ps -o pid,ppid,stat,cmd --pid=4242
+      - ps --pid=4242 -o pid,ppid,stat,cmd
+    output: |2
+          PID    PPID STAT CMD
+         4242       1 Sl   /srv/app/.venv/bin/python -m worker --queue emails
+    explanation: |
+      `-o` legt die Spalten fest, `-p` wählt Prozesse nach PID aus. Hier ist `PPID` 1: Der Worker wurde entweder von systemd gestartet oder ist ein Waisenprozess, dessen Elternprozess nicht mehr existiert. `Sl` heißt: schläft (wartet auf Arbeit) und hat mehrere Threads. Mit `-e` statt `-p` bekommst du dieselben Spalten für alle Prozesse.
+    resources:
+      - title: ps(1) – STANDARD FORMAT SPECIFIERS
+        url: https://man7.org/linux/man-pages/man1/ps.1.html#STANDARD_FORMAT_SPECIFIERS
+
+  - id: pkill-vite
+    type: command
+    title: Nur die Dev-Server treffen
+    prompt: |
+      Beende die beiden Vite-Dev-Server mit dem Standard-Signal `SIGTERM`, ohne den Editor zu treffen. Nutze **einen** `pkill`-Befehl mit dem Muster `bin/vite`.
+    context: |
+      ```console
+      $ pgrep -af vite
+      51230 node /home/steven/shop/node_modules/.bin/vite
+      51877 node /home/steven/shop/node_modules/.bin/vite --port 5174
+      52010 nvim vite.config.ts
+      ```
+    answers:
+      - pkill -f bin/vite
+      - pkill -f -TERM bin/vite
+      - pkill -TERM -f bin/vite
+      - pkill -SIGTERM -f bin/vite
+      - pkill -f -SIGTERM bin/vite
+      - pkill -15 -f bin/vite
+      - pkill -f -15 bin/vite
+      - pkill --signal TERM -f bin/vite
+      - pkill -f --signal TERM bin/vite
+      - pkill --full bin/vite
+    explanation: |
+      Ohne `-f` vergleicht `pkill` nur den Prozessnamen – der lautet hier `node` bzw. `nvim`, das Muster `bin/vite` würde nichts treffen. Mit `-f` durchsucht `pkill` die ganze Kommandozeile. Das Muster `bin/vite` passt auf beide Server, aber nicht auf `nvim vite.config.ts`; das bloße `vite` hätte deinen Editor mit ungespeicherten Änderungen beendet. Deshalb die Gewohnheit: erst `pgrep -af muster`, dann `pkill -f muster`. Ohne Signalangabe schickt `pkill` `SIGTERM`.
+    resources:
+      - title: pkill(1)
+        url: https://man7.org/linux/man-pages/man1/pkill.1.html
+
+  - id: nginx-hup
+    type: command
+    title: Konfiguration neu laden, ohne Verbindungen zu kappen
+    prompt: Schicke dem nginx-Masterprozess mit der PID `812` das Signal, das ihn seine Konfiguration neu laden lässt.
+    context: Du hast `/etc/nginx/nginx.conf` geändert und mit `nginx -t` geprüft. Du arbeitest in einer Root-Shell.
+    symbol: "#"
+    answers:
+      - kill -HUP 812
+      - kill -SIGHUP 812
+      - kill -s HUP 812
+      - kill -s SIGHUP 812
+      - kill -1 812
+      - kill -s 1 812
+      - sudo kill -HUP 812
+      - sudo kill -s HUP 812
+    explanation: |
+      `SIGHUP` heißt ursprünglich „Terminal aufgelegt“. Daemons haben kein Terminal und nutzen das Signal deshalb als Konvention für „Konfiguration neu einlesen“. nginx startet dabei neue Worker mit der neuen Konfiguration und lässt die alten ihre offenen Verbindungen zu Ende bedienen – ohne Ausfall. Im Alltag erledigt `systemctl reload nginx` genau das; die Unit schickt intern dasselbe Signal.
+    resources:
+      - title: nginx · Controlling nginx
+        url: https://nginx.org/en/docs/control.html
+      - title: kill(1)
+        url: https://man7.org/linux/man-pages/man1/kill.1.html
+
+  - id: werkzeugkasten-luecken
+    type: gap
+    title: Build im Hintergrund, Blick in /proc
+    prompt: Ergänze die Befehle. Das Skript läuft in Bash.
+    lang: bash
+    code: |
+      # Build mit der niedrigsten CPU-Priorität im Hintergrund starten
+      ⟦nice -n 19⟧ make -j8 &
+      # PID des zuletzt gestarteten Hintergrundjobs merken
+      build_pid=⟦$!⟧
+      # Einen anderen Prozess (PID 4242) auf den Nice-Wert 10 herabstufen
+      ⟦renice -n 10 -p⟧ 4242
+      # Zustand und Elternprozess des Builds nachlesen
+      grep -E '^(State|PPid)' /proc/"$build_pid"/⟦status⟧
+      # Welche Dateien hat der Build gerade offen?
+      ls -l /proc/"$build_pid"/⟦fd⟧
+    gaps:
+      - label: Niedrigste Priorität
+        hint: Der höchste Nice-Wert ist 19; die Option heißt `-n`.
+        accept: ["nice -19", "nice -n19", "nice --adjustment=19", "nice --adjustment 19"]
+      - label: PID des letzten Hintergrundjobs
+        hint: Eine Sondervariable aus `$` und einem Satzzeichen.
+      - label: Nice-Wert eines laufenden Prozesses ändern
+        hint: Das Werkzeug heißt wie `nice` mit Vorsilbe; `-p` kennzeichnet eine PID.
+        accept: ["renice 10 -p", "renice -n 10", "renice 10", "renice --priority 10 -p", "renice +10 -p", "renice +10"]
+      - label: Datei mit Zustand, PPid und Speicher
+        hint: Die lesbare Zusammenfassung eines Prozesses.
+      - label: Verzeichnis der Dateideskriptoren
+        hint: Zwei Buchstaben, die Abkürzung für „file descriptor“.
+    explanation: |
+      `nice -n 19` startet einen Befehl mit dem höchsten Nice-Wert, also der niedrigsten Priorität – der Build nimmt anderen Programmen dann kaum Rechenzeit weg. `$!` enthält in Bash die PID des zuletzt gestarteten Hintergrundjobs (in fish: `$last_pid`). `renice` ändert den Wert eines laufenden Prozesses; als normaler Benutzer darfst du ihn nur erhöhen. `/proc/<pid>/status` fasst Zustand, PPID und Speicher zusammen, `/proc/<pid>/fd/` zeigt jede offene Datei als symbolischen Link.
+    resources:
+      - title: renice(1)
+        url: https://man7.org/linux/man-pages/man1/renice.1.html
+      - title: proc_pid_fd(5)
+        url: https://man7.org/linux/man-pages/man5/proc_pid_fd.5.html
+
+  - id: stop-skript-kill9
+    type: bug
+    title: Der Worker hinterlässt Chaos
+    prompt: |
+      Nach jedem Deployment stoppt dieses Skript den Queue-Worker. Danach findet das Team halb verarbeitete Aufträge in der Queue, die Lock-Datei `/run/worker.lock` bleibt liegen, und im Log fehlt die Zeile „shutting down gracefully“, die der Worker beim Empfang von `SIGTERM` schreibt. Der Fallback mit `SIGKILL` am Ende soll erhalten bleiben. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: bash
+    code: |
+      #!/usr/bin/env bash
+      # stop-worker.sh – beendet den Queue-Worker
+      pid=$(cat /run/worker.pid)
+      kill -9 "$pid"
+      for i in $(seq 1 10); do
+        kill -0 "$pid" 2>/dev/null || exit 0
+        sleep 1
+      done
+      echo "Worker reagiert nicht, erzwinge Ende" >&2
+      kill -KILL "$pid"
+    lines: [4]
+    fix:
+      - line: 4
+        answers:
+          - kill "$pid"
+          - kill -TERM "$pid"
+          - kill -SIGTERM "$pid"
+          - kill -15 "$pid"
+          - kill -s TERM "$pid"
+          - kill $pid
+          - kill -TERM $pid
+          - kill -15 $pid
+    explanation: |
+      Zeile 4 schickt sofort `SIGKILL`. Der Worker bekommt keine Chance, den laufenden Auftrag abzuschließen, die Lock-Datei zu löschen oder seine Abschiedszeile zu loggen. Die Schleife danach ist genau für das richtige Muster gebaut: `kill -0` schickt kein Signal, sondern prüft nur, ob der Prozess noch existiert. Richtig ist also erst `SIGTERM` (`kill "$pid"`), bis zu zehn Sekunden warten und nur im Notfall `SIGKILL` – dasselbe Vorgehen wie systemd mit `TimeoutStopSec=`.
+    hints:
+      - Welche Zeile schickt ein Signal, das sich nicht abfangen lässt?
+    resources:
+      - title: kill(1)
+        url: https://man7.org/linux/man-pages/man1/kill.1.html
+      - title: systemd.kill(5)
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemd.kill.html
+
+  - id: grep-trifft-sich-selbst
+    type: bug
+    title: Neustart bricht mittendrin ab
+    prompt: |
+      Die Worker laufen als `python3 /srv/app/queue-worker.py`. Das Skript soll alle Worker beenden und neu starten. Stattdessen meldet es `kill: sending signal to 48213 failed: No such process` und bricht ab – danach laufen **gar keine** Worker mehr. Die PID in der Meldung ist jedes Mal eine andere. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: bash
+    code: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      ps aux | grep queue-worker | awk '{print $2}' | xargs kill
+      sleep 5
+      /srv/app/start-workers.sh
+    lines: [3]
+    fix:
+      - line: 3
+        answers:
+          - pkill -f queue-worker
+          - pkill -f queue-worker.py
+          - pkill -f /srv/app/queue-worker.py
+          - pkill -TERM -f queue-worker
+          - pgrep -f queue-worker | xargs kill
+          - ps aux | grep '[q]ueue-worker' | awk '{print $2}' | xargs kill
+    explanation: |
+      `grep queue-worker` findet auch sich selbst, denn seine eigene Kommandozeile enthält das Muster. Bis `xargs kill` läuft, ist der `grep`-Prozess schon beendet – `kill` scheitert an dieser PID, `xargs` liefert Status 123, und wegen `set -e` und `pipefail` bricht das Skript ab, **nachdem** die echten Worker schon beendet sind. `pkill -f queue-worker` (oder `pgrep -f … | xargs kill`) schließt sich selbst aus und ersetzt die ganze Pipeline. Der Trick `grep '[q]ueue-worker'` funktioniert auch, ist aber schwerer zu lesen.
+    hints:
+      - Führe `ps aux | grep queue-worker` im Kopf aus. Welche Zeile taucht zusätzlich auf?
+    resources:
+      - title: pgrep(1) / pkill(1)
+        url: https://man7.org/linux/man-pages/man1/pgrep.1.html
+
+  - id: load-ohne-cpu
+    type: explain
+    title: Load 7,9 bei leerer CPU
+    prompt: |
+      Um 03:12 Uhr meldet das Monitoring, dass die Web-App auf diesem Server kaum noch antwortet. Ein Kollege schlägt vor, den Server auf mehr CPU-Kerne hochzustufen. Erkläre anhand der Ausgabe, was hier passiert und warum der Vorschlag nicht hilft.
+    lang: console
+    code: |
+      $ uptime
+       03:12:40 up 41 days,  2:05,  1 user,  load average: 7.86, 7.12, 3.40
+      $ nproc
+      4
+      $ top -bn1 | head -3
+      top - 03:12:41 up 41 days,  2:05,  1 user,  load average: 7.86, 7.12, 3.40
+      Tasks: 212 total,   1 running, 203 sleep,   8 d-sleep,   0 stopped,   0 zombie
+      %Cpu(s):  2.1 us,  1.4 sy,  0.0 ni, 14.9 id, 81.6 wa,  0.0 hi,  0.0 si,  0.0 st
+      $ ps -eo stat,pid,comm | awk '$1 ~ /^D/'
+      D     1822 postgres
+      D     1830 postgres
+      D     1841 postgres
+      D     1855 postgres
+      D     1862 postgres
+      D     9120 rsync
+      D     9121 rsync
+      D     9135 rsync
+    points:
+      - Ein Load von rund 8 auf 4 Kernen sieht nach Überlast aus, aber die CPU rechnet kaum (`us` + `sy` ≈ 3,5 %).
+      - Die Load Average zählt auch Prozesse im Zustand `D`; hier warten acht Prozesse auf I/O, `wa` liegt bei 81,6 %.
+      - Der Trend (3,40 → 7,12 → 7,86) zeigt, dass das Problem vor wenigen Minuten begann und anhält – passend zu einem nächtlichen `rsync`-Backup.
+      - Engpass ist die Platte, die sich PostgreSQL und `rsync` teilen. Mehr Kerne helfen nicht; `kill -9` hilft bei `D`-Prozessen auch nicht.
+      - Sinnvolle Schritte sind, das Backup zu drosseln (`ionice`, `rsync --bwlimit`), zeitlich zu verschieben oder die I/O-Last genauer zu messen.
+    explanation: |
+      Auf den ersten Blick ist der Server überlastet: Load 7,86 bei 4 Kernen. Die CPU-Zeile widerspricht aber – nur 3,5 % der Zeit wird gerechnet, 81,6 % wartet die CPU auf I/O. Die Load Average zählt unter Linux neben laufenden auch Prozesse im Zustand `D`, und davon gibt es acht: fünf PostgreSQL-Prozesse und drei `rsync`-Prozesse. Der Anstieg von 3,40 (15 min) auf 7,86 (1 min) passt zu einem Backup, das um 03:00 Uhr gestartet ist und die Platte sättigt. Mehr CPU-Kerne würden nur noch mehr Leerlauf erzeugen. Ich würde das Backup mit `ionice -c3` oder `--bwlimit` drosseln oder in ein ruhigeres Zeitfenster legen und mit `iostat` oder `iotop` bestätigen, welche Platte ausgelastet ist.
+    resources:
+      - title: proc_loadavg(5)
+        url: https://man7.org/linux/man-pages/man5/proc_loadavg.5.html
+      - title: top(1) – SUMMARY Display
+        url: https://man7.org/linux/man-pages/man1/top.1.html#2._SUMMARY_Display
+
+  - id: prozess-detektiv
+    type: practice
+    title: Prozess-Detektiv
+    prompt: |
+      Arbeite in einer Bash (tippe `bash`, wenn du in fish bist) und verfolge einen Prozess durch seinen Lebenszyklus:
+
+      1. Starte `sleep 600` im Vordergrund und halte ihn mit `Strg+Z` an. Prüfe mit `ps`, in welchem Zustand er ist.
+      2. Setze ihn mit `bg` im Hintergrund fort und prüfe den Zustand erneut.
+      3. Lies in `/proc/<pid>/status` die Zeilen `State` und `PPid`. Vergleiche die PPID mit `$$`.
+      4. Zeige mit `pstree` die Kette seiner Vorfahren bis PID 1.
+      5. Beende ihn mit `SIGTERM` und lass dir mit `wait` den Exit-Status geben.
+      6. Starte `sleep 600` als vorübergehende Benutzer-Unit mit `systemd-run --user --unit=lern-sleep`, sieh sie dir mit `systemctl --user status` an und stoppe sie.
+
+      Notiere die Befehle, die du verwendet hast.
+    lang: console
+    solution: |
+      $ bash
+      $ sleep 600
+      ^Z
+      [1]+  Stopped                 sleep 600
+      $ ps -o pid,stat,cmd -p $(jobs -p %1)
+          PID STAT CMD
+        61201 T    sleep 600
+      $ bg %1
+      [1]+ sleep 600 &
+      $ ps -o pid,stat,cmd -p $!
+          PID STAT CMD
+        61201 S    sleep 600
+      $ grep -E '^(State|PPid)' /proc/$!/status
+      State:  S (sleeping)
+      PPid:   61150
+      $ echo $$
+      61150
+      $ pstree -p -s $!
+      systemd(1)───systemd(1432)───kitty(2210)───fish(2215)───bash(61150)───sleep(61201)
+      $ kill %1
+      $ wait %1; echo $?
+      [1]+  Terminated              sleep 600
+      143
+      $ systemd-run --user --unit=lern-sleep sleep 600
+      Running as unit: lern-sleep.service
+      $ systemctl --user status lern-sleep
+      ● lern-sleep.service - [systemd-run] /usr/bin/sleep 600
+           Active: active (running) since …
+      $ systemctl --user stop lern-sleep
+    checklist:
+      - Du hast gesehen, dass der angehaltene Prozess den Zustand `T` hat und nach `bg` den Zustand `S`.
+      - Die `PPid` aus `/proc/<pid>/status` stimmt mit `$$` überein, also der PID deiner Bash.
+      - "`pstree -p -s` zeigt die Kette von `systemd(1)` bis zu deinem `sleep`."
+      - "`wait` meldet nach `SIGTERM` den Status `143` und du kannst ihn als 128 + 15 erklären."
+      - Die Unit `lern-sleep` taucht in `systemctl --user status` auf und ist nach `systemctl --user stop` verschwunden.
+    explanation: |
+      Die Übung zeigt den ganzen Lebenszyklus: `Strg+Z` schickt `SIGTSTP` und hält den Prozess an (`T`), `bg` schickt `SIGCONT`, danach schläft `sleep` im Zustand `S`. Die PPID ist deine Bash, weil sie `sleep` per `fork` und `exec` gestartet hat. `kill %1` schickt `SIGTERM`, und `wait` liefert `128 + 15 = 143`. Mit `systemd-run` gehört derselbe Befehl nicht mehr zu deinem Terminal, sondern zu deinem systemd-Benutzermanager – er überlebt das Schließen des Fensters, und `systemctl` bzw. `journalctl` verwalten ihn.
+    resources:
+      - title: Bash Manual · Job Control Builtins
+        url: https://www.gnu.org/software/bash/manual/html_node/Job-Control-Builtins.html
+      - title: systemd-run(1)
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemd-run.html

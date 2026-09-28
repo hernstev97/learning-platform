@@ -1,0 +1,943 @@
+id: nebenlaeufigkeit
+title: Nebenläufigkeit – Threads, Prozesse, asyncio
+level: 3
+minutes: 180
+summary: Wann Threads, wann Prozesse, wann asyncio – mit einem klaren Denkmodell für GIL, Event-Loop und Race Conditions statt Rätselraten.
+goals:
+  - Du unterscheidest Nebenläufigkeit von Parallelität und I/O-bound von CPU-bound und wählst danach Threads, Prozesse oder asyncio.
+  - Du erklärst, was der GIL schützt und was nicht, und wie der Stand der free-threaded Builds in Python 3.13 und 3.14 ist.
+  - Du erkennst Race Conditions und behebst sie mit `Lock` oder `queue.Queue`.
+  - Du nutzt `concurrent.futures` mit `map`, `submit` und `as_completed` für Thread- und Prozess-Pools.
+  - Du schreibst asyncio-Code mit `gather`, `TaskGroup`, `timeout` und `Semaphore` und vermeidest blockierende Aufrufe in Coroutinen.
+resources:
+  - title: Concurrent Execution (Überblick der Standardbibliothek)
+    url: https://docs.python.org/3/library/concurrency.html
+  - title: asyncio – Coroutines and Tasks
+    url: https://docs.python.org/3/library/asyncio-task.html
+  - title: concurrent.futures
+    url: https://docs.python.org/3/library/concurrent.futures.html
+  - title: Python support for free threading (HOWTO)
+    url: https://docs.python.org/3/howto/free-threading-python.html
+  - title: PEP 779 – Criteria for supported status for free-threaded Python
+    url: https://peps.python.org/pep-0779/
+lesson: |
+  Ein Skript holt Preise von 400 Produktseiten. Jede Anfrage dauert 300 ms, fast nur Warten auf das Netz. Nacheinander sind das zwei Minuten, in denen die CPU sich langweilt. Ein anderes Skript berechnet Prüfsummen für 10 000 Bilder in reinem Python. Hier wartet niemand, die CPU rechnet die ganze Zeit. Beide sollen schneller werden – und die Lösung ist jeweils eine andere.
+
+  Python bietet drei Werkzeuge: Threads, Prozesse und asyncio. Welches passt, hängt an zwei Fragen: Worauf wartet das Programm? Und was darf gleichzeitig passieren? Diese Lektion baut das Denkmodell dafür auf, bevor sie in die APIs geht.
+
+  ## Nebenläufig, parallel, I/O-bound, CPU-bound
+
+  **Nebenläufigkeit** (Concurrency) heißt: Mehrere Aufgaben sind gleichzeitig *in Arbeit* und wechseln sich ab. Ein Koch, der Nudelwasser aufsetzt und währenddessen Gemüse schneidet, arbeitet nebenläufig. **Parallelität** heißt: Mehrere Aufgaben laufen im selben Moment auf mehreren CPU-Kernen – zwei Köche.
+
+  Die zweite Unterscheidung betrifft die Last:
+
+  - **I/O-bound:** Das Programm wartet die meiste Zeit auf Netz, Festplatte oder Datenbank. Mehr Kerne helfen nicht, geschicktes Warten schon. Nebenläufigkeit reicht.
+  - **CPU-bound:** Das Programm rechnet. Nur echte Parallelität auf mehreren Kernen macht es schneller.
+
+  Bevor du etwas parallelisierst, miss, wo die Zeit hingeht (etwa mit [`cProfile`](https://docs.python.org/3/library/profile.html)). Oft ist die schnellste Lösung eine Datenbankabfrage statt 400 einzelner.
+
+  ## Threads und der GIL
+
+  Ein [Thread](https://docs.python.org/3/library/threading.html) ist ein eigener Ausführungsstrang im selben Prozess. Alle Threads teilen sich den Speicher – das macht sie billig und gefährlich zugleich.
+
+  ```python
+  import threading
+  import time
+
+  def lade(url: str) -> None:
+      time.sleep(0.3)                  # steht für eine Netzwerkanfrage
+      print("fertig:", url)
+
+  threads = [threading.Thread(target=lade, args=(f"https://shop.example/p/{i}",)) for i in range(4)]
+  for t in threads:
+      t.start()                        # startet den Thread, kehrt sofort zurück
+  for t in threads:
+      t.join()                         # wartet, bis der Thread fertig ist
+  # dauert ~0,3 s statt 1,2 s
+  ```
+
+  In der Standard-Implementierung CPython gibt es den **Global Interpreter Lock** (GIL, [Glossar](https://docs.python.org/3/glossary.html#term-global-interpreter-lock)): Zu jedem Zeitpunkt führt nur ein Thread Python-Bytecode aus. Der GIL wird abgegeben, wenn ein Thread blockierend wartet (Socket, Datei, `time.sleep`), und außerdem regelmäßig, damit andere Threads drankommen (alle 5 ms, siehe [`sys.setswitchinterval`](https://docs.python.org/3/library/sys.html#sys.setswitchinterval)). Daraus folgt:
+
+  - Für **I/O-bound** Arbeit helfen Threads, weil während des Wartens andere Threads laufen.
+  - Für **CPU-bound** Arbeit in reinem Python helfen Threads im Standard-Build nicht – sie wechseln sich nur ab. Ausnahme: C-Erweiterungen wie `hashlib` oder NumPy, die den GIL während langer Berechnungen freigeben.
+
+  ### Race Conditions: Was der GIL nicht schützt
+
+  Der GIL schützt die internen Datenstrukturen des Interpreters, **nicht deine Logik**. `zaehler += 1` besteht aus Lesen, Addieren und Zurückschreiben. Wechselt der Thread zwischen Lesen und Schreiben, überschreibt er später das Ergebnis des anderen – eine **Race Condition**:
+
+  ```python
+  import threading
+
+  class Zaehler:
+      def __init__(self) -> None:
+          self.wert = 0
+          self._lock = threading.Lock()
+
+      def erhoehe_unsicher(self) -> None:
+          self.wert += 1               # lesen, addieren, schreiben – unterbrechbar
+
+      def erhoehe(self) -> None:
+          with self._lock:             # nur ein Thread gleichzeitig in diesem Block
+              self.wert += 1
+
+  z = Zaehler()
+  def arbeite() -> None:
+      for _ in range(100_000):
+          z.erhoehe()
+
+  threads = [threading.Thread(target=arbeite) for _ in range(8)]
+  for t in threads: t.start()
+  for t in threads: t.join()
+  print(z.wert)                        # mit Lock garantiert 800000
+  ```
+
+  Mit `erhoehe_unsicher` *kann* weniger herauskommen. Ob und wie oft du das beobachtest, hängt von Python-Version, Build und Timing ab – im Standard-Build von CPython seltener, im free-threaded Build deutlich häufiger. Der Code ist in jedem Fall falsch. Ein Bug, der nur manchmal auftritt, ist schlimmer als einer, der immer auftritt.
+
+  Zwei Werkzeuge lösen die meisten Fälle:
+
+  - Ein [`threading.Lock`](https://docs.python.org/3/library/threading.html#lock-objects) mit `with` schützt einen kritischen Abschnitt. Halte ihn kurz und rufe darin keine langsamen Funktionen auf.
+  - Eine [`queue.Queue`](https://docs.python.org/3/library/queue.html#queue.Queue) ist bereits threadsicher. Statt gemeinsamen Zustand zu teilen, schicken Produzenten Aufgaben in die Queue, und Worker holen sie ab. Diese Architektur vermeidet die meisten Locks.
+
+  ### Free-threaded Python (3.13 und 3.14)
+
+  [PEP 703](https://peps.python.org/pep-0703/) macht den GIL optional. Der Stand genau:
+
+  - **Python 3.13** brachte einen separaten, **experimentellen** free-threaded Build (typisch installiert als `python3.13t`).
+  - **Python 3.14** hat den Build laut [PEP 779](https://peps.python.org/pep-0779/) **offiziell unterstützt, aber optional** gemacht („Phase II“). Der Standard-Build hat weiterhin einen GIL. Laut [What's New in 3.14](https://docs.python.org/3/whatsnew/3.14.html#whatsnew314-free-threaded-cpython) kostet der free-threaded Modus einfädigen Code etwa 5–10 % Leistung.
+  - Ob er irgendwann Standard wird (Phase III), entscheidet ein künftiger PEP.
+  - Importierst du eine C-Erweiterung, die nicht als kompatibel markiert ist, kann der Interpreter den GIL wieder einschalten. `sys._is_gil_enabled()` verrät den aktuellen Zustand; die Umgebungsvariable [`PYTHON_GIL`](https://docs.python.org/3/using/cmdline.html#envvar-PYTHON_GIL) erzwingt ihn.
+
+  Für dich heißt das: Im free-threaded Build laufen Threads auch bei CPU-Arbeit parallel. Race Conditions, die bisher selten waren, treten dort öfter auf. Sauber synchronisierter Code funktioniert in beiden Builds. Der [HOWTO](https://docs.python.org/3/howto/free-threading-python.html) beschreibt Details und bekannte Einschränkungen.
+
+  ## Prozesse und concurrent.futures
+
+  Für CPU-bound Arbeit im Standard-Build startest du mehrere **Prozesse**. Jeder hat einen eigenen Interpreter, eigenen Speicher und eigenen GIL. Der Preis:
+
+  - **Start-Overhead.** Einen Prozess zu starten kostet Millisekunden bis zu einer Sekunde.
+  - **Kein geteilter Speicher.** Argumente und Ergebnisse werden mit [`pickle`](https://docs.python.org/3/library/pickle.html) serialisiert und zwischen den Prozessen kopiert. Lambdas, lokal definierte Funktionen und offene Verbindungen lassen sich nicht übertragen.
+  - **Start-Methode.** Unter Linux ist seit Python 3.14 `forkserver` statt `fork` voreingestellt, unter macOS und Windows `spawn` ([Start-Methoden](https://docs.python.org/3/library/multiprocessing.html#contexts-and-start-methods)). In jedem Fall gehört der Startcode hinter `if __name__ == "__main__":`, weil die Kindprozesse dein Modul importieren.
+
+  Statt `threading` und `multiprocessing` direkt zu benutzen, greifst du meist zu [`concurrent.futures`](https://docs.python.org/3/library/concurrent.futures.html). Es bietet für Threads und Prozesse dieselbe API:
+
+  ```python
+  from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+  import hashlib
+  from pathlib import Path
+
+  def pruefsumme(pfad: Path) -> str:                      # CPU-bound
+      return hashlib.sha256(pfad.read_bytes()).hexdigest()
+
+  def lade_seite(url: str) -> str: ...                     # I/O-bound
+
+  if __name__ == "__main__":
+      bilder = sorted(Path("bilder").glob("*.jpg"))
+      with ProcessPoolExecutor() as pool:                  # ein Prozess pro Kern
+          # map: Ergebnisse in Reihenfolge der Eingabe
+          for pfad, summe in zip(bilder, pool.map(pruefsumme, bilder, chunksize=64)):
+              print(pfad.name, summe[:12])
+
+      urls = [f"https://shop.example/p/{i}" for i in range(400)]
+      with ThreadPoolExecutor(max_workers=20) as pool:
+          futures = {pool.submit(lade_seite, url): url for url in urls}
+          for future in as_completed(futures):             # in Reihenfolge der Fertigstellung
+              url = futures[future]
+              try:
+                  html = future.result()                    # wirft die Exception des Tasks
+              except OSError as fehler:
+                  print("Fehler bei", url, fehler)
+  ```
+
+  Das Denkmodell dahinter: `submit` gibt sofort ein [`Future`](https://docs.python.org/3/library/concurrent.futures.html#future-objects) zurück – ein Versprechen auf ein Ergebnis. `result()` wartet darauf und wirft die Exception, falls der Task gescheitert ist. [`Executor.map`](https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.Executor.map) liefert die Ergebnisse in Eingabereihenfolge und wirft eine Exception erst, wenn du beim Iterieren an das betroffene Ergebnis kommst. [`as_completed`](https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.as_completed) liefert Futures, sobald sie fertig sind. `chunksize` bündelt bei Prozessen viele kleine Aufgaben, damit nicht jede einzeln gepickelt und verschickt wird. Seit 3.14 gibt es zusätzlich `InterpreterPoolExecutor`, der mehrere Interpreter in einem Prozess nutzt.
+
+  ## asyncio: ein Thread, eine Event-Loop
+
+  asyncio geht einen anderen Weg: **ein** Thread, in dem eine **Event-Loop** viele Coroutinen abwechselnd ausführt. Eine Coroutine (`async def`) läuft, bis sie an einem `await` auf etwas wartet. Dann gibt sie die Kontrolle an die Loop zurück, und die Loop setzt eine andere Coroutine fort, deren Daten inzwischen da sind. Kein Thread-Wechsel mitten in einer Zeile: Zwischen zwei `await` läuft dein Code ungestört. Das macht viele Race Conditions unmöglich und skaliert auf Tausende gleichzeitige Verbindungen. Wer JavaScript kennt: Es ist dasselbe Modell wie `async`/`await` mit Promises.
+
+  ```python run
+  import asyncio
+  import time
+
+  async def hole(url: str, dauer: float) -> str:
+      await asyncio.sleep(dauer)           # steht für eine Netzwerkanfrage
+      return f"{url}: 200"
+
+  async def main() -> None:
+      start = time.perf_counter()
+      ergebnisse = await asyncio.gather(   # alle drei laufen nebenläufig
+          hole("/nutzer", 0.3),
+          hole("/bestellungen", 0.2),
+          hole("/nachrichten", 0.1),
+      )
+      print(ergebnisse)                    # Reihenfolge wie die Argumente
+      print(f"{time.perf_counter() - start:.1f} s")   # ~0.3 s, nicht 0.6 s
+
+  # In einem Skript: asyncio.run(main())
+  # Hier läuft bereits eine Event-Loop, deshalb direkt:
+  await main()
+  ```
+
+  Drei Regeln, die du aus dem Modell ableiten kannst:
+
+  1. **Ein Aufruf von `hole(...)` führt nichts aus.** Er erzeugt ein Coroutine-Objekt. Erst `await`, `gather` oder ein Task lassen es laufen. Ein vergessenes `await` ist der häufigste asyncio-Fehler (Python warnt mit `RuntimeWarning: coroutine ... was never awaited`).
+  2. **In Skripten startet [`asyncio.run(main())`](https://docs.python.org/3/library/asyncio-runner.html#asyncio.run) die Loop**, genau einmal, ganz außen. Innerhalb laufender Loops (Jupyter, FastAPI, hier im Browser) rufst du es nicht auf.
+  3. **Nichts Blockierendes in Coroutinen.** `time.sleep(1)`, `requests.get(...)` oder eine lange Berechnung halten die ganze Loop an – alle anderen Coroutinen stehen still. Nimm asynchrone Bibliotheken (`httpx`, `asyncpg`) oder verlagere blockierende Aufrufe mit [`asyncio.to_thread`](https://docs.python.org/3/library/asyncio-task.html#asyncio.to_thread) in einen Thread.
+
+  ### Tasks, TaskGroup, Timeouts, Semaphore
+
+  [`asyncio.create_task(coro)`](https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task) plant eine Coroutine sofort ein und gibt ein `Task`-Objekt zurück. Die Dokumentation verlangt, eine Referenz auf den Task zu behalten, sonst kann er mitten in der Ausführung verschwinden. Seit 3.11 ist eine [`TaskGroup`](https://docs.python.org/3/library/asyncio-task.html#task-groups) der empfohlene Weg: Sie wartet am Ende des `async with`-Blocks auf alle Tasks. Scheitert einer, bricht sie die übrigen ab und wirft eine `ExceptionGroup` – das nennt man **Structured Concurrency**.
+
+  ```python run
+  import asyncio
+
+  async def hole_kurs(waehrung: str) -> float:
+      await asyncio.sleep(0.05)
+      return {"USD": 1.08, "GBP": 0.84}[waehrung]
+
+  async def langsamer_dienst() -> str:
+      await asyncio.sleep(5)
+      return "zu spät"
+
+  async def main() -> None:
+      async with asyncio.TaskGroup() as tg:
+          usd = tg.create_task(hole_kurs("USD"))
+          gbp = tg.create_task(hole_kurs("GBP"))
+      print(usd.result(), gbp.result())            # beide fertig nach dem Block
+
+      try:
+          async with asyncio.timeout(0.1):         # seit 3.11
+              await langsamer_dienst()
+      except TimeoutError:
+          print("Timeout – Fallback benutzen")
+
+      limit = asyncio.Semaphore(2)                 # höchstens 2 gleichzeitig
+      async def hole_begrenzt(n: int) -> int:
+          async with limit:
+              await asyncio.sleep(0.05)
+              return n * n
+      print(await asyncio.gather(*(hole_begrenzt(n) for n in range(5))))
+
+      ergebnisse = await asyncio.gather(hole_kurs("USD"), hole_kurs("JPY"), return_exceptions=True)
+      print(ergebnisse)                            # Exception als Wert statt Abbruch
+
+  await main()
+  ```
+
+  - [`asyncio.timeout`](https://docs.python.org/3/library/asyncio-task.html#asyncio.timeout) bricht den Block nach der Frist ab und wirft `TimeoutError`. Jeder Netzwerkaufruf in Produktion braucht ein Timeout.
+  - Ein [`Semaphore`](https://docs.python.org/3/library/asyncio-sync.html#asyncio.Semaphore) begrenzt, wie viele Coroutinen gleichzeitig einen Abschnitt betreten. 400 Anfragen gleichzeitig an einen fremden Server sind unhöflich und führen zu Rate-Limits; mit `Semaphore(10)` bleiben es zehn.
+  - [`gather(..., return_exceptions=True)`](https://docs.python.org/3/library/asyncio-task.html#asyncio.gather) liefert Exceptions als Elemente der Ergebnisliste. Ohne die Option wirft `gather` die erste Exception, die übrigen Coroutinen laufen aber weiter.
+
+  > [!WARNING] Blockierender Code in async
+  > Ein `requests.get()` oder `time.sleep()` in einem FastAPI-Endpunkt mit `async def` blockiert den ganzen Worker: Während es wartet, bedient er keinen anderen Request. Entweder asynchrone Bibliotheken benutzen, `await asyncio.to_thread(blockierende_funktion, arg)` schreiben oder den Endpunkt als normales `def` deklarieren (dann führt FastAPI ihn in einem Thread-Pool aus). Der [asyncio-Entwicklerleitfaden](https://docs.python.org/3/library/asyncio-dev.html#running-blocking-code) beschreibt, wie der Debug-Modus solche Stellen findet.
+
+  ## Entscheidungstabelle
+
+  | Situation | Werkzeug | Warum |
+  | --- | --- | --- |
+  | Viele Netzwerk-/Datenbankaufrufe, async-Bibliotheken vorhanden | asyncio | Tausende Verbindungen in einem Thread, wenig Overhead |
+  | Einige Dutzend I/O-Aufrufe mit synchronen Bibliotheken (`requests`, `boto3`) | `ThreadPoolExecutor` | Kein Umbau nötig, GIL wird beim Warten abgegeben |
+  | CPU-lastige Berechnung in reinem Python (Standard-Build) | `ProcessPoolExecutor` | Echte Parallelität, eigener GIL pro Prozess |
+  | CPU-lastig mit NumPy, `hashlib`, Kompression | Threads prüfen | Viele C-Erweiterungen geben den GIL frei |
+  | Blockierende Funktion in asyncio-Code | `asyncio.to_thread` | Hält die Event-Loop frei |
+  | Hintergrundjobs über Minuten, nach Neustart fortsetzen | Task-Queue (Celery, RQ) | Gehört in einen eigenen Dienst, nicht in den Webprozess |
+
+  > [!INTERVIEW] „Threads, Prozesse oder asyncio – wann was?“
+  > Antworte über die Last, nicht über die API. I/O-bound: asyncio, wenn der Stack asynchron ist, sonst ein Thread-Pool. CPU-bound in reinem Python: Prozesse, weil der GIL im Standard-Build nur einen Thread gleichzeitig Bytecode ausführen lässt. Dann die Nuance: Der GIL schützt keine eigene Logik (`+=` braucht trotzdem einen Lock), und seit 3.14 gibt es einen offiziell unterstützten, aber optionalen free-threaded Build. Wer noch „erst messen“ sagt, punktet.
+
+  ## Häufige Fehler
+
+  - **Geteilter Zustand ohne Lock.** Zähler, Listen-Prüfungen („ist noch Platz?“) und Dictionaries mit Check-then-Act-Logik gehen unter Last kaputt – selten und nicht reproduzierbar.
+  - **Threads für reine CPU-Arbeit.** Im Standard-Build wird es nicht schneller, oft sogar langsamer.
+  - **Prozesse für winzige Aufgaben.** Pickling und Start kosten mehr, als die Parallelität spart. `chunksize` erhöhen oder bei einem Prozess bleiben.
+  - **Vergessenes `await`.** Die Coroutine läuft nie; statt des Ergebnisses hast du ein Coroutine-Objekt.
+  - **Blockierende Aufrufe in `async def`.** Die Loop steht, alle Anfragen warten.
+  - **`asyncio.run` in einer laufenden Loop.** `RuntimeError: asyncio.run() cannot be called from a running event loop`.
+  - **Tasks ohne Referenz oder ohne Timeout.** Tasks verschwinden oder hängen für immer; nutze `TaskGroup` und `asyncio.timeout`.
+
+  > [!PRAXIS] So sieht es in Projekten aus
+  > Web-Backends mit FastAPI laufen auf asyncio: Datenbank über `asyncpg` oder SQLAlchemy async, HTTP über `httpx.AsyncClient`, parallele Aufrufe mit `TaskGroup` oder `gather`, begrenzt mit einem `Semaphore`. Datenpipelines und Skripte, die viele Dateien verarbeiten, nutzen `ProcessPoolExecutor`. Im Code-Review wird bei jeder globalen, veränderlichen Variable in Multi-Thread-Code gefragt: Wer schreibt hier gleichzeitig? Und bei jedem `async def`: Steckt irgendwo ein blockierender Aufruf?
+
+  > [!MERKE]
+  > I/O-bound → asyncio oder Threads. CPU-bound → Prozesse (oder free-threaded Build). Der GIL schützt den Interpreter, nicht deine Daten.
+
+  ## Zusammenfassung
+
+  - Nebenläufigkeit ist abwechselndes Arbeiten, Parallelität gleichzeitiges Arbeiten auf mehreren Kernen.
+  - Im Standard-Build führt wegen des GIL nur ein Thread gleichzeitig Python-Bytecode aus; beim Warten auf I/O gibt er den GIL ab.
+  - `+=` auf geteilten Daten ist nicht atomar: `Lock` oder `queue.Queue` benutzen.
+  - Python 3.13: free-threaded Build experimentell. Python 3.14: offiziell unterstützt, aber optional; der Standard-Build hat weiter einen GIL.
+  - Prozesse umgehen den GIL, kosten aber Start-Zeit und Pickling; Startcode hinter `if __name__ == "__main__":`.
+  - `concurrent.futures`: `map` in Eingabereihenfolge, `submit` + `as_completed` in Fertigstellungsreihenfolge.
+  - asyncio: eine Event-Loop, Wechsel nur an `await`; `asyncio.run` einmal außen, `TaskGroup`, `timeout`, `Semaphore`, `gather`.
+  - Nichts Blockierendes in `async def`; notfalls `asyncio.to_thread`.
+exercises:
+  - id: werkzeug-waehlen
+    type: choice
+    title: Welches Werkzeug passt?
+    prompt: Du arbeitest mit dem Standard-Build von CPython 3.14 (mit GIL). Welche Zuordnungen sind sinnvoll?
+    options:
+      - text: 300 PDF-Seiten in reinem Python parsen und auswerten → `ProcessPoolExecutor`
+        correct: true
+        why: CPU-bound in reinem Python. Nur getrennte Prozesse mit eigenem GIL rechnen parallel.
+      - text: 50 REST-Aufrufe mit der synchronen Bibliothek `requests` → `ThreadPoolExecutor`
+        correct: true
+        why: I/O-bound. Beim Warten auf das Netz geben Threads den GIL ab, und die bestehende Bibliothek bleibt nutzbar.
+      - text: Eine Primzahlsuche in reinem Python mit 8 Threads beschleunigen
+        correct: false
+        why: Im Standard-Build führt nur ein Thread gleichzeitig Bytecode aus; die Threads wechseln sich ab. Das wird nicht schneller, oft langsamer.
+      - text: 2 000 gleichzeitige WebSocket-Verbindungen in einem Server → `ProcessPoolExecutor` mit 2 000 Prozessen
+        correct: false
+        why: Prozesse sind teuer (Speicher, Start). Viele wartende Verbindungen sind der Kernfall für asyncio in einem Thread.
+    explanation: |
+      Entscheidend ist die Art der Last. I/O-bound Arbeit braucht Nebenläufigkeit (Threads oder asyncio), CPU-bound Arbeit braucht Parallelität, im Standard-Build also Prozesse. Tausende Verbindungen sind I/O-bound mit sehr vielen gleichzeitigen Wartezeiten – dafür ist asyncio gebaut.
+    resources:
+      - title: Concurrent Execution
+        url: https://docs.python.org/3/library/concurrency.html
+      - title: Glossar · global interpreter lock
+        url: https://docs.python.org/3/glossary.html#term-global-interpreter-lock
+
+  - id: taskgroup-ordnen
+    type: order
+    title: Zwei Anfragen mit TaskGroup
+    prompt: |
+      Bring die Zeilen in die richtige Reihenfolge: `lade_profilseite` lädt Profil und Bestellungen nebenläufig, mit einem Timeout von zwei Sekunden für beide zusammen, und gibt beide Ergebnisse zurück.
+    lang: python
+    lines: |
+      async def lade_profilseite(nutzer_id: int) -> tuple[dict, list]:
+          async with asyncio.timeout(2):
+              async with asyncio.TaskGroup() as tg:
+                  profil = tg.create_task(api.profil(nutzer_id))
+                  bestellungen = tg.create_task(api.bestellungen(nutzer_id))
+          return profil.result(), bestellungen.result()
+    alternatives:
+      - [1, 2, 3, 5, 4, 6]
+    hints:
+      - Die Ergebnisse sind erst verfügbar, wenn die TaskGroup alle Tasks abgewartet hat.
+    explanation: |
+      Das `timeout` umschließt die ganze TaskGroup, damit die Frist für beide Anfragen zusammen gilt. Die Tasks laufen ab `create_task` nebenläufig; am Ende des `async with`-Blocks wartet die TaskGroup auf beide. Erst danach ist `.result()` sicher. Die Reihenfolge der beiden `create_task`-Zeilen ist egal.
+    resources:
+      - title: asyncio · Task Groups
+        url: https://docs.python.org/3/library/asyncio-task.html#task-groups
+      - title: asyncio.timeout
+        url: https://docs.python.org/3/library/asyncio-task.html#asyncio.timeout
+
+  - id: executor-map-reihenfolge
+    type: output
+    title: In welcher Reihenfolge kommen die Ergebnisse?
+    prompt: Was gibt dieses Programm aus? Die Wartezeiten sind so gewählt, dass die Aufgabe `3` zuerst fertig wird.
+    lang: python
+    code: |
+      import time
+      from concurrent.futures import ThreadPoolExecutor
+
+      def lade(n):
+          time.sleep(0.05 * (4 - n))
+          return n * 10
+
+      def pruefe(n):
+          if n == 2:
+              raise ValueError(f"kaputt: {n}")
+          return n
+
+      with ThreadPoolExecutor(max_workers=3) as pool:
+          print(list(pool.map(lade, [1, 2, 3])))
+          try:
+              for ergebnis in pool.map(pruefe, [1, 2, 3]):
+                  print("ok", ergebnis)
+          except ValueError as fehler:
+              print("Fehler:", fehler)
+    expected: |
+      [10, 20, 30]
+      ok 1
+      Fehler: kaputt: 2
+    hints:
+      - "`Executor.map` verhält sich nach außen wie das eingebaute `map`."
+      - Wann genau taucht die Exception eines Tasks bei `map` auf?
+    explanation: |
+      `Executor.map` liefert die Ergebnisse in der Reihenfolge der Eingaben, auch wenn spätere Aufgaben früher fertig sind – es wartet beim Iterieren auf das jeweils nächste. Eine Exception im Task wirft `map` erst, wenn die Iteration an diesem Ergebnis ankommt: `ok 1` erscheint, dann fliegt der `ValueError`. Das Ergebnis für `3` wurde zwar berechnet, aber nie abgeholt. Brauchst du Ergebnisse in Fertigstellungsreihenfolge oder Fehler pro Aufgabe, nimm `submit` mit `as_completed`.
+    resources:
+      - title: concurrent.futures · Executor.map
+        url: https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.Executor.map
+
+  - id: gather-reihenfolge
+    type: output
+    title: Wer ist zuerst fertig?
+    prompt: |
+      Was gibt dieses Programm aus? (Es nutzt `await` auf oberster Ebene wie in Jupyter oder `python -m asyncio`; in einem Skript stünde dort `asyncio.run(main())`.)
+    lang: python
+    code: |
+      import asyncio
+
+      async def hole(name, dauer):
+          print("start", name)
+          await asyncio.sleep(dauer)
+          print("fertig", name)
+          return name.upper()
+
+      async def main():
+          koro = hole("x", 0.01)
+          print("noch nichts gestartet")
+          ergebnisse = await asyncio.gather(hole("a", 0.06), hole("b", 0.02), hole("c", 0.04))
+          print(ergebnisse)
+          print(await koro)
+
+      await main()
+    expected: |
+      noch nichts gestartet
+      start a
+      start b
+      start c
+      fertig b
+      fertig c
+      fertig a
+      ['A', 'B', 'C']
+      start x
+      fertig x
+      X
+    hints:
+      - Ein Aufruf einer `async def`-Funktion erzeugt nur ein Coroutine-Objekt.
+      - "`gather` startet die Coroutinen in der Reihenfolge der Argumente; wer zuerst aufwacht, entscheidet die Wartezeit."
+    explanation: |
+      `hole("x", 0.01)` führt noch keine Zeile aus, es entsteht nur ein Coroutine-Objekt – deshalb kommt `start x` erst ganz am Ende, beim `await koro`. `gather` startet `a`, `b` und `c`; jede läuft bis zu ihrem `await asyncio.sleep` und gibt die Kontrolle ab. Die Loop weckt sie nach Ablauf ihrer Wartezeit: `b`, dann `c`, dann `a`. Die Ergebnisliste von `gather` folgt trotzdem der Reihenfolge der Argumente.
+    resources:
+      - title: asyncio.gather
+        url: https://docs.python.org/3/library/asyncio-task.html#asyncio.gather
+      - title: asyncio · Coroutines
+        url: https://docs.python.org/3/library/asyncio-task.html#coroutines
+
+  - id: lock-ergaenzen
+    type: gap
+    title: Den Lagerbestand schützen
+    prompt: |
+      Mehrere Threads reservieren gleichzeitig Artikel. Unter Last wird manchmal mehr reserviert, als im Lager ist. Ergänze die Lücken so, dass Prüfen und Abziehen ein unteilbarer Schritt werden.
+    lang: python
+    code: |
+      import threading
+
+      class Lager:
+          def __init__(self, bestand: int) -> None:
+              self.bestand = bestand
+              self._lock = ⟦threading.Lock()⟧
+
+          def reserviere(self, menge: int) -> bool:
+              ⟦with self._lock:⟧
+                  if self.bestand >= menge:
+                      self.bestand -= menge
+                      return True
+                  return False
+    gaps:
+      - label: Lock erzeugen
+        hint: Eine Klasse aus `threading`.
+        accept: ["threading.RLock()"]
+      - label: Kritischer Abschnitt
+        hint: Ein Lock ist ein Context Manager.
+    explanation: |
+      Das Muster „prüfen, dann handeln“ (Check-then-Act) ist nur korrekt, wenn kein anderer Thread zwischen Prüfung und Änderung eingreift. Zwei Threads könnten sonst beide `bestand >= menge` sehen und beide abziehen. `with self._lock:` sorgt dafür, dass immer nur ein Thread im Block ist, und gibt den Lock auch bei `return` oder Exceptions frei. Der GIL hilft hier nicht: Er schützt einzelne Bytecode-Schritte des Interpreters, nicht deine zwei Zeilen Logik.
+    resources:
+      - title: threading · Lock objects
+        url: https://docs.python.org/3/library/threading.html#lock-objects
+
+  - id: begrenzt-abrufen
+    type: code
+    title: Höchstens n Anfragen gleichzeitig
+    prompt: |
+      Schreibe `async def hole_alle(urls, hole, limit)`. Sie ruft für jede URL `await hole(url)` auf – nebenläufig, aber mit höchstens `limit` Aufrufen gleichzeitig – und gibt die Ergebnisse **in der Reihenfolge der URLs** zurück.
+
+      `hole` ist eine async-Funktion, die du als Parameter bekommst (in Tests ein Fake, in Produktion etwa ein `httpx`-Aufruf).
+    lang: python
+    starter: |
+      import asyncio
+
+      async def hole_alle(urls: list[str], hole, limit: int) -> list[str]:
+          ergebnisse = []
+          for url in urls:
+              ergebnisse.append(await hole(url))
+          return ergebnisse
+    solution: |
+      import asyncio
+
+      async def hole_alle(urls: list[str], hole, limit: int) -> list[str]:
+          semaphore = asyncio.Semaphore(limit)
+
+          async def begrenzt(url: str) -> str:
+              async with semaphore:
+                  return await hole(url)
+
+          return await asyncio.gather(*(begrenzt(url) for url in urls))
+    setup: |
+      import asyncio
+
+      class FakeServer:
+          def __init__(self, dauer=0.02):
+              self.aktiv = 0
+              self.maximal = 0
+              self.dauer = dauer
+          async def hole(self, url):
+              self.aktiv += 1
+              self.maximal = max(self.maximal, self.aktiv)
+              await asyncio.sleep(self.dauer)
+              self.aktiv -= 1
+              return f"<html>{url}</html>"
+    tests:
+      - name: Ergebnisse in Reihenfolge der URLs
+        code: |
+          server = FakeServer()
+          urls = [f"/p/{i}" for i in range(6)]
+          ergebnis = await hole_alle(urls, server.hole, limit=3)
+          assert ergebnis == [f"<html>/p/{i}</html>" for i in range(6)], ergebnis
+      - name: Das Limit wird ausgeschöpft
+        code: |
+          server = FakeServer()
+          await hole_alle([f"/p/{i}" for i in range(10)], server.hole, limit=3)
+          assert server.maximal == 3, f"höchstens gleichzeitig: {server.maximal}, erwartet genau 3 – laufen die Aufrufe nebenläufig?"
+      - name: Nie mehr als das Limit
+        code: |
+          server = FakeServer()
+          await hole_alle([f"/p/{i}" for i in range(20)], server.hole, limit=5)
+          assert server.maximal <= 5, f"{server.maximal} Aufrufe gleichzeitig bei limit=5"
+      - name: Limit 1 heißt nacheinander
+        code: |
+          server = FakeServer(dauer=0.005)
+          assert await hole_alle(["/a", "/b"], server.hole, limit=1) == ["<html>/a</html>", "<html>/b</html>"]
+          assert server.maximal == 1
+      - name: Leere Liste
+        code: |
+          assert await hole_alle([], FakeServer().hole, limit=3) == []
+    hints:
+      - "`asyncio.Semaphore(limit)` lässt höchstens `limit` Coroutinen gleichzeitig in einen `async with`-Block."
+      - Umhülle `hole` in eine kleine innere Coroutine, die das Semaphore betritt, und übergib alle an `asyncio.gather`.
+    explanation: |
+      Der Startcode ist korrekt, aber seriell: Jedes `await` wartet, bevor die nächste Anfrage startet. `gather` startet alle Coroutinen nebenläufig und liefert die Ergebnisse in Argumentreihenfolge. Das `Semaphore` begrenzt, wie viele gleichzeitig im `async with`-Block sind; die übrigen warten an dessen Eingang. So bleibt die Last für den fremden Server kontrolliert. Das Semaphore muss innerhalb der Funktion entstehen, damit jeder Aufruf sein eigenes Limit hat.
+    resources:
+      - title: asyncio.Semaphore
+        url: https://docs.python.org/3/library/asyncio-sync.html#asyncio.Semaphore
+      - title: asyncio.gather
+        url: https://docs.python.org/3/library/asyncio-task.html#asyncio.gather
+
+  - id: timeout-fallback
+    type: code
+    title: Timeout mit Fallback
+    prompt: |
+      Schreibe `async def hole_mit_timeout(hole, url, sekunden, fallback=None)`:
+
+      - Liefert `await hole(url)`, wenn der Aufruf innerhalb von `sekunden` fertig wird.
+      - Liefert `fallback`, wenn die Frist abläuft.
+      - Andere Exceptions (etwa `ConnectionError`) fliegen unverändert weiter.
+
+      Nutze `asyncio.timeout` (seit Python 3.11).
+    lang: python
+    starter: |
+      import asyncio
+
+      async def hole_mit_timeout(hole, url, sekunden, fallback=None):
+          try:
+              return await hole(url)
+          except Exception:
+              return fallback
+    solution: |
+      import asyncio
+
+      async def hole_mit_timeout(hole, url, sekunden, fallback=None):
+          try:
+              async with asyncio.timeout(sekunden):
+                  return await hole(url)
+          except TimeoutError:
+              return fallback
+    setup: |
+      import asyncio
+      import time
+
+      async def schnell(url):
+          await asyncio.sleep(0.01)
+          return f"ok {url}"
+
+      async def haengt(url):
+          await asyncio.sleep(3)
+          return "zu spät"
+
+      async def kaputt(url):
+          raise ConnectionError("Verbindung abgelehnt")
+    tests:
+      - name: Schnelle Antwort kommt durch
+        code: |
+          assert await hole_mit_timeout(schnell, "/status", 0.5) == "ok /status"
+      - name: Nach Ablauf der Frist kommt der Fallback
+        code: |
+          start = time.perf_counter()
+          ergebnis = await hole_mit_timeout(haengt, "/status", 0.05, fallback="cache")
+          dauer = time.perf_counter() - start
+          assert ergebnis == "cache", f"erwartet 'cache', bekommen {ergebnis!r}"
+          assert dauer < 1, f"hat {dauer:.2f} s gewartet – bricht das Timeout den Aufruf ab?"
+      - name: Standard-Fallback ist None
+        code: |
+          assert await hole_mit_timeout(haengt, "/status", 0.02) is None
+      - name: Andere Fehler fliegen weiter
+        code: |
+          try:
+              await hole_mit_timeout(kaputt, "/status", 0.5, fallback="cache")
+          except ConnectionError:
+              pass
+          else:
+              raise AssertionError("ConnectionError darf nicht zum Fallback werden – nur Timeouts.")
+    hints:
+      - "`async with asyncio.timeout(sekunden):` um das `await`."
+      - Fang nur `TimeoutError`, nicht `Exception`.
+    explanation: |
+      `asyncio.timeout` bricht die wartende Coroutine nach Ablauf der Frist ab (intern mit einer Cancellation) und wandelt das am Ende des Blocks in `TimeoutError` um. Der Startcode hatte zwei Probleme: kein Timeout, also hängt er so lange wie der Server, und `except Exception` macht aus jedem Verbindungsfehler still einen Fallback – Fehler verschwinden aus Logs und Monitoring. Fange nur, was du bewusst behandelst.
+    resources:
+      - title: asyncio.timeout
+        url: https://docs.python.org/3/library/asyncio-task.html#asyncio.timeout
+
+  - id: dienste-pruefen
+    type: code
+    title: Healthcheck mit gather
+    prompt: |
+      Ein Healthcheck-Endpunkt prüft mehrere Dienste. Schreibe `async def pruefe_dienste(checks)`:
+
+      - `checks` ist ein Dictionary `{name: async_funktion}`; jede Funktion wird ohne Argumente aufgerufen.
+      - Alle Checks laufen **nebenläufig**.
+      - Ein fehlschlagender Check darf die anderen nicht abbrechen.
+      - Rückgabe: ein Dictionary `{name: "ok"}` für erfolgreiche Checks und `{name: "Fehler: <Meldung>"}` für gescheiterte, wobei `<Meldung>` `str(exception)` ist.
+    lang: python
+    starter: |
+      import asyncio
+
+      async def pruefe_dienste(checks):
+          ergebnis = {}
+          for name, check in checks.items():
+              await check()
+              ergebnis[name] = "ok"
+          return ergebnis
+    solution: |
+      import asyncio
+
+      async def pruefe_dienste(checks):
+          namen = list(checks)
+          antworten = await asyncio.gather(*(checks[name]() for name in namen), return_exceptions=True)
+          ergebnis = {}
+          for name, antwort in zip(namen, antworten):
+              if isinstance(antwort, Exception):
+                  ergebnis[name] = f"Fehler: {antwort}"
+              else:
+                  ergebnis[name] = "ok"
+          return ergebnis
+    setup: |
+      import asyncio
+      import time
+
+      async def datenbank():
+          await asyncio.sleep(0.1)
+          return True
+
+      async def cache():
+          await asyncio.sleep(0.1)
+          return True
+
+      async def mailserver():
+          await asyncio.sleep(0.05)
+          raise ConnectionError("smtp nicht erreichbar")
+    tests:
+      - name: Alle gesund
+        code: |
+          assert await pruefe_dienste({"db": datenbank, "cache": cache}) == {"db": "ok", "cache": "ok"}
+      - name: Ein Fehler bricht die anderen nicht ab
+        code: |
+          ergebnis = await pruefe_dienste({"db": datenbank, "mail": mailserver, "cache": cache})
+          assert ergebnis == {"db": "ok", "mail": "Fehler: smtp nicht erreichbar", "cache": "ok"}, ergebnis
+      - name: Läuft nebenläufig
+        code: |
+          start = time.perf_counter()
+          await pruefe_dienste({"db": datenbank, "cache": cache, "mail": mailserver})
+          dauer = time.perf_counter() - start
+          assert dauer < 0.2, f"dauerte {dauer:.2f} s – nacheinander wären es 0,25 s, nebenläufig ~0,1 s"
+      - name: Keine Checks
+        code: |
+          assert await pruefe_dienste({}) == {}
+    hints:
+      - "`asyncio.gather(*coroutinen, return_exceptions=True)` liefert Exceptions als Elemente der Ergebnisliste."
+      - Die Ergebnisliste hat dieselbe Reihenfolge wie die Argumente – merk dir die Namen in derselben Reihenfolge.
+    explanation: |
+      Der Startcode prüft nacheinander, und der erste Fehler bricht alles ab. `gather` startet alle Checks gleichzeitig; mit `return_exceptions=True` landet eine Exception als Wert in der Ergebnisliste, statt `gather` abzubrechen. Weil `gather` die Reihenfolge der Argumente einhält, kannst du Namen und Ergebnisse mit `zip` zusammenführen. Eine `TaskGroup` wäre hier die falsche Wahl: Sie bricht bei einem Fehler die übrigen Tasks ab.
+    resources:
+      - title: asyncio.gather
+        url: https://docs.python.org/3/library/asyncio-task.html#asyncio.gather
+
+  - id: dashboard-reparieren
+    type: code
+    title: Repariere das langsame Dashboard
+    prompt: |
+      `lade_dashboard` braucht so lange wie die drei API-Aufrufe zusammen, obwohl sie unabhängig voneinander sind. Repariere die Funktion so, dass die drei Aufrufe **nebenläufig** laufen. Das Ergebnis bleibt gleich, und ein Fehler in einem Aufruf soll weiterhin beim Aufrufer ankommen.
+    lang: python
+    starter: |
+      import asyncio
+
+      async def lade_dashboard(nutzer_id: int, api) -> dict:
+          profil = await api.profil(nutzer_id)
+          bestellungen = await api.bestellungen(nutzer_id)
+          nachrichten = await api.nachrichten(nutzer_id)
+          return {"profil": profil, "bestellungen": bestellungen, "nachrichten": nachrichten}
+    solution: |
+      import asyncio
+
+      async def lade_dashboard(nutzer_id: int, api) -> dict:
+          async with asyncio.TaskGroup() as tg:
+              profil = tg.create_task(api.profil(nutzer_id))
+              bestellungen = tg.create_task(api.bestellungen(nutzer_id))
+              nachrichten = tg.create_task(api.nachrichten(nutzer_id))
+          return {
+              "profil": profil.result(),
+              "bestellungen": bestellungen.result(),
+              "nachrichten": nachrichten.result(),
+          }
+    setup: |
+      import asyncio
+
+      class FakeApi:
+          def __init__(self, kaputt=None):
+              self.aktiv = 0
+              self.maximal = 0
+              self.kaputt = kaputt
+          async def _anfrage(self, name, wert):
+              self.aktiv += 1
+              self.maximal = max(self.maximal, self.aktiv)
+              await asyncio.sleep(0.03)
+              self.aktiv -= 1
+              if name == self.kaputt:
+                  raise ValueError(f"{name} fehlgeschlagen")
+              return wert
+          async def profil(self, nutzer_id):
+              return await self._anfrage("profil", {"id": nutzer_id, "name": "Ada"})
+          async def bestellungen(self, nutzer_id):
+              return await self._anfrage("bestellungen", [101, 102])
+          async def nachrichten(self, nutzer_id):
+              return await self._anfrage("nachrichten", ["Willkommen"])
+    tests:
+      - name: Ergebnis bleibt gleich
+        code: |
+          ergebnis = await lade_dashboard(7, FakeApi())
+          assert ergebnis == {"profil": {"id": 7, "name": "Ada"}, "bestellungen": [101, 102], "nachrichten": ["Willkommen"]}, ergebnis
+      - name: Die drei Aufrufe laufen gleichzeitig
+        code: |
+          api = FakeApi()
+          await lade_dashboard(7, api)
+          assert api.maximal == 3, f"höchstens {api.maximal} Aufrufe gleichzeitig – erwartet 3"
+      - name: Fehler kommen beim Aufrufer an
+        code: |
+          angekommen = False
+          try:
+              await lade_dashboard(7, FakeApi(kaputt="bestellungen"))
+          except* ValueError:
+              angekommen = True
+          assert angekommen, "Der ValueError aus api.bestellungen muss beim Aufrufer ankommen."
+    hints:
+      - "`asyncio.TaskGroup` oder `asyncio.gather` starten mehrere Coroutinen nebenläufig."
+      - Mit TaskGroup holst du die Ergebnisse nach dem `async with`-Block mit `.result()` ab.
+    explanation: |
+      Drei `await` hintereinander sind korrekt, aber seriell: Die zweite Anfrage startet erst, wenn die erste fertig ist. Mit einer `TaskGroup` starten alle drei sofort, und der Block endet, wenn alle fertig sind; die Gesamtdauer entspricht dem langsamsten Aufruf. Scheitert einer, bricht die TaskGroup die anderen ab und wirft eine `ExceptionGroup` – deshalb fängt der Test mit `except*`. `asyncio.gather` wäre ebenso richtig; es wirft die erste Exception direkt, lässt die anderen Aufrufe aber weiterlaufen.
+    resources:
+      - title: asyncio · Task Groups
+        url: https://docs.python.org/3/library/asyncio-task.html#task-groups
+      - title: Die try-Anweisung (except*)
+        url: https://docs.python.org/3/reference/compound_stmts.html#except-star
+
+  - id: blockierender-sleep
+    type: bug
+    title: Der Server hört auf zu antworten
+    prompt: |
+      Ein async-Webserver ruft `sende_mit_backoff` für fehlgeschlagene Webhooks auf. Sobald ein Webhook wiederholt wird, beantwortet der Server **gar keine** Anfragen mehr, bis die Wartezeit vorbei ist – auch Healthchecks laufen in den Timeout. Finde die Zeile und korrigiere sie.
+    lang: python
+    code: |
+      import asyncio
+      import time
+
+      async def sende_mit_backoff(sende, payload: dict, versuche: int = 3) -> bool:
+          for versuch in range(versuche):
+              if await sende(payload):
+                  return True
+              time.sleep(2 ** versuch)
+          return False
+    lines: [8]
+    fix:
+      - line: 8
+        answers: ["await asyncio.sleep(2 ** versuch)"]
+    explanation: |
+      `time.sleep` blockiert den Thread – und in asyncio gibt es nur einen Thread mit der Event-Loop. Solange er schläft, kann die Loop keine andere Coroutine fortsetzen, also steht der ganze Server. `await asyncio.sleep(...)` gibt die Kontrolle an die Loop zurück und lässt sich nach der Wartezeit wecken. Dasselbe gilt für `requests.get`, synchrone Datenbanktreiber und lange Berechnungen: in async-Code durch asynchrone Varianten oder `asyncio.to_thread` ersetzen.
+    resources:
+      - title: asyncio · Running blocking code
+        url: https://docs.python.org/3/library/asyncio-dev.html#running-blocking-code
+      - title: asyncio.sleep
+        url: https://docs.python.org/3/library/asyncio-task.html#asyncio.sleep
+
+  - id: vergessenes-await
+    type: bug
+    title: Coroutine statt Kurs
+    prompt: |
+      Der Aufruf `await preis_in_usd(100)` scheitert mit:
+
+      ```text
+      TypeError: unsupported operand type(s) for *: 'int' and 'coroutine'
+      RuntimeWarning: coroutine 'hole_kurs' was never awaited
+      ```
+
+      Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: python
+    code: |
+      import asyncio
+
+      async def hole_kurs(waehrung: str) -> float:
+          await asyncio.sleep(0.1)          # steht für einen API-Aufruf
+          return {"USD": 1.08}[waehrung]
+
+      async def preis_in_usd(betrag_eur: float) -> float:
+          kurs = hole_kurs("USD")
+          return round(betrag_eur * kurs, 2)
+    lines: [8]
+    fix:
+      - line: 8
+        answers: ["kurs = await hole_kurs(\"USD\")"]
+    explanation: |
+      Der Aufruf einer `async def`-Funktion führt ihren Körper nicht aus, sondern liefert ein Coroutine-Objekt. Erst `await` lässt die Coroutine laufen und liefert ihren Rückgabewert. Die `RuntimeWarning` ist der verlässliche Hinweis: Eine Coroutine wurde erzeugt und nie ausgeführt. mypy und pyright melden solche Stellen, weil der Typ `Coroutine[..., float]` statt `float` ist – ein Grund mehr für Type Hints in async-Code.
+    resources:
+      - title: asyncio · Coroutines
+        url: https://docs.python.org/3/library/asyncio-task.html#coroutines
+      - title: asyncio · Detect never-awaited coroutines
+        url: https://docs.python.org/3/library/asyncio-dev.html#detect-never-awaited-coroutines
+
+  - id: race-erklaeren
+    type: explain
+    title: Warum fehlen Seitenaufrufe?
+    prompt: |
+      Ein Flask-Dienst läuft mit mehreren Threads und zählt Seitenaufrufe im Speicher. Das Monitoring zeigt unter Last weniger Aufrufe als das Log des Load-Balancers. Ein Kollege meint: „Kann nicht sein, Python hat doch den GIL.“ Erkläre, was passiert, warum der GIL nicht hilft und wie du es behebst.
+    lang: python
+    code: |
+      aufrufe: dict[str, int] = {}
+
+      def zaehle(pfad: str) -> None:
+          aufrufe[pfad] = aufrufe.get(pfad, 0) + 1
+    points:
+      - Die Zeile ist ein Lesen-Ändern-Schreiben aus mehreren Schritten (lesen mit `get`, addieren, zurückschreiben), kein atomarer Vorgang.
+      - "Wechselt der Thread zwischen Lesen und Schreiben, lesen zwei Threads denselben alten Wert und schreiben beide `alt + 1` – ein Aufruf geht verloren (Lost Update)."
+      - Der GIL sorgt nur dafür, dass einzelne Bytecode-Schritte den Interpreter nicht beschädigen; zwischen den Schritten darf er den Thread wechseln. Im free-threaded Build laufen Threads sogar echt parallel.
+      - "Behebung: den Abschnitt mit einem `threading.Lock` schützen (`with lock:`), oder den Zähler in einen externen Speicher mit atomarem Inkrement auslagern (z. B. Redis `INCR`), wenn mehrere Prozesse laufen."
+    explanation: |
+      `aufrufe[pfad] = aufrufe.get(pfad, 0) + 1` sieht aus wie ein Schritt, ist aber drei: den alten Wert lesen, eins addieren, das Ergebnis schreiben. Der Interpreter darf zwischen diesen Schritten den Thread wechseln. Lesen zwei Threads beide `41`, schreiben beide `42` – ein Aufruf ist verloren. Unter Last passiert das häufiger, deshalb die Abweichung im Monitoring.
+
+      Der GIL schützt den Interpreter vor kaputten internen Strukturen, nicht deine Programmlogik vor Unterbrechung. Im free-threaded Build von 3.14 fehlt er sogar ganz. Die Lösung ist ein `threading.Lock` um den Lesen-Ändern-Schreiben-Abschnitt. Läuft der Dienst zusätzlich in mehreren Prozessen (etwa mehreren Gunicorn-Workern), hat jeder Prozess ohnehin sein eigenes Dictionary; dann gehört der Zähler in einen gemeinsamen Speicher wie Redis mit atomarem `INCR`.
+    resources:
+      - title: threading · Lock objects
+        url: https://docs.python.org/3/library/threading.html#lock-objects
+      - title: Free-threading HOWTO · Thread safety
+        url: https://docs.python.org/3/howto/free-threading-python.html#thread-safety
+
+  - id: prozesspool-erklaeren
+    type: explain
+    title: Warum ist der Prozess-Pool langsamer?
+    prompt: |
+      Eine Kollegin will die Validierung von 200 000 kurzen Datensätzen beschleunigen. Version A braucht 0,4 s. Version B braucht 6 s und scheitert, sobald sie `pool.map(lambda d: d["email"].lower(), daten)` probiert, mit `PicklingError`. Erkläre beide Beobachtungen und wie es besser geht.
+    lang: python
+    code: |
+      from concurrent.futures import ProcessPoolExecutor
+
+      def ist_gueltig(datensatz: dict) -> bool:
+          return "@" in datensatz.get("email", "") and len(datensatz.get("name", "")) > 1
+
+      def version_a(daten: list[dict]) -> int:
+          return sum(map(ist_gueltig, daten))
+
+      def version_b(daten: list[dict]) -> int:
+          with ProcessPoolExecutor() as pool:
+              return sum(pool.map(ist_gueltig, daten))
+    points:
+      - Jeder Aufruf von `ist_gueltig` ist winzig (Mikrosekunden); bei Prozessen wird aber jedes Argument und Ergebnis mit pickle serialisiert und zwischen Prozessen kopiert – der Overhead übersteigt die Arbeit.
+      - Das Starten der Worker-Prozesse kostet zusätzlich Zeit.
+      - Lambdas (und lokal definierte Funktionen) lassen sich nicht pickeln, weil pickle Funktionen über ihren importierbaren Namen überträgt.
+      - "Besser: bei so billigen Aufgaben seriell bleiben; wenn überhaupt parallel, mit großem `chunksize` bündeln und eine Funktion auf Modulebene übergeben; Startcode hinter `if __name__ == \"__main__\":`."
+    explanation: |
+      Prozess-Parallelität hat einen festen Preis: Worker starten und für jeden Aufruf Argumente und Ergebnisse per `pickle` über eine Pipe schicken. Bei 200 000 Aufrufen, die jeweils nur Mikrosekunden rechnen, besteht Version B fast nur aus diesem Overhead. `chunksize=10_000` würde die Nachrichten bündeln und den Abstand verkleinern, aber bei so billiger Arbeit gewinnt die serielle Version fast immer.
+
+      `pickle` überträgt Funktionen nicht als Code, sondern als Verweis „Modul + Name“. Ein Lambda hat keinen importierbaren Namen, deshalb scheitert es. Die Faustregel: Prozesse lohnen sich für wenige, große CPU-lastige Aufgaben (Bilder, Berechnungen im Sekundenbereich), nicht für viele winzige.
+    resources:
+      - title: ProcessPoolExecutor
+        url: https://docs.python.org/3/library/concurrent.futures.html#processpoolexecutor
+      - title: pickle · What can be pickled and unpickled?
+        url: https://docs.python.org/3/library/pickle.html#what-can-be-pickled-and-unpickled
+
+  - id: downloader-threads
+    type: practice
+    title: Paralleler Downloader mit Thread-Pool
+    prompt: |
+      Schreibe lokal (nicht im Browser – dort gibt es keine Threads) ein Skript `downloader.py`, das eine Liste von URLs mit der Standardbibliothek herunterlädt:
+
+      - `urllib.request.urlopen(url, timeout=10)` für jede URL, höchstens 8 gleichzeitig über `ThreadPoolExecutor`.
+      - Ausgabe in Fertigstellungsreihenfolge: URL, HTTP-Status, Anzahl Bytes – oder die Fehlermeldung, ohne dass ein Fehler die anderen Downloads abbricht.
+      - Am Ende eine Zusammenfassung: erfolgreich / fehlgeschlagen, Gesamtdauer.
+      - Vergleiche die Dauer mit `max_workers=1`.
+    lang: python
+    starter: |
+      import time
+      import urllib.request
+      from concurrent.futures import ThreadPoolExecutor, as_completed
+
+      URLS = [
+          "https://docs.python.org/3/",
+          "https://peps.python.org/",
+          "https://pypi.org/",
+          "https://example.invalid/",   # schlägt absichtlich fehl
+      ]
+
+      def lade(url: str) -> tuple[int, int]:
+          ...
+
+      def main() -> None:
+          ...
+
+      if __name__ == "__main__":
+          main()
+    solution: |
+      import time
+      import urllib.request
+      from concurrent.futures import ThreadPoolExecutor, as_completed
+
+      URLS = [
+          "https://docs.python.org/3/",
+          "https://peps.python.org/",
+          "https://pypi.org/",
+          "https://example.invalid/",   # schlägt absichtlich fehl
+      ]
+
+      def lade(url: str) -> tuple[int, int]:
+          with urllib.request.urlopen(url, timeout=10) as antwort:
+              return antwort.status, len(antwort.read())
+
+      def main(max_workers: int = 8) -> None:
+          start = time.perf_counter()
+          ok = fehler = 0
+          with ThreadPoolExecutor(max_workers=max_workers) as pool:
+              futures = {pool.submit(lade, url): url for url in URLS}
+              for future in as_completed(futures):
+                  url = futures[future]
+                  try:
+                      status, groesse = future.result()
+                  except OSError as exc:
+                      fehler += 1
+                      print(f"FEHLER {url}: {exc}")
+                  else:
+                      ok += 1
+                      print(f"{status} {url} ({groesse} Bytes)")
+          dauer = time.perf_counter() - start
+          print(f"{ok} erfolgreich, {fehler} fehlgeschlagen, {dauer:.2f} s")
+
+      if __name__ == "__main__":
+          main()
+    checklist:
+      - "`submit` für jede URL und ein Dictionary `Future → URL`, damit du bei `as_completed` weißt, welche URL fertig ist."
+      - "`future.result()` steht in `try`/`except`; ein Fehler bricht die Schleife nicht ab."
+      - Jeder Aufruf hat ein Timeout; ohne Timeout kann ein hängender Server den Pool für immer blockieren.
+      - Du hast die Laufzeit mit `max_workers=1` und `max_workers=8` gemessen und kannst den Unterschied mit „I/O-bound, GIL wird beim Warten abgegeben“ erklären.
+      - Der Startcode steht hinter `if __name__ == "__main__":`.
+    explanation: |
+      Das Skript ist I/O-bound: Fast die ganze Zeit wartet es auf das Netz, und währenddessen geben die Threads den GIL ab. Deshalb bringt ein Thread-Pool hier echte Beschleunigung, obwohl Python-Bytecode nie parallel läuft. `as_completed` liefert Ergebnisse, sobald sie da sind; das Dictionary ordnet jedes Future seiner URL zu. `urllib.error.URLError` und Timeouts sind Unterklassen von `OSError`, deshalb fängt `except OSError` die typischen Netzwerkfehler. Mit asyncio und `httpx` sähe die Lösung ähnlich aus – `gather` plus `Semaphore` statt Pool.
+    resources:
+      - title: concurrent.futures · ThreadPoolExecutor Example
+        url: https://docs.python.org/3/library/concurrent.futures.html#threadpoolexecutor-example
+      - title: urllib.request.urlopen
+        url: https://docs.python.org/3/library/urllib.request.html#urllib.request.urlopen

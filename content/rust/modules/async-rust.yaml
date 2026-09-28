@@ -1,0 +1,391 @@
+id: async-rust
+title: Async Rust mit Tokio
+level: 3
+minutes: 180
+summary: Futures, Tasks und Warteoperationen mit klaren Besitzern, Grenzen und Abbruchwegen organisieren.
+goals:
+- Du erklärst Future, Runtime, await und spawn getrennt.
+- Du sammelst Task-Ergebnisse und behandelst JoinError.
+- Du begrenzt Arbeit mit Channels und planst Cancellation.
+- Du erkennst blockierende Aufrufe und gefährliche Lock-Lebensdauern.
+resources:
+- &id001
+  title: Tokio · Async in depth
+  url: https://tokio.rs/tokio/tutorial/async
+- title: Tokio · Spawning
+  url: https://tokio.rs/tokio/tutorial/spawning
+- title: Tokio · Select
+  url: https://tokio.rs/tokio/tutorial/select
+- title: Tokio · Bounded mpsc
+  url: https://docs.rs/tokio/latest/tokio/sync/mpsc/index.html
+- title: Tokio · Graceful shutdown
+  url: https://tokio.rs/tokio/topics/shutdown
+lesson: |
+  Ein Werkzeug fragt viele Dienste ab und verbringt den größten Teil seiner Zeit mit Warten. Ein Betriebssystem-Thread pro Anfrage ist möglich, kostet aber Ressourcen. Asynchroner Code ermöglicht, viele wartende Operationen auf einer kleineren Zahl von Threads zu verwalten. CPU-intensive Arbeit wird dadurch nicht automatisch schneller, und ein blockierender Aufruf bleibt blockierend, auch wenn er in einer `async fn` steht.
+
+  Du kennst Threads, Channels und Ownership bereits. Jetzt kommen Futures und eine Runtime dazu. Das zentrale Lernziel ist nicht „überall await schreiben“, sondern die Lebensdauer nebenläufiger Arbeit bewusst zu kontrollieren: Wer startet sie, wer wartet auf das Ergebnis, wann wird sie abgebrochen und wie wird Überlast begrenzt?
+
+  ## Futures beschreiben noch nicht abgeschlossene Arbeit
+
+  Der Aufruf einer `async fn` erzeugt eine Future. Ihr Körper läuft nicht allein deshalb schon im Hintergrund. Eine Runtime muss die Future vorantreiben. Sie fragt mit `poll`, ob ein Ergebnis bereit ist; andernfalls liefert die Future `Pending` und organisiert eine spätere Benachrichtigung über einen Waker. Die [Tokio-Erklärung zu Futures](https://tokio.rs/tokio/tutorial/async) beschreibt diese Zustandsmaschine.
+
+  ```rust
+  async fn meldung() {
+      println!("ausgeführt");
+  }
+
+  fn main() {
+      let future = meldung();
+      println!("erzeugt");
+      drop(future);
+  }
+  ```
+
+  Hier erscheint nur `erzeugt`. Der Future-Wert wurde nie gepollt. `.await` bedeutet innerhalb einer async-Funktion, die innere Future zum Abschluss zu treiben und bei Bedarf die Ausführung freizugeben. Es bedeutet weder „neuer Thread“ noch „garantierte Unterbrechung“. Eine bereits fertige Future kann unmittelbar ein Ergebnis liefern.
+
+  Die Sprache stellt Future und async-Syntax bereit. Tokio ergänzt Executor, Timer, Netzwerkoperationen und Synchronisationswerkzeuge. Für die Beispiele verwendest du Tokio 1 mit den benötigten Features:
+
+  ```toml
+  [dependencies]
+  tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+  ```
+
+  Die Plattform prüft Standardbibliotheks-Beispiele automatisch. Tokio-Beispiele benötigen diese Cargo-Abhängigkeit und sind deshalb hier dokumentationsgeprüfte Beispiele für dein lokales Cargo-Projekt, keine im Browser ausgeführten Aufgaben.
+
+  ## Await-Reihenfolge und gemeinsame Ausführung
+
+  Zwei direkt aufeinanderfolgende `.await`-Aufrufe beginnen im üblichen Fall nacheinander. Erzeuge und bearbeite beide Futures gemeinsam, wenn die Operationen voneinander unabhängig sind. `tokio::join!` führt sie innerhalb derselben Task nebenläufig fort; es verspricht keine parallele CPU-Ausführung auf zwei Kernen.
+
+  ```rust
+  use tokio::time::{sleep, Duration};
+
+  async fn wert(n: u32) -> u32 {
+      sleep(Duration::from_millis(5)).await;
+      n
+  }
+
+  #[tokio::main]
+  async fn main() {
+      let (a, b) = tokio::join!(wert(2), wert(3));
+      println!("{}", a + b);
+  }
+  ```
+
+  Beide Zweige dürfen während ihrer Wartephase Fortschritt ermöglichen. Das Tupel folgt der Argumentreihenfolge, nicht der Abschlussreihenfolge. Bei `Result`-liefernden Operationen kann `try_join!` beim ersten Fehler zurückkehren. Prüfe dann, was das Fallenlassen der anderen Future bedeutet; bereits versendete Anfragen werden dadurch nicht rückgängig gemacht. Die [join!-Dokumentation](https://docs.rs/tokio/latest/tokio/macro.join.html) erläutert auch, warum blockierende Zweige alle anderen Zweige derselben Task anhalten.
+
+  ## Spawn braucht einen Besitzer und ein Ergebnis
+
+  `tokio::spawn` startet eine eigenständig geplante Task. Die Future muss dafür üblicherweise `Send + 'static` sein. `Send` erlaubt das Verschieben zwischen Runtime-Threads. `'static` bedeutet hier, dass sie keine kurzlebigen geliehenen Daten des Aufrufers benötigt; es bedeutet nicht, dass sie für immer laufen muss. `async move` übernimmt benötigte Werte.
+
+  ```rust
+  #[tokio::main]
+  async fn main() {
+      let name = String::from("Backup");
+      let task = tokio::spawn(async move { name.len() });
+      let laenge = task.await.expect("Demo-Task darf nicht paniken");
+      println!("{laenge}");
+  }
+  ```
+
+  Der [`JoinHandle`](https://tokio.rs/tokio/tutorial/spawning) liefert beim Await zusätzlich einen `JoinError`, beispielsweise wenn die Task panikt oder abgebrochen wird. Gibt die Task selbst `Result<T, E>` zurück, entstehen zwei getrennte Fehlerebenen: Konnte die Task beendet werden, und war ihre fachliche Arbeit erfolgreich? Handle beide statt sie in ein irreführendes „Request fehlgeschlagen“ zusammenzuwerfen.
+
+  Das Fallenlassen eines JoinHandle bricht eine Tokio-Task nicht ab, sondern trennt den Handle von ihr. Eine Anwendung sollte wichtige Tasks deshalb sammeln. Ein [`JoinSet`](https://docs.rs/tokio/latest/tokio/task/struct.JoinSet.html) verwaltet mehrere Tasks und liefert mit `join_next` jeweils einen Abschluss. Seine Reihenfolge ist nicht die Startreihenfolge. Beim Fallenlassen des Sets werden verbleibende Tasks abgebrochen.
+
+  ```rust
+  use tokio::task::JoinSet;
+
+  #[tokio::main]
+  async fn main() {
+      let mut jobs = JoinSet::new();
+      for n in 1..=3 {
+          jobs.spawn(async move { n * 2 });
+      }
+      let mut ergebnisse = Vec::new();
+      while let Some(result) = jobs.join_next().await {
+          ergebnisse.push(result.expect("Demo-Task"));
+      }
+      ergebnisse.sort();
+      println!("{ergebnisse:?}");
+  }
+  ```
+
+  > [!PRAXIS]
+  > Ein Task-Start ohne klaren Ergebnis- und Abbruchpfad ist im Review ein Warnsignal. Notiere den Owner, die Fehlerbehandlung und das Verhalten beim Herunterfahren, bevor du weitere Arbeit auslagerst.
+
+  ## Timeout und Cancellation sind keine Transaktion
+
+  Ein [`timeout`](https://docs.rs/tokio/latest/tokio/time/fn.timeout.html) begrenzt das Warten auf eine Future. Er unterbricht keinen beliebigen CPU-Code präemptiv. Wenn eine Future nicht kooperativ Fortschritt freigibt, kann die Zeitgrenze überschritten werden.
+
+  ```rust
+  use tokio::time::{timeout, Duration};
+
+  #[tokio::main]
+  async fn main() {
+      let ergebnis = timeout(Duration::from_secs(1), async { 42 }).await;
+      match ergebnis {
+          Ok(wert) => println!("{wert}"),
+          Err(_) => eprintln!("Zeitlimit überschritten"),
+      }
+  }
+  ```
+
+  `tokio::select!` wartet auf mehrere Alternativen und bearbeitet einen fertigen Zweig. Nicht ausgewählte, vom Ausdruck besessene Futures werden fallengelassen. Die [Select-Dokumentation](https://tokio.rs/tokio/tutorial/select) erklärt deshalb Cancellation Safety: Ist es korrekt, eine Operation mittendrin zu verwerfen und später erneut zu beginnen? Ein teilweise geschriebener Datensatz oder eine schon bestätigte Remote-Aktion verschwindet nicht durch Drop.
+
+  Auch `timeout(handle)` auf einem JoinHandle bedeutet nicht automatisch, dass die gestartete Task beendet wird. Ein verworfener Handle kann sie weiterlaufen lassen. Behalte den Handle, verwende bei Bedarf `abort()` und warte auf dessen Abschluss. Für fachlich notwendiges Aufräumen brauchst du einen kooperativen Shutdown-Pfad. Tokios [Shutdown-Anleitung](https://tokio.rs/tokio/topics/shutdown) trennt Auslöser, Benachrichtigung und Warten auf den Abschluss.
+
+  ## Backpressure und blockierende Grenzen
+
+  Ein unbegrenzter Produzent kann mehr Arbeit erzeugen, als ein Consumer verarbeiten kann. Ein begrenzter [`mpsc`-Channel](https://docs.rs/tokio/latest/tokio/sync/mpsc/index.html) macht Kapazität explizit. Ist der Puffer voll, wartet `send().await` auf Platz. Das ist Backpressure: Überlast wird an die Quelle weitergereicht statt als wachsender Speicherverbrauch versteckt.
+
+  ```rust
+  use tokio::sync::mpsc;
+
+  #[tokio::main]
+  async fn main() {
+      let (tx, mut rx) = mpsc::channel(2);
+      let producer = tokio::spawn(async move {
+          for n in 1..=3 {
+              if tx.send(n).await.is_err() { break; }
+          }
+      });
+      while let Some(n) = rx.recv().await {
+          println!("{n}");
+      }
+      producer.await.expect("Demo-Produzent");
+  }
+  ```
+
+  Sobald alle Sender verschwunden und gepufferte Werte gelesen sind, liefert `recv` None. Ein versehentlich behaltenes Sender-Klon kann diese Beendigung verhindern. Begrenze bei einem Workerpool außerdem die aktiven Tasks, nicht nur einen vorgelagerten Puffer; ein Consumer, der beliebig viele neue Tasks startet, umgeht die Begrenzung wieder.
+
+  Blockierende Bibliotheken gehören an eine explizite Grenze. [`spawn_blocking`](https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html) führt synchrone Arbeit auf dafür vorgesehenen Threads aus:
+
+  ```rust
+  #[tokio::main]
+  async fn main() {
+      let bytes = vec![1_u8, 2, 3];
+      let summe = tokio::task::spawn_blocking(move || {
+          bytes.iter().map(|&b| u64::from(b)).sum::<u64>()
+      }).await.expect("Demo-Berechnung");
+      println!("{summe}");
+  }
+  ```
+
+  Das winzige Beispiel dient nur der API. Für echte CPU-Last braucht es zusätzlich eine Begrenzung oder einen passenden CPU-Pool. Bereits gestartete `spawn_blocking`-Arbeit lässt sich durch Task-Abbruch nicht zuverlässig stoppen. Ebenso gehört `std::thread::sleep` nicht in eine wartende async-Schleife; verwende `tokio::time::sleep`.
+
+  Halte Locks kurz. Ein gewöhnlicher Mutex kann für kurze, nicht wartende Änderungen ausreichen, aber sein Guard sollte nicht über `.await` leben. Ein async-Mutex erlaubt wartendes Locken, beseitigt jedoch keine Deadlocks und keine unnötig lange Exklusivität. Kopiere die benötigten kleinen Werte unter dem Lock und führe I/O nach Freigabe aus.
+
+  > [!INTERVIEW]
+  > Async organisiert Wartezeiten. Threads stellen Ausführungskapazität bereit. Eine Future ist eine Zustandsmaschine, `.await` eine mögliche kooperative Unterbrechung und `spawn` eine neue Task. Keine dieser Aussagen verspricht automatische Parallelisierung oder Rückabwicklung.
+
+  ## Häufige Fehler und Zusammenfassung
+
+  - Ungepollte Futures erledigen keine Arbeit.
+  - Zwei aufeinanderfolgende Awaits sind nicht automatisch nebenläufig.
+  - Bewahre Handles und behandle Task- sowie Fachfehler getrennt.
+  - Timeout und Drop machen externe Nebenwirkungen nicht rückgängig.
+  - Begrenze Warteschlangen und die Zahl aktiver Tasks.
+  - Blockierende Arbeit benötigt eine kontrollierte Grenze.
+  - Plane Shutdown und prüfe Cancellation Safety jeder wartenden Operation.
+exercises:
+- id: future-start
+  type: choice
+  title: Wann beginnt die Arbeit?
+  prompt: Was bewirkt der alleinige Aufruf einer async fn?
+  options:
+  - text: Er erzeugt eine Future, die noch vorangetrieben werden muss.
+    correct: true
+    why: Der Körper wird durch Polling ausgeführt.
+  - text: Er startet immer einen neuen Betriebssystem-Thread.
+    correct: false
+    why: Async und Threads sind unterschiedliche Mechanismen.
+  - text: Er blockiert bis zum Ergebnis.
+    correct: false
+    why: Der Aufruf liefert die Future zurück.
+  explanation: Die Future beschreibt die laufbare Zustandsmaschine. Eine Runtime oder ein anderer Executor muss
+    sie pollen.
+  resources:
+  - *id001
+- id: shutdown-ablauf
+  type: order
+  title: Geordnet beenden
+  prompt: Ordne die Schritte eines kooperativen Shutdowns.
+  lang: text
+  lines: |-
+    Shutdown-Signal erkennen
+    Annahme neuer Arbeit stoppen
+    Laufende Worker über Abbruchwunsch informieren
+    Beenden oder Aufräumen der Worker abwarten
+    Prozess beenden
+  explanation: Nach dem Signal werden keine neuen Aufträge aufgenommen. Erst nach Abschluss oder begründetem Abbruch
+    endet der Prozess.
+  resources:
+  - *id001
+- id: lazy-future
+  type: output
+  title: Erzeugen ist nicht ausführen
+  prompt: Was gibt dieses Programm aus? Gib jede Ausgabezeile an.
+  lang: rust
+  code: |-
+    async fn job() { println!("Job"); }
+    fn main() {
+        let future = job();
+        println!("Start");
+        drop(future);
+        println!("Ende");
+    }
+  expected: |-
+    Start
+    Ende
+  explanation: Die Future wird nicht gepollt. Daher läuft ihr Körper nicht und Job erscheint nicht.
+  resources:
+  - *id001
+- id: join-ergebnis
+  type: output
+  title: Die Reihenfolge im Tupel
+  prompt: Was gibt dieses Programm aus? Gib jede Ausgabezeile an.
+  lang: rust
+  code: |-
+    #[tokio::main]
+    async fn main() {
+        let (a, b) = tokio::join!(async { 2 }, async { 5 });
+        println!("{a} {b}");
+    }
+  expected: 2 5
+  explanation: '`join!` liefert das Tupel in Argumentreihenfolge. Dieses Tokio-Beispiel benötigt die lokale Cargo-Abhängigkeit
+    und wird vom Plattform-Verifier nicht ausgeführt.'
+  verify: false
+  resources:
+  - *id001
+- id: await-future
+  type: gap
+  title: Auf ein Ergebnis warten
+  prompt: Ergänze das Schlüsselwort der Funktion und das Warten auf ihre Future.
+  lang: rust
+  code: |-
+    ⟦async⟧ fn zahl() -> u32 { 7 }
+    #[tokio::main]
+    async fn main() {
+        println!("{}", zahl().⟦await⟧);
+    }
+  gaps:
+  - label: Lücke 1
+    hint: Das Funktionsschlüsselwort lautet async.
+  - label: Lücke 2
+    hint: Eine Future wird mit .await abgewartet.
+  explanation: Die Funktion liefert eine Future; await macht ihren Ergebniswert verfügbar. Tokio stellt die Runtime
+    für main bereit.
+  resources:
+  - *id001
+- id: spawn-besitz
+  type: gap
+  title: Text an eine Task geben
+  prompt: Ergänze die Übernahme in den async-Block und das Warten auf den JoinHandle.
+  lang: rust
+  code: |-
+    #[tokio::main]
+    async fn main() {
+        let text = String::from("Plan");
+        let task = tokio::spawn(async ⟦move⟧ { text.len() });
+        let n = task.⟦await⟧.expect("Demo-Task");
+        println!("{n}");
+    }
+  gaps:
+  - label: Lücke 1
+    hint: Wie bei Closures überträgt move eingefangene Werte.
+  - label: Lücke 2
+    hint: Auch JoinHandle implementiert Future.
+  explanation: move übernimmt den String, sodass keine kurzlebige Leihe nach main besteht. await beobachtet das
+    Task-Ergebnis inklusive möglichem JoinError.
+  resources:
+  - *id001
+- id: bounded-channel
+  type: gap
+  title: Aufträge begrenzen
+  prompt: Ergänze die Channel-Kapazität für höchstens vier wartende Nachrichten und das Warten auf send.
+  lang: rust
+  code: |-
+    async fn send_one() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(⟦4⟧);
+        tx.send(7).⟦await⟧.expect("Empfänger vorhanden");
+        assert_eq!(rx.recv().await, Some(7));
+    }
+  gaps:
+  - label: Lücke 1
+    hint: Die geforderte Kapazität steht im Prompt.
+  - label: Lücke 2
+    hint: send auf einem bounded Channel ist asynchron.
+  explanation: Ein begrenzter Channel wartet bei ausgeschöpfter Kapazität. Die Begrenzung betrifft gepufferte Nachrichten,
+    nicht automatisch beliebig neu gestartete Tasks.
+  resources:
+  - *id001
+- id: sleep-blockiert
+  type: bug
+  title: Der Runtime-Thread wartet mit
+  prompt: Diese async-Funktion blockiert während der Pause ihren ausführenden Thread. Ersetze die Wartezeile durch
+    Tokios kooperativen Timer.
+  lang: rust
+  code: |-
+    async fn pause() {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+  lines:
+  - 2
+  fix:
+  - line: 2
+    answers:
+    - tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+  explanation: Eine async-Markierung ändert keinen synchronen sleep-Aufruf. Der Tokio-Timer gibt die Task während
+    der Wartezeit frei.
+  resources:
+  - *id001
+- id: timeout-handle
+  type: explain
+  title: Was läuft nach dem Zeitlimit?
+  prompt: Ein JoinHandle wird in timeout verschoben. Erkläre, warum ein Timeout die Task nicht sicher beendet.
+  lang: rust
+  code: |-
+    let handle = tokio::spawn(async { do_work().await });
+    let result = tokio::time::timeout(duration, handle).await;
+  points:
+  - timeout wartet auf die Future des Handles.
+  - Das Fallenlassen eines JoinHandle löst die Task nicht automatisch auf.
+  - Die Task kann nach dem Timeout weiterarbeiten.
+  - Ein geplanter Abbruch benötigt Handle, abort oder kooperatives Signal und Abschlussbeobachtung.
+  explanation: Der Handle ist die Beobachtung einer gestarteten Task. Sein Verlust ist kein Rückruf ihrer Arbeit.
+    Bewahre ihn, wenn du die Task nach dem Zeitlimit beenden und ihren Abschluss beobachten musst.
+  resources:
+  - *id001
+- id: channel-worker
+  type: practice
+  title: Einen begrenzten Verarbeitungspfad bauen
+  prompt: Baue einen Produzenten für die Werte 1 bis 5 und einen Consumer, der ihre Summe berechnet. Nutze Channel-Kapazität
+    2, gib alle Sender frei und warte auf den Produzenten. Führe den Code in einem Cargo-Projekt mit Tokio aus.
+  lang: rust
+  solution: |-
+    use tokio::sync::mpsc;
+    #[tokio::main]
+    async fn main() -> Result<(), Box<dyn std::error::Error>> {
+        let (tx, mut rx) = mpsc::channel(2);
+        let producer = tokio::spawn(async move {
+            for n in 1..=5_u32 {
+                if tx.send(n).await.is_err() { break; }
+            }
+        });
+        let mut summe = 0;
+        while let Some(n) = rx.recv().await { summe += n; }
+        producer.await?;
+        assert_eq!(summe, 15);
+        println!("{summe}");
+        Ok(())
+    }
+  checklist:
+  - Die Cargo-Dependency aktiviert rt-multi-thread, macros und sync.
+  - Die Kapazität ist 2 und send wird abgewartet.
+  - Kein Sender bleibt außerhalb des Produzenten übrig.
+  - Die Empfangsschleife endet und liefert 15.
+  - Ein Task-Fehler wird nicht still ignoriert.
+  verify: false
+  explanation: Der Produzent besitzt den einzigen Sender. Nach seiner Schleife wird dieser freigegeben; der Consumer
+    leert den Puffer und erhält None. Der JoinHandle macht das Ende beobachtbar.
+  resources:
+  - *id001

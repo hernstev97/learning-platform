@@ -1,0 +1,725 @@
+id: android-grundlagen
+title: "Android-Grundlagen: App, Lebenszyklus, Prozess"
+level: 1
+minutes: 130
+summary: Wie eine Android-App aufgebaut ist, wer ihren Prozess startet und beendet und warum Zustand bei Drehung und Process Death verloren geht – das Fundament, auf dem Compose, ViewModel und Navigation aufsetzen.
+goals:
+  - Du erklärst, wofür `build.gradle.kts`, `AndroidManifest.xml`, Ressourcen und die Klasse `R` zuständig sind, und unterscheidest `minSdk`, `targetSdk` und `compileSdk`.
+  - Du ordnest die vier App-Komponenten ihren heutigen Aufgaben zu und startest Komponenten mit expliziten und impliziten Intents sowie mit einem `PendingIntent`.
+  - Du sagst voraus, welcher Zustand eine Drehung, Process Death und das Schließen der App überlebt, und testest Process Death mit `adb`.
+  - Du erkennst Context-Leaks und Arbeit auf dem Main Thread, die zu einem ANR führt.
+  - Du fragst Runtime Permissions aus Compose heraus korrekt an und richtest eine Single-Activity-App mit Edge-to-Edge ein.
+resources:
+  - title: Application fundamentals
+    url: https://developer.android.com/guide/components/fundamentals
+  - title: The activity lifecycle
+    url: https://developer.android.com/guide/components/activities/activity-lifecycle
+  - title: Save UI states
+    url: https://developer.android.com/topic/libraries/architecture/saving-states
+  - title: Handle configuration changes
+    url: https://developer.android.com/guide/topics/resources/runtime-changes
+  - title: Request runtime permissions
+    url: https://developer.android.com/training/permissions/requesting
+lesson: |
+  Du tippst in Bear einen langen Gedanken ein, drehst das Handy – und der Text ist weg. Oder du wechselst kurz in eine andere App, kommst zehn Minuten später zurück, und Bear startet auf dem Startbildschirm statt im geöffneten Eintrag. Beides sind keine Compose-Fehler. Es sind Folgen davon, wie Android Apps ausführt: Das System erzeugt und zerstört deine Activity, wann es will, und beendet deinen Prozess, wenn es Speicher braucht.
+
+  Wer das Denkmodell dahinter kennt, schreibt Apps, die sich so verhalten, wie Nutzer es erwarten. Wer es nicht kennt, verliert Stunden mit Fehlern, die nur „manchmal“ auftreten. Dieses Modul legt das Fundament für den ganzen Android-Track: Aufbau einer App, Komponenten, Lebenszyklus, Process Death, Context, Main Thread, Permissions und die moderne Single-Activity-Struktur mit Compose.
+
+  ## Anatomie einer App: Gradle, Manifest, Ressourcen
+
+  Ein typisches Android-Projekt besteht aus einem Gradle-Build mit mindestens einem App-Modul:
+
+  ```text
+  bear/
+  ├── settings.gradle.kts        # welche Module gehören zum Build
+  ├── build.gradle.kts           # Plugins für alle Module
+  ├── gradle/libs.versions.toml  # Version Catalog: Bibliotheken und Versionen
+  └── app/
+      ├── build.gradle.kts       # Konfiguration des App-Moduls
+      └── src/
+          ├── main/
+          │   ├── AndroidManifest.xml
+          │   ├── java/app/kiumu/bear/   # Kotlin-Quellcode (Ordnername historisch „java“)
+          │   └── res/                   # Ressourcen: Strings, Bilder, Themes
+          └── test/                      # Unit-Tests auf der JVM
+  ```
+
+  Die wichtigsten Einstellungen des App-Moduls stehen im `android`-Block ([Configure the app module](https://developer.android.com/build/configure-app-module)):
+
+  ```kotlin
+  android {
+      namespace = "app.kiumu.bear"      // Paket für die generierte Klasse R
+      compileSdk = 37                   // gegen diese API-Stufe wird kompiliert
+
+      defaultConfig {
+          applicationId = "app.kiumu.bear"  // Identität im Play Store und auf dem Gerät
+          minSdk = 26                       // älteste unterstützte Android-Version
+          targetSdk = 36                    // Verhalten, für das die App getestet ist
+          versionCode = 12
+          versionName = "0.12.0"
+      }
+  }
+  ```
+
+  Die drei SDK-Werte werden ständig verwechselt:
+
+  | Wert | Bedeutung | Folge |
+  | --- | --- | --- |
+  | `minSdk` | Älteste Android-Version, auf der die App installiert werden kann | Neuere APIs brauchen eine Prüfung wie `if (Build.VERSION.SDK_INT >= 33)` |
+  | `compileSdk` | API-Stufe, gegen die der Compiler prüft | Bestimmt, welche APIs du im Code überhaupt aufrufen kannst; ändert kein Laufzeitverhalten |
+  | `targetSdk` | Android-Version, für deren Verhalten die App ausgelegt ist | Das System schaltet Verhaltensänderungen erst ein, wenn `targetSdk` sie erreicht |
+
+  Google Play verlangt ab dem 31. August 2026 für neue Apps und Updates `targetSdk` 36 (Android 16), siehe [Target API level requirements](https://developer.android.com/google/play/requirements/target-sdk). Aktuelle AndroidX-Bibliotheken setzen mindestens API 23 voraus, Navigation 2.10 bereits API 24. `applicationId` änderst du nach der Veröffentlichung nie wieder – für Google Play wäre es eine neue App. Den Debug-Build kannst du mit einem Suffix wie `.debug` als eigene App installieren; Bear macht das so.
+
+  Das **Manifest** beschreibt die App gegenüber dem System: welche Komponenten es gibt, welche Intents sie annehmen und welche Berechtigungen die App braucht ([App manifest overview](https://developer.android.com/guide/topics/manifest/manifest-intro)). Eine Komponente, die nicht im Manifest steht, kann das System nicht starten.
+
+  ```xml
+  <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+      <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+      <application
+          android:name=".BearApp"
+          android:label="@string/app_name"
+          android:theme="@style/Theme.Bear">
+          <activity
+              android:name=".MainActivity"
+              android:exported="true">
+              <intent-filter>
+                  <action android:name="android.intent.action.MAIN" />
+                  <category android:name="android.intent.category.LAUNCHER" />
+              </intent-filter>
+          </activity>
+      </application>
+  </manifest>
+  ```
+
+  `android:exported="true"` erlaubt anderen Apps – hier dem Launcher –, die Activity zu starten. Jede Komponente mit `<intent-filter>` muss `exported` ausdrücklich setzen; sonst lässt sich die App ab Android 12 nicht installieren.
+
+  **Ressourcen** liegen in `res/` und bekommen beim Build eine ID in der generierten Klasse `R`: `res/values/strings.xml` mit `<string name="app_name">` wird zu `R.string.app_name`. In Compose liest du sie mit `stringResource(R.string.app_name)` oder `painterResource(R.drawable.bear)`. Der eigentliche Nutzen sind **Qualifier**: `values-de/strings.xml` enthält die deutschen Texte, `values-night/` Farben für den Dark Mode. Android wählt zur Laufzeit den Ordner, der am besten zur aktuellen Konfiguration passt ([Provide alternative resources](https://developer.android.com/guide/topics/resources/providing-resources#AlternativeResources)). Deshalb brauchst du immer einen Standardordner ohne Qualifier – fehlt ein String dort und passt keine Alternative, stürzt die App mit einer `Resources.NotFoundException` ab.
+
+  ## Die vier App-Komponenten – und was heute davon übrig ist
+
+  Android kennt [vier Komponententypen](https://developer.android.com/guide/components/fundamentals#Components). Jede ist ein Einstiegspunkt, über den das System deine App starten kann – auch wenn ihr Prozess gerade nicht läuft.
+
+  | Komponente | Wofür | Heute in der Praxis |
+  | --- | --- | --- |
+  | **Activity** | Ein Fenster mit Oberfläche | Meist genau eine `MainActivity`, die Compose-Inhalte zeigt |
+  | **Service** | Arbeit ohne Oberfläche | Vor allem Foreground Services (Musik, Navigation); aufschiebbare Arbeit erledigt WorkManager |
+  | **BroadcastReceiver** | Reagiert auf Systemereignisse | Alarme, Neustart des Geräts, Aktionen aus Benachrichtigungen |
+  | **ContentProvider** | Teilt Daten mit anderen Apps | Selten selbst geschrieben; `FileProvider` zum Teilen von Dateien |
+
+  Welche Hintergrund-API für welche Aufgabe passt, beschreibt [Background tasks overview](https://developer.android.com/develop/background-work/background-tasks#choose-right-option); WorkManager behandelt das Modul `daten-netzwerk`.
+
+  Komponenten startest du mit **Intents**. Ein *expliziter* Intent nennt die Zielklasse, ein *impliziter* beschreibt nur eine Aktion, und das System sucht eine passende App ([Intent types](https://developer.android.com/guide/components/intents-filters#Types)):
+
+  ```kotlin
+  // Explizit: eine bestimmte Komponente der eigenen App
+  val open = Intent(context, MainActivity::class.java)
+
+  // Implizit: „zeige diese URL an“ – der Browser oder die Linear-App meldet sich
+  val view = Intent(Intent.ACTION_VIEW, Uri.parse("https://linear.app"))
+  context.startActivity(view)
+  ```
+
+  Ein **`PendingIntent`** ist ein Intent, den du einer anderen App oder dem System zur späteren Ausführung übergibst – etwa der Benachrichtigung „Zeit für eine Runde“, die beim Antippen Bear öffnet. Das System führt ihn später mit den Rechten deiner App aus. Deshalb musst du seit Android 12 die Veränderbarkeit angeben, und `FLAG_IMMUTABLE` ist der Normalfall ([Specify mutability](https://developer.android.com/guide/components/intents-filters#DeclareMutabilityPendingIntent)):
+
+  ```kotlin
+  val pending = PendingIntent.getActivity(
+      context,
+      0,
+      Intent(context, MainActivity::class.java).putExtra(EXTRA_OPEN_ROUND, true),
+      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+  )
+  ```
+
+  ## Activity-Lebenszyklus und Configuration Changes
+
+  Eine Activity durchläuft [sechs Callbacks](https://developer.android.com/guide/components/activities/activity-lifecycle#lifecycle-callbacks): `onCreate` → `onStart` (sichtbar) → `onResume` (im Vordergrund, nimmt Eingaben an) und rückwärts `onPause` → `onStop` → `onDestroy`. Drückt der Nutzer die Home-Taste, laufen `onPause` und `onStop`; die Activity bleibt im Speicher. Öffnet Activity A eine Activity B, ist die Reihenfolge festgelegt: A `onPause`, B `onCreate`/`onStart`/`onResume`, erst dann A `onStop`.
+
+  Das zentrale Denkmodell: **Bei einem Configuration Change zerstört Android die Activity und baut eine neue Instanz.** Drehen, Wechsel in den Dark Mode, eine andere Systemsprache, eine geänderte Schriftgröße, Multi-Window oder das Aufklappen eines Foldables – bei all dem ruft das System `onDestroy` auf der alten und `onCreate` auf einer neuen Instanz auf ([Activity recreation](https://developer.android.com/guide/topics/resources/runtime-changes#activity-recreation)). Grund: Ressourcen wie Layouts und Strings können von der Konfiguration abhängen, und der sicherste Weg, sie neu zu laden, ist ein Neuaufbau.
+
+  Alles, was nur in der alten Instanz lebte, ist danach weg: Felder der Activity, Zustand aus `remember { }` und laufende Arbeit, die an die Activity gebunden war.
+
+  ```kotlin
+  class MainActivity : ComponentActivity() {
+      private var taps = 0                       // stirbt mit jeder Instanz
+
+      override fun onCreate(savedInstanceState: Bundle?) {
+          super.onCreate(savedInstanceState)
+          setContent {
+              var draft by remember { mutableStateOf("") }          // weg nach Drehung
+              var saved by rememberSaveable { mutableStateOf("") }  // wird wiederhergestellt
+              // …
+          }
+      }
+  }
+  ```
+
+  > [!WARNING] Kein configChanges als Pflaster
+  > Mit `android:configChanges` im Manifest kannst du das Neuerzeugen für einzelne Änderungen abschalten. Die Doku rät ausdrücklich davon ab, das als Abkürzung gegen Zustandsverlust zu nutzen: Neuerzeugung lässt sich nie vollständig verhindern, und Process Death bleibt ohnehin. Ab Android 17 (API 37) erzeugt das System Activities bei einigen Änderungen wie Tastatur oder Farbmodus nicht mehr neu – für Drehung und Größenänderung aber weiterhin.
+
+  ## Process Death: der unsichtbare Neustart
+
+  Configuration Changes sind der sichtbare Fall. Der tückischere ist **Process Death**: Liegt deine App im Hintergrund und braucht das System Speicher, beendet es deinen ganzen Linux-Prozess. Kommt der Nutzer über die Liste der letzten Apps zurück, startet Android einen neuen Prozess, erzeugt die Activity neu und übergibt ihr den gespeicherten Instance State. Für den Nutzer sieht es aus, als wäre die App nie weg gewesen – wenn du es richtig machst. Das System beendet dabei nie eine einzelne Activity, sondern immer den Prozess ([Activity state and ejection from memory](https://developer.android.com/guide/components/activities/activity-lifecycle#activity-state)).
+
+  Welche Mechanismen was überleben, fasst die Doku in einer Tabelle zusammen ([Options for preserving UI state](https://developer.android.com/topic/libraries/architecture/saving-states#options)):
+
+  | Mechanismus | Configuration Change | Process Death | Nutzer schließt die App |
+  | --- | --- | --- | --- |
+  | Feld der Activity, `remember` | nein | nein | nein |
+  | `ViewModel` | ja | nein | nein |
+  | `rememberSaveable`, `SavedStateHandle` | ja | ja | nein |
+  | Room, DataStore, Dateien | ja | ja | ja |
+
+  Saved State landet in einem `Bundle`, das das System serialisiert. Es ist für kleine Werte gedacht – eine ID, einen Suchbegriff, einen Entwurf –, nicht für Listen oder Bilder. Geschrieben wird er, wenn die Activity gestoppt wird; für Apps ab `targetSdk` 28 läuft `onSaveInstanceState` [immer nach `onStop`](https://developer.android.com/reference/android/app/Activity#onSaveInstanceState(android.os.Bundle)).
+
+  Process Death testest du, ohne auf Speichermangel zu warten: App öffnen, Zustand herstellen, Home drücken, dann
+
+  ```console
+  $ adb shell am kill app.kiumu.bear.debug
+  ```
+
+  `am kill` beendet nur Prozesse, die gefahrlos beendet werden können – die App muss also im Hintergrund liegen ([adb: Activity manager](https://developer.android.com/tools/adb)). Danach öffnest du die App über die letzten Apps. Stimmt der Bildschirm, ist alles richtig gespeichert.
+
+  > [!PRAXIS] So macht es Bear
+  > In Bears `MainActivity` steht `if (savedInstanceState == null) takeEntry(intent)`. Ein Tipp auf das Widget liefert ein Intent mit der ID eines Eintrags. Nach einer Drehung oder nach Process Death bekommt die neue Instanz *dasselbe* Intent noch einmal – `savedInstanceState` ist dann aber nicht `null`, und Bear öffnet den Eintrag nicht ein zweites Mal. Ein neuer Tipp auf das Widget kommt über `onNewIntent` an. Diese Zeilen rekonstruierst du im Praxis-Track (Aufgaben 41–50).
+
+  ## Context, Main Thread und ANR
+
+  `Context` ist dein Zugang zum System: Ressourcen, Dateien, Datenbank, Systemdienste, Activities starten. Es gibt ihn in zwei Lebensdauern ([Context](https://developer.android.com/reference/android/content/Context)):
+
+  - Der **Application Context** lebt so lange wie der Prozess. Er ist richtig für alles, was länger lebt als ein Bildschirm: Datenbank, Repository, WorkManager.
+  - Der **Activity Context** (die Activity selbst, in Compose `LocalContext.current`) kennt zusätzlich Theme und Fenster. Er ist richtig für UI-nahe Aufgaben wie `startActivity` oder einen Dialog.
+
+  Hält ein langlebiges Objekt – ein `object`, ein Singleton, ein `ViewModel` – eine Activity fest, entsteht ein **Memory Leak**: Nach jeder Drehung bleibt die alte Activity mit allen Views und Bitmaps im Speicher, weil noch jemand auf sie zeigt. Die Doku nennt statische Referenzen als häufigste Ursache ([Memory leaks](https://developer.android.com/topic/performance/memory-leaks)); die ViewModel-Doku verbietet `Context` und `Resources` im ViewModel ausdrücklich.
+
+  Der **Main Thread** (UI-Thread) verarbeitet Eingaben, Compose und das Zeichnen. Blockiert er – durch Datenbankzugriff, Netzwerk oder `Thread.sleep` –, friert die App ein. Reagiert sie 5 Sekunden lang nicht auf eine Eingabe, zeigt Android den Dialog **ANR** („App Not Responding“) ([ANRs](https://developer.android.com/topic/performance/vitals/anr)). Schon 100 ms Blockade machen Animationen ruckelig. Die Lösung sind Coroutines: Room und Retrofit bieten `suspend`-Funktionen, die intern auf andere Threads wechseln, und eigene blockierende Arbeit schiebst du mit `withContext(Dispatchers.IO)` weg.
+
+  ```kotlin
+  class HomeViewModel(private val thoughts: ThoughtRepository) : ViewModel() {
+      fun refresh() {
+          viewModelScope.launch {
+              thoughts.syncWithLinear()   // suspend: blockiert den Main Thread nicht
+          }
+      }
+  }
+  ```
+
+  > [!INTERVIEW] „Was passiert, wenn der Nutzer das Handy dreht?“
+  > Kernsatz: Die Activity wird zerstört und neu erzeugt, damit Ressourcen passend zur neuen Konfiguration geladen werden. Dann die Folgen: Felder und `remember`-Zustand sind weg, das ViewModel überlebt, `rememberSaveable` und `SavedStateHandle` werden aus dem Bundle wiederhergestellt. Zum Schluss die Abgrenzung: Process Death überlebt das ViewModel nicht – wer nur auf das ViewModel setzt, verliert Zustand, sobald das System den Prozess im Hintergrund beendet.
+
+  ## Runtime Permissions
+
+  Normale Berechtigungen wie `INTERNET` gewährt das System bei der Installation. **Gefährliche** Berechtigungen – Kamera, Standort, seit Android 13 auch `POST_NOTIFICATIONS` – muss der Nutzer zur Laufzeit bestätigen. Der [empfohlene Ablauf](https://developer.android.com/training/permissions/requesting#workflow-for-requesting-permissions): Berechtigung im Manifest deklarieren, erst fragen, wenn der Nutzer die Funktion braucht, vorher mit `checkSelfPermission` prüfen, bei Bedarf erklären, warum, und bei Ablehnung die App weiter benutzbar lassen. Lehnt der Nutzer zweimal ab, zeigt Android den Dialog nicht mehr an.
+
+  In Compose fragst du über die Activity Result API an ([Requesting runtime permissions](https://developer.android.com/develop/ui/compose/libraries#requesting-runtime-permissions)):
+
+  ```kotlin
+  @Composable
+  fun AllowRemindersButton(onResult: (Boolean) -> Unit) {
+      val launcher = rememberLauncherForActivityResult(
+          ActivityResultContracts.RequestPermission()
+      ) { granted -> onResult(granted) }
+
+      Button(onClick = {
+          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+              launcher.launch(Manifest.permission.POST_NOTIFICATIONS)
+          } else {
+              onResult(true)   // vor Android 13 gibt es diese Laufzeitberechtigung nicht
+          }
+      }) {
+          Text("Erinnerungen erlauben")
+      }
+  }
+  ```
+
+  `launch` gehört in einen Klick-Handler, nicht direkt in den Composable-Körper – der läuft bei jeder Recomposition erneut.
+
+  ## Single Activity mit Compose und Edge-to-Edge
+
+  Früher bekam jeder Bildschirm eine eigene Activity. Heute ist das Muster **eine Activity, viele Composables**: Die Activity ist nur noch Einstiegspunkt und Host, alle Bildschirme sind Composables, und die Navigation zwischen ihnen erledigt Compose (Modul `navigation`). Zusätzliche Activities gibt es nur, wenn das System einen eigenen Einstieg braucht – Bear hat etwa eine `CaptureActivity` für die Schnellerfassung über die Kachel in den Schnelleinstellungen.
+
+  ```kotlin
+  class MainActivity : ComponentActivity() {
+      override fun onCreate(savedInstanceState: Bundle?) {
+          super.onCreate(savedInstanceState)
+          enableEdgeToEdge()
+          setContent {
+              BearTheme {
+                  BearAppUi()
+              }
+          }
+      }
+  }
+  ```
+
+  `enableEdgeToEdge()` lässt die App hinter Status- und Navigationsleiste zeichnen ([Set up edge-to-edge](https://developer.android.com/develop/ui/compose/system/setup-e2e)). Ab `targetSdk` 35 ist Edge-to-Edge auf Android 15 ohnehin Pflicht, und ab `targetSdk` 36 funktioniert der Ausweg `windowOptOutEdgeToEdgeEnforcement` auf Android 16 nicht mehr ([Android 16 behavior changes](https://developer.android.com/about/versions/16/behavior-changes-16)). Deine Aufgabe ist deshalb, Insets zu behandeln: `Scaffold` reicht sie als `innerPadding` weiter, eigene Layouts nutzen Modifier wie `safeDrawingPadding()` – mehr dazu in `compose-grundlagen`.
+
+  ## Häufige Fehler
+
+  - **Zustand nur im ViewModel.** Überlebt Drehung, nicht aber Process Death. Symptom: „Manchmal ist nach dem Zurückkehren alles leer.“ Kleine UI-Werte in `rememberSaveable` oder `SavedStateHandle`, Daten in Room oder DataStore.
+  - **Activity im Singleton.** `init(this)` aus der Activity in ein `object` – LeakCanary meldet nach der ersten Drehung eine zurückgehaltene `MainActivity`. Lösung: `applicationContext` übergeben.
+  - **Blockierende Arbeit auf dem Main Thread.** `runBlocking`, synchrone Datenbankzugriffe oder Netzwerk im Klick-Handler. Symptom: Ruckeln, ANR-Dialog, in Play Console die Kennzahl „ANR rate“. Lösung: `suspend`-Funktionen in `viewModelScope`.
+  - **`PendingIntent` ohne Mutability-Flag.** Ab `targetSdk` 31 wirft `getActivity` eine `IllegalArgumentException`. Lösung: `FLAG_IMMUTABLE`.
+  - **Intent doppelt verarbeitet.** Wer in `onCreate` Extras auswertet, ohne `savedInstanceState` zu prüfen, führt die Aktion nach jeder Drehung erneut aus.
+  - **Berechtigung beim App-Start anfragen.** Ohne Zusammenhang lehnen Nutzer ab; nach der zweiten Ablehnung ist der Dialog für immer weg.
+
+  > [!TIP] Zurück heißt nicht beenden
+  > Seit Android 12 beendet die Zurück-Taste die Start-Activity einer App nicht mehr, sondern schiebt die App in den Hintergrund ([Behavior changes in Android 12](https://developer.android.com/about/versions/12/behavior-changes-all#back-press)). Verlass dich also nicht darauf, dass „Zurück“ `onDestroy` auslöst.
+
+  ## Zusammenfassung
+
+  - `compileSdk` bestimmt die verfügbaren APIs, `targetSdk` das Laufzeitverhalten, `minSdk` die älteste unterstützte Version.
+  - Das Manifest deklariert Komponenten, Intent-Filter und Berechtigungen; Ressourcen mit Qualifiern wählt Android passend zur Konfiguration.
+  - Activity, Service, BroadcastReceiver und ContentProvider sind Einstiegspunkte für das System. Heute: eine Activity, Compose, WorkManager.
+  - Configuration Changes erzeugen die Activity neu. Das ViewModel überlebt das, aber nicht Process Death – dafür gibt es Saved State und persistente Speicher.
+  - Process Death testest du mit `adb shell am kill <paket>`, während die App im Hintergrund liegt.
+  - Langlebige Objekte bekommen den Application Context; der Main Thread bleibt frei von blockierender Arbeit.
+  - Runtime Permissions fragst du im Kontext der Funktion an, mit `rememberLauncherForActivityResult`.
+  - `PendingIntent`s sind standardmäßig `FLAG_IMMUTABLE`; Edge-to-Edge ist ab `targetSdk` 35 Pflicht.
+exercises:
+  - id: sdk-werte-unterscheiden
+    type: choice
+    title: Drei SDK-Werte, drei Bedeutungen
+    prompt: |
+      Eine App ist mit `compileSdk = 37`, `targetSdk = 36` und `minSdk = 26` konfiguriert. Welche Aussagen stimmen? (Stand September 2026)
+    options:
+      - text: Die App lässt sich auf einem Gerät mit Android 7.0 (API 24) installieren.
+        correct: false
+        why: "`minSdk = 26` ist die Untergrenze. Auf API 24 verweigert das System die Installation."
+      - text: Der Code darf APIs aus API 37 aufrufen, muss sie auf älteren Geräten aber mit einer `SDK_INT`-Prüfung absichern.
+        correct: true
+        why: "`compileSdk` macht die APIs für den Compiler sichtbar. Auf einem Gerät mit API 30 existieren sie trotzdem nicht – ohne Prüfung gibt es einen `NoSuchMethodError`."
+      - text: Auf einem Android-17-Gerät bleiben Verhaltensänderungen, die an `targetSdk` 37 hängen, für diese App ausgeschaltet.
+        correct: true
+        why: So bleibt Android abwärtskompatibel. Beispiel – das geänderte Neuerzeugen bei Configuration Changes aus Android 17 greift erst mit `targetSdk` 37.
+      - text: "`targetSdk` legt fest, gegen welche API-Stufe kompiliert wird."
+        correct: false
+        why: Das ist `compileSdk`. `targetSdk` beeinflusst nur das Laufzeitverhalten.
+      - text: Mit `targetSdk = 36` erfüllt die App die aktuelle Anforderung von Google Play für Updates.
+        correct: true
+        why: Seit dem 31. August 2026 müssen neue Apps und Updates mindestens Android 16 (API 36) als Ziel haben.
+    explanation: |
+      Merke dir die Frage hinter jedem Wert: `minSdk` – *wo läuft die App?* `compileSdk` – *was darf ich aufrufen?* `targetSdk` – *welches Verhalten habe ich getestet?* `compileSdk` ist deshalb meist die neueste stabile Stufe. `targetSdk` hebst du bewusst an, nachdem du die Verhaltensänderungen der neuen Version geprüft hast.
+    resources:
+      - title: Target API level requirements
+        url: https://developer.android.com/google/play/requirements/target-sdk
+      - title: "<uses-sdk> (API-Stufen erklärt)"
+        url: https://developer.android.com/guide/topics/manifest/uses-sdk-element
+
+  - id: drehung-callbacks-ordnen
+    type: order
+    title: Was passiert beim Drehen?
+    prompt: |
+      Eine Activity loggt jeden Callback. Die App ist im Vordergrund, dann dreht der Nutzer das Gerät (`targetSdk` 36). Bring die Logzeilen in die richtige Reihenfolge.
+    lang: text
+    lines: |
+      alt: onPause
+      alt: onStop
+      alt: onSaveInstanceState
+      alt: onDestroy
+      neu: onCreate (savedInstanceState != null)
+      neu: onStart
+      neu: onRestoreInstanceState
+      neu: onResume
+    explanation: |
+      Die alte Instanz wird vollständig abgebaut, bevor die neue entsteht. Ab `targetSdk` 28 läuft `onSaveInstanceState` immer *nach* `onStop`. Die neue Instanz bekommt das gespeicherte Bundle zweimal angeboten: in `onCreate` und in `onRestoreInstanceState`, das zwischen `onStart` und `onResume` läuft. Genau über dieses Bundle stellt Compose später `rememberSaveable` wieder her.
+    resources:
+      - title: Activity.onSaveInstanceState
+        url: https://developer.android.com/reference/android/app/Activity#onSaveInstanceState(android.os.Bundle)
+      - title: Activity recreation
+        url: https://developer.android.com/guide/topics/resources/runtime-changes#activity-recreation
+
+  - id: zwei-activities-log
+    type: output
+    title: Von der Liste ins Detail und zurück
+    prompt: |
+      Zwei Activities loggen ihre Callbacks mit `Log.d("LC", …)`. `ListActivity` ist im Vordergrund. Der Nutzer tippt auf einen Eintrag (Zeile 7 startet `DetailActivity`) und drückt danach in `DetailActivity` die Zurück-Taste. Welche Logzeilen erscheinen in dieser Reihenfolge? Gib nur die Nachrichten an.
+    lang: kotlin
+    code: |
+      class ListActivity : ComponentActivity() {
+          override fun onCreate(savedInstanceState: Bundle?) {
+              super.onCreate(savedInstanceState)
+              Log.d("LC", "List onCreate")
+              setContent {
+                  EntryList(onOpen = { id ->
+                      startActivity(Intent(this, DetailActivity::class.java).putExtra("id", id))
+                  })
+              }
+          }
+          override fun onStart() { super.onStart(); Log.d("LC", "List onStart") }
+          override fun onResume() { super.onResume(); Log.d("LC", "List onResume") }
+          override fun onPause() { super.onPause(); Log.d("LC", "List onPause") }
+          override fun onStop() { super.onStop(); Log.d("LC", "List onStop") }
+          override fun onDestroy() { super.onDestroy(); Log.d("LC", "List onDestroy") }
+      }
+      // DetailActivity loggt dieselben sechs Callbacks mit dem Präfix "Detail".
+    expected: |
+      List onPause
+      Detail onCreate
+      Detail onStart
+      Detail onResume
+      List onStop
+      Detail onPause
+      List onStart
+      List onResume
+      Detail onStop
+      Detail onDestroy
+    explanation: |
+      Android pausiert die sichtbare Activity zuerst, baut die neue bis `onResume` auf und stoppt die alte erst, wenn sie nicht mehr sichtbar ist. Deshalb gehören schwere Speicheroperationen nicht in `onPause` – sie verzögern den Start der nächsten Activity. Beim Zurückgehen läuft es spiegelbildlich: Detail pausiert, List kommt über `onStart`/`onResume` zurück (vorher läuft das hier nicht geloggte `onRestart`), und Detail wird gestoppt und zerstört, weil sie vom Back Stack entfernt ist. `List onCreate` erscheint nicht, weil die Instanz die ganze Zeit existiert.
+    resources:
+      - title: Coordinating activities
+        url: https://developer.android.com/guide/components/activities/activity-lifecycle#coordinating-activities
+
+  - id: was-ueberlebt-zaehler
+    type: output
+    title: Vier Zähler, zwei Katastrophen
+    prompt: |
+      Der Nutzer führt diese Schritte aus:
+
+      1. App starten, dreimal auf „Tippen“.
+      2. Gerät drehen, einmal auf „Tippen“.
+      3. Home drücken, am Rechner `adb shell am kill app.kiumu.bear.debug` ausführen, die App über die letzten Apps wieder öffnen.
+      4. Einmal auf „Tippen“.
+
+      Welche Log-Nachricht erscheint beim Tippen in Schritt 2 und welche in Schritt 4? Gib die beiden Zeilen an.
+    lang: kotlin
+    code: |
+      class TapViewModel : ViewModel() {
+          var taps = 0
+      }
+
+      class MainActivity : ComponentActivity() {
+          private var activityTaps = 0
+          private val vm: TapViewModel by viewModels()
+
+          override fun onCreate(savedInstanceState: Bundle?) {
+              super.onCreate(savedInstanceState)
+              setContent {
+                  var remembered by remember { mutableIntStateOf(0) }
+                  var saved by rememberSaveable { mutableIntStateOf(0) }
+                  Button(onClick = {
+                      activityTaps++; vm.taps++; remembered++; saved++
+                      Log.d("Zähler", "activity=$activityTaps vm=${vm.taps} remember=$remembered saveable=$saved")
+                  }) { Text("Tippen") }
+              }
+          }
+      }
+    expected: |
+      activity=1 vm=4 remember=1 saveable=4
+      activity=1 vm=1 remember=1 saveable=5
+    explanation: |
+      Nach der Drehung gibt es eine neue Activity (Feld wieder 0) und eine neue Composition (`remember` wieder 0). Das ViewModel ist dasselbe Objekt, also 3 → 4. `rememberSaveable` wird aus dem Bundle mit 3 wiederhergestellt, also 4. Nach Process Death ist der ganze Prozess neu: auch das ViewModel startet bei 0. Nur `rememberSaveable` hat den Wert 4 im Saved State überstanden, weil das System das Bundle beim Stoppen der Activity gesichert hat – also 5. Genau diese Tabelle solltest du im Kopf haben, bevor du entscheidest, wo ein Zustand lebt.
+    resources:
+      - title: Options for preserving UI state
+        url: https://developer.android.com/topic/libraries/architecture/saving-states#options
+      - title: Save simple, lightweight UI state using rememberSaveable
+        url: https://developer.android.com/guide/components/activities/activity-lifecycle#save-simple
+
+  - id: gradle-android-block
+    type: gap
+    title: Der android-Block
+    prompt: |
+      Ergänze die Eigenschaften im `android`-Block einer App wie Bear: gegen API 37 kompilieren, als eindeutige App-Identität `app.kiumu.bear` verwenden und das Verhalten von Android 16 (API 36) als Ziel setzen.
+    lang: kotlin
+    code: |
+      android {
+          namespace = "app.kiumu.bear"
+          ⟦compileSdk⟧ = 37
+
+          defaultConfig {
+              ⟦applicationId⟧ = "app.kiumu.bear"
+              minSdk = 26
+              ⟦targetSdk⟧ = 36
+              versionCode = 12
+              versionName = "0.12.0"
+          }
+      }
+    gaps:
+      - label: API-Stufe für den Compiler
+        hint: Der Name beginnt mit `compile`.
+      - label: Identität im Play Store
+        hint: Sie steht in `defaultConfig` und darf sich nach der Veröffentlichung nie ändern.
+      - label: Verhalten zur Laufzeit
+        hint: Das Gegenstück zu `minSdk`.
+    explanation: |
+      `namespace` bestimmt nur das Kotlin-Paket der generierten Klasse `R`, `applicationId` die Identität auf dem Gerät und im Store. Beide sind oft gleich, müssen es aber nicht sein – Build-Varianten wie ein Debug-Build hängen an die `applicationId` ein Suffix an, ohne dass sich Paketnamen im Code ändern. `compileSdk` steht außerhalb von `defaultConfig`, weil er für alle Varianten gilt.
+    resources:
+      - title: Set the application ID
+        url: https://developer.android.com/build/configure-app-module#set-application-id
+      - title: Set the namespace
+        url: https://developer.android.com/build/configure-app-module#set-namespace
+
+  - id: manifest-ergaenzen
+    type: gap
+    title: Das Manifest für den Start
+    prompt: |
+      Ergänze das Manifest: Die App braucht die Laufzeitberechtigung für Benachrichtigungen, und `MainActivity` soll im Launcher erscheinen.
+    lang: xml
+    code: |
+      <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+          <⟦uses-permission⟧ android:name="android.permission.POST_NOTIFICATIONS" />
+
+          <application android:name=".BearApp" android:label="@string/app_name">
+              <activity
+                  android:name=".MainActivity"
+                  android:exported="⟦true⟧">
+                  <intent-filter>
+                      <action android:name="⟦android.intent.action.MAIN⟧" />
+                      <category android:name="⟦android.intent.category.LAUNCHER⟧" />
+                  </intent-filter>
+              </activity>
+          </application>
+      </manifest>
+    gaps:
+      - label: Element für Berechtigungen
+        hint: "Das Element heißt wie „eine Berechtigung benutzen“, in kebab-case."
+      - label: Für andere Apps startbar?
+        hint: Der Launcher ist eine andere App.
+      - label: Aktion des Einstiegspunkts
+        hint: "`android.intent.action.…` – der Haupteinstieg."
+      - label: Kategorie für den App-Drawer
+        hint: "`android.intent.category.…` – der Name der App, die Icons anzeigt."
+    explanation: |
+      `MAIN` plus `LAUNCHER` macht eine Activity zum Icon im App-Drawer. Weil der Launcher eine fremde App ist, muss die Activity `exported="true"` sein; alle anderen Activities bleiben `false`. `<uses-permission>` deklariert nur, dass die App die Berechtigung anfragen *darf* – bei `POST_NOTIFICATIONS` muss der Nutzer ab Android 13 trotzdem zur Laufzeit zustimmen.
+    resources:
+      - title: App manifest overview
+        url: https://developer.android.com/guide/topics/manifest/manifest-intro
+      - title: Declare components
+        url: https://developer.android.com/guide/components/fundamentals#DeclaringComponents
+
+  - id: pending-intent-benachrichtigung
+    type: gap
+    title: Die Benachrichtigung öffnet Bear
+    prompt: |
+      Beim Antippen der Benachrichtigung „Zeit für eine Runde“ soll `MainActivity` mit dem Extra `EXTRA_OPEN_ROUND` starten. Ergänze die Zielklasse, die Fabrikmethode für Activities und das Flag, das den Intent vor Änderungen durch andere Apps schützt.
+    lang: kotlin
+    code: |
+      val open = Intent(context, ⟦MainActivity::class.java⟧).apply {
+          putExtra(Notifications.EXTRA_OPEN_ROUND, true)
+      }
+      val pending = PendingIntent.⟦getActivity⟧(
+          context,
+          0,
+          open,
+          PendingIntent.⟦FLAG_IMMUTABLE⟧ or PendingIntent.FLAG_UPDATE_CURRENT,
+      )
+    gaps:
+      - label: Zielklasse (explizit)
+        hint: Android erwartet eine Java-Klasse, keine Kotlin-`KClass`.
+      - label: Fabrikmethode
+        hint: Es gibt `getActivity`, `getService` und `getBroadcast`.
+      - label: Mutability-Flag
+        hint: Das Gegenteil von `FLAG_MUTABLE`.
+    explanation: |
+      `MainActivity::class.java` macht den Intent explizit – nur diese eine Activity kann ihn empfangen. Das System führt einen `PendingIntent` mit der Identität deiner App aus. Wäre er veränderbar, könnte die App, die ihn in der Hand hält, Ziel oder Extras umschreiben. Deshalb verlangt Android ab `targetSdk` 31 ein Mutability-Flag, und `FLAG_IMMUTABLE` ist der Standard. `FLAG_MUTABLE` brauchst du nur, wenn das System Daten einfüllen muss, etwa bei einer Direktantwort in der Benachrichtigung. `FLAG_UPDATE_CURRENT` ersetzt die Extras eines bereits existierenden, gleichen `PendingIntent`.
+    resources:
+      - title: Create immutable pending intents
+        url: https://developer.android.com/guide/components/intents-filters#CreateImmutablePendingIntents
+
+  - id: process-death-simulieren
+    type: command
+    title: Process Death auf Knopfdruck
+    prompt: |
+      Du hast die Debug-Version von Bear (`app.kiumu.bear.debug`) geöffnet, einen Entwurf getippt und Home gedrückt. Beende jetzt den Prozess der App so, wie es das System bei Speichermangel täte – ohne die App zwangsweise zu stoppen.
+    context: Das Pixel ist per USB verbunden und das einzige Gerät, `adb devices` zeigt es an.
+    answers:
+      - adb shell am kill app.kiumu.bear.debug
+    output: |
+      $
+    explanation: |
+      `am kill` beendet nur Prozesse, die das System ohnehin gefahrlos beenden dürfte, also Apps im Hintergrund – genau die Situation von Process Death. Öffnest du die App danach über die letzten Apps, stellt Android den Back Stack und den Saved State wieder her. `am force-stop` wäre der falsche Test: Es entspricht „Beenden erzwingen“ in den Einstellungen und verwirft den gespeicherten Zustand, die App startet danach frisch. Bei mehreren Geräten ergänzt du `adb -s <seriennummer>`.
+    resources:
+      - title: "adb: Call activity manager (am)"
+        url: https://developer.android.com/tools/adb
+
+  - id: berechtigung-zuruecksetzen
+    type: command
+    title: Berechtigung wieder entziehen
+    prompt: |
+      Du testest den Dialog für Benachrichtigungen. Nimm der Debug-App `app.kiumu.bear.debug` die Berechtigung `android.permission.POST_NOTIFICATIONS` wieder weg, ohne die App-Daten zu löschen.
+    answers:
+      - adb shell pm revoke app.kiumu.bear.debug android.permission.POST_NOTIFICATIONS
+    explanation: |
+      `pm revoke <paket> <berechtigung>` entzieht eine Laufzeitberechtigung, `pm grant` gewährt sie. Beachte: Entzieht man einer laufenden App eine Berechtigung, beendet Android ihren Prozess – ein weiterer Weg, in dem deine App Process Death erlebt. `pm clear` wäre zu grob, es löscht alle Daten der App. Hat der Nutzer zweimal abgelehnt, merkt sich das System das zusätzlich als Flag; die Doku zeigt, wie du es mit `pm clear-permission-flags` zurücksetzt.
+    resources:
+      - title: Inspect denial status when testing and debugging
+        url: https://developer.android.com/training/permissions/requesting#inspect-denial-status-when-testing-and-debugging
+      - title: "adb: Call package manager (pm)"
+        url: https://developer.android.com/tools/adb
+
+  - id: context-leak
+    type: bug
+    title: Die alte Activity will nicht gehen
+    prompt: |
+      `ReminderSounds` spielt Bears Erinnerungston. `MainActivity` ruft in `onCreate` den Aufruf `ReminderSounds.init(this)` auf. Nach dem ersten Drehen meldet LeakCanary: „1 retained instance of `MainActivity`“, und der Speicherverbrauch steigt mit jeder weiteren Drehung. Finde die Zeile im Objekt, die das verursacht, und korrigiere sie so, dass `init` mit jedem Context sicher ist.
+    lang: kotlin
+    code: |
+      object ReminderSounds {
+          private var context: Context? = null
+
+          fun init(context: Context) {
+              this.context = context
+          }
+
+          fun play() {
+              val ctx = context ?: return
+              MediaPlayer.create(ctx, R.raw.soft_bell)?.start()
+          }
+      }
+    lines: [5]
+    fix:
+      - line: 5
+        answers:
+          - this.context = context.applicationContext
+    explanation: |
+      Ein `object` lebt so lange wie der Prozess. Speichert es die übergebene Activity, kann der Garbage Collector sie nach `onDestroy` nicht freigeben – mit allen Views, Bitmaps und der Composition. Nach jeder Drehung zeigt das Feld zwar auf die neue Activity, bis dahin hängen aber schon Instanzen fest, und jeder andere Pfad, der `init` einmal überspringt, hält sie dauerhaft. `context.applicationContext` liefert immer den prozessweiten Context, egal was der Aufrufer übergibt. Die Korrektur im Objekt schützt vor jedem künftigen Aufrufer, nicht nur vor diesem einen.
+    resources:
+      - title: Memory leaks
+        url: https://developer.android.com/topic/performance/memory-leaks
+      - title: Context.getApplicationContext
+        url: https://developer.android.com/reference/android/content/Context#getApplicationContext()
+
+  - id: anr-beim-laden
+    type: bug
+    title: Die App friert beim Öffnen ein
+    prompt: |
+      Beim Öffnen der Liste friert Bear ein bis zwei Sekunden ein; bei langsamem Netz erscheint der Dialog „Bear reagiert nicht“. `repo.loadAll()` ist eine `suspend`-Funktion, die Room und das Netzwerk abfragt. Finde die Zeile, die den Main Thread blockiert, und korrigiere sie.
+    lang: kotlin
+    code: |
+      class EntriesViewModel(private val repo: ThoughtRepository) : ViewModel() {
+          private val _entries = MutableStateFlow<List<Thought>>(emptyList())
+          val entries: StateFlow<List<Thought>> = _entries
+
+          fun load() {
+              _entries.value = runBlocking { repo.loadAll() }
+          }
+      }
+    lines: [6]
+    fix:
+      - line: 6
+        answers:
+          - "viewModelScope.launch { _entries.value = repo.loadAll() }"
+    explanation: |
+      `runBlocking` blockiert den aufrufenden Thread, bis die Coroutine fertig ist. `load()` wird aus der UI aufgerufen, also blockiert es den Main Thread – keine Eingaben, keine Frames, nach 5 Sekunden ohne Reaktion auf eine Eingabe ein ANR. `viewModelScope.launch` startet die Arbeit, ohne zu warten; die `suspend`-Funktion gibt den Thread frei, während Room und Netzwerk arbeiten, und setzt den neuen Wert, wenn das Ergebnis da ist. Die Coroutine wird automatisch abgebrochen, wenn das ViewModel verschwindet.
+    resources:
+      - title: "ANRs: Slow code on the main thread"
+        url: https://developer.android.com/topic/performance/vitals/anr#slow-code-on-main
+      - title: Use coroutines with ViewModel
+        url: https://developer.android.com/topic/libraries/architecture/viewmodel#use-coroutines
+
+  - id: bear-mainactivity-erklaeren
+    type: explain
+    title: Bears MainActivity lesen
+    prompt: |
+      Dieser Ausschnitt stammt aus Bears `MainActivity`. Ein Widget auf dem Startbildschirm öffnet einen Eintrag, indem es `MainActivity` mit dem Extra `open_entry` startet. Erkläre wie im Code-Review: Warum prüft `onCreate` `savedInstanceState == null`, wozu gibt es `onNewIntent`, und warum steckt in `OpenEntry` ein Zähler?
+    lang: kotlin
+    code: |
+      class MainActivity : ComponentActivity() {
+          private val openEntry = mutableStateOf<OpenEntry?>(null)
+
+          override fun onCreate(savedInstanceState: Bundle?) {
+              enableEdgeToEdge()
+              super.onCreate(savedInstanceState)
+              // Only on a fresh start. After a rotation or a restart from saved state this intent was
+              // handled already; a new tap on a widget arrives through onNewIntent.
+              if (savedInstanceState == null) takeEntry(intent)
+              setContent { BearTheme { BearAppUi(openEntry.value) } }
+          }
+
+          override fun onNewIntent(intent: Intent) {
+              super.onNewIntent(intent)
+              takeEntry(intent)
+          }
+
+          private fun takeEntry(intent: Intent) {
+              val id = intent.getStringExtra(EXTRA_OPEN_ENTRY) ?: return
+              openEntry.value = OpenEntry(id, (openEntry.value?.count ?: 0) + 1)
+          }
+      }
+
+      /** The count lets the same entry open again after going back. */
+      data class OpenEntry(val id: String, val count: Int)
+    points:
+      - Nach Drehung oder Process Death bekommt die neue Instanz dasselbe Start-Intent erneut; `savedInstanceState != null` zeigt an, dass es schon verarbeitet wurde.
+      - "`onNewIntent` liefert ein neues Intent an die bestehende Instanz (bei `singleTop`-Launch-Mode oder `FLAG_ACTIVITY_SINGLE_TOP`), statt eine neue Activity zu erzeugen."
+      - "`openEntry` ist Compose-State; eine Änderung löst Recomposition aus, und die UI kann darauf reagieren."
+      - Der Zähler macht zwei Tipps auf denselben Eintrag zu verschiedenen Werten, sonst wäre der zweite `OpenEntry` gleich dem ersten und ein Effekt mit diesem Schlüssel würde nicht erneut laufen.
+    explanation: |
+      Das Widget-Intent ist ein einmaliges Ereignis, aber `getIntent()` liefert es nach jeder Neuerzeugung wieder. Ohne die Prüfung würde Bear nach jeder Drehung den Eintrag erneut öffnen, auch wenn der Nutzer längst zurückgegangen ist. Ist die Activity schon da und passt der Launch-Mode, erzeugt Android keine neue Instanz, sondern ruft `onNewIntent` – deshalb muss auch dort `takeEntry` laufen. `openEntry` ist ein `mutableStateOf`, damit Compose die Änderung bemerkt. Weil `OpenEntry` eine Data Class ist, wären zwei Tipps auf denselben Eintrag ohne Zähler *gleich*; ein `LaunchedEffect(openEntrySignal)` würde beim zweiten Mal nicht neu starten. Der Zähler macht jeden Tipp zu einem neuen Wert.
+    resources:
+      - title: Activity.onNewIntent
+        url: https://developer.android.com/reference/android/app/Activity#onNewIntent(android.content.Intent)
+      - title: Restore activity UI state using saved instance state
+        url: https://developer.android.com/guide/components/activities/activity-lifecycle#restore-activity
+
+  - id: benachrichtigungen-erlauben
+    type: practice
+    title: Erinnerungen nur mit Erlaubnis
+    prompt: |
+      Schreibe eine Composable `ReminderPermissionCard(onGranted: () -> Unit)` für Bears Einrichtung:
+
+      - Ist die Berechtigung `POST_NOTIFICATIONS` schon erteilt oder läuft das Gerät mit einer Version vor Android 13 (API 33), ruft die Karte sofort (einmalig) `onGranted` auf und zeigt nichts an.
+      - Sonst zeigt sie einen kurzen Text, *warum* Bear Benachrichtigungen braucht, und einen Button „Erlauben“, der den Systemdialog öffnet.
+      - Nach einer Ablehnung zeigt sie „Ohne Benachrichtigungen erinnert Bear dich nicht an Runden. Du kannst das später in den Einstellungen ändern.“ – ohne erneut zu fragen und ohne die App zu blockieren.
+
+      Nutze `rememberLauncherForActivityResult` und `ContextCompat.checkSelfPermission`.
+    lang: kotlin
+    starter: |
+      @Composable
+      fun ReminderPermissionCard(onGranted: () -> Unit) {
+          val context = LocalContext.current
+          // Dein Code
+      }
+    solution: |
+      @Composable
+      fun ReminderPermissionCard(onGranted: () -> Unit) {
+          val context = LocalContext.current
+          val alreadyGranted = remember {
+              Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+                  ContextCompat.checkSelfPermission(
+                      context, Manifest.permission.POST_NOTIFICATIONS
+                  ) == PackageManager.PERMISSION_GRANTED
+          }
+          var denied by rememberSaveable { mutableStateOf(false) }
+          val currentOnGranted by rememberUpdatedState(onGranted)
+
+          val launcher = rememberLauncherForActivityResult(
+              ActivityResultContracts.RequestPermission()
+          ) { granted ->
+              if (granted) currentOnGranted() else denied = true
+          }
+
+          if (alreadyGranted) {
+              LaunchedEffect(Unit) { currentOnGranted() }
+              return
+          }
+
+          Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+              if (denied) {
+                  Text(
+                      "Ohne Benachrichtigungen erinnert Bear dich nicht an Runden. " +
+                          "Du kannst das später in den Einstellungen ändern."
+                  )
+              } else {
+                  Text("Bear meldet sich ein paarmal am Tag mit einer kurzen Runde zu deinen Themen.")
+                  Button(onClick = { launcher.launch(Manifest.permission.POST_NOTIFICATIONS) }) {
+                      Text("Erlauben")
+                  }
+              }
+          }
+      }
+    checklist:
+      - Vor Android 13 (`SDK_INT < TIRAMISU`) fragst du nicht an, weil es die Laufzeitberechtigung dort nicht gibt.
+      - Du prüfst mit `ContextCompat.checkSelfPermission` vor dem Anfragen.
+      - "`launcher.launch(…)` steht in einem `onClick`, nicht direkt im Composable-Körper."
+      - "`onGranted` bei bereits erteilter Berechtigung läuft in einem Effekt (`LaunchedEffect`), nicht bei jeder Recomposition."
+      - Die Ablehnung merkst du dir in `rememberSaveable`, damit sie eine Drehung überlebt.
+      - Nach einer Ablehnung bleibt die App bedienbar, und du fragst nicht automatisch erneut.
+    explanation: |
+      Die Musterlösung folgt dem offiziellen Ablauf: prüfen, im Kontext erklären, per Klick anfragen, Ablehnung respektieren. `rememberLauncherForActivityResult` registriert den Launcher so, dass das Ergebnis auch nach einer Neuerzeugung der Activity zugestellt wird. `rememberUpdatedState` sorgt dafür, dass der Effekt immer das aktuelle `onGranted` aufruft, ohne neu zu starten – das behandelt `compose-state` im Detail. Eine Erklärung per `shouldShowRequestPermissionRationale` wäre eine sinnvolle Erweiterung; sie braucht die Activity, in Compose etwa über `LocalActivity.current`.
+    resources:
+      - title: Request runtime permissions
+        url: https://developer.android.com/training/permissions/requesting
+      - title: Notification runtime permission
+        url: https://developer.android.com/develop/ui/views/notifications/notification-permission

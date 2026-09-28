@@ -1,0 +1,397 @@
+id: fehlerbehandlung
+title: Fehlerbehandlung mit Result
+level: 1
+minutes: 150
+summary: Erwartbare Fehler als Werte modellieren, mit ? weitergeben und an der richtigen Grenze verständlich melden.
+goals:
+- Du unterscheidest Result, Option und Panic anhand des Vertrags.
+- Du verwendest ?, map_err und and_then gezielt.
+- Du entwirfst eigene Fehlerarten mit verständlichem Kontext.
+- Du prüfst Erfolgs- und Fehlerpfade mit konkreten Tests.
+resources:
+- &id001
+  title: Rust Book · Result
+  url: https://doc.rust-lang.org/book/ch09-02-recoverable-errors-with-result.html
+- title: Standardbibliothek · Result
+  url: https://doc.rust-lang.org/std/result/enum.Result.html
+- title: Standardbibliothek · Error
+  url: https://doc.rust-lang.org/std/error/trait.Error.html
+- title: thiserror
+  url: https://docs.rs/thiserror/latest/thiserror/
+- title: anyhow
+  url: https://docs.rs/anyhow/latest/anyhow/
+lesson: |
+  Dein CLI liest einen Port aus einer Konfigurationsdatei. Die Datei kann fehlen, der Text kann „morgen“ enthalten und die Zahl kann außerhalb des erlaubten Bereichs liegen. Keiner dieser Fälle rechtfertigt, dass eine Bibliotheksfunktion den ganzen Prozess beendet. Gleichzeitig wäre es falsch, jeden Fehler still durch Port 8080 zu ersetzen: Das Programm könnte auf einem anderen Port starten als beabsichtigt.
+
+  Rust behandelt solche Ausgänge als Werte. `Result<T, E>` macht den möglichen Fehler in der Signatur sichtbar. Der aufrufende Code entscheidet, ob er ihn anzeigt, weitergibt oder gezielt behebt. Dieses Modul trennt erwartbare Fehler von verletzten Programmannahmen und zeigt, wie hilfreiche Ursachen über mehrere Schichten erhalten bleiben.
+
+  ## Result ist ein normaler Rückgabewert
+
+  `Result<T, E>` hat zwei Varianten: `Ok(T)` für den Erfolg und `Err(E)` für den Fehler. Beide Typen gehören zum Vertrag. Ein Ergebnis ohne zusätzlichen Erfolgswert schreibt man als `Result<(), E>`. Der Unit-Typ `()` sagt dabei „die Operation ist gelungen“, nicht „es wurde nichts getan“.
+
+  ```rust
+  fn port(text: &str) -> Result<u16, std::num::ParseIntError> {
+      text.trim().parse::<u16>()
+  }
+
+  fn main() {
+      match port("8080") {
+          Ok(wert) => println!("Port: {wert}"),
+          Err(fehler) => eprintln!("Ungültiger Port: {fehler}"),
+      }
+  }
+  ```
+
+  Die Umwandlung prüft hier Zahlensyntax und den Bereich von `u16`. Ob der Wert 0 fachlich erlaubt ist, entscheidet eine zusätzliche Regel. Das [Rust Book zu Result](https://doc.rust-lang.org/book/ch09-02-recoverable-errors-with-result.html) erklärt diese Trennung zwischen einem Fehlerwert und der Entscheidung, das Programm abzubrechen.
+
+  `Option<T>` sagt dagegen lediglich, dass etwas fehlen kann. Wenn „keine Konfiguration vorhanden“ eine normale Wahl ist, passt `Option`. Wenn eine vorhandene Konfiguration ungültig ist, brauchst du eine Ursache und damit `Result`. `Result<Option<T>, E>` kann beide Unterschiede ausdrücklich bewahren: erfolgreich gesucht, möglicherweise nichts gefunden, oder Suche fehlgeschlagen.
+
+  ## Der Fragezeichen-Operator gibt Fehler weiter
+
+  `?` ist kein pauschales „ignoriere den Fehler“. Bei `Ok` erhältst du den inneren Wert. Bei `Err` verlässt die aktuelle Funktion ihren Kontrollfluss früh und gibt einen passenden Fehler zurück. Die umgebende Funktion muss einen kompatiblen Rückgabetyp besitzen.
+
+  ```rust
+  fn verdoppeln(text: &str) -> Result<u32, std::num::ParseIntError> {
+      let wert = text.parse::<u16>()?;
+      Ok(u32::from(wert) * 2)
+  }
+
+  fn main() {
+      println!("{:?}", verdoppeln("12"));
+      println!("{}", verdoppeln("falsch").is_err());
+  }
+  ```
+
+  Nach `?` darf die Funktion mit einem gültigen Wert weiterrechnen. Im Fehlerfall wird die letzte Zeile gar nicht erreicht. Der Operator wandelt bei `Result` den Fehler über passende Konvertierungen in den Rückgabetyp um. Das ist der Grund, weshalb ein eigener Fehler mit `From` mehrere untergeordnete Fehler vereinen kann. Details stehen im [Abschnitt zur Fehlerweitergabe](https://doc.rust-lang.org/book/ch09-02-recoverable-errors-with-result.html#a-shortcut-for-propagating-errors-the--operator).
+
+  ```rust
+  fn erste_zahl(text: &str) -> Option<u32> {
+      let wort = text.split_whitespace().next()?;
+      wort.parse().ok()
+  }
+
+  fn main() {
+      println!("{:?}", erste_zahl("42 weitere Werte"));
+      println!("{:?}", erste_zahl(""));
+  }
+  ```
+
+  Auch bei `Option` funktioniert `?`, aber es gibt dann `None` weiter. Du kannst nicht ohne Entscheidung `?` von `Option` in einer `Result`-Funktion verwenden. Mit `ok_or` beziehungsweise `ok_or_else` erzeugst du die fehlende Ursache. `ok()` im Beispiel verwirft dagegen bewusst den Parsefehler. Das passt nur, wenn der Aufrufer ausdrücklich keine Unterscheidung der Fehlerursachen benötigt.
+
+  > [!MERKE]
+  > Fehler weitergeben heißt Verantwortung verschieben, nicht Fehler beheben. Eine höhere Schicht muss entscheiden, was Nutzer oder Betrieb davon erfahren.
+
+  ## Fehler gezielt transformieren
+
+  Die [Result-Methoden](https://doc.rust-lang.org/std/result/enum.Result.html) ermöglichen kurze Verarbeitungsketten. `map` verändert den Erfolgswert. `map_err` verändert den Fehlerwert. `and_then` verkettet einen weiteren Schritt, der selbst fehlschlagen kann. Diese Unterschiede verhindern verschachtelte Typen wie `Result<Result<T, E>, E>`.
+
+  ```rust
+  fn menge(text: &str) -> Result<u32, String> {
+      text.parse::<u32>()
+          .map_err(|_| "Menge muss eine positive Ganzzahl sein".to_owned())
+          .and_then(|wert| {
+              if wert == 0 {
+                  Err("Menge muss größer als null sein".to_owned())
+              } else {
+                  Ok(wert)
+              }
+          })
+  }
+
+  fn main() {
+      println!("{:?}", menge("0"));
+      println!("{:?}", menge("3").map(|wert| wert * 2));
+  }
+  ```
+
+  Diese einfache String-Fehlermeldung eignet sich für eine kleine UI-Grenze. Als öffentliche Bibliotheks-API ist ein String häufig zu schwach: Aufrufer müssten Text durchsuchen, um zwischen ungültiger Syntax und unerlaubtem Wert zu unterscheiden. Ein typisierter Fehler bewahrt diese Möglichkeiten auch dann, wenn du die Formulierung der Meldung änderst.
+
+  `unwrap_or(default)` setzt bei jedem Fehler einen Standardwert ein. Das ist nur korrekt, wenn alle Fehler wirklich dieselbe fachliche Bedeutung haben. Außerdem wird der Default-Ausdruck sofort ausgewertet. `unwrap_or_else(|error| ...)` berechnet einen Ersatz erst im Fehlerfall. Keines der beiden Verfahren sollte kaputte Eingabedaten unbemerkt in erfolgreiche Verarbeitung verwandeln.
+
+  ## Eigene Fehlertypen mit Ursache
+
+  Ein Fehler-Enum beschreibt, was Aufrufer unterscheiden dürfen. [`std::error::Error`](https://doc.rust-lang.org/std/error/trait.Error.html) verlangt `Debug` und `Display`. `Display` ist für eine lesbare Beschreibung zuständig. `source()` kann die zugrunde liegende Ursache verfügbar machen.
+
+  ```rust
+  use std::{error::Error, fmt, num::ParseIntError};
+
+  #[derive(Debug)]
+  enum PortFehler {
+      Zahl(ParseIntError),
+      Null,
+  }
+  impl fmt::Display for PortFehler {
+      fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+          match self {
+              Self::Zahl(_) => write!(f, "Port ist keine gültige u16-Zahl"),
+              Self::Null => write!(f, "Port darf hier nicht null sein"),
+          }
+      }
+  }
+  impl Error for PortFehler {
+      fn source(&self) -> Option<&(dyn Error + 'static)> {
+          match self { Self::Zahl(e) => Some(e), Self::Null => None }
+      }
+  }
+  impl From<ParseIntError> for PortFehler {
+      fn from(error: ParseIntError) -> Self { Self::Zahl(error) }
+  }
+  fn port(text: &str) -> Result<u16, PortFehler> {
+      let wert = text.parse::<u16>()?;
+      if wert == 0 { Err(PortFehler::Null) } else { Ok(wert) }
+  }
+  fn main() {
+      println!("{:?}", port("8080"));
+  }
+  ```
+
+  Das wirkt für zwei Varianten ausführlich. Der Nutzen ist der Vertrag: Ein Aufrufer kann auf `PortFehler::Null` reagieren, ohne Meldungstexte zu interpretieren. Die Parseursache bleibt als Objekt verfügbar. Die Konvertierung durch `From` ergänzt keine kontextspezifischen Angaben wie einen Dateipfad; diese gehören an die Stelle, an der der Kontext tatsächlich bekannt ist.
+
+  Die Crate [thiserror](https://docs.rs/thiserror/latest/thiserror/) erzeugt solche Implementierungen aus Attributen. Sie nimmt dir Schreibarbeit ab, entscheidet aber nicht, welche Fehler dein Modell braucht:
+
+  ```rust
+  #[derive(Debug, thiserror::Error)]
+  enum KonfigFehler {
+      #[error("Konfiguration konnte nicht gelesen werden")]
+      Lesen(#[from] std::io::Error),
+      #[error("Port darf nicht null sein")]
+      Null,
+  }
+  ```
+
+  Dieser Ausschnitt benötigt eine `thiserror`-Abhängigkeit in Cargo und wird von der plattformeigenen Standardbibliotheks-Prüfung nicht kompiliert. Für Anwendungen mit vielen verschiedenartigen Fehlern ist [anyhow](https://docs.rs/anyhow/latest/anyhow/) eine Alternative. Sein Fokus liegt auf Weitergabe und Kontext, nicht auf einem öffentlichen Enum für programmatische Fallunterscheidung.
+
+  ```rust
+  use anyhow::{Context, Result};
+
+  fn lesen(pfad: &std::path::Path) -> Result<String> {
+      std::fs::read_to_string(pfad)
+          .with_context(|| format!("Konfiguration {} lesen", pfad.display()))
+  }
+  ```
+
+  > [!PRAXIS]
+  > Ergänze Kontext dort, wo er entsteht: welcher Pfad, welcher Arbeitsschritt, welche fachliche Operation. Gib die ursprüngliche Ursache weiter. Logge Zugangstokens oder vollständige geheime Konfigurationsinhalte dabei nicht mit.
+
+  ## Panic, Programmgrenzen und Tests
+
+  `panic!`, `unwrap()` und `expect()` eignen sich für verletzte Programmannahmen, nicht für normale Eingaben oder ausgefallene Dienste. Ein `expect`-Text sollte erklären, weshalb der Fall unmöglich sein sollte. Die [Empfehlungen des Rust Book](https://doc.rust-lang.org/book/ch09-03-to-panic-or-not-to-panic.html) unterscheiden Prototypen, Tests und robuste Schnittstellen.
+
+  An der äußeren Grenze eines CLI kannst du einen Fehler einmal melden und einen Fehlerstatus zurückgeben. Tiefere Funktionen sollten keine Meldung ausgeben und dann denselben Fehler weiterwerfen: Sonst erscheint dieselbe Ursache mehrfach. Ein Dienst benötigt möglicherweise eine strukturierte Fehlerantwort statt eines Prozessabbruchs. Die fachliche Entscheidung gehört deshalb nicht in die allgemeine Parserfunktion.
+
+  Teste nicht nur den normalen Port. Prüfe leeren Text, ungültige Zeichen, Null und Überlauf. Bei eigenen Enums prüfst du die Variante, bei einer Nutzeroberfläche zusätzlich den verständlichen Kontext. Ein Test auf `is_err()` allein reicht nicht, wenn mehrere Fehler unterschiedliche Konsequenzen haben.
+
+  > [!INTERVIEW]
+  > Auf „Wann Result, wann panic?“ trennst du erwartbare Umstände von gebrochenen Invarianten. Dateien und Nutzereingaben können regulär fehlschlagen. Ein intern behaupteter, aber unmöglicher Zustand weist dagegen auf einen Programmfehler hin. Auch dann solltest du begründen können, warum die Annahme gilt.
+
+  ## Häufige Fehler
+
+  - **Überall `unwrap()`:** Ein regulärer Fehler beendet den Ablauf ungeplant.
+  - **Fehler mit `.ok()` verwerfen:** Danach lässt sich ungültiger Inhalt nicht mehr von fehlendem Inhalt unterscheiden.
+  - **Strings parsen, um Fehlerarten zu erkennen:** Nutze strukturierte Varianten.
+  - **Nur Kontext ohne Ursache speichern:** Die ursprüngliche Diagnose geht verloren.
+  - **An jeder Schicht loggen:** Melde einmal an der Grenze mit dem nötigen Kontext.
+
+  ## Zusammenfassung
+
+  - `Result` enthält Erfolg oder eine konkrete Ursache.
+  - `?` gibt Fehler früh weiter und kann passende Fehlerkonvertierungen nutzen.
+  - `Option` und `Result` beschreiben unterschiedliche Verträge.
+  - `map`, `map_err` und `and_then` transformieren verschiedene Teile.
+  - Öffentliche Fehlertypen sollten notwendige Fallunterscheidungen ermöglichen.
+  - Kontext erklärt die Operation; `source` bewahrt die Ursache.
+  - Fehlerpfade verdienen ebenso konkrete Tests wie Erfolgsfälle.
+exercises:
+- id: result-oder-panic
+  type: choice
+  title: Die Datei fehlt
+  prompt: Ein Nutzer nennt einen nicht vorhandenen Konfigurationspfad. Was sollte eine wiederverwendbare Lesefunktion
+    tun?
+  options:
+  - text: Ein Result mit der I/O-Ursache zurückgeben.
+    correct: true
+    why: Der Aufrufer kann dann Anzeige, Ersatz oder Abbruch wählen.
+  - text: Mit expect abbrechen, weil Konfiguration wichtig ist.
+    correct: false
+    why: Der Fehler ist eine erwartbare Eingabesituation.
+  - text: Einen leeren String zurückgeben und den Fehler verwerfen.
+    correct: false
+    why: Damit wird ein Lesefehler von einem erfolgreichen leeren Inhalt ununterscheidbar.
+  explanation: Die Lesefunktion kennt die Fehlerursache, aber nicht die angemessene Nutzerreaktion. Ein `Result`
+    erhält diese Entscheidung für den Aufrufer.
+  resources:
+  - *id001
+- id: weitergabe-reihenfolge
+  type: order
+  title: Validierte Zahl verdoppeln
+  prompt: Sortiere die Zeilen zu einem vollständigen Programm.
+  lang: rust
+  lines: |-
+    fn doppelt(text: &str) -> Result<u32, std::num::ParseIntError> {
+        let wert = text.parse::<u16>()?;
+        Ok(u32::from(wert) * 2)
+    }
+    fn main() { println!("{:?}", doppelt("8")); }
+  explanation: '`?` liefert zuerst eine geprüfte Zahl. Nur im Erfolgsfall wird danach gerechnet und `Ok` erzeugt.'
+  resources:
+  - *id001
+- id: map-erfolg
+  type: output
+  title: Nur die erfolgreiche Seite
+  prompt: Was gibt dieses Programm aus? Gib jede Ausgabezeile an.
+  lang: rust
+  code: |-
+    fn main() {
+        let a: Result<i32, &str> = Ok(3);
+        let b: Result<i32, &str> = Err("kaputt");
+        println!("{:?}", a.map(|n| n * 2));
+        println!("{:?}", b.map(|n| n * 2));
+    }
+  expected: |-
+    Ok(6)
+    Err("kaputt")
+  explanation: '`map` arbeitet nur am Erfolgswert. Der Fehler wird unverändert weitergereicht.'
+  resources:
+  - *id001
+- id: frueher-ausstieg
+  type: output
+  title: Welche Zeile wird erreicht?
+  prompt: Was gibt dieses Programm aus? Gib jede Ausgabezeile an.
+  lang: rust
+  code: |-
+    fn lesen(text: &str) -> Result<u32, std::num::ParseIntError> {
+        println!("Start");
+        let n = text.parse()?;
+        println!("Weiter");
+        Ok(n)
+    }
+    fn main() { println!("{}", lesen("x").is_err()); }
+  expected: |-
+    Start
+    true
+  explanation: Die Parseoperation schlägt fehl. `?` verlässt die Funktion, daher erscheint Weiter nicht.
+  resources:
+  - *id001
+- id: fragezeichen
+  type: gap
+  title: Fehler weitergeben
+  prompt: Ergänze den Operator zur Fehlerweitergabe und die Erfolgsvariante.
+  lang: rust
+  code: |-
+    fn lesen(text: &str) -> Result<u32, std::num::ParseIntError> {
+        let wert = text.parse::<u32>()⟦?⟧;
+        ⟦Ok(wert)⟧
+    }
+    fn main() { println!("{:?}", lesen("7")); }
+  gaps:
+  - label: Lücke 1
+    hint: Der gesuchte Operator besteht aus einem Zeichen.
+  - label: Lücke 2
+    hint: Result nennt den Erfolgsfall Ok.
+  explanation: '`?` gibt einen Parsefehler an den Aufrufer weiter. Ein erfolgreicher Wert wird mit `Ok` in den Vertrag
+    zurückverpackt.'
+  resources:
+  - *id001
+- id: fehlende-ursache
+  type: gap
+  title: Option in Result verwandeln
+  prompt: Ergänze die Methode, die einen festen Fehlerwert für None einsetzt.
+  lang: rust
+  code: |-
+    fn erstes(werte: &[i32]) -> Result<i32, &'static str> {
+        werte.first().copied().⟦ok_or⟧("keine Werte")
+    }
+    fn main() { println!("{:?}", erstes(&[])); }
+  gaps:
+  - label: Lücke 1
+    hint: Die Methode heißt ok gefolgt von _or.
+  explanation: '`ok_or` verwandelt Some in Ok und None in den angegebenen Fehler. Hier ist die Ursache ein günstiger
+    statischer String.'
+  resources:
+  - *id001
+- id: fehler-abbilden
+  type: gap
+  title: Kontext hinzufügen
+  prompt: Ergänze die Methode, die ausschließlich die Fehlerseite transformiert.
+  lang: rust
+  code: |-
+    fn menge(text: &str) -> Result<u32, String> {
+        text.parse::<u32>().⟦map_err⟧(|e| format!("Menge ungültig: {e}"))
+    }
+    fn main() { println!("{}", menge("x").is_err()); }
+  gaps:
+  - label: Lücke 1
+    hint: Nicht map für Erfolge, sondern die Variante für Fehler.
+  explanation: '`map_err` verändert den Fehlertyp und erhält erfolgreiche Zahlen. Für eine öffentliche Bibliotheks-API
+    wäre ein strukturiertes Enum oft besser.'
+  resources:
+  - *id001
+- id: unwrap-parser
+  type: bug
+  title: Nutzereingabe verursacht einen Panic
+  prompt: Die Funktion verspricht Result, panikt aber bei "x". Repariere die Rückgabezeile, sodass der Parsefehler
+    beim Aufrufer ankommt.
+  lang: rust
+  code: |-
+    fn zahl(text: &str) -> Result<u32, std::num::ParseIntError> {
+        Ok(text.parse::<u32>().unwrap())
+    }
+    fn main() { println!("{}", zahl("x").is_err()); }
+  lines:
+  - 2
+  fix:
+  - line: 2
+    answers:
+    - text.parse::<u32>()
+    - Ok(text.parse::<u32>()?)
+  explanation: '`parse` liefert bereits den passenden Result-Typ. Die direkte Rückgabe erhält den Fehler statt ihn
+    durch unwrap in einen Panic umzuwandeln.'
+  resources:
+  - *id001
+- id: fehlervertrag
+  type: explain
+  title: Was geht durch ok verloren?
+  prompt: Erkläre den Unterschied zwischen beiden Schnittstellen bei fehlender und fehlerhafter Eingabe.
+  lang: rust
+  code: |-
+    fn streng(text: &str) -> Result<u32, std::num::ParseIntError> { text.parse() }
+    fn optional(text: &str) -> Option<u32> { text.parse().ok() }
+  points:
+  - Result bewahrt den konkreten Parsefehler.
+  - Option bewahrt nur Erfolg oder Fehlen.
+  - ok verwirft die Ursache bewusst.
+  - Die Wahl richtet sich nach den Entscheidungen des Aufrufers.
+  explanation: '`streng` lässt den Aufrufer einen Fehler diagnostizieren. `optional` reduziert jeden Parsefehler
+    auf None. Das ist nur korrekt, wenn der Vertrag die Ursache nicht benötigt; die Umwandlung ist keine Fehlerbehebung.'
+  resources:
+  - *id001
+- id: positive-menge
+  type: practice
+  title: Eine fachliche Regel validieren
+  prompt: Schreibe `menge(&str) -> Result<u32, MengeFehler>` mit getrennten Varianten `Ungueltig` und `Null`. Akzeptiere
+    positive u32-Werte. Teste Erfolg, Null und ungültige Syntax.
+  lang: rust
+  solution: |
+    #[derive(Debug, PartialEq)]
+    enum MengeFehler { Ungueltig, Null }
+    fn menge(text: &str) -> Result<u32, MengeFehler> {
+        let n = text.parse::<u32>().map_err(|_| MengeFehler::Ungueltig)?;
+        if n == 0 { Err(MengeFehler::Null) } else { Ok(n) }
+    }
+    fn main() { println!("{:?}", menge("3")); }
+    #[test]
+    fn prueft_alle_faelle() {
+        assert_eq!(menge("3"), Ok(3));
+        assert_eq!(menge("0"), Err(MengeFehler::Null));
+        assert_eq!(menge("x"), Err(MengeFehler::Ungueltig));
+        assert_eq!(menge("4294967296"), Err(MengeFehler::Ungueltig));
+    }
+  checklist:
+  - Die beiden Fehlerarten bleiben unterscheidbar.
+  - Ungültige Syntax und Überlauf führen zu Ungueltig.
+  - Null verletzt die zusätzliche Fachregel.
+  - Tests prüfen Varianten statt nur is_err.
+  explanation: Der Parser prüft zuerst die technische Repräsentation. Danach folgt die fachliche Regel. Diese Reihenfolge
+    hält die Fehlerfälle eindeutig und verhindert einen Erfolg mit Null.
+  resources:
+  - *id001

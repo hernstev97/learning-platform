@@ -1,0 +1,689 @@
+id: collections
+title: Collections und Daten-Pipelines
+level: 2
+minutes: 150
+summary: Wie Kotlins Collections aufgebaut sind, warum read-only nicht unveränderlich heißt und wie du Daten mit map, groupBy, fold und Sequences in lesbare und effiziente Pipelines verwandelst.
+goals:
+  - Du erklärst, warum `List` nur eine read-only Sicht ist, und entscheidest bewusst zwischen `List`, `MutableList` und einer Kopie.
+  - Du baust Pipelines mit `filter`, `map`, `groupBy`, `associateBy`, `partition` und `fold` und sagst ihr Ergebnis voraus – auch für leere Listen.
+  - Du sortierst nach mehreren Kriterien mit `sortedWith(compareBy { … }.thenBy { … })` und kennst den Unterschied zwischen `sorted…` und `sort…`.
+  - Du begründest, wann eine `Sequence` hilft und wann sie nur Overhead ist.
+  - Du erkennst quadratische Laufzeitfallen und ersetzt Suchen in Listen durch Maps oder Sets.
+resources:
+  - title: Kotlin Docs · Collections overview
+    url: https://kotlinlang.org/docs/collections-overview.html
+  - title: Kotlin Docs · Collection operations overview
+    url: https://kotlinlang.org/docs/collection-operations.html
+  - title: Kotlin Docs · Sequences
+    url: https://kotlinlang.org/docs/sequences.html
+  - title: Kotlin API · kotlin.collections
+    url: https://kotlinlang.org/api/core/kotlin-stdlib/kotlin.collections/
+lesson: |
+  Stell dir vor, deine App lädt 400 Issues aus der Linear-API. Der Bildschirm soll zeigen: offene Issues pro Team, die Summe der Story Points, sortiert nach Aufwand, dazu die drei größten Brocken. In Java hättest du dafür früher drei verschachtelte Schleifen, zwei Hilfs-Maps und einen Zähler geschrieben. In Kotlin ist es eine Pipeline aus fünf Zeilen, die sich liest wie die Anforderung selbst.
+
+  Genau diese Lesbarkeit hat einen Preis, wenn du das Modell dahinter nicht kennst: Jeder Schritt erzeugt eine neue Liste, `associateBy` verwirft stillschweigend Duplikate, `reduce` stürzt bei leeren Listen ab, und ein `contains` an der falschen Stelle macht aus linearer Laufzeit quadratische. Diese Lektion baut das Denkmodell auf, mit dem du solche Pipelines sicher schreibst und im Code-Review beurteilst.
+
+  ## Das Typmodell: read-only ist nicht unveränderlich
+
+  Kotlin trennt jede Collection-Art in zwei Interfaces: ein **read-only** Interface (`List`, `Set`, `Map`) mit Lesezugriff und ein **mutable** Interface (`MutableList`, `MutableSet`, `MutableMap`), das das read-only Interface um Schreiboperationen erweitert. Die Hierarchie beginnt bei `Iterable<T>` und `Collection<T>`; `Map` steht daneben ([Collection types](https://kotlinlang.org/docs/collections-overview.html#collection-types)).
+
+  Der entscheidende Punkt: `List<T>` sagt nur, dass **du über diese Referenz** nichts ändern kannst. Es sagt nichts darüber, ob jemand anderes die Liste ändert.
+
+  ```kotlin
+  val backing = mutableListOf("APP-1", "APP-2")
+  val view: List<String> = backing   // dieselbe Liste, nur ein engerer Typ
+
+  // view.add("APP-3")               // kompiliert nicht: List hat kein add
+  backing.add("APP-3")               // erlaubt – und view sieht die Änderung
+
+  println(view)                      // [APP-1, APP-2, APP-3]
+  ```
+
+  `view` und `backing` zeigen auf **dasselbe Objekt** im Speicher. Der Typ `List` ist eine Brille, durch die man nur lesen kann – keine Garantie über das Objekt. Wer einen echten Schnappschuss braucht, kopiert: `backing.toList()` erzeugt eine neue Liste, die spätere Änderungen an `backing` nicht mitbekommt.
+
+  Davon unabhängig ist die Frage `val` oder `var`. `val` fixiert die **Referenz**, nicht den Inhalt: Eine `val`-Variable vom Typ `MutableList` kannst du weiter befüllen, du kannst ihr nur keine andere Liste zuweisen. Die Kotlin-Doku empfiehlt ausdrücklich, `val` so oft wie möglich zu verwenden ([Collections overview](https://kotlinlang.org/docs/collections-overview.html)).
+
+  | Deklaration | Referenz neu zuweisen? | Inhalt ändern? |
+  | --- | --- | --- |
+  | `val a: List<T>` | nein | nicht über `a` |
+  | `var a: List<T>` | ja | nicht über `a` |
+  | `val a: MutableList<T>` | nein | ja |
+  | `var a: MutableList<T>` | ja | ja – meist ein Code-Smell |
+
+  Read-only Collections sind außerdem **kovariant**: Eine `List<Rectangle>` darf überall stehen, wo eine `List<Shape>` erwartet wird. Bei `MutableList` geht das nicht – sonst könntest du einen `Circle` in eine Liste von Rechtecken schreiben. Warum das so ist, klärt das Modul „Generics & Delegation“ mit `out` und `in`.
+
+  > [!MERKE]
+  > `List` heißt „ich darf nicht schreiben“, nicht „niemand darf schreiben“. Wer Unveränderlichkeit braucht, gibt eine Kopie heraus (`toList()`) oder nutzt eine persistente Collection wie [kotlinx.collections.immutable](https://github.com/Kotlin/kotlinx.collections.immutable).
+
+  Im Track [Praxis: Kotlin mit Bear](/kotlin/bear-04) siehst du dasselbe Prinzip im echten Code: Ein `val` hält dort eine veränderliche Liste, und die Aufgabe dreht sich genau um den Unterschied zwischen Referenz und Inhalt.
+
+  ## Collections erzeugen
+
+  Für feste Werte gibt es `listOf`, `setOf` und `mapOf`, für veränderliche `mutableListOf` und Co. Map-Einträge schreibst du mit der Infix-Funktion `to`, die ein `Pair` erzeugt. Wenn eine Liste bedingt zusammengebaut wird, ist `buildList` die sauberste Lösung: Innen ist die Liste veränderlich, nach außen kommt eine read-only `List` heraus ([Builder functions](https://kotlinlang.org/docs/constructing-collections.html#create-with-collection-builder-functions)).
+
+  ```kotlin
+  val limits = mapOf("free" to 3, "pro" to 50)       // Map<String, Int>
+  val weekdays = setOf("Mo", "Di", "Mi", "Di")        // [Mo, Di, Mi] – Duplikat entfällt
+  val slots = List(4) { index -> index * 15 }         // [0, 15, 30, 45]
+
+  fun menuFor(isAdmin: Boolean): List<String> = buildList {
+      add("Übersicht")
+      add("Einstellungen")
+      if (isAdmin) add("Benutzerverwaltung")
+  }
+  ```
+
+  Die Standard-Implementierungen sind `ArrayList`, `LinkedHashSet` und `LinkedHashMap`. Die beiden letzten behalten die **Einfügereihenfolge** – `first()` auf einem `setOf(…)` liefert also vorhersagbar das zuerst eingefügte Element. Doppelte Schlüssel in `mapOf` überschreiben sich: Der letzte Wert gewinnt.
+
+  ## Transformieren: aus Daten werden neue Daten
+
+  Für die Beispiele dieser Lektion nehmen wir ein kleines Modell:
+
+  ```kotlin
+  data class Issue(val key: String, val team: String, val points: Int, val done: Boolean)
+
+  val issues = listOf(
+      Issue("APP-1", "app", 3, done = false),
+      Issue("APP-2", "app", 5, done = true),
+      Issue("WEB-1", "web", 2, done = false),
+      Issue("APP-3", "app", 8, done = false),
+  )
+  ```
+
+  Alle Operationen in diesem Abschnitt lassen die Ausgangsliste unverändert und geben eine **neue** Collection zurück ([Transformations](https://kotlinlang.org/docs/collection-transformations.html)):
+
+  ```kotlin
+  issues.filter { !it.done }                  // List<Issue> mit APP-1, WEB-1, APP-3
+  issues.map { it.key }                       // [APP-1, APP-2, WEB-1, APP-3]
+  issues.mapNotNull { if (it.done) it.key else null }   // [APP-2]
+  listOf("a b", "c").flatMap { it.split(" ") }         // [a, b, c]
+
+  issues.groupBy { it.team }                  // Map<String, List<Issue>>: app → 3 Issues, web → 1
+  issues.associateBy { it.key }               // Map<String, Issue>: Schlüssel → genau ein Element
+  issues.associate { it.key to it.points }    // Map<String, Int>
+  val (done, open) = issues.partition { it.done }   // Pair<List<Issue>, List<Issue>>
+  ```
+
+  Der wichtigste Unterschied für die Praxis steckt zwischen `groupBy` und `associateBy`. `groupBy` sammelt **alle** Elemente mit demselben Schlüssel in einer Liste. `associateBy` erwartet eindeutige Schlüssel – gibt es doch Duplikate, gewinnt **das letzte Element**, die anderen verschwinden ohne Fehler ([associateBy](https://kotlinlang.org/api/core/kotlin-stdlib/kotlin.collections/associate-by.html)). `issues.associateBy { it.team }` liefert also für `app` nur `APP-3`.
+
+  Für Listen, die du in Stücken oder Fenstern verarbeiten willst, gibt es `chunked`, `windowed` und `zip` ([Retrieve collection parts](https://kotlinlang.org/docs/collection-parts.html)):
+
+  ```kotlin
+  val ids = (1..120).map { "ISS-$it" }
+  ids.chunked(50).map { it.size }                     // [50, 50, 20] – Batches für eine API
+  listOf(1, 2, 3, 4, 5).windowed(3)                   // [[1, 2, 3], [2, 3, 4], [3, 4, 5]]
+  listOf(10, 12, 17).zipWithNext { a, b -> b - a }    // [2, 5]
+  listOf("Mo", "Di").zip(listOf(4, 6))                // [(Mo, 4), (Di, 6)]
+  ```
+
+  ## Aggregieren: aus vielen Werten wird einer
+
+  Aggregationen reduzieren eine Collection auf einen einzelnen Wert ([Aggregate operations](https://kotlinlang.org/docs/collection-aggregate.html)). Für Summen nimmst du `sumOf`, für Zählungen `count`, für Extremwerte `maxByOrNull` oder `maxOf`, für Prüfungen `any`, `all` und `none`. Wenn nichts davon passt, ist `fold` das allgemeine Werkzeug: Es startet mit einem Anfangswert und kombiniert ihn Schritt für Schritt mit jedem Element.
+
+  ```kotlin
+  val openPoints = issues.filter { !it.done }.sumOf { it.points }       // 13
+  val openCount = issues.count { !it.done }                             // 3
+  val biggest = issues.maxByOrNull { it.points }?.key                   // APP-3
+  val allEstimated = issues.all { it.points > 0 }                       // true
+
+  // fold mit eigenem Akkumulator: offene und erledigte Punkte in einem Durchlauf
+  val (openSum, doneSum) = issues.fold(0 to 0) { (open, done), issue ->
+      if (issue.done) open to done + issue.points else open + issue.points to done
+  }                                                                     // 13 und 5
+  ```
+
+  Die Lambda von `fold` bekommt den bisherigen Akkumulator und das nächste Element und gibt den **neuen** Akkumulator zurück. Hier ist der Akkumulator ein `Pair`, das direkt in der Parameterliste zerlegt wird.
+
+  Das Denkmodell für **leere Collections** solltest du auswendig können, weil genau dort Bugs entstehen:
+
+  - `sumOf` liefert `0`, `count` liefert `0`, `fold` liefert den Anfangswert.
+  - `maxByOrNull`, `maxOrNull`, `firstOrNull` liefern `null` – der Typ zwingt dich, den Fall zu behandeln.
+  - `reduce`, `first()` und `maxOf` werfen eine Exception, weil es keinen sinnvollen Wert gibt.
+  - `all { … }` ist bei leerer Liste `true`, `any { … }` ist `false`, `none { … }` ist `true`. Logisch ist das korrekt: Es gibt kein Element, das die Bedingung verletzt.
+
+  ## Sortieren nach einem und mehreren Kriterien
+
+  Kotlin unterscheidet zwei Familien ([Ordering](https://kotlinlang.org/docs/collection-ordering.html)): `sorted`, `sortedBy`, `sortedWith` geben eine **neue** Liste zurück und funktionieren auf jeder Collection. `sort`, `sortBy`, `sortWith` sortieren eine `MutableList` **an Ort und Stelle** und geben `Unit` zurück. Wer aus JavaScript kommt, wo `array.sort()` das Array verändert, stolpert hier leicht.
+
+  Für mehrere Kriterien baust du einen `Comparator` mit `compareBy` und verkettest weitere Kriterien mit `thenBy` oder `thenByDescending` ([compareBy](https://kotlinlang.org/api/core/kotlin-stdlib/kotlin.comparisons/compare-by.html)):
+
+  ```kotlin
+  val board = issues.sortedWith(
+      compareBy<Issue> { it.done }          // false vor true: offene zuerst
+          .thenByDescending { it.points }   // dann die großen Brocken
+          .thenBy { it.key }                // bei Gleichstand alphabetisch
+  )
+  println(board.map { it.key })             // [APP-3, APP-1, WEB-1, APP-2]
+  ```
+
+  Die Sortierung ist **stabil**: Elemente, die nach dem Kriterium gleich sind, behalten ihre ursprüngliche Reihenfolge ([sortedBy](https://kotlinlang.org/api/core/kotlin-stdlib/kotlin.collections/sorted-by.html)). Darauf kannst du dich verlassen, wenn eine Liste schon vorsortiert ankommt.
+
+  ## Sequences: lazy statt eager
+
+  Operationen auf `List` und `Set` sind **eager**: Jeder Schritt läuft über die ganze Collection und erzeugt eine Zwischenliste, erst dann beginnt der nächste Schritt. Eine `Sequence` arbeitet **lazy**: Sie schickt jedes Element einzeln durch alle Schritte und rechnet erst, wenn eine Terminaloperation wie `toList()` oder `first()` ein Ergebnis verlangt ([Sequence processing example](https://kotlinlang.org/docs/sequences.html#sequence-processing-example)).
+
+  ```kotlin
+  val words = listOf("kotlin", "is", "fun", "and", "fast")
+
+  val result = words.asSequence()
+      .filter { println("filter $it"); it.length > 2 }
+      .map { println("map $it"); it.uppercase() }
+      .take(2)
+      .toList()
+  // filter kotlin, map kotlin, filter is, filter fun, map fun – dann Schluss
+  ```
+
+  Mit einer normalen Liste hätte `filter` alle fünf Wörter geprüft und `map` alle vier passenden umgewandelt, bevor `take(2)` zwei davon behält. Die Sequence hört auf, sobald zwei Ergebnisse feststehen.
+
+  Wann lohnt sich das?
+
+  - **Ja**, bei großen Datenmengen mit mehreren Schritten, bei Abbruch nach wenigen Treffern (`first`, `take`, `find`) und bei unendlichen Quellen wie `generateSequence(1) { it * 2 }`.
+  - **Nein**, bei kleinen Listen oder einem einzigen Schritt. Die Doku warnt ausdrücklich, dass der Overhead der Lazy-Auswertung dort ins Gewicht fällt ([Sequences](https://kotlinlang.org/docs/sequences.html)). Auch `sorted()` hilft eine Sequence wenig: Sortieren muss alle Elemente sehen.
+
+  Sequences sind synchron. Das asynchrone Gegenstück – Werte, die über die Zeit eintreffen – ist `Flow`, das du im Modul „Flow“ kennenlernst. Das Denkmodell „kalt, lazy, erst die Terminaloperation startet die Arbeit“ überträgt sich direkt.
+
+  ## Arrays, Listen und Laufzeit
+
+  `Array<T>` hat eine feste Größe, ist immer veränderlich und entspricht einem JVM-Array. Für primitive Werte gibt es `IntArray`, `LongArray` und so weiter, die ohne Boxing auskommen. Die Doku rät: Arrays für Java-Interop, `vararg` und echte Performance-Anforderungen, sonst Collections ([When to use arrays](https://kotlinlang.org/docs/arrays.html#when-to-use-arrays)). Eine Falle: `==` vergleicht bei Arrays **Referenzen**, bei Listen den **Inhalt**. Für Arrays nimmst du `contentEquals`.
+
+  Für die Laufzeit reicht meist dieses Modell:
+
+  | Operation | `List` (ArrayList) | `Set` / `Map` (Hash-basiert) |
+  | --- | --- | --- |
+  | Zugriff per Index | O(1) | – |
+  | `contains` / Suche nach Schlüssel | O(n) | O(1) im Mittel |
+  | Pipeline mit k Schritten | O(k · n) plus k Zwischenlisten | – |
+
+  Die häufigste Falle ist eine Suche in einer Liste **innerhalb** einer anderen Iteration:
+
+  ```kotlin
+  // O(n · m): für jedes Issue wird die ganze Liste blockedKeys durchsucht
+  val slow = issues.filter { it.key in blockedKeys }
+
+  // O(n + m): einmal ein Set bauen, dann Nachschlagen in konstanter Zeit
+  val blockedSet = blockedKeys.toSet()
+  val fast = issues.filter { it.key in blockedSet }
+  ```
+
+  Bei 400 Issues und 400 gesperrten Keys sind das 160 000 Vergleiche gegen rund 800 Operationen. Auf einem Handy im Main Thread merkt man das.
+
+  > [!PRAXIS] Pipelines im ViewModel
+  > In Android-Apps hält der UI-State meist eine `List<…>` (read-only). Aktualisiert wird er nicht durch `add`, sondern durch eine neue Liste: `state.copy(items = state.items + newItem)`. Das hat einen Grund: `StateFlow` und Compose erkennen Änderungen über `equals`. Wer eine `MutableList` im State verändert, ändert das Objekt, das beide schon kennen – und die Oberfläche bleibt stehen. Im Code-Review gilt außerdem: erst lesbar, dann schnell. Eine Kette aus `filter` und `map` über 50 Elemente ist kein Performance-Problem; ein `find` in einer Schleife über 5 000 Elemente schon.
+
+  ## Häufige Fehler
+
+  - **Read-only mit unveränderlich verwechseln.** Symptom: Eine Liste, die du „nur gelesen“ hast, hat plötzlich andere Einträge. Ursache: Jemand hält noch die `MutableList`-Referenz. Lösung: beim Herausgeben kopieren (`toList()`).
+  - **`reduce` auf möglicherweise leeren Listen.** Symptom: `UnsupportedOperationException: Empty collection can't be reduced.` Lösung: `sumOf`, `fold` oder `reduceOrNull`.
+  - **`associateBy` mit nicht eindeutigen Schlüsseln.** Symptom: Es fehlen Einträge, aber nichts stürzt ab. Lösung: `groupBy`, wenn ein Schlüssel mehrfach vorkommen kann.
+  - **Rückgabewert von `sortedBy` ignorieren.** Symptom: Die Liste ist „trotz Sortierung“ unsortiert. `sortedBy` gibt eine neue Liste zurück; an Ort und Stelle sortiert nur `sortBy` auf einer `MutableList`.
+  - **Beim Iterieren löschen.** Eine `MutableList` in einer `for`-Schleife zu verändern, wirft `ConcurrentModificationException`. Lösung: `removeAll { … }` oder `filter` und eine neue Liste ([List write operations](https://kotlinlang.org/docs/list-operations.html#list-write-operations)).
+  - **Listensuche in Schleifen.** `in`, `indexOf`, `find` auf einer Liste innerhalb von `map` oder `filter` ergibt O(n · m). Lösung: vorher `toSet()` oder `associateBy`.
+
+  > [!INTERVIEW] „Was ist der Unterschied zwischen `List` und `MutableList`?“
+  > Gute Antwort: „`List` ist ein read-only Interface, `MutableList` erweitert es um Schreiboperationen. Read-only heißt aber nicht immutable: Hinter einer `List` kann eine `MutableList` stecken, die anderswo verändert wird. Deshalb gebe ich aus Klassen Kopien oder read-only Typen heraus und halte die veränderliche Liste privat. Read-only Listen sind kovariant, mutable nicht.“ Als Anschlussfrage kommt oft: „Wann nimmst du eine Sequence?“ – bei großen Datenmengen mit mehreren Schritten oder frühem Abbruch, nicht standardmäßig.
+
+  ## Zusammenfassung
+
+  - `List`, `Set`, `Map` sind read-only Sichten, keine unveränderlichen Objekte. `toList()` erzeugt einen Schnappschuss.
+  - `val` fixiert die Referenz, der Typ (`List` oder `MutableList`) bestimmt, ob du über diese Referenz schreiben darfst.
+  - Transformationen (`map`, `filter`, `groupBy`, `associateBy`, `partition`, `chunked`, `windowed`, `zip`) erzeugen immer neue Collections.
+  - `associateBy` behält bei doppelten Schlüsseln nur das letzte Element, `groupBy` behält alle.
+  - Für leere Collections: `sumOf` ergibt 0, `…OrNull` ergibt `null`, `reduce` wirft, `all` ist `true`.
+  - `sorted…` gibt eine neue Liste zurück, `sort…` sortiert eine `MutableList` an Ort und Stelle. Mehrere Kriterien: `compareBy { … }.thenBy { … }`.
+  - Sequences lohnen sich bei großen Daten, mehreren Schritten und frühem Abbruch – sonst bleib bei Listen.
+  - Suche in Listen ist O(n). Wer oft nachschlägt, baut einmal ein `Set` oder eine `Map`.
+exercises:
+  - id: read-only-sicht
+    type: choice
+    title: Eine Liste, zwei Referenzen
+    prompt: |
+      Welche Aussagen über diesen Code stimmen?
+    lang: kotlin
+    code: |
+      val backing = mutableListOf("Kotlin", "Rust")
+      val languages: List<String> = backing
+    options:
+      - text: "`languages.add(\"Go\")` kompiliert nicht."
+        correct: true
+        why: Der statische Typ ist `List<String>`, und `List` hat keine Methode `add`. Der Compiler prüft den deklarierten Typ, nicht das Objekt dahinter.
+      - text: "`backing.add(\"Go\")` ändert auch, was man über `languages` liest."
+        correct: true
+        why: Beide Variablen zeigen auf dasselbe `ArrayList`-Objekt. `languages` ist nur eine engere Sicht darauf.
+      - text: "`languages` ist unveränderlich, weil der Typ `List` ist."
+        correct: false
+        why: "`List` heißt nur: Über diese Referenz kannst du nicht schreiben. Das Objekt selbst bleibt veränderlich."
+      - text: "Weil `backing` mit `val` deklariert ist, kann man keine Elemente hinzufügen."
+        correct: false
+        why: "`val` verhindert nur, dass `backing` eine andere Liste zugewiesen bekommt. Der Inhalt einer `MutableList` lässt sich weiter ändern."
+    explanation: |
+      Kotlin trennt Lesen und Schreiben über Interfaces, nicht über die Objekte. `List<T>` ist eine read-only Sicht, `MutableList<T>` erweitert sie um Schreibmethoden. Eine Variable vom Typ `List` kann also sehr wohl auf eine Liste zeigen, die anderswo verändert wird. Wer einen echten Schnappschuss braucht, kopiert mit `toList()`. `val` und `var` beziehen sich immer auf die Referenz, nie auf den Inhalt.
+    resources:
+      - title: Kotlin Docs · Collection types
+        url: https://kotlinlang.org/docs/collections-overview.html#collection-types
+  - id: sequence-wann
+    type: choice
+    title: Lohnt sich hier eine Sequence?
+    prompt: |
+      In welchen Fällen bringt `asSequence()` einen echten Vorteil gegenüber der normalen Listen-Pipeline?
+    options:
+      - text: "`logLines.asSequence().filter { \"ERROR\" in it }.map { parse(it) }.first()` auf 200 000 Logzeilen"
+        correct: true
+        why: Die Sequence bricht nach dem ersten Treffer ab und baut keine Zwischenlisten. Die Listen-Variante würde alle 200 000 Zeilen filtern und alle Treffer parsen.
+      - text: "`generateSequence(1) { it * 2 }.takeWhile { it < 1_000_000 }.toList()`"
+        correct: true
+        why: Eine unendliche Quelle lässt sich nur lazy verarbeiten. Mit einer Liste gäbe es diese Pipeline gar nicht.
+      - text: "`listOf(\"Mo\", \"Di\", \"Mi\").asSequence().map { it.uppercase() }.toList()`"
+        correct: false
+        why: Drei Elemente, ein Schritt, alle Ergebnisse gebraucht. Der Lazy-Overhead kostet hier mehr, als er spart.
+      - text: "`prices.asSequence().map { it * 1.19 }.toList()` auf einer Million Preisen, deren Ergebnis vollständig gebraucht wird"
+        correct: false
+        why: Ein einziger Schritt erzeugt ohnehin nur eine Ergebnisliste. Es gibt keine Zwischenliste zu sparen und keinen frühen Abbruch.
+    explanation: |
+      Sequences sparen Zwischenlisten und ermöglichen frühen Abbruch, weil jedes Element einzeln durch alle Schritte läuft. Das lohnt sich bei vielen Elementen und mehreren Schritten, bei `first`/`take`/`find` und bei unendlichen Quellen. Bei kleinen Collections oder einem einzelnen Schritt überwiegt der Verwaltungsaufwand. Die Kotlin-Doku empfiehlt ausdrücklich, beide Varianten abzuwägen.
+    resources:
+      - title: Kotlin Docs · Sequences
+        url: https://kotlinlang.org/docs/sequences.html
+  - id: pipeline-ordnen
+    type: order
+    title: Offene Punkte pro Team
+    prompt: |
+      Die Pipeline soll für jedes Team die Summe der Story Points aller **offenen** Issues berechnen, absteigend nach Summe sortiert, als `Map<String, Int>`. Bring die Zeilen in die einzige Reihenfolge, die kompiliert und das Richtige liefert.
+    lang: kotlin
+    lines: |
+      val openPointsByTeam: Map<String, Int> = issues
+          .filter { !it.done }
+          .groupBy { it.team }
+          .mapValues { (_, teamIssues) -> teamIssues.sumOf { it.points } }
+          .toList()
+          .sortedByDescending { (_, points) -> points }
+          .toMap()
+    explanation: |
+      Die Typen erzwingen die Reihenfolge. `filter { !it.done }` braucht einzelne `Issue`-Objekte, muss also vor `groupBy` stehen – danach gäbe es nur noch `Map.Entry`. `mapValues` arbeitet auf einer `Map<String, List<Issue>>` und macht daraus `Map<String, Int>`. Eine `Map` lässt sich nicht direkt sortieren, darum erst `toList()` (Liste von `Pair`), dann `sortedByDescending` und zurück mit `toMap()`. Das Ergebnis ist eine `LinkedHashMap`, die die sortierte Reihenfolge behält.
+    resources:
+      - title: Kotlin Docs · Grouping
+        url: https://kotlinlang.org/docs/collection-grouping.html
+      - title: Kotlin Docs · Map-specific operations
+        url: https://kotlinlang.org/docs/map-operations.html
+  - id: sicht-und-kopie
+    type: output
+    title: Sicht oder Kopie?
+    prompt: Was gibt dieses Programm aus?
+    lang: kotlin
+    code: |
+      fun main() {
+          val source = mutableListOf("a", "b")
+          val view: List<String> = source
+          val copy = source.toList()
+          source += "c"
+          println(view)
+          println(copy)
+          println(view == copy)
+      }
+    expected: |
+      [a, b, c]
+      [a, b]
+      false
+    explanation: |
+      `view` ist dieselbe Liste wie `source`, nur mit read-only Typ – sie zeigt `c` also mit. `toList()` hat vorher eine neue Liste angelegt, die von späteren Änderungen nichts weiß. `==` vergleicht bei Listen den Inhalt (`equals`), und der unterscheidet sich. Nebenbei: `source += "c"` funktioniert, weil `source` ein `val` vom Typ `MutableList` ist. Bei `var source: MutableList<String>` wäre `+=` mehrdeutig (neue Liste zuweisen oder hinzufügen?) und der Compiler würde einen Fehler melden.
+    resources:
+      - title: Kotlin Docs · Collections overview
+        url: https://kotlinlang.org/docs/collections-overview.html
+      - title: Kotlin API · toList
+        url: https://kotlinlang.org/api/core/kotlin-stdlib/kotlin.collections/to-list.html
+  - id: sequence-reihenfolge
+    type: output
+    title: Wer wird wann aufgerufen?
+    prompt: Was gibt das Programm aus? Achte auf die Reihenfolge der Zeilen.
+    lang: kotlin
+    code: |
+      fun main() {
+          val result = listOf(4, 1, 7, 2, 9)
+              .asSequence()
+              .filter { println("filter $it"); it > 3 }
+              .map { println("map $it"); it * 10 }
+              .first()
+          println(result)
+      }
+    expected: |
+      filter 4
+      map 4
+      40
+    explanation: |
+      Eine Sequence schickt jedes Element einzeln durch die ganze Kette. Die `4` passiert `filter`, wird in `map` zu `40`, und `first()` hat damit sein Ergebnis – die übrigen Elemente werden nie angefasst. Ohne `asSequence()` würde `filter` erst alle fünf Zahlen prüfen, `map` dann `4`, `7` und `9` umwandeln, und erst danach nähme `first()` das erste Element.
+    resources:
+      - title: Kotlin Docs · Sequence processing example
+        url: https://kotlinlang.org/docs/sequences.html#sequence-processing-example
+  - id: leere-listen
+    type: output
+    title: Nichts ist auch ein Ergebnis
+    prompt: Was gibt dieses Programm aus?
+    lang: kotlin
+    code: |
+      fun main() {
+          val empty = emptyList<Int>()
+          println(empty.all { it > 100 })
+          println(empty.any { it > 100 })
+          println(empty.sumOf { it })
+          println(empty.maxOrNull())
+          println(listOf(3, 7, 2).fold("") { acc, n -> acc + n })
+      }
+    expected: |
+      true
+      false
+      0
+      null
+      372
+    explanation: |
+      `all` fragt: „Gibt es ein Element, das die Bedingung verletzt?“ – bei einer leeren Liste nicht, also `true`. `any` braucht mindestens ein passendes Element, also `false`. `sumOf` startet bei `0`, `maxOrNull` hat nichts zum Vergleichen und liefert `null`. `fold` beginnt mit dem Anfangswert `""` und hängt jede Zahl an einen String an – das Ergebnis ist `"372"`, keine Summe. Genau diese Randfälle entscheiden im echten Code darüber, ob ein leerer Bildschirm funktioniert oder abstürzt.
+    resources:
+      - title: Kotlin Docs · Aggregate operations
+        url: https://kotlinlang.org/docs/collection-aggregate.html
+      - title: Kotlin Docs · Test predicates
+        url: https://kotlinlang.org/docs/collection-filtering.html#test-predicates
+  - id: collections-erzeugen
+    type: gap
+    title: Nachschlagen, Konfiguration, Menü
+    prompt: |
+      Ergänze die Lücken:
+
+      1. `usersById` soll ein Nachschlagen per ID in konstanter Zeit ermöglichen.
+      2. `limits` ist eine feste Map von Tarif zu Projektlimit.
+      3. `menu` wird bedingt zusammengebaut und ist danach read-only.
+    lang: kotlin
+    code: |
+      data class User(val id: String, val name: String)
+
+      val users = listOf(User("u1", "Ada"), User("u2", "Linus"))
+      val usersById: Map<String, User> = users.⟦associateBy⟧ { it.id }
+
+      val limits: Map<String, Int> = ⟦mapOf⟧("free" ⟦to⟧ 3, "pro" to 50)
+
+      fun menu(isAdmin: Boolean): List<String> = ⟦buildList⟧ {
+          add("Übersicht")
+          if (isAdmin) add("Benutzerverwaltung")
+      }
+    gaps:
+      - label: Liste → Map mit ID als Schlüssel
+        hint: Die Funktion ordnet jedem Element einen Schlüssel zu, das Element selbst wird zum Wert.
+      - label: feste Map erzeugen
+        hint: Das Gegenstück zu `listOf` für Maps.
+      - label: Paar bilden
+        hint: Eine Infix-Funktion aus zwei Buchstaben, die ein `Pair` erzeugt.
+      - label: Liste bauen
+        hint: Ein Builder, in dessen Lambda `add` verfügbar ist und der eine read-only `List` zurückgibt.
+    explanation: |
+      `associateBy { it.id }` baut einmalig eine `Map<String, User>`; danach ist `usersById["u1"]` ein Hash-Lookup statt einer Suche durch die Liste. Bei doppelten IDs gewinnt das letzte Element. `mapOf` mit `to` ist die idiomatische Map-Schreibweise – `to` erzeugt ein `Pair`. `buildList` gibt dir im Lambda eine `MutableList` als Empfänger und liefert am Ende eine `List` zurück, sodass niemand das Ergebnis über diese Referenz verändern kann.
+    resources:
+      - title: Kotlin Docs · Constructing collections
+        url: https://kotlinlang.org/docs/constructing-collections.html#create-with-collection-builder-functions
+      - title: Kotlin API · associateBy
+        url: https://kotlinlang.org/api/core/kotlin-stdlib/kotlin.collections/associate-by.html
+  - id: defensive-kopie
+    type: gap
+    title: Den Warenkorb schützen
+    prompt: |
+      `Cart` soll seine Positionen intern verändern, nach außen aber nur einen **Schnappschuss** herausgeben. Aufrufer dürfen die interne Liste weder verändern noch durch einen Cast an sie herankommen. Ergänze die Lücken.
+    lang: kotlin
+    code: |
+      data class Item(val sku: String, val quantity: Int)
+
+      class Cart {
+          private val _items = ⟦mutableListOf⟧<Item>()
+
+          val items: ⟦List⟧<Item>
+              get() = _items.⟦toList()⟧
+
+          fun add(item: Item) {
+              _items.add(item)
+          }
+      }
+    gaps:
+      - label: interne, veränderliche Liste
+        hint: Eine leere, veränderliche Liste mit explizitem Typargument.
+      - label: öffentlicher Typ
+        hint: Das read-only Interface.
+      - label: Schnappschuss
+        hint: Eine Funktion, die eine neue Liste mit denselben Elementen erzeugt.
+        accept: ["toList( )"]
+    explanation: |
+      Das Muster „privat veränderlich, öffentlich read-only“ kennst du später von `MutableStateFlow`/`StateFlow`. Würde der Getter `_items` direkt zurückgeben, wäre der Typ zwar `List`, aber ein Aufrufer könnte mit `cart.items as MutableList<Item>` an die interne Liste gelangen – und er sähe spätere Änderungen mit. `toList()` erzeugt bei jedem Zugriff eine Kopie. Das kostet O(n) pro Aufruf; für einen Warenkorb ist das egal, für eine Liste mit 100 000 Einträgen, die in einer Schleife abgefragt wird, nicht.
+    resources:
+      - title: Kotlin Docs · Collections overview
+        url: https://kotlinlang.org/docs/collections-overview.html
+  - id: mehrstufig-sortieren
+    type: gap
+    title: Das Board sortieren
+    prompt: |
+      Sortiere die Issues so: **offene zuerst** (`done == false`), innerhalb davon nach Punkten **absteigend**, bei Gleichstand nach `key` **aufsteigend**. Die Originalliste bleibt unverändert.
+    lang: kotlin
+    code: |
+      val board: List<Issue> = issues.⟦sortedWith⟧(
+          ⟦compareBy⟧<Issue> { it.done }
+              .⟦thenByDescending⟧ { it.points }
+              .⟦thenBy⟧ { it.key }
+      )
+    gaps:
+      - label: neue sortierte Liste mit Comparator
+        hint: Die Variante, die einen `Comparator` annimmt und eine neue Liste zurückgibt.
+      - label: erster Comparator
+        hint: Baut einen Comparator aus einer Selektor-Lambda.
+      - label: zweites Kriterium, absteigend
+        hint: "`thenBy`, aber in umgekehrter Richtung."
+      - label: drittes Kriterium
+        hint: Aufsteigend, als weiteres Kriterium angehängt.
+    explanation: |
+      `sortedWith` nimmt einen `Comparator` und gibt eine neue Liste zurück; `sortWith` würde eine `MutableList` an Ort und Stelle sortieren. `compareBy { it.done }` sortiert `false` vor `true`, weil `Boolean` `Comparable` ist und `false < true` gilt. `thenByDescending` und `thenBy` greifen nur, wenn alle vorherigen Kriterien Gleichstand melden. Die Typangabe `compareBy<Issue>` ist nötig, weil der Compiler den Typ von `it` sonst nicht ableiten kann, bevor `thenBy…` angehängt wird.
+    resources:
+      - title: Kotlin Docs · Custom orders
+        url: https://kotlinlang.org/docs/collection-ordering.html#custom-orders
+      - title: Kotlin API · thenBy
+        url: https://kotlinlang.org/api/core/kotlin-stdlib/kotlin.comparisons/then-by.html
+  - id: stuecke-und-fenster
+    type: gap
+    title: Batches, Fenster, Differenzen
+    prompt: |
+      Ergänze die drei Aufrufe:
+
+      1. Die API nimmt höchstens **50** IDs pro Anfrage – teile `ids` in Batches.
+      2. Glätte die Messwerte mit einem gleitenden Durchschnitt über je **3** aufeinanderfolgende Werte.
+      3. Berechne die Differenz zwischen jeweils zwei aufeinanderfolgenden Zählerständen.
+    lang: kotlin
+    code: |
+      val ids: List<String> = (1..120).map { "ISS-$it" }
+      val batches: List<List<String>> = ids.⟦chunked(50)⟧
+
+      val readings = listOf(20.0, 22.0, 30.0, 26.0, 24.0)
+      val smoothed: List<Double> = readings.⟦windowed(3)⟧ { it.average() }
+
+      val counters = listOf(100, 104, 111, 111)
+      val deltas: List<Int> = counters.⟦zipWithNext⟧ { a, b -> b - a }
+    gaps:
+      - label: Batches
+        hint: Teilt eine Liste in nicht überlappende Stücke fester Größe.
+        accept: ["chunked(size = 50)"]
+      - label: gleitendes Fenster
+        hint: Überlappende Fenster, Schrittweite 1 ist der Standard.
+        accept: ["windowed(size = 3)", "windowed(3, 1)", "windowed(3, step = 1)", "windowed(size = 3, step = 1)"]
+      - label: Nachbarpaare
+        hint: Wie `zip`, aber mit dem jeweils nächsten Element derselben Liste.
+    explanation: |
+      `chunked(50)` liefert nicht überlappende Stücke – hier `[50, 50, 20]` Elemente; das letzte Stück darf kleiner sein. `windowed(3)` liefert überlappende Fenster mit Schrittweite 1, also `[20, 22, 30]`, `[22, 30, 26]`, `[30, 26, 24]`, und die Lambda macht aus jedem Fenster direkt einen Durchschnitt. `zipWithNext` bildet Paare aus Nachbarn, das Ergebnis ist `[4, 7, 0]`. Alle drei gibt es auch auf Sequences.
+    resources:
+      - title: Kotlin Docs · Retrieve collection parts
+        url: https://kotlinlang.org/docs/collection-parts.html
+      - title: Kotlin API · windowed
+        url: https://kotlinlang.org/api/core/kotlin-stdlib/kotlin.collections/windowed.html
+  - id: sortiert-aber-nicht
+    type: bug
+    title: Die Top 3 sind zufällig
+    prompt: |
+      `topThree` soll die drei Issues mit den meisten Punkten liefern. Für `A(1), B(5), C(3), D(2)` kommt aber `[A, B, C]` heraus statt `[B, C, D]`. Der Code kompiliert und wirft keinen Fehler. Finde die fehlerhafte Zeile und korrigiere sie so, dass `sorted` danach wirklich sortiert ist.
+    lang: kotlin
+    code: |
+      fun topThree(issues: List<Issue>): List<Issue> {
+          val sorted = issues.toMutableList()
+          sorted.sortedByDescending { it.points }
+          return sorted.take(3)
+      }
+    lines: [3]
+    fix:
+      - line: 3
+        answers:
+          - "sorted.sortByDescending { it.points }"
+          - "sorted.sortBy { -it.points }"
+          - "sorted.sortWith(compareByDescending { it.points })"
+    explanation: |
+      `sortedByDescending` gibt eine **neue** sortierte Liste zurück und lässt `sorted` unverändert – das Ergebnis wird hier weggeworfen. Die In-place-Variante heißt `sortByDescending` und existiert nur auf `MutableList`. Wer aus JavaScript kommt, kennt `array.sort()` als verändernde Operation und fällt hier besonders leicht herein. Noch einfacher wäre der ganze Körper als `issues.sortedByDescending { it.points }.take(3)` – ohne Kopie und ohne veränderlichen Zustand.
+    resources:
+      - title: Kotlin Docs · List write operations (sort)
+        url: https://kotlinlang.org/docs/list-operations.html#sort
+  - id: leere-reduktion
+    type: bug
+    title: Absturz bei erledigten Teams
+    prompt: |
+      Der Bildschirm „Offene Punkte“ stürzt ab, sobald ein Team **alle** Issues erledigt hat:
+
+      ```text
+      java.lang.UnsupportedOperationException: Empty collection can't be reduced.
+      ```
+
+      Finde die Zeile und korrigiere sie, sodass für eine leere Liste `0` herauskommt.
+    lang: kotlin
+    code: |
+      fun openPoints(issues: List<Issue>): Int =
+          issues
+              .filter { !it.done }
+              .map { it.points }
+              .reduce { total, points -> total + points }
+    lines: [5]
+    fix:
+      - line: 5
+        answers:
+          - ".sum()"
+          - ".fold(0) { total, points -> total + points }"
+          - ".fold(0) { acc, points -> acc + points }"
+          - ".fold(0) { acc, p -> acc + p }"
+          - ".fold(0, Int::plus)"
+          - ".reduceOrNull { total, points -> total + points } ?: 0"
+    explanation: |
+      `reduce` nimmt das erste Element als Startwert. Gibt es keines, gibt es kein sinnvolles Ergebnis – also wirft `reduce`. `fold(0) { … }` startet mit einem expliziten Anfangswert und liefert bei leerer Liste genau diesen. Für Summen ist `sum()` am klarsten; noch kürzer wäre es, `map` und `reduce` durch `sumOf { it.points }` zu ersetzen. Die Regel: `reduce` nur, wenn eine leere Collection fachlich unmöglich ist.
+    resources:
+      - title: Kotlin Docs · Fold and reduce
+        url: https://kotlinlang.org/docs/collection-aggregate.html#fold-and-reduce
+  - id: join-erklaeren
+    type: explain
+    title: Autoren zuordnen
+    prompt: |
+      Ein Kollege hat diese Funktion geschrieben, die jedem Issue seinen Autor zuordnet. Erkläre im Code-Review, **wie** sie arbeitet, **welche Laufzeit** sie hat und welches **Verhalten bei Sonderfällen** (unbekannte oder doppelte User-IDs) sie zeigt.
+    lang: kotlin
+    code: |
+      data class Issue(val key: String, val authorId: String)
+      data class User(val id: String, val name: String)
+      data class IssueWithAuthor(val issue: Issue, val author: User)
+
+      fun attachAuthors(issues: List<Issue>, users: List<User>): List<IssueWithAuthor> {
+          val usersById = users.associateBy { it.id }
+          return issues.mapNotNull { issue ->
+              val author = usersById[issue.authorId] ?: return@mapNotNull null
+              IssueWithAuthor(issue, author)
+          }
+      }
+    points:
+      - "`associateBy` baut einmal eine Map von ID zu User – O(m) für m User."
+      - Jedes Nachschlagen in der Map ist im Mittel O(1), insgesamt also O(n + m) statt O(n · m) mit `users.find { … }` pro Issue.
+      - "`return@mapNotNull null` verlässt nur die Lambda für dieses Issue; `mapNotNull` lässt `null` weg, Issues ohne bekannten Autor fallen also still heraus."
+      - Bei doppelten User-IDs gewinnt der letzte User in der Liste, ohne Fehlermeldung.
+    explanation: |
+      Die Funktion ist ein Hash-Join: `users.associateBy { it.id }` erzeugt einmal eine `Map<String, User>` (O(m)), danach kostet jedes Nachschlagen im Mittel O(1). Insgesamt ist das O(n + m). Die naive Variante mit `users.find { it.id == issue.authorId }` für jedes Issue wäre O(n · m) – bei 1 000 Issues und 1 000 Usern eine Million Vergleiche. `return@mapNotNull null` ist ein Label-Return: Er beendet nur die aktuelle Lambda-Ausführung, nicht `attachAuthors`. Weil `mapNotNull` `null`-Ergebnisse verwirft, verschwinden Issues mit unbekanntem Autor kommentarlos – im Review würde ich fragen, ob das fachlich gewollt ist oder ob man sie loggen oder als „Unbekannt“ anzeigen sollte. Doppelte User-IDs führen dazu, dass der letzte User gewinnt, weil `associateBy` bei gleichen Schlüsseln überschreibt.
+    resources:
+      - title: Kotlin API · associateBy
+        url: https://kotlinlang.org/api/core/kotlin-stdlib/kotlin.collections/associate-by.html
+      - title: Kotlin Docs · Return to labels
+        url: https://kotlinlang.org/docs/returns.html#return-to-labels
+  - id: zeiterfassung
+    type: practice
+    title: Wochenbericht aus der Zeiterfassung
+    prompt: |
+      Ein Team erfasst Zeiten pro Issue. Schreibe drei Funktionen – ohne `for`-Schleifen, nur mit Collection-Operationen:
+
+      1. `minutesPerTeam(entries)` liefert eine `Map<String, Int>` mit der Summe der Minuten pro Team, **absteigend** nach Minuten sortiert.
+      2. `topIssues(entries, n)` liefert die `n` Issues mit den meisten Minuten als `List<Pair<String, Int>>`; bei Gleichstand entscheidet der Issue-Key alphabetisch.
+      3. `splitValid(entries)` trennt gültige Einträge (1 bis 600 Minuten) von ungültigen und gibt beides als `Pair` zurück.
+
+      Teste mit dem `main` aus dem Startcode. Leere Listen dürfen nicht abstürzen. Du kannst den Code in IntelliJ IDEA, Android Studio oder im [Kotlin Playground](https://play.kotlinlang.org/) ausführen.
+    lang: kotlin
+    starter: |
+      data class TimeEntry(val issueKey: String, val team: String, val minutes: Int)
+
+      fun minutesPerTeam(entries: List<TimeEntry>): Map<String, Int> = TODO()
+
+      fun topIssues(entries: List<TimeEntry>, n: Int): List<Pair<String, Int>> = TODO()
+
+      fun splitValid(entries: List<TimeEntry>): Pair<List<TimeEntry>, List<TimeEntry>> = TODO()
+
+      fun main() {
+          val entries = listOf(
+              TimeEntry("APP-1", "app", 90),
+              TimeEntry("WEB-4", "web", 45),
+              TimeEntry("APP-1", "app", 30),
+              TimeEntry("APP-7", "app", 120),
+              TimeEntry("WEB-2", "web", 0),
+              TimeEntry("OPS-3", "ops", 720),
+          )
+          println(minutesPerTeam(entries))  // {ops=720, app=240, web=45}
+          println(topIssues(entries, 2))    // [(OPS-3, 720), (APP-1, 120)] – APP-1 und APP-7 gleichauf
+          println(splitValid(entries).second.map { it.issueKey })  // [WEB-2, OPS-3]
+          println(minutesPerTeam(emptyList()))  // {}
+      }
+    solution: |
+      data class TimeEntry(val issueKey: String, val team: String, val minutes: Int)
+
+      fun minutesPerTeam(entries: List<TimeEntry>): Map<String, Int> =
+          entries
+              .groupBy { it.team }
+              .mapValues { (_, teamEntries) -> teamEntries.sumOf { it.minutes } }
+              .toList()
+              .sortedByDescending { (_, minutes) -> minutes }
+              .toMap()
+
+      fun topIssues(entries: List<TimeEntry>, n: Int): List<Pair<String, Int>> =
+          entries
+              .groupingBy { it.issueKey }
+              .fold(0) { total, entry -> total + entry.minutes }
+              .toList()
+              .sortedWith(
+                  compareByDescending<Pair<String, Int>> { it.second }
+                      .thenBy { it.first }
+              )
+              .take(n)
+
+      fun splitValid(entries: List<TimeEntry>): Pair<List<TimeEntry>, List<TimeEntry>> =
+          entries.partition { it.minutes in 1..600 }
+
+      fun main() {
+          val entries = listOf(
+              TimeEntry("APP-1", "app", 90),
+              TimeEntry("WEB-4", "web", 45),
+              TimeEntry("APP-1", "app", 30),
+              TimeEntry("APP-7", "app", 120),
+              TimeEntry("WEB-2", "web", 0),
+              TimeEntry("OPS-3", "ops", 720),
+          )
+          println(minutesPerTeam(entries))  // {ops=720, app=240, web=45}
+          println(topIssues(entries, 2))    // [(OPS-3, 720), (APP-1, 120)]
+          println(splitValid(entries).second.map { it.issueKey })  // [WEB-2, OPS-3]
+          println(minutesPerTeam(emptyList()))  // {}
+      }
+    checklist:
+      - Keine `for`-Schleife und keine `MutableList` – nur Collection-Operationen.
+      - "`minutesPerTeam` gruppiert, summiert mit `sumOf` und sortiert über `toList()`/`toMap()`, weil sich eine `Map` nicht direkt sortieren lässt."
+      - "`topIssues` summiert **pro Issue** (nicht pro Eintrag) und sortiert mit einem zweistufigen `Comparator`."
+      - "`splitValid` nutzt `partition` mit einem Bereich `1..600` statt zweier `filter`-Aufrufe."
+      - Die Ausgabe von `main` stimmt mit den Kommentaren überein, auch für die leere Liste.
+    explanation: |
+      `groupBy` + `mapValues` + `sumOf` ist das Standardmuster für „Summe pro Schlüssel“. Die Musterlösung zeigt für `topIssues` eine Alternative: `groupingBy { … }.fold(0) { … }` aggregiert direkt, ohne für jede Gruppe erst eine Liste anzulegen – bei großen Datenmengen spart das Speicher. Eine `Map` hat keine Sortierfunktion; der Umweg über `toList()` und `toMap()` erzeugt eine `LinkedHashMap`, die die sortierte Reihenfolge behält. `partition` durchläuft die Liste nur einmal, zwei `filter`-Aufrufe zweimal. Weil keine Funktion `reduce`, `first()` oder `maxOf` benutzt, funktionieren alle drei auch mit leeren Listen.
+    resources:
+      - title: Kotlin Docs · Grouping (groupingBy)
+        url: https://kotlinlang.org/docs/collection-grouping.html
+      - title: Kotlin Docs · Partition
+        url: https://kotlinlang.org/docs/collection-filtering.html#partition

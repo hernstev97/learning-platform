@@ -3,7 +3,7 @@ import './styles/layout.css';
 import './styles/content.css';
 import './styles/exercise.css';
 import './styles/pages.css';
-import { catalog, getStorageWarning, onStorageChange, summaryOf } from './app.ts';
+import { catalog, getStorageWarning, loadArea, onStorageChange, summaryOf } from './app.ts';
 import { $, html } from './ui/dom.ts';
 import type { Page } from './router.ts';
 import { navigate, parseRoute, startRouter } from './router.ts';
@@ -62,8 +62,13 @@ async function render(): Promise<void> {
   if (token !== renderToken) return;
   if (area === undefined && 'area' in route) page = (await import('./pages/not-found.ts')).default;
   try {
+    // Finish lazy content loading before a page can touch the shared main element.
+    // A slower earlier navigation must not overwrite the page selected in the meantime.
+    if (area && !['home', 'data', 'area', 'not-found'].includes(route.name)) await loadArea(area.id);
+    if (token !== renderToken) return;
     cleanup = await page(main, route as never);
   } catch (error) {
+    if (token !== renderToken) return;
     console.error(error);
     main.innerHTML = html`<section class="page narrow"><h1 class="page-title" tabindex="-1">Fehler</h1><p>Diese Seite konnte nicht geladen werden: ${String((error as Error).message)}</p><p><a class="btn" href="/">Zur Startseite</a></p></section>`.value;
   }
@@ -72,7 +77,8 @@ async function render(): Promise<void> {
 }
 
 startRouter(async (scroll) => {
+  const requested = location.href;
   await render();
-  scroll();
+  if (location.href === requested) scroll();
 });
 export { navigate };

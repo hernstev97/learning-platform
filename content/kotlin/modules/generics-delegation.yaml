@@ -1,0 +1,688 @@
+id: generics-delegation
+title: Generics & Delegation
+level: 3
+minutes: 160
+summary: Typsichere, wiederverwendbare Bausteine – generische Klassen und Funktionen, Varianz mit out und in, Type Erasure, Klassen-Delegation mit by und eigene Property Delegates.
+goals:
+  - Du schreibst generische Klassen und Funktionen und schränkst Typparameter mit Upper Bounds und `where` ein.
+  - Du erklärst Varianz mit `out` und `in` an `List<out E>` und `Comparable<in T>` und entscheidest zwischen Declaration-site und Use-site Varianz.
+  - Du erkennst, was Type Erasure zur Laufzeit verhindert, und nutzt Star Projections und `reified` als Ausweg.
+  - Du ersetzt Vererbung durch Klassen-Delegation mit `by` und kennst deren Grenze bei Selbstaufrufen.
+  - Du wählst zwischen `lazy`, `Delegates.observable`, `vetoable` und Map-Delegation und schreibst eigene Delegates mit `ReadWriteProperty`.
+resources:
+  - title: Kotlin Docs · Generics – in, out, where
+    url: https://kotlinlang.org/docs/generics.html
+  - title: Kotlin Docs · Delegation
+    url: https://kotlinlang.org/docs/delegation.html
+  - title: Kotlin Docs · Delegated properties
+    url: https://kotlinlang.org/docs/delegated-properties.html
+  - title: Kotlin API · kotlin.properties
+    url: https://kotlinlang.org/api/core/kotlin-stdlib/kotlin.properties/
+lesson: |
+  In Bear stehen Zeilen wie `var text by remember { mutableStateOf("") }` oder `val Context.dataStore by preferencesDataStore(name = "settings")`, und in jedem ViewModel gibt es einen `StateFlow<UiState>`, dem man `UiState.Loading` zuweisen darf, obwohl `Loading` gar keinen Typparameter hat. Beides funktioniert, weil zwei Sprachmechanismen im Hintergrund arbeiten: **Generics mit Varianz** und **Delegation mit `by`**.
+
+  Solange alles kompiliert, merkst du davon wenig. Sobald du selbst eine wiederverwendbare Klasse schreibst – einen Cache, einen Ergebnistyp, einen Wrapper um SharedPreferences –, brauchst du das Modell dahinter. Sonst endet es in `Any`-Casts, in Compilerfehlern wie „argument type mismatch: actual type is 'MutableList<Int>', but 'MutableList<Number>' was expected“ oder in Delegates, die an der falschen Stelle Speicher halten.
+
+  ## Generische Klassen und Funktionen
+
+  Ein Typparameter ist ein Platzhalter für einen Typ, den erst der Aufrufer festlegt. Die Klasse wird einmal geschrieben und für jeden Typ typsicher benutzt ([Generics](https://kotlinlang.org/docs/generics.html)):
+
+  ```kotlin
+  class Cache<K, V>(private val maxSize: Int) {
+      private val entries = LinkedHashMap<K, V>()
+
+      operator fun get(key: K): V? = entries[key]
+
+      fun put(key: K, value: V) {
+          if (entries.size >= maxSize) entries.remove(entries.keys.first())
+          entries[key] = value
+      }
+  }
+
+  val avatars = Cache<String, ByteArray>(maxSize = 50)
+  avatars.put("u1", byteArrayOf(1, 2, 3))
+  // avatars.put(42, "x")   // kompiliert nicht: Int ist kein String
+  ```
+
+  Funktionen können eigene Typparameter haben; sie stehen vor dem Funktionsnamen. Meist leitet der Compiler den Typ aus den Argumenten ab, du musst ihn nicht angeben ([Generic functions](https://kotlinlang.org/docs/generics.html#generic-functions)):
+
+  ```kotlin
+  fun <T> List<T>.secondOrNull(): T? = if (size >= 2) this[1] else null
+
+  val second = listOf("Mo", "Di", "Mi").secondOrNull()   // T = String, Ergebnis String?
+  ```
+
+  ### Upper Bounds und where
+
+  Ohne Einschränkung ist die obere Grenze eines Typparameters `Any?` – du darfst also nur, was jedes Objekt kann. Mit einem **Upper Bound** versprichst du mehr und darfst dafür mehr aufrufen ([Upper bounds](https://kotlinlang.org/docs/generics.html#upper-bounds)):
+
+  ```kotlin
+  fun <T : Comparable<T>> clamp(value: T, min: T, max: T): T =
+      if (value < min) min else if (value > max) max else value
+
+  clamp(120, 0, 100)             // 100
+  clamp("m", "a", "k")           // "k"
+
+  // mehrere Bedingungen an denselben Typparameter: where
+  fun <T> longestSorted(items: List<T>): List<T>
+      where T : CharSequence, T : Comparable<T> =
+      items.sortedWith(compareByDescending<T> { it.length }.thenBy { it })
+  ```
+
+  `T : Any` ist ein häufiger Spezialfall: Er schließt `null` als Typargument aus. Das brauchst du etwa, wenn `T?` in deiner Klasse „kein Wert“ bedeuten soll.
+
+  ## Varianz: out, in und invariant
+
+  Hier liegt der Kern des Moduls. `String` ist ein Untertyp von `Any`. Ist dann `MutableList<String>` ein Untertyp von `MutableList<Any>`? Nein – und das ist gut so:
+
+  ```kotlin
+  val names: MutableList<String> = mutableListOf("Ada")
+  // val things: MutableList<Any> = names   // Fehler – zum Glück:
+  // things.add(42)                         // sonst stünde eine Zahl in names
+  // val first: String = names[1]           // und hier gäbe es eine ClassCastException
+  ```
+
+  Generische Typen sind in Kotlin standardmäßig **invariant**: Zwischen `Box<String>` und `Box<Any>` besteht keine Beziehung. Die Beziehung wird erst sicher, wenn man weiß, **in welche Richtung** Werte fließen:
+
+  - **`out T` – Produzent.** Die Klasse gibt `T` nur heraus, nimmt es nie als Parameter an. Dann ist `Producer<String>` ein `Producer<Any>`: Wer `Any` erwartet, kann mit einem `String` leben. Das heißt **kovariant**.
+  - **`in T` – Konsument.** Die Klasse nimmt `T` nur an, gibt es nie heraus. Dann ist `Consumer<Any>` ein `Consumer<String>`: Wer alles annehmen kann, kann auch Strings annehmen. Das heißt **kontravariant**.
+
+  Die Standardbibliothek nutzt beides ([Declaration-site variance](https://kotlinlang.org/docs/generics.html#declaration-site-variance)). `List<out E>` hat nur lesende Methoden, deshalb ist `List<String>` ein `List<Any>`. `Comparable<in T>` hat nur `compareTo(other: T)`, deshalb ist ein `Comparable<Number>` auch ein `Comparable<Int>`:
+
+  ```kotlin
+  val strings: List<String> = listOf("a", "b")
+  val anything: List<Any> = strings                 // ok: List<out E>
+
+  fun demo(byNumber: Comparable<Number>) {
+      val byInt: Comparable<Int> = byNumber         // ok: Comparable<in T>
+  }
+  ```
+
+  Der Compiler prüft das: In einer Klasse mit `out T` darf `T` nicht als Parametertyp einer öffentlichen Methode auftauchen, bei `in T` nicht als Rückgabetyp. Das Merkwort aus der Java-Welt lautet PECS: *Producer Extends, Consumer Super* – in Kotlin also *Producer out, Consumer in*.
+
+  ### Warum UiState.Loading überall passt
+
+  Das Muster, das du in fast jedem Android-Projekt findest, lebt von `out` und dem Typ `Nothing`, der Untertyp **jedes** Typs ist:
+
+  ```kotlin
+  sealed interface UiState<out T> {
+      data object Loading : UiState<Nothing>
+      data class Success<T>(val data: T) : UiState<T>
+      data class Error(val message: String) : UiState<Nothing>
+  }
+
+  val state: UiState<List<String>> = UiState.Loading   // Nothing ist Untertyp von List<String>
+  ```
+
+  Weil `UiState` in `T` kovariant ist, ist `UiState<Nothing>` ein Untertyp von `UiState<List<String>>`, von `UiState<User>` und von jedem anderen `UiState<X>`. Ein einziges `Loading`-Objekt reicht für alle Bildschirme. Ohne `out` müsstest du für jeden Typ ein eigenes `Loading` anlegen.
+
+  ### Use-site Varianz und Star Projection
+
+  Manchmal ist eine Klasse invariant, weil sie in beide Richtungen arbeitet (wie `MutableList`), aber **deine Funktion** nutzt sie nur in einer Richtung. Dann schreibst du `out` oder `in` an die Verwendungsstelle – das heißt **Type Projection** ([Use-site variance](https://kotlinlang.org/docs/generics.html#use-site-variance-type-projections)):
+
+  ```kotlin
+  fun total(values: MutableList<out Number>): Double = values.sumOf { it.toDouble() }
+  fun fillDefaults(target: MutableList<in String>) { target.add("n/a") }
+
+  total(mutableListOf(1, 2, 3))          // MutableList<Int> passt dank out
+  fillDefaults(mutableListOf<Any>())     // MutableList<Any> passt dank in
+  ```
+
+  Innerhalb von `total` darfst du lesen, aber nichts hinzufügen – der Compiler sperrt `add`. Wenn dir der Typ völlig egal ist, nimmst du die **Star Projection** `*`: `MutableList<*>` liest Elemente als `Any?` und verbietet jedes Schreiben ([Star projections](https://kotlinlang.org/docs/generics.html#star-projections)).
+
+  > [!MERKE]
+  > Wer nur liest, nimmt `out`. Wer nur schreibt, nimmt `in`. Wer beides tut, bleibt invariant. Wer den Typ gar nicht braucht, nimmt `*`.
+
+  ## Type Erasure: was zur Laufzeit übrig bleibt
+
+  Auf der JVM werden Typargumente beim Kompilieren **gelöscht**. Zur Laufzeit ist eine `List<String>` einfach eine `List` ([Type erasure](https://kotlinlang.org/docs/generics.html#type-erasure)). Deshalb lehnt der Compiler diese Prüfung ab:
+
+  ```kotlin
+  fun describe(value: Any): String = when (value) {
+      // is List<String> -> …   // error: cannot check for instance of erased type 'List<String>'
+      is List<*> -> "Liste mit ${value.size} Elementen"
+      else -> "etwas anderes"
+  }
+  ```
+
+  `is List<*>` ist erlaubt, weil es nur prüft, was zur Laufzeit wirklich bekannt ist. Die Elemente prüfst du einzeln, etwa mit `value.filterIsInstance<String>()`. Diese Funktion kann `String` zur Laufzeit kennen, weil sie `inline` mit einem `reified` Typparameter ist – der Compiler setzt den konkreten Typ an jeder Aufrufstelle ein. Wie `inline` und `reified` im Detail funktionieren, hat das Modul „Funktionen & Lambdas“ gezeigt ([Reified type parameters](https://kotlinlang.org/docs/inline-functions.html#reified-type-parameters)).
+
+  > [!WARNING] Unchecked Casts
+  > `value as List<String>` kompiliert mit einer Warnung „unchecked cast“. Zur Laufzeit wird nur `List` geprüft. Steckt in Wahrheit eine `List<Int>` dahinter, knallt es erst viel später – beim ersten Zugriff auf ein Element, oft weit entfernt vom eigentlichen Fehler. Nimm die Warnung ernst.
+
+  ## Klassen-Delegation: Komposition mit by
+
+  Vererbung koppelt eng: Wer von `ArrayList` erbt, hängt an jedem Implementierungsdetail der Oberklasse. Kotlins Alternative ist **Klassen-Delegation**: Die Klasse implementiert ein Interface, leitet aber alle Aufrufe automatisch an ein anderes Objekt weiter. Nur, was du anders machen willst, überschreibst du ([Delegation](https://kotlinlang.org/docs/delegation.html)):
+
+  ```kotlin
+  class CountingSet<T>(
+      private val inner: MutableSet<T> = HashSet(),
+  ) : MutableSet<T> by inner {
+      var addCalls = 0
+          private set
+
+      override fun add(element: T): Boolean {
+          addCalls++
+          return inner.add(element)
+      }
+  }
+  ```
+
+  Der Compiler erzeugt für alle anderen Methoden von `MutableSet` Weiterleitungen an `inner`. Du schreibst eine Methode statt fünfzehn.
+
+  Es gibt eine wichtige Grenze: Die Weiterleitung ist **kein** Vererbungsersatz im Sinne von „das Objekt ruft meine Überschreibung auf“. `inner` kennt deinen Wrapper nicht. Ruft `inner.addAll(…)` intern `add` auf, dann seine **eigene** Methode – deine Zählung bekommt davon nichts mit. Die Doku sagt es ausdrücklich: Überschriebene Member werden von den Membern des Delegate-Objekts nicht aufgerufen ([Overriding a member](https://kotlinlang.org/docs/delegation.html#overriding-a-member-of-an-interface-implemented-by-delegation)). Wer alle Wege zählen will, muss `addAll` ebenfalls überschreiben.
+
+  ## Property Delegates: lazy, observable, vetoable, Map
+
+  Auch einzelne Properties lassen sich delegieren: `val x by delegate` bedeutet, dass Lesen `delegate.getValue(…)` aufruft und Schreiben `delegate.setValue(…)`. Die Standardbibliothek liefert die wichtigsten fertig ([Standard delegates](https://kotlinlang.org/docs/delegated-properties.html#standard-delegates)).
+
+  **`lazy`** berechnet einen Wert beim ersten Zugriff und merkt ihn sich. Standardmäßig ist das thread-sicher (`LazyThreadSafetyMode.SYNCHRONIZED`): Nur ein Thread rechnet, alle sehen denselben Wert. `PUBLICATION` erlaubt, dass mehrere Threads gleichzeitig rechnen, der erste Wert gewinnt. `NONE` spart jede Synchronisation und ist nur sicher, wenn garantiert immer derselbe Thread zugreift ([Lazy properties](https://kotlinlang.org/docs/delegated-properties.html#lazy-properties)). Wirft der Initialisierer eine Exception, versucht `lazy` es beim nächsten Zugriff erneut ([lazy](https://kotlinlang.org/api/core/kotlin-stdlib/kotlin/lazy.html)).
+
+  **`Delegates.observable`** ruft nach jeder Zuweisung einen Handler mit altem und neuem Wert auf. **`Delegates.vetoable`** ruft den Handler **vor** der Zuweisung auf; gibt er `false` zurück, bleibt der alte Wert ([Observable properties](https://kotlinlang.org/docs/delegated-properties.html#observable-properties)).
+
+  ```kotlin
+  import kotlin.properties.Delegates
+
+  class EditorSettings {
+      val highlighter: SyntaxHighlighter by lazy { SyntaxHighlighter.load() }  // teuer, erst bei Bedarf
+
+      var theme: String by Delegates.observable("light") { _, old, new ->
+          println("Theme: $old -> $new")
+      }
+
+      var fontSize: Int by Delegates.vetoable(14) { _, _, new -> new in 10..32 }
+  }
+  ```
+
+  Mit **Map-Delegation** liest eine Property ihren Wert aus einer Map unter ihrem eigenen Namen – praktisch für dynamische Daten wie geparstes JSON ([Storing properties in a map](https://kotlinlang.org/docs/delegated-properties.html#storing-properties-in-a-map)). Fehlt der Schlüssel, wirft der Zugriff eine `NoSuchElementException`.
+
+  ```kotlin
+  class FeatureFlags(values: Map<String, Any?>) {
+      val newEditor: Boolean by values
+      val maxUploads: Int by values
+  }
+
+  val flags = FeatureFlags(mapOf("newEditor" to true, "maxUploads" to 3))
+  println(flags.maxUploads)   // 3
+  ```
+
+  ## Eigene Delegates schreiben
+
+  Ein Delegate ist jedes Objekt mit passenden `getValue`- und (für `var`) `setValue`-Operatoren. Am bequemsten implementierst du die Interfaces `ReadOnlyProperty` oder `ReadWriteProperty`; dann gibt die IDE die Signaturen vor ([Property delegate requirements](https://kotlinlang.org/docs/delegated-properties.html#property-delegate-requirements)):
+
+  ```kotlin
+  import kotlin.properties.ReadWriteProperty
+  import kotlin.reflect.KProperty
+
+  class KeyValueStore {
+      private val data = mutableMapOf<String, String>()
+      fun read(key: String): String? = data[key]
+      fun write(key: String, value: String) { data[key] = value }
+  }
+
+  fun KeyValueStore.string(default: String): ReadWriteProperty<Any?, String> =
+      object : ReadWriteProperty<Any?, String> {
+          override fun getValue(thisRef: Any?, property: KProperty<*>): String =
+              read(property.name) ?: default
+
+          override fun setValue(thisRef: Any?, property: KProperty<*>, value: String) =
+              write(property.name, value)
+      }
+
+  class Profile(store: KeyValueStore) {
+      var displayName: String by store.string(default = "Bär")
+  }
+  ```
+
+  Der erste Typparameter von `ReadWriteProperty` ist der Typ des Objekts, das die Property besitzt (`thisRef`), der zweite der Typ des Werts. `property.name` liefert den Namen der Property – hier wird er zum Schlüssel im Store.
+
+  > [!DEEP] Was der Compiler daraus macht
+  > Für `var displayName by store.string(…)` erzeugt der Compiler ein verstecktes Feld `displayName$delegate`, das das Delegate-Objekt hält. Der Getter ruft `displayName$delegate.getValue(this, ::displayName)` auf, der Setter `setValue(this, ::displayName, value)`. Das Delegate wird **einmal** beim Erzeugen des Objekts angelegt, nicht bei jedem Zugriff ([Translation rules](https://kotlinlang.org/docs/delegated-properties.html#translation-rules-for-delegated-properties)).
+
+  > [!PRAXIS] by im Android-Alltag
+  > `by viewModels()` holt ein ViewModel, das Rotationen überlebt. `by remember { mutableStateOf(…) }` in Compose nutzt `getValue`/`setValue`-Extensions auf `State`. `by preferencesDataStore(…)` hängt einen DataStore als Singleton an `Context`. Überall gilt dasselbe Muster: Das Delegate kapselt Lebensdauer oder Speicherort, die Property sieht aus wie ein normales Feld. Im Code-Review fällt vor allem `lazy` auf, das eine `Activity` oder einen `View` im Initialisierer einfängt – das Objekt lebt dann so lange wie der Besitzer des `lazy` und kann ein Memory Leak verursachen.
+
+  ## Häufige Fehler
+
+  - **Invariante Parameter, wo `out` reicht.** Symptom: „argument type mismatch: actual type is 'MutableList<Int>', but 'MutableList<Number>' was expected“. Lösung: `List<Number>` (read-only und kovariant) oder `MutableList<out Number>`.
+  - **Typprüfung auf gelöschte Typen.** `is List<String>` kompiliert nicht, `as List<String>` nur mit Warnung. Lösung: `is List<*>` plus `filterIsInstance`, oder eine `reified`-Funktion.
+  - **Klassen-Delegation für Vererbung halten.** Überschreibst du `add`, ruft das Delegate in `addAll` trotzdem sein eigenes `add` auf.
+  - **`lazy(LazyThreadSafetyMode.NONE)` über Threads hinweg.** Der Initialisierer kann doppelt laufen oder ein halb initialisiertes Objekt sichtbar werden. `NONE` nur, wenn ein einziger Thread (etwa der Main Thread) zugreift.
+  - **`observable` zur Validierung.** Der Handler läuft **nach** der Zuweisung; zum Ablehnen brauchst du `vetoable`.
+  - **Map-Delegation mit fehlenden Schlüsseln.** Der Zugriff wirft `NoSuchElementException`. Für optionale Werte `Map<String, Any?>` mit explizitem `null` füllen oder die Map vorher validieren.
+
+  > [!INTERVIEW] „Erklär mir `out` und `in`.“
+  > Gute Antwort: „`out T` heißt, die Klasse produziert nur `T`s. Dann ist sie kovariant, `List<String>` ist ein `List<Any>`. `in T` heißt, sie konsumiert nur `T`s, dann ist sie kontravariant, wie `Comparable<in T>`: Ein Vergleicher für `Number` taugt auch für `Int`. Ohne Angabe sind Generics invariant, weil eine `MutableList<String>` als `MutableList<Any>` Fremdes aufnehmen könnte. Im Android-Alltag sehe ich das bei `sealed interface UiState<out T>` mit `Loading : UiState<Nothing>`.“ Häufige Anschlussfrage: „Delegation oder Vererbung?“ – Delegation, wenn du Verhalten wiederverwenden willst, ohne dich an die Implementierung der Oberklasse zu binden.
+
+  ## Zusammenfassung
+
+  - Typparameter machen Klassen und Funktionen wiederverwendbar und typsicher. Upper Bounds (`T : Comparable<T>`, `where`) erlauben mehr Operationen.
+  - Generics sind invariant. `out` macht einen Produzenten kovariant, `in` einen Konsumenten kontravariant.
+  - Declaration-site Varianz steht an der Klasse (`List<out E>`), Use-site Varianz an der Verwendung (`MutableList<out Number>`). `*` heißt „Typ egal, nur lesen“.
+  - `Nothing` plus `out` erlaubt ein einziges `Loading`-Objekt für alle `UiState<T>`.
+  - Type Erasure: Zur Laufzeit gibt es keine Typargumente. `is List<*>` geht, `is List<String>` nicht – außer mit `reified`.
+  - `class X : Interface by delegate` leitet alle Aufrufe weiter; Selbstaufrufe im Delegate sehen deine Overrides nicht.
+  - `lazy` (standardmäßig synchronisiert), `observable` (nach der Zuweisung), `vetoable` (davor, mit Veto) und Map-Delegation decken die meisten Fälle ab; eigene Delegates implementieren `ReadWriteProperty`.
+exercises:
+  - id: varianz-zuweisungen
+    type: choice
+    title: Was darf wohin?
+    prompt: |
+      Welche dieser Zuweisungen kompilieren? Die Deklarationen aus der Standardbibliothek: `List<out E>`, `MutableList<E>`, `Comparable<in T>`.
+    options:
+      - text: "`val a: List<Any> = listOf(\"x\")`"
+        correct: true
+        why: "`List` ist in `E` kovariant (`out`). Eine Liste von Strings kann als Liste von `Any` gelesen werden, ohne dass etwas schiefgeht."
+      - text: "`val b: MutableList<Any> = mutableListOf<String>()`"
+        correct: false
+        why: "`MutableList` ist invariant. Über `b` könnte man sonst `b.add(42)` in eine Liste von Strings schreiben."
+      - text: "`val c: Comparable<Int> = numberComparator` mit `numberComparator: Comparable<Number>`"
+        correct: true
+        why: "`Comparable` ist in `T` kontravariant (`in`). Was jede `Number` vergleichen kann, kann auch `Int` vergleichen."
+      - text: "`val d: List<String> = listOf<Any>(\"x\")`"
+        correct: false
+        why: Kovarianz geht nur in eine Richtung. Eine `List<Any>` kann beliebige Objekte enthalten, also ist sie keine `List<String>`.
+    explanation: |
+      Varianz beschreibt, ob die Untertyp-Beziehung der Typargumente auf den generischen Typ übertragen wird. Bei `out` (Produzent) geht sie in dieselbe Richtung: `List<String>` ist ein `List<Any>`. Bei `in` (Konsument) dreht sie sich um: `Comparable<Number>` ist ein `Comparable<Int>`. Ohne Angabe gibt es gar keine Beziehung – `MutableList` muss invariant sein, weil sie liest **und** schreibt.
+    resources:
+      - title: Kotlin Docs · Variance
+        url: https://kotlinlang.org/docs/generics.html#variance
+  - id: delegate-waehlen
+    type: choice
+    title: Welches Delegate passt?
+    prompt: |
+      Eine Einstellung `fontSize` soll nur Werte von 10 bis 32 annehmen. Ungültige Zuweisungen sollen **ignoriert** werden, der alte Wert bleibt. Welche Deklaration erfüllt das?
+    options:
+      - text: "`var fontSize: Int by Delegates.vetoable(14) { _, _, new -> new in 10..32 }`"
+        correct: true
+        why: "`vetoable` ruft den Handler vor der Zuweisung auf. Gibt er `false` zurück, wird die Zuweisung verworfen."
+      - text: "`var fontSize: Int by Delegates.observable(14) { _, _, new -> new in 10..32 }`"
+        correct: false
+        why: "`observable` ruft den Handler erst nach der Zuweisung auf, sein Rückgabewert wird ignoriert. Der ungültige Wert steht dann schon in der Property."
+      - text: "`val fontSize: Int by lazy { 14.coerceIn(10, 32) }`"
+        correct: false
+        why: "`lazy` funktioniert nur mit `val` und berechnet den Wert einmal. Zuweisungen sind gar nicht möglich."
+      - text: "`var fontSize: Int by Delegates.notNull()`"
+        correct: false
+        why: "`notNull` wirft nur eine Exception, wenn vor der ersten Zuweisung gelesen wird. Es prüft keine Wertebereiche."
+    explanation: |
+      Der Unterschied zwischen `observable` und `vetoable` ist der Zeitpunkt: `observable` reagiert nach der Änderung (Logging, UI aktualisieren), `vetoable` entscheidet vorher und kann ablehnen. Wer stattdessen korrigieren will (etwa auf 32 begrenzen), schreibt einen eigenen Setter mit `field = value.coerceIn(10, 32)`.
+    resources:
+      - title: Kotlin Docs · Observable properties
+        url: https://kotlinlang.org/docs/delegated-properties.html#observable-properties
+      - title: Kotlin API · Delegates.vetoable
+        url: https://kotlinlang.org/api/core/kotlin-stdlib/kotlin.properties/-delegates/vetoable.html
+  - id: delegation-zaehlt-falsch
+    type: output
+    title: Wie oft wurde gezählt?
+    prompt: Was gibt das Programm aus?
+    lang: kotlin
+    code: |
+      class CountingSet<T>(
+          private val inner: MutableSet<T> = HashSet(),
+      ) : MutableSet<T> by inner {
+          var addCalls = 0
+
+          override fun add(element: T): Boolean {
+              addCalls++
+              return inner.add(element)
+          }
+      }
+
+      fun main() {
+          val tags = CountingSet<String>()
+          tags.add("kotlin")
+          tags.addAll(listOf("android", "compose"))
+          println(tags.size)
+          println(tags.addCalls)
+      }
+    expected: |
+      3
+      1
+    explanation: |
+      `addAll` ist nicht überschrieben, also leitet der Compiler den Aufruf an `inner` weiter. Das `HashSet` fügt die Elemente über **sein eigenes** `add` hinzu – es weiß nichts von `CountingSet`. Die Menge enthält danach drei Elemente, gezählt wurde aber nur der direkte Aufruf. Bei echter Vererbung von `HashSet` wäre es umgekehrt: Dort ruft `addAll` das überschriebene `add` auf. Klassen-Delegation ist Komposition, keine Vererbung.
+    resources:
+      - title: Kotlin Docs · Overriding a member of an interface implemented by delegation
+        url: https://kotlinlang.org/docs/delegation.html#overriding-a-member-of-an-interface-implemented-by-delegation
+  - id: delegates-reihenfolge
+    type: output
+    title: Wann läuft welcher Handler?
+    prompt: Was gibt das Programm aus?
+    lang: kotlin
+    code: |
+      import kotlin.properties.Delegates
+
+      class Settings {
+          val cache: String by lazy {
+              println("lade Cache")
+              "bereit"
+          }
+          var theme: String by Delegates.observable("hell") { _, old, new ->
+              println("theme $old -> $new")
+          }
+          var fontSize: Int by Delegates.vetoable(14) { _, _, new -> new in 10..32 }
+      }
+
+      fun main() {
+          val s = Settings()
+          println("erstellt")
+          s.theme = "dunkel"
+          s.fontSize = 50
+          println(s.fontSize)
+          println(s.cache)
+          println(s.cache)
+      }
+    expected: |
+      erstellt
+      theme hell -> dunkel
+      14
+      lade Cache
+      bereit
+      bereit
+    explanation: |
+      `lazy` rechnet nicht beim Erzeugen des Objekts, sondern beim ersten Lesen – darum steht „lade Cache“ erst nach „erstellt“ und nur einmal. `observable` meldet sich nach der Zuweisung mit altem und neuem Wert. `vetoable` lehnt `50` ab, weil der Handler `false` liefert; `fontSize` bleibt `14`, und es gibt keine Fehlermeldung.
+    resources:
+      - title: Kotlin Docs · Standard delegates
+        url: https://kotlinlang.org/docs/delegated-properties.html#standard-delegates
+  - id: uistate-varianz
+    type: gap
+    title: Ein Loading für alle
+    prompt: |
+      Ergänze die Deklaration so, dass `UiState.Loading` und `UiState.Error` einer Variable **jedes** `UiState<X>`-Typs zugewiesen werden können.
+    lang: kotlin
+    code: |
+      sealed interface UiState<⟦out⟧ T> {
+          data object Loading : UiState<⟦Nothing⟧>
+          data class Success<T>(val data: T) : UiState<T>
+          data class Error(val message: String) : UiState<Nothing>
+      }
+
+      val profile: UiState<String> = UiState.Loading
+      val feed: UiState<List<Int>> = UiState.Error("offline")
+    gaps:
+      - label: Varianz-Modifikator
+        hint: "`UiState` gibt `T` nur heraus (über `Success.data`), nimmt es nie an."
+      - label: Typargument für Loading
+        hint: Der Typ, der Untertyp jedes anderen Typs ist und keine Werte hat.
+    explanation: |
+      `out T` macht `UiState` kovariant: Ist `A` ein Untertyp von `B`, dann ist `UiState<A>` ein Untertyp von `UiState<B>`. `Nothing` ist Untertyp von allem, also ist `UiState<Nothing>` Untertyp von `UiState<String>`, `UiState<List<Int>>` und jedem anderen `UiState<X>`. Ohne `out` wäre `UiState` invariant, und die Zuweisungen würden nicht kompilieren.
+    resources:
+      - title: Kotlin Docs · Declaration-site variance
+        url: https://kotlinlang.org/docs/generics.html#declaration-site-variance
+      - title: Kotlin Docs · Nothing type
+        url: https://kotlinlang.org/docs/exceptions.html#the-nothing-type
+  - id: bounds-und-where
+    type: gap
+    title: Typen einschränken
+    prompt: |
+      1. `clamp` soll für alle vergleichbaren Typen funktionieren (`Int`, `String`, `LocalDate` …).
+      2. `shortestFirst` braucht Elemente, die **sowohl** `CharSequence` **als auch** vergleichbar sind.
+    lang: kotlin
+    code: |
+      fun <⟦T : Comparable<T>⟧> clamp(value: T, min: T, max: T): T =
+          if (value < min) min else if (value > max) max else value
+
+      fun <T> shortestFirst(items: List<T>): List<T>
+          ⟦where⟧ T : CharSequence, T : Comparable<T> =
+          items.sortedWith(compareBy<T> { it.length }.thenBy { it })
+    gaps:
+      - label: Typparameter mit Upper Bound
+        hint: Der Typ muss sich mit sich selbst vergleichen lassen.
+      - label: mehrere Bedingungen
+        hint: Ein Schlüsselwort aus fünf Buchstaben nach der Signatur.
+    explanation: |
+      Mit `T : Comparable<T>` versprichst du, dass sich jedes `T` mit einem anderen `T` vergleichen lässt – deshalb darfst du `<` und `>` benutzen, die auf `compareTo` abgebildet werden. Brauchst du mehr als eine Bedingung, stehen sie in einer `where`-Klausel hinter der Signatur. In `shortestFirst` darfst du dadurch `it.length` (aus `CharSequence`) und die natürliche Ordnung (aus `Comparable`) nutzen.
+    resources:
+      - title: Kotlin Docs · Upper bounds
+        url: https://kotlinlang.org/docs/generics.html#upper-bounds
+  - id: eigenes-delegate
+    type: gap
+    title: Ein Delegate für den Key-Value-Store
+    prompt: |
+      Vervollständige das Delegate, das eine `String`-Property in einem `KeyValueStore` unter ihrem Namen speichert.
+    lang: kotlin
+    code: |
+      import kotlin.properties.ReadWriteProperty
+      import kotlin.reflect.KProperty
+
+      class KeyValueStore {
+          private val data = mutableMapOf<String, String>()
+          fun read(key: String): String? = data[key]
+          fun write(key: String, value: String) { data[key] = value }
+      }
+
+      class StoredString(
+          private val store: KeyValueStore,
+          private val default: String,
+      ) : ⟦ReadWriteProperty⟧<Any?, String> {
+          override fun getValue(thisRef: Any?, property: KProperty<*>): String =
+              store.read(⟦property.name⟧) ?: default
+
+          override fun ⟦setValue⟧(thisRef: Any?, property: KProperty<*>, value: String) {
+              store.write(property.name, value)
+          }
+      }
+
+      class Profile(store: KeyValueStore) {
+          var displayName: String ⟦by⟧ StoredString(store, "Bär")
+      }
+    gaps:
+      - label: Interface für lesende und schreibende Delegates
+        hint: Es gibt eine Variante nur zum Lesen und eine zum Lesen und Schreiben.
+      - label: Schlüssel
+        hint: Der Name der Property, an der das Delegate hängt, steht im `KProperty`-Objekt.
+      - label: Setter-Operator
+        hint: Das Gegenstück zu `getValue`.
+      - label: Delegation
+        hint: Das Schlüsselwort, das eine Property an ein Objekt weiterreicht.
+    explanation: |
+      `ReadWriteProperty<in T, V>` legt `getValue` und `setValue` fest; `T` ist der Typ des Besitzers (`thisRef`), `V` der Typ des Werts. Mit `Any?` als Besitzertyp kann das Delegate an jeder Klasse und sogar an lokalen Variablen hängen. `property.name` macht den Property-Namen zum Schlüssel, sodass `displayName` unter `"displayName"` gespeichert wird. Der Compiler legt für `displayName` ein verstecktes Feld mit dem `StoredString`-Objekt an und leitet Getter und Setter dorthin.
+    resources:
+      - title: Kotlin Docs · Property delegate requirements
+        url: https://kotlinlang.org/docs/delegated-properties.html#property-delegate-requirements
+      - title: Kotlin API · ReadWriteProperty
+        url: https://kotlinlang.org/api/core/kotlin-stdlib/kotlin.properties/-read-write-property/
+  - id: lazy-modus
+    type: gap
+    title: lazy bewusst konfigurieren
+    prompt: |
+      `formatter` wird **nur vom Main Thread** gelesen und soll ohne Synchronisations-Overhead lazy erzeugt werden. `config` wird von mehreren Threads gelesen; es ist harmlos, wenn der Initialisierer dabei mehrfach läuft, solange am Ende alle denselben Wert sehen. Ergänze die Modi.
+    lang: kotlin
+    code: |
+      import java.text.NumberFormat
+
+      class PriceScreen {
+          val formatter: NumberFormat by lazy(LazyThreadSafetyMode.⟦NONE⟧) {
+              NumberFormat.getCurrencyInstance()
+          }
+      }
+
+      class Repository(private val loadConfig: () -> Map<String, String>) {
+          val config: Map<String, String> by lazy(LazyThreadSafetyMode.⟦PUBLICATION⟧) {
+              loadConfig()
+          }
+      }
+    gaps:
+      - label: nur ein Thread
+        hint: Der Modus ohne jede Thread-Sicherheit.
+      - label: mehrere Threads, doppelte Berechnung erlaubt
+        hint: Mehrere dürfen rechnen, veröffentlicht wird der erste fertige Wert.
+    explanation: |
+      Standard ist `SYNCHRONIZED`: Ein Lock sorgt dafür, dass nur ein Thread den Initialisierer ausführt. `NONE` verzichtet auf jede Absicherung und ist nur korrekt, wenn garantiert nur ein Thread zugreift – dann spart es den Lock. `PUBLICATION` erlaubt parallele Initialisierung, aber alle sehen den zuerst gespeicherten Wert. Im Zweifel bleib beim Standard: Ein Lock bei der ersten Initialisierung kostet fast nichts, ein Race Condition-Bug viel.
+    resources:
+      - title: Kotlin Docs · Lazy properties
+        url: https://kotlinlang.org/docs/delegated-properties.html#lazy-properties
+      - title: Kotlin API · LazyThreadSafetyMode
+        url: https://kotlinlang.org/api/core/kotlin-stdlib/kotlin/-lazy-thread-safety-mode/
+  - id: invariante-liste
+    type: bug
+    title: Die Summe nimmt keine Ints
+    prompt: |
+      `total` soll Zahlen beliebigen Typs addieren und die Liste dabei **nicht verändern**. Der Aufruf in `main` kompiliert nicht:
+
+      ```text
+      error: argument type mismatch: actual type is 'MutableList<Int>', but 'MutableList<Number>' was expected.
+      ```
+
+      Finde die Ursache und korrigiere die Zeile.
+    lang: kotlin
+    code: |
+      fun total(values: MutableList<Number>): Double =
+          values.sumOf { it.toDouble() }
+
+      fun main() {
+          val durations: MutableList<Int> = mutableListOf(30, 45, 15)
+          println(total(durations))
+      }
+    lines: [1]
+    fix:
+      - line: 1
+        answers:
+          - "fun total(values: List<Number>): Double ="
+          - "fun total(values: MutableList<out Number>): Double ="
+          - "fun total(values: Collection<Number>): Double ="
+          - "fun total(values: Iterable<Number>): Double ="
+          - "fun total(values: List<out Number>): Double ="
+    explanation: |
+      `MutableList<E>` ist invariant, weil sie liest **und** schreibt: Wäre `MutableList<Int>` eine `MutableList<Number>`, könnte `total` ein `Double` hineinschreiben. `total` liest aber nur. Die idiomatische Lösung ist der read-only Typ `List<Number>` – `List` ist kovariant, und die Signatur dokumentiert gleich mit, dass nichts verändert wird. Wenn es unbedingt `MutableList` sein soll, macht `MutableList<out Number>` sie an dieser Stelle zum reinen Produzenten.
+    resources:
+      - title: Kotlin Docs · Use-site variance
+        url: https://kotlinlang.org/docs/generics.html#use-site-variance-type-projections
+  - id: geloeschter-typ
+    type: bug
+    title: Eine Prüfung, die es nicht gibt
+    prompt: |
+      `titles` soll aus einer dynamischen Antwort (`Any?`) alle Strings herausholen, wenn es eine Liste ist. Der Code kompiliert nicht:
+
+      ```text
+      error: cannot check for instance of erased type 'List<String>'.
+      ```
+
+      Korrigiere die markierte Zeile so, dass sie für **jede** Liste greift und nur die String-Elemente zurückgibt.
+    lang: kotlin
+    code: |
+      fun titles(payload: Any?): List<String> = when (payload) {
+          is List<String> -> payload
+          is String -> listOf(payload)
+          else -> emptyList()
+      }
+    lines: [2]
+    fix:
+      - line: 2
+        answers:
+          - "is List<*> -> payload.filterIsInstance<String>()"
+          - "is Iterable<*> -> payload.filterIsInstance<String>()"
+          - "is Collection<*> -> payload.filterIsInstance<String>()"
+    explanation: |
+      Typargumente werden auf der JVM gelöscht: Zur Laufzeit ist jede Liste nur eine `List`. Der Compiler weigert sich deshalb, `List<String>` zu prüfen. `is List<*>` prüft genau das, was zur Laufzeit bekannt ist; der Smart Cast macht `payload` danach zu `List<*>`, dessen Elemente `Any?` sind. `filterIsInstance<String>()` prüft jedes Element einzeln – das geht, weil die Funktion `inline` mit `reified T` ist. Ein Cast `payload as List<String>` würde zwar kompilieren (mit Warnung), aber eine `List<Int>` durchlassen und später mit `ClassCastException` abstürzen.
+    resources:
+      - title: Kotlin Docs · Type erasure and generic type checks
+        url: https://kotlinlang.org/docs/generics.html#generics-type-checks-and-casts
+      - title: Kotlin API · filterIsInstance
+        url: https://kotlinlang.org/api/core/kotlin-stdlib/kotlin.collections/filter-is-instance.html
+  - id: map-delegation-erklaeren
+    type: explain
+    title: Feature-Flags aus JSON
+    prompt: |
+      Erkläre einem Teammitglied, wie `RemoteFlags` funktioniert: Woher kommen die Werte, wann wird gelesen, was passiert bei fehlenden oder falsch typisierten Schlüsseln, und was bewirkt `by lazy` bei `summary`?
+    lang: kotlin
+    code: |
+      class RemoteFlags(private val raw: Map<String, Any?>) {
+          val newEditor: Boolean by raw
+          val maxUploads: Int by raw
+          val summary: String by lazy {
+              "editor=$newEditor, uploads=$maxUploads"
+          }
+      }
+
+      val flags = RemoteFlags(mapOf("newEditor" to true, "maxUploads" to 3))
+    points:
+      - "`by raw` liest bei jedem Zugriff aus der Map, mit dem Property-Namen als Schlüssel."
+      - Fehlt ein Schlüssel, wirft der Zugriff eine `NoSuchElementException` – erst beim Lesen, nicht beim Erzeugen.
+      - Der Wert wird ungeprüft auf den Property-Typ gecastet; ein falscher Typ fällt erst beim Zugriff als `ClassCastException` auf.
+      - "`summary` wird beim ersten Lesen einmal berechnet und dann gecacht; spätere Änderungen an der Map würde es nicht mehr sehen."
+    explanation: |
+      Map-Delegation verbindet jede Property mit dem gleichnamigen Eintrag der Map: `flags.maxUploads` ruft intern `raw.getValue("maxUploads")` auf und castet das Ergebnis auf `Int`. Gelesen wird bei jedem Zugriff, nicht beim Konstruieren – ein fehlender Schlüssel fällt deshalb erst auf, wenn jemand die Property liest, und zwar als `NoSuchElementException`. Liefert der Server `"3"` statt `3`, gibt es beim Zugriff eine `ClassCastException`. Das macht das Muster bequem, aber für externe Daten riskant; in Produktion würde ich die Daten beim Parsen validieren, etwa mit kotlinx.serialization. `summary` ist `lazy`: Der String wird beim ersten Lesen gebaut und danach nur noch zurückgegeben. Weil `raw` eine read-only `Map` ist, die hier nicht verändert wird, ist das Caching unproblematisch.
+    resources:
+      - title: Kotlin Docs · Storing properties in a map
+        url: https://kotlinlang.org/docs/delegated-properties.html#storing-properties-in-a-map
+  - id: lru-cache
+    type: practice
+    title: Ein generischer LRU-Cache
+    prompt: |
+      Schreibe einen generischen `LruCache<K : Any, V : Any>`, der höchstens `maxSize` Einträge hält und beim Überlauf den am **längsten nicht benutzten** Eintrag entfernt.
+
+      Anforderungen:
+
+      - Der Cache implementiert `Map<K, V>` **per Klassen-Delegation**, damit Aufrufer `size`, `containsKey`, `keys` usw. lesen können – aber nicht schreiben.
+      - `getOrPut(key) { … }` liefert den gespeicherten Wert (und markiert ihn als zuletzt benutzt) oder berechnet, speichert und liefert einen neuen.
+      - Ein Property `hits` zählt Treffer; es darf von außen nur gelesen werden.
+
+      Tipp: `LinkedHashMap(initialCapacity, loadFactor, accessOrder = true)` ordnet Einträge nach Zugriff; der erste Eintrag ist dann der älteste. Nenne das interne Feld nicht `entries` – so heißt schon eine Property von `Map`. Führe das Programm in IntelliJ IDEA, Android Studio oder im [Kotlin Playground](https://play.kotlinlang.org/) aus.
+    lang: kotlin
+    starter: |
+      class LruCache<K : Any, V : Any>(private val maxSize: Int) /* : Map<K, V> by … */ {
+          // Dein Code
+      }
+
+      fun main() {
+          val cache = LruCache<String, Int>(maxSize = 2)
+          cache.getOrPut("a") { 1 }
+          cache.getOrPut("b") { 2 }
+          cache.getOrPut("a") { 99 }   // Treffer, "a" ist jetzt zuletzt benutzt
+          cache.getOrPut("c") { 3 }    // verdrängt "b"
+          println(cache.keys)          // [a, c]
+          println(cache.hits)          // 1
+      }
+    solution: |
+      class LruCache<K : Any, V : Any> private constructor(
+          private val maxSize: Int,
+          private val store: LinkedHashMap<K, V>,
+      ) : Map<K, V> by store {
+
+          constructor(maxSize: Int) : this(maxSize, LinkedHashMap(16, 0.75f, true))
+
+          init {
+              require(maxSize > 0) { "maxSize muss positiv sein" }
+          }
+
+          var hits = 0
+              private set
+
+          fun getOrPut(key: K, compute: () -> V): V {
+              store[key]?.let {
+                  hits++
+                  return it
+              }
+              val value = compute()
+              store[key] = value
+              if (store.size > maxSize) {
+                  store.remove(store.keys.first())
+              }
+              return value
+          }
+      }
+
+      fun main() {
+          val cache = LruCache<String, Int>(maxSize = 2)
+          cache.getOrPut("a") { 1 }
+          cache.getOrPut("b") { 2 }
+          cache.getOrPut("a") { 99 }
+          cache.getOrPut("c") { 3 }
+          println(cache.keys)   // [a, c]
+          println(cache.hits)   // 1
+      }
+    checklist:
+      - "Die Klasse ist generisch mit `K : Any` und `V : Any`, sodass `null` als Wert eindeutig „nicht im Cache“ bedeutet."
+      - "`Map<K, V> by …` delegiert alle Lesemethoden an die interne `LinkedHashMap`; nach außen gibt es keine Schreibmethoden."
+      - Die interne Map ist nicht von außen erreichbar (privater Konstruktor oder privates Property).
+      - "`hits` hat einen `private set`."
+      - Ein Treffer verschiebt den Eintrag ans Ende (Zugriffsreihenfolge), beim Überlauf fliegt der erste Eintrag raus.
+      - "`main` gibt `[a, c]` und `1` aus."
+    explanation: |
+      Klassen-Delegation spart dir hier rund zehn Weiterleitungsmethoden: Alles, was `Map` verlangt, erledigt die interne `LinkedHashMap`. Hieße das Feld `entries`, meldete der Compiler „'entries' hides member of supertype 'Map' and needs an 'override' modifier“ – ein Namenskonflikt, den Delegation schnell sichtbar macht. Weil `LruCache` nur `Map` (read-only) implementiert, können Aufrufer lesen, aber nicht an `getOrPut` vorbei schreiben – ein Cast auf `MutableMap` scheitert, denn `LruCache` selbst ist keine `MutableMap`. Der Trick mit dem privaten Hauptkonstruktor ist nötig, weil das Delegationsziel nach `by` ein Konstruktorparameter oder Ausdruck sein muss; so bleibt die Map trotzdem privat. `accessOrder = true` sorgt dafür, dass `store[key]` den Eintrag ans Ende schiebt; der erste Schlüssel ist also immer der am längsten nicht benutzte. Die Bounds `K : Any, V : Any` verhindern nullable Typargumente, sodass `store[key] == null` eindeutig „nicht vorhanden“ heißt.
+    resources:
+      - title: Kotlin Docs · Delegation
+        url: https://kotlinlang.org/docs/delegation.html
+      - title: Kotlin Docs · Generics
+        url: https://kotlinlang.org/docs/generics.html

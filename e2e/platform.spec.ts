@@ -79,6 +79,9 @@ test('python code runs in the browser against the tests', async ({ page }) => {
   await page.locator('#editor').fill('while True:\n    pass');
   await page.locator('#run').click();
   await expect(page.locator('#run-output')).toContainText('Zeitlimit', { timeout: 30_000 });
+  await page.locator('#editor').fill('def zaehle_woerter(text: str) -> int:\n    return len(text.split())');
+  await page.locator('#run').click();
+  await expect(page.locator('#feedback')).toContainText('Richtig.', { timeout: 30_000 });
 });
 
 test('practice, bug and explain exercises', async ({ page }) => {
@@ -148,4 +151,77 @@ test('storage failures are reported without breaking the app', async ({ context 
   await page.locator('#answer-g1').fill('def');
   await expect(page.locator('#storage-warning')).toBeVisible();
   await expect(page.locator('#state-g1')).toContainText('Richtig');
+});
+
+test('unsaved work can be exported and merged when browser storage is blocked', async ({ page }) => {
+  await page.addInitScript(() => Object.defineProperty(window, 'localStorage', { get() { throw new DOMException('Blocked', 'SecurityError'); } }));
+  await page.goto(`${base}/1`);
+  await page.locator('#answer-g1').fill('def');
+  await page.locator('#answer-g2').fill('2 * x');
+  await expect(page.locator('#feedback')).toContainText('Richtig.');
+  // SPA navigation is deliberate: this is the work that only exists in the current tab.
+  await page.getByRole('link', { name: 'Daten', exact: true }).click();
+  const downloadEvent = page.waitForEvent('download');
+  await page.locator('#export').click();
+  const stream = await (await downloadEvent).createReadStream();
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream!) chunks.push(Buffer.from(chunk));
+  const backup = JSON.parse(Buffer.concat(chunks).toString());
+  expect(Object.keys(backup.areas.beispiel.done)).toHaveLength(1);
+  expect(Object.values(backup.areas.beispiel.drafts)).toContainEqual({ g1: 'def', g2: '2 * x' });
+  backup.areas.beispiel.done = {};
+  backup.areas.beispiel.drafts = {};
+  backup.areas.beispiel.read = { 'alle-typen': '2026-09-28' };
+  await page.locator('#import-file').setInputFiles({ name: 'backup.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(backup)) });
+  await expect(page.locator('#data-message')).toContainText('übernommen');
+  await expect(page.locator('.data-table tr', { hasText: 'Beispielbereich' })).toContainText('1 / 10');
+});
+
+test('malformed addresses render the not-found page without an unhandled exception', async ({ page }) => {
+  const errors = errorsOf(page);
+  await page.goto('/');
+  // Vite rejects malformed URL escapes at the HTTP layer; exercise the client router directly.
+  await page.evaluate(() => { history.pushState(null, '', '/%E0%A4%A'); dispatchEvent(new PopStateEvent('popstate')); });
+  await expect(page.locator('h1')).toHaveText('Gibt es nicht.');
+  await page.goto('/#%E0%A4%A');
+  await expect(page.locator('.hero-title')).toBeVisible();
+  expect(errors).toEqual([]);
+});
+
+test('two asynchronous Python snippets keep their output isolated', async ({ page }) => {
+  test.setTimeout(120_000);
+  await page.goto('/python/python-einstieg');
+  const blocks = page.locator('.codeblock[data-run="python"]');
+  await expect(blocks.nth(1)).toBeVisible();
+  await blocks.nth(0).locator('textarea').fill('import asyncio\nprint("erster-start")\nawait asyncio.sleep(0.2)\nprint("erster-ende")');
+  await blocks.nth(1).locator('textarea').fill('print("zweiter")');
+  await blocks.nth(0).getByRole('button', { name: 'Ausführen' }).click();
+  await blocks.nth(1).getByRole('button', { name: 'Ausführen' }).click();
+  await expect(blocks.nth(0).locator('.run-output')).toContainText('erster-ende', { timeout: 90_000 });
+  await expect(blocks.nth(0).locator('.run-output')).not.toContainText('zweiter');
+  await expect(blocks.nth(1).locator('.run-output')).toContainText('zweiter');
+  await expect(blocks.nth(1).locator('.run-output')).not.toContainText('erster');
+});
+
+test('late content cannot overwrite a more recent navigation', async ({ page }) => {
+  let release!: () => void;
+  let requested!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const intercepted = new Promise<void>((resolve) => { requested = resolve; });
+  await page.route('**/*', async (route) => {
+    if (route.request().url().includes('virtual:area/python')) { requested(); await held; }
+    await route.continue();
+  });
+  await page.goto('/python');
+  await page.locator('.module-row').first().click();
+  await intercepted;
+  await page.locator('.topnav a[data-area="rust"]').click();
+  await expect(page.locator('h1')).toHaveText('Rust');
+  const response = page.waitForResponse((res) => res.url().includes('virtual:area/python'));
+  release();
+  await (await response).finished();
+  // Allow the held import and its render continuation to settle.
+  await page.waitForTimeout(200);
+  await expect(page).toHaveURL(/\/rust$/);
+  await expect(page.locator('h1')).toHaveText('Rust');
 });

@@ -1,0 +1,926 @@
+id: fehler-module
+title: Fehlerbehandlung, Module & Logging
+level: 2
+minutes: 180
+summary: Exceptions gezielt fangen, verketten und als eigene Hierarchie anbieten, verstehen, was `import` wirklich tut, Projekte sauber aufteilen – und mit `logging` statt `print` nachvollziehbar machen, was passiert.
+goals:
+  - Du erklärst die Ausnahme-Hierarchie (`BaseException` vs. `Exception`) und sagst voraus, wann `except`, `else` und `finally` laufen.
+  - Du fängst gezielt, verkettest mit `raise … from …` und entwirfst eine eigene Exception-Hierarchie für eine Bibliothek.
+  - Du wählst begründet zwischen EAFP und LBYL und räumst mit `finally` und `with` zuverlässig auf.
+  - Du erklärst, dass Module einmal ausgeführt und in `sys.modules` gecacht werden, und löst zirkuläre Importe auf.
+  - Du strukturierst ein Projekt mit Paketen, `if __name__ == "__main__":` und src-Layout und loggst mit `getLogger(__name__)`.
+resources:
+  - title: Tutorial · Errors and Exceptions
+    url: https://docs.python.org/3/tutorial/errors.html
+  - title: Built-in Exceptions · Exception hierarchy
+    url: https://docs.python.org/3/library/exceptions.html#exception-hierarchy
+  - title: Tutorial · Modules
+    url: https://docs.python.org/3/tutorial/modules.html
+  - title: Logging HOWTO
+    url: https://docs.python.org/3/howto/logging.html
+  - title: Python Packaging User Guide · src layout vs flat layout
+    url: https://packaging.python.org/en/latest/discussions/src-layout-vs-flat-layout/
+lesson: |
+  Ein nächtlicher Import-Job bricht ab. Im Log steht nur `Fehler beim Import`, weil irgendwo ein `except Exception: print("Fehler beim Import")` alles verschluckt hat – den Tippfehler im Code genauso wie die fehlende Datei. Niemand weiß, welche Datei, welche Zeile, welche Ursache. Gute Fehlerbehandlung ist das Gegenteil davon: Sie fängt nur, was sie sinnvoll behandeln kann, erhält die Ursache und meldet den Rest laut.
+
+  Dieses Modul behandelt drei Dinge, die in jedem echten Python-Projekt zusammenspielen: Exceptions, die Aufteilung in Module und Pakete und Logging. Grundlage sind das Tutorial zu [Errors and Exceptions](https://docs.python.org/3/tutorial/errors.html), zu [Modules](https://docs.python.org/3/tutorial/modules.html) und das [Logging HOWTO](https://docs.python.org/3/howto/logging.html).
+
+  ## Die Ausnahme-Hierarchie
+
+  Exceptions sind normale Objekte, ihre Klassen bilden eine [Hierarchie](https://docs.python.org/3/library/exceptions.html#exception-hierarchy). Ein `except` fängt die genannte Klasse **und alle Unterklassen**:
+
+  ```text
+  BaseException
+   ├── KeyboardInterrupt        ← Strg+C
+   ├── SystemExit               ← sys.exit()
+   ├── GeneratorExit
+   └── Exception                ← alles, was ein Programm normalerweise behandelt
+        ├── ArithmeticError → ZeroDivisionError, …
+        ├── LookupError → KeyError, IndexError
+        ├── OSError → FileNotFoundError, PermissionError, TimeoutError, …
+        ├── TypeError, ValueError, AttributeError, …
+        └── ExceptionGroup
+  ```
+
+  Die Trennung ist Absicht: `KeyboardInterrupt` und `SystemExit` sind keine Fehler, sondern Bitten, das Programm zu beenden. [`Exception`](https://docs.python.org/3/library/exceptions.html#Exception) ist deshalb die Basis für alles Eigene und die breiteste Klasse, die du je fangen solltest. Ein nacktes `except:` fängt dagegen [`BaseException`](https://docs.python.org/3/library/exceptions.html#BaseException) – das Programm lässt sich dann nicht einmal mehr mit Strg+C abbrechen.
+
+  Ein Traceback liest du **von unten nach oben**: Die letzte Zeile nennt Typ und Nachricht, darüber steht die Zeile, in der die Exception entstand, darüber die Aufrufkette bis zum Einstiegspunkt.
+
+  ## `try`, `except`, `else`, `finally`
+
+  ```python run
+  import json
+
+  def lade(text: str) -> dict:
+      try:
+          daten = json.loads(text)              # nur, was fehlschlagen kann
+      except json.JSONDecodeError as fehler:
+          print(f"  except: kaputtes JSON in Zeile {fehler.lineno}")
+          return {}
+      else:
+          print("  else: nur ohne Exception")
+          return daten
+      finally:
+          print("  finally: immer, auch nach return")
+
+  print(lade('{"port": 8080}'))
+  print(lade("{port: 8080}"))
+  ```
+
+  Die Regeln aus der [Sprachreferenz zu `try`](https://docs.python.org/3/reference/compound_stmts.html#the-try-statement):
+
+  - `except` läuft, wenn im `try`-Block eine passende Exception auftritt. Mehrere `except`-Klauseln werden von oben nach unten geprüft, die erste passende gewinnt – spezielle Klassen also vor allgemeinen.
+  - `else` läuft nur, wenn der `try`-Block **ohne** Exception durchläuft. Code dort ist nicht mehr vom `except` geschützt. So hältst du den `try`-Block klein und fängst nicht aus Versehen Fehler aus Folgecode.
+  - `finally` läuft **immer**: nach Erfolg, nach einer behandelten oder unbehandelten Exception und auch, wenn `try` oder `except` mit `return` verlassen wird.
+
+  Mehrere Typen fängst du mit einem Tupel: `except (KeyError, ValueError) as fehler:`. Seit Python 3.14 sind die Klammern ohne `as` optional ([PEP 758](https://peps.python.org/pep-0758/)); mit Klammern ist der Code auch für ältere Versionen gültig.
+
+  > [!WARNING] `return` in `finally`
+  > Ein `return`, `break` oder `continue` in `finally` verschluckt eine laufende Exception still. Python 3.14 warnt deshalb mit `SyntaxWarning` ([PEP 765](https://peps.python.org/pep-0765/)). In `finally` gehört nur Aufräumcode.
+
+  ## Ausnahmen auslösen und verketten
+
+  Mit [`raise`](https://docs.python.org/3/reference/simple_stmts.html#the-raise-statement) löst du eine Exception aus. Ein nacktes `raise` in einem `except`-Block wirft die gerade behandelte Exception unverändert weiter – nützlich, wenn du nur loggen oder aufräumen willst.
+
+  Oft übersetzt du einen technischen Fehler in einen fachlichen: Aus `KeyError: 'port'` wird „Konfiguration unvollständig“. Dabei soll die Ursache nicht verloren gehen. Dafür gibt es [Exception Chaining](https://docs.python.org/3/tutorial/errors.html#exception-chaining):
+
+  ```python run
+  class KonfigFehler(Exception):
+      pass
+
+  def lade_port(konfig: dict) -> int:
+      try:
+          return int(konfig["port"])
+      except KeyError as fehler:
+          raise KonfigFehler("Einstellung 'port' fehlt") from fehler
+
+  try:
+      lade_port({"host": "db"})
+  except KonfigFehler as e:
+      print(repr(e))
+      print("Ursache:", repr(e.__cause__))
+  ```
+
+  | Form | `__cause__` | Traceback zeigt |
+  | --- | --- | --- |
+  | `raise Neu(...)` im `except`-Block | `None` (aber `__context__` ist gesetzt) | „During handling of the above exception, another exception occurred“ – wirkt wie ein zweiter Fehler |
+  | `raise Neu(...) from fehler` | `fehler` | „The above exception was the direct cause of …“ – bewusste Übersetzung |
+  | `raise Neu(...) from None` | `None`, Kontext unterdrückt | nur die neue Exception |
+
+  `__context__` setzt Python immer automatisch, wenn während der Behandlung eine neue Exception entsteht. `from` macht die Verbindung explizit, `from None` blendet sie aus – sinnvoll, wenn die Ursache ein Implementierungsdetail ist, das den Aufrufer nur verwirrt ([Exception context](https://docs.python.org/3/library/exceptions.html#exception-context)). Seit 3.11 kannst du einer Exception außerdem mit [`add_note()`](https://docs.python.org/3/library/exceptions.html#BaseException.add_note) Kontext anhängen, bevor du sie mit `raise` weiterwirfst.
+
+  ## Eigene Exceptions für eine Bibliothek
+
+  Eine Bibliothek definiert **eine Basisklasse** und darunter spezifische Fehler. Aufrufer können dann wählen: alles der Bibliothek fangen oder gezielt einen Fall.
+
+  ```python run
+  class ZahlungsFehler(Exception):
+      """Basis für alle Fehler dieses Pakets."""
+
+  class KarteAbgelehnt(ZahlungsFehler):
+      def __init__(self, grund: str) -> None:
+          super().__init__(f"Karte abgelehnt: {grund}")
+          self.grund = grund
+
+  class AnbieterNichtErreichbar(ZahlungsFehler):
+      def __init__(self, versuch_in_s: int) -> None:
+          super().__init__(f"Anbieter nicht erreichbar, neuer Versuch in {versuch_in_s} s")
+          self.versuch_in_s = versuch_in_s
+
+  for fehler in [KarteAbgelehnt("Limit überschritten"), AnbieterNichtErreichbar(30)]:
+      try:
+          raise fehler
+      except KarteAbgelehnt as e:
+          print("Kunde informieren:", e.grund)
+      except ZahlungsFehler as e:
+          print("Später erneut versuchen:", e)
+  ```
+
+  Regeln aus dem Tutorial ([User-defined Exceptions](https://docs.python.org/3/tutorial/errors.html#user-defined-exceptions)): von `Exception` erben, Namen auf `Error` bzw. hier „Fehler“ enden lassen, `super().__init__(nachricht)` aufrufen, damit `str(e)` sinnvoll ist, und Details als Attribute ablegen, damit Aufrufer nicht die Nachricht parsen müssen. Eigene Klassen lohnen sich, wenn Aufrufer **unterschiedlich reagieren** sollen; für „falscher Wert“ reicht oft `ValueError`.
+
+  ## EAFP, LBYL und Aufräumen
+
+  Python bevorzugt [EAFP](https://docs.python.org/3/glossary.html#term-EAFP) – *easier to ask for forgiveness than permission*: einfach versuchen und den Fehlerfall behandeln. Das Gegenteil ist [LBYL](https://docs.python.org/3/glossary.html#term-LBYL) – *look before you leap*: erst prüfen, dann handeln.
+
+  ```python
+  # LBYL: zwei Schritte – zwischen Prüfung und Zugriff kann sich die Welt ändern
+  if pfad.exists():
+      text = pfad.read_text(encoding="utf-8")   # Datei inzwischen gelöscht? → Exception trotzdem
+
+  # EAFP: ein Schritt, der Fehlerfall ist explizit
+  try:
+      text = pfad.read_text(encoding="utf-8")
+  except FileNotFoundError:
+      text = ""
+  ```
+
+  EAFP vermeidet diese Race Condition (*time of check to time of use*) und doppelte Arbeit. LBYL ist besser, wenn der Fehlerfall **häufig** ist oder der Versuch Nebenwirkungen hätte, die du nicht zurücknehmen kannst. Für einen `dict` mit Standardwert gibt es ohnehin `dict.get()`.
+
+  Aufräumen – Datei schließen, Sperre freigeben, Verbindung zurückgeben – gehört in `finally` oder besser in ein [`with`](https://docs.python.org/3/reference/compound_stmts.html#the-with-statement). Der Context Manager räumt auf, egal wie der Block verlassen wird ([Predefined Clean-up Actions](https://docs.python.org/3/tutorial/errors.html#predefined-clean-up-actions)). Eigene Context Manager schreibst du im Modul „Dekoratoren & funktionale Programmierung“. [`contextlib.suppress`](https://docs.python.org/3/library/contextlib.html#contextlib.suppress) ist die kurze Form von `try`/`except`/`pass` für bewusst ignorierte Fehler.
+
+  ### Mehrere Fehler auf einmal: `ExceptionGroup` und `except*`
+
+  Seit Python 3.11 kann eine [`ExceptionGroup`](https://docs.python.org/3/library/exceptions.html#ExceptionGroup) mehrere unabhängige Exceptions bündeln – etwa alle Validierungsfehler eines Formulars oder die Fehler paralleler Tasks in `asyncio.TaskGroup`. `except*` behandelt jeden passenden Teil der Gruppe ([Tutorial](https://docs.python.org/3/tutorial/errors.html#raising-and-handling-multiple-unrelated-exceptions)):
+
+  ```python run
+  def pruefe(nutzer: dict) -> None:
+      fehler = []
+      if "@" not in nutzer.get("email", ""):
+          fehler.append(ValueError("email ungültig"))
+      if nutzer.get("alter", 0) < 0:
+          fehler.append(ValueError("alter negativ"))
+      if "name" not in nutzer:
+          fehler.append(KeyError("name"))
+      if fehler:
+          raise ExceptionGroup("Nutzer ungültig", fehler)
+
+  try:
+      pruefe({"email": "ada", "alter": -1})
+  except* ValueError as gruppe:
+      print("Wertfehler:", [str(e) for e in gruppe.exceptions])
+  except* KeyError as gruppe:
+      print("Fehlende Felder:", [str(e) for e in gruppe.exceptions])
+  ```
+
+  Anders als bei `except` können hier **mehrere** Klauseln laufen. Im Alltag begegnet dir das vor allem bei nebenläufigem Code.
+
+  ## Module und Pakete: was `import` wirklich tut
+
+  Ein **Modul** ist eine `.py`-Datei, ein **Paket** ein Verzeichnis mit Modulen, klassisch mit einer Datei `__init__.py` ([Packages](https://docs.python.org/3/tutorial/modules.html#packages)). Das Denkmodell für `import konfig`:
+
+  1. Python schaut in [`sys.modules`](https://docs.python.org/3/library/sys.html#sys.modules) nach. Ist das Modul dort, ist der Import fertig.
+  2. Sonst sucht Python die Datei entlang [`sys.path`](https://docs.python.org/3/library/sys.html#sys.path), legt ein leeres Modulobjekt an, **trägt es in `sys.modules` ein** und führt dann den Code der Datei **einmal von oben nach unten** aus. Jede `def`, `class` und Zuweisung auf oberster Ebene wird dabei zu einem Attribut des Moduls.
+  3. Der Name `konfig` wird im importierenden Modul an das Modulobjekt gebunden.
+
+  ```python run
+  import os
+  import sys
+  from pathlib import Path
+
+  sys.modules.pop("einstellungen", None)    # nur damit die Demo wiederholbar ist
+  sys.path.insert(0, os.getcwd())
+  Path("einstellungen.py").write_text('print("einstellungen wird ausgeführt")\nDEBUG = False\n', encoding="utf-8")
+
+  import einstellungen                      # führt die Datei aus
+  import einstellungen as noch_einmal       # nur Nachschlagen in sys.modules
+  print(einstellungen is noch_einmal)
+
+  from einstellungen import DEBUG           # kopiert die aktuelle Bindung
+  einstellungen.DEBUG = True
+  print(DEBUG, einstellungen.DEBUG)
+  ```
+
+  Zwei Folgen, die du kennen musst: Code auf oberster Ebene eines Moduls läuft beim **ersten** Import, also teure Arbeit oder Seiteneffekte (Verbindungen, `print`) nicht dorthin. Und `from modul import name` bindet den **aktuellen Wert** an einen neuen Namen; spätere Neuzuweisungen im Modul sieht dieser Name nicht. Details: [The module cache](https://docs.python.org/3/reference/import.html#the-module-cache).
+
+  ### Absolute und relative Importe
+
+  Innerhalb eines Pakets `shop` kannst du absolut (`from shop.preise import netto_zu_brutto`) oder relativ (`from .preise import netto_zu_brutto`, `from ..util import slug`) importieren ([Intra-package References](https://docs.python.org/3/tutorial/modules.html#intra-package-references)). Relative Importe funktionieren nur, wenn das Modul als Teil des Pakets geladen wurde – nicht, wenn du `python shop/cli.py` direkt startest. Deshalb startest du Module in Paketen mit `python -m shop.cli`. [PEP 8](https://peps.python.org/pep-0008/#imports) empfiehlt absolute Importe als Standard.
+
+  ### Zirkuläre Importe
+
+  Importiert `shop/modelle.py` etwas aus `shop/preise.py` und umgekehrt, entsteht ein Kreis. Weil ein Modul **vor** seiner Ausführung in `sys.modules` steht, findet der zweite Import ein halb fertiges Modul:
+
+  ```console
+  $ python -c "import shop.modelle"
+  Traceback (most recent call last):
+    …
+    File "/app/shop/preise.py", line 1, in <module>
+      from shop.modelle import Artikel
+  ImportError: cannot import name 'Artikel' from partially initialized module 'shop.modelle' (most likely due to a circular import)
+  ```
+
+  Die saubere Lösung ist fast immer, die Abhängigkeit aufzulösen: Gemeinsames in ein drittes Modul verschieben, sodass die Abhängigkeiten nur in eine Richtung zeigen. Notlösungen sind ein Import innerhalb der Funktion, die ihn braucht, oder `import shop.modelle` statt `from … import`, weil der Attributzugriff dann erst beim Aufruf passiert.
+
+  ### `if __name__ == "__main__":` und das src-Layout
+
+  Jedes Modul hat ein Attribut `__name__`. Beim Import ist es der Modulname (`"shop.cli"`), beim direkten Start (`python datei.py` oder `python -m shop.cli`) ist es `"__main__"` ([`__main__`](https://docs.python.org/3/library/__main__.html#idiomatic-usage)). Damit trennst du „Code, der importiert werden kann“ von „Code, der beim Start läuft“:
+
+  ```python
+  def main() -> int:
+      ...                    # Argumente lesen, Logging konfigurieren, Arbeit starten
+      return 0
+
+  if __name__ == "__main__":
+      raise SystemExit(main())
+  ```
+
+  Für Projekte, die installiert und getestet werden, empfiehlt der [Packaging User Guide](https://packaging.python.org/en/latest/discussions/src-layout-vs-flat-layout/) das **src-Layout**:
+
+  ```text
+  shop-import/
+  ├── pyproject.toml
+  ├── src/
+  │   └── shop/
+  │       ├── __init__.py
+  │       ├── __main__.py     ← erlaubt python -m shop
+  │       ├── modelle.py
+  │       └── preise.py
+  └── tests/
+      └── test_preise.py
+  ```
+
+  Weil `src/` nicht automatisch auf `sys.path` liegt, testen die Tests das **installierte** Paket und nicht zufällig die Dateien im Arbeitsverzeichnis. Fehlende Dateien im Paket fallen so früh auf. Wie man das Projekt mit uv installiert, zeigt das Modul „Tooling & Packaging“.
+
+  ## Logging statt `print`
+
+  `print` schreibt alles gleich laut nach stdout, ohne Zeitpunkt, ohne Herkunft, ohne Möglichkeit, es im Betrieb leiser zu stellen. Das Modul [`logging`](https://docs.python.org/3/library/logging.html) trennt drei Fragen: **Wer** meldet (Logger), **wie wichtig** ist es (Level), **wohin** geht es (Handler, konfiguriert an einer Stelle).
+
+  ```python run
+  import logging
+
+  logger = logging.getLogger("shop.import")   # in echten Modulen: getLogger(__name__)
+
+  def importiere(zeilen: list[str]) -> int:
+      ok = 0
+      for nummer, zeile in enumerate(zeilen, start=1):
+          try:
+              ok += int(zeile) >= 0
+          except ValueError:
+              logger.warning("Zeile %d übersprungen: %r", nummer, zeile)
+      logger.info("%d von %d Zeilen importiert", ok, len(zeilen))
+      return ok
+
+  # Nur im Einstiegspunkt: Logging einmal konfigurieren.
+  # force=True ersetzt vorhandene Handler – hier nötig, weil der Block mehrfach laufen kann.
+  logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s", force=True)
+  importiere(["12", "x7", "3"])
+  logger.debug("unsichtbar: DEBUG liegt unter INFO")
+  ```
+
+  Die Regeln aus dem [Logging HOWTO](https://docs.python.org/3/howto/logging.html#when-to-use-logging):
+
+  - **Jedes Modul** holt sich `logger = logging.getLogger(__name__)`. Die Namen bilden eine Hierarchie (`shop` → `shop.import`), sodass du ganze Pakete lauter oder leiser stellen kannst.
+  - **Nur der Einstiegspunkt** konfiguriert mit [`basicConfig`](https://docs.python.org/3/library/logging.html#logging.basicConfig) oder `dictConfig`. Eine Bibliothek konfiguriert nie Handler – sonst verdoppelt oder verändert sie die Ausgaben der Anwendung ([Configuring Logging for a Library](https://docs.python.org/3/howto/logging.html#configuring-logging-for-a-library)).
+  - **Level:** `DEBUG` (Details für Entwickler), `INFO` (normaler Ablauf), `WARNING` (Unerwartetes, Programm läuft weiter; Standard-Schwelle), `ERROR` (eine Aufgabe ist gescheitert), `CRITICAL` (das Programm kann nicht weiter).
+  - **Platzhalter statt f-Strings:** `logger.info("%d Zeilen", n)` formatiert nur, wenn die Meldung wirklich ausgegeben wird.
+  - Im `except`-Block schreibt [`logger.exception(...)`](https://docs.python.org/3/library/logging.html#logging.Logger.exception) eine `ERROR`-Meldung **mit Traceback**.
+
+  > [!PRAXIS] So sieht es im Betrieb aus
+  > Ein Service läuft in Docker oder Kubernetes; stdout und stderr landen in einem zentralen Log-System. Dort filterst du nach Level und Logger-Namen und suchst nach dem Traceback, den `logger.exception` geschrieben hat. Ein `print("Fehler")` ohne Traceback ist in dieser Welt praktisch unsichtbar. Im Code-Review fällt deshalb jedes `except Exception: pass` und jedes `print` in Bibliothekscode auf.
+
+  > [!INTERVIEW] „Wie gehst du mit Exceptions um?“
+  > „Ich fange so spezifisch und so spät wie möglich – dort, wo ich wirklich etwas tun kann: erneut versuchen, einen Standardwert nehmen oder in eine fachliche Exception übersetzen, dann mit `raise … from …`, damit die Ursache erhalten bleibt. Alles andere lasse ich durchlaufen bis zu einer zentralen Stelle, die mit `logger.exception` loggt. Nie ein nacktes `except:`, und für Aufräumarbeit nehme ich `with` oder `finally`.“
+
+  ## Häufige Fehler
+
+  - **`except:` oder `except Exception: pass`.** Verschluckt Programmierfehler (`NameError`, `AttributeError`) und macht Bugs unsichtbar. Fange die konkrete Klasse; wenn du breit fangen musst, logge mit `logger.exception` und wirf weiter.
+  - **`except ValueError or TypeError:`.** `ValueError or TypeError` ist ein Ausdruck und ergibt `ValueError` – `TypeError` wird nicht gefangen. Richtig: `except (ValueError, TypeError):`.
+  - **Riesige `try`-Blöcke.** Der `except` fängt dann auch Fehler aus Zeilen, an die du nicht gedacht hast. Nur die riskante Zeile in `try`, den Rest in `else`.
+  - **Neue Exception ohne `from`.** Der Traceback sieht aus wie ein zweiter Fehler bei der Fehlerbehandlung.
+  - **Zirkuläre Importe.** `ImportError: cannot import name … from partially initialized module`. Gemeinsamen Code herausziehen.
+  - **Datei heißt wie ein Modul der Standardbibliothek** (`logging.py`, `json.py`). Dein Modul verdeckt dann das echte, und Importe schlagen seltsam fehl.
+  - **`logging.basicConfig` in einem Bibliotheksmodul** oder Logging vor dem Konfigurieren: Der erste Aufruf einer Logging-Funktion ohne Konfiguration kann selbst `basicConfig` auslösen, spätere Aufrufe bleiben dann wirkungslos.
+
+  ## Zusammenfassung
+
+  - `Exception` ist die Basis für alles Behandelbare; `KeyboardInterrupt` und `SystemExit` hängen direkt unter `BaseException`. Nie nacktes `except:`.
+  - `except` bei passender Exception, `else` nur ohne Exception, `finally` immer. Kleine `try`-Blöcke.
+  - `raise Neu(...) from fehler` übersetzt und erhält die Ursache; `from None` blendet sie aus; nacktes `raise` wirft weiter.
+  - Eigene Bibliotheken: eine Basisklasse, spezifische Unterklassen mit Attributen.
+  - EAFP ist der Python-Standard; LBYL, wenn der Fehlerfall häufig oder der Versuch nicht umkehrbar ist. Aufräumen mit `with`/`finally`.
+  - Ein Modul wird beim ersten Import ausgeführt und in `sys.modules` gecacht; `from m import x` kopiert die Bindung.
+  - `if __name__ == "__main__":` trennt Startcode von importierbarem Code; Module in Paketen startest du mit `python -m`.
+  - `getLogger(__name__)` in jedem Modul, Konfiguration nur im Einstiegspunkt, `logger.exception` im `except`-Block.
+exercises:
+  - id: was-faengt-exception
+    type: choice
+    title: Was fängt except Exception?
+    prompt: "Welche dieser Exceptions fängt ein `except Exception:`?"
+    options:
+      - text: "`KeyError`"
+        correct: true
+        why: "`KeyError` erbt über `LookupError` von `Exception`."
+      - text: "`KeyboardInterrupt` (Strg+C)"
+        correct: false
+        why: Erbt direkt von `BaseException`, damit ein breites `except Exception` den Abbruch durch den Nutzer nicht verhindert.
+      - text: "`SystemExit` aus `sys.exit(1)`"
+        correct: false
+        why: "`sys.exit()` löst `SystemExit` aus, das ebenfalls direkt unter `BaseException` hängt – sonst würde ein breiter Handler das Beenden verhindern."
+      - text: "`FileNotFoundError`"
+        correct: true
+        why: "`FileNotFoundError` ist eine Unterklasse von `OSError`, und die erbt von `Exception`."
+      - text: "`ExceptionGroup` mit zwei `ValueError`"
+        correct: true
+        why: "`ExceptionGroup` erbt von `Exception` (nur `BaseExceptionGroup` nicht)."
+    explanation: |
+      `except Klasse` fängt die Klasse und alle Unterklassen. Unter `Exception` liegt alles, was ein Programm normalerweise behandeln will. `KeyboardInterrupt`, `SystemExit` und `GeneratorExit` stehen bewusst daneben, direkt unter `BaseException`. Genau deshalb ist `except Exception` die breiteste vertretbare Form und ein nacktes `except:` (fängt `BaseException`) ein Fehler.
+    resources:
+      - title: Built-in Exceptions · Exception hierarchy
+        url: https://docs.python.org/3/library/exceptions.html#exception-hierarchy
+
+  - id: konfig-laden-ordnen
+    type: order
+    title: Konfiguration robust laden
+    prompt: |
+      Bring die Zeilen in die richtige Reihenfolge: Fehlt die Datei, wird gewarnt und ein leeres Dictionary zurückgegeben. Nur wenn das Lesen geklappt hat, wird das JSON geparst. Die Debug-Meldung soll in **jedem** Fall erscheinen.
+    lang: python
+    lines: |
+      def lade_konfig(pfad: Path) -> dict:
+          try:
+              text = pfad.read_text(encoding="utf-8")
+          except FileNotFoundError:
+              logger.warning("%s fehlt, nutze Standardwerte", pfad)
+              return {}
+          else:
+              return json.loads(text)
+          finally:
+              logger.debug("lade_konfig(%s) beendet", pfad)
+    explanation: |
+      Die Reihenfolge der Klauseln ist fest: `try`, dann `except`, dann `else`, dann `finally`. `json.loads` steht im `else`, damit ein `JSONDecodeError` nicht versehentlich vom `except FileNotFoundError` mit behandelt würde und damit der `try`-Block nur die Zeile schützt, die die Datei liest. `finally` läuft auch nach den beiden `return`-Anweisungen.
+    resources:
+      - title: Tutorial · Handling Exceptions
+        url: https://docs.python.org/3/tutorial/errors.html#handling-exceptions
+
+  - id: try-reihenfolge
+    type: output
+    title: Wer läuft wann?
+    prompt: Was gibt dieses Programm aus?
+    lang: python
+    code: |
+      def teile(a, b):
+          try:
+              ergebnis = a / b
+          except ZeroDivisionError:
+              print("except")
+              return None
+          else:
+              print("else")
+              return ergebnis
+          finally:
+              print("finally")
+
+      print(teile(6, 3))
+      print(teile(1, 0))
+    expected: |
+      else
+      finally
+      2.0
+      except
+      finally
+      None
+    explanation: |
+      Beim ersten Aufruf läuft `try` ohne Fehler, also `else`. Dessen `return` merkt sich den Rückgabewert `2.0`, aber bevor die Funktion ihn zurückgibt, läuft `finally`. Erst danach druckt der Aufrufer `2.0`. Beim zweiten Aufruf springt `ZeroDivisionError` in den `except`-Block; wieder läuft `finally` vor der Rückkehr. `/` liefert in Python 3 immer einen `float`, deshalb `2.0`.
+    resources:
+      - title: Language Reference · finally clause
+        url: https://docs.python.org/3/reference/compound_stmts.html#finally-clause
+
+  - id: verkettung-vorhersagen
+    type: output
+    title: Ursache und Kontext
+    prompt: Was gibt dieses Programm aus? Achte auf `from fehler` und `from None`.
+    lang: python
+    code: |
+      class KonfigFehler(Exception):
+          pass
+
+      def port_lesen(konfig):
+          try:
+              return int(konfig["port"])
+          except KeyError as fehler:
+              raise KonfigFehler("port fehlt") from fehler
+          except ValueError:
+              raise KonfigFehler("port ist keine Zahl") from None
+
+      for konfig in [{}, {"port": "acht"}]:
+          try:
+              port_lesen(konfig)
+          except KonfigFehler as e:
+              print(e, type(e.__cause__).__name__, type(e.__context__).__name__, e.__suppress_context__)
+    expected: |
+      port fehlt KeyError KeyError True
+      port ist keine Zahl NoneType ValueError True
+    explanation: |
+      `__context__` setzt Python **immer** automatisch auf die Exception, die gerade behandelt wurde – in beiden Fällen. `from fehler` setzt zusätzlich `__cause__` und `__suppress_context__ = True`; der Traceback zeigt dann „direct cause“ statt „during handling“. `from None` setzt `__cause__` auf `None` und unterdrückt die Anzeige des Kontexts ebenfalls, der `ValueError` bleibt aber in `__context__` erhalten – er wird nur nicht angezeigt.
+    resources:
+      - title: Built-in Exceptions · Exception context
+        url: https://docs.python.org/3/library/exceptions.html#exception-context
+
+  - id: modul-cache-vorhersagen
+    type: output
+    title: Wie oft läuft ein Modul?
+    prompt: |
+      Das Programm legt ein Modul `einstellungen.py` an und importiert es mehrfach. Was gibt es aus?
+    lang: python
+    code: |
+      import os
+      import sys
+      from pathlib import Path
+
+      sys.path.insert(0, os.getcwd())
+      Path("einstellungen.py").write_text(
+          'print("lade einstellungen")\nDEBUG = False\n', encoding="utf-8"
+      )
+
+      import einstellungen
+      from einstellungen import DEBUG
+      import einstellungen as e2
+
+      einstellungen.DEBUG = True
+      print(DEBUG, e2.DEBUG, "einstellungen" in sys.modules)
+    expected: |
+      lade einstellungen
+      False True True
+    explanation: |
+      Der erste Import führt die Datei aus und legt das Modul in `sys.modules` ab. Alle weiteren Importe – auch `from … import` und `import … as` – finden es dort und führen nichts erneut aus; deshalb erscheint `lade einstellungen` nur einmal. `e2` ist dasselbe Modulobjekt wie `einstellungen`, sieht also die Änderung. `from einstellungen import DEBUG` hat dagegen den damaligen Wert `False` an einen eigenen Namen gebunden; die spätere Neuzuweisung im Modul ändert diesen Namen nicht.
+    resources:
+      - title: Language Reference · The module cache
+        url: https://docs.python.org/3/reference/import.html#the-module-cache
+      - title: sys.modules
+        url: https://docs.python.org/3/library/sys.html#sys.modules
+
+  - id: luecken-fehler-logging
+    type: gap
+    title: Ein Modul mit sauberer Fehlerbehandlung
+    prompt: |
+      Ergänze das Modul: Der Logger soll nach dem Modul benannt sein. `lade_port` fängt fehlende **und** ungültige Werte und übersetzt sie in einen `KonfigFehler`, **ohne die Ursache zu verlieren**. `main()` läuft nur beim direkten Start, nicht beim Import.
+    lang: python
+    code: |
+      import logging
+
+      logger = logging.getLogger(⟦__name__⟧)
+
+      class KonfigFehler(Exception):
+          """Basis für alle Konfigurationsfehler."""
+
+      def lade_port(konfig: dict) -> int:
+          try:
+              return int(konfig["port"])
+          except ⟦(KeyError, ValueError)⟧ as fehler:
+              raise KonfigFehler("port fehlt oder ist ungültig") ⟦from fehler⟧
+
+      def main() -> None:
+          logging.basicConfig(level=logging.INFO)
+          try:
+              port = lade_port({"port": "8080"})
+          except KonfigFehler:
+              ⟦logger.exception⟧("Konfiguration unbrauchbar")
+              raise
+          logger.info("Starte auf Port %d", port)
+
+      if ⟦__name__ == "__main__"⟧:
+          main()
+    gaps:
+      - label: Logger-Name
+        hint: Ein Modulattribut, das beim Import den Modulnamen enthält.
+      - label: Zwei Exception-Typen
+        hint: Mehrere Typen fängst du mit einem Tupel.
+        accept: ["(ValueError, KeyError)", "KeyError, ValueError", "ValueError, KeyError"]
+      - label: Ursache erhalten
+        hint: Explizite Verkettung mit einem Schlüsselwort und dem gefangenen Objekt.
+      - label: ERROR mit Traceback
+        hint: Eine Logger-Methode, die im `except`-Block den Traceback mitschreibt.
+      - label: Nur beim direkten Start
+        hint: Beim direkten Start hat `__name__` einen besonderen Wert.
+        accept: ["'__main__' == __name__"]
+    explanation: |
+      `getLogger(__name__)` benennt den Logger nach dem Modul, etwa `shop.konfig`; so lässt sich die Ausgabe pro Paket steuern. Das Tupel fängt beide Fehlerarten; ohne Klammern ist das erst seit Python 3.14 erlaubt. `from fehler` hängt den `KeyError` bzw. `ValueError` als `__cause__` an. `logger.exception` loggt auf `ERROR` samt Traceback, das nackte `raise` wirft danach unverändert weiter. Der `__main__`-Block sorgt dafür, dass ein `import` des Moduls nichts startet und nichts konfiguriert.
+    resources:
+      - title: Tutorial · Exception Chaining
+        url: https://docs.python.org/3/tutorial/errors.html#exception-chaining
+      - title: __main__ · Idiomatic usage
+        url: https://docs.python.org/3/library/__main__.html#idiomatic-usage
+
+  - id: modul-als-skript
+    type: command
+    title: Ein Paketmodul starten
+    prompt: |
+      Du arbeitest im Projekt aus der Lektion (src-Layout, Paket in der aktiven virtuellen Umgebung installiert). Das Modul `shop/cli.py` nutzt relative Importe wie `from .preise import netto_zu_brutto`. Starte es so, dass diese Importe funktionieren.
+    context: Du bist in `~/projekte/shop-import`, die virtuelle Umgebung ist aktiviert.
+    answers: ["python -m shop.cli", "python3 -m shop.cli"]
+    output: |
+      INFO shop.cli: 3 von 3 Zeilen importiert
+    explanation: |
+      `python -m shop.cli` sucht das Modul über `sys.path` und lädt es **als Teil des Pakets `shop`**. `__package__` ist dann gesetzt, relative Importe funktionieren, und `__name__` ist trotzdem `"__main__"`. `python src/shop/cli.py` würde die Datei dagegen als losgelöstes Skript starten; der relative Import scheitert mit `ImportError: attempted relative import with no known parent package`.
+    resources:
+      - title: Command line · -m
+        url: https://docs.python.org/3/using/cmdline.html#cmdoption-m
+      - title: Tutorial · Intra-package References
+        url: https://docs.python.org/3/tutorial/modules.html#intra-package-references
+
+  - id: port-validieren
+    type: code
+    title: Eine Exception-Hierarchie für Konfiguration
+    prompt: |
+      Schreibe eine kleine Exception-Hierarchie und die Funktion `lade_port(konfig: dict) -> int`:
+
+      - `KonfigFehler(Exception)` ist die Basis. Darunter `FehlendeEinstellung` und `UngueltigeEinstellung`.
+      - `FehlendeEinstellung` bekommt den Schlüssel als Argument, speichert ihn als Attribut `schluessel` und hat die Nachricht `Einstellung 'port' fehlt`.
+      - Fehlt `"port"`, wirft `lade_port` `FehlendeEinstellung("port")` – verkettet mit dem `KeyError`.
+      - Ist der Wert keine ganze Zahl (`"acht"`), wirft sie `UngueltigeEinstellung` – verkettet mit dem `ValueError`.
+      - Liegt die Zahl nicht in 1–65535, wirft sie `UngueltigeEinstellung` (ohne Ursache).
+      - Strings wie `"8080"` und Zahlen wie `443` sind gültig.
+    lang: python
+    starter: |
+      class KonfigFehler(Exception):
+          pass
+
+      def lade_port(konfig: dict) -> int:
+          return int(konfig["port"])
+    solution: |
+      class KonfigFehler(Exception):
+          """Basis für alle Konfigurationsfehler."""
+
+      class FehlendeEinstellung(KonfigFehler):
+          def __init__(self, schluessel: str) -> None:
+              super().__init__(f"Einstellung {schluessel!r} fehlt")
+              self.schluessel = schluessel
+
+      class UngueltigeEinstellung(KonfigFehler):
+          pass
+
+      def lade_port(konfig: dict) -> int:
+          try:
+              roh = konfig["port"]
+          except KeyError as fehler:
+              raise FehlendeEinstellung("port") from fehler
+          try:
+              port = int(roh)
+          except ValueError as fehler:
+              raise UngueltigeEinstellung(f"port ist keine Zahl: {roh!r}") from fehler
+          if not 1 <= port <= 65535:
+              raise UngueltigeEinstellung(f"port außerhalb von 1–65535: {port}")
+          return port
+    tests:
+      - name: Gültige Werte
+        code: |
+          assert lade_port({"port": "8080"}) == 8080
+          assert lade_port({"port": 443}) == 443
+      - name: Fehlender Port
+        code: |
+          try:
+              lade_port({"host": "db"})
+          except FehlendeEinstellung as e:
+              assert e.schluessel == "port"
+              assert str(e) == "Einstellung 'port' fehlt", f"Nachricht: {e}"
+              assert isinstance(e.__cause__, KeyError), "Ursache soll der KeyError sein (raise … from …)"
+          else:
+              raise AssertionError("FehlendeEinstellung erwartet")
+      - name: Keine Zahl
+        code: |
+          try:
+              lade_port({"port": "acht"})
+          except UngueltigeEinstellung as e:
+              assert isinstance(e.__cause__, ValueError), "Ursache soll der ValueError sein"
+          else:
+              raise AssertionError("UngueltigeEinstellung erwartet")
+      - name: Außerhalb des Bereichs
+        code: |
+          for wert in (0, 70000, -1):
+              try:
+                  lade_port({"port": wert})
+              except UngueltigeEinstellung:
+                  pass
+              else:
+                  raise AssertionError(f"port={wert} muss UngueltigeEinstellung werfen")
+      - name: Hierarchie
+        code: |
+          assert issubclass(FehlendeEinstellung, KonfigFehler)
+          assert issubclass(UngueltigeEinstellung, KonfigFehler)
+          assert issubclass(KonfigFehler, Exception)
+          try:
+              lade_port({})
+          except KonfigFehler:
+              pass
+    hints:
+      - Zwei kleine `try`-Blöcke sind klarer als einer, der beide Fehler mischt.
+      - "`raise FehlendeEinstellung(\"port\") from fehler` im `except KeyError as fehler:`."
+      - "Im `__init__` von `FehlendeEinstellung`: `super().__init__(f\"Einstellung {schluessel!r} fehlt\")` und dann `self.schluessel = schluessel`."
+    explanation: |
+      Aufrufer können jetzt wählen: `except KonfigFehler` für „irgendetwas an der Konfiguration stimmt nicht“ oder gezielt `except FehlendeEinstellung`, um etwa einen Standardwert zu setzen. Das Attribut `schluessel` erspart es ihnen, die Nachricht zu parsen. `from fehler` erhält die technische Ursache im Traceback. Die Bereichsprüfung hat keine Ursache – es gibt keine ursprüngliche Exception, also auch kein `from`. `int(443)` und `int("8080")` funktionieren beide; `int("acht")` wirft `ValueError`.
+    resources:
+      - title: Tutorial · User-defined Exceptions
+        url: https://docs.python.org/3/tutorial/errors.html#user-defined-exceptions
+      - title: Language Reference · raise
+        url: https://docs.python.org/3/reference/simple_stmts.html#the-raise-statement
+
+  - id: eafp-verschachtelt
+    type: code
+    title: Tief in JSON greifen – EAFP
+    prompt: |
+      API-Antworten sind tief verschachtelt, und nicht jedes Feld ist immer da. Schreibe `hole(daten, pfad, standard=None)`: `pfad` ist eine Folge von Schlüsseln und Listenindizes, etwa `("kunde", "adressen", 0, "ort")`. Gibt es den Pfad, liefere den Wert, sonst `standard`.
+
+      Arbeite nach **EAFP**: einfach zugreifen und die passenden Exceptions fangen – nicht vorher mit `in`, `len` oder `isinstance` prüfen.
+    lang: python
+    starter: |
+      def hole(daten, pfad, standard=None):
+          for teil in pfad:
+              daten = daten[teil]
+          return daten
+    solution: |
+      def hole(daten, pfad, standard=None):
+          try:
+              for teil in pfad:
+                  daten = daten[teil]
+          except (KeyError, IndexError, TypeError):
+              return standard
+          return daten
+    tests:
+      - name: Vorhandener Pfad
+        code: |
+          antwort = {"kunde": {"adressen": [{"ort": "Köln"}, {"ort": "Bonn"}]}}
+          assert hole(antwort, ("kunde", "adressen", 1, "ort")) == "Bonn"
+          assert hole(antwort, ()) is antwort
+      - name: Fehlender Schlüssel
+        code: |
+          assert hole({"kunde": {}}, ("kunde", "adressen", 0, "ort")) is None
+      - name: Index außerhalb der Liste
+        code: |
+          assert hole({"kunde": {"adressen": []}}, ("kunde", "adressen", 0, "ort"), "unbekannt") == "unbekannt"
+      - name: Falscher Typ auf dem Weg
+        code: |
+          # "adressen" ist hier ein String; "abc"["ort"] wirft TypeError, None[0] ebenso
+          assert hole({"kunde": {"adressen": "abc"}}, ("kunde", "adressen", "ort"), "?") == "?"
+          assert hole({"kunde": None}, ("kunde", 0), "?") == "?"
+      - name: Falsy Werte sind echte Werte
+        code: |
+          assert hole({"rabatt": 0}, ("rabatt",), 10) == 0
+          assert hole({"tags": []}, ("tags",), ["x"]) == []
+    hints:
+      - "`d[\"x\"]` auf einem Dictionary wirft `KeyError`, `liste[5]` wirft `IndexError`, `None[0]` oder `\"abc\"[\"ort\"]` werfen `TypeError`."
+      - Umschließe die ganze Schleife mit einem `try` und fange die drei Typen als Tupel.
+    explanation: |
+      Jeder Zugriff kann auf genau drei Arten scheitern: Schlüssel fehlt (`KeyError`), Index fehlt (`IndexError`) oder der Zwischenwert lässt sich so gar nicht indizieren (`TypeError`). EAFP fängt genau diese drei, statt jeden Fall vorher mit `isinstance`, `in` und `len` abzufragen – kürzer und ohne Lücken. Wichtig ist, **nicht** `Exception` zu fangen: Ein Tippfehler im Code (`NameError`) soll weiterhin laut scheitern. Der Test mit `0` und `[]` zeigt, warum ein `or standard` falsch wäre: Falsy Werte sind gültige Ergebnisse.
+    resources:
+      - title: Glossary · EAFP
+        url: https://docs.python.org/3/glossary.html#term-EAFP
+      - title: Glossary · LBYL
+        url: https://docs.python.org/3/glossary.html#term-LBYL
+
+  - id: except-or
+    type: bug
+    title: Der TypeError rutscht durch
+    prompt: |
+      `als_zahl` soll für alles, was sich nicht in eine Zahl umwandeln lässt, `None` liefern. `als_zahl("abc")` gibt korrekt `None` zurück, aber `als_zahl(None)` bricht mit `TypeError: float() argument must be a string or a real number, not 'NoneType'` ab. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: python
+    code: |
+      def als_zahl(wert):
+          try:
+              return float(wert)
+          except ValueError or TypeError:
+              return None
+    lines: [4]
+    fix:
+      - line: 4
+        answers: ["except (ValueError, TypeError):", "except (TypeError, ValueError):", "except ValueError, TypeError:", "except TypeError, ValueError:"]
+    explanation: |
+      Hinter `except` steht ein **Ausdruck**. `ValueError or TypeError` wird ausgewertet, bevor irgendetwas gefangen wird: Eine Klasse ist truthy, also ergibt `or` den ersten Operanden, `ValueError`. Gefangen wird nur `ValueError`. Mehrere Typen gibst du als Tupel an: `except (ValueError, TypeError):`. Seit Python 3.14 ist auch die Form ohne Klammern erlaubt (PEP 758), solange kein `as` folgt.
+    resources:
+      - title: Language Reference · except clause
+        url: https://docs.python.org/3/reference/compound_stmts.html#except-clause
+      - title: PEP 758 – Allow except and except* expressions without parentheses
+        url: https://peps.python.org/pep-0758/
+
+  - id: import-reparieren
+    type: code
+    title: Repariere den Import, der alles verschluckt
+    prompt: |
+      `summiere(zeilen)` liest Zeilen im Format `"name;betrag_in_cent"`, summiert die Beträge und liefert `(summe, fehlerhafte_zeilennummern)`. Zeilennummern zählen ab 1.
+
+      Der vorhandene Code hat zwei Probleme: Eine kaputte Zeile beendet die ganze Verarbeitung, und ein **Programmierfehler** des Aufrufers (etwa `None` statt eines Strings in der Liste) wird still als „fehlerhafte Zeile“ verbucht, statt laut zu scheitern. Repariere die Funktion: Nur Zeilen mit falschem Format oder falschem Betrag werden übersprungen, alles andere fliegt weiter.
+    lang: python
+    starter: |
+      def summiere(zeilen: list[str]) -> tuple[int, list[int]]:
+          summe = 0
+          fehlerhaft = []
+          try:
+              for nummer, zeile in enumerate(zeilen, start=1):
+                  name, betrag = zeile.split(";")
+                  summe += int(betrag)
+          except Exception:
+              fehlerhaft.append(nummer)
+          return summe, fehlerhaft
+    solution: |
+      def summiere(zeilen: list[str]) -> tuple[int, list[int]]:
+          summe = 0
+          fehlerhaft = []
+          for nummer, zeile in enumerate(zeilen, start=1):
+              try:
+                  name, betrag = zeile.split(";")
+                  wert = int(betrag)
+              except ValueError:
+                  fehlerhaft.append(nummer)
+              else:
+                  summe += wert
+          return summe, fehlerhaft
+    tests:
+      - name: Alles gültig
+        code: assert summiere(["Kaffee;450", "Tee;300"]) == (750, [])
+      - name: Kaputte Zeile in der Mitte
+        code: |
+          ergebnis = summiere(["Kaffee;450", "Tee;drei", "Kakao;250"])
+          assert ergebnis == (700, [2]), f"bekommen {ergebnis!r} – geht es nach Zeile 2 weiter?"
+      - name: Falsches Format
+        code: |
+          ergebnis = summiere(["ohne Trenner", "a;1;2", "Keks;100"])
+          assert ergebnis == (100, [1, 2]), f"bekommen {ergebnis!r}"
+      - name: Programmierfehler bleiben sichtbar
+        code: |
+          try:
+              summiere(["Kaffee;450", None])
+          except AttributeError:
+              pass
+          else:
+              raise AssertionError("None in der Liste ist ein Programmierfehler und darf nicht verschluckt werden")
+    hints:
+      - Das `try` muss **in** die Schleife, damit es nach einer kaputten Zeile weitergeht.
+      - "Welche Exception werfen `\"a;1;2\".split(\";\")` beim Entpacken in zwei Namen und `int(\"drei\")`? Beide dieselbe."
+      - "Fange nur `ValueError`. `None.split` wirft `AttributeError` und soll durchfliegen."
+    explanation: |
+      Das `try` um die ganze Schleife beendet sie beim ersten Fehler; pro Zeile gehört ein eigenes `try` in die Schleife. Beide erwarteten Datenfehler sind `ValueError`: `int("drei")` und das Entpacken, wenn `split` nicht genau zwei Teile liefert. `except Exception` hätte zusätzlich den `AttributeError` von `None.split` verschluckt – ein Bug beim Aufrufer wäre als „Datenfehler“ getarnt worden. Die Addition steht im `else`, sodass nur die riskanten Zeilen im `try` liegen.
+    resources:
+      - title: Tutorial · Handling Exceptions
+        url: https://docs.python.org/3/tutorial/errors.html#handling-exceptions
+
+  - id: zirkulaer-erklaeren
+    type: explain
+    title: Warum scheitert dieser Import?
+    prompt: |
+      `python -c "import shop.modelle"` endet mit:
+
+      ```text
+      ImportError: cannot import name 'Artikel' from partially initialized module 'shop.modelle' (most likely due to a circular import)
+      ```
+
+      Erkläre Schritt für Schritt, wie es dazu kommt, und schlage eine saubere Lösung vor.
+    lang: python
+    code: |
+      # shop/modelle.py
+      from shop.preise import netto_zu_brutto
+
+      class Artikel:
+          def __init__(self, name: str, netto: int) -> None:
+              self.name = name
+              self.brutto = netto_zu_brutto(netto)
+
+      # shop/preise.py
+      from shop.modelle import Artikel
+
+      MWST = 0.19
+
+      def netto_zu_brutto(netto: int) -> int:
+          return round(netto * (1 + MWST))
+
+      def teuerster(artikel: list[Artikel]) -> Artikel:
+          return max(artikel, key=lambda a: a.brutto)
+    points:
+      - Beim ersten Import legt Python das Modul `shop.modelle` in `sys.modules` an und führt es dann von oben nach unten aus.
+      - Zeile 1 von `modelle` startet den Import von `shop.preise`, bevor `Artikel` definiert ist.
+      - "`preise` findet `shop.modelle` in `sys.modules`, aber nur teilweise initialisiert – `Artikel` existiert noch nicht, daher der `ImportError`."
+      - Lösung – die Abhängigkeit in eine Richtung bringen, etwa `netto_zu_brutto` und `MWST` in ein eigenes Modul verschieben, das nichts aus `modelle` importiert.
+      - "Notlösungen – Import in die Funktion verlegen oder das Modul statt des Namens importieren, damit der Zugriff erst zur Laufzeit passiert."
+    explanation: |
+      `import shop.modelle` erzeugt das Modulobjekt, trägt es in `sys.modules` ein und beginnt, die Datei auszuführen. Schon die erste Zeile importiert `shop.preise`; also wird jetzt `preise.py` ausgeführt. Deren erste Zeile will `Artikel` aus `shop.modelle` holen. Das Modul steht zwar schon in `sys.modules`, ist aber erst bis Zeile 1 ausgeführt – `Artikel` gibt es noch nicht, daher „partially initialized“. Sauber lösen lässt sich das, indem die Preislogik (`MWST`, `netto_zu_brutto`) in ein Modul ohne Rückabhängigkeit wandert, etwa `shop/steuern.py`; `modelle` und `preise` importieren dann beide daraus, und der Kreis ist weg. `teuerster` braucht `Artikel` hier nur für die Typannotation; ein Import innerhalb von `if TYPE_CHECKING:` oder das Verschieben in ein anderes Modul wären weitere Wege.
+    resources:
+      - title: Language Reference · The module cache
+        url: https://docs.python.org/3/reference/import.html#the-module-cache
+
+  - id: wiederholen-mit-logging
+    type: code
+    title: Wiederholen mit Logging
+    prompt: |
+      Netzwerkaufrufe scheitern manchmal vorübergehend. Schreibe `mit_wiederholung(aktion, versuche=3, erlaubt=(TimeoutError, ConnectionError))`:
+
+      - Ruft `aktion()` auf und gibt deren Ergebnis zurück.
+      - Wirft `aktion` eine Exception aus `erlaubt`, loggt die Funktion über den Logger `"netz"` eine Warnung im Format `Versuch 1/3 fehlgeschlagen: <Nachricht der Exception>` und versucht es erneut.
+      - Scheitert auch der letzte Versuch, wird **die letzte Exception unverändert** weitergeworfen.
+      - Andere Exceptions (etwa `ValueError`) fliegen sofort weiter, ohne weiteren Versuch.
+
+      Kein `sleep` nötig. Konfiguriere kein Logging in der Funktion.
+    lang: python
+    starter: |
+      import logging
+
+      logger = logging.getLogger("netz")
+
+      def mit_wiederholung(aktion, versuche=3, erlaubt=(TimeoutError, ConnectionError)):
+          try:
+              return aktion()
+          except Exception:
+              print("Fehler!")
+              return None
+    solution: |
+      import logging
+
+      logger = logging.getLogger("netz")
+
+      def mit_wiederholung(aktion, versuche=3, erlaubt=(TimeoutError, ConnectionError)):
+          for versuch in range(1, versuche + 1):
+              try:
+                  return aktion()
+              except erlaubt as fehler:
+                  logger.warning("Versuch %d/%d fehlgeschlagen: %s", versuch, versuche, fehler)
+                  if versuch == versuche:
+                      raise
+    setup: |
+      import unittest
+
+      def fake(*ergebnisse):
+          """Liefert eine Aktion, die nacheinander die Ergebnisse zurückgibt oder Exceptions wirft."""
+          aufrufe = []
+          def aktion():
+              aufrufe.append(1)
+              wert = ergebnisse[len(aufrufe) - 1]
+              if isinstance(wert, BaseException):
+                  raise wert
+              return wert
+          aktion.aufrufe = aufrufe
+          return aktion
+
+      pruefer = unittest.TestCase()
+    tests:
+      - name: Erfolg beim ersten Versuch
+        code: |
+          aktion = fake("ok")
+          assert mit_wiederholung(aktion) == "ok"
+          assert len(aktion.aufrufe) == 1
+      - name: Erfolg nach zwei Timeouts, mit Warnungen
+        code: |
+          aktion = fake(TimeoutError("zu langsam"), ConnectionError("reset"), "ok")
+          with pruefer.assertLogs("netz", level="WARNING") as logs:
+              assert mit_wiederholung(aktion) == "ok"
+          assert logs.output == [
+              "WARNING:netz:Versuch 1/3 fehlgeschlagen: zu langsam",
+              "WARNING:netz:Versuch 2/3 fehlgeschlagen: reset",
+          ], f"Log: {logs.output}"
+      - name: Letzter Fehler wird weitergeworfen
+        code: |
+          letzter = TimeoutError("dritter")
+          aktion = fake(TimeoutError("erster"), TimeoutError("zweiter"), letzter)
+          try:
+              with pruefer.assertLogs("netz", level="WARNING"):
+                  mit_wiederholung(aktion)
+          except TimeoutError as e:
+              assert e is letzter, "die letzte Exception soll unverändert weiterfliegen"
+          else:
+              raise AssertionError("nach drei Timeouts muss TimeoutError fliegen")
+          assert len(aktion.aufrufe) == 3
+      - name: Andere Fehler sofort weiter
+        code: |
+          aktion = fake(ValueError("kaputte Antwort"), "ok")
+          try:
+              mit_wiederholung(aktion)
+          except ValueError:
+              pass
+          else:
+              raise AssertionError("ValueError soll sofort weiterfliegen")
+          assert len(aktion.aufrufe) == 1, "bei ValueError kein zweiter Versuch"
+      - name: Anzahl der Versuche ist einstellbar
+        code: |
+          aktion = fake(ConnectionError("a"), ConnectionError("b"))
+          try:
+              with pruefer.assertLogs("netz", level="WARNING"):
+                  mit_wiederholung(aktion, versuche=2)
+          except ConnectionError:
+              pass
+          assert len(aktion.aufrufe) == 2
+    hints:
+      - "`except erlaubt as fehler:` funktioniert, weil `erlaubt` ein Tupel von Klassen ist."
+      - "Platzhalter statt f-String: `logger.warning(\"Versuch %d/%d fehlgeschlagen: %s\", versuch, versuche, fehler)`."
+      - Ein nacktes `raise` im `except`-Block wirft genau die gefangene Exception weiter – samt Traceback.
+    explanation: |
+      Die Schleife über `range(1, versuche + 1)` zählt die Versuche menschenlesbar. `except erlaubt` fängt nur vorübergehende Fehler; ein `ValueError` wird gar nicht erst gefangen und fliegt sofort weiter. Beim letzten Versuch wirft das nackte `raise` die Original-Exception mit ihrem Traceback weiter – ein neues `raise TimeoutError(...)` würde die Ursache verlieren. Die Funktion loggt nur, sie konfiguriert nichts; ob die Warnungen irgendwo erscheinen, entscheidet die Anwendung. `assertLogs` ist das `unittest`-Gegenstück zu pytests `caplog`. In echtem Code käme zwischen den Versuchen noch eine wachsende Wartezeit (Backoff).
+    resources:
+      - title: logging · Logger.warning und Logging-Level
+        url: https://docs.python.org/3/library/logging.html#logging-levels
+      - title: Logging HOWTO · Logging variable data
+        url: https://docs.python.org/3/howto/logging.html#logging-variable-data

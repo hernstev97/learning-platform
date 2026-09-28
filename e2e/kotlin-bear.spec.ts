@@ -19,6 +19,7 @@ test('gap checking, saved drafts, completion and reload', async ({ page }) => {
   await expect(page.locator('.step').first()).toHaveClass(/done/);
   await page.locator('#next').click();
   await expect(page).toHaveURL(/bear-01\/2$/);
+  await expect(page.locator('#exercise-title')).toHaveText(bear[0].exercises[1].title);
   await page.locator('#answer-g1').fill('"Be');
   await page.reload();
   await expect(page.locator('#answer-g1')).toHaveValue('"Be');
@@ -30,11 +31,13 @@ test('gap checking, saved drafts, completion and reload', async ({ page }) => {
 test('every Bear task is solvable in the browser', async ({ page }) => {
   test.setTimeout(240_000);
   for (const module of bear) {
+    await page.goto(`/kotlin/${module.id}/1`);
     for (const [i, exercise] of module.exercises.entries()) {
-      await page.goto(`/kotlin/${module.id}/${i + 1}`);
+      await expect(page.locator('#exercise-title')).toHaveText(exercise.title);
       const answers = gapSolution(exercise as GapExercise);
       for (const [id, value] of Object.entries(answers)) await page.locator(`#answer-${id}`).fill(value);
       await expect(page.locator('#feedback')).toContainText('Richtig.');
+      if (i < module.exercises.length - 1) await page.locator('#next').click();
     }
   }
   await page.goto('/kotlin');
@@ -50,4 +53,23 @@ test('source dialog shows the original file with the excerpt marked', async ({ p
   await expect(page.locator('.source-line.selected')).toHaveCount(exercise.source!.end - exercise.source!.start + 1);
   await page.keyboard.press('Escape');
   await expect(page.getByRole('dialog')).toBeHidden();
+});
+
+test('existing Bear progress imports through the data page and survives reload', async ({ page }) => {
+  const first = bear[0].exercises[0];
+  const second = bear[0].exercises[1];
+  const legacy = {
+    version: 2,
+    completed: { [first.id.split('/')[1]]: { at: '2026-09-28', fingerprint: first.fingerprint } },
+    drafts: { [first.id.split('/')[1]]: gapSolution(first as GapExercise), [second.id.split('/')[1]]: { g1: '"Be' } },
+  };
+  await page.goto('/daten');
+  await page.locator('#legacy').fill(JSON.stringify(legacy));
+  await page.locator('#import-legacy').click();
+  await expect(page.locator('#data-message')).toContainText('1 gelöste Bear-Aufgaben übernommen');
+  await page.goto('/kotlin/bear-01/1');
+  await expect(page.locator('#feedback')).toContainText('Richtig.');
+  await page.locator('#next').click();
+  await page.reload();
+  await expect(page.locator('#answer-g1')).toHaveValue('"Be');
 });

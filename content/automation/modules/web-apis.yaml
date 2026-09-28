@@ -1,0 +1,395 @@
+id: web-apis
+title: Web-APIs robust automatisieren
+level: 2
+minutes: 190
+summary: HTTP-Anfragen mit Authentifizierung, Paginierung, Zeitgrenzen und begrenzten Wiederholungen zu einem verlässlichen
+  Import verbinden.
+goals:
+- Du prüfst Transport, HTTP-Status und fachliche Antwort getrennt.
+- Du paginierst mit definiertem Abbruch und erkennst wiederholte Cursor.
+- Du behandelst Rate Limits und Retry-After ohne unendliche Wiederholungen.
+- Du schützt Zugangsdaten und testest Netzwerklogik mit injizierten Fakes.
+resources:
+- &id001
+  title: HTTPX · QuickStart
+  url: https://www.python-httpx.org/quickstart/
+- title: HTTPX · Timeouts
+  url: https://www.python-httpx.org/advanced/timeouts/
+- title: HTTP Semantics · Retry-After
+  url: https://www.rfc-editor.org/rfc/rfc9110.html#section-10.2.3
+- title: Python · urllib.parse
+  url: https://docs.python.org/3/library/urllib.parse.html
+lesson: |
+  Du möchtest alle offenen Aufgaben eines Dienstes in einen Bericht übernehmen. Der erste Test liefert 50 Aufgaben, also scheint der Import fertig. Später zeigt sich, dass die API standardmäßig nur eine Seite liefert. Ein anderer Lauf scheitert nach der dritten Seite an einem Rate Limit. Gute API-Automation muss deshalb den vollständigen Arbeitsauftrag und die Grenzen des Dienstes abbilden, nicht nur einen erfolgreichen Einzelrequest.
+
+  In diesem Modul sind Transport und Fachlogik getrennt. Lokale Beispiele zeigen HTTPX; ausführbare Browserbeispiele simulieren Seiten und Fehler. Dadurch lernst du Paginierung, Wiederholungsentscheidungen und Validierung reproduzierbar, ohne API-Schlüssel zu benötigen oder fremde Dienste anzusprechen.
+
+  ## Eine Anfrage hat einen Vertrag
+
+  Methode, URL, Query-Parameter, Header und Körper bilden die Anfrage. Query-Parameter übergibst du als Datenstruktur, statt einen URL-String mit fremden Werten zusammenzukleben. [HTTPX](https://www.python-httpx.org/quickstart/#passing-parameters-in-urls) übernimmt die Kodierung. Für mehrere Anfragen verwendet ein Client wiederverwendbare Verbindungen und gemeinsame Konfiguration.
+
+  ```python
+  import os
+  import httpx
+  with httpx.Client(
+      base_url="https://api.example.org",
+      headers={"Authorization": f"Bearer {os.environ['API_TOKEN']}"},
+      timeout=10.0,
+  ) as client:
+      antwort = client.get("/tasks", params={"state": "open", "limit": 50})
+      antwort.raise_for_status()
+      daten = antwort.json()
+  ```
+
+  Das ist ein lokales Beispiel mit einer reservierten Beispieldomain, kein hier erreichbarer Dienst. Der tatsächliche Anbieter definiert seine Authentifizierung und Parameter. Zugangsdaten kommen aus einer geeigneten Laufzeitkonfiguration, werden nicht in Quellcode geschrieben und gehören nicht ins Log. Eine fehlende Variable soll vor dem ersten Request zu einer klaren Konfigurationsmeldung führen.
+
+  ```python run
+  from urllib.parse import urlencode
+  print(urlencode({"query": "Python & Daten", "limit": 20}))
+  ```
+
+  Die Standardbibliothek bietet mit [`urllib.parse.urlencode`](https://docs.python.org/3/library/urllib.parse.html#urllib.parse.urlencode) denselben Grundbaustein für eigene URL-Konstruktion.
+
+  Ein Token gilt für einen bestimmten Dienst. Folge extern gelieferten nächsten URLs nicht ungeprüft mit denselben Authentifizierungsheadern zu beliebigen Hosts. Bei Redirects und absoluten Paginierungslinks musst du den Zielvertrag des Clients und der API kennen. Eine reine Cursor-Paginierung an einer festgelegten Basisadresse macht diese Grenze oft leichter kontrollierbar.
+
+  ## Erfolg in mehreren Schichten prüfen
+
+  Ein DNS-Fehler oder Timeout bedeutet, dass kein verlässliches fachliches Ergebnis vorliegt. Ein HTTP-Status wie 401 oder 403 deutet auf Authentifizierung beziehungsweise fehlende Berechtigung. Ein 404 kann eine erwartete fehlende Ressource oder einen falschen Pfad bedeuten. Danach können JSON-Syntax und Datenmodell immer noch falsch sein. Die [`json`-Dokumentation](https://docs.python.org/3/library/json.html#json.loads) beschreibt die Datensyntax; sie definiert nicht dein Fachschema.
+
+  ```python run
+  def validiere_seite(daten):
+      if not isinstance(daten, dict) or not isinstance(daten.get("items"), list):
+          raise ValueError("Antwort braucht items als Liste")
+      return daten["items"]
+
+  print(validiere_seite({"items": [{"id": 1}]}))
+  ```
+
+  Diese schmale Validierung reicht nur für den Beispielvertrag. Ein echter Import prüft auch die benötigten Felder jedes Elements und den Cursor. Trenne erwartete externe Fehler von Programmierfehlern. `except Exception: return []` ist gefährlich: Ein kaputter Import sähe dann aus wie ein erfolgreich leerer Bestand und könnte Folgeaktionen auslösen.
+
+  [HTTPX-Timeouts](https://www.python-httpx.org/advanced/timeouts/) unterscheiden Verbindungsaufbau, Lesen, Schreiben und Warten auf eine Verbindung aus dem Pool. Setze sinnvolle Grenzen und zusätzlich eine Gesamtstrategie für den Job. Zwanzig Requests mit zehn Sekunden Einzelgrenze können deutlich länger als zehn Sekunden dauern.
+
+  ## Paginierung bis zu einer eindeutigen Endbedingung
+
+  APIs verwenden Seitenzahlen, Offsets oder Cursor. Ein Cursor ist ein vom Server gelieferter Fortsetzungsschlüssel, dessen Inhalt du normalerweise nicht selbst interpretierst. Definiere den Endzustand anhand der Dokumentation, beispielsweise `next_cursor is None`. Eine kurze Seite ist nicht bei jeder API ein verlässliches Endsignal.
+
+  ```python run
+  seiten = {
+      None: {"items": [1, 2], "next_cursor": "seite-2"},
+      "seite-2": {"items": [3], "next_cursor": None},
+  }
+  def alle(hole):
+      cursor = None
+      while True:
+          seite = hole(cursor)
+          yield from seite["items"]
+          cursor = seite["next_cursor"]
+          if cursor is None:
+              return
+
+  print(list(alle(lambda cursor: seiten[cursor])))
+  ```
+
+  Das Minimalbeispiel zeigt die Mechanik. Im Betrieb ergänzst du eine maximale Seitenzahl und erkennst wiederholte Cursor. So wird eine fehlerhafte API-Antwort kein Endlosjob. Ob doppelte IDs ignoriert, aktualisiert oder als Fehler gemeldet werden, ist eine fachliche Entscheidung. Ein Set ohne diese Entscheidung kann wertvolle Änderungen verdecken.
+
+  Wenn sich Daten während des Imports ändern, können Offset-Seiten Einträge doppelt zeigen oder überspringen. Ein dokumentierter Cursor oder Snapshot-Modus kann diese Risiken reduzieren; er garantiert nicht automatisch eine unveränderliche Gesamtsicht. Halte im Bericht fest, auf welchen Zeitraum beziehungsweise Stand sich der Import bezieht.
+
+  ## Wiederholungen benötigen Grund und Grenze
+
+  Ein vorübergehender 503 oder ein Verbindungsfehler kann einen erneuten Versuch rechtfertigen. Ein 400 wegen ungültiger Daten tut das normalerweise nicht. Die [HTTP-Semantik idempotenter Methoden](https://www.rfc-editor.org/rfc/rfc9110.html#section-9.2.2) beschreibt die beabsichtigte Wirkung wiederholter gleicher Anfragen. Die Entscheidung hängt außerdem von der Operation ab: Nach einem Timeout bei einer schreibenden Anfrage kann die Wirkung auf dem Server unklar sein. Ein erneuter Versand braucht dann einen dokumentierten Idempotency-Key oder eine Abgleichstrategie.
+
+  Ein begrenzter exponentieller Backoff vergrößert die Abstände zwischen Versuchen. Eine Obergrenze verhindert unkontrolliert lange Pausen. Jitter verteilt viele gleichzeitig scheiternde Clients, ist aber im Test als injizierte Zufallsquelle kontrollierbar.
+
+  ```python run
+  def abstand(versuch, basis=1, maximum=30):
+      return min(maximum, basis * 2 ** (versuch - 1))
+  print([abstand(n) for n in range(1, 8)])
+  ```
+
+  Bei 429 kann der Dienst eine Wartezeit vorgeben. [`Retry-After`](https://www.rfc-editor.org/rfc/rfc9110.html#section-10.2.3) erlaubt Sekunden oder ein HTTP-Datum. Eine erste Implementierung darf ausdrücklich nur die Sekundenvariante unterstützen und für die andere Form einen dokumentierten Fallback nutzen; sie sollte nicht behaupten, den gesamten Headervertrag abzudecken.
+
+  ```python run
+  def sekunden_header(text):
+      if text is None or not text.strip().isascii() or not text.strip().isdigit():
+          return None
+      return int(text.strip())
+  print(sekunden_header("15"))
+  print(sekunden_header("Mon, 28 Sep 2026 12:00:00 GMT"))
+  ```
+
+  Überschreitet eine verlangte Pause dein Jobbudget, brich ab oder plane einen späteren Lauf. Verkürze sie nicht still und belaste den Dienst früher als erlaubt. Ein Retry-Budget umfasst Anzahl, Gesamtzeit und gegebenenfalls Kosten. Ein Endlosloop ist keine Robustheit.
+
+  ## Testen mit nachvollziehbaren Fakes
+
+  Ein Fake-Abrufer kann Seiten liefern und seine Aufrufe protokollieren. So prüfst du Cursor-Reihenfolge, Abbruch und Fehler, ohne echte Wartezeiten. Auch die Pausenfunktion wird als Parameter übergeben; im Test hängt sie Werte an eine Liste.
+
+  ```python run
+  aufrufe = []
+  def hole(cursor):
+      aufrufe.append(cursor)
+      return {"items": [], "next_cursor": None}
+  print(hole(None))
+  print(aufrufe)
+  ```
+
+  Für den Transportadapter brauchst du später zusätzlich eine Integration gegen die echte Bibliothek und eine passende Testumgebung des Anbieters. Teste Statusfehler, ungültiges JSON, leere Seite mit Fortsetzung, wiederholten Cursor und einen Abbruch in der Mitte. Ein Import darf nach einem Teilfehler nicht ohne Kennzeichnung einen vollständigen Bericht ausgeben.
+
+  > [!PRAXIS]
+  > Halte Anzahl der Seiten, gelesenen Datensätze, Wiederholungen und den Abschlussstatus fest. Damit ist ein ungewöhnlich kleiner Bericht untersuchbar, ohne komplette Antworten oder Tokens zu protokollieren.
+
+  ## Häufige Fehler
+
+  Typische Fehler sind eine einzige gelesene Seite, fehlende Zeitgrenzen, pauschale Retries und geheime Header im Debug-Log. Ein weiterer Fehler ist, jede Exception in eine leere Liste umzuwandeln. So verschwinden Ausfälle aus der Beobachtung und werden zu falschen Fachinformationen.
+
+  > [!INTERVIEW]
+  > „Kann ein Timeout nach POST bedeuten, dass nichts passiert ist?“ Nein. Die Antwort kann verloren gegangen sein, nachdem der Server die Änderung bereits durchgeführt hat. Genau deshalb sind Idempotenz und Abgleich wichtig.
+
+  > [!MERKE]
+  > Vollständig ist ein Import erst, wenn seine dokumentierte Endbedingung erreicht und sein Ergebnis erfolgreich geprüft wurde.
+
+  ## Zusammenfassung
+
+  - Verwende Parameterstrukturen und einen kontrollierten Client.
+  - Schütze Tokens auch bei Logs und wechselnden Zielen.
+  - Prüfe Transport, Status und Datenmodell getrennt.
+  - Paginierung braucht Endbedingung, Schleifenschutz und Budget.
+  - Wiederhole nur passende Fehler und Operationen.
+  - Teste Seiten, Pausen und Fehler mit Fakes.
+exercises:
+- id: retry
+  type: choice
+  title: Was darf wiederholt werden?
+  prompt: Welche Aussage ist belastbar?
+  options:
+  - text: Ein Retry muss sowohl Fehlerart als auch Wirkung der Operation berücksichtigen.
+    correct: true
+    why: Bei schreibenden Requests kann der erste Versuch schon gewirkt haben.
+  - text: Nach jedem Timeout hat der Server nichts getan.
+    correct: false
+    why: Nur die Antwort kann verloren gegangen sein.
+  - text: 401 wird durch sofortige unbegrenzte Wiederholung repariert.
+    correct: false
+    why: Ungültige Authentifizierung benötigt eine andere Behandlung.
+  explanation: Wiederholungen sind Teil des fachlichen Vertrags. Transportunsicherheit bedeutet nicht automatisch
+    Wirkungslosigkeit.
+  resources:
+  - *id001
+- id: request
+  type: order
+  title: Antwort kontrolliert verarbeiten
+  prompt: Ordne die Verarbeitung eines einzelnen Requests.
+  lang: python
+  lines: |-
+    # Anfrage mit Zeitgrenze senden
+    # Transportfehler behandeln
+    # HTTP-Status prüfen
+    # JSON parsen
+    # Fachschema validieren
+    # Datensätze weiterverarbeiten
+  explanation: Jede Stufe setzt eine andere Eigenschaft voraus. Eine erfolgreiche frühere Stufe ersetzt die spätere
+    nicht.
+  resources:
+  - *id001
+- id: query
+  type: output
+  title: Query-Parameter kodieren
+  prompt: Welche Ausgabe erzeugt dieses Programm?
+  lang: python
+  code: |-
+    from urllib.parse import urlencode
+    print(urlencode({"q": "a b", "limit": 2}))
+  expected: q=a+b&limit=2
+  explanation: urlencode kodiert das Leerzeichen als Plus im Query-Format. Der Parameterwert bleibt ein Wert und
+    wird nicht als zusätzliche URL-Struktur interpretiert.
+  resources:
+  - *id001
+- id: backoff
+  type: output
+  title: Abstände wachsen begrenzt
+  prompt: Welche Ausgabe erzeugt dieses Programm?
+  lang: python
+  code: print([min(10, 2 ** i) for i in range(5)])
+  expected: '[1, 2, 4, 8, 10]'
+  explanation: Die exponentielle Folge wird am Maximum begrenzt. Ein solches Schema braucht zusätzlich eine maximale
+    Versuchsanzahl.
+  resources:
+  - *id001
+- id: pagination
+  type: code
+  title: Alle Cursor-Seiten lesen
+  prompt: Schreibe `sammle(hole)`. Starte mit cursor None. Jede Antwort enthält items und next_cursor. Sammle alle
+    items, bis next_cursor None ist. Antworten bilden in dieser Aufgabe eine endliche Kette.
+  lang: python
+  starter: |-
+    def sammle(hole):
+        ...
+  solution: |-
+    def sammle(hole):
+        daten = []
+        cursor = None
+        while True:
+            seite = hole(cursor)
+            daten.extend(seite["items"])
+            cursor = seite["next_cursor"]
+            if cursor is None:
+                return daten
+  tests:
+  - name: Zwei Seiten
+    code: |-
+      seiten={None:{"items":[1,2],"next_cursor":"b"},"b":{"items":[3],"next_cursor":None}}
+      assert sammle(seiten.__getitem__) == [1,2,3]
+  - name: Leere Mitte
+    code: |-
+      seiten={None:{"items":[],"next_cursor":"b"},"b":{"items":[4],"next_cursor":None}}
+      assert sammle(seiten.__getitem__) == [4]
+  - name: Leeres Ende
+    code: 'assert sammle(lambda c: {"items":[],"next_cursor":None}) == []'
+  explanation: Die Endbedingung ist der Cursor, nicht die Länge von items. Deshalb wird auch nach einer leeren Seite
+    mit Fortsetzung weitergelesen.
+  resources:
+  - *id001
+- id: retry-after
+  type: code
+  title: Sekunden aus Retry-After
+  prompt: 'Schreibe `wartezeit(text)`: Akzeptiere einen nur aus ASCII-Ziffern bestehenden String nach strip, liefere
+    int; bei None oder anderem Format None. HTTP-Daten sind hier ausdrücklich nicht unterstützt.'
+  lang: python
+  starter: |-
+    def wartezeit(text):
+        ...
+  solution: |-
+    def wartezeit(text):
+        if text is None:
+            return None
+        wert = text.strip()
+        return int(wert) if wert.isascii() and wert.isdigit() else None
+  tests:
+  - name: Sekunden
+    code: assert wartezeit(" 15 ") == 15
+  - name: 'Null'
+    code: assert wartezeit("0") == 0
+  - name: Andere Formate
+    code: assert wartezeit(None) is None and wartezeit("Mon, 28 Sep 2026 12:00:00 GMT") is None
+  - name: Kein Vorzeichen
+    code: assert wartezeit("-1") is None and wartezeit("２") is None
+  explanation: Der enge Parser macht seine Grenze deutlich. Der aufrufende Code muss für HTTP-Daten und fehlende
+    Header eine bewusste andere Strategie festlegen.
+  resources:
+  - *id001
+- id: status
+  type: gap
+  title: HTTP-Fehler nicht verstecken
+  prompt: Ergänze die HTTPX-Methode zur Prüfung auf Fehlerstatus.
+  lang: python
+  code: |-
+    antwort = client.get("/tasks")
+    antwort.⟦raise_for_status⟧()
+    daten = antwort.json()
+  explanation: Ein JSON-Körper kann auch eine Fehlermeldung transportieren. Die Statusprüfung verhindert, dass solche
+    Antworten als normale Fachdatensätze behandelt werden.
+  resources:
+  - *id001
+  gaps:
+  - label: HTTP-Fehler nicht verstecken
+    hint: Die Methode wirft bei einem HTTP-Fehlerstatus eine Exception.
+- id: cursor-schutz
+  type: code
+  title: Wiederholte Cursor erkennen
+  prompt: 'Schreibe `pruefe_cursor(cursor, gesehen)`: Bei None gib False zurück. Bei bereits enthaltenem Cursor
+    wirf ValueError. Sonst füge ihn in das Set ein und liefere True.'
+  lang: python
+  starter: |-
+    def pruefe_cursor(cursor, gesehen):
+        ...
+  solution: |-
+    def pruefe_cursor(cursor, gesehen):
+        if cursor is None:
+            return False
+        if cursor in gesehen:
+            raise ValueError("Cursor wiederholt")
+        gesehen.add(cursor)
+        return True
+  tests:
+  - name: Neu
+    code: s=set(); assert pruefe_cursor("a",s) is True and s=={"a"}
+  - name: Ende
+    code: s=set(); assert pruefe_cursor(None,s) is False and s==set()
+  - name: Schleife
+    code: |-
+      try:
+          pruefe_cursor("a", {"a"})
+      except ValueError:
+          pass
+      else:
+          assert False, "Cursor-Schleife muss sichtbar werden"
+  explanation: Die gespeicherte Historie macht eine kaputte Fortsetzung sichtbar. Der Endmarker None wird nicht
+    mit einem echten Cursor verwechselt.
+  resources:
+  - *id001
+- id: leere-seite
+  type: bug
+  title: Ein Import endet zu früh
+  prompt: Eine leere Seite besitzt next_cursor="b", aber der Import bricht ab. Er soll ausschließlich beim Endmarker
+    stoppen.
+  lang: python
+  code: |-
+    def fertig(seite):
+        return not seite["items"]
+  lines:
+  - 2
+  fix:
+  - line: 2
+    answers:
+    - return seite["next_cursor"] is None
+  explanation: Die API definiert den Cursor als Abschlusskriterium. Eine leere Zwischenseite darf deshalb nicht
+    als vollständiger Import gewertet werden.
+  resources:
+  - *id001
+- id: post-timeout
+  type: explain
+  title: Die unklare Wirkung
+  prompt: Erkläre, warum die Wiederholung in diesem lokalen Entwurf doppelte Datensätze erzeugen kann.
+  lang: python
+  code: |-
+    try:
+        client.post("/tasks", json=daten, timeout=5)
+    except TimeoutError:
+        client.post("/tasks", json=daten, timeout=5)
+  points:
+  - Der erste Request könnte bereits verarbeitet worden sein.
+  - Der Timeout sagt nur, dass kein rechtzeitiges Ergebnis ankam.
+  - Eine zweite POST-Anfrage kann eine zweite Ressource anlegen.
+  - Benötigt wird ein dokumentierter Idempotency-Key oder ein Abgleich.
+  explanation: Ein Transportfehler lässt die Wirkung offen. Zusätzlich muss ein realer Adapter die Exception-Typen
+    seiner Bibliothek verwenden; der Ausschnitt ist bewusst nur der konzeptionelle Fehlerfall.
+  resources:
+  - *id001
+- id: api-import
+  type: practice
+  title: Ein begrenzter Aufgabenimport
+  prompt: Baue lokal einen API-Import mit Seitenlimit, wiederholten Cursor-Erkennung und einem Abschlussstatus.
+    Beginne mit Fakes; ergänze danach einen kontrollierten read-only Integrationstest.
+  lang: python
+  solution: |-
+    def importiere(hole, max_seiten=100):
+        cursor, gesehen, daten = None, set(), []
+        for _ in range(max_seiten):
+            seite = hole(cursor)
+            daten.extend(seite["items"])
+            cursor = seite["next_cursor"]
+            if cursor is None:
+                return daten
+            if cursor in gesehen:
+                raise ValueError("Cursor-Schleife")
+            gesehen.add(cursor)
+        raise RuntimeError("Seitenbudget ausgeschöpft")
+  checklist:
+  - Leere Zwischenseite wird korrekt weitergelesen.
+  - Cursor-Schleife und Seitenbudget erzeugen sichtbare Fehler.
+  - Zugangsdaten erscheinen nicht im Log.
+  - Jeder echte Request hat eine Zeitgrenze.
+  - Ein Teilfehler erzeugt keinen als vollständig markierten Bericht.
+  explanation: Das Beispiel setzt bereits validierte Seiten voraus. Im echten Adapter gehören Status-, JSON- und
+    Schemaprüfung davor; der fachliche Sammler bleibt dadurch unabhängig vom HTTP-Client.
+  resources:
+  - *id001
