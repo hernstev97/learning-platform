@@ -26,6 +26,7 @@ pnpm dev            # http://127.0.0.1:5180
 | `pnpm lint`, `pnpm typecheck` | ESLint und strikte TypeScript-Prüfung einschließlich Backend |
 | `pnpm test:convex:e2e` | Echte lokale Convex-Verbindung und mehrere Browsersitzungen; Setup in docs/CONVEX.md |
 | `pnpm test:e2e` | Browser-Tests aller Lernbereiche, neun Übungsarten, Python-Laufzeit, Lernstand und Bear-Track |
+| `pnpm test:pwa:e2e` | Produktionsbuild mit Service Worker: Installierbarkeit und Offline-Lesen |
 | `pnpm build` | TypeScript prüfen und statisch nach `dist/` bauen |
 | `pnpm bear:build`, `pnpm bear:check` | Bear-Track aus dem gepinnten Snapshot erzeugen bzw. prüfen |
 | `pnpm screenshots /pfad@390 …` | Screenshots gegen den laufenden Dev-Server |
@@ -44,7 +45,8 @@ tooling/verify-code.ts     Führt Musterlösungen und Beispiele aus
 tooling/fixtures/          Beispielbereich mit jeder Übungsart (Tests, Vorlage)
 src/engine/                Prüflogik (tokenbasiert je Sprache), Highlighter, Lernstand
 convex/                    Schema, zentrale Einzelnutzer-Autorisierung, Fortschritt und Migration
-src/main.ts                Clerk-Anmeldung und geschlossenes Zugriffstor
+src/main.ts                Clerk-Anmeldung, geschlossenes Zugriffstor und Offline-Start
+src/service-worker.ts      Offline-Cache für App-Shell und Lerninhalte (Build erzeugt /sw.js)
 src/app.ts                 Reaktiver Convex-Lernstand und optimistische Mutationen
 src/shell.ts               Bestehende Lernoberfläche und Navigation nach autorisiertem Laden
 src/exercises/             Die neun Übungsarten
@@ -58,6 +60,8 @@ Die Oberfläche bleibt ein statisches Vite-Projekt ohne Frontendframework. Inhal
 ## Lernstand
 
 Convex speichert gelöste Übungen mit Fingerprint, versionierte Entwürfe, gelesene Lektionen, Kartenboxen, Projektschritte und die letzte Lernposition. Fortschrittsanzeigen werden daraus berechnet. Ändert sich der geprüfte Teil einer Übung, zählt ein früherer Erfolg nicht mehr. Bestehende `learn:<bereich>:v1`-Einträge werden nach Anmeldung erkannt und unter `/daten` bewusst importiert; Originale bleiben erhalten. Dort gibt es weiterhin JSON-Sicherung, Wiederherstellung, Bereichsreset und Bear-Import. Details und Konfliktregeln: [Convex-Dokumentation](docs/CONVEX.md).
+
+Die Plattform ist als App installierbar (PWA) und offline lesbar. Details und Grenzen: [Offline und installierbare App](docs/CONVEX.md#offline-und-installierbare-app).
 
 Das Design (hell oder dunkel) folgt der Systemeinstellung, bis es über den Schalter in der Kopfzeile gewählt wird. Diese Wahl gilt pro Gerät (`localStorage`, Schlüssel `learn:theme`) und wird nicht synchronisiert.
 

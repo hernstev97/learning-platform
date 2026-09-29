@@ -4,7 +4,7 @@ const deployedUrl = process.env.PLAYWRIGHT_BASE_URL;
 
 export default defineConfig({
   testDir: './e2e',
-  testIgnore: '**/convex/**',
+  testIgnore: ['**/convex/**', '**/pwa/**'],
   fullyParallel: true,
   timeout: 60_000,
   use: { baseURL: deployedUrl || 'http://127.0.0.1:5181', viewport: { width: 1280, height: 1000 } },

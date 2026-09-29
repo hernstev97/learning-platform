@@ -83,6 +83,8 @@ import type { Entry, Position } from '../../convex/model.ts';
 export const isCloud = false;
 export const getSyncStatus = () => getStorageWarning() ? 'Nicht gespeichert' : 'Lernstand nur in diesem Browser gespeichert';
 export const hasPendingWrites = () => false;
+export const getSyncNotice = (): string | null => null;
+export const isOffline = () => false;
 const CONTINUE_KEY = 'learn:continue-area';
 export function getContinueArea(): string | null {
   try { return storage()?.getItem(CONTINUE_KEY) ?? null; } catch { return null; }

@@ -1,9 +1,9 @@
 import { defineConfig } from 'vite';
-import { content, pyodide } from './tooling/vite-plugins.ts';
+import { content, pyodide, serviceWorker } from './tooling/vite-plugins.ts';
 import { fileURLToPath } from 'node:url';
 
 export default defineConfig(({ command, mode }) => ({
-  plugins: [content(), pyodide(), ...(command === 'serve' && ['test-local', 'test-convex'].includes(mode) ? [{
+  plugins: [content(), pyodide(), serviceWorker(), ...(command === 'serve' && ['test-local', 'test-convex'].includes(mode) ? [{
     name: 'local-regression-tests',
     transformIndexHtml(html: string) { return html.replace('/src/main.ts', `/src/testing/${mode === 'test-local' ? 'local' : 'convex'}-main.ts`); },
   }] : [])],
