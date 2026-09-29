@@ -59,6 +59,8 @@ Die Oberfläche bleibt ein statisches Vite-Projekt ohne Frontendframework. Inhal
 
 Convex speichert gelöste Übungen mit Fingerprint, versionierte Entwürfe, gelesene Lektionen, Kartenboxen, Projektschritte und die letzte Lernposition. Fortschrittsanzeigen werden daraus berechnet. Ändert sich der geprüfte Teil einer Übung, zählt ein früherer Erfolg nicht mehr. Bestehende `learn:<bereich>:v1`-Einträge werden nach Anmeldung erkannt und unter `/daten` bewusst importiert; Originale bleiben erhalten. Dort gibt es weiterhin JSON-Sicherung, Wiederherstellung, Bereichsreset und Bear-Import. Details und Konfliktregeln: [Convex-Dokumentation](docs/CONVEX.md).
 
+Das Design (hell oder dunkel) folgt der Systemeinstellung, bis es über den Schalter in der Kopfzeile gewählt wird. Diese Wahl gilt pro Gerät (`localStorage`, Schlüssel `learn:theme`) und wird nicht synchronisiert.
+
 ## Prüfung der Antworten – und ihre Grenzen
 
 - **Lückencode, Terminal, Fehlerkorrektur:** tokenweiser Vergleich mit den akzeptierten Antworten, je nach Sprache (Python: `'a'` = `"a"`; Shell: `-la` = `-al` = `-l -a`, harmlose Anführungszeichen egal). Es wird kein Compiler ausgeführt; gleichwertige Umformulierungen müssen als Alternative hinterlegt sein.

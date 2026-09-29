@@ -244,3 +244,24 @@ test('late content cannot overwrite a more recent navigation', async ({ page }) 
   await expect(page).toHaveURL(/\/rust$/);
   await expect(page.locator('h1')).toHaveText('Rust');
 });
+
+test('theme follows the system until chosen, then persists', async ({ browser }) => {
+  const context = await browser.newContext({ colorScheme: 'dark' });
+  const page = await context.newPage();
+  const errors = errorsOf(page);
+  const theme = () => page.evaluate(() => document.documentElement.dataset.theme);
+  await page.goto('/');
+  expect(await theme()).toBe('dark');
+  await expect(page.locator('#theme-toggle')).toHaveAttribute('aria-label', 'Helles Design aktivieren');
+  await page.emulateMedia({ colorScheme: 'light' });
+  await expect.poll(theme).toBe('light');
+  await page.locator('#theme-toggle').click();
+  expect(await theme()).toBe('dark');
+  await expect(page.locator('meta[name="theme-color"]')).toHaveAttribute('content', '#161614');
+  await page.reload();
+  expect(await theme()).toBe('dark');
+  await page.emulateMedia({ colorScheme: 'light' });
+  expect(await theme()).toBe('dark');
+  expect(errors).toEqual([]);
+  await context.close();
+});

@@ -39,5 +39,7 @@ export const icons = {
   play: '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4v16l14-8z" fill="currentColor"/></svg>',
   up: '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20V5m-6 6 6-6 6 6" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="square"/></svg>',
   down: '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v15m6-6-6 6-6-6" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="square"/></svg>',
+  sun: '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4.5" fill="none" stroke="currentColor" stroke-width="2.4"/><path d="M12 1.5v3m0 15v3M1.5 12h3m15 0h3M4.6 4.6l2.1 2.1m10.6 10.6 2.1 2.1M4.6 19.4l2.1-2.1M17.3 6.7l2.1-2.1" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="square"/></svg>',
+  moon: '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4 8.5 8.5 0 1 0 20 14.5z" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linejoin="miter"/></svg>',
   external: '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 5h10v10M19 5 6 18" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="square"/></svg>',
 };
