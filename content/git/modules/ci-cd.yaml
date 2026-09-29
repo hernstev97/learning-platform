@@ -1,0 +1,766 @@
+id: ci-cd
+title: CI/CD rund um Git
+level: 3
+minutes: 170
+summary: Was Hooks lokal leisten und warum erst die CI Regeln durchsetzt, was ein CI-Klon von deinem Repository enthält, wie Tags zu Releases werden und was zu tun ist, wenn ein Secret in der History gelandet ist.
+goals:
+  - Du schreibst `pre-commit`-, `commit-msg`- und `pre-push`-Hooks, verteilst sie mit `core.hooksPath` und erklärst, warum Hooks keine Durchsetzung sind.
+  - Du erklärst, was `actions/checkout` klont (Tiefe 1, Merge-Ref eines PR) und behebst Fehler wie `No names found` oder unbekannte Revisionen in flachen Klonen.
+  - Du unterscheidest flache und partielle Klone und wählst `fetch-depth`, `--filter` und `sparse-checkout` passend zur Aufgabe.
+  - Du versionierst mit SemVer und annotierten Tags, liest `git describe` und baust einen Release-Workflow, der auf Tags reagiert.
+  - Du reagierst richtig auf ein Secret in der History – rotieren zuerst, History bereinigen nur, wenn nötig.
+resources:
+  - title: githooks – Referenz
+    url: https://git-scm.com/docs/githooks
+  - title: GitHub Docs · Workflow syntax
+    url: https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax
+  - title: GitHub Docs · Events that trigger workflows
+    url: https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows
+  - title: actions/checkout
+    url: https://github.com/actions/checkout
+  - title: git-describe – Referenz
+    url: https://git-scm.com/docs/git-describe
+lesson: |
+  Der PR ist grün, du mergst, und der Release-Job bricht ab: `fatal: No names found, cannot describe anything.` Lokal funktioniert `git describe` einwandfrei. Oder: Im Team gilt „Commit-Nachrichten nach Conventional Commits“, trotzdem stehen in `main` Betreffzeilen wie „fixed stuff“ – obwohl jeder einen Hook installiert haben sollte.
+
+  Beide Probleme haben dieselbe Wurzel: Automatisierung rund um Git sieht nicht dein Repository, sondern eine bestimmte Kopie davon. Ein Hook läuft nur auf dem Rechner, auf dem er installiert ist. Ein CI-Job arbeitet mit einem Klon, den `actions/checkout` so knapp wie möglich hält. Wer weiß, was in dieser Kopie steckt und was fehlt, baut Pipelines, die nicht zufällig funktionieren. Allgemeine CI-Themen wie Rechte, Caches und Artefakte behandelt das Modul [Deployment & Continuous Integration](/automation/deployment-ci); hier geht es um alles, was an Git hängt.
+
+  ## Hooks: Automatisierung auf dem eigenen Rechner
+
+  Ein [Hook](https://git-scm.com/docs/githooks) ist ein ausführbares Programm im Verzeichnis `.git/hooks/`, dessen Dateiname einem Ereignis entspricht. Git ruft es an einer festen Stelle auf. Bei Hooks, die vor einer Aktion laufen – etwa `pre-commit`, `commit-msg` und `pre-push` –, bricht ein Exit-Code ungleich 0 die Aktion ab.
+
+  | Hook | Wann | Eingaben | Kann abbrechen |
+  | --- | --- | --- | --- |
+  | `pre-commit` | vor dem Commit, bevor die Nachricht feststeht | keine | ja |
+  | `commit-msg` | nachdem die Nachricht geschrieben ist | `$1` = Pfad der Nachrichtendatei | ja |
+  | `pre-push` | vor dem Übertragen | `$1` Remote-Name, `$2` URL, zu pushende Refs auf stdin | ja |
+  | `post-commit`, `post-merge` | danach | keine bzw. bei `post-merge` `$1` = Squash-Flag | nein |
+
+  Ein `commit-msg`-Hook, der Conventional Commits verlangt:
+
+  ```bash title=.githooks/commit-msg
+  #!/bin/sh
+  betreff=$(head -n 1 "$1")
+  if ! printf '%s\n' "$betreff" | grep -Eq '^(feat|fix|docs|refactor|test|chore|ci)(\([a-z0-9-]+\))?!?: '; then
+    echo "commit-msg: Betreff braucht ein Präfix wie 'fix: …' oder 'feat(api): …'" >&2
+    exit 1
+  fi
+  ```
+
+  ```console
+  $ chmod +x .githooks/commit-msg
+  $ git config core.hooksPath .githooks
+  $ git commit -m "Login repariert"
+  commit-msg: Betreff braucht ein Präfix wie 'fix: …' oder 'feat(api): …'
+  $ git commit -m "fix(auth): Login nach Passwortwechsel reparieren"
+  [feature/login 4c1e2d9] fix(auth): Login nach Passwortwechsel reparieren
+   1 file changed, 2 insertions(+)
+  ```
+
+  Ein `pre-push`-Hook bekommt pro Ref eine Zeile `<lokale Ref> <lokaler Hash> <entfernte Ref> <entfernter Hash>`. Wer Pushes auf `main` verhindern will, prüft die **entfernte** Ref – `git push origin hotfix:main` hat die lokale Ref `refs/heads/hotfix`, landet aber auf `main`.
+
+  Drei Eigenschaften muss man kennen:
+
+  - **Nicht ausführbar = ignoriert.** Fehlt das x-Bit, überspringt Git den Hook und meldet nur `hint: The '.git/hooks/pre-commit' hook was ignored because it's not set as executable.`
+  - **Nicht versioniert.** `.git/hooks/` gehört nicht zum Repository und wird nicht geklont. Teams legen Hooks deshalb in ein versioniertes Verzeichnis wie `.githooks/` und aktivieren es mit [`core.hooksPath`](https://git-scm.com/docs/git-config#Documentation/git-config.txt-corehooksPath) – jede Person einmal pro Klon. Seit Git 2.54 lassen sich Hooks zusätzlich über die Konfiguration (`hook.<name>.event` und `hook.<name>.command`) definieren, auch mehrere pro Ereignis ([git-hook](https://git-scm.com/docs/git-hook)).
+  - **Nicht erzwungen.** `git commit --no-verify` und `git push --no-verify` überspringen die Hooks, und wer `core.hooksPath` nie gesetzt hat, hat gar keine.
+
+  Frameworks wie [pre-commit](https://pre-commit.com/), Husky oder Lefthook installieren Hooks per Befehl und pinnen die Versionen der Linter – praktisch, ändert aber nichts an den drei Eigenschaften.
+
+  > [!MERKE]
+  > Hooks sind schnelles Feedback auf dem eigenen Rechner. Durchgesetzt wird eine Regel erst dort, wo niemand vorbeikommt: in der CI, deren Checks per Branch Protection Pflicht sind.
+
+  ## GitHub Actions: was die CI von deinem Repository sieht
+
+  Ein Workflow unter `.github/workflows/` reagiert auf Ereignisse. Für Git-nahe CI sind drei entscheidend: `push`, `pull_request` und – mit Merge Queue – `merge_group` ([Events that trigger workflows](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows)).
+
+  ```yaml title=.github/workflows/ci.yml
+  name: CI
+  on:
+    push:
+      branches: [main]
+    pull_request:
+    merge_group:
+  jobs:
+    test:
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v7
+        - run: ./scripts/test.sh
+  ```
+
+  **Was wird bei einem PR getestet?** Nicht die Spitze deines Branches. Für `pull_request` setzt GitHub `GITHUB_REF` auf `refs/pull/<n>/merge` – einen Merge-Commit aus deinem Branch und dem **aktuellen** Stand des Base-Branches, den GitHub im Hintergrund erzeugt, ohne `main` zu verändern. Hat der PR einen Merge-Konflikt, gibt es diesen Commit nicht, und `pull_request`-Workflows starten erst nach der Konfliktlösung. `GITHUB_SHA` ist dieser Merge-Commit; die Spitze deines Branches steht in `github.event.pull_request.head.sha`.
+
+  ```text
+  A---B---C-----M    M = refs/pull/57/merge = GITHUB_SHA  (main steht auf C)
+       \       /
+        D-----E      feature/login = pull_request.head.sha
+  ```
+
+  Das ist ein Vorteil – Konflikte mit `main` fallen früh auf –, aber das Ergebnis gilt nur für den Stand von `main` zum Zeitpunkt des Laufs. Wird danach ein anderer PR gemergt, ist die Kombination ungetestet. Genau dagegen helfen „Require branches to be up to date“ und die Merge Queue aus dem Modul [Pull Requests](/git/pull-requests); für die Queue braucht der Workflow den Trigger `merge_group`, sonst wird der Pflicht-Check dort nie gemeldet und der Merge aus der Queue scheitert.
+
+  **Pfadfilter und Pflicht-Checks.** Mit `paths` oder `paths-ignore` läuft ein Workflow nur, wenn bestimmte Dateien geändert wurden. Für PRs vergleicht GitHub dabei per Drei-Punkt-Diff mit dem Base-Branch. Vorsicht: Wird ein Workflow wegen eines Filters übersprungen, bleibt sein Check auf „Pending“ – ist er Pflicht, lässt sich der PR nicht mergen ([Workflow syntax · paths](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#onpushpull_requestpull_request_targetpathspaths-ignore)). Pflicht-Workflows filtert man deshalb besser auf Job-Ebene: Ein per `if:` übersprungener Job meldet „Success“ ([Troubleshooting required status checks](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks)).
+
+  ## Flache und partielle Klone
+
+  [`actions/checkout`](https://github.com/actions/checkout) holt standardmäßig **genau einen Commit** (`fetch-depth: 1`), keine Tags und keine anderen Branches. Für Tests reicht das. Alles, was History braucht, scheitert:
+
+  ```console
+  $ git rev-parse --is-shallow-repository
+  true
+  $ git log --oneline
+  58115d1 (grafted, HEAD -> main, origin/main, origin/HEAD) feat: Gutscheine
+  $ git describe
+  fatal: No names found, cannot describe anything.
+  $ git fetch --tags
+  From github.com:acme/shop
+   * [new tag]         v2.3.0     -> v2.3.0
+  $ git describe
+  fatal: No tags can describe '58115d1aca4627ceef703bac41d2e7394472a2a0'.
+  Try --always, or create some tags.
+  $ git fetch --unshallow
+  $ git describe
+  v2.3.0-2-g58115d1
+  ```
+
+  `grafted` markiert die künstliche Grenze: Git kennt die Eltern von `58115d1` nur als Hashes. `git fetch --tags` holt zwar den Tag, aber der Weg vom aktuellen Commit zum Tag fehlt – `describe` braucht **History und Tags**. Ebenso scheitern `git log origin/main..HEAD` (bei einem PR-Checkout gibt es `origin/main` gar nicht: `fatal: ambiguous argument 'origin/main..HEAD'`), `git merge-base` und Changelogs.
+
+  Die Abhilfen:
+
+  - `fetch-depth: 0` in `actions/checkout` holt die komplette History aller Branches und Tags.
+  - Nachträglich im Job: [`git fetch --unshallow`](https://git-scm.com/docs/git-fetch#Documentation/git-fetch.txt---unshallow), oder begrenzt mit `--deepen=<n>` bzw. `--depth=<n>`.
+  - `fetch-depth: 2` genügt, wenn ein Job nur `HEAD^` braucht.
+
+  **Partielle Klone** gehen den umgekehrten Weg: Alle Commits und Trees werden geholt, aber Dateiinhalte (Blobs) erst, wenn sie gebraucht werden ([partial clone](https://git-scm.com/docs/partial-clone)). `git clone --filter=blob:none` liefert damit eine vollständige History für `log`, `describe` und `merge-base` zu einem Bruchteil der Größe; der Server muss Filter unterstützen, GitHub tut das. `actions/checkout` bietet dafür die Option `filter`; für die vollständige History braucht es zusätzlich `fetch-depth: 0`, sonst bleibt der Klon trotzdem flach.
+
+  | | Flach (`--depth 1`) | Partiell (`--filter=blob:none`) |
+  | --- | --- | --- |
+  | Commits | nur die letzten n | alle |
+  | Dateiinhalte | nur für diese Commits | bei Bedarf nachgeladen |
+  | `describe`, `merge-base`, `log A..B` | scheitern oft | funktionieren |
+  | Braucht Server später | nein | ja, für fehlende Blobs |
+
+  Für Monorepos kommt [`git sparse-checkout`](https://git-scm.com/docs/git-sparse-checkout) dazu: `git sparse-checkout set services/api` beschränkt das Arbeitsverzeichnis auf ausgewählte Verzeichnisse.
+
+  ## Versionen, Tags und Releases
+
+  [Semantic Versioning](https://semver.org/) schreibt Versionen als `MAJOR.MINOR.PATCH`: MAJOR bei inkompatiblen Änderungen, MINOR bei neuen, kompatiblen Funktionen, PATCH bei Fehlerbehebungen. Mit [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) lässt sich die nächste Version aus den Betreffzeilen ablesen: `fix:` → PATCH, `feat:` → MINOR, `!` oder ein `BREAKING CHANGE:`-Footer → MAJOR.
+
+  In Git markiert ein **Tag** die Version. Ein annotierter Tag (`git tag -a v2.4.0 -m "Release 2.4.0"`) ist ein eigenes Objekt mit Autor, Datum und Nachricht und lässt sich signieren; ein leichtgewichtiger Tag (`git tag nightly`) ist nur ein Name für einen Commit. Für Releases nimmt man annotierte Tags. Tags werden bei `git push` nicht mitgeschickt: `git push origin v2.4.0` überträgt einen, `git push --follow-tags` zusätzlich alle annotierten Tags, die von den gepushten Commits aus erreichbar sind und dem Server fehlen.
+
+  [`git describe`](https://git-scm.com/docs/git-describe) beschreibt einen Commit relativ zum nächsten erreichbaren Tag:
+
+  ```console
+  $ git describe
+  v2.3.0-2-g58115d1
+  $ git describe --abbrev=0
+  v2.3.0
+  $ git describe --tags
+  nightly
+  ```
+
+  `v2.3.0-2-g58115d1` heißt: zwei Commits nach `v2.3.0`, aktueller Commit `58115d1` (das `g` steht für Git). Ohne Optionen berücksichtigt `describe` nur annotierte Tags; `--tags` nimmt leichtgewichtige dazu. Build-Werkzeuge nutzen das für Versionsnummern von Zwischenständen.
+
+  **Release per Tag.** Ein Workflow, der auf gepushte Tags reagiert, baut und veröffentlicht die Version:
+
+  ```yaml title=.github/workflows/release.yml
+  name: Release
+  on:
+    push:
+      tags: ["v*.*.*"]
+  permissions:
+    contents: write
+  jobs:
+    release:
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v7
+          with:
+            fetch-depth: 0
+        - name: Changelog seit dem letzten Tag
+          run: |
+            vorher=$(git describe --abbrev=0 HEAD^)
+            git log --no-merges --format='- %s' "$vorher..HEAD" \
+              | grep -E '^- (feat|fix)(\(.+\))?!?: ' > CHANGELOG.md || true
+        - name: Release anlegen
+          env:
+            GH_TOKEN: ${{ github.token }}
+          run: gh release create "$GITHUB_REF_NAME" --verify-tag --notes-file CHANGELOG.md
+  ```
+
+  `fetch-depth: 0` ist hier Pflicht, sonst findet `describe` den vorigen Tag nicht. Ohne `--tags` berücksichtigt es nur annotierte Tags, ein Hilfstag wie `nightly` stört also nicht. `permissions: contents: write` erlaubt dem Token, ein Release anzulegen. Werkzeuge wie release-please oder semantic-release automatisieren Versionsvorschlag und Changelog auf derselben Grundlage.
+
+  > [!INTERVIEW] „Warum schlägt `git describe` in der CI fehl, lokal aber nicht?“
+  > Weil `actions/checkout` standardmäßig einen flachen Klon mit Tiefe 1 und ohne Tags anlegt. `describe` braucht den Weg vom Commit zum Tag und den Tag selbst. Ich setze `fetch-depth: 0` oder hole im Job mit `git fetch --unshallow` nach; nur `--tags` zu holen reicht nicht, weil dann die History dazwischen fehlt.
+
+  ## Secrets gehören nicht ins Repository
+
+  Alles, was einmal gepusht wurde, liegt in jedem Klon, jedem Fork und womöglich in Caches. Ein Folge-Commit, der die Zeile löscht, entfernt sie nur aus dem aktuellen Stand – `git log -p` zeigt sie weiter. Öffentliche Repositorys werden automatisiert nach Schlüsseln durchsucht.
+
+  Vorbeugen: `.env` und lokale Konfiguration in `.gitignore` (Details in [Gute Commits und Commit-Hygiene](/git/commit-hygiene)), Zugangsdaten als Actions-Secrets oder Umgebungs-Secrets, [Push Protection](https://docs.github.com/en/code-security/concepts/secret-security/push-protection) auf GitHub, die Pushes mit erkannten Secrets blockiert, und ein Secret-Scanner als `pre-commit`-Hook.
+
+  Ist es passiert, gilt diese Reihenfolge ([GitHub Docs · Removing sensitive data](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/removing-sensitive-data-from-a-repository)):
+
+  1. **Secret widerrufen bzw. rotieren** – sofort. Danach ist der alte Wert wertlos; oft ist das Problem damit gelöst.
+  2. **Prüfen, ob es missbraucht wurde** (Logs des Anbieters).
+  3. **History bereinigen, falls nötig.** War der Commit noch nicht gepusht, reichen `commit --amend` oder ein interaktives Rebase ([History aufräumen](/git/interactive-rebase)). Sonst mit [git filter-repo](https://github.com/newren/git-filter-repo):
+
+  ```bash
+  git filter-repo --sensitive-data-removal --invert-paths --path config/.env
+  git push --force --mirror origin
+  ```
+
+  Das schreibt jeden Commit ab dem Leck neu: alle Hashes ändern sich, Kolleginnen müssen neu klonen oder ihre Branches rebasen (nicht mergen, sonst kommt das Secret zurück), Branch Protection gegen Force-Pushes muss vorübergehend aus. Referenzen in alten PRs und Caches entfernt nur der GitHub-Support, Forks bleiben unberührt. Deshalb steht das Rotieren an erster Stelle.
+
+  > [!WARNING]
+  > „Repository schnell auf privat stellen“ oder „History umschreiben“ ersetzt das Rotieren nicht. Ein Schlüssel, der einmal öffentlich war, gilt als kompromittiert.
+
+  ## Deployment aus main und Umgebungen
+
+  In GitHub Flow und Trunk-based Development ist `main` jederzeit auslieferbar. Jeder Merge baut ein Artefakt, das über den Commit-Hash eindeutig ist, und rollt es nach Staging aus; Produktion folgt automatisch, nach Freigabe oder beim Tag. **Umgebungen** (environments) in GitHub Actions setzen dafür Regeln: Reviewer müssen einen Job freigeben, eine Wartezeit läuft ab, nur bestimmte Branches oder Tags dürfen deployen, und Umgebungs-Secrets gibt es erst nach der Freigabe ([Deployments and environments](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments)).
+
+  ```yaml title=.github/workflows/deploy.yml
+  on:
+    push:
+      branches: [main]
+  jobs:
+    staging:
+      runs-on: ubuntu-latest
+      environment: staging
+      concurrency: deploy-staging
+      steps:
+        - uses: actions/checkout@v7
+        - run: ./scripts/deploy.sh staging "$GITHUB_SHA"
+    production:
+      needs: staging
+      runs-on: ubuntu-latest
+      environment: production
+      steps:
+        - uses: actions/checkout@v7
+        - run: ./scripts/deploy.sh production "$GITHUB_SHA"
+  ```
+
+  Der Rückweg ist ebenfalls Git: den vorigen Tag erneut ausrollen oder den fehlerhaften Commit mit `git revert` rückgängig machen und den normalen Weg durch die Pipeline gehen ([Cherry-pick und Revert](/git/cherry-pick-revert)). Ein Force-Push auf `main` ist nie der Rollback.
+
+  > [!PRAXIS] So sieht es in Teams aus
+  > Lokal: `pre-commit` mit Formatierer und Linter (Sekunden), `commit-msg` für das Nachrichtenformat. In der CI: dieselben Prüfungen plus Tests als Pflicht-Checks, dazu ein Check der Commit-Nachrichten, weil Hooks übersprungen werden können. `main` ist geschützt, gemergt wird über die Merge Queue, jeder Merge landet in Staging, Tags `v*` erzeugen Releases. Wer neu ins Team kommt, braucht nur `git config core.hooksPath .githooks` – oder den Installationsbefehl des Hook-Frameworks.
+
+  ## Häufige Fehler
+
+  - **Hook ohne x-Bit.** Er wird still übersprungen (nur ein `hint`). `chmod +x` und für versionierte Hooks `git update-index --chmod=+x .githooks/commit-msg`, damit das Bit auch im Repository steht.
+  - **Hooks als Sicherheitsmaßnahme** verstehen. `--no-verify` genügt, um sie zu umgehen. Was zählt, prüft die CI.
+  - **`pre-push` prüft die lokale Ref** statt der entfernten – `git push origin fix:main` rutscht durch.
+  - **`git describe`, Changelog oder `merge-base` im flachen Klon.** Symptome: `No names found`, `No tags can describe`, `ambiguous argument`. Lösung: `fetch-depth: 0` oder gezielt nachladen.
+  - **Nur `--tags` nachladen** und sich wundern, dass `describe` trotzdem scheitert.
+  - **Pfadfilter auf Pflicht-Workflows.** Der Check bleibt „Pending“, der PR hängt.
+  - **Merge Queue aktiviert, `merge_group` vergessen.** Der Pflicht-Check startet in der Queue nie, der Merge scheitert.
+  - **Leichtgewichtige Tags für Releases** – `git describe` ohne `--tags` ignoriert sie.
+  - **Secret gelöscht statt rotiert.** Die History und jeder Klon behalten den Wert.
+
+  ## Zusammenfassung
+
+  - Hooks sind ausführbare Dateien für Ereignisse wie `pre-commit`, `commit-msg`, `pre-push`; Exit-Code ≠ 0 bricht ab. Sie sind nicht versioniert, nicht erzwungen und per `--no-verify` umgehbar – verteilt werden sie über `core.hooksPath` oder ein Framework.
+  - Durchgesetzt werden Regeln in der CI mit Pflicht-Checks; Hooks liefern nur frühes Feedback.
+  - Bei `pull_request` testet die CI den Merge-Commit `refs/pull/<n>/merge` mit dem damaligen Stand des Base-Branches; Merge Queue und `merge_group` schließen die Lücke zum späteren Stand.
+  - `actions/checkout` klont mit Tiefe 1 ohne Tags. `describe`, `log A..B` und `merge-base` brauchen `fetch-depth: 0` oder `git fetch --unshallow`.
+  - Flache Klone kappen History, partielle Klone (`--filter=blob:none`) laden Inhalte nach und behalten die History.
+  - SemVer plus annotierte Tags plus Conventional Commits ergeben nachvollziehbare Versionen; ein Workflow auf `push.tags` baut das Release.
+  - Ein geleaktes Secret wird zuerst rotiert; `git filter-repo` und Force-Push sind der zweite, aufwendige Schritt.
+  - Deployments laufen aus `main` oder von Tags über geschützte Umgebungen; der Rollback ist ein Revert oder ein erneutes Deployment eines alten Tags.
+exercises:
+  - id: secret-geleakt
+    type: choice
+    title: Der Schlüssel liegt in der History
+    prompt: |
+      Beim Review fällt auf: Vor drei Wochen wurde ein Stripe-API-Key in `config.yaml` committet und nach `main` des öffentlichen Repositorys gepusht. Ein späterer Commit hat die Zeile wieder gelöscht. Welche Aussagen stimmen?
+    options:
+      - text: Der erste Schritt ist, den Key beim Anbieter zu widerrufen bzw. zu rotieren und danach die Logs auf Missbrauch zu prüfen.
+        correct: true
+        why: Der Key war öffentlich und gilt als kompromittiert. Erst ein neuer Key macht den alten wertlos – unabhängig davon, was mit der History passiert.
+      - text: Weil der aktuelle Stand von `main` den Key nicht mehr enthält, ist nichts weiter zu tun.
+        correct: false
+        why: Jeder Commit bleibt in der History. `git log -p -- config.yaml` zeigt den Key in jedem Klon.
+      - text: "`git filter-repo` und ein Force-Push entfernen den Key überall; danach ist er sicher."
+        correct: false
+        why: Klone, Forks, alte PR-Refs und Caches behalten ihn. Die Bereinigung verkleinert das Problem, ersetzt aber das Rotieren nicht.
+      - text: Damit es nicht wieder passiert, gehört die Konfiguration mit Zugangsdaten in `.gitignore`, der Key in ein Actions- oder Umgebungs-Secret, und Push Protection wird aktiviert.
+        correct: true
+        why: Das beseitigt die Ursache. Push Protection blockiert Pushes mit erkannten Secrets, bevor sie auf dem Server landen.
+      - text: Das Repository auf privat zu stellen, löst das Problem, weil dann niemand mehr darauf zugreifen kann.
+        correct: false
+        why: Wer den Key in drei Wochen abgegriffen hat, hat ihn längst. Sichtbarkeit rückwirkend zu ändern, macht ihn nicht ungültig.
+    explanation: |
+      Sobald ein Secret gepusht ist, ist die Frage nicht mehr „wie lösche ich es?“, sondern „wie mache ich es wertlos?“. Rotieren ist schnell, vollständig und unabhängig von Git. History-Bereinigung mit `git filter-repo` schreibt alle folgenden Commits um, erfordert Koordination mit allen Klonen und erreicht Forks nicht – GitHub selbst empfiehlt sie nur, wenn Rotieren nicht genügt.
+    resources:
+      - title: GitHub Docs · Removing sensitive data from a repository
+        url: https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/removing-sensitive-data-from-a-repository
+      - title: GitHub Docs · Push protection
+        url: https://docs.github.com/en/code-security/concepts/secret-security/push-protection
+
+  - id: release-ablauf
+    type: order
+    title: Vom grünen main zum Release
+    prompt: Bring die Schritte eines Tag-basierten Releases in die richtige Reihenfolge.
+    lang: text
+    lines: |
+      Alle Änderungen für die Version sind per PR auf main, die CI ist grün
+      Nächste Version aus den Commits seit v2.3.0 ableiten (fix → PATCH, feat → MINOR)
+      Annotierten Tag setzen: git tag -a v2.4.0 -m "Release 2.4.0"
+      Tag übertragen: git push origin v2.4.0
+      Der Workflow mit on.push.tags startet und klont mit fetch-depth: 0
+      Der Workflow baut das Artefakt und legt das GitHub-Release mit Changelog an
+      Deployment in die Umgebung production nach Freigabe
+    explanation: |
+      Die Version ergibt sich aus dem, was seit dem letzten Tag passiert ist – deshalb zuerst der Blick auf die Commits, dann der Tag. Ein Tag landet nur mit einem eigenen Push auf dem Server, und erst dieses Ereignis startet den Release-Workflow. Der Workflow braucht die volle History, um den vorigen Tag und den Changelog zu bestimmen. Deployments in produktive Umgebungen hängen an Freigaberegeln der Umgebung.
+    resources:
+      - title: Semantic Versioning 2.0.0
+        url: https://semver.org/
+      - title: GitHub Docs · Workflow syntax – on.push.tags
+        url: https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax
+
+  - id: hook-vorhersagen
+    type: output
+    title: Welche Commits kommen durch?
+    prompt: Was gibt das Skript aus? Der Hook meldet immer einen Fehler.
+    lang: bash
+    code: |
+      git init -q
+      printf '#!/bin/sh\necho "ruff: 3 Fehler" >&2\nexit 1\n' > .git/hooks/pre-commit
+      printf 'x = 1\n' > app.py && git add app.py
+      git commit -qm "Erster Versuch" 2>/dev/null || echo "1 abgelehnt"
+      chmod +x .git/hooks/pre-commit
+      printf 'x = 2\n' > app.py && git add app.py
+      git commit -qm "Zweiter Versuch" 2>/dev/null || echo "2 abgelehnt"
+      git commit -qm "Dritter Versuch" --no-verify
+      git log --format=%s
+    expected: |
+      2 abgelehnt
+      Dritter Versuch
+      Erster Versuch
+    verify: true
+    explanation: |
+      Der erste Commit geht durch, weil der Hook noch kein x-Bit hat – Git ignoriert ihn und gibt nur einen Hinweis auf stderr aus. Nach `chmod +x` läuft er, endet mit 1 und verhindert den zweiten Commit. `--no-verify` überspringt `pre-commit` (und `commit-msg`), deshalb gelingt der dritte Versuch mit denselben gestagten Änderungen. Das zeigt beide Schwächen von Hooks: Sie greifen nur, wenn sie korrekt installiert sind, und jeder kann sie umgehen.
+    resources:
+      - title: githooks – pre-commit
+        url: https://git-scm.com/docs/githooks#_pre_commit
+
+  - id: describe-vorhersagen
+    type: output
+    title: Welcher Tag beschreibt HEAD?
+    prompt: Was gibt das Skript aus? (Die letzte Zeile entfernt den Hash-Teil, damit die Ausgabe vorhersagbar ist.)
+    lang: bash
+    code: |
+      git init -q
+      git commit -q --allow-empty -m "Start"
+      git tag -a v1.0.0 -m "Release 1.0.0"
+      git commit -q --allow-empty -m "Bugfix"
+      git commit -q --allow-empty -m "Feature"
+      git tag nightly
+      git describe --abbrev=0
+      git describe --tags
+      git describe | sed 's/-g[0-9a-f]*$//'
+    expected: |
+      v1.0.0
+      nightly
+      v1.0.0-2
+    verify: true
+    explanation: |
+      Ohne Optionen berücksichtigt `git describe` nur annotierte Tags. Der nächste erreichbare ist `v1.0.0`, zwei Commits zurück; `--abbrev=0` zeigt nur den Tag-Namen, ohne Option lautet das Ergebnis `v1.0.0-2-g<hash>`. Mit `--tags` zählen auch leichtgewichtige Tags – `nightly` zeigt direkt auf `HEAD`, also erscheint nur der Name. Deshalb gehören Releases auf annotierte Tags: Sonst übergeht die Versionsermittlung sie oder ein Hilfstag wie `nightly` verdrängt sie.
+    resources:
+      - title: git-describe – Beschreibung
+        url: https://git-scm.com/docs/git-describe#_description
+      - title: Pro Git · Tagging
+        url: https://git-scm.com/book/en/v2/Git-Basics-Tagging
+
+  - id: klone-vorhersagen
+    type: output
+    title: Flach oder partiell?
+    prompt: Was gibt das Skript aus? `uploadpack.allowFilter` erlaubt dem Quell-Repository Filter, wie es GitHub tut.
+    lang: bash
+    code: |
+      git init -q app
+      for n in 1 2 3 4; do
+        printf '%s\n' "$n" > app/version.txt
+        git -C app add version.txt
+        git -C app commit -qm "Version $n"
+      done
+      git -C app config uploadpack.allowFilter true
+      git clone -q --depth 1 "file://$PWD/app" flach
+      git clone -q --filter=blob:none "file://$PWD/app" partiell
+      git -C flach rev-list --count HEAD
+      git -C partiell rev-list --count HEAD
+      git -C flach show HEAD~1:version.txt 2>/dev/null || echo "fehlt"
+      git -C partiell show HEAD~1:version.txt
+    expected: |
+      1
+      4
+      fehlt
+      3
+    verify: true
+    explanation: |
+      Der flache Klon enthält nur den letzten Commit; `HEAD~1` existiert für ihn nicht, `show` scheitert. Der partielle Klon hat alle vier Commits und Trees, aber zunächst nur die Blobs für den ausgecheckten Stand. Den Inhalt von `version.txt` im vorletzten Commit (`3`) lädt Git bei Bedarf vom Quell-Repository nach. Für CI-Jobs, die History brauchen (`describe`, Changelogs), ist ein partieller Klon deshalb oft die bessere Wahl als `--depth`.
+    resources:
+      - title: git-clone – --filter
+        url: https://git-scm.com/docs/git-clone#Documentation/git-clone.txt---filterfilter-spec
+      - title: partial-clone – Konzept
+        url: https://git-scm.com/docs/partial-clone
+
+  - id: hookspath-setzen
+    type: command
+    title: Die Team-Hooks aktivieren
+    prompt: Das Repository enthält versionierte Hooks im Verzeichnis `.githooks/`. Richte **nur für dieses Repository** ein, dass Git seine Hooks dort sucht.
+    context: Du bist im Wurzelverzeichnis deines frischen Klons von `acme/shop`.
+    answers:
+      - git config core.hooksPath .githooks
+      - git config --local core.hooksPath .githooks
+      - git config set core.hooksPath .githooks
+      - git config set --local core.hooksPath .githooks
+      - git config core.hooksPath .githooks/
+      - git config --local core.hooksPath .githooks/
+    explanation: |
+      `core.hooksPath` ersetzt `.git/hooks` als Hook-Verzeichnis. Ein relativer Pfad bezieht sich auf das Verzeichnis, in dem die Hooks laufen – bei einem normalen Repository das Wurzelverzeichnis des Arbeitsbaums. Ohne `--global` landet die Einstellung in `.git/config`, gilt also nur für diesen Klon. Genau das ist der Haken: Jede Person muss es einmal ausführen, und niemand wird dazu gezwungen.
+    resources:
+      - title: git-config – core.hooksPath
+        url: https://git-scm.com/docs/git-config#Documentation/git-config.txt-corehooksPath
+
+  - id: tag-annotiert
+    type: command
+    title: Die Version festhalten
+    prompt: Setze auf den aktuellen Commit einen **annotierten** Tag `v2.4.0` mit der Nachricht `Release 2.4.0`.
+    context: "`main` ist grün, alle Änderungen für Version 2.4.0 sind gemergt, du stehst auf `main`."
+    answers:
+      - git tag -a v2.4.0 -m "Release 2.4.0"
+      - git tag -a -m "Release 2.4.0" v2.4.0
+      - git tag -m "Release 2.4.0" v2.4.0
+      - git tag v2.4.0 -m "Release 2.4.0"
+      - git tag -m "Release 2.4.0" -a v2.4.0
+      - git tag v2.4.0 -a -m "Release 2.4.0"
+      - git tag --annotate v2.4.0 -m "Release 2.4.0"
+      - git tag -a v2.4.0 -m "Release 2.4.0" HEAD
+      - git tag -am "Release 2.4.0" v2.4.0
+    explanation: |
+      `-a` erzeugt ein Tag-Objekt mit Autor, Datum und Nachricht; `-m` liefert die Nachricht und impliziert `-a`, falls weder `-a`, `-s` noch `-u` angegeben ist. Ein leichtgewichtiger Tag (`git tag v2.4.0`) wäre nur ein Name – `git describe` ohne `--tags` übersieht ihn. Übertragen wird der Tag erst mit `git push origin v2.4.0`.
+    resources:
+      - title: git-tag – Referenz
+        url: https://git-scm.com/docs/git-tag
+
+  - id: partieller-klon
+    type: command
+    title: Schnell klonen, History behalten
+    prompt: Klone `https://github.com/acme/shop.git` so, dass **alle Commits** übertragen werden, Dateiinhalte aber erst bei Bedarf.
+    context: Das Repository ist mehrere Gigabyte groß, weil früher Bilder eingecheckt wurden. Dein Build braucht `git describe` und `git log` über die gesamte History.
+    answers:
+      - git clone --filter=blob:none https://github.com/acme/shop.git
+      - git clone https://github.com/acme/shop.git --filter=blob:none
+      - git clone --filter blob:none https://github.com/acme/shop.git
+    explanation: |
+      `--filter=blob:none` macht einen partiellen Klon: Commits und Trees kommen vollständig, Blobs nur für den ausgecheckten Stand; weitere lädt Git nach, sobald ein Befehl sie braucht. `--depth` wäre hier falsch, weil es History abschneidet und `describe` dann scheitert. Noch sparsamer ist `--filter=tree:0`, das auch Trees nachlädt – das lohnt sich vor allem für einmalige Builds.
+    resources:
+      - title: git-clone – --filter
+        url: https://git-scm.com/docs/git-clone#Documentation/git-clone.txt---filterfilter-spec
+
+  - id: workflow-luecken
+    type: gap
+    title: Der Workflow soll überall laufen
+    prompt: |
+      Ergänze den Workflow. Er soll bei Pushes auf `main`, bei jedem Pull Request und in der Merge Queue laufen. Der erste Schritt nach dem Checkout ruft `git describe --tags` auf und braucht dafür die vollständige History samt Tags.
+    lang: yaml
+    code: |
+      name: CI
+      on:
+        push:
+          branches: [⟦main⟧]
+        ⟦pull_request⟧:
+        ⟦merge_group⟧:
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v7
+              with:
+                ⟦fetch-depth⟧: ⟦0⟧
+            - run: git describe --tags
+            - run: ./scripts/test.sh
+    gaps:
+      - label: Branch-Filter für push
+        hint: Der Name des Default-Branches.
+        accept: ["\"main\"", "'main'"]
+      - label: Ereignis für Pull Requests
+        hint: Das Ereignis, dessen Läufe `refs/pull/<n>/merge` auschecken.
+      - label: Ereignis für die Merge Queue
+        hint: Ohne dieses Ereignis meldet die Merge Queue nie einen Check.
+      - label: Option von actions/checkout
+        hint: Die Anzahl der geholten Commits.
+      - label: Wert für alles
+        hint: Welcher Wert bedeutet „alle Commits, alle Branches und Tags“?
+        accept: ["\"0\"", "'0'"]
+    explanation: |
+      `push` mit `branches: [main]` deckt Merges auf `main` ab, `pull_request` jeden PR (getestet wird der simulierte Merge `refs/pull/<n>/merge`), `merge_group` die temporären Branches der Merge Queue – ohne diesen Trigger bleibt der Pflicht-Check dort aus. `fetch-depth: 0` holt die komplette History aller Branches und Tags; mit dem Standardwert 1 würde `git describe` mit `No names found` scheitern.
+    resources:
+      - title: GitHub Docs · Events that trigger workflows – merge_group
+        url: https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#merge_group
+      - title: actions/checkout – Fetch all history
+        url: https://github.com/actions/checkout
+
+  - id: commit-check-bug
+    type: bug
+    title: Die Revision gibt es nicht
+    prompt: |
+      Der Workflow soll in jedem PR prüfen, ob alle neuen Commits einen Conventional-Commit-Betreff haben. Er bricht bei jedem PR ab:
+
+      ```text
+      fatal: ambiguous argument 'origin/main..HEAD': unknown revision or path not in the working tree.
+      ```
+
+      Lokal funktioniert derselbe `git log`-Befehl. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: yaml
+    code: |
+      name: Commit-Nachrichten
+      on: pull_request
+      jobs:
+        pruefen:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v7
+              with:
+                fetch-depth: 1
+            - name: Betreffzeilen prüfen
+              run: |
+                git log --no-merges --format=%s "origin/${{ github.base_ref }}..HEAD" > betreffs.txt
+                if grep -Ev '^(feat|fix|docs|refactor|test|chore|ci)(\(.+\))?!?: ' betreffs.txt; then
+                  exit 1
+                fi
+    lines: [9]
+    fix:
+      - line: 9
+        answers:
+          - "fetch-depth: 0"
+          - "fetch-depth: \"0\""
+          - "fetch-depth: '0'"
+    explanation: |
+      Mit `fetch-depth: 1` holt `actions/checkout` nur den Merge-Commit `refs/pull/<n>/merge` – kein `origin/main`, keine History. `origin/main..HEAD` verweist also auf eine Ref, die im Runner nicht existiert. `fetch-depth: 0` holt alle Branches und Tags samt History; dann liefert der Bereich genau die Commits des PR, und `--no-merges` blendet den von GitHub erzeugten Merge-Commit aus. Lokal fällt der Fehler nicht auf, weil dein Klon vollständig ist.
+    resources:
+      - title: actions/checkout – Usage (fetch-depth)
+        url: https://github.com/actions/checkout
+      - title: gitrevisions – Bereiche
+        url: https://git-scm.com/docs/gitrevisions
+
+  - id: merge-ref-erklaeren
+    type: explain
+    title: Grün im PR, rot auf main
+    prompt: |
+      PR #57 war grün und wurde gemergt. Eine Stunde später ist der Test-Job auf `main` rot. Seit dem CI-Lauf von #57 wurde nur PR #58 gemergt, der ebenfalls grün war. Im Log des Laufs von #57 findest du diese Ausgaben. Erkläre, was die CI von #57 getestet hat, warum `main` trotzdem brechen konnte und was das Team dagegen tun kann.
+    lang: console
+    code: |
+      $ echo "$GITHUB_REF"
+      refs/pull/57/merge
+      $ git log -1 --format='%h %s'
+      9a0a926 Merge d668097b24e2838bd2d118a3993e994821590a3d into ac593985615ec2ede58e132d2e21d2b1cbd6127c
+      $ git cat-file -p HEAD | grep '^parent'
+      parent ac593985615ec2ede58e132d2e21d2b1cbd6127c
+      parent d668097b24e2838bd2d118a3993e994821590a3d
+      $ git rev-parse --is-shallow-repository
+      true
+    points:
+      - "Getestet wurde nicht die Spitze des PR-Branches, sondern ein von GitHub erzeugter Merge-Commit `refs/pull/57/merge` (`9a0a926`): erster Elternteil `ac59398` = damaliges `main`, zweiter `d668097` = Spitze von #57."
+      - Das Ergebnis gilt nur für den Stand von `main` zum Zeitpunkt des Laufs. #58 wurde danach gemergt; die Kombination #57 + #58 hat keine CI je gesehen – ein semantischer Konflikt ohne Textkonflikt.
+      - Der Klon ist flach (Tiefe 1); die Eltern stehen nur als Hashes im Commit-Objekt, die Commits selbst fehlen. Für History-Vergleiche bräuchte der Job `fetch-depth` > 1 oder 0.
+      - "Abhilfe: Pflicht-Checks im Modus „Require branches to be up to date before merging“ oder eine Merge Queue (mit `merge_group`-Trigger im Workflow), die jede Kombination vor dem Merge testet; CI auf `push` nach `main` meldet Brüche zusätzlich sofort."
+    explanation: |
+      Bei `pull_request` checkt `actions/checkout` die Ref `refs/pull/57/merge` aus. Das ist ein Merge-Commit, den GitHub nur für die CI anlegt: Erster Elternteil ist `main` zum Zeitpunkt des Laufs (`ac59398`), zweiter die Spitze des PR (`d668097`). Grün hieß also: „#57 auf dem damaligen `main` funktioniert“. Danach wurde #58 gemergt, dessen CI wiederum ohne #57 lief. Beide Änderungen vertragen sich nicht – etwa weil #58 eine Funktion umbenennt, die #57 neu aufruft –, und diese Kombination hat erst der Push auf `main` getestet. Der flache Klon zeigt nebenbei, dass der Job keine History hat; die Elternhashes stehen nur im Commit-Objekt. Dagegen hilft, Pflicht-Checks auf „up to date“ zu stellen oder – bei vielen PRs – eine Merge Queue, die jeden PR zusammen mit allem davor testet. Dafür muss der Workflow auf `merge_group` reagieren.
+    resources:
+      - title: GitHub Docs · How the merge branch affects your workflow
+        url: https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request
+      - title: GitHub Docs · Managing a merge queue
+        url: https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue
+
+  - id: labor-commit-msg-hook
+    type: practice
+    title: "Labor: „fixed stuff“ auf main"
+    prompt: |
+      Führe das Labor-Skript in einem leeren Verzeichnis aus (`cd "$(mktemp -d)"`) – **nie** in einem echten Repository.
+
+      Im Team gelten Conventional Commits, trotzdem ist der letzte (noch nicht gepushte) Commit mit `fixed stuff` betitelt. Richte einen versionierbaren `commit-msg`-Hook in `.githooks/commit-msg` ein und aktiviere ihn für das Repository. Er soll Betreffzeilen ohne Präfix wie `feat:`, `fix(api):` oder `feat!:` ablehnen und `fixup!`-, `squash!`- und `amend!`-Commits durchlassen. Gib dem letzten Commit danach einen passenden Betreff. **Beweise im Skript**, dass der Hook ablehnt und akzeptiert.
+    lang: bash
+    starter: |
+      # Labor: erzeugt den kaputten Zustand
+      git init -q shop
+      cd shop
+      printf 'print("shop")\n' > app.py
+      git add app.py
+      git commit -qm "feat: Grundgerüst anlegen"
+      printf 'print("shop", "2.0")\n' > app.py
+      git commit -qam "fixed stuff"
+      mkdir .githooks
+      # Deine Reparatur:
+    solution: |
+      # Labor: erzeugt den kaputten Zustand
+      git init -q shop
+      cd shop
+      printf 'print("shop")\n' > app.py
+      git add app.py
+      git commit -qm "feat: Grundgerüst anlegen"
+      printf 'print("shop", "2.0")\n' > app.py
+      git commit -qam "fixed stuff"
+      mkdir .githooks
+      # Reparatur
+      cat > .githooks/commit-msg <<'HOOK'
+      #!/bin/sh
+      betreff=$(head -n 1 "$1")
+      typen='feat|fix|docs|refactor|perf|test|build|ci|chore|revert'
+      if printf '%s\n' "$betreff" | grep -Eq "^($typen)(\([a-z0-9-]+\))?!?: .+|^(fixup|squash|amend)! "; then
+        exit 0
+      fi
+      echo "commit-msg: kein Conventional-Commit-Betreff: $betreff" >&2
+      echo "Beispiel: fix(api): Timeout beim Login erhöhen" >&2
+      exit 1
+      HOOK
+      chmod +x .githooks/commit-msg
+      git config core.hooksPath .githooks
+      git commit -q --amend -m "feat: Version in der Ausgabe anzeigen"
+      # Kontrolle
+      if git commit -q --allow-empty -m "Login repariert" 2>/dev/null; then exit 1; fi
+      if git commit -q --allow-empty -m "feat Login" 2>/dev/null; then exit 1; fi
+      git commit -q --allow-empty -m "fix(api): Timeout beim Login erhöhen"
+      test "$(git rev-list --count HEAD)" = 3
+      test -z "$(git log --format=%s | grep -Ev '^[a-z]+(\([a-z0-9-]+\))?!?: ')"
+    checklist:
+      - "`.githooks/commit-msg` ist ausführbar (`ls -l` zeigt `x`) und `git config core.hooksPath` gibt `.githooks` aus."
+      - "Ein Commit mit `Login repariert` bricht mit deiner Fehlermeldung ab, `git log` bleibt unverändert."
+      - "`fix(api): Timeout beim Login erhöhen` und `feat!: …` werden akzeptiert, ebenso ein mit `git commit --fixup` erzeugter Commit."
+      - "`git log --format=%s` enthält keinen Betreff mehr ohne Präfix."
+      - Du kannst erklären, warum der Hook allein nicht verhindert, dass `fixed stuff` auf `main` landet.
+    verify: true
+    explanation: |
+      Git ruft `commit-msg` mit dem Pfad der Nachrichtendatei als `$1` auf; die erste Zeile ist der Betreff. Exit-Code 1 bricht den Commit ab, die Meldung auf stderr sieht die Person am Terminal. Der Hook liegt in `.githooks/`, damit er versioniert wird; `core.hooksPath` aktiviert ihn, `chmod +x` ist Pflicht, sonst ignoriert Git ihn. Auch `commit --amend` läuft durch den Hook – der neue Betreff muss also passen. Die Ausnahmen für `fixup!` und Co. sind nötig, weil diese Commits erst beim Autosquash verschwinden. Durchsetzen lässt sich die Regel trotzdem nur in der CI: `--no-verify` oder ein fehlendes `core.hooksPath` genügen, um den Hook zu umgehen.
+    resources:
+      - title: githooks – commit-msg
+        url: https://git-scm.com/docs/githooks#_commit_msg
+      - title: Conventional Commits 1.0.0
+        url: https://www.conventionalcommits.org/en/v1.0.0/
+
+  - id: labor-describe-flach
+    type: practice
+    title: "Labor: No names found"
+    prompt: |
+      Führe das Labor-Skript in einem leeren Verzeichnis aus (`cd "$(mktemp -d)"`) – **nie** in einem echten Repository.
+
+      Das Skript baut ein Projekt mit dem Release `v2.3.0` und zwei Commits danach und klont es so, wie es `actions/checkout` mit Standardeinstellungen tut. Im Klon `ci` scheitert `git describe`. Stelle den Zustand her, in dem `git describe` in `ci` eine Ausgabe der Form `v2.3.0-2-g<hash>` liefert. Ein neuer Klon ist nicht erlaubt.
+    lang: bash
+    starter: |
+      # Labor: erzeugt den kaputten Zustand
+      git init -q shop
+      for n in 1 2 3; do
+        printf 'version = "2.%s"\n' "$n" > shop/version.py
+        git -C shop add version.py
+        git -C shop commit -qm "Version 2.$n vorbereiten"
+      done
+      git -C shop tag -a v2.3.0 -m "Release 2.3.0"
+      git -C shop commit -q --allow-empty -m "fix: Warenkorb rundet falsch"
+      git -C shop commit -q --allow-empty -m "feat: Gutscheine"
+      # So klont actions/checkout mit der Standardeinstellung fetch-depth: 1
+      git clone -q --depth 1 "file://$PWD/shop" ci
+      cd ci
+      git describe || true
+      # Deine Reparatur:
+    solution: |
+      # Labor: erzeugt den kaputten Zustand
+      git init -q shop
+      for n in 1 2 3; do
+        printf 'version = "2.%s"\n' "$n" > shop/version.py
+        git -C shop add version.py
+        git -C shop commit -qm "Version 2.$n vorbereiten"
+      done
+      git -C shop tag -a v2.3.0 -m "Release 2.3.0"
+      git -C shop commit -q --allow-empty -m "fix: Warenkorb rundet falsch"
+      git -C shop commit -q --allow-empty -m "feat: Gutscheine"
+      # So klont actions/checkout mit der Standardeinstellung fetch-depth: 1
+      git clone -q --depth 1 "file://$PWD/shop" ci
+      cd ci
+      git describe || true
+      # Reparatur
+      git fetch -q --unshallow
+      # Kontrolle
+      git describe | grep -Eq '^v2\.3\.0-2-g[0-9a-f]+$'
+    checklist:
+      - "Du hast die Ursache mit `git rev-parse --is-shallow-repository` (Ausgabe `true`) und `git tag` (leer) bestätigt."
+      - Du hast ausprobiert, dass `git fetch --tags` allein nicht reicht, und kannst die Meldung `No tags can describe` erklären.
+      - "`git describe` gibt `v2.3.0-2-g…` aus."
+      - "Du weißt, welche Einstellung in `actions/checkout` dasselbe bewirkt (`fetch-depth: 0`)."
+    verify: true
+    explanation: |
+      Der Klon mit `--depth 1` enthält einen Commit und keinen Tag, weil `v2.3.0` auf einen Commit zeigt, der nicht übertragen wurde. `git fetch --unshallow` holt die restliche History, und dabei folgt Git automatisch den Tags, die auf nun vorhandene Commits zeigen. `describe` findet `v2.3.0` zwei Commits zurück. `git fetch --tags` allein holt den Tag samt seinem Commit, aber nicht die Commits dazwischen – der Weg von `HEAD` zum Tag bleibt abgeschnitten. `git fetch --deepen=5` oder `--depth=3` funktionieren hier ebenfalls, setzen aber voraus, dass du die Tiefe kennst. In GitHub Actions entspricht das `fetch-depth: 0`.
+    resources:
+      - title: git-fetch – --unshallow
+        url: https://git-scm.com/docs/git-fetch#Documentation/git-fetch.txt---unshallow
+      - title: actions/checkout
+        url: https://github.com/actions/checkout
+
+  - id: labor-pre-push-main
+    type: practice
+    title: "Labor: Direkt auf main gearbeitet"
+    prompt: |
+      Führe das Labor-Skript in einem leeren Verzeichnis aus (`cd "$(mktemp -d)"`) – **nie** in einem echten Repository.
+
+      Du hast aus Versehen direkt auf `main` committet, und nichts hätte dich beim Pushen aufgehalten. Richte einen `pre-push`-Hook ein, der **jeden** Push ablehnt, der auf dem Server `main` verändern würde – auch `git push origin <anderer-branch>:main`. Verschiebe deinen Commit auf einen Branch `fix/preis-runden`, setze dein lokales `main` auf `origin/main` zurück und beweise im Skript, dass Pushes auf `main` scheitern und der Push des Branches gelingt.
+    lang: bash
+    starter: |
+      # Labor: erzeugt den kaputten Zustand
+      git init -q --bare origin.git
+      git clone -q origin.git lea 2>/dev/null
+      cd lea
+      printf 'def preis(netto):\n    return netto * 1.19\n' > shop.py
+      git add shop.py
+      git commit -qm "feat: Preisberechnung"
+      git push -q -u origin main
+      # Aus Versehen direkt auf main gearbeitet
+      printf 'def preis(netto):\n    return round(netto * 1.19, 2)\n' > shop.py
+      git commit -qam "fix: Preis auf Cent runden"
+      # Deine Reparatur:
+    solution: |
+      # Labor: erzeugt den kaputten Zustand
+      git init -q --bare origin.git
+      git clone -q origin.git lea 2>/dev/null
+      cd lea
+      printf 'def preis(netto):\n    return netto * 1.19\n' > shop.py
+      git add shop.py
+      git commit -qm "feat: Preisberechnung"
+      git push -q -u origin main
+      # Aus Versehen direkt auf main gearbeitet
+      printf 'def preis(netto):\n    return round(netto * 1.19, 2)\n' > shop.py
+      git commit -qam "fix: Preis auf Cent runden"
+      # Reparatur
+      cat > .git/hooks/pre-push <<'HOOK'
+      #!/bin/sh
+      while read -r lokal_ref lokal_oid remote_ref remote_oid; do
+        if [ "$remote_ref" = "refs/heads/main" ]; then
+          echo "pre-push: Kein direkter Push auf main – bitte per Pull Request." >&2
+          exit 1
+        fi
+      done
+      exit 0
+      HOOK
+      chmod +x .git/hooks/pre-push
+      git switch -q -c fix/preis-runden
+      git branch -f main origin/main
+      # Kontrolle
+      if git push -q origin fix/preis-runden:main 2>/dev/null; then exit 1; fi
+      if git push -q origin HEAD:refs/heads/main 2>/dev/null; then exit 1; fi
+      git push -q -u origin fix/preis-runden
+      test "$(git -C ../origin.git log -1 --format=%s main)" = "feat: Preisberechnung"
+      test "$(git rev-parse main)" = "$(git rev-parse origin/main)"
+      test "$(git -C ../origin.git rev-parse fix/preis-runden)" = "$(git rev-parse HEAD)"
+    checklist:
+      - Der Hook liest die Zeilen von stdin und vergleicht die **entfernte** Ref (drittes Feld) mit `refs/heads/main`.
+      - "`git push origin fix/preis-runden:main` bricht mit deiner Meldung ab; auf dem Server bleibt `main` bei `feat: Preisberechnung`."
+      - "`git push -u origin fix/preis-runden` gelingt."
+      - "`git status -sb` auf `main` zeigt `## main...origin/main` ohne ahead."
+      - Du kannst erklären, warum trotzdem Branch Protection auf dem Server nötig ist.
+    verify: true
+    explanation: |
+      Git übergibt dem `pre-push`-Hook pro zu pushender Ref eine Zeile `<lokale Ref> <lokaler Hash> <entfernte Ref> <entfernter Hash>`. Entscheidend ist die entfernte Ref: Bei `git push origin fix/preis-runden:main` ist die lokale Ref `refs/heads/fix/preis-runden`, das Ziel aber `refs/heads/main`. Ein Hook, der die lokale Ref prüft, ließe genau diesen Push durch. `git switch -c` nimmt deinen Commit auf einen neuen Branch mit, `git branch -f main origin/main` setzt `main` zurück, ohne dass du den Branch wechseln musst. Der Hook schützt nur deinen Klon; verbindlich wird die Regel erst mit Branch Protection bzw. einem Ruleset auf dem Server.
+    resources:
+      - title: githooks – pre-push
+        url: https://git-scm.com/docs/githooks#_pre_push
+      - title: GitHub Docs · About protected branches
+        url: https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches

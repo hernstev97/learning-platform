@@ -70,7 +70,7 @@ Eine vollständige, minimale Vorlage mit jeder Übungsart liegt in [`tooling/fix
 
 1. **Lehrplan entwerfen.** Schreibe zuerst die Liste der Module auf: 10–16 Module in 2–4 Tracks, vom Einstieg bis zum Profi-Niveau. Frage dich bei jedem Modul: *Was kann ich danach, was ich vorher nicht konnte?* Und: *Würde ein Arbeitgeber das erwarten?*
 2. **Ordner anlegen:** `content/<bereich>/` mit `area.yaml` (Abschnitt 4). Die Ordner-ID ist kurz, klein und kebab-case, zum Beispiel `go`, `typescript`, `devops`.
-3. **Farbe wählen.** Eine kräftige Farbe, auf der schwarzer Text gut lesbar ist (Kontrast ≥ 4,5 : 1 zu `#0B0B0B`). Vorhandene Farben nicht wiederholen: `#A98BFF` Kotlin, `#FF6A3D` Rust, `#FFD400` Linux, `#4D8BFF` Python, `#2BD97C` Automation. Gute freie Kandidaten: `#FF5CA8` (Pink), `#22D3EE` (Cyan), `#C6F432` (Limette), `#FF9F1C` (Orange-Gelb).
+3. **Farbe wählen.** Eine kräftige Farbe, auf der schwarzer Text gut lesbar ist (Kontrast ≥ 4,5 : 1 zu `#0B0B0B`). Vorhandene Farben nicht wiederholen: `#A98BFF` Kotlin, `#FF6A3D` Rust, `#FFD400` Linux, `#4D8BFF` Python, `#2BD97C` Automation, `#FF5CA8` Git. Gute freie Kandidaten: `#22D3EE` (Cyan), `#C6F432` (Limette), `#FF9F1C` (Orange-Gelb).
 4. **Module schreiben** (Abschnitte 5–7). Ein Modul pro Datei, Dateiname = Modul-ID.
 5. **Karten, Projekte, Glossar, Spickzettel, Berufsseite** ergänzen (Abschnitt 8).
 6. **Prüfen:** `pnpm content:check <bereich>`, dann `pnpm verify <bereich>`, dann `pnpm test` und `pnpm build`.
@@ -328,7 +328,9 @@ Die Plattform mischt die Zeilen deterministisch. 4–10 Zeilen sind ideal. Zeile
   explanation: …
 ```
 
-Verglichen wird zeilenweise ohne Leerraum am Zeilenende und ohne Leerzeilen am Anfang oder Ende. Für Shell-Code (`lang: bash`) kann `verify: true` gesetzt werden; dann führt `pnpm verify` ihn in einem leeren Wegwerf-Verzeichnis aus. Ausgaben mit Zeitstempeln, PIDs oder Zufall sind ungeeignet.
+Verglichen wird zeilenweise ohne Leerraum am Zeilenende und ohne Leerzeilen am Anfang oder Ende. Für Shell-Code (`lang: bash`) kann `verify: true` gesetzt werden; dann führt `pnpm verify` ihn in einem leeren Wegwerf-Verzeichnis aus. Ausgaben mit Zeitstempeln, PIDs, Commit-Hashes oder Zufall sind ungeeignet.
+
+Git läuft dabei ohne System- und globale Konfiguration, mit fester Identität, `init.defaultBranch=main`, ohne Editor und Pager und mit englischen Meldungen (`GIT_ENV` in `tooling/verify-code.ts`). Verglichen wird nur stdout; viele Git-Meldungen landen auf stderr.
 
 ### `command` – Terminal
 
@@ -464,6 +466,8 @@ Ablauf: Der Lernende schreibt seine Erklärung (mindestens ein paar Sätze), ver
 ```
 
 Für alles, was sich im Browser nicht prüfen lässt: Kotlin-Programme, Rust-Programme, Konfigurationen, Dockerfiles, systemd-Units, Bash-Skripte. Rust-Aufgaben bekommen automatisch einen Button „Im Rust Playground öffnen“ mit dem eigenen Entwurf. Die Checkliste enthält überprüfbare Kriterien, keine Floskeln.
+
+**Kaputt-Labore** (Bash mit `verify: true`): `starter` ist ein Skript, das in einem leeren Verzeichnis einen kaputten Zustand erzeugt, etwa ein Git-Repository nach einem missglückten `reset --hard`. `solution` wiederholt dieses Skript zeichengleich, ergänzt die Reparatur und endet mit einer `# Kontrolle` aus `test`, `grep -q` oder `git diff --quiet`, die ohne Reparatur scheitert. `pnpm verify` führt die Lösung unter `set -euo pipefail` in einem Wegwerf-Verzeichnis aus und verlangt Exit-Code 0. Absichtlich scheiternde Befehle (Merge mit Konflikt, abgelehnter Push) brauchen `|| true`. Der Git-Bereich nutzt dieses Muster in jedem Modul.
 
 ## 8. Interview-Karten, Projekte, Glossar, Spickzettel, Beruf
 

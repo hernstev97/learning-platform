@@ -5,6 +5,8 @@
 //  - Rust programs (gap, order, practice, lesson blocks with fn main): they compile; #[test]s pass.
 //  - Python lesson blocks marked `run`: they run without an exception (unless flagged `fails`).
 //  - Shell `output` exercises only with `verify: true` (they run in a throwaway directory).
+//  - Shell `practice` exercises with `verify: true`: the solution runs under `set -euo pipefail`
+//    in a throwaway directory and must exit 0 (used for Git break-and-repair labs).
 // Needs python3 and rustc. Kotlin is not compiled (no toolchain dependency); the Bear course is
 // checked by its own generator instead.
 import { spawn } from 'node:child_process';
@@ -23,9 +25,10 @@ const root = process.argv.includes('--fixtures') ? join(ROOT, 'tooling/fixtures'
 const loaded = loadContent(only, root, { allowMissing: process.argv.includes('--allow-missing') });
 if (loaded.errors.length) { console.error('Inhalte sind ungültig – erst pnpm content:check beheben.'); process.exit(1); }
 
-function exec(command: string, args: string[], options: { input?: string; cwd?: string; timeout?: number } = {}): Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean }> {
+function exec(command: string, args: string[], options: { input?: string; cwd?: string; timeout?: number; env?: Record<string, string> } = {}): Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean }> {
   return new Promise((resolve) => {
-    const child = spawn(command, args, { cwd: options.cwd, stdio: ['pipe', 'pipe', 'pipe'] });
+    const env = options.env ? { ...process.env, ...options.env } : process.env;
+    const child = spawn(command, args, { cwd: options.cwd, env, stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
     let timedOut = false;
@@ -69,11 +72,23 @@ async function rust(code: string, mode: 'run' | 'check' | 'test'): Promise<{ std
   }
 }
 
-async function bash(code: string): Promise<string> {
+// Git scenarios must not depend on the machine: no global or system config, a fixed identity,
+// no pager or editor, English messages. Hashes still differ per run (commit times are real).
+const GIT_ENV = {
+  GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null',
+  GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'init.defaultBranch', GIT_CONFIG_VALUE_0: 'main',
+  GIT_AUTHOR_NAME: 'Lea Lernt', GIT_AUTHOR_EMAIL: 'lea@example.com',
+  GIT_COMMITTER_NAME: 'Lea Lernt', GIT_COMMITTER_EMAIL: 'lea@example.com',
+  GIT_PAGER: 'cat', GIT_EDITOR: 'true', GIT_TERMINAL_PROMPT: '0', LC_MESSAGES: 'C', LANGUAGE: '',
+};
+
+async function bash(code: string, options: { strict?: boolean } = {}): Promise<{ code: number | null; stdout: string; stderr: string }> {
   const dir = mkdtempSync(join(tmpdir(), 'verify-sh-'));
   try {
-    const result = await exec('bash', ['--noprofile', '--norc', '-c', code], { cwd: dir, timeout: 15000 });
-    return result.stdout;
+    const flags = options.strict ? ['-euo', 'pipefail'] : [];
+    const result = await exec('bash', ['--noprofile', '--norc', ...flags, '-c', code], { cwd: dir, timeout: 15000, env: GIT_ENV });
+    if (result.timedOut) throw new Error('Zeitüberschreitung (15 s)');
+    return result;
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -114,10 +129,15 @@ for (const { area, file, exercise: authored, normalized } of loaded.raw) {
       } });
     } else if (['bash', 'sh', 'shell'].includes(lang) && authored.verify === true) {
       jobs.push({ label, run: async () => {
-        const stdout = await bash(ex.code);
+        const { stdout } = await bash(ex.code);
         return normalizeOutput(stdout) === normalizeOutput(ex.expected[0]) ? null : diff(normalizeOutput(ex.expected[0]), normalizeOutput(stdout));
       } });
     } else skipped++;
+  } else if (normalized.type === 'practice' && ['bash', 'sh', 'shell'].includes(lang) && authored.verify === true) {
+    jobs.push({ label, run: async () => {
+      const result = await bash(normalized.solution, { strict: true });
+      return result.code === 0 ? null : `Musterlösung endet mit Exit-Code ${result.code}:\n${(result.stdout + result.stderr).trim().split('\n').slice(-15).join('\n')}`;
+    } });
   } else if (normalized.type === 'bug' && lang === 'python' && (normalized as BugExercise).fixes.length) {
     const code = fixedCode(normalized as BugExercise);
     jobs.push({ label, run: async () => {
