@@ -58,6 +58,18 @@ describe('progress storage', () => {
     local.notes = { intro: 'Lokal' };
     expect(mergeProgress(local, parsed.python).notes).toEqual({ intro: 'Lokal', second: 'Neu' });
   });
+  it('keeps review state of exercises and modules in backups, drops malformed values and merges the newer one', () => {
+    const drill = { box: 2, due: '2026-10-02', last: '2026-09-28', fails: 2, hints: 1, reveals: 0, open: 0 };
+    const parsed = sanitize({ version: 1, drills: { 'm/a': drill, 'm/b': { ...drill, box: 7 }, 'm/c': { ...drill, fails: -1 }, 'm/d': { ...drill, last: 'gestern' }, 'm/e': { ...drill, due: 'bald' } }, topics: { m: { reps: 2, last: '2026-09-20' }, n: { reps: 1.5, last: '2026-09-20' } } });
+    expect(parsed.drills).toEqual({ 'm/a': drill, 'm/e': { box: 2, last: '2026-09-28', fails: 2, hints: 1, reveals: 0, open: 0 } });
+    expect(parsed.topics).toEqual({ m: { reps: 2, last: '2026-09-20' } });
+    const local = freshProgress();
+    local.drills['m/a'] = { ...drill, last: '2026-09-30', box: 3 };
+    local.topics.m = { reps: 0, last: '2026-09-10' };
+    const merged = mergeProgress(local, parsed);
+    expect(merged.drills['m/a'].box).toBe(3);
+    expect(merged.topics.m).toEqual({ reps: 2, last: '2026-09-20' });
+  });
   it('converts progress from kotlin.kiumu.app', () => {
     const modules = [{ id: 'bear-01', exercises: [{ id: 'bear-01/bear-001', fingerprint: 'f1' }, { id: 'bear-01/bear-002', fingerprint: 'f2' }] }];
     const old = JSON.stringify({ version: 2, activeId: 'bear-002', drafts: { 'bear-002': { g1: '"Be' } }, completed: { 'bear-001': { answers: { g1: 'val' }, at: '2026-09-28', fingerprint: 'f1' }, 'bear-002': { answers: {}, at: 'x', fingerprint: 'stale' } } });

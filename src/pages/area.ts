@@ -1,6 +1,8 @@
 import { hasNote, progressOf, summaryOf } from '../app.ts';
 import { resolveResume, type Resume } from '../engine/persistence.ts';
 import { areaStats } from '../engine/storage.ts';
+import { analyzeArea } from '../engine/weakness.ts';
+import { STATUS } from '../ui/review.ts';
 import { RESUME_NOTES, areaTabs, moduleBars, resumeStep } from '../ui/area-nav.ts';
 import { LEVELS, html, icons, minutes, pad, raw } from '../ui/dom.ts';
 import type { Page } from '../router.ts';
@@ -22,6 +24,7 @@ const area: Page<{ name: 'area'; area: string }> = (main, route) => {
   const { resume } = target;
   document.title = `${summary.title} · learn.kiumu.app`;
   const capstone = summary.projects.find((p) => p.capstone);
+  const topics = new Map(analyzeArea(summary, progress).map((r) => [r.topic.id, r]));
   let n = 0;
   main.innerHTML = html`
     <header class="area-hero" style="--area:${summary.color}">
@@ -60,12 +63,14 @@ const area: Page<{ name: 'area'; area: string }> = (main, route) => {
           <ol class="module-list">
             ${track.modules.map((id) => {
               const m = summary.modules.find((x) => x.id === id)!;
-              const bars = moduleBars(m, progress);
+              const topic = topics.get(m.id);
+              const bars = moduleBars(m, progress, new Set(topic?.exercises.filter((e) => e.weak).map((e) => e.id)));
+              const review = topic && (topic.status === 'due' || topic.status === 'stale') ? topic : undefined;
               n++;
               const status = bars.done === bars.total && bars.total ? 'Fertig' : bars.done ? `${bars.done}/${bars.total}` : progress.read[m.id] ? 'Gelesen' : 'Neu';
               return html`<li><a class="module-row ${bars.done === bars.total && bars.total ? 'complete' : ''}" href="/${summary.id}/${m.id}">
                 <span class="module-number">${pad(n)}</span>
-                <span class="module-main"><span class="module-title">${m.title}</span><span class="module-summary">${m.summary}</span>${hasNote(summary.id, m.id) ? html`<span class="note-mark">Notiz</span>` : ''}</span>
+                <span class="module-main"><span class="module-title">${m.title}</span><span class="module-summary">${m.summary}</span>${hasNote(summary.id, m.id) || review ? html`<span class="row-marks">${hasNote(summary.id, m.id) ? html`<span class="note-mark">Notiz</span>` : ''}${review ? html`<span class="review-mark" title="${review.reasons[0]?.text ?? ''}">${STATUS[review.status]}</span>` : ''}</span>` : ''}</span>
                 <span class="module-meta"><span class="tag">${LEVELS[m.level]}</span><span class="tag">${minutes(m.minutes)}</span>${m.bear ? html`<span class="tag ink">Bear</span>` : ''}</span>
                 <span class="module-progress">${bars.markup}<span class="label">${status}</span></span>
               </a></li>`;

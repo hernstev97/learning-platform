@@ -3,8 +3,9 @@ import { ConvexError, v } from 'convex/values';
 import { internalMutation, mutation, query, type MutationCtx, type QueryCtx } from './_generated/server';
 import { internal } from './_generated/api';
 import { requireOwner } from './auth';
-import { assertId, assertPair, draftInput, entry, entryKey, grade, noteInput, validateDraft, validateEntry, validateNote, type Entry } from './model';
+import { assertDay, assertId, assertPair, draftInput, drillEvent, entry, entryKey, grade, noteInput, validateDraft, validateEntry, validateNote, type Entry } from './model';
 import { schedule } from '../src/engine/review';
+import { drill, drillBase } from '../src/engine/drill';
 
 async function checkGeneration(ctx: MutationCtx, areaId: string, generation: number) {
   assertId(areaId);
@@ -12,10 +13,12 @@ async function checkGeneration(ctx: MutationCtx, areaId: string, generation: num
   if (!Number.isSafeInteger(generation) || generation !== (reset?.generation ?? 0)) throw new ConvexError('PROGRESS_WAS_RESET');
   return reset;
 }
+const findEntry = (ctx: MutationCtx, areaId: string, key: string) =>
+  ctx.db.query('progress').withIndex('by_area_key', (q) => q.eq('areaId', areaId).eq('key', key)).unique();
 async function put(ctx: MutationCtx, areaId: string, value: Entry, missingOnly = false) {
   validateEntry(value);
   const key = entryKey(value);
-  const existing = await ctx.db.query('progress').withIndex('by_area_key', (q) => q.eq('areaId', areaId).eq('key', key)).unique();
+  const existing = await findEntry(ctx, areaId, key);
   if (existing && (missingOnly || (value.kind !== 'position' && JSON.stringify(existing.value) === JSON.stringify(value)))) return;
   const record = { areaId, key, value, updatedAt: Date.now() };
   if (existing) await ctx.db.replace(existing._id, record); else await ctx.db.insert('progress', record);
@@ -48,14 +51,30 @@ export const reviewCard = mutation({
     await requireOwner(ctx);
     await checkGeneration(ctx, areaId, generation);
     assertId(cardId);
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(today) || !Number.isFinite(Date.parse(today))) throw new ConvexError('INVALID_DATE');
+    assertDay(today);
     const rating = grade ?? (knew === undefined ? undefined : knew ? 'good' : 'again');
     if (!rating) throw new ConvexError('INVALID_GRADE');
-    const current = await ctx.db.query('progress').withIndex('by_area_key', (q) => q.eq('areaId', areaId).eq('key', `card:${cardId}`)).unique();
+    const current = await findEntry(ctx, areaId, `card:${cardId}`);
     const state = current?.value.kind === 'card' ? current.value.value : undefined;
     const next = schedule(state, rating, today);
     await put(ctx, areaId, { kind: 'card', id: cardId, value: next });
     await ctx.db.insert('cardReviews', { areaId, generation, cardId, grade: rating, day: today, reviewedAt: Date.now(), box: next.box, due: next.due });
+  },
+});
+
+/** A wrong check, hint, shown solution or solve, applied to the latest stored state and logged in drillEvents. */
+export const recordDrill = mutation({
+  args: { areaId: v.string(), generation: v.number(), exerciseId: v.string(), event: drillEvent, review: v.boolean(), today: v.string() },
+  handler: async (ctx, { areaId, generation, exerciseId, event, review, today }) => {
+    await requireOwner(ctx);
+    await checkGeneration(ctx, areaId, generation);
+    assertPair(exerciseId);
+    assertDay(today);
+    const [stored, completion, revealed] = await Promise.all(['drill', 'completion', 'revealed'].map((kind) => findEntry(ctx, areaId, `${kind}:${exerciseId}`)));
+    const next = drill(drillBase(stored?.value, completion?.value, revealed?.value, today), event, today, review);
+    if (!next) return;
+    await put(ctx, areaId, { kind: 'drill', id: exerciseId, value: next });
+    await ctx.db.insert('drillEvents', { areaId, generation, exerciseId, event, review, day: today, at: Date.now(), box: next.box });
   },
 });
 
@@ -173,6 +192,7 @@ export const resetArea = mutation({
     else await ctx.db.insert('areaResets', { areaId, generation: 1 });
     await ctx.scheduler.runAfter(0, internal.progress.purgeDrafts, { areaId, generation });
     await ctx.scheduler.runAfter(0, internal.progress.purgeReviews, { areaId, generation });
+    await ctx.scheduler.runAfter(0, internal.progress.purgeDrillEvents, { areaId, generation });
     // Keep receipts: an old device must not silently restore a deliberately reset area.
   },
 });
@@ -198,5 +218,17 @@ export const purgeReviews = internalMutation({
     const rows = await ctx.db.query('cardReviews').withIndex('by_area_generation_card', (q) => q.eq('areaId', areaId).eq('generation', generation)).take(256);
     for (const row of rows) await ctx.db.delete(row._id);
     if (rows.length === 256) await ctx.scheduler.runAfter(0, internal.progress.purgeReviews, { areaId, generation });
+  },
+});
+
+/** Exercise events of a reset generation, deleted in bounded batches like card reviews. */
+export const purgeDrillEvents = internalMutation({
+  args: { areaId: v.string(), generation: v.number() },
+  handler: async (ctx, { areaId, generation }) => {
+    const reset = await ctx.db.query('areaResets').withIndex('by_area', (q) => q.eq('areaId', areaId)).unique();
+    if (!reset || reset.generation <= generation) return;
+    const rows = await ctx.db.query('drillEvents').withIndex('by_area_generation_exercise', (q) => q.eq('areaId', areaId).eq('generation', generation)).take(256);
+    for (const row of rows) await ctx.db.delete(row._id);
+    if (rows.length === 256) await ctx.scheduler.runAfter(0, internal.progress.purgeDrillEvents, { areaId, generation });
   },
 });

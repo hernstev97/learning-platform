@@ -3,10 +3,12 @@ import './styles/layout.css';
 import './styles/content.css';
 import './styles/exercise.css';
 import './styles/pages.css';
+import './styles/review.css';
 import { catalog, closeDraft, getStorageWarning, getSyncNotice, getSyncStatus, hasPendingWrites, isCloud, isOffline, loadArea, onProgressChange, onStorageChange, prepareDraft, summaryOf, visit } from './app.ts';
 import { scanLegacy } from './engine/legacy.ts';
 import { $, html, icons, raw } from './ui/dom.ts';
 import { mountSearch } from './ui/search.ts';
+import { dueTopicCount } from './ui/review.ts';
 import { currentTheme, initTheme, onThemeChange, setTheme } from './ui/theme.ts';
 import type { Page } from './router.ts';
 import { navigate, parseRoute, startRouter } from './router.ts';
@@ -21,6 +23,7 @@ export function mount(signOut: () => Promise<void> = async () => {}): void {
         ${catalog.areas.map((area) => html`<a href="/${area.id}" data-area="${area.id}" style="--area:${area.color}">${area.short}</a>`)}
       </nav>
       <button class="topbar-search" id="search-open" type="button" title="Suche (/ oder Strg+K)" aria-haspopup="dialog" aria-keyshortcuts="/ Control+K Meta+K">${raw(icons.search)}<span class="topbar-search-text">Suche</span><kbd class="kbd-hint" aria-hidden="true">/</kbd></button>
+      <a class="topbar-review" href="/wiederholen" id="review-link">${raw(icons.repeat)}<span class="topbar-review-text">Wiederholen</span><b id="review-count" hidden></b></a>
       <a class="topbar-data" href="/daten">Daten</a>
       <button class="theme-toggle" id="theme-toggle" type="button"></button>
       <button class="btn small" id="sign-out" type="button" ${isOffline() ? 'hidden' : ''}>Abmelden</button>
@@ -79,6 +82,17 @@ export function mount(signOut: () => Promise<void> = async () => {}): void {
     $('#storage-status').textContent = getSyncStatus();
   }
   onStorageChange(updateStorage);
+  // Topics due for review across all areas; recomputed from the synchronized state, like every other count.
+  const reviewCount = $('#review-count');
+  const updateReviewCount = () => {
+    const count = dueTopicCount();
+    reviewCount.hidden = !count;
+    reviewCount.textContent = String(count);
+    const label = count ? `Wiederholen, ${count} ${count === 1 ? 'Thema' : 'Themen'} fällig` : 'Wiederholen';
+    $('#review-link').setAttribute('aria-label', label);
+    $('#review-link').title = label;
+  };
+  onProgressChange((draft) => { if (!draft) updateReviewCount(); });
 
   async function render(recordVisit = true): Promise<void> {
     const token = ++renderToken;
@@ -90,6 +104,8 @@ export function mount(signOut: () => Promise<void> = async () => {}): void {
     document.documentElement.dataset.area = area?.id ?? '';
     document.querySelectorAll<HTMLAnchorElement>('.topnav a').forEach((link) => link.toggleAttribute('aria-current', link.dataset.area === area?.id));
     revealCurrent($<HTMLElement>('.topnav'));
+    $('#review-link').toggleAttribute('aria-current', route.name.startsWith('review'));
+    updateReviewCount();
     let page: Page;
     switch (route.name) {
       case 'home': page = (await import('./pages/home.ts')).default; break;
@@ -100,6 +116,8 @@ export function mount(signOut: () => Promise<void> = async () => {}): void {
       case 'cards': page = (await import('./pages/cards.ts')).default; break;
       case 'projects': case 'project': page = (await import('./pages/projects.ts')).default; break;
       case 'reference': page = (await import('./pages/reference.ts')).default; break;
+      case 'review-home': case 'review': page = (await import('./pages/review.ts')).default; break;
+      case 'review-round': page = (await import('./pages/review-round.ts')).default; break;
       default: page = (await import('./pages/not-found.ts')).default;
     }
     if (token !== renderToken) return;
@@ -145,7 +163,7 @@ export function mount(signOut: () => Promise<void> = async () => {}): void {
   });
   let scheduled = false;
   onProgressChange((draft) => {
-    if (draft || ['exercise', 'lesson', 'project', 'cards', 'data'].includes(parseRoute(location.pathname).name) || scheduled) return;
+    if (draft || ['exercise', 'lesson', 'project', 'cards', 'data', 'review-round'].includes(parseRoute(location.pathname).name) || scheduled) return;
     scheduled = true;
     requestAnimationFrame(() => { scheduled = false; void render(false); });
   });

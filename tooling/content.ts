@@ -8,12 +8,14 @@ import { createMarkdown, codeBlock, slug } from './markdown.ts';
 import { escape } from '../src/engine/highlight.ts';
 import { shuffledOrder, tokens } from '../src/engine/answers.ts';
 import type {
-  Area, AreaSummary, Card, Catalog, Exercise, GlossaryEntry, Level, Module, ModuleSummary, Project, Resource, TrackSummary,
+  Area, AreaSummary, Card, Catalog, Exercise, GlossaryEntry, Level, Module, ModuleSummary, Project, Resource, TopicSummary, TrackSummary,
 } from '../src/content/types.ts';
 
 export const ROOT = join(import.meta.dirname, '..');
 export const CONTENT = join(ROOT, 'content');
-export const RESERVED = ['karten', 'projekte', 'spickzettel', 'glossar', 'beruf'];
+export const RESERVED = ['karten', 'projekte', 'spickzettel', 'glossar', 'beruf', 'wiederholen'];
+/** Top-level pages that an area folder must not shadow. */
+export const RESERVED_AREAS = ['daten', 'wiederholen'];
 const TYPES = ['gap', 'choice', 'order', 'output', 'command', 'code', 'practice', 'bug', 'explain'] as const;
 const ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const validId = (id: unknown): id is string => typeof id === 'string' && id.length <= 120 && ID.test(id) && !['constructor', 'prototype'].includes(id);
@@ -318,6 +320,7 @@ function loadArea(dir: string, raw: RawExercise[], sink: { errors: Issue[]; warn
   const f = fields(data, 'Bereich', report, ['id', 'title', 'short', 'tagline', 'description', 'color', 'order', 'outcomes', 'tracks']);
   const id = f.str('id');
   if (!validId(id)) report.error('Bereich', `id "${id}" muss ein gültiger kebab-case-Schlüssel sein`);
+  if (RESERVED_AREAS.includes(id)) report.error('Bereich', `id "${id}" ist für eine Seite der Plattform reserviert`);
   const color = f.str('color');
   if (!/^#[0-9a-fA-F]{6}$/.test(color)) report.error('Bereich', '"color" muss #RRGGBB sein');
   const modules: Record<string, Module> = {};
@@ -362,12 +365,16 @@ function loadArea(dir: string, raw: RawExercise[], sink: { errors: Issue[]; warn
       const seen = new Set<string>();
       cf.list<Obj>('cards', true).forEach((card, i) => {
         const where = `Karte ${i + 1}${card?.id ? ` (${card.id})` : ''}`;
-        const c = fields(card ?? {}, where, r, ['id', 'q', 'a', 'tags', 'level']);
+        const c = fields(card ?? {}, where, r, ['id', 'q', 'a', 'tags', 'level', 'module']);
         const cid = c.str('id');
         if (!validId(cid)) r.error(where, 'id muss ein gültiger kebab-case-Schlüssel sein');
         if (seen.has(cid)) r.error(where, `doppelte id "${cid}"`);
         seen.add(cid);
-        cards.push({ id: cid, question: block(c.str('q')), answer: block(c.str('a')), tags: c.list<string>('tags').map(String), level: level(card?.level, where, r) });
+        const moduleId = c.str('module', false) || null;
+        if (moduleId && (!modules[moduleId] || modules[moduleId].bear)) r.error(where, `"module: ${moduleId}" ist kein Modul dieses Bereichs`);
+        const tags = c.list<string>('tags').map(String);
+        if (!moduleId && !tags.length) r.warn(where, 'weder "module" noch "tags" – die Karte lässt sich keinem Thema zuordnen');
+        cards.push({ id: cid, question: block(c.str('q')), answer: block(c.str('a')), tags, level: level(card?.level, where, r), module: moduleId });
       });
     }
     flush(r);
@@ -453,10 +460,25 @@ function loadArea(dir: string, raw: RawExercise[], sink: { errors: Issue[]; warn
     const m = modules[mid];
     return { id: m.id, title: m.title, summary: m.summary, level: m.level, minutes: m.minutes, bear: m.bear, exercises: m.exercises.map((e) => ({ id: e.id, type: e.type, fingerprint: e.fingerprint })) };
   });
+  // Cards without a module are grouped by their first tag, so weak spots still come in topics.
+  const loose = new Map<string, string[]>();
+  for (const card of cards) if (!card.module || !modules[card.module]) {
+    const tag = card.tags[0] ?? 'allgemein';
+    loose.set(tag, [...loose.get(tag) ?? [], card.id]);
+  }
+  const topics: TopicSummary[] = [
+    ...moduleSummaries.map((m) => ({ id: m.id, title: m.title, module: m.id, cards: cards.filter((c) => c.module === m.id).map((c) => c.id) })),
+    ...[...loose].map(([tag, ids]) => ({ id: `interview-${slug(tag)}`, title: `Interview: ${tag.charAt(0).toUpperCase()}${tag.slice(1)}`, module: null, cards: ids })),
+  ];
+  const topicIds = new Set<string>();
+  for (const topic of topics) {
+    if (topicIds.has(topic.id)) report.error('Bereich', `Das Interview-Thema "${topic.id}" entsteht aus zwei verschiedenen Tags oder kollidiert mit einer Modul-id; gib den Karten ein Modul oder vereinheitliche den ersten Tag`);
+    topicIds.add(topic.id);
+  }
   const summary: AreaSummary = {
     id, title: f.str('title'), short: f.str('short', false) || f.str('title'), tagline: f.str('tagline'), description: f.str('description'), color,
     outcomes: f.list<string>('outcomes').map((o) => inline(String(o))), tracks, modules: moduleSummaries,
-    cards: cards.map((c) => c.id), projects: projects.map((p) => ({ id: p.id, title: p.title, capstone: p.capstone, level: p.level, hours: p.hours, summary: p.summary, steps: [...p.steps.map((s) => s.id), ...p.acceptance.map((a) => a.id)] })),
+    cards: cards.map((c) => c.id), topics, projects: projects.map((p) => ({ id: p.id, title: p.title, capstone: p.capstone, level: p.level, hours: p.hours, summary: p.summary, steps: [...p.steps.map((s) => s.id), ...p.acceptance.map((a) => a.id)] })),
     counts: {
       modules: moduleSummaries.length, exercises: moduleSummaries.reduce((n, m) => n + m.exercises.length, 0), cards: cards.length,
       projects: projects.length, glossary: glossary.length, minutes: moduleSummaries.reduce((n, m) => n + m.minutes, 0),

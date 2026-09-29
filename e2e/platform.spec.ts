@@ -104,6 +104,115 @@ test('gap, choice, order, output and command exercises', async ({ page }) => {
   expect(errors).toEqual([]);
 });
 
+test('wrong attempts become an explained review topic, and a round from scratch moves each exercise on', async ({ page }) => {
+  const errors = errorsOf(page);
+  await page.goto('/wiederholen');
+  await expect(page.locator('.review-empty')).toContainText('Noch nichts zu wiederholen');
+  await expect(page.locator('#review-count')).toBeHidden();
+  // A wrong answer left in a gap counts once; so does a wrong prediction. Both are solved afterwards.
+  await page.goto(`${base}/1`);
+  await page.locator('#answer-g1').fill('function');
+  await page.locator('#answer-g2').focus();
+  await page.locator('#answer-g1').fill('def');
+  await page.locator('#answer-g2').fill('2 * x');
+  await expect(page.locator('#feedback')).toContainText('Richtig.');
+  await page.goto(`${base}/4`);
+  await page.locator('#prediction').fill('[1, 2, 3]\n[1, 2, 3]');
+  await page.locator('#check').click();
+  await page.locator('#prediction').fill('[1, 2, 3]\n[3, 1, 2]');
+  await page.locator('#check').click();
+  await expect(page.locator('#feedback')).toContainText('Richtig.');
+
+  // Not due yet: the topic waits, and says when it returns.
+  await page.goto('/beispiel/wiederholen');
+  const row = page.locator('#thema-alle-typen');
+  await expect(row.locator('.topic-status')).toHaveText('Wackelig');
+  await expect(row).toContainText('2 Fehlversuche in 2 Übungen');
+  await expect(row).toContainText('Nächste Wiederholung in 4 Tagen');
+
+  // Five days later it is on today's plan, on the home page and in the top bar.
+  await page.clock.setFixedTime(new Date(Date.now() + 5 * 86_400_000));
+  await page.goto('/');
+  const card = page.locator('.review-band .topic-card');
+  await expect(card).toHaveCount(1);
+  await expect(card).toContainText('Alle Übungsarten');
+  await expect(card).toContainText('2 Fehlversuche in 2 Übungen');
+  await expect(card).toContainText('2 Übungen · ca. 4 min');
+  await expect(page.locator('#review-count')).toHaveText('1');
+  await page.goto('/beispiel');
+  await expect(page.locator('.module-row', { hasText: 'Alle Übungsarten' }).locator('.review-mark')).toHaveText('Fällig');
+  await expect(page.locator('.mini-bars i.weak')).toHaveCount(2);
+
+  await page.goto('/');
+  await card.getByRole('link', { name: 'Wiederholen' }).click();
+  await expect(page).toHaveURL('/beispiel/wiederholen/alle-typen');
+  await expect(page.locator('.round-why')).toContainText('2 Fehlversuche in 2 Übungen');
+  // The gap starts empty, not with the saved answer; solved without help it moves up a step.
+  await expect(page.locator('.round-item-why')).toContainText('1 Fehlversuch · Stufe 2 von 3');
+  await expect(page.locator('#answer-g1')).toHaveValue('');
+  await page.locator('#answer-g1').fill('def');
+  await page.locator('#answer-g2').fill('2 * x');
+  // Comparing with the solution after solving is not trouble.
+  await page.locator('#reveal').click();
+  await page.locator('#continue').click();
+  // Wrong again: it stays on its step.
+  await page.locator('#prediction').fill('[1, 2, 3]\n[1, 2, 3]');
+  await page.locator('#check').click();
+  await page.locator('#prediction').fill('[1, 2, 3]\n[3, 1, 2]');
+  await page.locator('#check').click();
+  await page.locator('#continue').click();
+  const done = page.locator('.round-done');
+  await expect(done.locator('h2')).toHaveText('1 von 2 Übungen ohne Hilfe');
+  await expect(done.locator('.round-result').nth(0)).toContainText('Ohne Hilfe gelöst · Stufe 3 · wieder in 10 Tagen');
+  await expect(done.locator('.round-result').nth(1)).toContainText('Mit Fehlversuchen oder Hinweisen gelöst · Stufe 2 · wieder in 4 Tagen');
+  await page.goto('/wiederholen');
+  await expect(page.locator('.review-empty')).toContainText('Heute ist nichts fällig');
+  // The learning path keeps its own saved answer.
+  await page.goto(`${base}/1`);
+  await expect(page.locator('#answer-g1')).toHaveValue('def');
+  expect(errors).toEqual([]);
+});
+
+test('a shown solution and a forgotten card are bundled by topic and explained', async ({ page }) => {
+  const errors = errorsOf(page);
+  // Help needed again on a later visit is not counted twice.
+  await page.goto(`${base}/2`);
+  await page.locator('#hint').click();
+  await page.locator('#reveal').click();
+  await page.reload();
+  await page.locator('#hint').click();
+  await page.locator('#reveal').click();
+  await page.locator('[data-option="0"]').click();
+  await page.locator('[data-option="2"]').click();
+  await page.locator('#check').click();
+  await expect(page.locator('#feedback')).toContainText('Richtig.');
+  expect(await page.evaluate(() => JSON.parse(localStorage.getItem('learn:beispiel:v1')!).drills['alle-typen/auswahl'])).toMatchObject({ box: 1, hints: 1, reveals: 1, fails: 0 });
+  await page.goto('/beispiel/karten');
+  await page.locator('#tag').selectOption('nebenläufigkeit');
+  await page.locator('#start').click();
+  await page.keyboard.press(' ');
+  await page.keyboard.press('1');
+
+  await page.clock.setFixedTime(new Date(Date.now() + 86_400_000));
+  await page.goto('/beispiel/wiederholen');
+  await expect(page.locator('.area-tabs [aria-current] b')).toHaveText('2');
+  const topics = page.locator('.review-today .topic-card');
+  await expect(topics).toHaveCount(2);
+  await expect(topics.filter({ hasText: 'Alle Übungsarten' })).toContainText('Lösung bei 1 Übung angesehen');
+  const interview = topics.filter({ hasText: 'Interview: Nebenläufigkeit' });
+  await expect(interview).toContainText('1 Interviewkarte zuletzt vergessen');
+  await interview.getByRole('link', { name: 'Wiederholen' }).click();
+  await expect(page.locator('.round-item-why')).toContainText('Zuletzt vergessen');
+  await page.keyboard.press(' ');
+  await page.keyboard.press('3');
+  await expect(page.locator('.round-done h2')).toHaveText('1 von 1 Karte gewusst');
+  await expect(page.locator('.round-done .round-result')).toContainText('Okay · Box 2 · wieder in 3 Tagen');
+  await page.locator('.round-done').getByRole('link', { name: /Nächstes Thema: Alle Übungsarten/ }).click();
+  await expect(page.locator('.round-item-why')).toContainText('Lösung angesehen · 1 Hinweis · Stufe 1 von 3');
+  await expect(page.locator('[data-option="0"]')).toHaveAttribute('aria-checked', 'false');
+  expect(errors).toEqual([]);
+});
+
 test('python code runs in the browser against the tests', async ({ page }) => {
   test.setTimeout(120_000);
   await page.goto(`${base}/7`);
@@ -149,6 +258,7 @@ test('practice, bug and explain exercises', async ({ page }) => {
 
 test('cards, projects, reference pages and data export', async ({ page }) => {
   await page.goto('/beispiel/karten');
+  await page.locator('#tag').selectOption('nebenläufigkeit');
   await page.locator('#start').click();
   await page.keyboard.press(' ');
   await expect(page.locator('.flashcard-answer')).toBeVisible();

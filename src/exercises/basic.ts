@@ -3,7 +3,7 @@ import type { ChoiceExercise, CommandExercise, GapExercise, OutputExercise, Answ
 import { isChoiceCorrect, isCommandCorrect, isGapCorrect, isGapExerciseCorrect, isOutputCorrect, isPartial, normalizeOutput } from '../engine/answers.ts';
 import { highlight, highlightWithGaps } from '../engine/highlight.ts';
 import { $, $$, escape, html, icons, raw } from '../ui/dom.ts';
-import type { ExerciseRenderer } from './types.ts';
+import { failOnce, type ExerciseRenderer } from './types.ts';
 
 export const codeCard = (code: string, lang: string, label: string, gaps = false) =>
   `<div class="codeblock exercise-code" data-lang="${escape(lang)}"><div class="codeblock-bar"><span>${escape(label)}</span></div><pre tabindex="0"><code>${gaps ? highlightWithGaps(code, lang) : highlight(code, lang)}</code></pre></div>`;
@@ -46,11 +46,19 @@ export const gap: ExerciseRenderer<GapExercise, Answers> = (exercise, ctx) => {
         if (isGapExerciseCorrect(exercise, answers)) ctx.complete();
         else ctx.feedback(attempted ? 'partial' : 'info', attempted ? `${solved} von ${exercise.gaps.length} Lücken richtig.` : 'Fülle die Lücken. Nummern im Code springen zum Eingabefeld.');
       };
-      $$<HTMLTextAreaElement>('[data-answer]', root).forEach((input) => input.addEventListener('input', () => {
-        answers[input.dataset.answer!] = input.value;
-        ctx.save({ ...answers });
-        update();
-      }));
+      $$<HTMLTextAreaElement>('[data-answer]', root).forEach((input) => {
+        input.addEventListener('input', () => {
+          answers[input.dataset.answer!] = input.value;
+          ctx.save({ ...answers });
+          update();
+        });
+        // Answers are checked while typing; only a wrong answer left behind in a field counts as a wrong attempt.
+        input.addEventListener('change', () => {
+          const g = exercise.gaps.find((x) => x.id === input.dataset.answer)!;
+          if (input.value.trim() && !isGapCorrect(g, input.value, exercise.lang) && !isPartial(g, input.value)) ctx.fail();
+        });
+      });
+      $$<HTMLDetailsElement>('.gap-hint', root).forEach((details) => details.addEventListener('toggle', () => { if (details.open) ctx.hint(); }, { once: true }));
       $$<HTMLAnchorElement>('[data-gap-link]', root).forEach((link) => link.addEventListener('click', (event) => {
         event.preventDefault();
         $<HTMLTextAreaElement>(`#answer-${link.dataset.gapLink}`, root).focus();
@@ -62,6 +70,7 @@ export const gap: ExerciseRenderer<GapExercise, Answers> = (exercise, ctx) => {
 
 export const choice: ExerciseRenderer<ChoiceExercise, number[]> = (exercise, ctx) => {
   let selected = [...(ctx.draft ?? [])];
+  const fail = failOnce(ctx);
   const letters = 'ABCDEFGH';
   return {
     markup: html`
@@ -98,6 +107,7 @@ export const choice: ExerciseRenderer<ChoiceExercise, number[]> = (exercise, ctx
         paint(true);
         if (isChoiceCorrect(exercise, selected)) ctx.complete();
         else {
+          fail([...selected].sort());
           const wrong = selected.filter((i) => !exercise.options[i].correct).length;
           const missing = exercise.options.filter((o, i) => o.correct && !selected.includes(i)).length;
           ctx.feedback('bad', wrong ? `${wrong === 1 ? 'Eine Auswahl ist' : `${wrong} Auswahlen sind`} falsch – lies die Begründung und versuch es noch einmal.` : `Richtig, aber unvollständig: ${missing === 1 ? 'eine richtige Antwort fehlt' : `${missing} richtige Antworten fehlen`}.`);
@@ -118,10 +128,12 @@ export const output: ExerciseRenderer<OutputExercise, string> = (exercise, ctx) 
   solution: () => `<pre class="code plain">${escape(exercise.expected[0])}</pre>`,
   bind(root) {
     const input = $<HTMLTextAreaElement>('#prediction', root);
+    const fail = failOnce(ctx);
     const check = () => {
       if (!input.value.trim()) { ctx.feedback('bad', 'Schreib zuerst deine Vorhersage.'); return; }
       const diff = $('#diff', root);
       if (isOutputCorrect(exercise, input.value)) { diff.hidden = true; ctx.complete(); return; }
+      fail(normalizeOutput(input.value));
       const expected = normalizeOutput(exercise.expected[0]).split('\n');
       const actual = normalizeOutput(input.value).split('\n');
       const lines = Math.max(expected.length, actual.length);
@@ -140,6 +152,7 @@ export const output: ExerciseRenderer<OutputExercise, string> = (exercise, ctx) 
 
 type CommandDraft = { value: string; history: string[] };
 export const command: ExerciseRenderer<CommandExercise, CommandDraft> = (exercise, ctx) => {
+  const fail = failOnce(ctx);
   const draft: CommandDraft = { value: ctx.draft?.value ?? '', history: [...(ctx.draft?.history ?? [])] };
   return {
     markup: html`
@@ -164,6 +177,7 @@ export const command: ExerciseRenderer<CommandExercise, CommandDraft> = (exercis
         const value = input.value.trim();
         if (!value) return;
         if (isCommandCorrect(exercise, value)) { showOutput(); ctx.complete(); return; }
+        fail(value);
         draft.history = [...draft.history, value].slice(-6);
         ctx.save(draft);
         $('#history', root).insertAdjacentHTML('beforeend', html`<div class="term-line"><span class="syntax-prompt">${exercise.symbol} </span>${value}</div><div class="term-line term-bad">✗ nicht die gesuchte Lösung</div>`.value);

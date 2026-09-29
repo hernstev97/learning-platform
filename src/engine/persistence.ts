@@ -33,6 +33,8 @@ export function toEntries(progress: AreaProgress, area?: AreaSummary): Entry[] {
   for (const id of Object.keys(progress.revealed)) entries.push({ kind: 'revealed', id, value: true });
   for (const [id, value] of Object.entries(progress.cards)) entries.push({ kind: 'card', id, value });
   for (const [project, steps] of Object.entries(progress.projects)) for (const [step, completed] of Object.entries(steps)) entries.push({ kind: 'step', id: `${project}/${step}`, completed });
+  for (const [id, value] of Object.entries(progress.drills)) entries.push({ kind: 'drill', id, value });
+  for (const [id, value] of Object.entries(progress.topics)) entries.push({ kind: 'topic', id, value });
   const position = progress.position ?? (area && legacyPosition(area, progress.last));
   if (position) entries.push({ kind: 'position', id: 'last', value: position });
   return entries;
@@ -47,6 +49,8 @@ export function projectSnapshot(snapshot: Snapshot, catalog: Catalog): Record<st
       case 'completion': if (value.value) p.done[value.id] = value.value; break;
       case 'revealed': if (value.value) p.revealed[value.id] = true; break;
       case 'card': p.cards[value.id] = value.value; break;
+      case 'drill': p.drills[value.id] = value.value; break;
+      case 'topic': p.topics[value.id] = value.value; break;
       case 'step': {
         const [project, step] = value.id.split('/');
         if (value.completed) (p.projects[project] ??= {})[step] = true;

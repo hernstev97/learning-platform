@@ -9,6 +9,9 @@ export type Route =
   | { name: 'projects'; area: string }
   | { name: 'project'; area: string; project: string }
   | { name: 'reference'; area: string; page: 'spickzettel' | 'glossar' | 'beruf' }
+  | { name: 'review-home' }
+  | { name: 'review'; area: string }
+  | { name: 'review-round'; area: string; topic: string }
   | { name: 'not-found' };
 export type Page<R extends Route = any> = (main: HTMLElement, route: R) => Promise<(() => void) | void> | (() => void) | void;
 
@@ -20,8 +23,9 @@ export function parseRoute(pathname: string): Route {
   if (!parts.length) return { name: 'home' };
   if (parts.some((part) => !SEGMENT.test(part))) return { name: 'not-found' };
   const [area, second, third] = parts;
-  if (parts.length === 1) return area === 'daten' ? { name: 'data' } : { name: 'area', area };
+  if (parts.length === 1) return area === 'daten' ? { name: 'data' } : area === 'wiederholen' ? { name: 'review-home' } : { name: 'area', area };
   if (second === 'karten' && parts.length === 2) return { name: 'cards', area };
+  if (second === 'wiederholen') return parts.length === 2 ? { name: 'review', area } : parts.length === 3 ? { name: 'review-round', area, topic: third } : { name: 'not-found' };
   if (second === 'projekte') return parts.length === 2 ? { name: 'projects', area } : parts.length === 3 ? { name: 'project', area, project: third } : { name: 'not-found' };
   if ((second === 'spickzettel' || second === 'glossar' || second === 'beruf') && parts.length === 2) return { name: 'reference', area, page: second };
   if (parts.length === 2) return { name: 'lesson', area, module: second };

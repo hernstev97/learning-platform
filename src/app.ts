@@ -4,10 +4,11 @@ import loaders from 'virtual:area-loaders';
 import type { ConvexClient } from 'convex/browser';
 import type { FunctionReturnType } from 'convex/server';
 import { api } from '../convex/_generated/api.js';
-import { applyEntries, generationOf, validateDraft, validateEntry, validateNote, type DraftInput, type Entry, type Grade, type NoteInput, type Position, type Snapshot } from '../convex/model.ts';
+import { applyEntries, generationOf, validateDraft, validateEntry, validateNote, type DrillEvent, type DraftInput, type Entry, type Grade, type NoteInput, type Position, type Snapshot } from '../convex/model.ts';
 import type { Area, AreaSummary, Exercise } from './content/types.ts';
 import { freshProgress, localDay, type AreaProgress, type Backup } from './engine/storage.ts';
 import { schedule } from './engine/review.ts';
+import { drill, drillBase } from './engine/drill.ts';
 import { latestArea, projectSnapshot, safeDraft, sameEntry, toEntries } from './engine/persistence.ts';
 import { browserStorage, readOfflineCopy, writeOfflineCopy } from './engine/offline.ts';
 
@@ -191,6 +192,22 @@ export function reviewCard(areaId: string, cardId: string, grade: Grade): void {
       const card = current.entries.find((e) => e.areaId === areaId && e.key === `card:${cardId}`)?.value;
       const value = schedule(card?.kind === 'card' ? card.value : undefined, grade, today);
       store.setQuery(api.progress.snapshot, {}, applyEntries(current, areaId, [{ kind: 'card', id: cardId, value }], Date.now()));
+    },
+  })).catch(() => {});
+}
+
+/** A wrong check, hint, shown solution or solve on an exercise; `review` for rounds under „Wiederholen“. */
+export function recordDrill(areaId: string, exerciseId: string, event: DrillEvent, review: boolean): void {
+  if (!active) return;
+  const today = localDay();
+  const generation = generationOf(snapshot, areaId);
+  void track(client.mutation(api.progress.recordDrill, { areaId, generation, exerciseId, event, review, today }, {
+    optimisticUpdate(store) {
+      const current = store.getQuery(api.progress.snapshot, {});
+      if (!current || generationOf(current, areaId) !== generation) return;
+      const find = (kind: string) => current.entries.find((e) => e.areaId === areaId && e.key === `${kind}:${exerciseId}`)?.value;
+      const value = drill(drillBase(find('drill'), find('completion'), find('revealed'), today), event, today, review);
+      if (value) store.setQuery(api.progress.snapshot, {}, applyEntries(current, areaId, [{ kind: 'drill', id: exerciseId, value }], Date.now()));
     },
   })).catch(() => {});
 }

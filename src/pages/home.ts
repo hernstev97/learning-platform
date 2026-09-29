@@ -1,8 +1,10 @@
 import { catalog, getContinueArea, progressOf } from '../app.ts';
 import { resolveResume } from '../engine/persistence.ts';
 import { areaStats } from '../engine/storage.ts';
+import { dailyPlan } from '../engine/weakness.ts';
 import { RESUME_NOTES, resumeStep } from '../ui/area-nav.ts';
-import { html, icons, pad, raw } from '../ui/dom.ts';
+import { html, icons, pad, plural, raw } from '../ui/dom.ts';
+import { allReports, topicCard } from '../ui/review.ts';
 import type { Page } from '../router.ts';
 
 const home: Page = (main) => {
@@ -13,6 +15,9 @@ const home: Page = (main) => {
   const current = areas.find((a) => a.id === getContinueArea());
   const resume = current && resolveResume(current, progressOf(current.id));
   const module = resume?.module;
+  const reports = allReports();
+  const plan = dailyPlan(reports);
+  const reviewing = reports.some((r) => r.started);
   main.innerHTML = html`
     <section class="hero">
       <div class="hero-text">
@@ -36,6 +41,14 @@ const home: Page = (main) => {
         <p class="hero-stats label">${totals.modules} Module · ${totals.exercises} Übungen · ${totals.cards} Interview-Karten</p>
       </div>
     </section>
+    ${reviewing ? html`<section class="review-band" aria-labelledby="review-band-title">
+      <div class="review-band-head">
+        <h2 id="review-band-title" class="section-title">Heute wiederholen</h2>
+        <p class="label">${plan.today.length ? `${plural(plan.today.length, 'Thema', 'Themen')} · ca. ${plan.minutes} min${plan.later.length ? ` · ${plan.later.length} weitere fällig` : ''}` : 'Nichts fällig'}</p>
+        <a class="btn small" href="/wiederholen">Alle Schwachstellen ${raw(icons.arrow)}</a>
+      </div>
+      ${plan.today.length ? html`<ol class="topic-cards">${plan.today.map(topicCard)}</ol>` : html`<p class="review-empty">Heute ist nichts fällig. Übungen mit Fehlversuchen, vergessene Karten und lange liegende Module erscheinen hier, sobald sie dran sind.</p>`}
+    </section>` : ''}
     <section class="area-grid" aria-label="Lernbereiche">
       ${areas.map((area, i) => {
         const stats = areaStats(area, progressOf(area.id));

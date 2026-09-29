@@ -8,6 +8,9 @@ export const LEGACY_BEAR_KEY = 'kotlin-lernen:bear:progress:v2';
 
 export type Completion = { at: string; fp: string; help?: boolean };
 export type CardState = { box: number; due: string; seen: number; last?: string; lapses?: number; grade?: Grade };
+/** Review state of an exercise; see drillState in convex/model.ts and the rules in drill.ts. */
+export type DrillState = { box: number; due?: string; last: string; fails: number; hints: number; reveals: number; open: number };
+export type TopicState = { reps: number; last: string };
 export type AreaProgress = {
   version: 1;
   /** Solved exercises by id, with the fingerprint they were solved against. */
@@ -21,6 +24,10 @@ export type AreaProgress = {
   read: Record<string, string>;
   cards: Record<string, CardState>;
   projects: Record<string, Record<string, boolean>>;
+  /** Exercises that needed help or were reviewed, by exercise id. */
+  drills: Record<string, DrillState>;
+  /** Refreshers of learned modules, by module id. */
+  topics: Record<string, TopicState>;
   last: string | null;
   position?: Position;
   /** Personal lesson notes by module id. Convex keeps them apart from progress; here only in backups and local tests. */
@@ -28,9 +35,11 @@ export type AreaProgress = {
 };
 
 type StoragePort = Pick<Storage, 'getItem' | 'setItem'>;
-export const freshProgress = (): AreaProgress => ({ version: 1, done: {}, drafts: {}, revealed: {}, read: {}, cards: {}, projects: {}, last: null });
+export const freshProgress = (): AreaProgress => ({ version: 1, done: {}, drafts: {}, revealed: {}, read: {}, cards: {}, projects: {}, drills: {}, topics: {}, last: null });
 const record = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
 const safeKey = (key: string) => !['__proto__', 'constructor', 'prototype'].includes(key);
+const DAY = /^\d{4}-\d{2}-\d{2}$/;
+const count = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
 
 /** Accepts anything that parses; drops malformed parts instead of failing as a whole. */
 export function sanitize(data: unknown): AreaProgress {
@@ -55,6 +64,17 @@ export function sanitize(data: unknown): AreaProgress {
         ...(GRADES.includes(value.grade as Grade) ? { grade: value.grade as Grade } : {}),
       };
     }
+  }
+  if (record(data.drills)) for (const [id, value] of Object.entries(data.drills)) {
+    if (!safeKey(id) || !record(value) || !Number.isInteger(value.box) || (value.box as number) < 0 || (value.box as number) > 3 || typeof value.last !== 'string' || !DAY.test(value.last)) continue;
+    if (![value.fails, value.hints, value.reveals, value.open].every(count)) continue;
+    progress.drills[id] = {
+      box: value.box as number, last: value.last, fails: value.fails as number, hints: value.hints as number, reveals: value.reveals as number, open: value.open as number,
+      ...(typeof value.due === 'string' && DAY.test(value.due) ? { due: value.due } : {}),
+    };
+  }
+  if (record(data.topics)) for (const [id, value] of Object.entries(data.topics)) {
+    if (safeKey(id) && record(value) && count(value.reps) && typeof value.last === 'string' && DAY.test(value.last)) progress.topics[id] = { reps: value.reps, last: value.last };
   }
   if (record(data.projects)) for (const [id, steps] of Object.entries(data.projects)) {
     if (safeKey(id) && record(steps)) progress.projects[id] = Object.fromEntries(Object.entries(steps).filter(([key, v]) => safeKey(key) && v === true).map(([key]) => [key, true]));
@@ -99,6 +119,9 @@ export function addDays(day: string, days: number): string {
   const [y, m, d] = day.split('-').map(Number);
   return localDay(new Date(y, m - 1, d + days));
 }
+const dayNumber = (day: string) => { const [y, m, d] = day.split('-').map(Number); return Date.UTC(y, m - 1, d) / 86_400_000; };
+/** Whole days from one local day to another; negative if `to` lies before `from`. */
+export const daysBetween = (from: string, to: string) => dayNumber(to) - dayNumber(from);
 
 // ---- Export / import ---------------------------------------------------------------------------
 
@@ -125,6 +148,8 @@ export function mergeProgress(local: AreaProgress, incoming: AreaProgress): Area
     if (!existing || (existing.last ?? '') < (value.last ?? '') || ((existing.last ?? '') === (value.last ?? '') && value.seen > existing.seen)) merged.cards[id] = value;
   }
   for (const [id, steps] of Object.entries(incoming.projects)) merged.projects[id] = { ...steps, ...merged.projects[id] };
+  for (const [id, value] of Object.entries(incoming.drills)) if (!merged.drills[id] || merged.drills[id].last < value.last) merged.drills[id] = value;
+  for (const [id, value] of Object.entries(incoming.topics)) if (!merged.topics[id] || merged.topics[id].last < value.last) merged.topics[id] = value;
   merged.last ??= incoming.last;
   merged.position ??= incoming.position;
   if (incoming.notes) merged.notes = { ...incoming.notes, ...merged.notes };
