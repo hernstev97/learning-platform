@@ -16,7 +16,7 @@ export function areaTabs(area: AreaSummary, progress: AreaProgress, active: Tab)
     ['glossar', 'Glossar', `/${area.id}/glossar`, area.pages.glossary],
     ['beruf', 'Beruf', `/${area.id}/beruf`, area.pages.career],
   ];
-  return html`<nav class="area-tabs no-print" aria-label="Bereich ${area.title}">
+  return html`<nav class="area-tabs no-print" aria-label="Bereich ${area.title}" style="--area:${area.color}">
     ${tabs.filter((t) => t[3]).map(([id, label, href]) => html`<a href="${href}" ${id === active ? html`aria-current="page"` : ''}>${raw(label)}</a>`)}
   </nav>`;
 }

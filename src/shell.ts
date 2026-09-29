@@ -25,7 +25,7 @@ export function mount(signOut: () => Promise<void> = async () => {}): void {
     </header>
     <p id="storage-warning" class="storage-warning" role="status" hidden></p>
     <p id="legacy-notice" class="storage-warning" hidden>Lokaler Lernstand gefunden. <a href="/daten">Unter Daten prüfen und importieren</a>.</p>
-    <main id="main" tabindex="-1"></main>
+    <main id="main" tabindex="-1" aria-busy="true"></main>
     <footer class="footer">
       <span>learn.kiumu.app</span>
       <span id="storage-status" role="status">Lernstand wird geladen …</span>
@@ -33,6 +33,9 @@ export function mount(signOut: () => Promise<void> = async () => {}): void {
     </footer>`.value;
 
   const main = $('#main');
+  // Sticky rows below the top bar need its real height, which changes when the bar wraps on small screens.
+  const topbar = $('.topbar');
+  new ResizeObserver(() => document.documentElement.style.setProperty('--topbar-h', `${topbar.getBoundingClientRect().height}px`)).observe(topbar);
   if (isCloud) void scanLegacy(catalog).then((scan) => { $('#legacy-notice').hidden = scan.imported || !Object.keys(scan.areas).length; }).catch(() => {});
   $('#sign-out').addEventListener('click', () => { void signOut(); });
   initTheme();
@@ -69,6 +72,7 @@ export function mount(signOut: () => Promise<void> = async () => {}): void {
     document.documentElement.style.setProperty('--accent', area?.color ?? '#FF4F00');
     document.documentElement.dataset.area = area?.id ?? '';
     document.querySelectorAll<HTMLAnchorElement>('.topnav a').forEach((link) => link.toggleAttribute('aria-current', link.dataset.area === area?.id));
+    revealCurrent($<HTMLElement>('.topnav'));
     let page: Page;
     switch (route.name) {
       case 'home': page = (await import('./pages/home.ts')).default; break;
@@ -89,6 +93,7 @@ export function mount(signOut: () => Promise<void> = async () => {}): void {
       if (area && !['home', 'data', 'area', 'not-found'].includes(route.name)) await loadArea(area.id);
       if (token !== renderToken) return;
       if (route.name === 'exercise' && area) {
+        main.setAttribute('aria-busy', 'true');
         main.innerHTML = '<section class="page"><p role="status">Entwurf wird geladen …</p></section>';
         const content = await loadArea(area.id);
         const exercise = content.modules[route.module]?.exercises[route.index - 1];
@@ -111,6 +116,8 @@ export function mount(signOut: () => Promise<void> = async () => {}): void {
       main.innerHTML = html`<section class="page narrow"><h1 class="page-title" tabindex="-1">Fehler</h1><p>Diese Seite konnte nicht geladen werden: ${String((error as Error).message)}</p><p><a class="btn" href="/">Zur Startseite</a></p></section>`.value;
     }
     if (token !== renderToken) return;
+    main.removeAttribute('aria-busy');
+    revealCurrent(main.querySelector<HTMLElement>('.area-tabs'));
     updateStorage();
   }
 
@@ -125,5 +132,15 @@ export function mount(signOut: () => Promise<void> = async () => {}): void {
     scheduled = true;
     requestAnimationFrame(() => { scheduled = false; void render(false); });
   });
+}
+
+/** Centers the current entry of a horizontally scrollable tab row if it is cut off. */
+function revealCurrent(row: HTMLElement | null): void {
+  const current = row?.querySelector<HTMLElement>('[aria-current]');
+  if (!row || !current || row.scrollWidth <= row.clientWidth) return;
+  const box = row.getBoundingClientRect();
+  const rect = current.getBoundingClientRect();
+  if (rect.left >= box.left && rect.right <= box.right) return;
+  row.scrollLeft += rect.left - box.left - (row.clientWidth - rect.width) / 2;
 }
 export { navigate };

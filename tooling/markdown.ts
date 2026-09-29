@@ -26,7 +26,7 @@ export function codeBlock(text: string, info = ''): string {
   const label = title ?? LABELS[name] ?? (lang || 'Text');
   const attrs = [`data-lang="${escape(name)}"`, runnable ? 'data-run="python"' : '', playground ? 'data-playground="rust"' : ''].filter(Boolean).join(' ');
   const body = runnable
-    ? `<textarea class="code-editor" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Python-Code, editierbar">${escape(text)}</textarea>`
+    ? `<textarea class="code-editor" wrap="off" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Python-Code, editierbar">${escape(text)}</textarea>`
     : `<pre tabindex="0"><code>${highlight(text, name)}</code></pre>`;
   return `<div class="codeblock" ${attrs}><div class="codeblock-bar"><span>${escape(label)}</span></div>${body}</div>`;
 }

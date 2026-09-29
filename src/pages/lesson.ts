@@ -38,6 +38,9 @@ const lesson: Page<{ name: 'lesson'; area: string; module: string }> = async (ma
         </nav>
       </aside>
       <article class="lesson">
+        <details class="toc-mobile no-print"><summary class="label">Inhalt der Lektion</summary>
+          <ol>${module.toc.map((entry) => html`<li><a href="#${entry.id}">${entry.title}</a></li>`)}<li><a href="#uebungen">Übungen</a></li></ol>
+        </details>
         ${module.goals.length ? html`<section class="goals"><h2 class="label">Nach diesem Modul</h2><ul>${module.goals.map((goal) => html`<li>${raw(goal)}</li>`)}</ul></section>` : ''}
         <div class="prose">${raw(module.lesson)}</div>
         ${module.resources.length ? html`<section class="resources-block"><h2 class="label">Offizielle Dokumentation</h2><ul>${module.resources.map((r) => html`<li><a class="external-link" href="${r.url}" target="_blank" rel="noopener noreferrer">${r.title}</a></li>`)}</ul></section>` : ''}
@@ -73,6 +76,9 @@ const lesson: Page<{ name: 'lesson'; area: string; module: string }> = async (ma
     }
   }, { rootMargin: '-20% 0px -70% 0px' });
   main.querySelectorAll('.prose h2[id], #uebungen').forEach((h) => observer.observe(h));
+  // Close the mobile contents before the jump so the target position is measured without it.
+  const mobileToc = $<HTMLDetailsElement>('.toc-mobile', main);
+  mobileToc.addEventListener('click', (event) => { if ((event.target as Element).closest('a')) mobileToc.open = false; });
   const cleanCode = enhanceCode(main);
   const unsubscribe = onProgressChange(() => {
     $<HTMLInputElement>('#read', main).checked = !!progress.read[module.id];

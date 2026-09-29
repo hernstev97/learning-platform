@@ -80,7 +80,7 @@ const exercisePage: Page<{ name: 'exercise'; area: string; module: string; index
         </nav>
       </header>
       <article class="exercise" aria-labelledby="exercise-title">
-        <p class="exercise-kicker"><span class="tag ink">${TYPE_VERBS[exercise.type]}</span><span class="tag">${TYPE_LABELS[exercise.type]}</span><span class="label muted">Übung ${pad(index + 1)} / ${pad(total)}</span></p>
+        <p class="exercise-kicker"><span class="tag ink">${TYPE_VERBS[exercise.type]}</span>${TYPE_LABELS[exercise.type] !== TYPE_VERBS[exercise.type] ? html`<span class="tag">${TYPE_LABELS[exercise.type]}</span>` : ''}<span class="label muted">Übung ${pad(index + 1)} / ${pad(total)}</span></p>
         <h1 id="exercise-title" tabindex="-1">${exercise.title}</h1>
         <div class="prose prompt">${raw(exercise.prompt)}</div>
         ${source ? html`<p class="source-ref"><button type="button" class="link-button" id="open-source">${source.file.replace(/^android\/app\/src\/(main|test)\/java\/app\/kiumu\/bear\//, '')}:${source.start}${source.end !== source.start ? `–${source.end}` : ''}</button> <span class="muted small">Originaldatei aus Bear (enthält die Lösung)</span></p>` : ''}

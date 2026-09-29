@@ -86,13 +86,15 @@ export const order: ExerciseRenderer<OrderExercise, number[]> = (exercise, ctx) 
   };
 };
 
+const RUNNER_IDLE = '<span class="kbd-hint">Strg + Enter · </span>läuft direkt im Browser';
+
 export const code: ExerciseRenderer<CodeExercise, string> = (exercise, ctx) => ({
   markup: html`
     <div class="codeblock editor-block" data-lang="python">
       <div class="codeblock-bar"><span>Python · dein Code</span><button type="button" id="reset">Zurücksetzen</button></div>
-      <textarea id="editor" class="code-editor" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Dein Python-Code. Tab rückt ein, Strg+Enter führt aus, Escape dann Tab verlässt den Editor.">${ctx.draft ?? exercise.starter}</textarea>
+      <textarea id="editor" class="code-editor" wrap="off" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Dein Python-Code. Tab rückt ein, Strg+Enter führt aus, Escape dann Tab verlässt den Editor.">${ctx.draft ?? exercise.starter}</textarea>
     </div>
-    <div class="exercise-actions"><button type="button" class="btn primary" id="run">${raw(icons.play)} Ausführen &amp; testen</button><span class="muted small" id="runner-state">Strg + Enter · läuft direkt im Browser</span></div>
+    <div class="exercise-actions"><button type="button" class="btn primary" id="run">${raw(icons.play)} Ausführen &amp; testen</button><span class="muted small" id="runner-state">${raw(RUNNER_IDLE)}</span></div>
     <div class="test-results" id="results" aria-live="polite">
       <p class="label">${exercise.tests.length} Tests</p>
       <ul>${exercise.tests.map((t, i) => html`<li id="test-${i}" class="test pending"><span class="test-mark" aria-hidden="true">·</span><span>${t.name}</span></li>`)}</ul>
@@ -146,7 +148,7 @@ export const code: ExerciseRenderer<CodeExercise, string> = (exercise, ctx) => (
       editor.dispatchEvent(new Event('input'));
     });
     const unsubscribe = onRunnerState((state) => {
-      stateLabel.textContent = state === 'loading' ? 'Python wird geladen (einmalig ca. 12 MB) …' : state === 'running' ? 'Läuft …' : 'Strg + Enter · läuft direkt im Browser';
+      stateLabel.innerHTML = state === 'loading' ? 'Python wird geladen (einmalig ca. 12 MB) …' : state === 'running' ? 'Läuft …' : RUNNER_IDLE;
     });
     return () => { active = false; unsubscribe(); };
   },
@@ -159,7 +161,7 @@ export const practice: ExerciseRenderer<PracticeExercise, PracticeDraft> = (exer
     markup: html`
       <div class="codeblock editor-block" data-lang="${exercise.lang}">
         <div class="codeblock-bar"><span>${langName(exercise.lang)} · dein Entwurf</span>${exercise.lang === 'rust' ? html`<a id="playground" href="#" target="_blank" rel="noopener noreferrer">Im Playground ausführen ${raw(icons.external)}</a>` : ''}</div>
-        <textarea id="editor" class="code-editor" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Dein Entwurf">${draft.code}</textarea>
+        <textarea id="editor" class="code-editor" wrap="off" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Dein Entwurf" placeholder="Schreib hier deinen Entwurf …">${draft.code}</textarea>
       </div>
       <p class="check-note">${exercise.lang === 'rust' ? 'Dein Entwurf wird gespeichert. Kompilieren und ausführen kannst du ihn im offiziellen Rust Playground.' : 'Dein Entwurf wird gespeichert. Schreib ihn hier oder in deiner IDE und vergleiche danach mit der Musterlösung.'}</p>
       <fieldset class="checklist"><legend class="label">Selbstkontrolle – hake ab, was deine Lösung erfüllt</legend>
