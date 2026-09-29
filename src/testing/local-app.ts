@@ -83,7 +83,10 @@ import type { Entry, Position } from '../../convex/model.ts';
 export const isCloud = false;
 export const getSyncStatus = () => getStorageWarning() ? 'Nicht gespeichert' : 'Lernstand nur in diesem Browser gespeichert';
 export const hasPendingWrites = () => false;
-export const getContinueArea = (): string | null => null;
+const CONTINUE_KEY = 'learn:continue-area';
+export function getContinueArea(): string | null {
+  try { return storage()?.getItem(CONTINUE_KEY) ?? null; } catch { return null; }
+}
 export const onProgressChange = (_fn: (draft: boolean) => void) => () => {};
 export const closeDraft = () => {};
 export const prepareDraft = async (_area: string, _exercise: Exercise) => {};
@@ -100,7 +103,10 @@ export function setEntry(area: string, entry: Entry) {
   }
   save(area);
 }
-export function visit(area: string, value: Position) { setEntry(area, { kind: 'position', id: 'last', value }); }
+export function visit(area: string, value: Position) {
+  setEntry(area, { kind: 'position', id: 'last', value });
+  if (value.page !== 'cards') try { storage()?.setItem(CONTINUE_KEY, area); } catch { /* only the home shortcut is lost */ }
+}
 export function reviewCard(area: string, card: string, knew: boolean) { progressOf(area).cards[card] = gradeCard(progressOf(area).cards[card], knew); save(area); }
 export async function resetProgress(area: string) { replaceProgress(area, freshProgress()); }
 export async function importProgress(values: Record<string, AreaProgress>) { for (const [id, value] of Object.entries(values)) replaceProgress(id, mergeProgress(progressOf(id), value)); }

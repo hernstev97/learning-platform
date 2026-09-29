@@ -47,7 +47,7 @@ const home: Page = (main) => {
           <span class="area-tagline">${area.tagline}</span>
           <span class="area-meta label">${area.counts.modules} Module · ${area.counts.exercises} Übungen · ${area.counts.cards} Karten${area.counts.projects ? ` · ${area.counts.projects} Projekte` : ''}</span>
           <span class="area-progress" aria-label="${stats.percent} Prozent der Übungen gelöst"><span style="width:${stats.percent}%"></span></span>
-          <span class="area-foot label"><span>${stats.done ? `${stats.done} / ${stats.total} gelöst · ${stats.percent} %` : 'Noch nicht begonnen'}</span><span class="area-go">${next.started ? 'Weiter' : 'Öffnen'} ${raw(icons.arrow)}</span></span>
+          <span class="area-foot label"><span>${stats.done || next.started ? `${stats.done} / ${stats.total} gelöst · ${stats.percent} %` : 'Noch nicht begonnen'}</span><span class="area-go">${next.started ? 'Weiter' : 'Öffnen'} ${raw(icons.arrow)}</span></span>
         </a>`;
       })}
     </section>`.value;
