@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { loadContent } from '../../tooling/content.ts';
-import { applyEntries, type Entry, type Position, type Snapshot } from '../../convex/model.ts';
+import { applyEntries, validateEntry, type Entry, type Position, type Snapshot } from '../../convex/model.ts';
 import { areaStats, freshProgress, sanitize } from './storage.ts';
 import { latestArea, legacyPosition, positionHref, projectSnapshot, resolveResume, safeDraft, toEntries } from './persistence.ts';
 
@@ -54,6 +54,16 @@ describe('persistence projection and stable IDs', () => {
     expect(third.entries).toHaveLength(2);
   });
   it('an empty legacy client produces no destructive writes', () => { expect(toEntries(freshProgress(), area)).toEqual([]); });
+  it('round-trips review state of exercises and modules through backup entries', () => {
+    const progress = freshProgress();
+    progress.drills[exercise.id] = { box: 1, due: '2026-09-29', last: '2026-09-28', fails: 3, hints: 0, reveals: 1, open: 0 };
+    progress.topics[module.id] = { reps: 1, last: '2026-09-28' };
+    const entries = toEntries(progress, area);
+    entries.forEach(validateEntry);
+    const projected = projectSnapshot(applyEntries(empty, area.id, entries, 1), loaded.catalog)[area.id];
+    expect(projected.drills).toEqual(progress.drills);
+    expect(projected.topics).toEqual(progress.topics);
+  });
   it('round-trips stable navigation through a backup even if the exercise index changes', () => {
     const position: Entry = { kind: 'position', id: 'last', value: { page: 'exercise', moduleId: module.id, exerciseId: exercise.id } };
     const p = projectSnapshot(applyEntries(empty, area.id, [position], 1), loaded.catalog)[area.id];

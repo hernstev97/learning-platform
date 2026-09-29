@@ -1,15 +1,18 @@
 import type { AreaSummary } from '../content/types.ts';
 import type { Resume } from '../engine/persistence.ts';
 import { areaStats, isDone, type AreaProgress } from '../engine/storage.ts';
+import { analyzeArea, dueTopics } from '../engine/weakness.ts';
 import { TYPE_LABELS, html, pad, raw } from './dom.ts';
 
-export type Tab = 'pfad' | 'karten' | 'projekte' | 'spickzettel' | 'glossar' | 'beruf';
+export type Tab = 'pfad' | 'wiederholen' | 'karten' | 'projekte' | 'spickzettel' | 'glossar' | 'beruf';
 
 /** The tab row shared by all area pages. */
 export function areaTabs(area: AreaSummary, progress: AreaProgress, active: Tab) {
   const due = areaStats(area, progress).due;
+  const review = dueTopics(analyzeArea(area, progress)).length;
   const tabs: [Tab, string, string, boolean][] = [
     ['pfad', 'Lernpfad', `/${area.id}`, true],
+    ['wiederholen', `Wiederholen${review ? ` <b>${review}</b>` : ''}`, `/${area.id}/wiederholen`, true],
     ['karten', `Interview${area.counts.cards ? ` <b>${due}</b>` : ''}`, `/${area.id}/karten`, area.counts.cards > 0],
     ['projekte', 'Projekte', `/${area.id}/projekte`, area.counts.projects > 0],
     ['spickzettel', 'Spickzettel', `/${area.id}/spickzettel`, area.pages.cheatsheet],
@@ -31,10 +34,10 @@ export function areaBanner(area: AreaSummary, progress: AreaProgress, active: Ta
   </header>${areaTabs(area, progress, active)}`;
 }
 
-/** Tiny per-exercise bars for a module row. */
-export function moduleBars(module: AreaSummary['modules'][number], progress: AreaProgress) {
+/** Tiny per-exercise bars for a module row; exercises on the review list are marked. */
+export function moduleBars(module: AreaSummary['modules'][number], progress: AreaProgress, weak: Set<string> = new Set()) {
   const done = module.exercises.filter((e) => isDone(progress, e)).length;
-  return { done, total: module.exercises.length, markup: html`<span class="mini-bars" aria-hidden="true">${module.exercises.map((e) => html`<i class="${isDone(progress, e) ? 'on' : ''}"></i>`)}</span>` };
+  return { done, total: module.exercises.length, markup: html`<span class="mini-bars" aria-hidden="true">${module.exercises.map((e) => html`<i class="${[isDone(progress, e) ? 'on' : '', weak.has(e.id) ? 'weak' : ''].filter(Boolean).join(' ')}"></i>`)}</span>` };
 }
 export const moduleNumber = (area: AreaSummary, id: string) => pad(area.modules.findIndex((m) => m.id === id) + 1);
 

@@ -7,6 +7,17 @@ export type Grade = Infer<typeof grade>;
 export const GRADES: readonly Grade[] = ['again', 'hard', 'good', 'easy'];
 /** lapses counts "again" ratings; grade is the latest rating. Both are absent on cards reviewed before four ratings existed. */
 export const cardState = v.object({ box: v.number(), due: v.string(), seen: v.number(), last: v.optional(v.string()), lapses: v.optional(v.number()), grade: v.optional(grade) });
+/** What happened on an exercise: a wrong check, an opened hint, the solution shown, or a solve. */
+export const drillEvent = v.union(v.literal('fail'), v.literal('hint'), v.literal('reveal'), v.literal('solve'));
+export type DrillEvent = Infer<typeof drillEvent>;
+/**
+ * Review state of one exercise, written only once something went wrong or it was reviewed (rules: src/engine/drill.ts).
+ * box 0 is off the review list, 1–3 returns on `due`. fails, hints and reveals count every attempt; open is the
+ * trouble since the last solve, which decides the box at the next one. last is the local day of the latest event.
+ */
+export const drillState = v.object({ box: v.number(), due: v.optional(v.string()), last: v.string(), fails: v.number(), hints: v.number(), reveals: v.number(), open: v.number() });
+/** Refreshers of a learned module: clean ones in a row and the local day of the latest. */
+export const topicState = v.object({ reps: v.number(), last: v.string() });
 export const position = v.union(
   v.object({ page: v.literal('lesson'), moduleId: v.string() }),
   v.object({ page: v.literal('exercise'), moduleId: v.string(), exerciseId: v.string() }),
@@ -20,6 +31,8 @@ export const entry = v.union(
   v.object({ kind: v.literal('card'), id: v.string(), value: cardState }),
   v.object({ kind: v.literal('step'), id: v.string(), completed: v.boolean() }),
   v.object({ kind: v.literal('position'), id: v.literal('last'), value: position }),
+  v.object({ kind: v.literal('drill'), id: v.string(), value: drillState }),
+  v.object({ kind: v.literal('topic'), id: v.string(), value: topicState }),
 );
 export type Entry = Infer<typeof entry>;
 export type Position = Infer<typeof position>;
@@ -52,11 +65,16 @@ export function assertPair(id: string): void {
 function assertDate(value: string): void {
   if (value.length > 30 || !/^\d{4}-\d{2}-\d{2}(?:T.*Z)?$/.test(value) || !Number.isFinite(Date.parse(value))) throw new ConvexError('INVALID_DATE');
 }
+/** A local calendar day as sent by the client, e.g. for card reviews. */
+export function assertDay(value: string): void {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value) || !Number.isFinite(Date.parse(value))) throw new ConvexError('INVALID_DATE');
+}
+const count = (value: number) => Number.isSafeInteger(value) && value >= 0;
 export function assertFingerprint(value: string): void {
   if (!/^[a-zA-Z0-9_-]{1,128}$/.test(value)) throw new ConvexError('INVALID_FINGERPRINT');
 }
 export function validateEntry(value: Entry): void {
-  if (['completion', 'revealed', 'step'].includes(value.kind)) assertPair(value.id); else assertId(value.id);
+  if (['completion', 'revealed', 'step', 'drill'].includes(value.kind)) assertPair(value.id); else assertId(value.id);
   switch (value.kind) {
     case 'lesson': if (value.completedAt !== null) assertDate(value.completedAt); break;
     case 'completion': if (value.value) { assertDate(value.value.at); assertFingerprint(value.value.fp); } break;
@@ -68,6 +86,14 @@ export function validateEntry(value: Entry): void {
       if (c.last) assertDate(c.last);
       break;
     }
+    case 'drill': {
+      const d = value.value;
+      if (!Number.isInteger(d.box) || d.box < 0 || d.box > 3 || ![d.fails, d.hints, d.reveals, d.open].every(count)) throw new ConvexError('INVALID_DRILL');
+      assertDay(d.last);
+      if (d.due !== undefined) assertDay(d.due);
+      break;
+    }
+    case 'topic': if (!count(value.value.reps)) throw new ConvexError('INVALID_TOPIC'); assertDay(value.value.last); break;
     case 'position': {
       const p = value.value;
       if ('moduleId' in p) assertId(p.moduleId);

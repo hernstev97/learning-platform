@@ -58,7 +58,8 @@ export type Module = {
   bear: boolean;
 };
 
-export type Card = { id: string; question: string; answer: string; tags: string[]; level: Level };
+/** `module` is the module whose topic the card tests; weak spots are bundled by it. */
+export type Card = { id: string; question: string; answer: string; tags: string[]; level: Level; module: string | null };
 export type ProjectStep = { id: string; title: string; detail: string };
 export type Project = {
   id: string;
@@ -79,6 +80,11 @@ export type Project = {
 export type GlossaryEntry = { id: string; term: string; definition: string };
 
 export type TrackSummary = { title: string; description: string; modules: string[] };
+/**
+ * A unit for weak spots and reviews: every module with the cards assigned to it (`id` = module id), plus one topic
+ * per first tag for cards without a module (`id` = `interview-<tag>`, `module` = null).
+ */
+export type TopicSummary = { id: string; title: string; module: string | null; cards: string[] };
 export type ModuleSummary = {
   id: string;
   title: string;
@@ -99,6 +105,7 @@ export type AreaSummary = {
   tracks: TrackSummary[];
   modules: ModuleSummary[];
   cards: string[];
+  topics: TopicSummary[];
   projects: { id: string; title: string; capstone: boolean; level: Level; hours: number; summary: string; steps: string[] }[];
   counts: { modules: number; exercises: number; cards: number; projects: number; glossary: number; minutes: number };
   pages: { cheatsheet: boolean; career: boolean; glossary: boolean };

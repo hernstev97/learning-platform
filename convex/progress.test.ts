@@ -25,6 +25,7 @@ const endpoints = [
   ['set', (t: Client) => t.mutation(api.progress.set, { areaId, generation: 0, changes: [lesson] })],
   ['saveDraft', (t: Client) => t.mutation(api.progress.saveDraft, { areaId, generation: 0, draft })],
   ['reviewCard', (t: Client) => t.mutation(api.progress.reviewCard, { areaId, generation: 0, cardId: 'first', grade: 'good', today: '2026-09-28' })],
+  ['recordDrill', (t: Client) => t.mutation(api.progress.recordDrill, { areaId, generation: 0, exerciseId: 'intro/first', event: 'fail', review: false, today: '2026-09-28' })],
   ['importLegacy', (t: Client) => t.mutation(api.progress.importLegacy, imported)],
   ['resetArea', (t: Client) => t.mutation(api.progress.resetArea, { areaId, generation: 0 })],
   ['note', (t: Client) => t.query(api.progress.note, { areaId, moduleId: note.moduleId })],
@@ -119,6 +120,51 @@ describe('personal state', () => {
     await t.finishAllScheduledFunctions(vi.runAllTimers);
     const history = await t.run((ctx) => ctx.db.query('cardReviews').collect());
     expect(history.map(({ areaId, generation, grade }) => ({ areaId, generation, grade }))).toEqual([{ areaId: 'rust', generation: 0, grade: 'good' }, { areaId, generation: 1, grade: 'easy' }]);
+  });
+  it('turns recorded trouble into a review box at the next solve and logs every event', async () => {
+    const t = create(); const owner = t.withIdentity(identity);
+    const record = (event: 'fail' | 'hint' | 'reveal' | 'solve', today = '2026-09-28', review = false) => owner.mutation(api.progress.recordDrill, { areaId, generation: 0, exerciseId: 'intro/first', event, review, today });
+    for (const event of ['fail', 'fail', 'hint'] as const) await record(event);
+    await record('solve');
+    const drill = () => owner.query(api.progress.snapshot, {}).then((s) => s.entries.find((e) => e.key === 'drill:intro/first')?.value);
+    expect(await drill()).toEqual({ kind: 'drill', id: 'intro/first', value: { box: 1, due: '2026-09-29', last: '2026-09-28', fails: 2, hints: 1, reveals: 0, open: 0 } });
+    await record('solve', '2026-09-29', true);
+    expect(await drill()).toMatchObject({ value: { box: 2, due: '2026-10-03', open: 0 } });
+    const history = await t.run((ctx) => ctx.db.query('drillEvents').collect());
+    expect(history.map(({ event, review, day, box }) => [event, review, day, box])).toEqual([
+      ['fail', false, '2026-09-28', 0], ['fail', false, '2026-09-28', 0], ['hint', false, '2026-09-28', 0], ['solve', false, '2026-09-28', 1], ['solve', true, '2026-09-29', 2],
+    ]);
+  });
+  it('writes nothing for a clean first solve, but records a clean review', async () => {
+    const t = create(); const owner = t.withIdentity(identity);
+    await owner.mutation(api.progress.recordDrill, { areaId, generation: 0, exerciseId: 'intro/first', event: 'solve', review: false, today: '2026-09-28' });
+    expect((await owner.query(api.progress.snapshot, {})).entries).toEqual([]);
+    expect(await t.run((ctx) => ctx.db.query('drillEvents').collect())).toEqual([]);
+    await owner.mutation(api.progress.recordDrill, { areaId, generation: 0, exerciseId: 'intro/first', event: 'solve', review: true, today: '2026-10-20' });
+    expect((await owner.query(api.progress.snapshot, {})).entries[0].value).toMatchObject({ kind: 'drill', value: { box: 0, last: '2026-10-20', open: 0 } });
+  });
+  it('counts a solution shown before help was recorded', async () => {
+    const t = create().withIdentity(identity);
+    await t.mutation(api.progress.set, { areaId, generation: 0, changes: [{ kind: 'completion', id: 'intro/first', value: { fp: 'abc123', at: '2026-09-01T10:00:00.000Z', help: true } }, { kind: 'revealed', id: 'intro/second', value: true }] });
+    await t.mutation(api.progress.recordDrill, { areaId, generation: 0, exerciseId: 'intro/first', event: 'solve', review: true, today: '2026-09-28' });
+    await t.mutation(api.progress.recordDrill, { areaId, generation: 0, exerciseId: 'intro/second', event: 'solve', review: false, today: '2026-09-28' });
+    const drills = Object.fromEntries((await t.query(api.progress.snapshot, {})).entries.filter((e) => e.value.kind === 'drill').map((e) => [e.value.id, e.value.kind === 'drill' && e.value.value]));
+    expect(drills['intro/first']).toMatchObject({ box: 2, reveals: 1 });
+    expect(drills['intro/second']).toMatchObject({ box: 1, reveals: 1, due: '2026-09-29' });
+  });
+  it('clears exercise events of a reset area and rejects malformed drill state', async () => {
+    vi.useFakeTimers();
+    const t = create(); const owner = t.withIdentity(identity);
+    await owner.mutation(api.progress.recordDrill, { areaId, generation: 0, exerciseId: 'intro/first', event: 'fail', review: false, today: '2026-09-28' });
+    await owner.mutation(api.progress.resetArea, { areaId, generation: 0 });
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+    expect(await t.run((ctx) => ctx.db.query('drillEvents').collect())).toEqual([]);
+    const drill = { box: 4, last: '2026-09-28', fails: 0, hints: 0, reveals: 0, open: 0 };
+    await expect(owner.mutation(api.progress.set, { areaId, generation: 1, changes: [{ kind: 'drill', id: 'intro/first', value: drill }] })).rejects.toThrow('INVALID_DRILL');
+    await expect(owner.mutation(api.progress.set, { areaId, generation: 1, changes: [{ kind: 'drill', id: 'intro', value: { ...drill, box: 1 } }] })).rejects.toThrow('INVALID_ID');
+    await expect(owner.mutation(api.progress.recordDrill, { areaId, generation: 1, exerciseId: 'intro/first', event: 'fail', review: false, today: '28.09.2026' })).rejects.toThrow('INVALID_DATE');
+    await owner.mutation(api.progress.set, { areaId, generation: 1, changes: [{ kind: 'topic', id: 'intro', value: { reps: 1, last: '2026-09-28' } }] });
+    expect((await owner.query(api.progress.snapshot, {})).entries.map((e) => e.key)).toEqual(['topic:intro']);
   });
   it('imports only missing state, atomically records receipts and never resurrects unchecked progress', async () => {
     const t = create().withIdentity(identity);

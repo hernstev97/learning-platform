@@ -1,14 +1,14 @@
 import { loadArea, onProgressChange, progressOf, reviewCard, summaryOf } from '../app.ts';
 import type { Card } from '../content/types.ts';
 import { GRADES, type Grade } from '../../convex/model.ts';
-import { byWeakness, GRADE_LABELS, nextReview } from '../engine/review.ts';
-import { localDay, type CardState } from '../engine/storage.ts';
+import { byWeakness } from '../engine/review.ts';
+import { localDay } from '../engine/storage.ts';
 import { areaBanner } from '../ui/area-nav.ts';
-import { $, $$, LEVELS, html, raw } from '../ui/dom.ts';
+import { $, $$, html, raw } from '../ui/dom.ts';
+import { flashcard, mastery } from '../ui/flashcard.ts';
 import type { Page } from '../router.ts';
 
 const NEW_PER_SESSION = 12;
-const mastery = (state: CardState | undefined) => state ? `Box ${state.box}${state.lapses ? ` · ${state.lapses}× vergessen` : ''}` : 'Neu';
 
 const cards: Page<{ name: 'cards'; area: string }> = async (main, route) => {
   const summary = summaryOf(route.area)!;
@@ -72,14 +72,7 @@ const cards: Page<{ name: 'cards'; area: string }> = async (main, route) => {
     }
     const card = queue[position];
     const state = progress.cards[card.id];
-    deck.innerHTML = html`
-      <div class="flashcard ${revealed ? 'revealed' : ''}">
-        <div class="flashcard-meta label"><span>Karte ${position + 1} / ${queue.length}</span><span>${mastery(state)} · ${LEVELS[card.level]}${card.tags.length ? ` · ${card.tags.join(', ')}` : ''}</span></div>
-        <div class="flashcard-question prose">${raw(card.question)}</div>
-        ${revealed ? html`<div class="flashcard-answer prose compact">${raw(card.answer)}</div>
-          <div class="grade-row grades" role="group" aria-label="Wie gut wusstest du die Antwort?">${GRADES.map((g, i) => html`<button type="button" class="btn big${g === 'good' ? ' primary' : ''}" id="${g}" data-grade="${g}"><kbd>${i + 1}</kbd> ${GRADE_LABELS[g]}<span class="grade-next">${nextReview(state, g)}</span></button>`)}</div>`
-          : html`<div class="grade-row"><button type="button" class="btn primary big" id="show"><kbd>Leertaste</kbd> Antwort zeigen</button></div>`}
-      </div>`.value;
+    deck.innerHTML = flashcard(card, state, revealed, `Karte ${position + 1} / ${queue.length}`).value;
     main.querySelector('#show')?.addEventListener('click', reveal);
     deck.querySelectorAll<HTMLButtonElement>('[data-grade]').forEach((button) => button.addEventListener('click', () => grade(button.dataset.grade as Grade)));
     (deck.querySelector<HTMLButtonElement>('#good') ?? deck.querySelector<HTMLButtonElement>('button'))?.focus({ preventScroll: true });

@@ -78,9 +78,11 @@ export function onStorageChange(listener: () => void): () => void {
 // Development-only regression adapter. Vite never includes this module in production.
 import { mergeProgress } from '../engine/storage.ts';
 import { schedule } from '../engine/review.ts';
+import { drill, legacyDrill } from '../engine/drill.ts';
+import { localDay } from '../engine/storage.ts';
 import { positionHref } from '../engine/persistence.ts';
 import type { Exercise } from '../content/types.ts';
-import type { Entry, Grade, Position } from '../../convex/model.ts';
+import type { DrillEvent, Entry, Grade, Position } from '../../convex/model.ts';
 export const isCloud = false;
 export const getSyncStatus = () => getStorageWarning() ? 'Nicht gespeichert' : 'Lernstand nur in diesem Browser gespeichert';
 export const hasPendingWrites = () => false;
@@ -102,6 +104,8 @@ export function setEntry(area: string, entry: Entry) {
     case 'revealed': if (entry.value) p.revealed[entry.id] = true; else delete p.revealed[entry.id]; break;
     case 'step': { const [project, step] = entry.id.split('/'); (p.projects[project] ??= {})[step] = entry.completed; break; }
     case 'card': p.cards[entry.id] = entry.value; break;
+    case 'drill': p.drills[entry.id] = entry.value; break;
+    case 'topic': p.topics[entry.id] = entry.value; break;
     case 'position': p.position = entry.value; p.last = positionHref(summaryOf(area)!, entry.value); break;
   }
   save(area);
@@ -111,6 +115,12 @@ export function visit(area: string, value: Position) {
   if (value.page !== 'cards') try { storage()?.setItem(CONTINUE_KEY, area); } catch { /* only the home shortcut is lost */ }
 }
 export function reviewCard(area: string, card: string, grade: Grade) { progressOf(area).cards[card] = schedule(progressOf(area).cards[card], grade); save(area); }
+export function recordDrill(area: string, exerciseId: string, event: DrillEvent, review: boolean) {
+  const p = progressOf(area);
+  const today = localDay();
+  const next = drill(p.drills[exerciseId] ?? legacyDrill(!!p.done[exerciseId]?.help, !!p.revealed[exerciseId], today), event, today, review);
+  if (next) { p.drills[exerciseId] = next; save(area); }
+}
 export async function resetProgress(area: string) { replaceProgress(area, freshProgress()); }
 export async function importProgress(values: Record<string, AreaProgress>) { for (const [id, value] of Object.entries(values)) replaceProgress(id, mergeProgress(progressOf(id), value)); }
 export const hasNote = (area: string, moduleId: string) => !!progressOf(area).notes?.[moduleId];

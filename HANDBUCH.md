@@ -59,10 +59,11 @@ Routen, die daraus entstehen:
 | `/<bereich>/<modul>` | Lektion |
 | `/<bereich>/<modul>/<n>` | Übung Nummer n (ab 1) |
 | `/<bereich>/karten` | Interview-Training (Karteikarten mit Wiederholung) |
+| `/wiederholen`, `/<bereich>/wiederholen` und `/<bereich>/wiederholen/<thema>` | Schwachstellen: heute fällige Themen, alle Themen eines Bereichs, eine Wiederholungsrunde |
 | `/<bereich>/projekte` und `/<bereich>/projekte/<id>` | Projekte |
 | `/<bereich>/spickzettel`, `/<bereich>/glossar`, `/<bereich>/beruf` | Nachschlageseiten |
 
-Die Namen `karten`, `projekte`, `spickzettel`, `glossar` und `beruf` sind deshalb als Modul-IDs verboten.
+Die Namen `karten`, `projekte`, `spickzettel`, `glossar`, `beruf` und `wiederholen` sind deshalb als Modul-IDs verboten, `daten` und `wiederholen` als Bereichs-IDs.
 
 Eine vollständige, minimale Vorlage mit jeder Übungsart liegt in [`tooling/fixtures/beispiel/`](tooling/fixtures/beispiel/). Sie wird nicht ausgeliefert, aber von den Tests geladen.
 
@@ -476,6 +477,7 @@ Für alles, was sich im Browser nicht prüfen lässt: Kotlin-Programme, Rust-Pro
 ```yaml
 cards:
   - id: send-sync               # kebab-case, stabil
+    module: nebenlaeufigkeit     # Modul, dessen Stoff die Karte abfragt (empfohlen)
     q: Was bedeuten `Send` und `Sync`?
     a: |
       Markdown-Antwort, so formuliert, wie man sie im Gespräch geben würde:
@@ -485,6 +487,8 @@ cards:
 ```
 
 Richtwert: 40–60 Karten pro Bereich. Mischung aus Wissensfragen („Was ist …?“), Vergleichen („Unterschied zwischen …?“), Szenarien („Die App friert ein – wie gehst du vor?“), Code-Review-Fragen und Verhaltensfragen mit Fachbezug. Die Plattform wiederholt Karten nach dem Leitner-System (Box 1–5, fällig nach 1, 3, 7, 16 und 35 Tagen). Nach dem Aufdecken bewertet man sich selbst: „Okay“ schiebt die Karte eine Box weiter, „Leicht“ zwei, „Schwer“ lässt sie in ihrer Box, „Vergessen“ setzt sie auf Box 1 zurück. Die Regeln stehen in `src/engine/review.ts`.
+
+**`module`** ordnet die Karte dem Modul zu, dessen Stoff sie abfragt. Unter „Wiederholen“ werden Schwächen nach Themen gebündelt: Eine vergessene Karte erscheint dann zusammen mit den Übungen desselben Moduls („Ownership: 2 Fehlversuche, 1 Karte vergessen“). Wähle das Modul, in dem man das Konzept tatsächlich lernt, nicht nur das mit dem passenden Tag. Reine Verhaltens- und Karrierefragen („Wie gehst du mit einer Deadline um?“) bekommen kein Modul; sie werden nach ihrem ersten Tag gebündelt („Interview: Praxis“). Der Build meldet unbekannte oder Bear-Module als Fehler.
 
 ### projects.yaml
 
@@ -570,9 +574,10 @@ Checkliste vor dem Commit:
 
 ## 11. IDs, Fortschritt und Änderungen
 
-Fortschritt liegt nach Anmeldung in Convex: gelöste Übungen (mit Fingerprint), Entwürfe, gelesene Lektionen, Notizen pro Lektion, Kartenboxen, Projektschritte und die letzte Lernposition. Die alten Browser-Einträge `learn:<bereich>:v1` bleiben als importierbare Quelle unverändert. [Migration und Zustandsmodell](docs/CONVEX.md).
+Fortschritt liegt nach Anmeldung in Convex: gelöste Übungen (mit Fingerprint), Entwürfe, gelesene Lektionen, Notizen pro Lektion, Kartenboxen, Fehlversuche, Hinweise und angesehene Lösungen pro Übung (für „Wiederholen“), Projektschritte und die letzte Lernposition. Die alten Browser-Einträge `learn:<bereich>:v1` bleiben als importierbare Quelle unverändert. [Migration und Zustandsmodell](docs/CONVEX.md).
 
-- **Übungs-ID** = `<modul>/<id>`. Wer eine ID oder den Modulnamen ändert, verliert den Fortschritt dieser Übung.
+- **Übungs-ID** = `<modul>/<id>`. Wer eine ID oder den Modulnamen ändert, verliert den Fortschritt dieser Übung, auch ihren Wiederholungsstand.
+- **Wiederholen** braucht keine Pflege: Fehlversuche meldet jede Übungsart selbst. Neue Übungsarten müssen bei einer falsch geprüften Antwort `ctx.fail()` aufrufen (oder `failOnce(ctx)` aus `src/exercises/types.ts`, damit dieselbe Antwort nur einmal zählt), sonst fließen sie nicht in die Schwachstellen ein. Die Regeln stehen in `src/engine/drill.ts` und `src/engine/weakness.ts`; die Seite „Wiederholen“ erklärt sie auch für Lernende.
 - **Fingerprint:** Ändert sich der geprüfte Teil einer Übung (Code, Antworten, Optionen, Tests), zählt ein früherer Erfolg nicht mehr. Tippfehler in Titel oder Erklärung ändern den Fingerprint nicht.
 - **Neue Übungen** ans Ende eines Moduls oder dazwischen einfügen ist unproblematisch – die Nummer in der URL ändert sich, der Fortschritt nicht.
 - Module umsortieren ist jederzeit möglich (`area.yaml`).

@@ -140,11 +140,23 @@ for (const area of loaded.catalog.areas) {
 
 test('real content fits phone, tablet and desktop viewports', async ({ page }) => {
   test.setTimeout(180_000);
+  // Weak spots in every area, so the review pages show topic cards, the topic map and a running round.
+  const day = (offset: number) => new Date(Date.now() + offset * 86_400_000).toISOString().slice(0, 10);
+  const seeded = Object.fromEntries(loaded.catalog.areas.map((area) => {
+    const [first] = area.modules;
+    const done = Object.fromEntries(first.exercises.map((e) => [e.id, { at: `${day(-20)}T10:00:00.000Z`, fp: e.fingerprint }]));
+    const drills = { [first.exercises[1].id]: { box: 1, due: day(-1), last: day(-2), fails: 3, hints: 1, reveals: 1, open: 0 } };
+    const card = area.topics.find((t) => t.cards.length)!.cards[0];
+    return [area.id, { version: 1, done, drafts: {}, revealed: {}, read: {}, cards: { [card]: { box: 1, due: day(0), seen: 2, grade: 'again', lapses: 2 } }, projects: {}, drills, topics: {}, last: null }];
+  }));
+  await page.goto('/');
+  await page.evaluate((areas) => { for (const [id, value] of Object.entries(areas)) localStorage.setItem(`learn:${id}:v1`, JSON.stringify(value)); }, seeded);
   for (const width of [360, 768, 1440]) {
     await page.setViewportSize({ width, height: 900 });
-    const paths = ['/', '/daten'];
+    const paths = ['/', '/daten', '/wiederholen'];
     for (const area of loaded.catalog.areas) {
       paths.push(`/${area.id}`, `/${area.id}/${area.modules[0].id}`, `/${area.id}/karten`, `/${area.id}/projekte`, `/${area.id}/projekte/${area.projects.find((p) => p.capstone)!.id}`, `/${area.id}/glossar`, `/${area.id}/spickzettel`, `/${area.id}/beruf`);
+      paths.push(`/${area.id}/wiederholen`, `/${area.id}/wiederholen/${area.modules[0].id}`);
       const types = new Set<string>();
       for (const module of area.modules) for (const [index, exercise] of module.exercises.entries()) {
         if (types.has(exercise.type)) continue;

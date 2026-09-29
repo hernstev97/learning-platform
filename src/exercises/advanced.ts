@@ -6,9 +6,10 @@ import { onRunnerState, runExercise } from '../python/runner.ts';
 import { autosize, editorKeys, outputMarkup, playgroundUrl } from '../ui/code.ts';
 import { $, $$, escape, html, icons, raw } from '../ui/dom.ts';
 import { codeCard, langName } from './basic.ts';
-import type { ExerciseRenderer } from './types.ts';
+import { failOnce, type ExerciseRenderer } from './types.ts';
 
 export const order: ExerciseRenderer<OrderExercise, number[]> = (exercise, ctx) => {
+  const fail = failOnce(ctx);
   const arrangement = ctx.draft?.length === exercise.lines.length ? [...ctx.draft] : [...exercise.shuffled];
   const lineMarkup = (index: number, position: number) => html`<li class="order-item" data-index="${index}" draggable="true">
     <span class="order-handle" aria-hidden="true">⠿</span>
@@ -76,6 +77,7 @@ export const order: ExerciseRenderer<OrderExercise, number[]> = (exercise, ctx) 
         paint();
         if (isOrderCorrect(exercise, arrangement)) ctx.complete();
         else {
+          fail(arrangement);
           const right = arrangement.filter((index, position) => exercise.lines[index] === exercise.lines[position]).length;
           ctx.feedback('bad', `${right} von ${exercise.lines.length} Zeilen stehen schon an der richtigen Stelle (grün markiert).`);
         }
@@ -106,6 +108,8 @@ export const code: ExerciseRenderer<CodeExercise, string> = (exercise, ctx) => (
     const editor = $<HTMLTextAreaElement>('#editor', root);
     const runButton = $<HTMLButtonElement>('#run', root);
     const stateLabel = $('#runner-state', root);
+    // Running the tests is part of writing the code: failing runs count once per visit, not each run.
+    const fail = failOnce(ctx);
     let active = true;
     autosize(editor, 6);
     const run = async () => {
@@ -127,9 +131,9 @@ export const code: ExerciseRenderer<CodeExercise, string> = (exercise, ctx) => (
           if (t.ok) passed++;
         });
         if (result.stdout || result.error) { out.hidden = false; out.className = `run-output standalone${result.error ? ' error' : ''}`; out.innerHTML = outputMarkup(result.stdout, result.error); }
-        if (result.error) ctx.feedback('bad', 'Dein Code bricht mit einem Fehler ab, bevor die Tests laufen. Lies die Meldung unten – sie nennt die Zeile.');
+        if (result.error) { fail('run'); ctx.feedback('bad', 'Dein Code bricht mit einem Fehler ab, bevor die Tests laufen. Lies die Meldung unten – sie nennt die Zeile.'); }
         else if (passed === exercise.tests.length) ctx.complete();
-        else ctx.feedback('partial', `${passed} von ${exercise.tests.length} Tests bestanden.`);
+        else { fail('run'); ctx.feedback('partial', `${passed} von ${exercise.tests.length} Tests bestanden.`); }
       } catch (error) {
         if (!active) return;
         out.hidden = false;
@@ -192,6 +196,7 @@ export const practice: ExerciseRenderer<PracticeExercise, PracticeDraft> = (exer
 
 type BugDraft = { selected: number[]; found: boolean; fixes: Record<string, string> };
 export const bug: ExerciseRenderer<BugExercise, BugDraft> = (exercise, ctx) => {
+  const fail = failOnce(ctx);
   const draft: BugDraft = { selected: [...(ctx.draft?.selected ?? [])], found: !!ctx.draft?.found, fixes: { ...(ctx.draft?.fixes ?? {}) } };
   const lines = exercise.code.split('\n');
   const many = exercise.lines.length > 1;
@@ -249,16 +254,25 @@ export const bug: ExerciseRenderer<BugExercise, BugDraft> = (exercise, ctx) => {
           if (exercise.fixes.length) { $('#fixes', root).hidden = false; $<HTMLTextAreaElement>('textarea[data-fix]', root).focus(); checkFixes(); }
           else ctx.complete();
         } else {
+          fail([...draft.selected].sort());
           paint(true);
           const hits = draft.selected.filter((line) => exercise.lines.includes(line)).length;
           ctx.feedback('bad', hits ? `${hits} Treffer, aber nicht alles stimmt. Vergleiche das beschriebene Symptom mit jeder Zeile.` : 'Diese Zeile ist nicht die Ursache. Spiel den Code mit einem konkreten Beispiel durch.');
         }
       });
-      $$<HTMLTextAreaElement>('[data-fix]', root).forEach((input) => input.addEventListener('input', () => {
-        draft.fixes[input.dataset.fix!] = input.value;
-        ctx.save(draft);
-        checkFixes();
-      }));
+      $$<HTMLTextAreaElement>('[data-fix]', root).forEach((input) => {
+        input.addEventListener('input', () => {
+          draft.fixes[input.dataset.fix!] = input.value;
+          ctx.save(draft);
+          checkFixes();
+        });
+        // Checked while typing, like gaps: a wrong line left behind counts as a wrong attempt, a started one does not.
+        input.addEventListener('change', () => {
+          const value = input.value.trim();
+          const started = exercise.fixes.find((fix) => fix.line === Number(input.dataset.fix))?.answers.some((answer) => answer.trim().startsWith(value));
+          if (value && !started && !isBugFixCorrect(exercise, Number(input.dataset.fix), input.value)) ctx.fail();
+        });
+      });
       paint();
       if (draft.found) { if (exercise.fixes.length) checkFixes(); else ctx.complete(); }
     },

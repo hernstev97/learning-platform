@@ -2,7 +2,7 @@
 // Everything that decides when a card returns lives here. The stored review history
 // (rating and day of every review) is enough to replay a different algorithm later.
 import type { Grade } from '../../convex/model.ts';
-import { addDays, localDay, type CardState } from './storage.ts';
+import { addDays, daysBetween, localDay, type CardState } from './storage.ts';
 
 export const GRADE_LABELS: Record<Grade, string> = { again: 'Vergessen', hard: 'Schwer', good: 'Okay', easy: 'Leicht' };
 /** Leitner intervals in days for boxes 1–5. */
@@ -30,9 +30,8 @@ export function byWeakness(a: CardState, b: CardState): number {
   return a.box - b.box || (b.lapses ?? 0) - (a.lapses ?? 0) || a.due.localeCompare(b.due);
 }
 
-const dayNumber = (day: string) => { const [y, m, d] = day.split('-').map(Number); return Date.UTC(y, m - 1, d) / 86_400_000; };
 /** When a card would return after this rating, for the rating buttons. */
 export function nextReview(state: CardState | undefined, grade: Grade, today = localDay()): string {
-  const days = dayNumber(schedule(state, grade, today).due) - dayNumber(today);
+  const days = daysBetween(today, schedule(state, grade, today).due);
   return days === 0 ? 'heute' : days === 1 ? '1 Tag' : `${days} Tage`;
 }

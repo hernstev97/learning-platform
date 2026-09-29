@@ -30,18 +30,21 @@ Es gibt absichtlich **einen persönlichen Datenbestand**, keine Daten pro regist
 
 | Tabelle | Inhalt | Index |
 | --- | --- | --- |
-| `progress` | Kleine, typisierte Einträge: Lektion gelesen/ungelesen, Übungserfolg mit Fingerprint, Lösung angesehen, Kartenbox/Fälligkeit/Reviewzahl/Zahl der „Vergessen“/letzte Bewertung, einzelner Projektschritt, letzte Position je Bereich; jeweils `updatedAt` | `by_area_key` |
+| `progress` | Kleine, typisierte Einträge: Lektion gelesen/ungelesen, Übungserfolg mit Fingerprint, Lösung angesehen, Kartenbox/Fälligkeit/Reviewzahl/Zahl der „Vergessen“/letzte Bewertung, Wiederholungsstand einer Übung (`drill`), Auffrischungen eines Moduls (`topic`), einzelner Projektschritt, letzte Position je Bereich; jeweils `updatedAt` | `by_area_key` |
 | `cardReviews` | Eine Zeile pro Kartenbewertung: Bereich, Reset-Generation, Karte, Bewertung, lokaler Tag, Serverzeit, Box und Fälligkeit danach. Nicht Teil von `snapshot` | `by_area_generation_card` |
+| `drillEvents` | Eine Zeile pro erfasstem Übungsereignis (`fail`, `hint`, `reveal`, `solve`): Bereich, Reset-Generation, Übung, ob in einer Wiederholungsrunde, lokaler Tag, Serverzeit und Stufe danach. Nicht Teil von `snapshot` | `by_area_generation_exercise` |
 | `drafts` | Entwurf pro Bereich, Reset-Generation und Übungs-ID; JSON bis 60 KB, Inhaltsfingerprint und Änderungszeit | `by_area_generation_exercise` |
 | `areaResets` | Monotone Reset-Generation je Bereich, schützt vor verspäteten alten Schreibvorgängen | `by_area` |
 | `notes` | Persönliche Notiz pro Bereich und Lektion (Modul-ID), bis 20 000 Zeichen, mit Änderungszeit; bewusst ohne Reset-Generation | `by_area_module` |
 | `imports` | Atomare Importbelege pro Bereich und Chunk, ohne Kopie der importierten Inhalte | `by_area_import` |
 
-`convex/model.ts` definiert die Zustandsvarianten und Eingabegrenzen, `schema.ts` Tabellen/Indizes. Ein Modul hat bereits genau eine Lektion; seine stabile Modul-ID ist deshalb gleichzeitig die Lektions-ID. Ein Projektschritt verwendet `projekt-id/schritt-id`. Status und Prozente ergeben sich aus den aktuellen Schritten bzw. aktuellen Übungs-IDs/Fingerprints. Keine gespeicherten Summen, unnötigen Versuchszähler oder Kopien des Curriculums.
+`convex/model.ts` definiert die Zustandsvarianten und Eingabegrenzen, `schema.ts` Tabellen/Indizes. Ein Modul hat bereits genau eine Lektion; seine stabile Modul-ID ist deshalb gleichzeitig die Lektions-ID. Ein Projektschritt verwendet `projekt-id/schritt-id`. Status und Prozente ergeben sich aus den aktuellen Schritten bzw. aktuellen Übungs-IDs/Fingerprints. Keine gespeicherten Summen oder Kopien des Curriculums. Versuchszähler gibt es nur dort, wo das Wiederholungssystem sie braucht (`drill`).
+
+**Schwachstellen und Wiederholen.** Die Übungsregeln stehen allein in `src/engine/drill.ts` (`drill`), das Client (optimistisch) und `recordDrill` (maßgeblich) gemeinsam nutzen. Ein `drill`-Eintrag (ID `modul/übung`) entsteht erst, wenn bei einer Übung etwas schiefging (falsch geprüfte Antwort, Hinweis, „Lösung zeigen“ vor dem Lösen) oder sie in einer Wiederholungsrunde gelöst wurde. Ein sauberes erstes Lösen braucht keinen Eintrag; dafür genügt der Übungserfolg. `fails`, `hints` und `reveals` zählen alle Versuche, `open` die Punkte seit dem letzten Lösen (Fehlversuch und Hinweis 1, Lösung 3). Beim Lösen entscheidet `open` über die Stufe: ab 3 Punkten Stufe 1 (morgen), sonst Stufe 2 (in 4 Tagen), ohne Punkte eine Stufe höher (1, 4, 10 Tage) und nach Stufe 3 von der Liste (`box` 0). Frische Schwierigkeiten verschieben eine Übung immer auf den nächsten Tag. Übungen, deren Lösung vor dieser Erfassung angesehen wurde (Erfolg mit `help` oder `revealed`), zählen beim ersten Ereignis als schwere Schwierigkeit (`drillBase`). Ein `topic`-Eintrag (ID = Modul-ID) hält fest, wie oft ein gelerntes Modul hintereinander ohne Hilfe aufgefrischt wurde. Davon hängt der Abstand bis zur nächsten Auffrischung ab (10, 30, 75, 180 Tage). Die Runde schreibt ihn über `set`, sobald alle Übungen einer Auffrischung erledigt sind. Welche Themen heute dran sind und warum, berechnet `src/engine/weakness.ts` ausschließlich im Client aus diesem Stand. Karten werden über ihr `module`-Feld aus dem Curriculum einem Modul zugeordnet. `drillEvents` hält jedes Ereignis fest, damit sich andere Regeln später aus der Historie neu berechnen lassen. Wie bei Karten ist diese Historie nicht in der JSON-Sicherung enthalten; Sicherung und Import übernehmen `drill`- und `topic`-Einträge. Bei gleichem Eintrag gewinnt beim Zusammenführen der mit dem jüngeren Tag.
 
 **Kartenwiederholung.** Die Regeln stehen allein in `src/engine/review.ts` (`schedule`), das Client (optimistisch) und `reviewCard` (maßgeblich) gemeinsam nutzen: Box 1–5 mit 1, 3, 7, 16 und 35 Tagen; „Vergessen“ → Box 1 und heute fällig, „Schwer“ → gleiche Box, „Okay“ → eine Box höher, „Leicht“ → zwei. Fällige Karten werden schwächste zuerst abgefragt (niedrige Box, häufig vergessen, lange überfällig). `cardReviews` hält jede Bewertung mit Tag fest, sodass sich ein anderer Algorithmus später aus der Historie neu berechnen lässt. Die Historie ist nicht in der JSON-Sicherung enthalten; ein Import übernimmt nur den Kartenstand.
 
-`convex/auth.ts::requireOwner` prüft die von Convex validierte Identität auf **Issuer, Subject und deren tokenIdentifier**. Convex selbst prüft Signatur, Ablauf und Audience anhand von `auth.config.ts`. Alle zwölf öffentlichen Endpunkte beginnen mit diesem Guard; keiner nimmt eine Eigentümer-ID entgegen:
+`convex/auth.ts::requireOwner` prüft die von Convex validierte Identität auf **Issuer, Subject und deren tokenIdentifier**. Convex selbst prüft Signatur, Ablauf und Audience anhand von `auth.config.ts`. Alle dreizehn öffentlichen Endpunkte beginnen mit diesem Guard; keiner nimmt eine Eigentümer-ID entgegen:
 
 | Endpunkt | Zweck |
 | --- | --- |
@@ -51,6 +54,7 @@ Es gibt absichtlich **einen persönlichen Datenbestand**, keine Daten pro regist
 | `set` | Gezielt einzelne Fortschrittsfelder ändern; kein Überschreiben ganzer Bereiche |
 | `saveDraft` | Einen versionierten Entwurf ersetzen |
 | `reviewCard` | Eine Bewertung (`again`, `hard`, `good`, `easy`) atomar auf den letzten Serverstand anwenden und in `cardReviews` protokollieren. Das frühere `knew` wird für vor dem Update geöffnete Tabs noch angenommen |
+| `recordDrill` | Ein Übungsereignis (`fail`, `hint`, `reveal`, `solve`) atomar auf den letzten Serverstand anwenden und in `drillEvents` protokollieren; `review` kennzeichnet Wiederholungsrunden |
 | `importLegacy` | Begrenzt große, wiederholbar sichere Import-Chunks |
 | `resetArea` | Einen Bereich absichtlich zurücksetzen |
 | `note` | Reaktive Notiz der geöffneten Lektion |
@@ -58,7 +62,7 @@ Es gibt absichtlich **einen persönlichen Datenbestand**, keine Daten pro regist
 | `saveNote` | Eine Notiz ersetzen; leerer Text löscht sie |
 | `exportNotes` | Begrenzte Seiten für eine JSON-Sicherung |
 
-`purgeDrafts` und `purgeReviews` sind **nur intern** aufrufbar. Nach einem Reset sind alte Entwürfe sofort unsichtbar; `purgeDrafts` löscht sie anschließend in begrenzten Batches, `purgeReviews` ebenso die Review-Historie der alten Generation. So funktioniert Zurücksetzen auch, wenn alle Entwürfe zusammen ein Convex-Transaktionslimit überschreiten. Importbelege und Reset-Grenzen bleiben erhalten.
+`purgeDrafts`, `purgeReviews` und `purgeDrillEvents` sind **nur intern** aufrufbar. Nach einem Reset sind alte Entwürfe sofort unsichtbar; `purgeDrafts` löscht sie anschließend in begrenzten Batches, `purgeReviews` und `purgeDrillEvents` ebenso die Karten- und Übungshistorie der alten Generation. So funktioniert Zurücksetzen auch, wenn alle Entwürfe zusammen ein Convex-Transaktionslimit überschreiten. Importbelege und Reset-Grenzen bleiben erhalten.
 
 Die Backend-Validierung prüft Typen, IDs, Datumswerte, JSON-Struktur, Größen und Positionskonsistenz. Sie importiert kein Curriculum: entfernte IDs dürfen archiviert bleiben und werden von aktuellen Fortschrittsberechnungen ignoriert. Client und Backend können deshalb unabhängig aktualisiert werden. Wer das erlaubte Konto besitzt, darf seinen Lernstand selbst bewerten; der Server führt keine Aufgabenlösungen aus.
 
