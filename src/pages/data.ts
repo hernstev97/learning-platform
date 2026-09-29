@@ -22,7 +22,7 @@ const data: Page = async (main) => {
           return html`<tr data-progress-area="${area.id}"><td>${area.title}</td><td>${stats.done} / ${stats.total}</td><td>${Object.keys(progressOf(area.id).cards).length}</td><td><button type="button" class="btn small" data-reset="${area.id}">Zurück&shy;setzen</button></td></tr>`;
         })}
       </tbody></table></div>
-      <section class="data-section"><h2 class="section-title">Sichern</h2><p>Lädt eine JSON-Datei mit dem Lernstand aller Bereiche herunter.</p><button type="button" class="btn primary" id="export">Sicherung herunterladen</button></section>
+      <section class="data-section"><h2 class="section-title">Sichern</h2><p>Lädt eine JSON-Datei mit dem Lernstand und den Notizen aller Bereiche herunter.</p><button type="button" class="btn primary" id="export">Sicherung herunterladen</button></section>
       <section class="data-section"><h2 class="section-title">Wiederherstellen</h2><p>Eine Sicherung ergänzt fehlende Einträge. Vorhandene Serverwerte haben Vorrang, auch bewusst zurückgenommene Häkchen. Nach einem vollständigen Bereichsreset kannst du ihn hier absichtlich wiederherstellen.</p><label class="btn" for="import-file">Sicherung auswählen</label><input type="file" id="import-file" accept="application/json,.json" class="sr-only"></section>
       <section class="data-section"><h2 class="section-title">Von kotlin.kiumu.app übernehmen</h2>
         <p>Der Bear-Kurs lief früher auf kotlin.kiumu.app. Browser trennen Speicher pro Domain, deshalb musst du den alten Stand einmal kopieren: Öffne kotlin.kiumu.app, dann die Entwicklerkonsole (F12) und führe <code>copy(localStorage.getItem('kotlin-lernen:bear:progress:v2'))</code> aus. Füge das Ergebnis hier ein.</p>
@@ -80,7 +80,7 @@ const data: Page = async (main) => {
     });
     main.querySelectorAll<HTMLButtonElement>('[data-reset]').forEach((button) => button.addEventListener('click', async () => {
       const area = summaryOf(button.dataset.reset!)!;
-      if (!confirm(`Lernstand für „${area.title}“ wirklich löschen? Das lässt sich nur mit einer Sicherung rückgängig machen.`)) return;
+      if (!confirm(`Lernstand für „${area.title}“ wirklich löschen? Das lässt sich nur mit einer Sicherung rückgängig machen. Deine Notizen zu den Lektionen bleiben erhalten.`)) return;
       try {
       button.disabled = true;
       await resetProgress(area.id);

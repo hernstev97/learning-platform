@@ -1,9 +1,9 @@
 import { paginationOptsValidator } from 'convex/server';
 import { ConvexError, v } from 'convex/values';
-import { internalMutation, mutation, query, type MutationCtx } from './_generated/server';
+import { internalMutation, mutation, query, type MutationCtx, type QueryCtx } from './_generated/server';
 import { internal } from './_generated/api';
 import { requireOwner } from './auth';
-import { assertId, assertPair, draftInput, entry, entryKey, validateDraft, validateEntry, type Entry } from './model';
+import { assertId, assertPair, draftInput, entry, entryKey, noteInput, validateDraft, validateEntry, validateNote, type Entry } from './model';
 import { gradeCard } from '../src/engine/storage';
 
 async function checkGeneration(ctx: MutationCtx, areaId: string, generation: number) {
@@ -88,14 +88,59 @@ export const exportDrafts = query({
   },
 });
 
+const findNote = (ctx: QueryCtx, areaId: string, moduleId: string) =>
+  ctx.db.query('notes').withIndex('by_area_module', (q) => q.eq('areaId', areaId).eq('moduleId', moduleId)).unique();
+
+export const note = query({
+  args: { areaId: v.string(), moduleId: v.string() },
+  handler: async (ctx, { areaId, moduleId }) => {
+    await requireOwner(ctx);
+    assertId(areaId); assertId(moduleId);
+    return (await findNote(ctx, areaId, moduleId))?.text ?? null;
+  },
+});
+
+/** Marks lessons with notes without sending their text. */
+export const noteIndex = query({
+  args: {},
+  handler: async (ctx) => {
+    await requireOwner(ctx);
+    return (await ctx.db.query('notes').collect()).map(({ areaId, moduleId }) => ({ areaId, moduleId }));
+  },
+});
+
+/** Notes are not tied to a reset generation; empty text deletes the note. */
+export const saveNote = mutation({
+  args: { areaId: v.string(), note: noteInput },
+  handler: async (ctx, { areaId, note }) => {
+    await requireOwner(ctx);
+    assertId(areaId); validateNote(note);
+    const existing = await findNote(ctx, areaId, note.moduleId);
+    if (!note.text.trim()) { if (existing) await ctx.db.delete(existing._id); return; }
+    if (existing?.text === note.text) return;
+    const record = { areaId, ...note, updatedAt: Date.now() };
+    if (existing) await ctx.db.replace(existing._id, record); else await ctx.db.insert('notes', record);
+  },
+});
+
+export const exportNotes = query({
+  args: { paginationOpts: paginationOptsValidator },
+  handler: async (ctx, { paginationOpts }) => {
+    await requireOwner(ctx);
+    const result = await ctx.db.query('notes').paginate({ ...paginationOpts, numItems: Math.min(paginationOpts.numItems, 16) });
+    return { ...result, page: result.page.map(({ areaId, moduleId, text }) => ({ areaId, moduleId, text })) };
+  },
+});
+
 /** Chunked, transactional, insert-only import: explicit false/null records are tombstones. */
 export const importLegacy = mutation({
-  args: { areaId: v.string(), generation: v.number(), importId: v.string(), mode: v.union(v.literal('legacy'), v.literal('backup')), entries: v.array(entry), drafts: v.array(draftInput) },
+  args: { areaId: v.string(), generation: v.number(), importId: v.string(), mode: v.union(v.literal('legacy'), v.literal('backup')), entries: v.array(entry), drafts: v.array(draftInput), notes: v.optional(v.array(noteInput)) },
   handler: async (ctx, args) => {
     await requireOwner(ctx);
     const reset = await checkGeneration(ctx, args.areaId, args.generation);
     if (!/^[a-f0-9]{64}$/.test(args.importId)) throw new ConvexError('INVALID_IMPORT_ID');
-    if (args.entries.length > 32 || args.drafts.length > 4) throw new ConvexError('BATCH_TOO_LARGE');
+    const notes = args.notes ?? [];
+    if (args.entries.length > 32 || args.drafts.length > 4 || notes.length > 4) throw new ConvexError('BATCH_TOO_LARGE');
     const receipt = await ctx.db.query('imports').withIndex('by_area_import', (q) => q.eq('areaId', args.areaId).eq('importId', args.importId)).unique();
     if (receipt) return;
     if (args.mode === 'legacy' && reset) throw new ConvexError('LEGACY_IMPORT_AFTER_RESET');
@@ -104,6 +149,10 @@ export const importLegacy = mutation({
       validateDraft(draft);
       const existing = await ctx.db.query('drafts').withIndex('by_area_generation_exercise', (q) => q.eq('areaId', args.areaId).eq('generation', args.generation).eq('exerciseId', draft.exerciseId)).unique();
       if (!existing) await ctx.db.insert('drafts', { areaId: args.areaId, generation: args.generation, ...draft, updatedAt: Date.now() });
+    }
+    for (const note of notes) {
+      validateNote(note);
+      if (note.text.trim() && !await findNote(ctx, args.areaId, note.moduleId)) await ctx.db.insert('notes', { areaId: args.areaId, ...note, updatedAt: Date.now() });
     }
     await ctx.db.insert('imports', { areaId: args.areaId, importId: args.importId, importedAt: Date.now() });
   },
