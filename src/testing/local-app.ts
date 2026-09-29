@@ -83,7 +83,7 @@ import type { Entry, Position } from '../../convex/model.ts';
 export const isCloud = false;
 export const getSyncStatus = () => getStorageWarning() ? 'Nicht gespeichert' : 'Lernstand nur in diesem Browser gespeichert';
 export const hasPendingWrites = () => false;
-export const getContinueHref = () => null;
+export const getContinueArea = (): string | null => null;
 export const onProgressChange = (_fn: (draft: boolean) => void) => () => {};
 export const closeDraft = () => {};
 export const prepareDraft = async (_area: string, _exercise: Exercise) => {};
@@ -96,7 +96,7 @@ export function setEntry(area: string, entry: Entry) {
     case 'revealed': if (entry.value) p.revealed[entry.id] = true; else delete p.revealed[entry.id]; break;
     case 'step': { const [project, step] = entry.id.split('/'); (p.projects[project] ??= {})[step] = entry.completed; break; }
     case 'card': p.cards[entry.id] = entry.value; break;
-    case 'position': p.last = positionHref(summaryOf(area)!, entry.value); break;
+    case 'position': p.position = entry.value; p.last = positionHref(summaryOf(area)!, entry.value); break;
   }
   save(area);
 }

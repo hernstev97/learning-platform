@@ -1,6 +1,7 @@
 import type { AreaSummary } from '../content/types.ts';
+import type { Resume } from '../engine/persistence.ts';
 import { areaStats, isDone, type AreaProgress } from '../engine/storage.ts';
-import { html, pad, raw } from './dom.ts';
+import { TYPE_LABELS, html, pad, raw } from './dom.ts';
 
 export type Tab = 'pfad' | 'karten' | 'projekte' | 'spickzettel' | 'glossar' | 'beruf';
 
@@ -36,3 +37,17 @@ export function moduleBars(module: AreaSummary['modules'][number], progress: Are
   return { done, total: module.exercises.length, markup: html`<span class="mini-bars" aria-hidden="true">${module.exercises.map((e) => html`<i class="${isDone(progress, e) ? 'on' : ''}"></i>`)}</span>` };
 }
 export const moduleNumber = (area: AreaSummary, id: string) => pad(area.modules.findIndex((m) => m.id === id) + 1);
+
+/** Short description of where "Weiterlernen" leads, e.g. "Übung 3 von 8 · Lückencode". */
+export function resumeStep(resume: Resume): string {
+  switch (resume.step.page) {
+    case 'lesson': return 'Lektion';
+    case 'exercise': return `Übung ${resume.step.index} von ${resume.step.total} · ${TYPE_LABELS[resume.step.type]}`;
+    case 'project': return 'Projekt';
+    case 'finished': return 'Alle Übungen gelöst';
+  }
+}
+export const RESUME_NOTES = {
+  solved: 'Deine letzte Stelle ist schon erledigt – hier geht es weiter.',
+  removed: 'Deine letzte Stelle gibt es nicht mehr – hier geht es weiter.',
+} as const;

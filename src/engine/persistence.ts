@@ -1,5 +1,5 @@
-import type { AreaSummary, Catalog, Exercise } from '../content/types.ts';
-import { freshProgress, type AreaProgress } from './storage.ts';
+import type { AreaSummary, Catalog, Exercise, ExerciseType } from '../content/types.ts';
+import { freshProgress, isDone, type AreaProgress } from './storage.ts';
 import { entryKey, type Entry, type Position, type Snapshot } from '../../convex/model.ts';
 
 /** URLs stay unchanged; stored resume positions use content IDs, never exercise indexes. */
@@ -62,9 +62,67 @@ export function projectSnapshot(snapshot: Snapshot, catalog: Catalog): Record<st
   return areas;
 }
 
-export function latestPosition(snapshot: Snapshot, catalog: Catalog): string | null {
-  const last = snapshot.entries.filter((e) => e.value.kind === 'position' && catalog.areas.some((a) => a.id === e.areaId)).sort((a, b) => b.updatedAt - a.updatedAt)[0];
-  return last?.value.kind === 'position' ? positionHref(catalog.areas.find((a) => a.id === last.areaId)!, last.value.value) : null;
+/** Area of the most recent learning-path position. Card reviews are side trips and never count. */
+export function latestArea(snapshot: Snapshot, catalog: Catalog): string | null {
+  const last = snapshot.entries
+    .filter((e) => e.value.kind === 'position' && e.value.value.page !== 'cards' && catalog.areas.some((a) => a.id === e.areaId))
+    .sort((a, b) => b.updatedAt - a.updatedAt)[0];
+  return last?.areaId ?? null;
+}
+
+export type Resume = {
+  href: string;
+  /** Module on the learning path; absent for projects and once every exercise is solved. */
+  module?: { id: string; title: string; number: number; done: number; total: number };
+  step:
+    | { page: 'lesson' }
+    | { page: 'exercise'; index: number; total: number; type: ExerciseType }
+    | { page: 'project'; title: string }
+    | { page: 'finished' };
+  /** Why the stored position was not used as-is. */
+  moved: 'solved' | 'removed' | null;
+  started: boolean;
+};
+
+/**
+ * Where "Weiterlernen" leads: the stored position unless it was solved or removed meanwhile.
+ * Then the next open exercise in the module, then the next module with open exercises.
+ */
+export function resolveResume(area: AreaSummary, progress: AreaProgress): Resume {
+  const modules = area.modules;
+  const open = (m: AreaSummary['modules'][number]) => m.exercises.some((e) => !isDone(progress, e));
+  const position = progress.position?.page === 'cards' ? undefined : progress.position;
+  const started = !!position || Object.keys(progress.done).length > 0 || Object.keys(progress.read).length > 0;
+  const moduleInfo = (m: AreaSummary['modules'][number]) => ({
+    id: m.id, title: m.title, number: modules.indexOf(m) + 1, done: m.exercises.filter((e) => isDone(progress, e)).length, total: m.exercises.length,
+  });
+  const exercise = (m: AreaSummary['modules'][number], index: number, moved: Resume['moved']): Resume => ({
+    href: `/${area.id}/${m.id}/${index + 1}`, module: moduleInfo(m), step: { page: 'exercise', index: index + 1, total: m.exercises.length, type: m.exercises[index].type }, moved, started,
+  });
+  const lesson = (m: AreaSummary['modules'][number], moved: Resume['moved']): Resume => ({ href: `/${area.id}/${m.id}`, module: moduleInfo(m), step: { page: 'lesson' }, moved, started });
+  // A module that was already begun continues at its first open exercise, a new one at its lesson.
+  const enter = (m: AreaSummary['modules'][number], moved: Resume['moved']): Resume =>
+    m.exercises.some((e) => isDone(progress, e)) ? exercise(m, m.exercises.findIndex((e) => !isDone(progress, e)), moved) : lesson(m, moved);
+  const nextModule = (from: number, moved: Resume['moved']): Resume => {
+    const next = [...modules.slice(from), ...modules.slice(0, from)].find(open);
+    if (next) return enter(next, moved);
+    return { href: area.counts.cards ? `/${area.id}/karten` : `/${area.id}`, step: { page: 'finished' }, moved, started };
+  };
+
+  if (!position) return nextModule(0, null);
+  if (position.page === 'project') {
+    const project = area.projects.find((p) => p.id === position.projectId);
+    return project ? { href: `/${area.id}/projekte/${project.id}`, step: { page: 'project', title: project.title }, moved: null, started } : nextModule(0, 'removed');
+  }
+  const index = modules.findIndex((m) => m.id === position.moduleId);
+  if (index < 0) return nextModule(0, 'removed');
+  const module = modules[index];
+  if (position.page === 'lesson') return open(module) || !module.exercises.length ? lesson(module, null) : nextModule(index + 1, 'solved');
+  const at = module.exercises.findIndex((e) => e.id === position.exerciseId);
+  if (at >= 0 && !isDone(progress, module.exercises[at])) return exercise(module, at, null);
+  const moved = at < 0 ? 'removed' : 'solved';
+  const after = [...module.exercises.keys()].map((i) => (at + 1 + i) % module.exercises.length).find((i) => !isDone(progress, module.exercises[i]));
+  return after === undefined ? nextModule(index + 1, moved) : exercise(module, after, moved);
 }
 
 /** Do not hand unchecked JSON to renderers that expect arrays/objects of a specific shape. */

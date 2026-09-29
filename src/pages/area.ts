@@ -1,27 +1,25 @@
 import { progressOf, summaryOf } from '../app.ts';
-import { areaStats, isDone } from '../engine/storage.ts';
-import { areaTabs, moduleBars } from '../ui/area-nav.ts';
+import { resolveResume, type Resume } from '../engine/persistence.ts';
+import { areaStats } from '../engine/storage.ts';
+import { RESUME_NOTES, areaTabs, moduleBars, resumeStep } from '../ui/area-nav.ts';
 import { LEVELS, html, icons, minutes, pad, raw } from '../ui/dom.ts';
 import type { Page } from '../router.ts';
 
-/** Where to continue: last visited page, else the first module with open exercises. */
-export function resumeTarget(areaId: string): { href: string; label: string } {
+/** Button target and label for the area's "Weiter" CTA, shared resolution with the home page. */
+export function resumeTarget(areaId: string): { href: string; label: string; resume: Resume } {
   const area = summaryOf(areaId)!;
-  const progress = progressOf(areaId);
-  if (progress.last) {
-    const [, , moduleId] = progress.last.split('/');
-    const module = area.modules.find((m) => m.id === moduleId);
-    if (module) return { href: progress.last, label: `Weiter: ${module.title}` };
-  }
-  const open = area.modules.find((m) => m.exercises.some((e) => !isDone(progress, e)));
-  return open ? { href: `/${area.id}/${open.id}`, label: `${Object.keys(progress.done).length ? 'Weiter' : 'Start'}: ${open.title}` } : { href: `/${area.id}/karten`, label: 'Alles gelöst – Interview-Training' };
+  const resume = resolveResume(area, progressOf(areaId));
+  const title = resume.module?.title ?? (resume.step.page === 'project' ? resume.step.title : null);
+  const label = title ? `${resume.started ? 'Weiter' : 'Start'}: ${title}` : area.counts.cards ? 'Alles gelöst – Interview-Training' : 'Alles gelöst';
+  return { href: resume.href, label, resume };
 }
 
 const area: Page<{ name: 'area'; area: string }> = (main, route) => {
   const summary = summaryOf(route.area)!;
   const progress = progressOf(summary.id);
   const stats = areaStats(summary, progress);
-  const resume = resumeTarget(summary.id);
+  const target = resumeTarget(summary.id);
+  const { resume } = target;
   document.title = `${summary.title} · learn.kiumu.app`;
   const capstone = summary.projects.find((p) => p.capstone);
   let n = 0;
@@ -34,7 +32,9 @@ const area: Page<{ name: 'area'; area: string }> = (main, route) => {
         <div class="area-hero-grid">
           <div>
             <p class="area-hero-description">${summary.description}</p>
-            <a class="btn primary big" href="${resume.href}">${resume.label} ${raw(icons.arrow)}</a>
+            <a class="btn primary big" href="${target.href}">${target.label} ${raw(icons.arrow)}</a>
+            ${resume.started ? html`<p class="resume-step label">${resumeStep(resume)}${resume.module ? ` · ${resume.module.done} / ${resume.module.total} im Modul gelöst` : ''}</p>` : ''}
+            ${resume.moved ? html`<p class="resume-note">${RESUME_NOTES[resume.moved]}</p>` : ''}
           </div>
           <dl class="stat-grid">
             <div><dt class="label">Module</dt><dd>${summary.counts.modules}</dd></div>
