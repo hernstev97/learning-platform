@@ -1,11 +1,14 @@
 import { loadArea, onProgressChange, progressOf, reviewCard, summaryOf } from '../app.ts';
 import type { Card } from '../content/types.ts';
-import { INTERVALS, localDay } from '../engine/storage.ts';
+import { GRADES, type Grade } from '../../convex/model.ts';
+import { byWeakness, GRADE_LABELS, nextReview } from '../engine/review.ts';
+import { localDay, type CardState } from '../engine/storage.ts';
 import { areaBanner } from '../ui/area-nav.ts';
-import { $, $$, LEVELS, html, raw } from '../ui/dom.ts';
+import { $, LEVELS, html, raw } from '../ui/dom.ts';
 import type { Page } from '../router.ts';
 
 const NEW_PER_SESSION = 12;
+const mastery = (state: CardState | undefined) => state ? `Box ${state.box}${state.lapses ? ` · ${state.lapses}× vergessen` : ''}` : 'Neu';
 
 const cards: Page<{ name: 'cards'; area: string }> = async (main, route) => {
   const summary = summaryOf(route.area)!;
@@ -18,7 +21,8 @@ const cards: Page<{ name: 'cards'; area: string }> = async (main, route) => {
   let queue: Card[] = [];
   let position = 0;
   let revealed = false;
-  let sessionKnown = 0;
+  /** Cards rated „Vergessen“ at least once this round; they come back until rated otherwise. */
+  let forgotten = new Set<string>();
 
   const pool = () => area.cards.filter((c) => !tag || c.tags.includes(tag));
   const due = () => pool().filter((c) => progress.cards[c.id] && progress.cards[c.id].due <= today);
@@ -28,7 +32,7 @@ const cards: Page<{ name: 'cards'; area: string }> = async (main, route) => {
   main.innerHTML = html`
     ${areaBanner(summary, progress, 'karten', 'Interview-Training')}
     <div class="page cards-page">
-      <p class="page-intro">Karteikarten mit echten Interviewfragen. Beantworte jede Frage erst laut oder schriftlich, dann deck die Antwort auf und sei ehrlich zu dir. Gewusste Karten kommen nach 1, 3, 7, 16 und 35 Tagen wieder (Leitner-System), vergessene sofort.</p>
+      <p class="page-intro">Karteikarten mit echten Interviewfragen. Beantworte jede Frage erst laut oder schriftlich, dann deck die Antwort auf und bewerte dich ehrlich. <strong>Okay</strong> schiebt die Karte eine Box weiter, <strong>Leicht</strong> zwei, <strong>Schwer</strong> lässt sie in ihrer Box, <strong>Vergessen</strong> holt sie zurück in Box 1 und noch in dieser Runde wieder. Box 1 bis 5 kommen nach 1, 3, 7, 16 und 35 Tagen wieder (Leitner-System). Die schwächsten fälligen Karten kommen zuerst.</p>
       <div class="cards-toolbar">
         <label class="label" for="tag">Thema</label>
         <select id="tag"><option value="">Alle Themen (${area.cards.length})</option>${tags.map((t) => html`<option value="${t}">${t} (${area.cards.filter((c) => c.tags.includes(t)).length})</option>`)}</select>
@@ -54,12 +58,13 @@ const cards: Page<{ name: 'cards'; area: string }> = async (main, route) => {
     const deck = $('#deck', main);
     if (!queue.length || position >= queue.length) {
       const done = queue.length > 0;
+      const round = new Set(queue.map((c) => c.id)).size;
       const available = due().length + Math.min(fresh().length, NEW_PER_SESSION);
       deck.innerHTML = html`${renderStats()}
         <div class="deck-start">
-          ${done ? html`<p class="deck-done"><strong>Runde fertig.</strong> ${sessionKnown} von ${queue.length} gewusst.</p>` : ''}
+          ${done ? html`<p class="deck-done"><strong>Runde fertig.</strong> ${round - forgotten.size} von ${round} auf Anhieb gewusst.</p>` : ''}
           ${available ? html`<button type="button" class="btn primary big" id="start">${done ? 'Nächste Runde' : 'Training starten'} · ${available}&nbsp;Karten</button><p class="muted small">${due().length} fällige Wiederholungen und bis zu ${NEW_PER_SESSION} neue Karten.</p>`
-            : html`<p><strong>Für heute ist alles wiederholt.</strong> Morgen sind wieder Karten fällig. Du kannst unten jederzeit alle Fragen durchgehen.</p><button type="button" class="btn" id="extra">Trotzdem üben (zufällige Auswahl)</button>`}
+            : html`<p><strong>Für heute ist alles wiederholt.</strong> Morgen sind wieder Karten fällig. Du kannst unten jederzeit alle Fragen durchgehen.</p><button type="button" class="btn" id="extra">Trotzdem üben (schwächste Karten zuerst)</button>`}
         </div>`.value;
       main.querySelector('#start')?.addEventListener('click', () => startSession(false));
       main.querySelector('#extra')?.addEventListener('click', () => startSession(true));
@@ -69,22 +74,21 @@ const cards: Page<{ name: 'cards'; area: string }> = async (main, route) => {
     const state = progress.cards[card.id];
     deck.innerHTML = html`
       <div class="flashcard ${revealed ? 'revealed' : ''}">
-        <div class="flashcard-meta label"><span>Karte ${position + 1} / ${queue.length}</span><span>${state ? `Box ${state.box}` : 'Neu'} · ${LEVELS[card.level]}${card.tags.length ? ` · ${card.tags.join(', ')}` : ''}</span></div>
+        <div class="flashcard-meta label"><span>Karte ${position + 1} / ${queue.length}</span><span>${mastery(state)} · ${LEVELS[card.level]}${card.tags.length ? ` · ${card.tags.join(', ')}` : ''}</span></div>
         <div class="flashcard-question prose">${raw(card.question)}</div>
         ${revealed ? html`<div class="flashcard-answer prose compact">${raw(card.answer)}</div>
-          <div class="grade-row"><button type="button" class="btn big" id="again"><kbd>1</kbd> Nochmal</button><button type="button" class="btn primary big" id="knew"><kbd>2</kbd> Gewusst</button></div>`
+          <div class="grade-row grades" role="group" aria-label="Wie gut wusstest du die Antwort?">${GRADES.map((g, i) => html`<button type="button" class="btn big${g === 'good' ? ' primary' : ''}" id="${g}" data-grade="${g}"><kbd>${i + 1}</kbd> ${GRADE_LABELS[g]}<span class="grade-next">${nextReview(state, g)}</span></button>`)}</div>`
           : html`<div class="grade-row"><button type="button" class="btn primary big" id="show"><kbd>Leertaste</kbd> Antwort zeigen</button></div>`}
       </div>`.value;
     main.querySelector('#show')?.addEventListener('click', reveal);
-    main.querySelector('#again')?.addEventListener('click', () => grade(false));
-    main.querySelector('#knew')?.addEventListener('click', () => grade(true));
-    deck.querySelector<HTMLButtonElement>('button')?.focus({ preventScroll: true });
+    deck.querySelectorAll<HTMLButtonElement>('[data-grade]').forEach((button) => button.addEventListener('click', () => grade(button.dataset.grade as Grade)));
+    (deck.querySelector<HTMLButtonElement>('#good') ?? deck.querySelector<HTMLButtonElement>('button'))?.focus({ preventScroll: true });
   };
   const reveal = () => { revealed = true; renderDeck(); };
-  const grade = (knew: boolean) => {
+  const grade = (rating: Grade) => {
     const card = queue[position];
-    reviewCard(summary.id, card.id, knew);
-    if (knew) sessionKnown++; else queue.push(card);
+    reviewCard(summary.id, card.id, rating);
+    if (rating === 'again') { queue.push(card); forgotten.add(card.id); }
     position++;
     revealed = false;
     renderDeck();
@@ -92,14 +96,16 @@ const cards: Page<{ name: 'cards'; area: string }> = async (main, route) => {
   };
   const startSession = (extra: boolean) => {
     const shuffle = <T,>(items: T[]) => items.map((item) => [Math.random(), item] as const).sort((a, b) => a[0] - b[0]).map(([, item]) => item);
-    queue = extra ? shuffle(pool()).slice(0, 15) : [...shuffle(due()), ...fresh().slice(0, NEW_PER_SESSION)];
-    position = 0; revealed = false; sessionKnown = 0;
+    // Shuffled first, so cards of equal weakness still come in a new order each round.
+    const weakest = (items: Card[]) => shuffle(items).sort((a, b) => byWeakness(progress.cards[a.id], progress.cards[b.id]));
+    queue = extra ? weakest(pool().filter((c) => progress.cards[c.id])).slice(0, 15) : [...weakest(due()), ...fresh().slice(0, NEW_PER_SESSION)];
+    position = 0; revealed = false; forgotten = new Set();
     renderDeck();
   };
   const renderList = () => {
     $('#all-cards', main).innerHTML = pool().map((card) => {
       const state = progress.cards[card.id];
-      return html`<details class="card-item"><summary><span class="card-q">${raw(card.question.replace(/<\/?p>/g, ''))}</span><span class="tag">${state ? `Box ${state.box}` : 'Neu'}</span></summary><div class="prose compact">${raw(card.answer)}</div></details>`.value;
+      return html`<details class="card-item"><summary><span class="card-q">${raw(card.question.replace(/<\/?p>/g, ''))}</span><span class="tag">${mastery(state)}</span></summary><div class="prose compact">${raw(card.answer)}</div></details>`.value;
     }).join('');
   };
   $<HTMLSelectElement>('#tag', main).addEventListener('change', (event) => {
@@ -110,13 +116,11 @@ const cards: Page<{ name: 'cards'; area: string }> = async (main, route) => {
   const keys = (event: KeyboardEvent) => {
     if (!queue.length || position >= queue.length || (event.target as Element).closest('input, textarea, select')) return;
     if (!revealed && (event.key === ' ' || event.key === 'Enter')) { event.preventDefault(); reveal(); }
-    else if (revealed && event.key === '1') grade(false);
-    else if (revealed && event.key === '2') grade(true);
+    else if (revealed && /^[1-4]$/.test(event.key)) grade(GRADES[Number(event.key) - 1]);
   };
   document.addEventListener('keydown', keys);
   renderDeck();
   renderList();
-  void INTERVALS; void $$;
   const unsubscribe = onProgressChange(() => { renderList(); if (!queue.length || position >= queue.length) renderDeck(); });
   return () => { document.removeEventListener('keydown', keys); unsubscribe(); };
 };

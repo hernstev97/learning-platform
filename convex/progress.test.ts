@@ -16,7 +16,7 @@ const imported = { areaId, generation: 0, importId: 'a'.repeat(64), mode: 'legac
 const create = () => convexTest(schema, modules);
 type Client = ReturnType<ReturnType<typeof create>['withIdentity']>;
 beforeEach(() => { vi.stubEnv('CLERK_JWT_ISSUER_DOMAIN', identity.issuer); vi.stubEnv('ALLOWED_CLERK_USER_ID', identity.subject); });
-afterEach(() => vi.unstubAllEnvs());
+afterEach(() => { vi.unstubAllEnvs(); vi.useRealTimers(); });
 
 const endpoints = [
   ['snapshot', (t: Client) => t.query(api.progress.snapshot, {})],
@@ -24,7 +24,7 @@ const endpoints = [
   ['exportDrafts', (t: Client) => t.query(api.progress.exportDrafts, { paginationOpts: { numItems: 10, cursor: null } })],
   ['set', (t: Client) => t.mutation(api.progress.set, { areaId, generation: 0, changes: [lesson] })],
   ['saveDraft', (t: Client) => t.mutation(api.progress.saveDraft, { areaId, generation: 0, draft })],
-  ['reviewCard', (t: Client) => t.mutation(api.progress.reviewCard, { areaId, generation: 0, cardId: 'first', knew: true, today: '2026-09-28' })],
+  ['reviewCard', (t: Client) => t.mutation(api.progress.reviewCard, { areaId, generation: 0, cardId: 'first', grade: 'good', today: '2026-09-28' })],
   ['importLegacy', (t: Client) => t.mutation(api.progress.importLegacy, imported)],
   ['resetArea', (t: Client) => t.mutation(api.progress.resetArea, { areaId, generation: 0 })],
   ['note', (t: Client) => t.query(api.progress.note, { areaId, moduleId: note.moduleId })],
@@ -86,10 +86,39 @@ describe('personal state', () => {
   });
   it('grades reviews from the latest stored state, rather than a stale client counter', async () => {
     const t = create();
-    const request = { areaId, generation: 0, cardId: 'ownership', knew: true, today: '2026-09-28' };
+    const request = { areaId, generation: 0, cardId: 'ownership', grade: 'good' as const, today: '2026-09-28' };
     await t.withIdentity(identity).mutation(api.progress.reviewCard, request);
     await t.withIdentity(identity).mutation(api.progress.reviewCard, request);
-    expect((await t.withIdentity(identity).query(api.progress.snapshot, {})).entries[0].value).toMatchObject({ kind: 'card', value: { box: 2, seen: 2, due: '2026-10-01' } });
+    expect((await t.withIdentity(identity).query(api.progress.snapshot, {})).entries[0].value).toMatchObject({ kind: 'card', value: { box: 2, seen: 2, due: '2026-10-01', grade: 'good' } });
+  });
+  it('records every rating in the review history and keeps mastery data on the card', async () => {
+    const t = create(); const owner = t.withIdentity(identity);
+    for (const grade of ['easy', 'again', 'hard'] as const) await owner.mutation(api.progress.reviewCard, { areaId, generation: 0, cardId: 'ownership', grade, today: '2026-09-28' });
+    expect((await owner.query(api.progress.snapshot, {})).entries[0].value).toMatchObject({ value: { box: 1, seen: 3, lapses: 1, grade: 'hard', due: '2026-09-29' } });
+    const history = await t.run((ctx) => ctx.db.query('cardReviews').collect());
+    expect(history.map(({ cardId, grade, day, box, due, generation }) => ({ cardId, grade, day, box, due, generation }))).toEqual([
+      { cardId: 'ownership', grade: 'easy', day: '2026-09-28', box: 2, due: '2026-10-01', generation: 0 },
+      { cardId: 'ownership', grade: 'again', day: '2026-09-28', box: 1, due: '2026-09-28', generation: 0 },
+      { cardId: 'ownership', grade: 'hard', day: '2026-09-28', box: 1, due: '2026-09-29', generation: 0 },
+    ]);
+  });
+  it('still accepts the former two-button rating from tabs opened before an update', async () => {
+    const t = create().withIdentity(identity);
+    await t.mutation(api.progress.reviewCard, { areaId, generation: 0, cardId: 'ownership', knew: true, today: '2026-09-28' });
+    await t.mutation(api.progress.reviewCard, { areaId, generation: 0, cardId: 'ownership', knew: false, today: '2026-09-28' });
+    expect((await t.query(api.progress.snapshot, {})).entries[0].value).toMatchObject({ value: { box: 1, seen: 2, lapses: 1, grade: 'again' } });
+    await expect(t.mutation(api.progress.reviewCard, { areaId, generation: 0, cardId: 'ownership', today: '2026-09-28' })).rejects.toThrow('INVALID_GRADE');
+  });
+  it('clears the review history of a reset area without touching the new generation', async () => {
+    vi.useFakeTimers();
+    const t = create(); const owner = t.withIdentity(identity);
+    await owner.mutation(api.progress.reviewCard, { areaId, generation: 0, cardId: 'ownership', grade: 'good', today: '2026-09-28' });
+    await owner.mutation(api.progress.reviewCard, { areaId: 'rust', generation: 0, cardId: 'ownership', grade: 'good', today: '2026-09-28' });
+    await owner.mutation(api.progress.resetArea, { areaId, generation: 0 });
+    await owner.mutation(api.progress.reviewCard, { areaId, generation: 1, cardId: 'ownership', grade: 'easy', today: '2026-09-29' });
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+    const history = await t.run((ctx) => ctx.db.query('cardReviews').collect());
+    expect(history.map(({ areaId, generation, grade }) => ({ areaId, generation, grade }))).toEqual([{ areaId: 'rust', generation: 0, grade: 'good' }, { areaId, generation: 1, grade: 'easy' }]);
   });
   it('imports only missing state, atomically records receipts and never resurrects unchecked progress', async () => {
     const t = create().withIdentity(identity);

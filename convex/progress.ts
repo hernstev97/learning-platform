@@ -3,8 +3,8 @@ import { ConvexError, v } from 'convex/values';
 import { internalMutation, mutation, query, type MutationCtx, type QueryCtx } from './_generated/server';
 import { internal } from './_generated/api';
 import { requireOwner } from './auth';
-import { assertId, assertPair, draftInput, entry, entryKey, noteInput, validateDraft, validateEntry, validateNote, type Entry } from './model';
-import { gradeCard } from '../src/engine/storage';
+import { assertId, assertPair, draftInput, entry, entryKey, grade, noteInput, validateDraft, validateEntry, validateNote, type Entry } from './model';
+import { schedule } from '../src/engine/review';
 
 async function checkGeneration(ctx: MutationCtx, areaId: string, generation: number) {
   assertId(areaId);
@@ -42,15 +42,20 @@ export const set = mutation({
 });
 
 export const reviewCard = mutation({
-  args: { areaId: v.string(), generation: v.number(), cardId: v.string(), knew: v.boolean(), today: v.string() },
-  handler: async (ctx, { areaId, generation, cardId, knew, today }) => {
+  // `knew` is the former two-button rating (true = good, false = again); tabs opened before the update still send it.
+  args: { areaId: v.string(), generation: v.number(), cardId: v.string(), grade: v.optional(grade), knew: v.optional(v.boolean()), today: v.string() },
+  handler: async (ctx, { areaId, generation, cardId, grade, knew, today }) => {
     await requireOwner(ctx);
     await checkGeneration(ctx, areaId, generation);
     assertId(cardId);
     if (!/^\d{4}-\d{2}-\d{2}$/.test(today) || !Number.isFinite(Date.parse(today))) throw new ConvexError('INVALID_DATE');
+    const rating = grade ?? (knew === undefined ? undefined : knew ? 'good' : 'again');
+    if (!rating) throw new ConvexError('INVALID_GRADE');
     const current = await ctx.db.query('progress').withIndex('by_area_key', (q) => q.eq('areaId', areaId).eq('key', `card:${cardId}`)).unique();
     const state = current?.value.kind === 'card' ? current.value.value : undefined;
-    await put(ctx, areaId, { kind: 'card', id: cardId, value: gradeCard(state, knew, today) });
+    const next = schedule(state, rating, today);
+    await put(ctx, areaId, { kind: 'card', id: cardId, value: next });
+    await ctx.db.insert('cardReviews', { areaId, generation, cardId, grade: rating, day: today, reviewedAt: Date.now(), box: next.box, due: next.due });
   },
 });
 
@@ -167,6 +172,7 @@ export const resetArea = mutation({
     if (reset) await ctx.db.patch(reset._id, { generation: generation + 1 });
     else await ctx.db.insert('areaResets', { areaId, generation: 1 });
     await ctx.scheduler.runAfter(0, internal.progress.purgeDrafts, { areaId, generation });
+    await ctx.scheduler.runAfter(0, internal.progress.purgeReviews, { areaId, generation });
     // Keep receipts: an old device must not silently restore a deliberately reset area.
   },
 });
@@ -180,5 +186,17 @@ export const purgeDrafts = internalMutation({
     const rows = await ctx.db.query('drafts').withIndex('by_area_generation_exercise', (q) => q.eq('areaId', areaId).eq('generation', generation)).take(16);
     for (const row of rows) await ctx.db.delete(row._id);
     if (rows.length === 16) await ctx.scheduler.runAfter(0, internal.progress.purgeDrafts, { areaId, generation });
+  },
+});
+
+/** Review history of a reset generation, deleted in bounded batches like drafts. */
+export const purgeReviews = internalMutation({
+  args: { areaId: v.string(), generation: v.number() },
+  handler: async (ctx, { areaId, generation }) => {
+    const reset = await ctx.db.query('areaResets').withIndex('by_area', (q) => q.eq('areaId', areaId)).unique();
+    if (!reset || reset.generation <= generation) return;
+    const rows = await ctx.db.query('cardReviews').withIndex('by_area_generation_card', (q) => q.eq('areaId', areaId).eq('generation', generation)).take(256);
+    for (const row of rows) await ctx.db.delete(row._id);
+    if (rows.length === 256) await ctx.scheduler.runAfter(0, internal.progress.purgeReviews, { areaId, generation });
   },
 });

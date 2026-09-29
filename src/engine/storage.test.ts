@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { addDays, convertLegacyBear, exportAll, freshProgress, gradeCard, keyFor, mergeProgress, parseBackup, readProgress, sanitize, writeProgress } from './storage.ts';
+import { addDays, convertLegacyBear, exportAll, freshProgress, keyFor, mergeProgress, parseBackup, readProgress, sanitize, writeProgress } from './storage.ts';
+import { schedule } from './review.ts';
 
 function memoryStorage(seed: Record<string, string> = {}) {
   const data = new Map(Object.entries(seed));
@@ -27,13 +28,12 @@ describe('progress storage', () => {
     expect(readProgress(blocked, 'rust').progress).toEqual(freshProgress());
     expect(writeProgress(blocked, 'rust', freshProgress())).toBe(false);
   });
-  it('schedules cards with Leitner intervals', () => {
-    const first = gradeCard(undefined, true, '2026-09-28');
-    expect(first).toMatchObject({ box: 1, due: '2026-09-29' });
-    const second = gradeCard(first, true, '2026-09-29');
-    expect(second).toMatchObject({ box: 2, due: '2026-10-02' });
-    expect(gradeCard(second, false, '2026-10-02')).toMatchObject({ box: 1, due: '2026-10-02' });
+  it('adds days across month and year boundaries', () => {
     expect(addDays('2026-12-31', 1)).toBe('2027-01-01');
+  });
+  it('keeps mastery data of cards in backups and drops malformed values', () => {
+    const cards = { a: { box: 2, due: '2026-10-01', seen: 4, lapses: 2, grade: 'hard' }, b: { box: 1, due: '2026-10-01', seen: 1, lapses: -1, grade: 'perfect' } };
+    expect(sanitize({ ...freshProgress(), cards }).cards).toEqual({ a: cards.a, b: { box: 1, due: '2026-10-01', seen: 1 } });
   });
   it('exports, imports and merges without losing progress', () => {
     const storage = memoryStorage();
@@ -67,9 +67,9 @@ describe('progress storage', () => {
   });
   it('imports the later review on the same day without reverting it on a second import', () => {
     const older = freshProgress();
-    older.cards.c = gradeCard(undefined, false, '2026-09-28');
+    older.cards.c = schedule(undefined, 'again', '2026-09-28');
     const newer = freshProgress();
-    newer.cards.c = gradeCard(older.cards.c, true, '2026-09-28');
+    newer.cards.c = schedule(older.cards.c, 'good', '2026-09-28');
     const merged = mergeProgress(older, newer);
     expect(merged.cards.c).toEqual(newer.cards.c);
     expect(mergeProgress(merged, older).cards.c).toEqual(newer.cards.c);

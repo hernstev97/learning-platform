@@ -30,13 +30,16 @@ Es gibt absichtlich **einen persönlichen Datenbestand**, keine Daten pro regist
 
 | Tabelle | Inhalt | Index |
 | --- | --- | --- |
-| `progress` | Kleine, typisierte Einträge: Lektion gelesen/ungelesen, Übungserfolg mit Fingerprint, Lösung angesehen, Kartenbox/Fälligkeit/Reviewzahl, einzelner Projektschritt, letzte Position je Bereich; jeweils `updatedAt` | `by_area_key` |
+| `progress` | Kleine, typisierte Einträge: Lektion gelesen/ungelesen, Übungserfolg mit Fingerprint, Lösung angesehen, Kartenbox/Fälligkeit/Reviewzahl/Zahl der „Vergessen“/letzte Bewertung, einzelner Projektschritt, letzte Position je Bereich; jeweils `updatedAt` | `by_area_key` |
+| `cardReviews` | Eine Zeile pro Kartenbewertung: Bereich, Reset-Generation, Karte, Bewertung, lokaler Tag, Serverzeit, Box und Fälligkeit danach. Nicht Teil von `snapshot` | `by_area_generation_card` |
 | `drafts` | Entwurf pro Bereich, Reset-Generation und Übungs-ID; JSON bis 60 KB, Inhaltsfingerprint und Änderungszeit | `by_area_generation_exercise` |
 | `areaResets` | Monotone Reset-Generation je Bereich, schützt vor verspäteten alten Schreibvorgängen | `by_area` |
 | `notes` | Persönliche Notiz pro Bereich und Lektion (Modul-ID), bis 20 000 Zeichen, mit Änderungszeit; bewusst ohne Reset-Generation | `by_area_module` |
 | `imports` | Atomare Importbelege pro Bereich und Chunk, ohne Kopie der importierten Inhalte | `by_area_import` |
 
 `convex/model.ts` definiert die Zustandsvarianten und Eingabegrenzen, `schema.ts` Tabellen/Indizes. Ein Modul hat bereits genau eine Lektion; seine stabile Modul-ID ist deshalb gleichzeitig die Lektions-ID. Ein Projektschritt verwendet `projekt-id/schritt-id`. Status und Prozente ergeben sich aus den aktuellen Schritten bzw. aktuellen Übungs-IDs/Fingerprints. Keine gespeicherten Summen, unnötigen Versuchszähler oder Kopien des Curriculums.
+
+**Kartenwiederholung.** Die Regeln stehen allein in `src/engine/review.ts` (`schedule`), das Client (optimistisch) und `reviewCard` (maßgeblich) gemeinsam nutzen: Box 1–5 mit 1, 3, 7, 16 und 35 Tagen; „Vergessen“ → Box 1 und heute fällig, „Schwer“ → gleiche Box, „Okay“ → eine Box höher, „Leicht“ → zwei. Fällige Karten werden schwächste zuerst abgefragt (niedrige Box, häufig vergessen, lange überfällig). `cardReviews` hält jede Bewertung mit Tag fest, sodass sich ein anderer Algorithmus später aus der Historie neu berechnen lässt. Die Historie ist nicht in der JSON-Sicherung enthalten; ein Import übernimmt nur den Kartenstand.
 
 `convex/auth.ts::requireOwner` prüft die von Convex validierte Identität auf **Issuer, Subject und deren tokenIdentifier**. Convex selbst prüft Signatur, Ablauf und Audience anhand von `auth.config.ts`. Alle zwölf öffentlichen Endpunkte beginnen mit diesem Guard; keiner nimmt eine Eigentümer-ID entgegen:
 
@@ -47,7 +50,7 @@ Es gibt absichtlich **einen persönlichen Datenbestand**, keine Daten pro regist
 | `exportDrafts` | Begrenzte Seiten für eine JSON-Sicherung |
 | `set` | Gezielt einzelne Fortschrittsfelder ändern; kein Überschreiben ganzer Bereiche |
 | `saveDraft` | Einen versionierten Entwurf ersetzen |
-| `reviewCard` | Reviewzahl und Leitner-Box atomar aus dem letzten Serverstand fortschreiben |
+| `reviewCard` | Eine Bewertung (`again`, `hard`, `good`, `easy`) atomar auf den letzten Serverstand anwenden und in `cardReviews` protokollieren. Das frühere `knew` wird für vor dem Update geöffnete Tabs noch angenommen |
 | `importLegacy` | Begrenzt große, wiederholbar sichere Import-Chunks |
 | `resetArea` | Einen Bereich absichtlich zurücksetzen |
 | `note` | Reaktive Notiz der geöffneten Lektion |
@@ -55,7 +58,7 @@ Es gibt absichtlich **einen persönlichen Datenbestand**, keine Daten pro regist
 | `saveNote` | Eine Notiz ersetzen; leerer Text löscht sie |
 | `exportNotes` | Begrenzte Seiten für eine JSON-Sicherung |
 
-`purgeDrafts` ist **nur intern** aufrufbar. Nach einem Reset sind alte Entwürfe sofort unsichtbar; diese Funktion löscht sie anschließend in begrenzten Batches. So funktioniert Zurücksetzen auch, wenn alle Entwürfe zusammen ein Convex-Transaktionslimit überschreiten. Importbelege und Reset-Grenzen bleiben erhalten.
+`purgeDrafts` und `purgeReviews` sind **nur intern** aufrufbar. Nach einem Reset sind alte Entwürfe sofort unsichtbar; `purgeDrafts` löscht sie anschließend in begrenzten Batches, `purgeReviews` ebenso die Review-Historie der alten Generation. So funktioniert Zurücksetzen auch, wenn alle Entwürfe zusammen ein Convex-Transaktionslimit überschreiten. Importbelege und Reset-Grenzen bleiben erhalten.
 
 Die Backend-Validierung prüft Typen, IDs, Datumswerte, JSON-Struktur, Größen und Positionskonsistenz. Sie importiert kein Curriculum: entfernte IDs dürfen archiviert bleiben und werden von aktuellen Fortschrittsberechnungen ignoriert. Client und Backend können deshalb unabhängig aktualisiert werden. Wer das erlaubte Konto besitzt, darf seinen Lernstand selbst bewerten; der Server führt keine Aufgabenlösungen aus.
 
@@ -92,7 +95,7 @@ Die Kopie ist keine Autorisierung und keine Datenquelle für Convex. Sie wird ge
 - Projekt-Abnahmen haben jetzt explizite `{ id, text }`-Einträge. Die bereits veröffentlichten Schlüssel `abnahme-1`, `abnahme-2` usw. wurden unverändert übernommen. **Nicht neu nummerieren**, wenn du Kriterien verschiebst oder einfügst. Neue Kriterien erhalten eine neue freie, vorzugsweise beschreibende ID.
 - Übungserfolge zählen wie bisher nur bei passendem Fingerprint. Neue Entwürfe erhalten ebenfalls einen Fingerprint; nach einer inhaltlich relevanten Änderung wird ein alter Entwurf nicht ungeprüft in den neuen Renderer geladen. Er bleibt in der Sicherung erhalten. Die vorhandene Fingerprint-Regel für `practice` enthält auch den Aufgabentitel; dessen Änderung macht einen alten Erfolg weiterhin ungültig. Diese bestehende Regel wurde zur Kompatibilität mit lokalen Erfolgen beibehalten.
 - „Weiterlernen“ speichert Modul-/Übungs-/Projekt-IDs mit Serverzeit; die Startseite nimmt den Bereich mit der jüngsten Position. Besuche der Interview-Karten setzen keine Position. Die numerische Übungs-URL wird erst beim Öffnen aus dem aktuellen Curriculum abgeleitet (`resolveResume` in `src/engine/persistence.ts`). Ist die gespeicherte Übung schon gelöst oder entfernt, führt der Link zur nächsten offenen Übung im Modul, danach zum nächsten Modul mit offenen Übungen; ist alles gelöst, zum Interview-Training. Ein entferntes Modul oder Projekt fällt auf das erste offene Modul des Bereichs zurück.
-- Die Prozentanzeige folgt weiterhin den Übungen; „Lektion gelesen“ ist ein separates Häkchen. Projektstatus ergibt sich aus aktuellen Checklistenpunkten, Kartenbeherrschung aus der vorhandenen Leitner-Box.
+- Die Prozentanzeige folgt weiterhin den Übungen; „Lektion gelesen“ ist ein separates Häkchen. Projektstatus ergibt sich aus aktuellen Checklistenpunkten, Kartenbeherrschung aus der Leitner-Box.
 
 ## Lokale Migration und Sicherungen
 

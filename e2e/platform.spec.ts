@@ -152,8 +152,16 @@ test('cards, projects, reference pages and data export', async ({ page }) => {
   await page.locator('#start').click();
   await page.keyboard.press(' ');
   await expect(page.locator('.flashcard-answer')).toBeVisible();
-  await page.keyboard.press('2');
-  await expect(page.locator('.deck-done')).toContainText('1 von 1');
+  await expect(page.locator('#good .grade-next')).toHaveText('1 Tag');
+  await page.keyboard.press('1');
+  await expect(page.locator('.flashcard-meta')).toContainText('Karte 2 / 2');
+  await expect(page.locator('.flashcard-meta')).toContainText('Box 1 · 1× vergessen');
+  await page.keyboard.press(' ');
+  await expect(page.locator('#again .grade-next')).toHaveText('heute');
+  await expect(page.locator('#hard .grade-next')).toHaveText('1 Tag');
+  await page.keyboard.press('3');
+  await expect(page.locator('.deck-done')).toContainText('0 von 1 auf Anhieb gewusst');
+  await expect(page.locator('.card-item .tag')).toHaveText('Box 2 · 1× vergessen');
   await page.goto('/beispiel/projekte/abschluss');
   await page.locator('[data-key]').first().check();
   await page.reload();

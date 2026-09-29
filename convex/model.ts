@@ -1,7 +1,12 @@
 import { ConvexError, v, type Infer } from 'convex/values';
 
 export const completion = v.object({ at: v.string(), fp: v.string(), help: v.optional(v.boolean()) });
-export const cardState = v.object({ box: v.number(), due: v.string(), seen: v.number(), last: v.optional(v.string()) });
+export const grade = v.union(v.literal('again'), v.literal('hard'), v.literal('good'), v.literal('easy'));
+export type Grade = Infer<typeof grade>;
+/** Self-ratings after a card review, from weakest to strongest. */
+export const GRADES: readonly Grade[] = ['again', 'hard', 'good', 'easy'];
+/** lapses counts "again" ratings; grade is the latest rating. Both are absent on cards reviewed before four ratings existed. */
+export const cardState = v.object({ box: v.number(), due: v.string(), seen: v.number(), last: v.optional(v.string()), lapses: v.optional(v.number()), grade: v.optional(grade) });
 export const position = v.union(
   v.object({ page: v.literal('lesson'), moduleId: v.string() }),
   v.object({ page: v.literal('exercise'), moduleId: v.string(), exerciseId: v.string() }),
@@ -58,6 +63,7 @@ export function validateEntry(value: Entry): void {
     case 'card': {
       const c = value.value;
       if (!Number.isInteger(c.box) || c.box < 1 || c.box > 5 || !Number.isSafeInteger(c.seen) || c.seen < 0) throw new ConvexError('INVALID_CARD');
+      if (c.lapses !== undefined && (!Number.isSafeInteger(c.lapses) || c.lapses < 0)) throw new ConvexError('INVALID_CARD');
       assertDate(c.due);
       if (c.last) assertDate(c.last);
       break;
