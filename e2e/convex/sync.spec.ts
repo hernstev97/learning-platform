@@ -36,6 +36,19 @@ test('separate devices share lessons, drafts, exercise success and the latest st
   await phone.close();
 });
 
+test('continue learning on another device skips solved work and ignores card reviews', async ({ page, browser }) => {
+  const phone = await browser.newContext({ viewport: { width: 390, height: 844 } }); await fixture(phone);
+  const other = await phone.newPage();
+  await page.goto(`${base}/1`); await page.locator('#answer-g1').fill('val'); await synced(page);
+  await page.goto('/kotlin/karten'); await synced(page);
+  await other.goto('/');
+  const resume = other.locator('.resume');
+  await expect(resume).toContainText('Übung 2 von'); await expect(resume).toContainText('1 / ');
+  await expect(resume).toContainText('schon erledigt');
+  await expect(resume.getByRole('link', { name: 'Weiterlernen' })).toHaveAttribute('href', `${base}/2`);
+  await phone.close();
+});
+
 test('project steps and cards react across devices without restarting active training', async ({ page, browser }) => {
   const phone = await browser.newContext(); await fixture(phone); const other = await phone.newPage();
   const project = loadContent(['kotlin']).catalog.areas[0].projects[0].id;

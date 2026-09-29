@@ -19,6 +19,25 @@ test('home and area pages render and link together', async ({ page }) => {
   expect(errors).toEqual([]);
 });
 
+test('home continues after a solved exercise and ignores card reviews', async ({ page }) => {
+  const errors = errorsOf(page);
+  await page.goto('/');
+  await expect(page.locator('.resume')).toHaveCount(0);
+  await page.goto(`${base}/1`);
+  await page.locator('#answer-g1').fill('def');
+  await page.locator('#answer-g2').fill('2 * x');
+  await expect(page.locator('#feedback')).toContainText('Richtig.');
+  await page.goto('/beispiel/karten');
+  await page.goto('/');
+  const resume = page.locator('.resume');
+  await expect(resume).toContainText('Beispielbereich');
+  await expect(resume).toContainText('Übung 2 von');
+  await expect(resume).toContainText('schon erledigt');
+  await expect(resume.getByRole('link', { name: 'Weiterlernen' })).toHaveAttribute('href', `${base}/2`);
+  await expect(page.locator('.area-block', { hasText: 'Beispielbereich' })).toHaveAttribute('href', `${base}/2`);
+  expect(errors).toEqual([]);
+});
+
 test('gap, choice, order, output and command exercises', async ({ page }) => {
   const errors = errorsOf(page);
   await page.goto(`${base}/1`);

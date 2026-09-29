@@ -7,7 +7,7 @@ import { api } from '../convex/_generated/api.js';
 import { applyEntries, generationOf, validateDraft, validateEntry, type DraftInput, type Entry, type Position, type Snapshot } from '../convex/model.ts';
 import type { Area, AreaSummary, Exercise } from './content/types.ts';
 import { freshProgress, gradeCard, localDay, type AreaProgress, type Backup } from './engine/storage.ts';
-import { latestPosition, projectSnapshot, safeDraft, sameEntry, toEntries } from './engine/persistence.ts';
+import { latestArea, projectSnapshot, safeDraft, sameEntry, toEntries } from './engine/persistence.ts';
 
 export { catalog };
 const areas = new Map<string, Area>();
@@ -42,7 +42,7 @@ const statusChanged = () => statusListeners.forEach((fn) => fn());
 export const getStorageWarning = () => warning;
 export const getSyncStatus = () => warning ? 'Synchronisierung fehlgeschlagen' : pending ? `${pending} Änderung${pending === 1 ? '' : 'en'} wird gespeichert …` : !connected ? 'Verbindung wird wiederhergestellt …' : 'Lernstand synchronisiert';
 export const hasPendingWrites = () => active && pending > 0;
-export const getContinueHref = () => latestPosition(snapshot, catalog);
+export const getContinueArea = () => latestArea(snapshot, catalog);
 export const isCloud = true;
 export function onStorageChange(fn: () => void): () => void { statusListeners.add(fn); return () => { statusListeners.delete(fn); }; }
 export function onProgressChange(fn: (draft: boolean) => void): () => void { progressListeners.add(fn); return () => { progressListeners.delete(fn); }; }

@@ -82,13 +82,13 @@ export function mount(signOut: () => Promise<void> = async () => {}): void {
         if (token !== renderToken) return;
       }
       cleanup = await page(main, route as never);
+      // Card reviews are a side trip and never replace the learning-path position.
       if (recordVisit && area) {
         if (route.name === 'lesson' && area.modules.some((m) => m.id === route.module)) visit(area.id, { page: 'lesson', moduleId: route.module });
         if (route.name === 'exercise') {
           const exercise = area.modules.find((m) => m.id === route.module)?.exercises[route.index - 1];
           if (exercise) visit(area.id, { page: 'exercise', moduleId: route.module, exerciseId: exercise.id });
         }
-        if (route.name === 'cards') visit(area.id, { page: 'cards' });
         if (route.name === 'project' && area.projects.some((p) => p.id === route.project)) visit(area.id, { page: 'project', projectId: route.project });
       }
     } catch (error) {
