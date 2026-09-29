@@ -38,6 +38,24 @@ test('home continues after a solved exercise and ignores card reviews', async ({
   expect(errors).toEqual([]);
 });
 
+test('lesson notes save while typing, survive a reload and mark the lesson', async ({ page }) => {
+  const errors = errorsOf(page);
+  await page.goto(base);
+  await page.locator('.toc a', { hasText: 'Meine Notizen' }).click();
+  const note = page.locator('#note');
+  await expect(note).toBeEditable();
+  await note.fill('Erkenntnis: def definiert eine Funktion.');
+  await page.reload();
+  await expect(note).toHaveValue('Erkenntnis: def definiert eine Funktion.');
+  await page.goto('/beispiel');
+  await expect(page.locator('.module-row', { hasText: 'Alle Übungsarten' }).locator('.note-mark')).toHaveText('Notiz');
+  await page.goto(base);
+  await note.fill('');
+  await page.goto('/beispiel');
+  await expect(page.locator('.note-mark')).toHaveCount(0);
+  expect(errors).toEqual([]);
+});
+
 test('gap, choice, order, output and command exercises', async ({ page }) => {
   const errors = errorsOf(page);
   await page.goto(`${base}/1`);

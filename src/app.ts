@@ -4,7 +4,7 @@ import loaders from 'virtual:area-loaders';
 import type { ConvexClient } from 'convex/browser';
 import type { FunctionReturnType } from 'convex/server';
 import { api } from '../convex/_generated/api.js';
-import { applyEntries, generationOf, validateDraft, validateEntry, type DraftInput, type Entry, type Position, type Snapshot } from '../convex/model.ts';
+import { applyEntries, generationOf, validateDraft, validateEntry, validateNote, type DraftInput, type Entry, type NoteInput, type Position, type Snapshot } from '../convex/model.ts';
 import type { Area, AreaSummary, Exercise } from './content/types.ts';
 import { freshProgress, gradeCard, localDay, type AreaProgress, type Backup } from './engine/storage.ts';
 import { latestArea, projectSnapshot, safeDraft, sameEntry, toEntries } from './engine/persistence.ts';
@@ -34,6 +34,13 @@ let cancelDraftLoad: (() => void) | undefined;
 // Until the open exercise's saved draft has arrived, a typed draft is held instead of blindly replacing it.
 let draftKnown = true;
 let heldDraft: { json: string; send: () => void } | undefined;
+// Lessons with notes by area. Typed note text is sent after a short pause; confirmed text reaches the open lesson
+// only once none of its own writes is outstanding, so server echoes never replace newer typing.
+let noted = new Map<string, Set<string>>();
+let queuedNote: { areaId: string; moduleId: string; text: string; timer: ReturnType<typeof setTimeout> } | undefined;
+const notesInFlight = new Map<string, number>();
+let openNote: { key: string; show: (text: string) => void; latest?: string } | undefined;
+const noteKey = (areaId: string, moduleId: string) => `${areaId}/${moduleId}`;
 export const summaryOf = (id: string): AreaSummary | undefined => catalog.areas.find((a) => a.id === id);
 export async function loadArea(id: string): Promise<Area> {
   const cached = areas.get(id);
@@ -49,7 +56,7 @@ export function progressOf(id: string): AreaProgress {
 }
 const statusChanged = () => statusListeners.forEach((fn) => fn());
 export const getStorageWarning = () => warning;
-const waiting = () => pending + (heldDraft ? 1 : 0);
+const waiting = () => pending + (heldDraft ? 1 : 0) + (queuedNote ? 1 : 0);
 const changes = (n: number) => `${n} Änderung${n === 1 ? '' : 'en'}`;
 const stamp = (time: number) => new Date(time).toLocaleString('de-DE', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
 export const getSyncStatus = () => offlineSince !== null ? `Offline · Lernstand vom ${stamp(offlineSince)}`
@@ -67,6 +74,7 @@ export function getSyncNotice(): string | null {
 export const isOffline = () => offlineSince !== null;
 export const hasPendingWrites = () => active && waiting() > 0;
 export const getContinueArea = () => latestArea(snapshot, catalog);
+export const hasNote = (areaId: string, moduleId: string) => !!noted.get(areaId)?.has(moduleId);
 export const isCloud = true;
 export function onStorageChange(fn: () => void): () => void { statusListeners.add(fn); return () => { statusListeners.delete(fn); }; }
 export function onProgressChange(fn: (draft: boolean) => void): () => void { progressListeners.add(fn); return () => { progressListeners.delete(fn); }; }
@@ -133,10 +141,19 @@ export async function connectProgress(convex: ConvexClient, denied: () => void):
       else denied();
     });
   }).catch((error: unknown) => { stopConnection(); stopSnapshot(); active = false; throw error; });
+  // Markers only; a lost authorization is already handled by the snapshot subscription.
+  const stopNotes = client.onUpdate(api.progress.noteIndex, {}, (value) => {
+    if (!active) return;
+    const next = new Map<string, Set<string>>();
+    for (const { areaId, moduleId } of value) (next.get(areaId) ?? next.set(areaId, new Set()).get(areaId)!).add(moduleId);
+    const same = next.size === noted.size && [...next].every(([area, ids]) => ids.size === noted.get(area)?.size && [...ids].every((id) => noted.get(area)!.has(id)));
+    noted = next;
+    if (!same) progressListeners.forEach((fn) => fn(false));
+  }, () => {});
   return () => {
-    active = false; ++draftToken; stopSnapshot(); stopConnection(); stopDraft?.();
-    clearTimeout(copyTimer);
-    progress.clear(); snapshot = { entries: [], resets: [] };
+    active = false; ++draftToken; stopSnapshot(); stopNotes(); stopConnection(); stopDraft?.();
+    clearTimeout(copyTimer); clearTimeout(queuedNote?.timer); queuedNote = undefined; openNote = undefined;
+    progress.clear(); snapshot = { entries: [], resets: [] }; noted = new Map();
   };
 }
 
@@ -229,6 +246,53 @@ export function saveAnswer(areaId: string, exercise: Exercise, value: unknown): 
   else { heldDraft = { json: draft.json, send }; statusChanged(); }
 }
 
+/** Shows the saved note of one lesson, first on arrival and later for changes made elsewhere. */
+export function watchNote(areaId: string, moduleId: string, show: (text: string) => void): () => void {
+  if (!active) return () => {};
+  const watch: NonNullable<typeof openNote> = { key: noteKey(areaId, moduleId), show };
+  openNote = watch;
+  const stop = client.onUpdate(api.progress.note, { areaId, moduleId }, (value) => {
+    if (openNote !== watch || !active) return;
+    watch.latest = value ?? '';
+    if (!noteBusy(watch.key)) show(watch.latest);
+  }, () => { warning = 'Die Notiz konnte nicht geladen werden. Bitte neu anmelden oder erneut laden.'; statusChanged(); });
+  return () => { stop(); if (openNote === watch) openNote = undefined; };
+}
+const noteBusy = (key: string) => (notesInFlight.get(key) ?? 0) > 0 || (!!queuedNote && noteKey(queuedNote.areaId, queuedNote.moduleId) === key);
+/** Saves after a pause in typing; flushNote() sends right away. */
+export function saveNote(areaId: string, moduleId: string, text: string): void {
+  try { validateNote({ moduleId, text }); }
+  catch { warning = 'Diese Notiz ist zu lang (maximal 20 000 Zeichen). Bitte kürze sie, bevor du die Seite verlässt.'; statusChanged(); return; }
+  if (!active) return;
+  if (queuedNote && noteKey(queuedNote.areaId, queuedNote.moduleId) !== noteKey(areaId, moduleId)) flushNote();
+  clearTimeout(queuedNote?.timer);
+  queuedNote = { areaId, moduleId, text, timer: setTimeout(flushNote, 800) };
+  statusChanged();
+}
+export function flushNote(): void {
+  const queued = queuedNote;
+  if (!queued) return;
+  clearTimeout(queued.timer);
+  queuedNote = undefined;
+  if (!active) return;
+  const { areaId, moduleId, text } = queued;
+  const key = noteKey(areaId, moduleId);
+  const note: NoteInput = { moduleId, text };
+  notesInFlight.set(key, (notesInFlight.get(key) ?? 0) + 1);
+  void track(client.mutation(api.progress.saveNote, { areaId, note }, {
+    optimisticUpdate(store) {
+      const kept = !!text.trim();
+      store.setQuery(api.progress.note, { areaId, moduleId }, kept ? text : null);
+      const index = store.getQuery(api.progress.noteIndex, {});
+      if (index) store.setQuery(api.progress.noteIndex, {}, [...index.filter((n) => n.areaId !== areaId || n.moduleId !== moduleId), ...kept ? [{ areaId, moduleId }] : []]);
+    },
+  })).catch(() => {}).finally(() => {
+    notesInFlight.set(key, notesInFlight.get(key)! - 1);
+    if (!notesInFlight.get(key)) notesInFlight.delete(key);
+    if (openNote?.key === key && openNote.latest !== undefined && !noteBusy(key)) openNote.show(openNote.latest);
+  });
+}
+
 const OFFLINE_ONLY = 'Im Offline-Modus nicht verfügbar. Lade die Seite mit Verbindung neu.';
 
 export async function backupProgress(): Promise<Backup> {
@@ -243,6 +307,11 @@ export async function backupProgress(): Promise<Backup> {
       p.drafts[draft.exerciseId] = JSON.parse(draft.json);
       (p.draftFingerprints ??= {})[draft.exerciseId] = draft.fingerprint;
     }
+    cursor = page.isDone ? null : page.continueCursor;
+  } while (cursor);
+  do {
+    const page: FunctionReturnType<typeof api.progress.exportNotes> = await client.query(api.progress.exportNotes, { paginationOpts: { numItems: 16, cursor } });
+    for (const note of page.page) ((backup.areas[note.areaId] ??= freshProgress()).notes ??= {})[note.moduleId] = note.text;
     cursor = page.isDone ? null : page.continueCursor;
   } while (cursor);
   return backup;
@@ -265,8 +334,10 @@ export async function importProgress(values: Record<string, AreaProgress>, mode:
       json: JSON.stringify(value),
     }));
     drafts.forEach(validateDraft);
-    for (let offset = 0; offset < Math.max(entries.length / 32, drafts.length / 4); offset++) {
-      const chunk = { entries: entries.slice(offset * 32, (offset + 1) * 32), drafts: drafts.slice(offset * 4, (offset + 1) * 4) };
+    const notes: NoteInput[] = Object.entries(p.notes ?? {}).map(([moduleId, text]) => ({ moduleId, text }));
+    notes.forEach(validateNote);
+    for (let offset = 0; offset < Math.max(entries.length / 32, drafts.length / 4, notes.length / 4); offset++) {
+      const chunk = { entries: entries.slice(offset * 32, (offset + 1) * 32), drafts: drafts.slice(offset * 4, (offset + 1) * 4), ...notes.length ? { notes: notes.slice(offset * 4, (offset + 1) * 4) } : {} };
       const importId = await hash([mode, areaId, generation, chunk]);
       await track(client.mutation(api.progress.importLegacy, { areaId, generation, importId, mode, ...chunk }));
     }
