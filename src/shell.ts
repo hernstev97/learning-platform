@@ -3,7 +3,7 @@ import './styles/layout.css';
 import './styles/content.css';
 import './styles/exercise.css';
 import './styles/pages.css';
-import { catalog, closeDraft, getStorageWarning, getSyncStatus, hasPendingWrites, isCloud, loadArea, onProgressChange, onStorageChange, prepareDraft, summaryOf, visit } from './app.ts';
+import { catalog, closeDraft, getStorageWarning, getSyncNotice, getSyncStatus, hasPendingWrites, isCloud, isOffline, loadArea, onProgressChange, onStorageChange, prepareDraft, summaryOf, visit } from './app.ts';
 import { scanLegacy } from './engine/legacy.ts';
 import { $, html, icons } from './ui/dom.ts';
 import { currentTheme, initTheme, onThemeChange, setTheme } from './ui/theme.ts';
@@ -15,14 +15,15 @@ export function mount(signOut: () => Promise<void> = async () => {}): void {
   app.innerHTML = html`
     <a class="skip-link" href="#main">Zum Inhalt springen</a>
     <header class="topbar">
-      <a class="logo" href="/" aria-label="learn.kiumu.app – Startseite"><span class="logo-mark" aria-hidden="true">L</span><span class="logo-text">learn<span>.kiumu</span></span></a>
+      <a class="logo" href="/" aria-label="learn.kiumu.app – Startseite"><img class="logo-mark" src="/icons/learnkiumu-logo.svg" alt="" width="34" height="34"><span class="logo-text">learn<span>.kiumu</span></span></a>
       <nav class="topnav" aria-label="Lernbereiche">
         ${catalog.areas.map((area) => html`<a href="/${area.id}" data-area="${area.id}" style="--area:${area.color}">${area.short}</a>`)}
       </nav>
       <a class="topbar-data" href="/daten">Daten</a>
       <button class="theme-toggle" id="theme-toggle" type="button"></button>
-      <button class="btn small" id="sign-out" type="button">Abmelden</button>
+      <button class="btn small" id="sign-out" type="button" ${isOffline() ? 'hidden' : ''}>Abmelden</button>
     </header>
+    <p id="sync-notice" class="storage-warning sync-notice" hidden><span role="status"></span>${isOffline() ? html` <button class="btn small" id="reconnect" type="button">Erneut verbinden</button>` : ''}</p>
     <p id="storage-warning" class="storage-warning" role="status" hidden></p>
     <p id="legacy-notice" class="storage-warning" hidden>Lokaler Lernstand gefunden. <a href="/daten">Unter Daten prüfen und importieren</a>.</p>
     <main id="main" tabindex="-1" aria-busy="true"></main>
@@ -34,10 +35,20 @@ export function mount(signOut: () => Promise<void> = async () => {}): void {
 
   const main = $('#main');
   // Sticky rows below the top bar need its real height, which changes when the bar wraps on small screens.
+  // The connection notice sticks directly below the bar and counts towards that height while it is shown.
   const topbar = $('.topbar');
-  new ResizeObserver(() => document.documentElement.style.setProperty('--topbar-h', `${topbar.getBoundingClientRect().height}px`)).observe(topbar);
-  if (isCloud) void scanLegacy(catalog).then((scan) => { $('#legacy-notice').hidden = scan.imported || !Object.keys(scan.areas).length; }).catch(() => {});
+  const syncNotice = $('#sync-notice');
+  const headerSize = new ResizeObserver(() => {
+    const height = topbar.getBoundingClientRect().height;
+    syncNotice.style.top = `${height}px`;
+    document.documentElement.style.setProperty('--topbar-h', `${height + syncNotice.getBoundingClientRect().height}px`);
+  });
+  headerSize.observe(topbar);
+  headerSize.observe(syncNotice);
+  if (isCloud && !isOffline()) void scanLegacy(catalog).then((scan) => { $('#legacy-notice').hidden = scan.imported || !Object.keys(scan.areas).length; }).catch(() => {});
   $('#sign-out').addEventListener('click', () => { void signOut(); });
+  // A reload signs in and loads the current state; reading mode holds no unsaved changes.
+  document.querySelector('#reconnect')?.addEventListener('click', () => location.reload());
   initTheme();
   const toggle = $<HTMLButtonElement>('#theme-toggle');
   const showTheme = () => {
@@ -59,6 +70,9 @@ export function mount(signOut: () => Promise<void> = async () => {}): void {
     const element = $('#storage-warning');
     element.hidden = !warning;
     element.textContent = warning ?? '';
+    const notice = getSyncNotice();
+    syncNotice.hidden = !notice;
+    $('span', syncNotice).textContent = notice ?? '';
     $('#storage-status').textContent = getSyncStatus();
   }
   onStorageChange(updateStorage);

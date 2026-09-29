@@ -56,13 +56,27 @@ Die Backend-Validierung prüft Typen, IDs, Datumswerte, JSON-Struktur, Größen 
 
 ## Frontend, Reaktivität und Konflikte
 
-`src/main.ts` stellt die Clerk-Sitzung her und wartet auf eine erfolgreiche autorisierte Convex-Abfrage, bevor `shell.ts` die Lernoberfläche startet. Abmeldung/Sitzungswechsel schließen den Client und entfernen die Ansicht samt privatem Arbeitsspeicher durch Neuladen. Private Fortschritte werden nicht in LocalStorage gespiegelt.
+`src/main.ts` stellt die Clerk-Sitzung her und wartet auf eine erfolgreiche autorisierte Convex-Abfrage, bevor `shell.ts` die Lernoberfläche startet. Abmeldung/Sitzungswechsel schließen den Client und entfernen die Ansicht samt privatem Arbeitsspeicher durch Neuladen. Einzige lokale Kopie privater Daten ist die schreibgeschützte Offline-Kopie des Lernstands (siehe [Offline](#offline-und-installierbare-app)); Entwürfe werden nie lokal gespeichert.
 
 `src/app.ts` übersetzt Convex-Abonnements in das bestehende `AreaProgress`-Modell. Mutationen nutzen die optimistischen Updates des Convex-JavaScript-Clients; kein eigener Offline-Sync-Dienst. Die geöffneten Editoren und Kartenrunden werden bei Serverupdates nicht neu aufgebaut. Ein fremd geänderter Entwurf wird mit einem kleinen „Laden“-Button angeboten; während des Tippens bleibt der aktuelle Text stehen.
 
 Verschiedene Einträge werden unabhängig geschrieben. Beim selben Häkchen/Entwurf gewinnt die zuletzt vom Server verarbeitete explizite Änderung; es gibt keine gemeinsame Dokumentbearbeitung. Kartenbewertungen werden serverseitig nacheinander verrechnet. Convex wiederholt ausstehende Mutationen nach einem Verbindungsabbruch mit seiner normalen Exactly-once-Semantik. Ein wiederholtes bewusstes Kartenreview zählt als neues Review; identische Zustandsschreibvorgänge erstellen keine Duplikate.
 
-Der Footer unterscheidet synchronisiert, wartende Änderungen, Verbindungsaufbau und Fehler. Offene Mutationen lösen eine Warnung vor dem Schließen aus. Während einer kurzen Unterbrechung bleibt die geladene Seite benutzbar. **Ein offline neu gestarteter Browser oder das Schließen vor bestätigter Synchronisierung wird nicht unterstützt.** Fehlgeschlagene Änderungen werden zurückgerollt; Eingabetext im offenen Editor bleibt kopierbar. Bei einer dauerhaften Fehlermeldung Ursache beheben, Änderung wiederholen und anschließend neu laden.
+Der Footer unterscheidet synchronisiert, wartende Änderungen, Verbindungsaufbau, Offline und Fehler. Offene Mutationen lösen eine Warnung vor dem Schließen aus. Während einer Unterbrechung bleibt die geladene Seite benutzbar; Änderungen warten im Convex-Client. **Das Schließen vor bestätigter Synchronisierung verliert diese Änderungen**, deshalb nennt ein Hinweis unter der Kopfzeile ihre Zahl, solange die Verbindung fehlt. Fehlgeschlagene Änderungen werden zurückgerollt; Eingabetext im offenen Editor bleibt kopierbar. Bei einer dauerhaften Fehlermeldung Ursache beheben, Änderung wiederholen und anschließend neu laden.
+
+## Offline und installierbare App
+
+Die Plattform ist eine installierbare PWA (`public/manifest.webmanifest`, Logo `public/icons/learnkiumu-logo.svg` als Favicon und im Header, PNG-Symbole daraus mit `node tooling/icons.mjs`). Es gibt keine eigene Sync-Engine: Schreibvorgänge laufen weiterhin ausschließlich über die Warteschlange und optimistischen Updates des Convex-Clients.
+
+**Service Worker.** `pnpm build` erzeugt `/sw.js` aus `src/service-worker.ts` (Plugin `serviceWorker` in `tooling/vite-plugins.ts`). Er speichert beim ersten Besuch App-Shell, alle Inhaltschunks, Schriften und Symbole (gzip etwa 1,5 MB) in einem versionierten Cache. Seitenaufrufe gehen zuerst ins Netz, sodass online immer das aktuelle Deployment läuft; ohne Antwort nach 4 Sekunden oder offline rendert die zwischengespeicherte Shell jede Route. Pyodide (etwa 12 MB) wird erst bei der ersten Python-Übung gespeichert. Python läuft offline also nur, wenn es auf diesem Gerät schon einmal geladen wurde. Ein neues Deployment installiert sich im Hintergrund; der vorherige Cache bleibt für bereits geöffnete Seiten erhalten. Clerk, Convex und der persönliche Lernstand laufen nicht über den Service Worker. Der Worker ist nur im Produktionsbuild aktiv, nicht im Dev-Server.
+
+**Verbindung bricht während der Sitzung ab.** Nach drei Sekunden ohne Verbindung (Browser offline, WebSocket getrennt oder Anfragen länger als fünf Sekunden unbeantwortet) erscheint unter der Kopfzeile ein Hinweis mit der Zahl nicht synchronisierter Änderungen. Übungen öffnen sich auch ohne Verbindung (auf einer langsamen nach vier Sekunden). Clerk liefert offline keinen Token; `waitForToken` wartet dann auf die Verbindung, statt Convex eine fehlende Anmeldung zu melden. Sonst würden nach dem Wiederverbinden alle wartenden Änderungen abgewiesen und die Seite neu geladen.
+
+**Konflikte nach dem Wiederverbinden.** Es gelten die Regeln oben: Einträge werden einzeln geschrieben, beim selben Eintrag gewinnt die zuletzt verarbeitete explizite Änderung. Kartenreviews rechnet der Server aus dem aktuellen Stand. Schreibvorgänge in einen inzwischen zurückgesetzten Bereich lehnt die Reset-Generation ab. Zusätzlich gilt für Entwürfe: Wurde eine Übung geöffnet, bevor ihr gespeicherter Entwurf geladen war, hält die App den getippten Text zurück. Fehlt auf dem Server ein Entwurf oder ist er gleich, wird der Text gespeichert. Liegt ein anderer Entwurf vor, bleibt er erhalten und wird mit „Geänderter Entwurf verfügbar · Laden“ angeboten; erst Weitertippen überschreibt ihn bewusst. Wer die Übung vorher verlässt, speichert den Text wie bisher (letzte Änderung gewinnt).
+
+**Offline starten.** Nach jeder bestätigten Synchronisierung legt die App eine Kopie des Serverstands ohne Entwürfe und ohne optimistische Änderungen in LocalStorage ab (`learn-offline:snapshot:v1`). Startet der Browser ohne Netz, zeigt er damit Lerninhalte und den Lernstand zu diesem Zeitpunkt. Clerk und Convex werden dabei nicht kontaktiert. Ist das Netz nur schlecht oder Clerk nicht erreichbar, bietet das Anmeldetor „Offline weiterlesen“ an. Dieser Lesemodus schreibt nichts: Häkchen, Antworten und Karten gelten nur bis zum Neuladen, Daten-Export, Import und Reset sind gesperrt. Ein Hinweis sagt das; „Erneut verbinden“ lädt die Seite mit Anmeldung neu. Ohne Kopie zeigt ein offline gestarteter Browser nur „Keine Verbindung“ und lädt neu, sobald das Netz zurück ist.
+
+Die Kopie ist keine Autorisierung und keine Datenquelle für Convex. Sie wird gelöscht bei Abmeldung, bei „Kein Zugriff“ und wenn Clerk online bestätigt, dass keine Sitzung besteht. Ist Clerk nicht erreichbar, meldet es ebenfalls keine Sitzung (ohne Client-ID); das löscht die Kopie nicht. Auf fremden Geräten deshalb abmelden. Der Offline-Start mit echter Clerk-Sitzung, eine Unterbrechung über mehr als eine Minute (Token-Ablauf) und die Installation auf Android und iOS lassen sich nur mit dem echten Konto prüfen. Die automatisierten Tests decken den Service Worker im Produktionsbuild (`pnpm test:pwa:e2e`) sowie Unterbrechungen und Entwurfskonflikte gegen lokales Convex ab.
 
 ## Stabile IDs und Inhaltsänderungen
 
@@ -115,6 +129,7 @@ pnpm content:check
 pnpm bear:check
 pnpm verify
 pnpm test:e2e         # Bestehende Lernabläufe mit lokalem Regressionstest-Adapter
+pnpm test:pwa:e2e     # Produktionsbuild: Manifest, Service Worker, Offline-Lesen
 pnpm build
 ```
 

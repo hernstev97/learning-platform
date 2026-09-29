@@ -13,6 +13,7 @@ const url = `http://127.0.0.1:${config.ports.cloud}`;
 const http = new ConvexHttpClient(url);
 (http as unknown as { setAdminAuth(key: string, identity: { issuer: string; subject: string }): void }).setAdminAuth(config.adminKey, { issuer: 'https://learning.clerk.accounts.dev', subject: 'user_owner' });
 const base = '/kotlin/bear-01';
+const second = Object.values(loadContent(['kotlin']).areas.kotlin.modules['bear-01'].exercises)[1].title;
 const fixture = async (context: BrowserContext, subject = 'user_owner') => context.addInitScript((value) => { (window as unknown as { __convexTest: unknown }).__convexTest = value; }, { url, adminKey: config.adminKey, subject });
 const synced = async (page: import('@playwright/test').Page) => expect(page.locator('#storage-status')).toHaveText('Lernstand synchronisiert');
 
@@ -141,4 +142,34 @@ test('concurrent direct writes stay unique and card reviews use transactional se
   const final = await http.query(api.progress.snapshot, {});
   expect(final.entries.filter((e) => e.areaId === areaId && e.key === 'lesson:bear-01')).toHaveLength(1);
   expect(final.entries.find((e) => e.areaId === areaId && e.key === 'card:concurrent')?.value).toMatchObject({ value: { seen: 8, box: 5 } });
+});
+
+test('a lasting outage is announced; exercises open without a connection and typed drafts sync afterwards', async ({ page, context, browser }) => {
+  await page.goto(`${base}/1`); await synced(page);
+  await expect.poll(() => page.evaluate(() => localStorage.getItem('learn-offline:snapshot:v1'))).not.toBeNull();
+  await context.setOffline(true);
+  await page.locator('.step').nth(1).click(); await expect(page.locator('#exercise-title')).toHaveText(second);
+  await page.locator('#answer-g1').fill('"Be');
+  // The draft and the new learning position wait for the connection.
+  await expect(page.locator('#sync-notice')).toContainText('2 Änderungen sind noch nicht synchronisiert');
+  await expect(page.locator('#storage-status')).toHaveText('Offline · 2 Änderungen nicht synchronisiert');
+  await context.setOffline(false); await synced(page);
+  await expect(page.locator('#sync-notice')).toBeHidden();
+  const phone = await browser.newContext(); await fixture(phone); const other = await phone.newPage();
+  await other.goto(`${base}/2`); await expect(other.locator('#answer-g1')).toHaveValue('"Be');
+  await phone.close();
+});
+
+test('a draft typed offline does not silently replace a different draft saved on another device', async ({ page, context, browser }) => {
+  const phone = await browser.newContext(); await fixture(phone); const other = await phone.newPage();
+  await other.goto(`${base}/2`); await other.locator('#answer-g1').fill('"Bo'); await synced(other);
+  await page.goto(`${base}/1`); await synced(page);
+  await context.setOffline(true);
+  await page.locator('.step').nth(1).click(); await expect(page.locator('#exercise-title')).toHaveText(second);
+  await page.locator('#answer-g1').fill('"Be');
+  await context.setOffline(false); await synced(page);
+  await page.getByRole('button', { name: 'Geänderter Entwurf verfügbar · Laden' }).click();
+  await expect(page.locator('#answer-g1')).toHaveValue('"Bo');
+  await other.reload(); await expect(other.locator('#answer-g1')).toHaveValue('"Bo');
+  await phone.close();
 });

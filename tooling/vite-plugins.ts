@@ -1,6 +1,8 @@
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import type { Plugin, ViteDevServer } from 'vite';
+import { createHash } from 'node:crypto';
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { join, relative } from 'node:path';
+import { transformWithOxc, type Plugin, type ViteDevServer } from 'vite';
+import type { WorkerConfig } from '../src/service-worker.ts';
 import { CONTENT, ROOT, formatIssues, loadContent, type Loaded } from './content.ts';
 
 const CATALOG = 'virtual:catalog';
@@ -84,6 +86,43 @@ export function pyodide(): Plugin {
       for (const file of PYODIDE_FILES) copyFileSync(join(from, file), join(to, file));
       for (const file of readdirSync(join(ROOT, 'vendor/pyodide'))) copyFileSync(join(ROOT, 'vendor/pyodide', file), join(to, file));
       writeFileSync(stamp, version);
+    },
+  };
+}
+
+const files = (dir: string): string[] => existsSync(dir) ? readdirSync(dir, { recursive: true, encoding: 'utf8' }).filter((name) => statSync(join(dir, name)).isFile()) : [];
+/**
+ * Emits /sw.js from src/service-worker.ts in production builds. It precaches every built file (app shell and all
+ * content chunks) plus fonts, icons and the manifest from public/; Pyodide is only cached once it is used.
+ * The cache version changes with any of these files, so each deployment installs a fresh, consistent set.
+ */
+export function serviceWorker(): Plugin {
+  let publicDir = '';
+  return {
+    name: 'offline-service-worker',
+    apply: 'build',
+    enforce: 'post',
+    configResolved(config) { publicDir = config.publicDir; },
+    async generateBundle(_, bundle) {
+      const hash = createHash('sha256');
+      const built = Object.keys(bundle).sort();
+      for (const name of built) {
+        const item = bundle[name];
+        hash.update(name).update(item.type === 'chunk' ? item.code : item.source);
+      }
+      const extra = files(publicDir).map((name) => name.split('\\').join('/')).filter((name) => !name.startsWith('pyodide/') && /\.(woff2|svg|png|webmanifest)$/.test(name)).sort();
+      for (const name of extra) hash.update(name).update(readFileSync(join(publicDir, name)));
+      const runtime = createHash('sha256');
+      for (const name of files(join(publicDir, 'pyodide')).sort()) runtime.update(name).update(readFileSync(join(publicDir, 'pyodide', name)));
+      const config: WorkerConfig = {
+        version: hash.digest('hex').slice(0, 12),
+        files: [...built, ...extra].map((name) => `/${name}`),
+        pyodide: runtime.digest('hex').slice(0, 12),
+      };
+      const source = join(ROOT, 'src/service-worker.ts');
+      const { code } = await transformWithOxc(readFileSync(source, 'utf8'), relative(ROOT, source), { lang: 'ts' });
+      // A classic script: module service workers are not supported everywhere yet.
+      this.emitFile({ type: 'asset', fileName: 'sw.js', source: `${code.replace(/^export /gm, '')}\nserviceWorker(self, ${JSON.stringify(config)});\n` });
     },
   };
 }
