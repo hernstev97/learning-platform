@@ -15,7 +15,7 @@ export function mount(signOut: () => Promise<void> = async () => {}): void {
   app.innerHTML = html`
     <a class="skip-link" href="#main">Zum Inhalt springen</a>
     <header class="topbar">
-      <a class="logo" href="/" aria-label="learn.kiumu.app – Startseite"><span class="logo-mark" aria-hidden="true">L</span><span class="logo-text">learn<span>.kiumu</span></span></a>
+      <a class="logo" href="/" aria-label="learn.kiumu.app – Startseite"><img class="logo-mark" src="/icons/learnkiumu-logo.svg" alt="" width="34" height="34"><span class="logo-text">learn<span>.kiumu</span></span></a>
       <nav class="topnav" aria-label="Lernbereiche">
         ${catalog.areas.map((area) => html`<a href="/${area.id}" data-area="${area.id}" style="--area:${area.color}">${area.short}</a>`)}
       </nav>

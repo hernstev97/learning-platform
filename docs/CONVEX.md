@@ -66,7 +66,7 @@ Der Footer unterscheidet synchronisiert, wartende Änderungen, Verbindungsaufbau
 
 ## Offline und installierbare App
 
-Die Plattform ist eine installierbare PWA (`public/manifest.webmanifest`, Symbole in `public/icons/`, erzeugt mit `node tooling/icons.mjs`). Es gibt keine eigene Sync-Engine: Schreibvorgänge laufen weiterhin ausschließlich über die Warteschlange und optimistischen Updates des Convex-Clients.
+Die Plattform ist eine installierbare PWA (`public/manifest.webmanifest`, Logo `public/icons/learnkiumu-logo.svg` als Favicon und im Header, PNG-Symbole daraus mit `node tooling/icons.mjs`). Es gibt keine eigene Sync-Engine: Schreibvorgänge laufen weiterhin ausschließlich über die Warteschlange und optimistischen Updates des Convex-Clients.
 
 **Service Worker.** `pnpm build` erzeugt `/sw.js` aus `src/service-worker.ts` (Plugin `serviceWorker` in `tooling/vite-plugins.ts`). Er speichert beim ersten Besuch App-Shell, alle Inhaltschunks, Schriften und Symbole (gzip etwa 1,5 MB) in einem versionierten Cache. Seitenaufrufe gehen zuerst ins Netz, sodass online immer das aktuelle Deployment läuft; ohne Antwort nach 4 Sekunden oder offline rendert die zwischengespeicherte Shell jede Route. Pyodide (etwa 12 MB) wird erst bei der ersten Python-Übung gespeichert. Python läuft offline also nur, wenn es auf diesem Gerät schon einmal geladen wurde. Ein neues Deployment installiert sich im Hintergrund; der vorherige Cache bleibt für bereits geöffnete Seiten erhalten. Clerk, Convex und der persönliche Lernstand laufen nicht über den Service Worker. Der Worker ist nur im Produktionsbuild aktiv, nicht im Dev-Server.
 
