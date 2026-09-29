@@ -40,16 +40,18 @@ content/<bereich>/         Inhalte (YAML + Markdown) – siehe HANDBUCH.md
 content/kotlin/bear/       Bear-Track: Generator, gepinnter Bear-Snapshot, erzeugter Kurs
 tooling/content.ts         Lädt, validiert und normalisiert alle Inhalte (Build, Tests, Skripte)
 tooling/markdown.ts        Markdown → HTML zur Build-Zeit (Callouts, Codeblöcke, Inhaltsverzeichnis)
+tooling/search-index.ts    Suchindex zur Build-Zeit (Klartext je Modul, Abschnitt, Begriff, Projekt und Karte)
 tooling/vite-plugins.ts    Inhalte als virtuelle Module (ein Chunk pro Bereich), Pyodide selbst gehostet
 tooling/verify-code.ts     Führt Musterlösungen und Beispiele aus
 tooling/fixtures/          Beispielbereich mit jeder Übungsart (Tests, Vorlage)
-src/engine/                Prüflogik (tokenbasiert je Sprache), Highlighter, Lernstand
+src/engine/                Prüflogik (tokenbasiert je Sprache), Highlighter, Lernstand, Suche (Treffer und Ranking)
 convex/                    Schema, zentrale Einzelnutzer-Autorisierung, Fortschritt und Migration
 src/main.ts                Clerk-Anmeldung, geschlossenes Zugriffstor und Offline-Start
 src/service-worker.ts      Offline-Cache für App-Shell und Lerninhalte (Build erzeugt /sw.js)
 src/app.ts                 Reaktiver Convex-Lernstand und optimistische Mutationen
 src/shell.ts               Bestehende Lernoberfläche und Navigation nach autorisiertem Laden
 src/exercises/             Die neun Übungsarten
+src/ui/search.ts           Suchdialog mit Tastaturbedienung
 src/pages/                 Startseite, Bereich, Lektion, Übung, Karten, Projekte, Nachschlageseiten, Daten
 src/python/                Pyodide-Worker und Harness (dieselbe Harness nutzt pnpm verify)
 vendor/pyodide/            Zusätzliche Pyodide-Pakete (tzdata, beautifulsoup4, PyYAML)
@@ -60,6 +62,8 @@ Die Oberfläche bleibt ein statisches Vite-Projekt ohne Frontendframework. Inhal
 ## Lernstand
 
 Convex speichert gelöste Übungen mit Fingerprint, versionierte Entwürfe, gelesene Lektionen, persönliche Notizen pro Lektion, Kartenboxen samt Review-Historie, Projektschritte und die letzte Lernposition. Fortschrittsanzeigen werden daraus berechnet. Ändert sich der geprüfte Teil einer Übung, zählt ein früherer Erfolg nicht mehr. Bestehende `learn:<bereich>:v1`-Einträge werden nach Anmeldung erkannt und unter `/daten` bewusst importiert; Originale bleiben erhalten. Dort gibt es weiterhin JSON-Sicherung, Wiederherstellung, Bereichsreset und Bear-Import. Details und Konfliktregeln: [Convex-Dokumentation](docs/CONVEX.md).
+
+Die globale Suche (Lupe in der Kopfzeile, Taste `/` oder `Strg`/`⌘`+`K`) findet Module, Lektionsabschnitte, Glossarbegriffe, Spickzettel-Abschnitte, Projekte und Interview-Karten aller Bereiche und springt direkt an die Stelle. Der Index entsteht beim Build aus den Inhalten, wird erst beim ersten Öffnen geladen und funktioniert offline. Einen externen Suchdienst gibt es nicht.
 
 Die Plattform ist als App installierbar (PWA) und offline lesbar. Details und Grenzen: [Offline und installierbare App](docs/CONVEX.md#offline-und-installierbare-app).
 

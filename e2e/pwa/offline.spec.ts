@@ -44,6 +44,12 @@ test('a browser that was signed in before reads lessons offline with its last sy
   // Content chunks of other areas and pages that were never opened come from the precache.
   await page.locator('.topnav a[data-area="rust"]').click();
   await expect(page.locator('h1')).toHaveText(loadContent(['rust']).catalog.areas[0].title);
+  // So is the search index.
+  await page.keyboard.press('Control+k');
+  await page.getByRole('combobox', { name: 'Lerninhalte durchsuchen' }).fill(second.title);
+  await expect(page.getByRole('option').first()).toContainText(second.title);
+  await page.keyboard.press('Enter');
+  await expect(page.locator('h1')).toHaveText(second.title);
   await page.goto(`/python/${second.id}/1`);
   await expect(page.locator('#exercise-title')).toBeVisible();
   await page.goto('/daten');

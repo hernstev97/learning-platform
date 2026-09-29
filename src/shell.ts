@@ -5,7 +5,8 @@ import './styles/exercise.css';
 import './styles/pages.css';
 import { catalog, closeDraft, getStorageWarning, getSyncNotice, getSyncStatus, hasPendingWrites, isCloud, isOffline, loadArea, onProgressChange, onStorageChange, prepareDraft, summaryOf, visit } from './app.ts';
 import { scanLegacy } from './engine/legacy.ts';
-import { $, html, icons } from './ui/dom.ts';
+import { $, html, icons, raw } from './ui/dom.ts';
+import { mountSearch } from './ui/search.ts';
 import { currentTheme, initTheme, onThemeChange, setTheme } from './ui/theme.ts';
 import type { Page } from './router.ts';
 import { navigate, parseRoute, startRouter } from './router.ts';
@@ -19,6 +20,7 @@ export function mount(signOut: () => Promise<void> = async () => {}): void {
       <nav class="topnav" aria-label="Lernbereiche">
         ${catalog.areas.map((area) => html`<a href="/${area.id}" data-area="${area.id}" style="--area:${area.color}">${area.short}</a>`)}
       </nav>
+      <button class="topbar-search" id="search-open" type="button" title="Suche (/ oder Strg+K)" aria-haspopup="dialog" aria-keyshortcuts="/ Control+K Meta+K">${raw(icons.search)}<span class="topbar-search-text">Suche</span><kbd class="kbd-hint" aria-hidden="true">/</kbd></button>
       <a class="topbar-data" href="/daten">Daten</a>
       <button class="theme-toggle" id="theme-toggle" type="button"></button>
       <button class="btn small" id="sign-out" type="button" ${isOffline() ? 'hidden' : ''}>Abmelden</button>
@@ -47,6 +49,7 @@ export function mount(signOut: () => Promise<void> = async () => {}): void {
   headerSize.observe(syncNotice);
   if (isCloud && !isOffline()) void scanLegacy(catalog).then((scan) => { $('#legacy-notice').hidden = scan.imported || !Object.keys(scan.areas).length; }).catch(() => {});
   $('#sign-out').addEventListener('click', () => { void signOut(); });
+  mountSearch(app, $<HTMLButtonElement>('#search-open'));
   // A reload signs in and loads the current state; reading mode holds no unsaved changes.
   document.querySelector('#reconnect')?.addEventListener('click', () => location.reload());
   initTheme();

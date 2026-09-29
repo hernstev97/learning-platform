@@ -189,6 +189,66 @@ test('lesson python blocks run, pages stay within the viewport on mobile', async
   }
 });
 
+test('global search finds lessons, glossary terms and cards across areas and opens them', async ({ page }) => {
+  const errors = errorsOf(page);
+  const dialog = page.getByRole('dialog', { name: 'Suche' });
+  const input = page.getByRole('combobox', { name: 'Lerninhalte durchsuchen' });
+  const options = page.getByRole('option');
+  await page.goto('/');
+  await page.keyboard.press('/');
+  await expect(input).toBeFocused();
+  await input.fill('Rust im Playground');
+  await expect(options.first()).toContainText('Rust im Playground');
+  await expect(options.first().locator('.search-hit-meta')).toHaveText(/Beispiel.*Lektion.*Alle Übungsarten/);
+  await page.keyboard.press('Enter');
+  await expect(page).toHaveURL('/beispiel/alle-typen#rust-im-playground');
+  await expect(dialog).toBeHidden();
+  await expect(page.locator('#rust-im-playground')).toBeFocused();
+  await expect(page.locator('#rust-im-playground')).toBeInViewport();
+
+  // One query, several areas: arrow keys select, Enter opens the selected card with its answer.
+  await page.keyboard.press('Control+k');
+  await expect(input).toBeFocused();
+  await input.fill('Global Interpreter Lock');
+  await expect(options.first()).toBeVisible();
+  expect(new Set(await page.locator('.search-hit-area').allTextContents()).size).toBeGreaterThan(1);
+  const labels = await options.evaluateAll((items) => items.map((item) => item.querySelector('.search-hit-meta')!.textContent!));
+  const card = labels.findIndex((label) => label.includes('Beispiel') && label.includes('Interview-Karte'));
+  expect(card).toBeGreaterThan(-1);
+  for (let i = 0; i < card; i++) await page.keyboard.press('ArrowDown');
+  await expect(options.nth(card)).toHaveAttribute('aria-selected', 'true');
+  await expect(input).toHaveAttribute('aria-activedescendant', `search-hit-${card}`);
+  await page.keyboard.press('Enter');
+  await expect(page).toHaveURL('/beispiel/karten#karte-gil');
+  await expect(page.locator('#karte-gil')).toHaveAttribute('open', '');
+  await expect(page.locator('#karte-gil')).toBeInViewport();
+
+  // A result on the current page is shown even if the glossary filter hides it; "/" in a text field is just typed.
+  await page.goto('/beispiel/glossar');
+  await page.locator('#glossary-filter').fill('immutable');
+  await page.locator('#glossary-filter').press('/');
+  await expect(dialog).toBeHidden();
+  await expect(page.locator('#begriff-repl')).toBeHidden();
+  await page.locator('#search-open').click();
+  await input.fill('repl');
+  await options.filter({ hasText: 'Glossar' }).filter({ hasText: 'Beispiel' }).click();
+  await expect(page).toHaveURL('/beispiel/glossar#begriff-repl');
+  await expect(page.locator('#begriff-repl')).toBeVisible();
+
+  // Escape closes and returns to the button; the dialog fits a phone screen.
+  await page.locator('#search-open').click();
+  await expect(input).toHaveValue('repl');
+  await page.keyboard.press('Escape');
+  await expect(dialog).toBeHidden();
+  await expect(page.locator('#search-open')).toBeFocused();
+  await page.setViewportSize({ width: 360, height: 780 });
+  await page.locator('#search-open').click();
+  await input.fill('xyz-gibt-es-nicht');
+  await expect(page.locator('#search-status')).toHaveText('Keine Treffer für „xyz-gibt-es-nicht“.');
+  expect(await dialog.evaluate((element) => element.getBoundingClientRect().right <= innerWidth && document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  expect(errors).toEqual([]);
+});
+
 test('storage failures are reported without breaking the app', async ({ context }) => {
   const page = await context.newPage();
   await page.addInitScript(() => Object.defineProperty(window, 'localStorage', { get() { throw new DOMException('Blocked', 'SecurityError'); } }));

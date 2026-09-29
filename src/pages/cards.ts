@@ -4,7 +4,7 @@ import { GRADES, type Grade } from '../../convex/model.ts';
 import { byWeakness, GRADE_LABELS, nextReview } from '../engine/review.ts';
 import { localDay, type CardState } from '../engine/storage.ts';
 import { areaBanner } from '../ui/area-nav.ts';
-import { $, LEVELS, html, raw } from '../ui/dom.ts';
+import { $, $$, LEVELS, html, raw } from '../ui/dom.ts';
 import type { Page } from '../router.ts';
 
 const NEW_PER_SESSION = 12;
@@ -103,9 +103,12 @@ const cards: Page<{ name: 'cards'; area: string }> = async (main, route) => {
     renderDeck();
   };
   const renderList = () => {
-    $('#all-cards', main).innerHTML = pool().map((card) => {
+    const list = $('#all-cards', main);
+    // A progress update must not close answers that are being read (or the one a search result opened).
+    const open = new Set($$<HTMLDetailsElement>('.card-item[open]', list).map((item) => item.id));
+    list.innerHTML = pool().map((card) => {
       const state = progress.cards[card.id];
-      return html`<details class="card-item"><summary><span class="card-q">${raw(card.question.replace(/<\/?p>/g, ''))}</span><span class="tag">${mastery(state)}</span></summary><div class="prose compact">${raw(card.answer)}</div></details>`.value;
+      return html`<details class="card-item" id="karte-${card.id}" ${open.has(`karte-${card.id}`) ? 'open' : ''}><summary><span class="card-q">${raw(card.question.replace(/<\/?p>/g, ''))}</span><span class="tag">${mastery(state)}</span></summary><div class="prose compact">${raw(card.answer)}</div></details>`.value;
     }).join('');
   };
   $<HTMLSelectElement>('#tag', main).addEventListener('change', (event) => {
@@ -114,7 +117,7 @@ const cards: Page<{ name: 'cards'; area: string }> = async (main, route) => {
     renderDeck(); renderList();
   });
   const keys = (event: KeyboardEvent) => {
-    if (!queue.length || position >= queue.length || (event.target as Element).closest('input, textarea, select')) return;
+    if (!queue.length || position >= queue.length || (event.target as Element).closest('input, textarea, select, dialog')) return;
     if (!revealed && (event.key === ' ' || event.key === 'Enter')) { event.preventDefault(); reveal(); }
     else if (revealed && /^[1-4]$/.test(event.key)) grade(GRADES[Number(event.key) - 1]);
   };

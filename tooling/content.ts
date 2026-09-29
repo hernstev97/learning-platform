@@ -432,9 +432,16 @@ function loadArea(dir: string, raw: RawExercise[], sink: { errors: Issue[]; warn
         const name = g.str('term');
         if (seen.has(name.toLowerCase())) r.error(`Begriff ${i + 1}`, `"${name}" doppelt`);
         seen.add(name.toLowerCase());
-        glossary.push({ term: name, definition: block(g.str('definition')) });
+        glossary.push({ id: '', term: name, definition: block(g.str('definition')) });
       });
       glossary.sort((a, b) => a.term.localeCompare(b.term, 'de', { sensitivity: 'base' }));
+      // Anchors for search results; terms like "C" and "C++" share a slug.
+      const anchors = new Set<string>();
+      for (const entry of glossary) {
+        entry.id = `begriff-${slug(entry.term)}`;
+        for (let n = 2; anchors.has(entry.id); n++) entry.id = `begriff-${slug(entry.term)}-${n}`;
+        anchors.add(entry.id);
+      }
     }
     flush(r);
   }

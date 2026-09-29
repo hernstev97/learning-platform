@@ -4,12 +4,14 @@ import { join, relative } from 'node:path';
 import { transformWithOxc, type Plugin, type ViteDevServer } from 'vite';
 import type { WorkerConfig } from '../src/service-worker.ts';
 import { CONTENT, ROOT, formatIssues, loadContent, type Loaded } from './content.ts';
+import { buildSearchIndex } from './search-index.ts';
 
 const CATALOG = 'virtual:catalog';
 const LOADERS = 'virtual:area-loaders';
 const AREA = 'virtual:area/';
+const SEARCH = 'virtual:search-index';
 
-/** Serves content/ as virtual modules: a small catalog plus one lazily loaded chunk per area. */
+/** Serves content/ as virtual modules: a small catalog, one lazily loaded chunk per area and the search index. */
 export function content(): Plugin {
   let cache: Loaded | null = null;
   let building = false;
@@ -35,13 +37,14 @@ export function content(): Plugin {
     name: 'learning-content',
     configResolved(config) { building = config.command === 'build'; },
     resolveId(id) {
-      if (id === CATALOG || id === LOADERS || id.startsWith(AREA)) return `\0${id}`;
+      if (id === CATALOG || id === LOADERS || id === SEARCH || id.startsWith(AREA)) return `\0${id}`;
     },
     load(id) {
       if (!id.startsWith('\0virtual:')) return;
       const name = id.slice(1);
       const loaded = load();
       if (name === CATALOG) return `export default ${JSON.stringify(loaded.catalog)};`;
+      if (name === SEARCH) return `export default JSON.parse(${JSON.stringify(JSON.stringify(buildSearchIndex(loaded)))});`;
       if (name === LOADERS) return `export default {${Object.keys(loaded.areas).map((area) => `${JSON.stringify(area)}: () => import(${JSON.stringify(AREA + area)})`).join(',')}};`;
       if (name.startsWith(AREA)) {
         const area = loaded.areas[name.slice(AREA.length)];
