@@ -33,7 +33,7 @@ let onChange: (scroll: () => void) => Promise<void> = async () => {};
 const scrollFor = (hash: string, preserve?: number) => () => {
   if (preserve !== undefined) { window.scrollTo(0, preserve); return; }
   const target = hashTarget(hash);
-  if (target) target.scrollIntoView();
+  if (target) showTarget(target);
   else window.scrollTo(0, 0);
   const heading = document.querySelector<HTMLElement>('main h1');
   if (!target && heading) { heading.setAttribute('tabindex', '-1'); heading.focus({ preventScroll: true }); }
@@ -44,11 +44,24 @@ function hashTarget(hash: string): HTMLElement | null {
   catch { return null; }
 }
 
-export function navigate(path: string, options: { replace?: boolean; keepScroll?: boolean } = {}): void {
+/** Scrolls to the element a fragment points to (opening it if it is a closed <details>), marks it briefly and focuses it. */
+function showTarget(target: HTMLElement): void {
+  if (target instanceof HTMLDetailsElement) target.open = true;
+  target.scrollIntoView();
+  document.querySelector('.hash-target')?.classList.remove('hash-target');
+  target.classList.add('hash-target');
+  // Moves the keyboard position to the target, as a native fragment navigation would.
+  if (!target.hasAttribute('tabindex')) target.setAttribute('tabindex', '-1');
+  target.focus({ preventScroll: true });
+}
+
+/** `render` renders the page again even if only the fragment changes. */
+export function navigate(path: string, options: { replace?: boolean; keepScroll?: boolean; render?: boolean } = {}): void {
   const url = new URL(path, location.href);
-  if (url.pathname === location.pathname && url.hash && !options.replace) {
+  if (url.pathname === location.pathname && url.hash && !options.replace && !options.render) {
     history.pushState(null, '', url);
-    hashTarget(url.hash)?.scrollIntoView();
+    const target = hashTarget(url.hash);
+    if (target) showTarget(target);
     return;
   }
   if (options.replace) history.replaceState(null, '', url); else history.pushState(null, '', url);

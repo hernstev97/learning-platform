@@ -75,7 +75,8 @@ export type Project = {
   stretch: string[];
   portfolio: string;
 };
-export type GlossaryEntry = { term: string; definition: string };
+/** `id` is the entry's anchor on the glossary page (`begriff-<slug>`). */
+export type GlossaryEntry = { id: string; term: string; definition: string };
 
 export type TrackSummary = { title: string; description: string; modules: string[] };
 export type ModuleSummary = {
@@ -114,4 +115,16 @@ export type Area = {
   career: string | null;
   /** Original files for exercises with a source reference (Bear). */
   files: Record<string, string>;
+};
+
+export type SearchKind = 'module' | 'lesson' | 'glossary' | 'cheatsheet' | 'project' | 'card';
+/** One findable place, produced at build time by tooling/search-index.ts. Title, context and text are plain text. */
+export type SearchDoc = {
+  area: string;
+  kind: SearchKind;
+  title: string;
+  /** Where the place belongs, e.g. the module of a lesson section; may be empty. */
+  context: string;
+  text: string;
+  href: string;
 };

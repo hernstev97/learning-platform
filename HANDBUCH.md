@@ -150,7 +150,7 @@ Eine Lektion ist ein gut strukturiertes Kapitel, kein Blogartikel und kein Nachs
 
 Was nicht in die Lektion gehört: vollständige API-Listen, Historie, Randfälle ohne Praxisrelevanz. Dafür gibt es Links, Glossar und Spickzettel.
 
-Nur `##` und `###` verwenden. `##`-Überschriften bilden das Inhaltsverzeichnis neben der Lektion.
+Nur `##` und `###` verwenden. `##`-Überschriften bilden das Inhaltsverzeichnis neben der Lektion. Außerdem wird jeder `##`-Abschnitt ein eigener Treffer der globalen Suche, mit der Überschrift als Titel. Überschriften sollten deshalb das Thema nennen („Borrowing: Daten nutzen, ohne sie zu besitzen“) statt nur „Beispiel“ zu lauten.
 
 ### Callouts
 
@@ -531,7 +531,7 @@ terms:
     definition: Markdown, 1–3 Sätze.
 ```
 
-Richtwert: 30–60 Begriffe. Die Plattform sortiert alphabetisch und bietet eine Suche.
+Richtwert: 30–60 Begriffe. Die Plattform sortiert alphabetisch und bietet eine Suche. Jeder Begriff ist unter `/<bereich>/glossar#begriff-<slug>` direkt erreichbar, auch aus der globalen Suche.
 
 ### cheatsheet.md und career.md
 
@@ -579,6 +579,7 @@ Fortschritt liegt nach Anmeldung in Convex: gelöste Übungen (mit Fingerprint),
 - Auch „Weiterlernen“ speichert jetzt die Übungs-ID und berechnet die aktuelle URL-Nummer daraus.
 - Abnahmekriterien tragen explizite IDs. Die früher verwendeten Schlüssel `abnahme-N` bleiben bei bestehenden Inhalten erhalten und dürfen beim Umsortieren nicht neu nummeriert werden. Neue Kriterien brauchen neue IDs.
 - Entwürfe sind an ihren Inhaltsfingerprint gebunden; veraltete Entwürfe bleiben exportierbar, werden aber nicht automatisch in geänderte Übungen geladen.
+- Die **globale Suche** braucht keine Pflege: Der Build indexiert Module, Lektionsabschnitte, Glossar, Spickzettel, Projekte und Interview-Karten aus denselben Dateien. Sprungziele sind die `##`-Überschriften, Glossarbegriffe und Karten-IDs (`/<bereich>/karten#karte-<id>`).
 
 ## 12. YAML-Fallen
 

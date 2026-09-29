@@ -17,7 +17,7 @@ const reference: Page<{ name: 'reference'; area: string; page: 'spickzettel' | '
     main.innerHTML = html`${banner}<div class="page">
       <div class="glossary-search"><label class="label" for="glossary-filter">Begriff suchen</label><input id="glossary-filter" type="search" placeholder="z. B. ${area.glossary[0]?.term ?? ''}" autocomplete="off"></div>
       <p class="muted small" id="glossary-count"></p>
-      <dl class="glossary">${area.glossary.map((entry) => html`<div class="glossary-entry" data-term="${entry.term.toLowerCase()}"><dt>${entry.term}</dt><dd class="prose compact">${raw(entry.definition)}</dd></div>`)}</dl>
+      <dl class="glossary">${area.glossary.map((entry) => html`<div class="glossary-entry" id="${entry.id}" data-term="${entry.term.toLowerCase()}"><dt>${entry.term}</dt><dd class="prose compact">${raw(entry.definition)}</dd></div>`)}</dl>
     </div>`.value;
     const filter = $<HTMLInputElement>('#glossary-filter', main);
     const apply = () => {
