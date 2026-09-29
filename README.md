@@ -74,7 +74,7 @@ Das Design (hell oder dunkel) folgt der Systemeinstellung, bis es über den Scha
 
 ## Deployment
 
-Vercel-Projekt `learning-platform` im Team `kiumu`, verbunden mit diesem Repository. `main` wird über `pnpm build:production` gebaut und unter https://learn.kiumu.app veröffentlicht. **Vor dem ersten Deployment die Convex-/Clerk-Produktionsvariablen einrichten**, siehe [Setup](docs/CONVEX.md#produktion-und-vercel). Dieser Build verbindet Backenddeployment und passende Frontend-URL. `vercel.json` enthält weiterhin SPA-Routing, Cache- und Sicherheits-Header. Die gepinnte pnpm-Version wird über Corepack genutzt (`ENABLE_EXPERIMENTAL_COREPACK=1`).
+Vercel-Projekt `learning-platform` im Team `kiumu`, verbunden mit diesem Repository. `main` wird über `pnpm build:production` gebaut und unter https://learn.kiumu.app veröffentlicht. Andere Branches erzeugen keine Preview-Deployments (`git.deploymentEnabled` in `vercel.json`), weil Previews keinen Convex-Deploy-Key haben. **Vor dem ersten Deployment die Convex-/Clerk-Produktionsvariablen einrichten**, siehe [Setup](docs/CONVEX.md#produktion-und-vercel). Dieser Build verbindet Backenddeployment und passende Frontend-URL. `vercel.json` enthält weiterhin SPA-Routing, Cache- und Sicherheits-Header. Die gepinnte pnpm-Version wird über Corepack genutzt (`ENABLE_EXPERIMENTAL_COREPACK=1`).
 
 ```sh
 # Die vorhandene Regression läuft lokal mit einem nur für Tests geladenen Adapter.
