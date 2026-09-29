@@ -5,7 +5,8 @@ import './styles/exercise.css';
 import './styles/pages.css';
 import { catalog, closeDraft, getStorageWarning, getSyncStatus, hasPendingWrites, isCloud, loadArea, onProgressChange, onStorageChange, prepareDraft, summaryOf, visit } from './app.ts';
 import { scanLegacy } from './engine/legacy.ts';
-import { $, html } from './ui/dom.ts';
+import { $, html, icons } from './ui/dom.ts';
+import { currentTheme, initTheme, onThemeChange, setTheme } from './ui/theme.ts';
 import type { Page } from './router.ts';
 import { navigate, parseRoute, startRouter } from './router.ts';
 
@@ -19,6 +20,7 @@ export function mount(signOut: () => Promise<void> = async () => {}): void {
         ${catalog.areas.map((area) => html`<a href="/${area.id}" data-area="${area.id}" style="--area:${area.color}">${area.short}</a>`)}
       </nav>
       <a class="topbar-data" href="/daten">Daten</a>
+      <button class="theme-toggle" id="theme-toggle" type="button"></button>
       <button class="btn small" id="sign-out" type="button">Abmelden</button>
     </header>
     <p id="storage-warning" class="storage-warning" role="status" hidden></p>
@@ -33,6 +35,18 @@ export function mount(signOut: () => Promise<void> = async () => {}): void {
   const main = $('#main');
   if (isCloud) void scanLegacy(catalog).then((scan) => { $('#legacy-notice').hidden = scan.imported || !Object.keys(scan.areas).length; }).catch(() => {});
   $('#sign-out').addEventListener('click', () => { void signOut(); });
+  initTheme();
+  const toggle = $<HTMLButtonElement>('#theme-toggle');
+  const showTheme = () => {
+    const dark = currentTheme() === 'dark';
+    const label = dark ? 'Helles Design aktivieren' : 'Dunkles Design aktivieren';
+    toggle.innerHTML = dark ? icons.sun : icons.moon;
+    toggle.setAttribute('aria-label', label);
+    toggle.title = label;
+  };
+  showTheme();
+  onThemeChange(showTheme);
+  toggle.addEventListener('click', () => setTheme(currentTheme() === 'dark' ? 'light' : 'dark'));
   window.addEventListener('beforeunload', (event) => { if (hasPendingWrites()) { event.preventDefault(); event.returnValue = ''; } });
   let cleanup: (() => void) | void;
   let renderToken = 0;
