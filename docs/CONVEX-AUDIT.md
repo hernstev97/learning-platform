@@ -19,7 +19,7 @@ Die vorhandenen Projekttexte und Schritt-IDs wurden gegen Git HEAD verglichen: a
 | `exportDrafts` | `requireOwner`; höchstens 16 Entwürfe pro Seite; alte Generationen ausgefiltert |
 | `set` | `requireOwner`; Generation, IDs, Zustandsvarianten und maximal 32 Einträge geprüft; gezielte Upserts |
 | `saveDraft` | `requireOwner`; Generation, Inhaltsfingerprint, JSON-Tiefe, Struktur und maximal 60 KB geprüft; idempotenter Upsert |
-| `reviewCard` | `requireOwner`; Generation und IDs geprüft; Zähler/Box atomar aus Serverstand berechnet |
+| `reviewCard` | `requireOwner`; Generation, IDs und Bewertung geprüft; Zähler/Box atomar aus Serverstand berechnet; Historie in derselben Transaktion |
 | `importLegacy` | `requireOwner`; begrenzte Chunks, nur fehlende Datensätze, Importbeleg in derselben Transaktion; Reset-Sperre |
 | `resetArea` | `requireOwner`; Generation geprüft; Fortschritt gelöscht und Generation atomar erhöht |
 

@@ -102,7 +102,7 @@ for (const area of loaded.catalog.areas) {
     await page.locator('#start').click();
     await page.locator('#show').click();
     await expect(page.locator('.flashcard-answer')).toBeVisible();
-    await page.locator('#knew').click();
+    await page.locator('#good').click();
     await page.reload();
     await expect(page.locator('.card-item .tag', { hasText: 'Box 1' })).toHaveCount(1);
     const capstone = area.projects.find((project) => project.capstone)!;

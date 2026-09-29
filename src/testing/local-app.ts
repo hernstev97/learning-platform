@@ -76,10 +76,11 @@ export function onStorageChange(listener: () => void): () => void {
 }
 
 // Development-only regression adapter. Vite never includes this module in production.
-import { gradeCard, mergeProgress } from '../engine/storage.ts';
+import { mergeProgress } from '../engine/storage.ts';
+import { schedule } from '../engine/review.ts';
 import { positionHref } from '../engine/persistence.ts';
 import type { Exercise } from '../content/types.ts';
-import type { Entry, Position } from '../../convex/model.ts';
+import type { Entry, Grade, Position } from '../../convex/model.ts';
 export const isCloud = false;
 export const getSyncStatus = () => getStorageWarning() ? 'Nicht gespeichert' : 'Lernstand nur in diesem Browser gespeichert';
 export const hasPendingWrites = () => false;
@@ -109,6 +110,6 @@ export function visit(area: string, value: Position) {
   setEntry(area, { kind: 'position', id: 'last', value });
   if (value.page !== 'cards') try { storage()?.setItem(CONTINUE_KEY, area); } catch { /* only the home shortcut is lost */ }
 }
-export function reviewCard(area: string, card: string, knew: boolean) { progressOf(area).cards[card] = gradeCard(progressOf(area).cards[card], knew); save(area); }
+export function reviewCard(area: string, card: string, grade: Grade) { progressOf(area).cards[card] = schedule(progressOf(area).cards[card], grade); save(area); }
 export async function resetProgress(area: string) { replaceProgress(area, freshProgress()); }
 export async function importProgress(values: Record<string, AreaProgress>) { for (const [id, value] of Object.entries(values)) replaceProgress(id, mergeProgress(progressOf(id), value)); }

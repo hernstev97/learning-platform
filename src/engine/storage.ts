@@ -1,13 +1,13 @@
 // Existing progress view, legacy localStorage reader and portable JSON backups.
 import type { AreaSummary } from '../content/types.ts';
-import { parsePosition, type Position } from '../../convex/model.ts';
+import { GRADES, parsePosition, type Grade, type Position } from '../../convex/model.ts';
 
 export const VERSION = 1;
 export const keyFor = (area: string) => `learn:${area}:v${VERSION}`;
 export const LEGACY_BEAR_KEY = 'kotlin-lernen:bear:progress:v2';
 
 export type Completion = { at: string; fp: string; help?: boolean };
-export type CardState = { box: number; due: string; seen: number; last?: string };
+export type CardState = { box: number; due: string; seen: number; last?: string; lapses?: number; grade?: Grade };
 export type AreaProgress = {
   version: 1;
   /** Solved exercises by id, with the fingerprint they were solved against. */
@@ -46,7 +46,12 @@ export function sanitize(data: unknown): AreaProgress {
   if (record(data.read)) for (const [id, value] of Object.entries(data.read)) if (safeKey(id) && typeof value === 'string') progress.read[id] = value;
   if (record(data.cards)) for (const [id, value] of Object.entries(data.cards)) {
     if (safeKey(id) && record(value) && typeof value.box === 'number' && Number.isInteger(value.box) && value.box >= 1 && value.box <= 5 && typeof value.due === 'string') {
-      progress.cards[id] = { box: value.box, due: value.due, seen: Number(value.seen) || 0, ...(typeof value.last === 'string' ? { last: value.last } : {}) };
+      progress.cards[id] = {
+        box: value.box, due: value.due, seen: Number(value.seen) || 0,
+        ...(typeof value.last === 'string' ? { last: value.last } : {}),
+        ...(Number.isSafeInteger(value.lapses) && (value.lapses as number) > 0 ? { lapses: value.lapses as number } : {}),
+        ...(GRADES.includes(value.grade as Grade) ? { grade: value.grade as Grade } : {}),
+      };
     }
   }
   if (record(data.projects)) for (const [id, steps] of Object.entries(data.projects)) {
@@ -87,12 +92,6 @@ export const localDay = (date = new Date()) => `${date.getFullYear()}-${String(d
 export function addDays(day: string, days: number): string {
   const [y, m, d] = day.split('-').map(Number);
   return localDay(new Date(y, m - 1, d + days));
-}
-/** Leitner intervals in days for boxes 1–5. */
-export const INTERVALS = [0, 1, 3, 7, 16, 35];
-export function gradeCard(state: CardState | undefined, knew: boolean, today = localDay()): CardState {
-  const box = knew ? Math.min((state?.box ?? 0) + 1, 5) : 1;
-  return { box, due: knew ? addDays(today, INTERVALS[box]) : today, seen: (state?.seen ?? 0) + 1, last: today };
 }
 
 // ---- Export / import ---------------------------------------------------------------------------

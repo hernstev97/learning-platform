@@ -484,7 +484,7 @@ cards:
     level: 2                    # 1–3
 ```
 
-Richtwert: 40–60 Karten pro Bereich. Mischung aus Wissensfragen („Was ist …?“), Vergleichen („Unterschied zwischen …?“), Szenarien („Die App friert ein – wie gehst du vor?“), Code-Review-Fragen und Verhaltensfragen mit Fachbezug. Die Plattform wiederholt Karten nach dem Leitner-System (Box 1–5; nach „Gewusst“ in 1, 3, 7, 16 und 35 Tagen).
+Richtwert: 40–60 Karten pro Bereich. Mischung aus Wissensfragen („Was ist …?“), Vergleichen („Unterschied zwischen …?“), Szenarien („Die App friert ein – wie gehst du vor?“), Code-Review-Fragen und Verhaltensfragen mit Fachbezug. Die Plattform wiederholt Karten nach dem Leitner-System (Box 1–5, fällig nach 1, 3, 7, 16 und 35 Tagen). Nach dem Aufdecken bewertet man sich selbst: „Okay“ schiebt die Karte eine Box weiter, „Leicht“ zwei, „Schwer“ lässt sie in ihrer Box, „Vergessen“ setzt sie auf Box 1 zurück. Die Regeln stehen in `src/engine/review.ts`.
 
 ### projects.yaml
 

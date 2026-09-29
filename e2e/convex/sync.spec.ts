@@ -58,7 +58,7 @@ test('project steps and cards react across devices without restarting active tra
   await expect(other.locator('[data-key]').first()).toBeChecked();
   await other.locator('[data-key]').nth(1).check(); await synced(other);
   await expect(page.locator('#project-count')).toContainText('2/');
-  await page.goto('/kotlin/karten'); await page.locator('#start').click(); await page.locator('#show').click(); await page.locator('#knew').click(); await synced(page);
+  await page.goto('/kotlin/karten'); await page.locator('#start').click(); await page.locator('#show').click(); await page.locator('#good').click(); await synced(page);
   await expect(page.locator('.flashcard-meta')).toContainText('Karte 2');
   await other.goto('/kotlin/karten'); await expect(other.locator('.card-item .tag', { hasText: 'Box 1' })).toHaveCount(1);
   await phone.close();
@@ -137,7 +137,7 @@ test('concurrent direct writes stay unique and card reviews use transactional se
     areaId, generation, changes: [{ kind: 'lesson', id: 'bear-01', completedAt: '2026-09-28' }],
   })));
   await Promise.all(Array.from({ length: 8 }, () => http.mutation(api.progress.reviewCard, {
-    areaId, generation, cardId: 'concurrent', knew: true, today: '2026-09-28',
+    areaId, generation, cardId: 'concurrent', grade: 'good', today: '2026-09-28',
   })));
   const final = await http.query(api.progress.snapshot, {});
   expect(final.entries.filter((e) => e.areaId === areaId && e.key === 'lesson:bear-01')).toHaveLength(1);
