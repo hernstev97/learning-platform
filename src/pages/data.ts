@@ -19,7 +19,7 @@ const data: Page = async (main) => {
       <div class="data-table-scroll" role="region" tabindex="0" aria-label="Lernstand je Bereich"><table class="data-table"><thead><tr><th>Bereich</th><th>Gelöst</th><th>Karten gesehen</th><th></th></tr></thead><tbody>
         ${catalog.areas.map((area) => {
           const stats = areaStats(area, progressOf(area.id));
-          return html`<tr data-progress-area="${area.id}"><td>${area.title}</td><td>${stats.done} / ${stats.total}</td><td>${Object.keys(progressOf(area.id).cards).length}</td><td><button type="button" class="btn small" data-reset="${area.id}">Zurücksetzen</button></td></tr>`;
+          return html`<tr data-progress-area="${area.id}"><td>${area.title}</td><td>${stats.done} / ${stats.total}</td><td>${Object.keys(progressOf(area.id).cards).length}</td><td><button type="button" class="btn small" data-reset="${area.id}">Zurück&shy;setzen</button></td></tr>`;
         })}
       </tbody></table></div>
       <section class="data-section"><h2 class="section-title">Sichern</h2><p>Lädt eine JSON-Datei mit dem Lernstand aller Bereiche herunter.</p><button type="button" class="btn primary" id="export">Sicherung herunterladen</button></section>

@@ -43,9 +43,11 @@ const cards: Page<{ name: 'cards'; area: string }> = async (main, route) => {
   const renderStats = () => {
     const b = boxes();
     const max = Math.max(1, ...b);
-    return html`<div class="deck-stats">
+    // Before the first review every box is empty; the chart would only be blank space.
+    const seen = b.some((count) => count > 0);
+    return html`<div class="deck-stats${seen ? '' : ' empty'}">
       <div class="deck-counts"><div><span class="big-number">${due().length}</span><span class="label">fällig</span></div><div><span class="big-number">${fresh().length}</span><span class="label">neu</span></div><div><span class="big-number">${b[2] + b[3] + b[4]}</span><span class="label">sitzen (Box 3+)</span></div></div>
-      <div class="boxes" aria-label="Verteilung auf die Boxen">${b.map((count, i) => html`<div class="box-col"><span class="box-bar" style="height:${Math.round(count / max * 100)}%"></span><span class="label">Box ${i + 1}</span><span class="label muted">${count}</span></div>`)}</div>
+      ${seen ? html`<div class="boxes" aria-label="Verteilung auf die Boxen">${b.map((count, i) => html`<div class="box-col"><span class="box-bar" style="height:${Math.round(count / max * 100)}%"></span><span class="label">Box ${i + 1}</span><span class="label muted">${count}</span></div>`)}</div>` : ''}
     </div>`;
   };
   const renderDeck = () => {
@@ -56,7 +58,7 @@ const cards: Page<{ name: 'cards'; area: string }> = async (main, route) => {
       deck.innerHTML = html`${renderStats()}
         <div class="deck-start">
           ${done ? html`<p class="deck-done"><strong>Runde fertig.</strong> ${sessionKnown} von ${queue.length} gewusst.</p>` : ''}
-          ${available ? html`<button type="button" class="btn primary big" id="start">${done ? 'Nächste Runde' : 'Training starten'} · ${available} Karten</button><p class="muted small">${due().length} fällige Wiederholungen und bis zu ${NEW_PER_SESSION} neue Karten.</p>`
+          ${available ? html`<button type="button" class="btn primary big" id="start">${done ? 'Nächste Runde' : 'Training starten'} · ${available}&nbsp;Karten</button><p class="muted small">${due().length} fällige Wiederholungen und bis zu ${NEW_PER_SESSION} neue Karten.</p>`
             : html`<p><strong>Für heute ist alles wiederholt.</strong> Morgen sind wieder Karten fällig. Du kannst unten jederzeit alle Fragen durchgehen.</p><button type="button" class="btn" id="extra">Trotzdem üben (zufällige Auswahl)</button>`}
         </div>`.value;
       main.querySelector('#start')?.addEventListener('click', () => startSession(false));

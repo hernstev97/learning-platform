@@ -112,8 +112,8 @@ export const output: ExerciseRenderer<OutputExercise, string> = (exercise, ctx) 
   markup: html`
     ${raw(codeCard(exercise.code, exercise.lang, `${langName(exercise.lang)} · Programm`))}
     <label class="field-label label" for="prediction">Deine Vorhersage der Ausgabe</label>
-    <textarea id="prediction" class="answer-input multiline" rows="${Math.max(2, exercise.expected[0].split('\n').length + 1)}" spellcheck="false" autocapitalize="off" autocomplete="off" placeholder="Genau so, wie es im Terminal stünde …">${ctx.draft ?? ''}</textarea>
-    <div class="exercise-actions"><button type="button" class="btn primary" id="check">Vorhersage prüfen</button><span class="muted small">Strg + Enter</span></div>
+    <textarea id="prediction" class="answer-input multiline" rows="${Math.max(2, exercise.expected[0].split('\n').length + 1)}" spellcheck="false" autocapitalize="off" autocomplete="off" placeholder="So, wie es im Terminal stünde …">${ctx.draft ?? ''}</textarea>
+    <div class="exercise-actions"><button type="button" class="btn primary" id="check">Vorhersage prüfen</button><span class="muted small kbd-hint">Strg + Enter</span></div>
     <div id="diff" class="diff" hidden></div>`.value,
   solution: () => `<pre class="code plain">${escape(exercise.expected[0])}</pre>`,
   bind(root) {
