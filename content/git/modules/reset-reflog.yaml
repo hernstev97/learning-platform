@@ -1,0 +1,814 @@
+id: reset-reflog
+title: Reset, Reflog und Recovery
+level: 3
+minutes: 190
+summary: Was `git reset` mit HEAD, Index und Arbeitsverzeichnis macht, wie der Reflog jede Bewegung festhält und wie du verlorene Commits, gelöschte Branches, verworfene Stashes und gestagte Inhalte zurückholst – und was endgültig verloren ist.
+goals:
+  - Du erklärst die drei Bäume HEAD, Index und Arbeitsverzeichnis und sagst vorher, was `reset --soft`, `--mixed` und `--hard` mit jedem davon machen.
+  - Du unterscheidest `git reset` mit Pfad von `git restore` und wählst das passende Werkzeug.
+  - Du liest Reflogs von HEAD und Branches und adressierst frühere Stände mit `@{n}`, Zeitangaben und `ORIG_HEAD`.
+  - Du rettest Commits nach `reset --hard`, gelöschte Branches, misslungene Rebases, verworfene Stashes und nur gestagte Inhalte.
+  - Du weißt, wann Reflog-Einträge verfallen, was unwiederbringlich verloren ist und wie du riskante Aktionen vorher absicherst.
+resources:
+  - title: Pro Git · Reset Demystified
+    url: https://git-scm.com/book/en/v2/Git-Tools-Reset-Demystified
+  - title: git-reset – Referenz
+    url: https://git-scm.com/docs/git-reset
+  - title: git-reflog – Referenz
+    url: https://git-scm.com/docs/git-reflog
+  - title: Pro Git · Maintenance and Data Recovery
+    url: https://git-scm.com/book/en/v2/Git-Internals-Maintenance-and-Data-Recovery#_data_recovery
+  - title: git-fsck – Referenz
+    url: https://git-scm.com/docs/git-fsck
+lesson: |
+  „Ich habe `git reset --hard` gemacht, und jetzt ist alles weg.“ Diesen Satz hört jedes Team irgendwann. Meist stimmt er nicht. Wenn ein Branch zurückgesetzt wird, löscht Git keine Commits – es bewegt einen Zeiger. Die alten Commits liegen weiter in der Objektdatenbank, und Git hat notiert, wo der Zeiger vorher stand. Wer das weiß, repariert in zwei Minuten, wofür andere das Repository neu klonen und Arbeit verlieren.
+
+  Dieses Modul baut zuerst das Modell auf, mit dem du vorhersagst, was `git reset` anrichtet. Danach folgen der Reflog als Gedächtnis von Git, ein Satz Rettungsrezepte und die ehrliche Antwort auf die Frage, was endgültig verloren ist.
+
+  ## Drei Bäume: HEAD, Index, Arbeitsverzeichnis
+
+  Git verwaltet drei Versionen deines Projekts gleichzeitig ([Pro Git · The Three Trees](https://git-scm.com/book/en/v2/Git-Tools-Reset-Demystified#_the_three_trees)):
+
+  | Baum | Was er enthält | Ändert sich durch |
+  | --- | --- | --- |
+  | **HEAD** | den Snapshot des letzten Commits auf dem aktuellen Branch | `commit`, `reset`, `switch` |
+  | **Index** (Staging Area) | den Snapshot, den der nächste Commit bekäme | `add`, `restore --staged`, `reset` |
+  | **Arbeitsverzeichnis** | die Dateien, die du bearbeitest | Editor, `restore`, `reset --hard` |
+
+  `git status` vergleicht diese drei: Die linke Spalte von `git status --short` zeigt Unterschiede zwischen HEAD und Index, die rechte zwischen Index und Arbeitsverzeichnis. Direkt nach einem Commit sind alle drei gleich, und `git status` meldet nichts.
+
+  HEAD ist meist ein Verweis auf einen Branch, und der Branch zeigt auf einen Commit. `git switch` hängt HEAD an einen anderen Branch. `git reset <commit>` dagegen lässt HEAD, wo es ist, und bewegt den **Branch**, auf den HEAD zeigt:
+
+  ```text
+  vorher:    A---B---C---D    main, HEAD
+
+  git reset HEAD~2
+
+  nachher:   A---B            main, HEAD
+                  \
+                   C---D      von keinem Branch mehr erreichbar – aber noch vorhanden
+  ```
+
+  ## `git reset` in drei Stufen
+
+  `git reset <commit>` arbeitet in bis zu drei Schritten, und der Modus bestimmt, wo es aufhört ([git reset · --soft](https://git-scm.com/docs/git-reset#Documentation/git-reset.txt---soft)):
+
+  1. Den aktuellen Branch auf `<commit>` setzen. Das macht jeder Modus.
+  2. Den Index an diesen Commit angleichen. `--soft` hört vorher auf.
+  3. Das Arbeitsverzeichnis an diesen Commit angleichen. Das macht nur `--hard`.
+
+  | Modus | Branch | Index | Arbeitsverzeichnis | Typischer Zweck |
+  | --- | --- | --- | --- | --- |
+  | `--soft` | bewegt | bleibt | bleibt | Commits zusammenfassen, Commit neu machen |
+  | `--mixed` (Standard) | bewegt | angeglichen | bleibt | Commit auflösen und neu stagen |
+  | `--hard` | bewegt | angeglichen | angeglichen | alles verwerfen |
+
+  Im Terminal sieht das so aus. Der letzte Commit „Add logout endpoint“ hat `api.py` geändert, er wird dreimal aufgelöst und zwischendurch neu erstellt:
+
+  ```console
+  $ git reset --soft HEAD~1
+  $ git status --short
+  M  api.py
+  $ git commit -qm "Add logout endpoint"
+  $ git reset HEAD~1
+  Unstaged changes after reset:
+  M       api.py
+  $ git status --short
+   M api.py
+  $ git commit -qam "Add logout endpoint"
+  $ git reset --hard HEAD~1
+  HEAD is now at 995c93a Add login endpoint
+  $ git status --short
+  ```
+
+  Nach `--soft` liegt die Änderung des aufgelösten Commits gestagt vor (`M` links), nach `--mixed` nur noch im Arbeitsverzeichnis (`M` rechts), nach `--hard` ist sie aus Index und Arbeitsverzeichnis verschwunden. Den Commit selbst gibt es in allen drei Fällen weiter. Der typische Einsatz von `--soft`: drei WIP-Commits zu einem zusammenfassen – `git reset --soft HEAD~3`, danach `git commit -m "Add login form validation"`.
+
+  > [!WARNING]
+  > `git reset --hard` verwirft uncommittete Änderungen an getrackten Dateien ohne Rückfrage. Committete Stände bekommst du über den Reflog zurück, gestagte mit etwas Mühe über `git fsck`. Änderungen, die nie gestagt waren, sind weg. Untrackte Dateien lässt `--hard` in Ruhe; die entfernt nur `git clean`.
+
+  `--keep` ist die vorsichtige Variante von `--hard`: Es setzt nur die Dateien zurück, die sich zwischen altem und neuem Commit unterscheiden, und bricht ab, wenn genau diese Dateien lokale Änderungen haben (`error: Entry 'api.py' not uptodate. Cannot merge.`). Lokale Änderungen an anderen Dateien bleiben erhalten ([git reset · --keep](https://git-scm.com/docs/git-reset#Documentation/git-reset.txt---keep)).
+
+  ## Reset mit Pfaden und `restore`
+
+  Mit einem Pfad verhält sich `git reset` anders: Es bewegt keinen Branch, sondern kopiert die Datei aus einem Commit **nur in den Index**. `git reset -- config.yaml` (ohne Commit ist `HEAD` gemeint) nimmt die Datei also aus der Staging Area – das Gegenteil von `git add`. `--soft` und `--hard` sind mit Pfaden nicht erlaubt (`fatal: Cannot do hard reset with paths.`).
+
+  Seit Git 2.23 drückt [`git restore`](https://git-scm.com/docs/git-restore) solche Dateioperationen klarer aus:
+
+  ```bash
+  git restore --staged config.yaml                  # wie git reset -- config.yaml
+  git restore config.yaml                           # Arbeitsverzeichnis aus dem Index – verwirft Änderungen!
+  git restore --source=HEAD~1 config.yaml           # Arbeitsverzeichnis aus einem älteren Commit
+  git restore --source=HEAD~1 --staged --worktree config.yaml   # Index und Arbeitsverzeichnis
+  ```
+
+  Faustregel: **`reset` mit Commit bewegt Branches, `restore` repariert Dateien.** Die ältere Form `git checkout -- config.yaml` findest du in vielen Anleitungen; sie entspricht `git restore config.yaml`.
+
+  ## Der Reflog: das Gedächtnis jeder Ref
+
+  Jedes Mal, wenn sich eine Ref bewegt – durch Commit, Reset, Rebase, Merge oder Branch-Wechsel –, schreibt Git einen Eintrag in ihren **Reflog**: alter Wert, neuer Wert, Zeitpunkt und Grund ([git reflog](https://git-scm.com/docs/git-reflog)). Es gibt einen Reflog für HEAD und einen für jeden Branch.
+
+  ```console
+  $ git reset --hard HEAD~2
+  HEAD is now at 72431aa Add orders endpoint
+  $ git reflog
+  72431aa (HEAD -> main) HEAD@{0}: reset: moving to HEAD~2
+  8ec5e1d HEAD@{1}: commit: Cache order totals
+  f30a172 HEAD@{2}: commit: Add pagination to orders
+  72431aa (HEAD -> main) HEAD@{3}: commit (initial): Add orders endpoint
+  $ git reset --hard 'HEAD@{1}'
+  HEAD is now at 8ec5e1d Cache order totals
+  ```
+
+  Der neueste Eintrag steht oben. `HEAD@{0}` ist der aktuelle Stand, `HEAD@{1}` der vor der letzten Bewegung. Diese Namen funktionieren in jedem Befehl, der einen Commit erwartet ([gitrevisions · @{n}](https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt-refnamenegmaster1)):
+
+  ```bash
+  git show 'HEAD@{1}'                  # wo HEAD vor der letzten Bewegung stand
+  git log --format=%s 'main@{2}'       # History von main vor zwei Bewegungen
+  git diff 'main@{1.hour.ago}' main    # was sich an main in der letzten Stunde geändert hat
+  git reflog show feature/login        # Reflog eines Branches, wie git log -g feature/login
+  git reset --hard ORIG_HEAD           # Stand vor dem letzten reset, merge oder rebase
+  ```
+
+  Drei Unterscheidungen sind wichtig:
+
+  - **`HEAD@{n}` oder `main@{n}`.** Der Reflog von HEAD enthält jeden Branch-Wechsel, der von `main` nur Bewegungen von `main`. Nach einigen `git switch` ist `main@{1}` oft die verlässlichere Adresse. `@{1}` ohne Namen meint den aktuellen Branch.
+  - **`HEAD~2` oder `HEAD@{2}`.** Die Tilde folgt den Eltern im Commit-Graphen, `@{…}` folgt der Zeit – dem Weg, den die Ref genommen hat. Nach einem Reset zeigen beide oft auf völlig verschiedene Commits.
+  - **Nummern verschieben sich.** Jeder neue Eintrag schiebt alle anderen eine Nummer weiter. Liegen zwischen Nachsehen und Retten weitere Befehle, nimm den Hash aus der Reflog-Zeile.
+
+  `ORIG_HEAD` ist eine eigene Ref: `reset`, `merge`, `rebase` und `am` legen dort den Stand vor ihrer Operation ab ([gitrevisions · ORIG_HEAD](https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt-ORIGHEAD)). Sie ist bequem, aber flüchtig: Der nächste dieser Befehle überschreibt sie.
+
+  > [!TIP]
+  > Setze `HEAD@{1}` in Anführungszeichen. In PowerShell haben `@{…}` eine eigene Bedeutung, in Bash, Zsh und fish schaden die Quotes nicht.
+
+  Der Reflog ist **lokal**. Er wird weder gepusht noch geklont. Was auf dem Rechner deiner Kollegin schiefging, rettest du nur dort.
+
+  > [!MERKE]
+  > Ein Commit ist erst verloren, wenn ihn kein Branch, kein Tag, kein anderer Commit und kein Reflog-Eintrag mehr erreicht – und danach `git gc` gelaufen ist.
+
+  ## Rettungsrezepte
+
+  Alle Rezepte folgen demselben Muster: den verlorenen Stand finden und ihm wieder einen Namen geben – als Branch, durch einen Reset oder als Stash. Pro Git beschreibt das Vorgehen im Kapitel [Data Recovery](https://git-scm.com/book/en/v2/Git-Internals-Maintenance-and-Data-Recovery#_data_recovery).
+
+  ### Commits nach `reset --hard`
+
+  Wie oben: `git reflog` zeigt den Eintrag vor dem Reset, `git reset --hard 'HEAD@{1}'` stellt den Branch wieder her. `ORIG_HEAD` funktioniert ebenfalls, solange kein weiterer Reset, Merge oder Rebase dazwischenkam. Wer unsicher ist, legt zuerst einen Rettungsbranch an: `git branch rettung 8ec5e1d`. Der kostet nichts und sichert den Fund.
+
+  ### Gelöschter Branch
+
+  Mit dem Branch verschwindet auch sein Reflog. Der Reflog von HEAD bleibt aber, und `git branch -D` nennt den Hash in seiner Ausgabe:
+
+  ```console
+  $ git branch -D feature/login
+  Deleted branch feature/login (was afb32ad).
+  $ git reflog
+  e885ba1 (HEAD -> main) HEAD@{0}: checkout: moving from feature/login to main
+  afb32ad HEAD@{1}: commit: Validate login input
+  4817dba HEAD@{2}: commit: Add login form
+  e885ba1 (HEAD -> main) HEAD@{3}: checkout: moving from main to feature/login
+  e885ba1 (HEAD -> main) HEAD@{4}: commit (initial): Add API skeleton
+  $ git branch feature/login afb32ad
+  ```
+
+  ### Misslungenes Rebase oder Merge
+
+  Ein Rebase schreibt mehrere Einträge in den Reflog von HEAD, einen pro übertragenem Commit. Der Reflog des Branches bekommt nur einen:
+
+  ```console
+  $ git reflog -4
+  e8b011d (HEAD -> feature/session) HEAD@{0}: rebase (finish): returning to refs/heads/feature/session
+  e8b011d (HEAD -> feature/session) HEAD@{1}: rebase (pick): Add session refresh
+  d83e747 (main) HEAD@{2}: rebase (start): checkout main
+  cc9ccf5 HEAD@{3}: checkout: moving from main to feature/session
+  $ git reflog show -2 feature/session
+  e8b011d (HEAD -> feature/session) feature/session@{0}: rebase (finish): refs/heads/feature/session onto d83e7471e4fe7de6e220631a8930b3bee0f3062d
+  cc9ccf5 feature/session@{1}: commit: Add session refresh
+  $ git reset --hard ORIG_HEAD
+  HEAD is now at cc9ccf5 Add session refresh
+  ```
+
+  `HEAD@{1}` wäre hier falsch: Es ist der letzte Schritt *innerhalb* des Rebase und damit schon der umgeschriebene Stand. Richtig sind `ORIG_HEAD` oder `feature/session@{1}`. Für Merges gilt dasselbe: Direkt nach einem ungewollten, nicht gepushten Merge bringt `git reset --hard ORIG_HEAD` den Branch zurück (mehr im Modul [Merge](/git/merge)).
+
+  ### Verworfener Stash
+
+  Ein Stash ist ein Commit mit zwei oder drei Eltern, `refs/stash` ist eine Ref, und `git stash list` zeigt deren Reflog. `git stash drop` löscht den Reflog-Eintrag – danach zeigt nichts mehr auf den Commit. In der Objektdatenbank liegt er trotzdem, und [`git fsck`](https://git-scm.com/docs/git-fsck#Documentation/git-fsck.txt---unreachable) findet ihn:
+
+  ```console
+  $ git stash drop
+  Dropped refs/stash@{0} (899822fe1507d063eacc129aa06189199a3e06da)
+  $ git fsck
+  Checking ref database: 100% (1/1), done.
+  Checking object directories: 100% (256/256), done.
+  dangling commit 899822fe1507d063eacc129aa06189199a3e06da
+  $ git stash apply 899822f
+  ```
+
+  *Dangling* heißt: Kein anderes Objekt und keine Ref zeigt darauf. Commits, die nur noch im Reflog stehen, meldet `git fsck` nicht als dangling – mit `--no-reflogs` zählen Reflog-Einträge nicht als Verweis. Gibt es viele Kandidaten, hilft das Rezept aus der Stash-Dokumentation, das nur Merge-Commits mit „WIP“ in der Nachricht zeigt ([git stash · Recovering stash entries](https://git-scm.com/docs/git-stash#Documentation/git-stash.txt-Recoveringstashentriesthatwerecleareddroppederroneously)).
+
+  ### Gestagt, aber nie committet
+
+  `git add` schreibt den Inhalt einer Datei sofort als Blob in die Objektdatenbank. Verwirft `git reset --hard` den Index, bleibt dieser Blob übrig – ohne Dateinamen, aber mit Inhalt:
+
+  ```console
+  $ git fsck --lost-found
+  Checking ref database: 100% (1/1), done.
+  Checking object directories: 100% (256/256), done.
+  dangling blob b689a1b0d9fb092591d06b12d7f2b9d3b2a6f743
+  $ git cat-file -p b689a1b > config.yaml
+  ```
+
+  `--lost-found` kopiert die Funde zusätzlich nach `.git/lost-found/other/` (Blobs) und `.git/lost-found/commit/` (Commits) ([git fsck · --lost-found](https://git-scm.com/docs/git-fsck#Documentation/git-fsck.txt---lost-found)). Welcher Blob zu welcher Datei gehörte, erkennst du nur am Inhalt.
+
+  ## Was endgültig verloren ist – und wann Git aufräumt
+
+  Git hebt unerreichbare Objekte nicht ewig auf. Reflog-Einträge verfallen nach `gc.reflogExpire` (Standard 90 Tage). Einträge, die vom aktuellen Stand der Ref nicht mehr erreichbar sind – etwa die Commits vor einem `reset --hard` –, verfallen schon nach `gc.reflogExpireUnreachable` (Standard 30 Tage) ([git gc · gc.reflogExpire](https://git-scm.com/docs/git-gc#Documentation/git-gc.txt-gcreflogExpire)). Erst wenn kein Eintrag mehr auf ein Objekt zeigt, darf `git gc` es löschen, und auch dann erst, wenn es älter ist als `gc.pruneExpire` (Standard zwei Wochen). `git gc --auto` startet Git nach manchen Befehlen selbst.
+
+  Einen Commit, den es einmal gab, holst du in den folgenden Wochen also fast immer zurück. Endgültig verloren sind:
+
+  - **nie gestagte Änderungen** an getrackten Dateien nach `git reset --hard`, `git restore <datei>` oder `git checkout -- <datei>`,
+  - **untrackte Dateien** nach `git clean -fd`,
+  - alles, was nach `git reflog expire --expire-unreachable=now --all` und `git gc --prune=now` unerreichbar war – diese Kombination löscht absichtlich und gründlich.
+
+  Dann bleiben nur noch der lokale Verlauf deiner IDE und Backups.
+
+  > [!PRAXIS]
+  > Vor riskanten Aktionen – großes Rebase, Reset, History-Umbau – setzen erfahrene Entwickler ein Lesezeichen in Form eines Branches. Geht etwas schief, ist der alte Stand einen Befehl entfernt, ohne im Reflog zu suchen. Und wer länger als eine Stunde nicht committet hat, macht einen WIP-Commit: Committete Arbeit ist rettbar, uncommittete nicht.
+
+  ```bash
+  git branch backup/session-vor-rebase         # Lesezeichen, kostet nichts
+  git rebase main
+  # ... etwas ist schiefgegangen:
+  git reset --hard backup/session-vor-rebase
+  git branch -D backup/session-vor-rebase      # aufräumen, wenn alles passt
+  ```
+
+  > [!INTERVIEW]
+  > „Du hast mit `git reset --hard` Commits verloren. Was tust du?“ – Nichts aufräumen und keinen neuen Klon anlegen. Mit `git reflog` suche ich den Eintrag vor dem Reset, sichere den Stand mit `git branch rettung <hash>` und setze dann den Branch zurück. Unerreichbare Reflog-Einträge hält Git standardmäßig 30 Tage. Verloren sind nur Änderungen, die nie gestagt oder committet waren. Künftig setze ich vor riskanten Aktionen einen Backup-Branch.
+
+  ## Häufige Fehler
+
+  - **`--hard` statt `--soft`.** Zum Zusammenfassen von Commits war `git reset --soft HEAD~3` gemeint. Rettung: `git reset --hard 'HEAD@{1}'` oder `ORIG_HEAD`, dann richtig.
+  - **`HEAD@{1}` nach einem Rebase.** Der Eintrag zeigt auf den letzten Rebase-Schritt, nicht auf den Stand davor. Nimm `ORIG_HEAD` oder den Reflog des Branches.
+  - **Veraltete Reflog-Nummern.** Zwischen `git reflog` und dem Rettungsbefehl lagen weitere Befehle, die Nummern haben sich verschoben. Nimm den Hash.
+  - **Reflog des gelöschten Branches suchen.** `git reflog show feature/login` scheitert mit `unknown revision`, weil der Reflog mit dem Branch gelöscht wurde. Such im Reflog von HEAD.
+  - **Reset auf geteilten Branches.** `git reset` schreibt History um. Ist der Commit gepusht, nimm `git revert` (siehe [Cherry-pick und Revert](/git/cherry-pick-revert)).
+  - **Panisches Aufräumen.** `git gc --prune=now`, ein neuer Klon oder gelöschte Verzeichnisse machen die Rettung schwerer oder unmöglich. Erst suchen, dann aufräumen.
+
+  ## Zusammenfassung
+
+  - Git verwaltet drei Bäume: HEAD, Index und Arbeitsverzeichnis.
+  - `reset --soft` bewegt nur den Branch, `--mixed` gleicht zusätzlich den Index an, `--hard` auch das Arbeitsverzeichnis.
+  - `reset` mit Pfad ändert nur den Index. Für Dateien ist `restore` das klarere Werkzeug.
+  - Der Reflog protokolliert jede Bewegung von HEAD und jedem Branch. `HEAD@{n}`, `main@{n}` und `main@{1.hour.ago}` adressieren frühere Stände, `ORIG_HEAD` den Stand vor `reset`, `merge` oder `rebase`.
+  - Retten heißt: den Stand im Reflog oder mit `git fsck` finden und ihm wieder einen Namen geben.
+  - Gestagte Inhalte überleben als dangling blob, nie gestagte Änderungen sind verloren.
+  - Reflog-Einträge verfallen nach 90 bzw. 30 Tagen, danach räumt `gc` auf.
+  - Vor riskanten Aktionen setzt du einen Backup-Branch.
+exercises:
+  - id: was-ist-noch-da
+    type: choice
+    title: Was überlebt `reset --hard`?
+    prompt: |
+      Auf `main` gab es zwei ungepushte Commits. Außerdem war eine Änderung an `api.py` gestagt, eine Änderung an `config.py` nur im Arbeitsverzeichnis, und die Datei `notes.md` war nie mit `git add` erfasst. Dann lief `git reset --hard HEAD~2`. Was ist danach noch vorhanden oder mit Git-Mitteln rettbar?
+    options:
+      - text: Die beiden Commits
+        correct: true
+        why: Der Branch zeigt nicht mehr darauf, aber der Reflog tut es. `git reset --hard 'HEAD@{1}'` oder `ORIG_HEAD` holt sie zurück.
+      - text: Die gestagte Änderung an `api.py`
+        correct: true
+        why: "`git add` hat den Inhalt als Blob gespeichert. `git fsck --lost-found` findet ihn als dangling blob – ohne Dateinamen, aber mit Inhalt."
+      - text: Die nie gestagte Änderung an `config.py`
+        correct: false
+        why: Sie existierte nur als Datei im Arbeitsverzeichnis. Git hat nie ein Objekt davon angelegt, `--hard` hat sie überschrieben.
+      - text: Die Datei `notes.md`
+        correct: true
+        why: "`reset --hard` fasst untrackte Dateien nicht an. `notes.md` liegt unverändert im Verzeichnis."
+    explanation: |
+      Git kann nur retten, wovon es ein Objekt angelegt hat. Commits sind über den Reflog erreichbar, gestagte Inhalte liegen als Blob in der Objektdatenbank. Die ungestagte Änderung an einer getrackten Datei hatte nie ein Objekt und ist verloren. Untrackte Dateien gehören Git nicht – `reset --hard` lässt sie liegen, erst `git clean` würde sie löschen.
+    resources:
+      - title: git-reset · --hard
+        url: https://git-scm.com/docs/git-reset#Documentation/git-reset.txt---hard
+
+  - id: reset-stufen
+    type: output
+    title: Drei Resets, drei Zustände
+    prompt: |
+      Was gibt das Skript aus? Achte auf die Spalten von `git status --short`.
+    lang: bash
+    code: |
+      git init -q
+      printf 'TIMEOUT = 30\n' > config.py
+      git add config.py && git commit -qm "Add config"
+      printf 'TIMEOUT = 60\n' > config.py && git commit -qam "Raise timeout"
+      git reset -q --soft HEAD~1
+      git status --short
+      git reset -q
+      git status --short
+      git reset -q --hard
+      git status --short
+      cat config.py
+    expected: |
+      M  config.py
+       M config.py
+      TIMEOUT = 30
+    verify: true
+    hints:
+      - Links steht der Vergleich HEAD ↔ Index, rechts Index ↔ Arbeitsverzeichnis.
+      - "`git reset` ohne Commit und ohne Modus ist `git reset --mixed HEAD`."
+    explanation: |
+      `--soft HEAD~1` bewegt nur den Branch: Der Index enthält noch `TIMEOUT = 60`, HEAD aber `30` – gestagte Änderung, `M` links. `git reset` (mixed, `HEAD`) gleicht den Index an HEAD an; die Änderung bleibt nur im Arbeitsverzeichnis, `M` rechts. `git reset --hard` gleicht auch das Arbeitsverzeichnis an, `git status --short` gibt nichts aus, und die Datei steht wieder auf 30.
+    resources:
+      - title: Pro Git · The Role of Reset
+        url: https://git-scm.com/book/en/v2/Git-Tools-Reset-Demystified#_the_role_of_reset
+
+  - id: tilde-oder-reflog
+    type: output
+    title: Eltern oder Erinnerung?
+    prompt: |
+      Was gibt das Skript aus?
+    lang: bash
+    code: |
+      git init -q
+      for n in 1 2 3; do
+        printf 'VERSION = %s\n' "$n" > version.py
+        git add version.py && git commit -qm "Release $n"
+      done
+      git reset -q --hard HEAD~2
+      printf 'VERSION = "1-hotfix"\n' > version.py
+      git commit -qam "Hotfix"
+      git log -1 --format=%s HEAD~1
+      git log -1 --format=%s 'HEAD@{2}'
+      git rev-list --count 'HEAD@{2}'
+    expected: |
+      Release 1
+      Release 3
+      3
+    verify: true
+    hints:
+      - "Schreib den Reflog von HEAD auf: Welche drei Einträge kamen zuletzt?"
+      - "`HEAD@{0}` ist der Hotfix-Commit, `HEAD@{1}` der Reset."
+    explanation: |
+      `HEAD~1` folgt dem Elternteil des Hotfix-Commits – das ist „Release 1“, denn der Hotfix entstand nach dem Reset. `HEAD@{2}` folgt dem Reflog: `@{0}` ist der Hotfix-Commit, `@{1}` der Reset auf „Release 1“, `@{2}` der Stand davor, also „Release 3“. Von dort aus sind drei Commits erreichbar. Die Commits „Release 2“ und „Release 3“ sind vom Branch aus nicht mehr sichtbar, über den Reflog aber vollständig vorhanden.
+    resources:
+      - title: gitrevisions · @{n}
+        url: https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt-refnamenegmaster1
+
+  - id: commit-aufloesen
+    type: command
+    title: Commit auflösen, Arbeit behalten
+    context: |
+      Dein letzter Commit „Add login form“ auf `feature/login` ist nicht gepusht. Die Nachricht passt nicht, und eine Datei fehlt.
+    prompt: |
+      Mach den Commit mit `git reset` rückgängig, sodass seine Änderungen **gestagt** bleiben.
+    answers:
+      - git reset --soft HEAD~1
+      - git reset --soft HEAD~
+      - git reset --soft HEAD^
+      - git reset --soft HEAD^1
+      - git reset --soft @~
+      - git reset --soft @~1
+      - git reset --soft @^
+    explanation: |
+      `--soft` bewegt nur den Branch auf den Elternteil. Index und Arbeitsverzeichnis bleiben unverändert, die Änderungen des Commits erscheinen deshalb als gestagt. Jetzt kannst du die fehlende Datei mit `git add` ergänzen und neu committen. Für genau diesen Fall gibt es auch `git commit --amend`, das beides in einem Schritt erledigt. `git reset HEAD~1` (mixed) hätte die Änderungen zusätzlich aus dem Index genommen.
+    resources:
+      - title: git-reset · Undo a commit and redo
+        url: https://git-scm.com/docs/git-reset#Documentation/git-reset.txt-Undoacommitandredo
+
+  - id: datei-unstagen
+    type: command
+    title: Zu viel gestagt
+    context: |
+      ```console
+      $ git status --short
+      M  config.yaml
+      M  src/api.py
+      ```
+    prompt: |
+      Nimm `config.yaml` aus der Staging Area. Die Änderung im Arbeitsverzeichnis muss erhalten bleiben, `src/api.py` bleibt gestagt.
+    answers:
+      - git restore --staged config.yaml
+      - git restore -S config.yaml
+      - git restore --staged -- config.yaml
+      - git reset config.yaml
+      - git reset -- config.yaml
+      - git reset HEAD config.yaml
+      - git reset HEAD -- config.yaml
+      - git reset -q config.yaml
+    explanation: |
+      `git restore --staged` kopiert die Datei aus HEAD in den Index und lässt das Arbeitsverzeichnis in Ruhe. `git reset -- config.yaml` macht dasselbe: Mit einem Pfad bewegt `reset` keinen Branch, sondern setzt nur den Indexeintrag zurück. `git restore config.yaml` ohne `--staged` wäre gefährlich – es überschreibt die Datei im Arbeitsverzeichnis mit dem Stand aus dem Index.
+    resources:
+      - title: git-restore · --staged
+        url: https://git-scm.com/docs/git-restore#Documentation/git-restore.txt---staged
+
+  - id: reflog-eines-branches
+    type: command
+    title: Nur die Geschichte eines Branches
+    context: |
+      Im Reflog von HEAD stehen Dutzende Branch-Wechsel. Dich interessiert nur, wohin `release/2.4` in letzter Zeit gezeigt hat.
+    prompt: |
+      Zeige den Reflog des Branches `release/2.4` mit `git reflog`.
+    answers:
+      - git reflog show release/2.4
+      - git reflog release/2.4
+    output: |
+      3c8e2f1 release/2.4@{0}: cherry-pick: Fix off-by-one in session expiry
+      a91d0b7 release/2.4@{1}: merge origin/release/2.4: Fast-forward
+      5f2e8c4 release/2.4@{2}: branch: Created from refs/remotes/origin/release/2.4
+    explanation: |
+      Jeder Branch hat einen eigenen Reflog, der nur seine Bewegungen enthält – Commits, Resets, Merges, Rebases, nicht aber Wechsel zwischen Branches. `git reflog release/2.4` ist die Kurzform von `git reflog show release/2.4`. Gleichwertig ist `git log -g release/2.4` (`--walk-reflogs`), das die volle `git log`-Formatierung erlaubt. Die Einträge adressierst du als `release/2.4@{1}` usw.
+    resources:
+      - title: git log · --walk-reflogs
+        url: https://git-scm.com/docs/git-log#Documentation/git-log.txt---walk-reflogs
+
+  - id: rettungsbefehle
+    type: gap
+    title: Drei Rettungen, drei Befehle
+    prompt: |
+      Ergänze die Rettungsbefehle. Die Kommentare beschreiben, was passiert ist.
+    lang: bash
+    code: |
+      # 1. Branch gelöscht. Git meldete: Deleted branch feature/login (was 4817dba).
+      #    Stelle den Branch unter demselben Namen wieder her, ohne ihn auszuchecken.
+      git ⟦branch⟧ feature/login 4817dba
+
+      # 2. Stash verworfen. Git meldete: Dropped refs/stash@{0} (899822fe…).
+      #    Wende den Stash wieder auf das Arbeitsverzeichnis an.
+      git ⟦stash apply⟧ 899822f
+
+      # 3. Gerade eben auf main versehentlich: git reset --hard HEAD~2
+      #    Seitdem kein weiterer Befehl. Nimm keinen Hash.
+      git reset --hard ⟦ORIG_HEAD⟧
+    gaps:
+      - label: Branch anlegen
+        hint: Der Befehl, der Branches auflistet, legt mit Name und Commit auch einen an.
+      - label: Stash anwenden
+        hint: "`pop` akzeptiert nur Einträge aus der Stash-Liste – dieser Commit steht nicht mehr darin."
+        accept: ["stash apply --index"]
+      - label: Stand vor dem Reset
+        hint: "`reset` legt den vorherigen Stand in einer eigenen Ref ab. Alternativ hilft der Reflog."
+        accept: ["HEAD@{1}", "'HEAD@{1}'", "main@{1}", "'main@{1}'", "@{1}", "'@{1}'"]
+    explanation: |
+      `git branch feature/login 4817dba` setzt einen neuen Branch auf den alten Commit. `git stash apply` akzeptiert jeden Stash-Commit, auch einen, der nicht mehr in der Liste steht. `git stash pop` würde mit `is not a stash reference` abbrechen. `ORIG_HEAD` zeigt nach einem Reset auf den Stand davor. Gleichwertig sind `HEAD@{1}` und `main@{1}`, weil seit dem Reset nichts passiert ist.
+    resources:
+      - title: git-stash · Recovering stash entries
+        url: https://git-scm.com/docs/git-stash#Documentation/git-stash.txt-Recoveringstashentriesthatwerecleareddroppederroneously
+
+  - id: rebase-rueckgaengig
+    type: bug
+    title: Das Rebase bleibt
+    prompt: |
+      Nach dem Rebase von `feature/session` auf `main` schlagen die Tests fehl. Die letzte Zeile soll den Branch auf den Stand **vor** dem Rebase zurücksetzen. Danach zeigt `git log --format=%s` aber weiterhin die umgeschriebenen Commits über „Raise default timeout“ von `main`. Finde die fehlerhafte Zeile und korrigiere sie, ohne einen Hash zu verwenden.
+    lang: bash
+    code: |
+      git switch feature/session
+      git rebase main
+      # Tests schlagen fehl – Rebase rückgängig machen:
+      git reset --hard 'HEAD@{1}'
+    lines: [4]
+    fix:
+      - line: 4
+        answers:
+          - git reset --hard ORIG_HEAD
+          - git reset --hard 'feature/session@{1}'
+          - git reset --hard feature/session@{1}
+          - git reset --hard '@{1}'
+          - git reset --hard @{1}
+    explanation: |
+      Ein Rebase schreibt mehrere Einträge in den Reflog von HEAD: `rebase (start)`, je ein `rebase (pick)` und `rebase (finish)`. `HEAD@{1}` ist der letzte Pick – derselbe umgeschriebene Stand wie jetzt. Der Reset bewegt also nichts. `ORIG_HEAD` zeigt auf den Stand vor dem Rebase. Der Reflog des Branches enthält pro Rebase nur einen Eintrag, deshalb ist auch `feature/session@{1}` (kurz `@{1}`) richtig. Vorsicht, wenn die falsche Zeile schon lief: Auch `reset` setzt `ORIG_HEAD`, danach zeigt es auf den umgeschriebenen Stand. Dann hilft nur `git reflog show feature/session`.
+    resources:
+      - title: gitrevisions · ORIG_HEAD
+        url: https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt-ORIGHEAD
+
+  - id: reflog-lesen
+    type: explain
+    title: Wo sind die zwei Commits?
+    prompt: |
+      Ein Kollege meldet: „Meine zwei letzten Commits auf `main` sind weg.“ Seitdem hat er einen Hotfix-Branch angelegt, dort committet und ist zurück auf `main` gewechselt. Erkläre anhand des Reflogs, was passiert ist und wie er die Commits zurückbekommt.
+    lang: console
+    code: |
+      $ git reflog
+      8b21a0a (HEAD -> main) HEAD@{0}: checkout: moving from hotfix/2.4.1 to main
+      3b42dbe (hotfix/2.4.1) HEAD@{1}: commit: Fix VAT rounding
+      8b21a0a (HEAD -> main) HEAD@{2}: checkout: moving from main to hotfix/2.4.1
+      8b21a0a (HEAD -> main) HEAD@{3}: reset: moving to HEAD~2
+      2a3d98c HEAD@{4}: commit: Cache order totals
+      b866160 HEAD@{5}: commit: Add pagination to orders
+      8b21a0a (HEAD -> main) HEAD@{6}: commit (initial): Add orders endpoint
+    points:
+      - Von unten gelesen – nach zwei Commits hat `reset --hard HEAD~2` (`HEAD@{3}`) `main` auf „Add orders endpoint“ zurückgesetzt.
+      - Die Commits `b866160` und `2a3d98c` existieren weiter, nur zeigt kein Branch mehr darauf.
+      - "Rettung auf `main`: `git reset --hard 2a3d98c` (oder vorher `git branch rettung 2a3d98c`); `HEAD@{1}` wäre falsch, weil seither neue Einträge dazukamen."
+      - Der Hotfix-Branch ist davon unabhängig und bleibt erhalten.
+    explanation: |
+      Der Reflog liest sich von unten nach oben: zwei Commits, dann `reset: moving to HEAD~2` – seitdem zeigt `main` wieder auf `8b21a0a`. Die Commits „Add pagination to orders“ (`b866160`) und „Cache order totals“ (`2a3d98c`) sind nicht gelöscht, nur unerreichbar. Weil danach ein Branch-Wechsel, ein Commit auf `hotfix/2.4.1` und ein Rückwechsel kamen, ist `HEAD@{1}` inzwischen der Hotfix-Commit. Sicher ist der Hash: `git reset --hard 2a3d98c` auf `main` stellt beide Commits wieder her, weil `2a3d98c` `b866160` als Elternteil hat. Auch `main@{1}` zeigt auf `2a3d98c`, weil der Reflog von `main` die Branch-Wechsel nicht enthält. Der Hotfix-Branch bleibt unberührt.
+    resources:
+      - title: git-reflog – Referenz
+        url: https://git-scm.com/docs/git-reflog
+
+  - id: labor-hard-statt-soft
+    type: practice
+    title: "Labor: --hard statt --soft"
+    prompt: |
+      Führe das Labor-Skript in einem leeren Verzeichnis aus (`cd "$(mktemp -d)"`) – **nie** in einem echten Repository.
+
+      Auf `main` lagen drei unaufgeräumte Commits „WIP“, „WIP 2“ und „fix“ über „Add login“. Sie sollten zu einem Commit zusammengefasst werden. Nach dem letzten Befehl des Skripts gibt es nur noch „Add login“, und `validate.py` ist verschwunden.
+
+      Hol die Arbeit zurück und fasse die drei Commits anschließend richtig zu **einem** Commit „Add login form validation“ zusammen. Prüfe am Ende mit `git log --format=%s`, `cat validate.py` und `git status --short`.
+    lang: bash
+    starter: |
+      # Labor: erzeugt den kaputten Zustand
+      git init -q -b main
+      printf 'def login(user, password):\n    return check(user, password)\n' > auth.py
+      git add auth.py && git commit -qm "Add login"
+      printf 'def validate_email(email):\n    return "@" in email\n' > validate.py
+      git add validate.py && git commit -qm "WIP"
+      printf 'def validate_password(pw):\n    return len(pw) >= 12\n' >> validate.py
+      git commit -qam "WIP 2"
+      printf 'def validate_form(email, pw):\n    return validate_email(email) and validate_password(pw)\n' >> validate.py
+      git commit -qam "fix"
+      # Ziel war: die drei WIP-Commits zu einem zusammenfassen. Stattdessen:
+      git reset -q --hard HEAD~3
+      # Deine Reparatur:
+    solution: |
+      # Labor: erzeugt den kaputten Zustand
+      git init -q -b main
+      printf 'def login(user, password):\n    return check(user, password)\n' > auth.py
+      git add auth.py && git commit -qm "Add login"
+      printf 'def validate_email(email):\n    return "@" in email\n' > validate.py
+      git add validate.py && git commit -qm "WIP"
+      printf 'def validate_password(pw):\n    return len(pw) >= 12\n' >> validate.py
+      git commit -qam "WIP 2"
+      printf 'def validate_form(email, pw):\n    return validate_email(email) and validate_password(pw)\n' >> validate.py
+      git commit -qam "fix"
+      # Ziel war: die drei WIP-Commits zu einem zusammenfassen. Stattdessen:
+      git reset -q --hard HEAD~3
+      # Reparatur
+      git reset --hard 'HEAD@{1}'
+      git reset --soft HEAD~3
+      git commit -qm "Add login form validation"
+      # Kontrolle
+      test "$(git log --format=%s)" = "$(printf 'Add login form validation\nAdd login')"
+      grep -q 'def validate_email' validate.py
+      grep -q 'def validate_form' validate.py
+      test -z "$(git status --porcelain)"
+    checklist:
+      - "`git log --format=%s` zeigt genau „Add login form validation“ und „Add login“."
+      - "`validate.py` enthält `validate_email`, `validate_password` und `validate_form`."
+      - "`git status --short` ist leer."
+    verify: true
+    hints:
+      - "`git reflog` zeigt, wo `main` vor dem Reset stand."
+      - "`git reset --hard 'HEAD@{1}'` oder `git reset --hard ORIG_HEAD` holt die drei Commits zurück."
+      - "Zum Zusammenfassen bewegt `git reset --soft HEAD~3` nur den Branch – die Änderungen bleiben gestagt für einen neuen Commit."
+    explanation: |
+      `reset --hard HEAD~3` hat `main` zurückgesetzt und Index sowie Arbeitsverzeichnis angeglichen. Die drei Commits lagen danach nur noch im Reflog. `HEAD@{1}` und `ORIG_HEAD` zeigen beide auf „fix“, den Stand vor dem Reset. Von dort aus bewegt `reset --soft HEAD~3` nur den Branch auf „Add login“. Index und Arbeitsverzeichnis behalten den Inhalt aller drei Commits, und ein einziger `git commit` fasst sie zusammen. Das Gleiche erreichst du mit interaktivem Rebase und `fixup` (siehe [Interaktives Rebase](/git/interactive-rebase)). Für die obersten drei Commits eines Branches ist `reset --soft` der kürzere Weg.
+    resources:
+      - title: Pro Git · Squashing mit reset
+        url: https://git-scm.com/book/en/v2/Git-Tools-Reset-Demystified#_squashing_2
+
+  - id: labor-branch-geloescht
+    type: practice
+    title: "Labor: Der falsche Branch ist gelöscht"
+    prompt: |
+      Führe das Labor-Skript in einem leeren Verzeichnis aus (`cd "$(mktemp -d)"`) – **nie** in einem echten Repository.
+
+      Beim Aufräumen nach einem Review wurde `feature/password-reset` mit `git branch -D` gelöscht. Die Ausgabe mit dem Hash ist nicht mehr zu sehen, `git reflog show feature/password-reset` meldet `unknown revision`. Die beiden Commits des Branches waren nie gemergt oder gepusht.
+
+      Stelle `feature/password-reset` mit beiden Commits wieder her, ohne `main` zu verlassen. Prüfe am Ende mit `git log --format=%s feature/password-reset` und `git branch --show-current`.
+    lang: bash
+    starter: |
+      # Labor: erzeugt den kaputten Zustand
+      git init -q -b main
+      printf 'def login(user, password):\n    return check(user, password)\n' > auth.py
+      git add auth.py && git commit -qm "Add login"
+      git switch -qc feature/password-reset
+      printf 'def send_reset_mail(user):\n    mail(user.email, token(user))\n' > reset.py
+      git add reset.py && git commit -qm "Send password reset mail"
+      printf 'RESET_TOKEN_TTL = 900\n' > settings.py
+      git add settings.py && git commit -qm "Expire reset tokens after 15 minutes"
+      git switch -q main
+      # Aufräumen nach dem Review – dabei den falschen Branch erwischt:
+      git branch -q -D feature/password-reset
+      # Deine Reparatur:
+    solution: |
+      # Labor: erzeugt den kaputten Zustand
+      git init -q -b main
+      printf 'def login(user, password):\n    return check(user, password)\n' > auth.py
+      git add auth.py && git commit -qm "Add login"
+      git switch -qc feature/password-reset
+      printf 'def send_reset_mail(user):\n    mail(user.email, token(user))\n' > reset.py
+      git add reset.py && git commit -qm "Send password reset mail"
+      printf 'RESET_TOKEN_TTL = 900\n' > settings.py
+      git add settings.py && git commit -qm "Expire reset tokens after 15 minutes"
+      git switch -q main
+      # Aufräumen nach dem Review – dabei den falschen Branch erwischt:
+      git branch -q -D feature/password-reset
+      # Reparatur
+      git branch feature/password-reset 'HEAD@{1}'
+      # Kontrolle
+      test "$(git log -1 --format=%s feature/password-reset)" = "Expire reset tokens after 15 minutes"
+      test "$(git rev-list --count main..feature/password-reset)" = 2
+      test "$(git branch --show-current)" = main
+    checklist:
+      - "`git log --format=%s feature/password-reset` zeigt „Expire reset tokens after 15 minutes“, „Send password reset mail“ und „Add login“."
+      - "`git rev-list --count main..feature/password-reset` ergibt 2."
+      - "`git branch --show-current` zeigt `main`."
+    verify: true
+    hints:
+      - Mit dem Branch ist auch sein Reflog verschwunden. Welcher Reflog bleibt?
+      - "`git reflog` zeigt, von wo aus zuletzt auf `main` gewechselt wurde."
+      - "`git branch <name> <commit>` legt einen Branch an, ohne ihn auszuchecken."
+    explanation: |
+      `git branch -D` löscht die Ref und ihren Reflog, aber nicht die Commits. Im Reflog von HEAD steht noch `checkout: moving from feature/password-reset to main` – der Eintrag direkt darunter (`HEAD@{1}`) ist der letzte Commit des Branches. `git branch feature/password-reset 'HEAD@{1}'` gibt ihm seinen Namen zurück. Stattdessen den Hash aus der Reflog-Zeile zu nehmen, ist genauso richtig und robuster, wenn inzwischen weitere Befehle liefen. Findest du die Commits im Reflog von HEAD nicht – etwa weil die Einträge abgelaufen sind –, sucht `git fsck --no-reflogs` nach Commits, auf die kein Branch mehr zeigt.
+    resources:
+      - title: Pro Git · Data Recovery
+        url: https://git-scm.com/book/en/v2/Git-Internals-Maintenance-and-Data-Recovery#_data_recovery
+
+  - id: labor-rebase-missglueckt
+    type: practice
+    title: "Labor: Ein Commit ist beim Rebase verschwunden"
+    prompt: |
+      Führe das Labor-Skript in einem leeren Verzeichnis aus (`cd "$(mktemp -d)"`) – **nie** in einem echten Repository.
+
+      `feature/session` wurde auf `main` gerebaset und danach um einen Commit „Test session refresh“ ergänzt. Erst jetzt fällt auf: Der Commit „Extend session timeout“ ist aus dem Branch verschwunden, und `config.py` enthält `TIMEOUT = 60` statt `120`. Nichts ist gepusht.
+
+      Stelle `feature/session` so her, wie der Branch vor dem Rebase war, plus den neuen Commit „Test session refresh“ obendrauf. Ein erneutes Rebase ist nicht Teil der Aufgabe. Prüfe am Ende mit `git log --format=%s`, `cat config.py` und `git status --short`.
+    lang: bash
+    starter: |
+      # Labor: erzeugt den kaputten Zustand
+      git init -q -b main
+      printf 'TIMEOUT = 30\nLOG_LEVEL = "info"\n' > config.py
+      git add config.py && git commit -qm "Add config"
+      git switch -qc feature/session
+      printf 'TIMEOUT = 120\nLOG_LEVEL = "info"\n' > config.py
+      git commit -qam "Extend session timeout"
+      printf 'def refresh(session):\n    session.touch()\n' > session.py
+      git add session.py && git commit -qm "Add session refresh"
+      git switch -q main
+      printf 'TIMEOUT = 60\nLOG_LEVEL = "info"\n' > config.py
+      git commit -qam "Raise default timeout"
+      git switch -q feature/session
+      # "ours = meine Änderungen", dachte jemand:
+      git rebase -q -X ours main
+      # Danach unbemerkt weitergearbeitet:
+      printf 'def test_refresh():\n    assert refresh\n' > test_session.py
+      git add test_session.py && git commit -qm "Test session refresh"
+      # Deine Reparatur:
+    solution: |
+      # Labor: erzeugt den kaputten Zustand
+      git init -q -b main
+      printf 'TIMEOUT = 30\nLOG_LEVEL = "info"\n' > config.py
+      git add config.py && git commit -qm "Add config"
+      git switch -qc feature/session
+      printf 'TIMEOUT = 120\nLOG_LEVEL = "info"\n' > config.py
+      git commit -qam "Extend session timeout"
+      printf 'def refresh(session):\n    session.touch()\n' > session.py
+      git add session.py && git commit -qm "Add session refresh"
+      git switch -q main
+      printf 'TIMEOUT = 60\nLOG_LEVEL = "info"\n' > config.py
+      git commit -qam "Raise default timeout"
+      git switch -q feature/session
+      # "ours = meine Änderungen", dachte jemand:
+      git rebase -q -X ours main
+      # Danach unbemerkt weitergearbeitet:
+      printf 'def test_refresh():\n    assert refresh\n' > test_session.py
+      git add test_session.py && git commit -qm "Test session refresh"
+      # Reparatur
+      git reset --hard ORIG_HEAD
+      git cherry-pick 'HEAD@{1}'
+      # Kontrolle
+      test "$(git log --format=%s)" = "$(printf 'Test session refresh\nAdd session refresh\nExtend session timeout\nAdd config')"
+      grep -q 'TIMEOUT = 120' config.py
+      test -f test_session.py
+      test -z "$(git status --porcelain)"
+    checklist:
+      - "`git log --format=%s` zeigt „Test session refresh“, „Add session refresh“, „Extend session timeout“, „Add config“ – „Raise default timeout“ von `main` ist nicht dabei."
+      - "`config.py` enthält `TIMEOUT = 120`."
+      - "`test_session.py` existiert."
+      - "`git status --short` ist leer."
+    verify: true
+    hints:
+      - Welche Ref zeigt nach einem Rebase auf den Stand davor – und hat `git commit` sie verändert?
+      - "Nach dem Zurücksetzen steht der neue Commit nur noch im Reflog – `HEAD@{1}` direkt nach dem Reset."
+      - "`git cherry-pick` überträgt ihn wieder auf den wiederhergestellten Branch."
+    explanation: |
+      `git rebase -X ours` bedeutet beim Rebase das Gegenteil dessen, was die Person dachte: „ours“ ist beim Rebase die Basis, auf die übertragen wird – hier `main` –, „theirs“ der eigene Commit. Bei jedem Konflikt gewann `main`. „Extend session timeout“ wurde dadurch leer und stillschweigend verworfen (`dropping … patch contents already upstream`). `ORIG_HEAD` zeigt noch auf den Stand vor dem Rebase, weil `git commit` es nicht verändert. `git reset --hard ORIG_HEAD` stellt ihn her. Der neue Test-Commit ist danach nur noch über `HEAD@{1}` erreichbar, `git cherry-pick` überträgt ihn. Statt `ORIG_HEAD` funktioniert auch `git reset --hard 'feature/session@{2}'`: Der Reflog des Branches enthält den Test-Commit (`@{0}`), das Ende des Rebase (`@{1}`) und davor den alten Stand. Danach lässt sich das Rebase ohne `-X` wiederholen und der Konflikt von Hand lösen (siehe [Konflikte lösen](/git/konflikte)).
+    resources:
+      - title: git-rebase · -X (ours und theirs beim Rebase)
+        url: https://git-scm.com/docs/git-rebase#Documentation/git-rebase.txt--Xstrategy-option
+      - title: gitrevisions · ORIG_HEAD
+        url: https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt-ORIGHEAD
+
+  - id: labor-stash-verworfen
+    type: practice
+    title: "Labor: Der Stash ist weg"
+    prompt: |
+      Führe das Labor-Skript in einem leeren Verzeichnis aus (`cd "$(mktemp -d)"`) – **nie** in einem echten Repository.
+
+      Halbfertige Arbeit am Passwort-Reset wurde mit `git stash push` geparkt – eine neue, gestagte Datei `reset.py` und eine Änderung an `auth.py`. Beim Aufräumen der Stash-Liste wurde der Eintrag verworfen. `git stash list` ist leer, die Ausgabe von `git stash drop` mit dem Hash wurde unterdrückt.
+
+      Hol die geparkte Arbeit zurück ins Arbeitsverzeichnis. Prüfe am Ende mit `git status --short` und `cat auth.py`.
+    lang: bash
+    starter: |
+      # Labor: erzeugt den kaputten Zustand
+      git init -q -b main
+      printf 'def login(user, password):\n    return check(user, password)\n' > auth.py
+      git add auth.py && git commit -qm "Add login"
+      # Halbfertige Arbeit wird geparkt ...
+      printf 'def reset_password(user):\n    send_reset_mail(user)\n' > reset.py
+      git add reset.py
+      printf 'def login(user, password):\n    audit(user)\n    return check(user, password)\n' > auth.py
+      git stash push -q -m "WIP: password reset"
+      # ... und beim Aufräumen der Stash-Liste verworfen:
+      git stash drop -q
+      # Deine Reparatur:
+    solution: |
+      # Labor: erzeugt den kaputten Zustand
+      git init -q -b main
+      printf 'def login(user, password):\n    return check(user, password)\n' > auth.py
+      git add auth.py && git commit -qm "Add login"
+      # Halbfertige Arbeit wird geparkt ...
+      printf 'def reset_password(user):\n    send_reset_mail(user)\n' > reset.py
+      git add reset.py
+      printf 'def login(user, password):\n    audit(user)\n    return check(user, password)\n' > auth.py
+      git stash push -q -m "WIP: password reset"
+      # ... und beim Aufräumen der Stash-Liste verworfen:
+      git stash drop -q
+      # Reparatur
+      stash=$(git fsck 2>/dev/null | awk '/dangling commit/ {print $3}')
+      git log -1 --format=%s "$stash"
+      git stash apply "$stash"
+      # Kontrolle
+      test -f reset.py
+      grep -q 'audit(user)' auth.py
+      test "$(git status --short)" = "$(printf ' M auth.py\nA  reset.py')"
+    checklist:
+      - "`git status --short` zeigt ` M auth.py` und `A  reset.py`."
+      - "`auth.py` enthält `audit(user)`."
+      - "`reset.py` enthält `send_reset_mail`."
+    verify: true
+    hints:
+      - Ein Stash ist ein Commit. Nach dem Verwerfen zeigt keine Ref mehr darauf.
+      - "`git fsck` meldet Commits, auf die nichts mehr zeigt, als `dangling commit`."
+      - "`git stash apply <hash>` nimmt auch einen Commit, der nicht mehr in der Stash-Liste steht."
+    explanation: |
+      `git stash push` legt einen Commit an, dessen Eltern der aktuelle HEAD-Commit und ein Commit mit dem Index-Stand sind. `refs/stash` und ihr Reflog bilden die Stash-Liste. `git stash drop` entfernt nur den Listeneintrag. Der Commit bleibt, bis `gc` ihn nach Ablauf der Fristen entfernt. `git fsck` meldet ihn als `dangling commit`, `git log -1 --format=%s <hash>` zeigt die Stash-Nachricht zur Kontrolle, `git stash apply <hash>` wendet ihn an. Neue Dateien kommen dabei gestagt zurück, geänderte ungestagt. Mit `--index` wäre auch der frühere Index-Stand wiederhergestellt worden. Bei vielen Kandidaten hilft das Rezept aus der Stash-Dokumentation.
+    resources:
+      - title: git-stash · Recovering stash entries
+        url: https://git-scm.com/docs/git-stash#Documentation/git-stash.txt-Recoveringstashentriesthatwerecleareddroppederroneously
+
+  - id: labor-nur-gestagt
+    type: practice
+    title: "Labor: Gestagt, nie committet"
+    prompt: |
+      Führe das Labor-Skript in einem leeren Verzeichnis aus (`cd "$(mktemp -d)"`) – **nie** in einem echten Repository.
+
+      Nach einem Lasttest wurde `pool_size` in `config.yaml` von 5 auf 20 erhöht und die Änderung gestagt. Danach kam noch eine Zeile `timeout: 30` dazu, ungestagt. Ein `git reset --hard` zum „schnellen Aufräumen“ hat beides entfernt. Es gibt keinen Commit mit dem neuen Wert.
+
+      Hol den gestagten Stand von `config.yaml` zurück ins Arbeitsverzeichnis. Prüfe am Ende mit `cat config.yaml` und `git status --short`. Überlege, warum `timeout: 30` nicht zurückkommt.
+    lang: bash
+    starter: |
+      # Labor: erzeugt den kaputten Zustand
+      git init -q -b main
+      printf 'database:\n  host: localhost\n  pool_size: 5\n' > config.yaml
+      git add config.yaml && git commit -qm "Add database config"
+      # Neue Pool-Größe nach dem Lasttest – gestagt, noch nicht committet:
+      printf 'database:\n  host: localhost\n  pool_size: 20\n' > config.yaml
+      git add config.yaml
+      # Danach noch eine Zeile ergänzt, aber nicht gestagt:
+      printf '  timeout: 30\n' >> config.yaml
+      # Um "schnell aufzuräumen":
+      git reset -q --hard
+      # Deine Reparatur:
+    solution: |
+      # Labor: erzeugt den kaputten Zustand
+      git init -q -b main
+      printf 'database:\n  host: localhost\n  pool_size: 5\n' > config.yaml
+      git add config.yaml && git commit -qm "Add database config"
+      # Neue Pool-Größe nach dem Lasttest – gestagt, noch nicht committet:
+      printf 'database:\n  host: localhost\n  pool_size: 20\n' > config.yaml
+      git add config.yaml
+      # Danach noch eine Zeile ergänzt, aber nicht gestagt:
+      printf '  timeout: 30\n' >> config.yaml
+      # Um "schnell aufzuräumen":
+      git reset -q --hard
+      # Reparatur
+      blob=$(git fsck --lost-found 2>/dev/null | awk '/dangling blob/ {print $3}')
+      git cat-file -p "$blob" > config.yaml
+      # Kontrolle
+      grep -q 'pool_size: 20' config.yaml
+      grep -q 'host: localhost' config.yaml
+      test "$(git status --short)" = " M config.yaml"
+    checklist:
+      - "`config.yaml` enthält `pool_size: 20` und `host: localhost`."
+      - "`git status --short` zeigt ` M config.yaml`."
+      - Du kannst erklären, warum `timeout: 30` verloren ist.
+    verify: true
+    hints:
+      - "`git add` legt sofort einen Blob in der Objektdatenbank an."
+      - "`git fsck --lost-found` listet dangling blobs und kopiert sie nach `.git/lost-found/other/`."
+      - "`git cat-file -p <hash> > config.yaml` schreibt den Blob-Inhalt in die Datei."
+    explanation: |
+      Beim `git add` hat Git den Inhalt mit `pool_size: 20` als Blob gespeichert und im Index eingetragen. `reset --hard` hat den Index zurückgesetzt. Der Blob blieb als dangling blob liegen – ohne Dateinamen, weil Namen nur in Trees stehen. `git fsck --lost-found` findet ihn, `git cat-file -p` gibt den Inhalt aus. Die Zeile `timeout: 30` existierte nur im Arbeitsverzeichnis. Git hatte nie ein Objekt davon und kann sie nicht zurückholen. Genau das ist die Grenze jeder Git-Rettung: Was nie gestagt oder committet war, ist nach `reset --hard` verloren.
+    resources:
+      - title: git-fsck · --lost-found
+        url: https://git-scm.com/docs/git-fsck#Documentation/git-fsck.txt---lost-found

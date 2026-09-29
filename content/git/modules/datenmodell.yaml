@@ -1,0 +1,697 @@
+id: datenmodell
+title: "Das Datenmodell: Blob, Tree, Commit"
+level: 2
+minutes: 170
+summary: Unter jedem Git-Befehl liegt eine kleine Objektdatenbank aus Blobs, Trees, Commits und Tags plus Refs, die darauf zeigen – wer sie versteht, sagt vorher, was ein Befehl tut, und findet verloren geglaubte Stände wieder.
+goals:
+  - Du erklärst, wie Git Inhalte adressiert, und zeigst mit `hash-object` und `cat-file`, dass gleicher Inhalt überall denselben Hash hat.
+  - Du unterscheidest Blob, Tree, Commit und annotierten Tag und liest ihren Inhalt mit `cat-file -p` und `ls-tree`.
+  - Du beschreibst Branches, Tags und HEAD als Refs, findest sie in `.git/refs` und `packed-refs` und setzt sie mit `update-ref` sicher um.
+  - Du zerlegst `git commit` in `write-tree`, `commit-tree` und `update-ref` und baust einen Commit nur mit Plumbing.
+  - Du navigierst im Commit-Graphen mit `HEAD~n`, `HEAD^n`, `<rev>:<pfad>` und `rev-parse`.
+resources:
+  - title: Pro Git · Git Objects
+    url: https://git-scm.com/book/en/v2/Git-Internals-Git-Objects
+  - title: Pro Git · Git References
+    url: https://git-scm.com/book/en/v2/Git-Internals-Git-References
+  - title: gitrevisions · Specifying Revisions
+    url: https://git-scm.com/docs/gitrevisions#_specifying_revisions
+  - title: gitdatamodel
+    url: https://git-scm.com/docs/gitdatamodel
+  - title: gitrepository-layout
+    url: https://git-scm.com/docs/gitrepository-layout
+lesson: |
+  Ein Kollege hat mit `git reset --hard` drei Commits „gelöscht“ und will das Repository neu klonen. Eine Kollegin fragt im Review, warum der Diff eine umbenannte Datei als gelöscht und neu anzeigt. Im Vorstellungsgespräch kommt die Frage: „Was ist ein Branch?“ Alle drei Situationen lösen sich mit demselben Wissen: Git ist eine kleine Datenbank aus unveränderlichen Objekten und beweglichen Namen, die auf diese Objekte zeigen.
+
+  Dieses Modul öffnet das Verzeichnis `.git` und baut einen Commit von Hand. Danach sind Branches, Rebase, Reset und Reflog keine Zaubersprüche mehr, sondern Operationen auf einem Graphen, den du vor dir siehst.
+
+  ## Ein Blick in .git
+
+  Nach `git init` und dem ersten `git add` sieht das Repository so aus ([gitrepository-layout](https://git-scm.com/docs/gitrepository-layout)):
+
+  ```console
+  $ ls -F .git
+  config
+  description
+  HEAD
+  hooks/
+  index
+  info/
+  objects/
+  refs/
+  ```
+
+  - `objects/` ist die **Objektdatenbank**: jeder Dateiinhalt, jedes Verzeichnis, jeder Commit.
+  - `refs/` enthält die **Namen**: `refs/heads/` für Branches, `refs/tags/` für Tags, `refs/remotes/` für Remote-Tracking-Branches.
+  - `HEAD` sagt, wo du gerade bist.
+  - `index` ist die Staging Area aus [Git-Grundlagen](/git/git-einstieg), `config` die lokale Konfiguration.
+  - `hooks/` enthält Beispielskripte für Hooks ([CI/CD rund um Git](/git/ci-cd)), `info/exclude` lokale Ignore-Muster. `description` nutzt nur das Web-Frontend GitWeb.
+
+  Später kommen `logs/` (der Reflog), `packed-refs` und Hilfsdateien wie `ORIG_HEAD` oder `COMMIT_EDITMSG` dazu. Alles, was Git über dein Projekt weiß, steht in diesem Verzeichnis.
+
+  ## Inhaltsadressiert: Objekte und ihre Hashes
+
+  Die Objektdatenbank ist ein Schlüssel-Wert-Speicher. Der Wert ist ein Objekt, der Schlüssel wird aus dem Wert **berechnet**: Git bildet den Hash über einen kurzen Header (Typ, Leerzeichen, Größe in Byte, Nullbyte) und den Inhalt ([Pro Git · Git Objects](https://git-scm.com/book/en/v2/Git-Internals-Git-Objects)). Das lässt sich nachrechnen:
+
+  ```console
+  $ printf 'Hallo Git\n' | git hash-object --stdin
+  cbea0f7af8dcf8c37303483efc3b8abc92f49a5f
+  $ printf 'blob 10\0Hallo Git\n' | sha1sum
+  cbea0f7af8dcf8c37303483efc3b8abc92f49a5f  -
+  ```
+
+  Dieselbe Zeichenfolge ergibt auf jedem Rechner der Welt denselben Hash. Daraus folgen drei Eigenschaften, die du ab jetzt überall wiederfindest:
+
+  1. **Gleicher Inhalt, gleiches Objekt.** Zwei identische Dateien – im selben Commit oder zehn Jahre auseinander – belegen genau ein Objekt.
+  2. **Objekte sind unveränderlich.** Ändert sich ein Byte, ändert sich der Hash; es entsteht ein neues Objekt, das alte bleibt unberührt.
+  3. **Integrität ist eingebaut.** Ein beschädigtes Objekt passt nicht mehr zu seinem Namen, Git bemerkt das beim Lesen.
+
+  `git hash-object` berechnet nur den Hash; mit `-w` schreibt es das Objekt auch in die Datenbank. `git add` tut genau das für jede Datei. Nach dem ersten `git add .` in der Shop-API liegen dort drei Objekte, gespeichert unter den ersten zwei Hex-Zeichen als Verzeichnis und dem Rest als Dateiname:
+
+  ```console
+  $ find .git/objects -type f
+  .git/objects/8c/c7fdc354e800eb5323ab2a94220cf5ad11249a
+  .git/objects/9e/aac817118b453c849b8a0e7215e4d47ef0e1fc
+  .git/objects/dc/1c6bda20e21213778130fcd93d5eb53673213d
+  $ git cat-file -t 9eaac81
+  blob
+  $ git cat-file -s 9eaac81
+  27
+  $ git cat-file -p 9eaac81
+  log_level: info
+  port: 8000
+  ```
+
+  Die Dateien sind mit zlib komprimiert, deshalb liest du sie mit [`git cat-file`](https://git-scm.com/docs/git-cat-file) statt mit `cat`: `-t` gibt den Typ aus, `-s` die Größe in Byte, `-p` den Inhalt in lesbarer Form. Überall, wo Git einen Hash erwartet, reicht ein eindeutiges Präfix – meist die ersten sieben Zeichen.
+
+  **SHA-1 und SHA-256.** Git verwendet standardmäßig SHA-1 in einer gehärteten Variante, die bekannte Kollisionsangriffe erkennt. `git init --object-format=sha256` legt ein Repository mit 64 Zeichen langen SHA-256-Hashes an. Der Austausch mit SHA-1-Repositorys und die Unterstützung durch Hosting-Dienste sind noch eingeschränkt, deshalb begegnen dir im Alltag fast nur SHA-1-Repositorys ([hash-function-transition](https://git-scm.com/docs/hash-function-transition)).
+
+  > [!DEEP] Lose Objekte und Packfiles
+  > Jedes Objekt als eigene Datei heißt „loses Objekt“. Sammeln sich viele davon an, oder beim Übertragen über das Netz, fasst Git sie zu **Packfiles** in `.git/objects/pack/` zusammen. Darin speichert es ähnliche Objekte als Delta zueinander. Das ist eine Speicheroptimierung: Nach außen bleibt jedes Objekt ein vollständiger Schnappschuss mit unverändertem Hash. `git gc` räumt auf und packt, Git startet es bei Bedarf automatisch; `git count-objects -v` zeigt, wie viele lose und gepackte Objekte es gibt ([Pro Git · Packfiles](https://git-scm.com/book/en/v2/Git-Internals-Packfiles)).
+
+  ## Blob, Tree, Commit, Tag
+
+  Git kennt vier Objekttypen ([gitdatamodel](https://git-scm.com/docs/gitdatamodel)):
+
+  - **Blob** – der reine Inhalt einer Datei. Kein Name, keine Rechte, kein Datum.
+  - **Tree** – ein Verzeichnis: eine Liste von Einträgen aus Modus, Typ, Hash und Name. Einträge zeigen auf Blobs (Dateien) oder weitere Trees (Unterverzeichnisse). Modi: `100644` normale Datei, `100755` ausführbar, `120000` symbolischer Link, `040000` Verzeichnis.
+  - **Commit** – ein Tree für den Gesamtstand, null oder mehr Eltern, Autor, Committer und Nachricht.
+  - **Annotierter Tag** – zeigt auf ein Objekt (meist einen Commit) und trägt Name, Tagger, Datum und Nachricht. Ein leichtgewichtiger Tag ist dagegen nur ein Name ohne eigenes Objekt.
+
+  Nach dem zweiten Commit, der nur `config.yaml` ändert, sieht die Datenbank so aus:
+
+  ```console
+  $ git cat-file -p HEAD
+  tree 8c44ee5486689a8d30a9992281ce070d4464fddf
+  parent 0f7b98513a91ee05cf1405918fb5adbead348c80
+  author Lea Lernt <lea@example.com> 1790687606 +0200
+  committer Lea Lernt <lea@example.com> 1790687606 +0200
+
+  Debug-Logging aktivieren
+  $ git cat-file -p 'HEAD^{tree}'
+  100644 blob dc1c6bda20e21213778130fcd93d5eb53673213d    README.md
+  100644 blob 03b2c4adb8534b2c3552d46644fb8492ac907153    config.yaml
+  040000 tree 7dacc3bf926c54feb822eea0ce1c562b71279565    src
+  ```
+
+  ```text
+  commit b019dd2 "Debug-Logging aktivieren"   commit 0f7b985 "Grundgerüst der Shop-API"
+    parent ──────────────────────────────────▶
+    tree 8c44ee5                               tree 4cdfbe7
+      ├── README.md    blob dc1c6bd ◀───────────── README.md
+      ├── config.yaml  blob 03b2c4a                config.yaml  blob 9eaac81
+      └── src/         tree 7dacc3b ◀───────────── src/
+                         └── api.py  blob 8cc7fdc
+  ```
+
+  Der zweite Commit hat einen neuen Root-Tree und einen neuen Blob für `config.yaml`. `README.md` und das komplette Verzeichnis `src/` sind dieselben Objekte wie vorher – der neue Tree verweist auf dieselben Hashes. So bleibt ein vollständiger Schnappschuss pro Commit billig: Neu gespeichert wird nur, was sich geändert hat, plus die Trees auf dem Weg zur Wurzel.
+
+  `git ls-tree` listet Trees bequemer: `git ls-tree -r HEAD` rekursiv, `git ls-tree --name-only HEAD` nur Namen, `git ls-tree HEAD:src` den Inhalt eines Unterverzeichnisses.
+
+  **Umbenennungen existieren nicht.** Weil der Name im Tree steht und nicht im Blob, ist `git mv config.yaml settings.yaml` für Git ein neuer Tree, in dem derselbe Blob unter anderem Namen steht. Es gibt kein „umbenannt“-Feld. `git diff`, `git log` und `git status` erkennen Umbenennungen nachträglich per Heuristik: Eine gelöschte und eine neue Datei mit mindestens 50 % ähnlichem Inhalt gelten als umbenannt (einstellbar mit `-M`). `git log --follow datei` verfolgt eine Datei über solche Umbenennungen hinweg.
+
+  > [!PRAXIS] Umbenennen und Umbauen trennen
+  > Benennst du eine Datei um und schreibst sie im selben Commit zur Hälfte neu, erkennt Git die Umbenennung oft nicht mehr. Im Review erscheint eine gelöschte und eine komplett neue Datei, `git log --follow` und `git blame` verlieren die History. Deshalb gilt in vielen Teams: erst ein Commit, der nur verschiebt, dann einer, der ändert.
+
+  ## Refs: Namen für Commits
+
+  Hashes sind eindeutig, aber niemand merkt sich `b019dd2c5c4d…`. Dafür gibt es **Refs**: Namen, die auf ein Objekt zeigen. Ein Branch ist eine Datei in `.git/refs/heads/` mit 40 Hex-Zeichen und einem Zeilenumbruch – 41 Byte ([Pro Git · Git References](https://git-scm.com/book/en/v2/Git-Internals-Git-References)).
+
+  ```console
+  $ cat .git/HEAD
+  ref: refs/heads/main
+  $ cat .git/refs/heads/main
+  b019dd2c5c4d5fbc22810bd88a90fc933ed4a3b1
+  $ git rev-parse main
+  b019dd2c5c4d5fbc22810bd88a90fc933ed4a3b1
+  $ git cat-file -p v1.0.0
+  object b019dd2c5c4d5fbc22810bd88a90fc933ed4a3b1
+  type commit
+  tag v1.0.0
+  tagger Lea Lernt <lea@example.com> 1790687606 +0200
+
+  Erstes Release
+  ```
+
+  `HEAD` ist eine **symbolische Ref**: Sie enthält keinen Hash, sondern den Namen eines Branches. Committest du, bewegt Git den Branch, auf den HEAD zeigt; HEAD selbst bleibt unverändert. Steht in HEAD direkt ein Hash, bist du im „Detached HEAD“-Zustand – dazu mehr in [Branches, HEAD und Remotes](/git/branches-head). Die Ref `refs/tags/v1.0.0` zeigt hier auf ein Tag-Objekt, das seinerseits auf den Commit zeigt.
+
+  Nicht jede Ref liegt als eigene Datei vor. Bei vielen Tags und Branches fasst Git sie in der Datei `.git/packed-refs` zusammen, `git gc` und `git pack-refs` tun das. Neuere Git-Versionen können Refs außerdem im Format reftable speichern (`git init --ref-format=reftable`). Skripte sollten `.git/refs` deshalb nie direkt lesen, sondern fragen:
+
+  - [`git rev-parse`](https://git-scm.com/docs/git-rev-parse) übersetzt jeden Namen oder Ausdruck in einen Hash.
+  - `git symbolic-ref HEAD` zeigt, auf welchen Branch HEAD zeigt.
+  - `git for-each-ref` und `git show-ref` listen Refs.
+  - [`git update-ref`](https://git-scm.com/docs/git-update-ref) setzt eine Ref sicher: mit Sperre, Reflog-Eintrag und optional dem erwarteten alten Wert als drittem Argument.
+
+  > [!MERKE]
+  > Objekte sind unveränderlich, Refs sind beweglich. Ein Branch ist eine 41-Byte-Datei mit einem Commit-Hash. Einen Branch anzulegen kopiert keine Dateien, einen Branch zu löschen löscht keine Commits.
+
+  > [!WARNING] Refs nur mit vollem Namen setzen
+  > `git update-ref` ist ein Low-Level-Werkzeug und prüft wenig. Gib immer den vollständigen Namen wie `refs/heads/main` an, und bearbeite Dateien in `.git` nicht mit dem Editor. Branches dürfen nur auf Commits zeigen; einen annotierten Tag schälst du vorher mit `v2.4.1^{commit}` bis zum Commit ab.
+
+  ## git commit, zerlegt
+
+  Die Befehle aus [Git-Grundlagen](/git/git-einstieg) heißen **Porcelain**: bequem für Menschen. Darunter liegen **Plumbing**-Befehle, die jeweils genau einen Schritt erledigen und für Skripte gedacht sind ([Pro Git · Plumbing and Porcelain](https://git-scm.com/book/en/v2/Git-Internals-Plumbing-and-Porcelain)). Ein `git commit` besteht aus drei solchen Schritten:
+
+  ```console
+  $ git add config.yaml
+  $ git ls-files --stage
+  100644 dc1c6bda20e21213778130fcd93d5eb53673213d 0    README.md
+  100644 03b2c4adb8534b2c3552d46644fb8492ac907153 0    config.yaml
+  100644 8cc7fdc354e800eb5323ab2a94220cf5ad11249a 0    src/api.py
+  $ tree=$(git write-tree)
+  $ commit=$(git commit-tree "$tree" -p HEAD -m "Debug-Logging aktivieren")
+  $ git update-ref refs/heads/main "$commit"
+  $ git log --oneline
+  b019dd2 Debug-Logging aktivieren
+  0f7b985 Grundgerüst der Shop-API
+  ```
+
+  1. `git add` schreibt den Blob (`hash-object -w`) und trägt ihn in den Index ein. `git ls-files --stage` zeigt den Index so, wie Git ihn sieht: Modus, Blob-Hash, Stufe und Pfad. Die Stufe ist normalerweise `0`; die Stufen 1 bis 3 tauchen bei [Konflikten](/git/konflikte) auf.
+  2. `git write-tree` macht aus dem Index Tree-Objekte und gibt den Hash des Root-Trees aus.
+  3. [`git commit-tree`](https://git-scm.com/docs/git-commit-tree) erzeugt ein Commit-Objekt aus Tree, Eltern (`-p`) und Nachricht. Es bewegt keinen Branch – der Commit ist zunächst von keinem Namen aus erreichbar.
+  4. `git update-ref` setzt den Branch auf den neuen Commit.
+
+  Fehlt bei `commit-tree` das `-p`, entsteht ein Commit ohne Eltern – eine neue Wurzel ohne jede History. Fehlt der letzte Schritt, existiert der Commit, aber kein Branch zeigt darauf. Genau das passiert in abgeschwächter Form, wenn Commits „verloren gehen“: Das Objekt ist da, nur der Name fehlt. Wie man es wiederfindet, zeigt [Reset und Reflog](/git/reset-reflog).
+
+  ## Der Commit-Graph und Revisionen
+
+  Jeder Commit kennt nur seine Eltern, nie seine Kinder. Zusammen bilden die Commits einen **gerichteten azyklischen Graphen** (DAG): Die Pfeile zeigen in die Vergangenheit, und kein Weg führt im Kreis. Der erste Commit hat keine Eltern, ein normaler Commit genau einen, ein Merge-Commit zwei oder mehr. Der erste Elternteil eines Merge-Commits ist der Branch, auf dem gemergt wurde, der zweite der hereingeholte.
+
+  ```text
+            F   feature
+           / \
+  A---B---C---M   main, HEAD
+
+  HEAD~1 = HEAD^ = HEAD^1 = C      erster Elternteil
+  HEAD^2                  = F      zweiter Elternteil des Merge-Commits
+  HEAD~2 = HEAD^^         = B      zweimal dem ersten Elternteil folgen
+  HEAD^2~1                = B      zweiter Elternteil, dann dessen erster
+  ```
+
+  Hier zweigt `feature` bei B ab, F ist der Commit auf `feature`, C der Commit auf `main`, M der Merge. Die Regeln ([gitrevisions · Specifying Revisions](https://git-scm.com/docs/gitrevisions#_specifying_revisions)):
+
+  - `~n` geht n Schritte zurück und folgt dabei immer dem **ersten** Elternteil. `HEAD~` ist `HEAD~1`.
+  - `^n` wählt den **n-ten Elternteil** eines einzelnen Commits. `HEAD^` ist `HEAD^1`. `HEAD^2` gibt es nur bei Merge-Commits; sonst meldet Git `unknown revision`.
+  - Beides lässt sich verketten: `HEAD^2~3`, `main~4^2`.
+  - `<rev>:<pfad>` bezeichnet einen Blob oder Tree in einem Commit: `git show HEAD~2:config.yaml` zeigt die Datei, wie sie damals war.
+  - `<rev>^{tree}` und `<rev>^{commit}` „schälen“ ein Objekt bis zum gewünschten Typ, etwa einen annotierten Tag bis zum Commit.
+  - `@` ist eine Abkürzung für `HEAD`. Bereiche wie `main..feature` behandelt [Branches, HEAD und Remotes](/git/branches-head), `HEAD@{1}` behandelt [Reset und Reflog](/git/reset-reflog).
+
+  > [!INTERVIEW] „Was ist der Unterschied zwischen HEAD~2 und HEAD^2?“
+  > `~2` heißt „zwei Generationen zurück, jeweils über den ersten Elternteil“ – der Großvater auf der eigenen Linie. `^2` heißt „der zweite Elternteil“ und existiert nur bei Merge-Commits; es führt in den gemergten Branch. Bei einer linearen History sind `HEAD~1` und `HEAD^` gleich, `HEAD^2` gibt es dort nicht.
+
+  ## Häufige Fehler
+
+  - **„Git speichert Diffs.“** Jeder Commit zeigt auf einen vollständigen Tree. Deltas gibt es nur als Speicheroptimierung in Packfiles; der Diff im Review wird beim Anzeigen berechnet.
+  - **`HEAD^2` auf einem normalen Commit.** `fatal: ambiguous argument 'HEAD^2': unknown revision or path not in the working tree.` Gemeint war fast immer `HEAD~2`.
+  - **Refs direkt aus `.git/refs` lesen.** Nach `git gc` stehen sie in `packed-refs`, und das Skript findet den Branch nicht mehr. `git rev-parse` fragen.
+  - **Tag-Objekt statt Commit setzen.** `git update-ref refs/heads/release v2.4.1` mit einem annotierten Tag bricht mit `trying to write non-commit object … to branch` ab. `v2.4.1^{commit}` verwenden.
+  - **Gelöschter Branch = gelöschte Commits?** Nein. Die Objekte bleiben, bis `git gc` sie nach Ablauffristen entfernt. Rettung über den Reflog in [Reset und Reflog](/git/reset-reflog).
+  - **Secret „im nächsten Commit gelöscht“.** Der Blob mit dem Passwort steckt weiter im alten Tree und wird mit jedem Klon verteilt. Das Passwort muss rotiert werden ([CI/CD rund um Git](/git/ci-cd)).
+
+  ## Zusammenfassung
+
+  - Git ist ein inhaltsadressierter Speicher: Der Hash wird aus Header und Inhalt berechnet, gleicher Inhalt ergibt überall denselben Hash.
+  - Vier Objekttypen: Blob (Inhalt), Tree (Namen, Modi, Verweise), Commit (Tree, Eltern, Autor, Nachricht), annotierter Tag.
+  - Objekte sind unveränderlich. Unveränderte Dateien und Verzeichnisse teilen sich Objekte über Commits hinweg.
+  - Umbenennungen werden nicht gespeichert, sondern beim Diff anhand ähnlicher Inhalte erkannt.
+  - Refs sind Namen für Hashes: Branches in `refs/heads`, Tags in `refs/tags`, HEAD als symbolische Ref; lesen mit `rev-parse`, setzen mit `update-ref`.
+  - `git commit` = `write-tree` + `commit-tree` + `update-ref`.
+  - `~n` folgt dem ersten Elternteil, `^n` wählt den n-ten Elternteil, `<rev>:<pfad>` holt eine Datei aus einem Commit.
+exercises:
+  - id: objekt-aussagen
+    type: choice
+    title: Was steckt in welchem Objekt?
+    prompt: Welche Aussagen über die Objektdatenbank stimmen?
+    options:
+      - text: Zwei Dateien mit identischem Inhalt in verschiedenen Verzeichnissen belegen nur einen Blob.
+        correct: true
+        why: Der Blob-Hash hängt nur vom Inhalt ab. Beide Tree-Einträge zeigen auf dasselbe Objekt.
+      - text: Ein Blob speichert Dateiname und Dateirechte, damit Git die Datei wiederherstellen kann.
+        correct: false
+        why: Name und Modus stehen im Tree-Eintrag. Ein Blob enthält ausschließlich den Inhalt.
+      - text: Benennst du eine Datei nur um, entsteht kein neuer Blob, aber ein neuer Tree und ein neuer Commit.
+        correct: true
+        why: Der Inhalt ist unverändert, also bleibt der Blob. Der Tree mit dem neuen Namen hat einen anderen Hash, und der Commit zeigt auf diesen Tree.
+      - text: Ein Commit speichert die Unterschiede zu seinem Vorgänger; den vollständigen Stand berechnet Git durch Aufaddieren aller Diffs.
+        correct: false
+        why: Jeder Commit zeigt auf einen vollständigen Tree. Diffs berechnet Git erst beim Anzeigen.
+      - text: Ändert sich die Nachricht eines alten Commits, behalten alle späteren Commits ihren Hash.
+        correct: false
+        why: Der Hash eines Commits umfasst den Hash seines Elternteils. Ein neuer Hash weiter unten ändert die Hashes aller Nachfolger.
+    explanation: |
+      Blobs kennen nur Inhalt, Trees verbinden Namen mit Hashes, Commits verbinden einen Tree mit Eltern und Metadaten. Weil jede Ebene die Hashes der darunterliegenden enthält, wirkt sich eine Änderung immer nach oben bis zum Commit aus – und über den `parent`-Eintrag auf alle späteren Commits. Deshalb erzeugt jedes Umschreiben der History neue Commits.
+    resources:
+      - title: Pro Git · Git Objects
+        url: https://git-scm.com/book/en/v2/Git-Internals-Git-Objects
+
+  - id: commit-zerlegt
+    type: order
+    title: Ein Commit in Einzelteilen
+    prompt: Bring die Befehle in die Reihenfolge, in der sie einen neuen Commit auf `main` erzeugen, ohne `git commit` zu verwenden.
+    lang: bash
+    lines: |
+      printf '## 2.4.1\n- Login-Timeout erhöht\n' >> CHANGELOG.md
+      git add CHANGELOG.md
+      tree=$(git write-tree)
+      commit=$(git commit-tree "$tree" -p HEAD -m "Changelog für 2.4.1")
+      git update-ref refs/heads/main "$commit"
+      git log --format=%s -n 1
+    explanation: |
+      Jeder Schritt braucht das Ergebnis des vorigen: Ohne geänderte Datei gibt es nichts vorzumerken, `write-tree` liest den Index, `commit-tree` braucht den Tree-Hash, `update-ref` den Commit-Hash. Erst nach `update-ref` zeigt `main` – und damit HEAD – auf den neuen Commit, deshalb steht die Kontrolle mit `git log` am Ende.
+    resources:
+      - title: Pro Git · Plumbing and Porcelain
+        url: https://git-scm.com/book/en/v2/Git-Internals-Plumbing-and-Porcelain
+
+  - id: objekte-zaehlen
+    type: output
+    title: Wie viele Objekte?
+    prompt: |
+      `git rev-list --objects --all` listet jedes Objekt, das von einer Ref aus erreichbar ist, eine Zeile pro Objekt. Was gibt das Skript aus?
+    lang: bash
+    code: |
+      git init -q
+      mkdir src
+      printf 'TIMEOUT = 30\n' > src/api.py
+      cp src/api.py src/api_backup.py
+      printf 'debug: false\n' > config.yaml
+      git add . && git commit -qm "Start"
+      git rev-list --objects --all | wc -l
+      printf 'debug: true\n' > config.yaml
+      git commit -qam "Debug an"
+      git rev-list --objects --all | wc -l
+      git mv config.yaml settings.yaml
+      git commit -qm "Umbenannt"
+      git rev-list --objects --all | wc -l
+    expected: |
+      5
+      8
+      10
+    verify: true
+    hints:
+      - Zähle für den ersten Commit Blobs, Trees und den Commit selbst. Zwei der Dateien haben denselben Inhalt.
+      - Beim zweiten Commit bleibt `src/` unverändert. Welche Objekte sind trotzdem neu?
+      - Eine Umbenennung ändert keinen Inhalt.
+    explanation: |
+      Erster Commit: zwei Blobs (`api.py` und `api_backup.py` teilen sich einen), der Tree für `src`, der Root-Tree und der Commit – 5. Der zweite Commit braucht einen neuen Blob für `config.yaml`, einen neuen Root-Tree und den Commit; `src` ist unverändert und wird wiederverwendet – 8. Die Umbenennung erzeugt nur einen neuen Root-Tree (derselbe Blob unter neuem Namen) und einen Commit – 10. Umbenennen kostet also keinen neuen Blob.
+    resources:
+      - title: git-rev-list
+        url: https://git-scm.com/docs/git-rev-list
+
+  - id: eltern-navigieren
+    type: output
+    title: Tilde oder Dach?
+    prompt: |
+      Die Commits heißen der Übersicht halber A, B, C und F. Was gibt das Skript aus?
+    lang: bash
+    code: |
+      git init -q
+      git commit -q --allow-empty -m "A"
+      git commit -q --allow-empty -m "B"
+      git switch -q -c feature
+      git commit -q --allow-empty -m "F"
+      git switch -q main
+      git commit -q --allow-empty -m "C"
+      git merge -q --no-edit feature
+      for rev in HEAD~1 HEAD^2 HEAD~2 HEAD^2~1; do
+        git log -1 --format=%s "$rev"
+      done
+    expected: |
+      C
+      F
+      B
+      B
+    verify: true
+    hints:
+      - Zeichne den Graphen. HEAD ist der Merge-Commit, sein erster Elternteil ist der letzte Commit auf `main`.
+      - "`~` folgt immer dem ersten Elternteil, `^2` nimmt den zweiten."
+    explanation: |
+      HEAD ist der Merge-Commit. Sein erster Elternteil ist C (der Stand von `main` vor dem Merge), also ist `HEAD~1` = C. `HEAD^2` ist der zweite Elternteil, der Commit F aus `feature`. `HEAD~2` folgt zweimal dem ersten Elternteil: C, dann B. `HEAD^2~1` geht erst zu F und von dort einen Schritt zurück – ebenfalls B, weil `feature` bei B abgezweigt ist. Zwei verschiedene Wege führen zum selben Commit.
+    resources:
+      - title: gitrevisions · Specifying Revisions
+        url: https://git-scm.com/docs/gitrevisions#_specifying_revisions
+
+  - id: plumbing-commit-luecken
+    type: gap
+    title: Drei Befehle statt git commit
+    prompt: Die Änderung an `CHANGELOG.md` ist bereits mit `git add` vorgemerkt. Ergänze die Plumbing-Befehle so, dass `main` danach auf einen neuen Commit zeigt, dessen Elternteil der bisherige HEAD-Commit ist.
+    lang: bash
+    code: |
+      # Index als Tree-Objekt speichern
+      tree=$(git ⟦write-tree⟧)
+      # Commit-Objekt mit dem aktuellen Commit als Elternteil anlegen
+      commit=$(git ⟦commit-tree⟧ "$tree" ⟦-p HEAD⟧ -m "Changelog für 2.4.1")
+      # den Branch main auf den neuen Commit setzen
+      git ⟦update-ref⟧ ⟦refs/heads/main⟧ "$commit"
+    gaps:
+      - label: Index → Tree
+        hint: Der Befehl schreibt einen Tree aus dem Index.
+      - label: Tree → Commit
+        hint: Der Befehl erzeugt aus einem Tree einen Commit.
+      - label: Elternteil
+        hint: Eine Kurzoption für „parent“ und die Revision, auf der du stehst.
+        accept: ["-p main", "-p @", "-p refs/heads/main", "-p \"$(git rev-parse HEAD)\""]
+      - label: Ref setzen
+        hint: Der Plumbing-Befehl, der eine Ref sicher auf einen neuen Wert setzt.
+      - label: Vollständiger Ref-Name
+        hint: Branches liegen unter `refs/heads/`.
+        accept: ["HEAD"]
+    explanation: |
+      `write-tree` liefert den Hash des Root-Trees, `commit-tree` verpackt ihn mit Elternteil und Nachricht in ein Commit-Objekt, `update-ref` bewegt den Branch. Ohne `-p` entstünde ein Commit ohne Eltern, und `main` hätte danach nur noch diesen einen Commit in seiner History. `git update-ref HEAD` ist ebenfalls richtig, weil `update-ref` der symbolischen Ref HEAD bis zu `refs/heads/main` folgt. Der Kurzname `main` allein wäre dagegen falsch: `update-ref` würde eine neue Ref `.git/main` anlegen.
+    resources:
+      - title: git-commit-tree
+        url: https://git-scm.com/docs/git-commit-tree
+      - title: git-update-ref
+        url: https://git-scm.com/docs/git-update-ref
+
+  - id: objekttyp-bestimmen
+    type: command
+    title: Was ist 9eaac81?
+    prompt: Lass dir von Git ausschließlich den **Typ** des Objekts `9eaac81` ausgeben.
+    context: Im Review-Kommentar steht nur „Schau dir mal `9eaac81` an.“ Du weißt nicht, ob das ein Commit, ein Tree oder ein Blob ist.
+    answers:
+      - git cat-file -t 9eaac81
+    output: |
+      blob
+    explanation: |
+      `git cat-file -t` gibt den Typ aus, `-s` die Größe, `-p` den Inhalt in lesbarer Form. Wer den Typ kennt, weiß, womit er weiterarbeitet: Bei einem Commit hilft `git show`, bei einem Tree `git ls-tree`, bei einem Blob `git cat-file -p`. Ein Hash allein verrät den Typ nicht.
+    resources:
+      - title: git-cat-file
+        url: https://git-scm.com/docs/git-cat-file
+
+  - id: alte-dateiversion
+    type: command
+    title: Nur nachsehen, nichts ändern
+    prompt: Gib den Inhalt von `config.yaml` aus, wie er **zwei Commits vor HEAD** war (entlang des ersten Elternteils). Arbeitsverzeichnis und Index sollen unverändert bleiben.
+    context: Du willst in einer laufenden Fehlersuche vergleichen, welche Konfiguration vor zwei Commits aktiv war.
+    answers:
+      - git show HEAD~2:config.yaml
+      - git show HEAD^^:config.yaml
+      - git show HEAD~~:config.yaml
+      - git show @~2:config.yaml
+      - git cat-file -p HEAD~2:config.yaml
+      - git cat-file -p HEAD^^:config.yaml
+      - git cat-file -p @~2:config.yaml
+    output: |
+      log_level: info
+      port: 8000
+    explanation: |
+      `HEAD~2` wählt den Commit, `:config.yaml` den Blob unter diesem Pfad in dessen Tree. `git show` gibt einen Blob als Text aus, `git cat-file -p` ebenso. Nichts davon berührt Index oder Arbeitsverzeichnis – im Unterschied zu `git restore --source=HEAD~2 config.yaml`, das die Datei überschreibt. Willst du die alte Fassung speichern, leitest du die Ausgabe um: `git show HEAD~2:config.yaml > config.alt.yaml`.
+    resources:
+      - title: gitrevisions · Specifying Revisions
+        url: https://git-scm.com/docs/gitrevisions#_specifying_revisions
+
+  - id: tree-eines-verzeichnisses
+    type: command
+    title: Was liegt in src?
+    prompt: Liste die Einträge des Verzeichnisses `src` im Tree des aktuellen Commits auf – mit der Revisionssyntax `<rev>:<pfad>`.
+    answers:
+      - git ls-tree HEAD:src
+      - git ls-tree HEAD:src/
+      - git ls-tree @:src
+      - git ls-tree @:src/
+      - git ls-tree HEAD src/
+    output: |
+      100644 blob 8cc7fdc354e800eb5323ab2a94220cf5ad11249a    api.py
+    explanation: |
+      `HEAD:src` bezeichnet den Tree des Verzeichnisses `src` im Commit HEAD, `git ls-tree` listet dessen Einträge mit Modus, Typ, Hash und Name. Auch `git ls-tree HEAD src/` führt zum Ziel, zeigt aber den Pfad relativ zur Wurzel (`src/api.py`); `git ls-tree HEAD src` ohne Schrägstrich listet nur den Eintrag `src` selbst.
+    resources:
+      - title: git-ls-tree
+        url: https://git-scm.com/docs/git-ls-tree
+
+  - id: vollstaendiger-hash
+    type: command
+    title: Der Hash für das Image-Tag
+    prompt: Gib den vollständigen Hash des Commits aus, auf den der Branch `main` zeigt.
+    context: Das Deploy-Skript taggt Docker-Images mit dem vollen Commit-Hash. Es soll nicht davon abhängen, welcher Branch gerade ausgecheckt ist.
+    answers:
+      - git rev-parse main
+      - git rev-parse refs/heads/main
+      - git rev-parse heads/main
+      - git rev-parse --verify main
+      - git rev-parse --verify refs/heads/main
+    output: |
+      b019dd2c5c4d5fbc22810bd88a90fc933ed4a3b1
+    explanation: |
+      `git rev-parse` übersetzt einen Namen in einen Hash, egal ob die Ref als Datei, in `packed-refs` oder im reftable-Format liegt. `cat .git/refs/heads/main` funktioniert nur, solange die Ref nicht gepackt ist. Mit `--short` bekommst du die gekürzte Form, mit `--verify` bricht der Befehl bei einem ungültigen Namen mit Fehler ab – nützlich in Skripten.
+    resources:
+      - title: git-rev-parse
+        url: https://git-scm.com/docs/git-rev-parse
+
+  - id: update-ref-kurzname
+    type: bug
+    title: Der Commit ist da, aber main merkt nichts
+    prompt: |
+      Das Skript soll einen Commit mit Plumbing-Befehlen erzeugen und `main` darauf setzen. Es läuft ohne Fehler durch. Danach zeigt `git log --format=%s` den neuen Commit nicht, `git status --short` meldet weiter `M  README.md`, und `git log main` gibt `warning: refname 'main' is ambiguous.` aus – zeigt den neuen Commit dann aber doch. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: bash
+    code: |
+      printf '# Shop-API\n\nStarten mit `make run`.\n' > README.md
+      git add README.md
+      tree=$(git write-tree)
+      commit=$(git commit-tree "$tree" -p HEAD -m "README: Startbefehl ergänzen")
+      git update-ref main "$commit"
+    lines: [5]
+    fix:
+      - line: 5
+        answers:
+          - git update-ref refs/heads/main "$commit"
+          - git update-ref refs/heads/main $commit
+          - git update-ref HEAD "$commit"
+          - git update-ref HEAD $commit
+    explanation: |
+      `git update-ref` erwartet einen vollständigen Ref-Namen. Mit `main` legt es eine neue Ref direkt unter `.git/main` an, statt `refs/heads/main` zu bewegen. HEAD zeigt weiter auf `refs/heads/main`, das unverändert auf dem alten Commit steht – deshalb fehlt der Commit im Log, und der Index weicht von HEAD ab. `git log main` findet zwei Refs dieses Namens, warnt und nimmt die Datei `.git/main`. Korrekt ist `refs/heads/main` oder `HEAD`, dem `update-ref` bis zum Branch folgt. Die versehentlich angelegte Datei `.git/main` entfernst du danach mit `rm .git/main`; `git update-ref -d main` lehnt den Namen ab.
+    resources:
+      - title: git-update-ref
+        url: https://git-scm.com/docs/git-update-ref
+
+  - id: merge-commit-lesen
+    type: explain
+    title: Ein Merge-Commit von innen
+    prompt: Erkläre Zeile für Zeile, was dieses Commit-Objekt enthält, was es nicht enthält und was passiert, wenn man eine dieser Zeilen ändern würde.
+    lang: console
+    code: |
+      $ git cat-file -p HEAD
+      tree ac1a5970b11404784c0e4676413da2af5b9db0c9
+      parent 20828e63f85316bb484f6eeced5dac7cb10e6690
+      parent f727245bbec61e4acf8cd99bc956a04de28b5a54
+      author Lea Lernt <lea@example.com> 1790687361 +0200
+      committer Lea Lernt <lea@example.com> 1790687361 +0200
+
+      Merge branch 'feature/login'
+    points:
+      - "`tree` zeigt auf den vollständigen Schnappschuss des Merge-Ergebnisses; ein Diff ist nicht gespeichert."
+      - Zwei `parent`-Zeilen machen es zum Merge-Commit. Der erste ist der vorherige Stand des Ziel-Branches (`HEAD^1`), der zweite die Spitze von `feature/login` (`HEAD^2`).
+      - "Autor hat die Änderung geschrieben, Committer hat den Commit erzeugt; bei Rebase, Cherry-pick oder eingespielten Patches unterscheiden sie sich. Die Zeit steht als Unix-Sekunden mit Zeitzone."
+      - Der Commit-Hash wird über genau diesen Text berechnet. Jede Änderung – Nachricht, Zeitstempel, Elternteil – ergibt einen neuen Commit und damit neue Hashes für alle Nachfolger.
+    explanation: |
+      Das Objekt ist reiner Text. `tree` verweist auf den Root-Tree mit dem vollständigen Stand nach dem Merge; welche Zeilen sich geändert haben, berechnet Git erst beim Anzeigen. Die zwei `parent`-Zeilen machen den Commit zum Merge-Commit: Der erste Elternteil ist der Stand von `main` vor dem Merge, der zweite die Spitze von `feature/login` – deshalb führt `HEAD^2` in den Feature-Branch und `git log --first-parent` bleibt auf `main`. Autor und Committer sind hier dieselbe Person; bei einem Rebase oder Cherry-pick bliebe der Autor erhalten und der Committer wäre, wer die Operation ausführt. Weil der Hash aus diesem Text entsteht, lässt sich nichts daran ändern, ohne einen neuen Commit zu erzeugen – und jeder spätere Commit, der auf ihn als Elternteil verweist, bekäme ebenfalls einen neuen Hash.
+    resources:
+      - title: Pro Git · Git Objects
+        url: https://git-scm.com/book/en/v2/Git-Internals-Git-Objects
+      - title: gitglossary
+        url: https://git-scm.com/docs/gitglossary
+
+  - id: labor-commit-mit-plumbing
+    type: practice
+    title: "Labor: Ein Commit ohne git commit"
+    prompt: |
+      Führe das Labor-Skript in einem leeren Verzeichnis aus (`cd "$(mktemp -d)"`) – **nie** in einem echten Repository.
+
+      Die neue Version von `CHANGELOG.md` ist vorgemerkt, `notizen.txt` liegt untracked daneben und gehört nicht ins Repository. Erzeuge den Commit „Changelog für 2.4.1“ auf `main` **ohne** `git commit` – nur mit Plumbing-Befehlen. Die bisherige History muss erhalten bleiben.
+
+      Prüfe am Ende mit `git log --format=%s`, `git cat-file -p HEAD` und `git status --short`.
+    lang: bash
+    starter: |
+      # Labor: erzeugt den Ausgangszustand
+      git init -q
+      printf '# Changelog\n\n## 2.4.0\n- Login über SSO\n' > CHANGELOG.md
+      git add CHANGELOG.md
+      git commit -qm "Changelog angelegt"
+      printf '# Changelog\n\n## 2.4.1\n- Login-Timeout auf 30 s erhöht\n\n## 2.4.0\n- Login über SSO\n' > CHANGELOG.md
+      git add CHANGELOG.md
+      printf 'Fragen an das Team\n' > notizen.txt
+      # Deine Reparatur:
+    solution: |
+      # Labor: erzeugt den Ausgangszustand
+      git init -q
+      printf '# Changelog\n\n## 2.4.0\n- Login über SSO\n' > CHANGELOG.md
+      git add CHANGELOG.md
+      git commit -qm "Changelog angelegt"
+      printf '# Changelog\n\n## 2.4.1\n- Login-Timeout auf 30 s erhöht\n\n## 2.4.0\n- Login über SSO\n' > CHANGELOG.md
+      git add CHANGELOG.md
+      printf 'Fragen an das Team\n' > notizen.txt
+      # Reparatur
+      tree=$(git write-tree)
+      commit=$(git commit-tree "$tree" -p HEAD -m "Changelog für 2.4.1")
+      git update-ref refs/heads/main "$commit"
+      # Kontrolle
+      test "$(git log --format=%s | tr '\n' '|')" = "Changelog für 2.4.1|Changelog angelegt|"
+      test "$(git symbolic-ref HEAD)" = refs/heads/main
+      test "$(git rev-parse 'HEAD^{tree}')" = "$(git write-tree)"
+      test "$(git status --short)" = "?? notizen.txt"
+      grep -q '2.4.1' CHANGELOG.md
+    checklist:
+      - Du hast nur `write-tree`, `commit-tree` und `update-ref` verwendet, kein `git commit`.
+      - "`git log --format=%s` zeigt „Changelog für 2.4.1“ über „Changelog angelegt“."
+      - "`git cat-file -p HEAD` zeigt genau eine `parent`-Zeile."
+      - "`git status --short` zeigt nur `?? notizen.txt`; Index und HEAD stimmen überein."
+      - HEAD zeigt weiter symbolisch auf `refs/heads/main` (`git symbolic-ref HEAD`).
+    verify: true
+    explanation: |
+      `write-tree` speichert den Index als Tree – untracked Dateien wie `notizen.txt` stehen nicht im Index und bleiben deshalb draußen. `commit-tree` erzeugt den Commit; erst `-p HEAD` macht ihn zum Nachfolger des bisherigen Commits. `update-ref refs/heads/main` bewegt den Branch, und weil HEAD symbolisch auf `main` zeigt, steht auch HEAD danach auf dem neuen Commit. Genau diese drei Schritte führt `git commit` intern aus – zusätzlich ruft es Hooks auf, öffnet bei Bedarf den Editor und schreibt einen aussagekräftigen Reflog-Eintrag.
+    resources:
+      - title: Pro Git · Git Objects
+        url: https://git-scm.com/book/en/v2/Git-Internals-Git-Objects
+      - title: git-commit-tree
+        url: https://git-scm.com/docs/git-commit-tree
+
+  - id: labor-branch-falsch-gesetzt
+    type: practice
+    title: "Labor: Das Release enthält ein fremdes Feature"
+    prompt: |
+      Führe das Labor-Skript in einem leeren Verzeichnis aus (`cd "$(mktemp -d)"`) – **nie** in einem echten Repository.
+
+      Nach einem Lauf des Release-Skripts zeigt `git log --oneline release/2.4` an erster Stelle „Neues Dashboard (experimentell)“ – ein Feature, das nie in Version 2.4 sollte. Der Hotfix „Login-Timeout“ fehlt in dieser Liste. Der zuletzt ausgelieferte Stand ist mit dem annotierten Tag `v2.4.1` markiert. `main` ist in Ordnung.
+
+      Setze `release/2.4` mit `git update-ref` wieder auf den Commit dieses Releases. Gib dabei den alten Wert als drittes Argument mit, damit du nur dann überschreibst, wenn der Branch noch auf dem falschen Commit steht. Prüfe am Ende mit `git log -1 --format=%s release/2.4` und `git cat-file -t release/2.4`.
+    lang: bash
+    starter: |
+      # Labor: erzeugt den kaputten Zustand
+      git init -q
+      printf 'TIMEOUT = 10\n' > api.py
+      git add api.py
+      git commit -qm "Release 2.4.0"
+      git branch release/2.4
+      git switch -q release/2.4
+      printf 'TIMEOUT = 30\n' > api.py
+      git commit -qam "Hotfix: Login-Timeout"
+      git tag -a v2.4.1 -m "Version 2.4.1"
+      git switch -q main
+      printf 'DASHBOARD = True\n' > dashboard.py
+      git add dashboard.py
+      git commit -qm "Neues Dashboard (experimentell)"
+      # Das Release-Skript setzt den Branch auf den falschen Commit
+      git update-ref refs/heads/release/2.4 main
+      # Deine Reparatur:
+    solution: |
+      # Labor: erzeugt den kaputten Zustand
+      git init -q
+      printf 'TIMEOUT = 10\n' > api.py
+      git add api.py
+      git commit -qm "Release 2.4.0"
+      git branch release/2.4
+      git switch -q release/2.4
+      printf 'TIMEOUT = 30\n' > api.py
+      git commit -qam "Hotfix: Login-Timeout"
+      git tag -a v2.4.1 -m "Version 2.4.1"
+      git switch -q main
+      printf 'DASHBOARD = True\n' > dashboard.py
+      git add dashboard.py
+      git commit -qm "Neues Dashboard (experimentell)"
+      # Das Release-Skript setzt den Branch auf den falschen Commit
+      git update-ref refs/heads/release/2.4 main
+      # Reparatur: Tag bis zum Commit schälen, alter Wert = der Dashboard-Commit
+      git cat-file -t v2.4.1
+      git update-ref refs/heads/release/2.4 'v2.4.1^{commit}' main
+      # Kontrolle
+      test "$(git cat-file -t refs/heads/release/2.4)" = commit
+      test "$(git log -1 --format=%s release/2.4)" = "Hotfix: Login-Timeout"
+      test "$(git log -1 --format=%s main)" = "Neues Dashboard (experimentell)"
+      test "$(git symbolic-ref --short HEAD)" = main
+    checklist:
+      - "`git log -1 --format=%s release/2.4` gibt `Hotfix: Login-Timeout` aus."
+      - "`git cat-file -t release/2.4` gibt `commit` aus, nicht `tag`."
+      - "`main` zeigt weiter auf „Neues Dashboard (experimentell)“, und du bist weiter auf `main`."
+      - Dein `update-ref`-Aufruf enthält den erwarteten alten Wert als drittes Argument.
+      - Du kannst erklären, warum `git update-ref refs/heads/release/2.4 v2.4.1` scheitert.
+    verify: true
+    explanation: |
+      `v2.4.1` ist ein annotierter Tag, also ein eigenes Objekt vom Typ `tag`, das auf den Hotfix-Commit zeigt. `git update-ref refs/heads/release/2.4 v2.4.1` bricht deshalb ab: `trying to write non-commit object … to branch`. `v2.4.1^{commit}` schält den Tag bis zum Commit. Das dritte Argument `main` ist der erwartete alte Wert – steht der Branch inzwischen woanders, weil ein anderes Skript ihn bewegt hat, verweigert `update-ref` die Änderung mit `cannot lock ref … is at … but expected …`. Der Porcelain-Weg `git branch -f release/2.4 v2.4.1` schält automatisch, prüft aber keinen alten Wert. Der Hotfix war übrigens nie verloren: Der Tag und der Reflog von `release/2.4` zeigen weiter auf ihn.
+    resources:
+      - title: git-update-ref
+        url: https://git-scm.com/docs/git-update-ref
+      - title: gitrevisions · Specifying Revisions
+        url: https://git-scm.com/docs/gitrevisions#_specifying_revisions
+
+  - id: labor-alter-blob
+    type: practice
+    title: "Labor: Die Konfiguration von damals"
+    prompt: |
+      Führe das Labor-Skript in einem leeren Verzeichnis aus (`cd "$(mktemp -d)"`) – **nie** in einem echten Repository.
+
+      Seit einem „Aufräum“-Commit startet die API nicht mehr: `config.yaml` enthält `timeout: 3O` (Buchstabe O statt Null), Retries und Cache fehlen. Eine Kollegin schreibt: „Die letzte funktionierende `config.yaml` war der Blob `65b1869`.“ Ein späterer Commit an `src/api.py` ist in Ordnung und muss bleiben. Die History ist schon geteilt und darf nicht umgeschrieben werden.
+
+      Stelle `config.yaml` exakt mit dem Inhalt dieses Blobs wieder her und halte das in einem **neuen** Commit fest. Prüfe am Ende mit `git rev-parse HEAD:config.yaml`, dass der Commit wieder auf denselben Blob zeigt.
+    lang: bash
+    starter: |
+      # Labor: erzeugt den kaputten Zustand
+      git init -q
+      mkdir src
+      printf 'timeout: 30\nretries: 3\n' > config.yaml
+      printf 'TIMEOUT = 10\n' > src/api.py
+      git add .
+      git commit -qm "Retries konfiguriert"
+      printf 'timeout: 30\nretries: 3\ncache: redis\n' > config.yaml
+      git commit -qam "Redis-Cache aktiviert"
+      printf 'timeout: 3O\n' > config.yaml
+      git commit -qam "Konfiguration aufgeräumt"
+      printf 'TIMEOUT = 30\n' > src/api.py
+      git commit -qam "API-Timeout erhöht"
+      # Deine Reparatur:
+    solution: |
+      # Labor: erzeugt den kaputten Zustand
+      git init -q
+      mkdir src
+      printf 'timeout: 30\nretries: 3\n' > config.yaml
+      printf 'TIMEOUT = 10\n' > src/api.py
+      git add .
+      git commit -qm "Retries konfiguriert"
+      printf 'timeout: 30\nretries: 3\ncache: redis\n' > config.yaml
+      git commit -qam "Redis-Cache aktiviert"
+      printf 'timeout: 3O\n' > config.yaml
+      git commit -qam "Konfiguration aufgeräumt"
+      printf 'TIMEOUT = 30\n' > src/api.py
+      git commit -qam "API-Timeout erhöht"
+      # Reparatur
+      git cat-file -t 65b1869
+      git cat-file -p 65b1869 > config.yaml
+      git commit -qam "Konfiguration mit Retries und Redis-Cache wiederherstellen"
+      # Kontrolle
+      test "$(git rev-parse HEAD:config.yaml)" = "$(git rev-parse HEAD~3:config.yaml)"
+      test "$(git rev-list --count HEAD)" = 5
+      grep -q 'TIMEOUT = 30' src/api.py
+      test -z "$(git status --porcelain)"
+    checklist:
+      - "`git cat-file -t 65b1869` gibt `blob` aus, bevor du ihn verwendest."
+      - "`git rev-parse HEAD:config.yaml` beginnt mit `65b1869`."
+      - "`git rev-list --count HEAD` ergibt 5: Die alten Commits sind unverändert, dein Commit ist neu dazugekommen."
+      - "`src/api.py` enthält weiter `TIMEOUT = 30`."
+      - "`git status --short` ist leer."
+    verify: true
+    explanation: |
+      Ein Blob ist nur Inhalt – `git cat-file -p 65b1869 > config.yaml` schreibt ihn zurück in die Datei. Weil der Hash aus dem Inhalt berechnet wird, zeigt der neue Commit danach auf exakt denselben Blob wie „Redis-Cache aktiviert“; der Vergleich der Hashes beweist das, ohne eine Zeile zu lesen. Gleichwertig ist `git restore --source=HEAD~2 config.yaml` oder `git show HEAD~2:config.yaml > config.yaml`, wenn du den Commit statt des Blobs kennst; `git log --format='%h %s' -- config.yaml` hilft beim Suchen. Ein `git reset --hard HEAD~2` hätte dagegen die geteilte History umgeschrieben und die Änderung an `src/api.py` verworfen.
+    resources:
+      - title: git-cat-file
+        url: https://git-scm.com/docs/git-cat-file
+      - title: Pro Git · Git Objects
+        url: https://git-scm.com/book/en/v2/Git-Internals-Git-Objects

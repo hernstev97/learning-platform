@@ -1,6 +1,6 @@
 # learn.kiumu.app
 
-Private Lernplattform für Kotlin & Android, Rust, Linux, Python und Automation mit Python. Live: [learn.kiumu.app](https://learn.kiumu.app) · Privates Repository: [hernstev97/learning-platform](https://github.com/hernstev97/learning-platform)
+Private Lernplattform für Kotlin & Android, Rust, Linux, Python, Automation mit Python und Git. Live: [learn.kiumu.app](https://learn.kiumu.app) · Privates Repository: [hernstev97/learning-platform](https://github.com/hernstev97/learning-platform)
 
 Die Plattform ist kein Nachschlagewerk. Jedes Modul besteht aus einer Lektion, die ein Denkmodell aufbaut und auf die offizielle Dokumentation verweist, und aus 10–14 Übungen in fester Reihenfolge: verstehen → vorhersagen → schreiben → Fehler finden → erklären → anwenden. Jeder Bereich hat Interview-Karteikarten mit Wiederholung, Projekte und ein Abschlussprojekt, das wie eine Take-Home-Aufgabe im Bewerbungsprozess geschnitten ist.
 
@@ -20,7 +20,7 @@ pnpm dev            # http://127.0.0.1:5180
 | Befehl | Zweck |
 | --- | --- |
 | `pnpm content:check [bereich]` | Inhalte validieren (Pflichtfelder, IDs, Lücken, Richtwerte) |
-| `pnpm verify [bereich]` | Python-Übungen und -Beispiele ausführen, Rust kompilieren, Ausgaben vergleichen |
+| `pnpm verify [bereich]` | Python-Übungen und -Beispiele ausführen, Rust kompilieren, Ausgaben vergleichen, Git-Labore durchspielen |
 | `pnpm links [bereich]` | Alle externen Links und Anker prüfen |
 | `pnpm test` | Unit-Tests (Prüflogik, Speicher, Bear-Rekonstruktion, Inhalte) |
 | `pnpm lint`, `pnpm typecheck` | ESLint und strikte TypeScript-Prüfung einschließlich Backend |

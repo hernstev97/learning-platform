@@ -1,0 +1,811 @@
+id: bisect-historie
+title: Fehlersuche in der History
+level: 3
+minutes: 160
+summary: Du befragst die History gezielt mit Pickaxe, log -L, blame und git grep und findest mit git bisect in wenigen Schritten den Commit, der eine Regression eingeführt hat.
+goals:
+  - Du unterscheidest `git log -S` und `git log -G` und findest damit, wann ein Text in den Code kam oder verschwand.
+  - Du verfolgst Dateien, Funktionen und Zeilen mit `log --follow`, `log -L` und `blame` und blendest Formatierungs-Commits mit `.git-blame-ignore-revs` aus.
+  - Du führst eine Bisect-Sitzung von Hand, korrigierst Fehlmarkierungen mit `bisect log` und `bisect replay` und beendest sie sauber.
+  - Du automatisierst Bisect mit `git bisect run` und einem Prüfskript mit den richtigen Exit-Codes.
+  - Du erklärst, warum atomare, baubare Commits und `--first-parent` Bisect erst zuverlässig machen.
+resources:
+  - title: git-bisect – Referenz
+    url: https://git-scm.com/docs/git-bisect
+  - title: git-blame – Referenz
+    url: https://git-scm.com/docs/git-blame
+  - title: git-log – Referenz
+    url: https://git-scm.com/docs/git-log
+  - title: Pro Git · Debugging with Git
+    url: https://git-scm.com/book/en/v2/Git-Tools-Debugging-with-Git
+  - title: Pro Git · Searching
+    url: https://git-scm.com/book/en/v2/Git-Tools-Searching
+lesson: |
+  Seit dem letzten Release rundet der Checkout rabattierte Preise falsch: Aus 17,99 € werden 18 €. Version 2.3.0 war in Ordnung, auf `main` liegen seitdem 180 Commits von sechs Leuten. Du kannst raten, 180 Diffs lesen – oder die History befragen.
+
+  Dafür gibt es zwei Arten von Fragen. **Textfragen:** Wo steht dieser Code, wann kam er hinein, wer hat diese Zeile zuletzt geändert und warum? Dafür sind `git grep`, `git log -S`/`-G`, `git log -L` und `git blame` da. **Verhaltensfragen:** Ab welchem Commit ist das Ergebnis falsch? Die beantwortet `git bisect` mit einer binären Suche über die Commits – auch dann, wenn du keine Ahnung hast, welche Datei schuld ist.
+
+  ## Den Code durchsuchen: git grep
+
+  [`git grep`](https://git-scm.com/docs/git-grep) durchsucht nur getrackte Dateien – kein `node_modules/`, kein `.venv/`, keine Build-Artefakte. Vor allem kann es jede beliebige Revision durchsuchen, ohne sie auszuchecken:
+
+  ```console
+  $ git grep -n TIMEOUT
+  src/config.py:1:TIMEOUT = 5
+  src/zahlung.py:1:from src.config import TIMEOUT
+  src/zahlung.py:4:    return api.post(betrag, timeout=TIMEOUT)
+  tests/test_zahlung.py:1:from src.config import TIMEOUT
+  $ git grep -n TIMEOUT v2.3.0 -- src/config.py
+  v2.3.0:src/config.py:1:TIMEOUT = 30
+  ```
+
+  `-n` zeigt Zeilennummern, `-w` sucht ganze Wörter, `-i` ignoriert Groß- und Kleinschreibung. Mit einer Revision wie `v2.3.0` vor den Pfaden steht vor jedem Treffer, aus welchem Stand er stammt. So siehst du in Sekunden, dass das Timeout im Release noch 30 war.
+
+  ## Pickaxe: Wann kam dieser Text hinein?
+
+  `git grep` zeigt, **wo** etwas steht. Die „Pickaxe“-Optionen von `git log` zeigen, **wann** es sich geändert hat:
+
+  - `git log -S <text>` findet Commits, die die **Anzahl der Vorkommen** von `<text>` verändern – also Commits, die ihn hinzufügen oder entfernen ([git-log · -S](https://git-scm.com/docs/git-log#Documentation/git-log.txt--Sstring)).
+  - `git log -G <regex>` findet Commits, deren Diff eine **hinzugefügte oder entfernte Zeile** enthält, auf die der reguläre Ausdruck passt ([git-log · -G](https://git-scm.com/docs/git-log#Documentation/git-log.txt--Gregex)).
+
+  Der Unterschied zeigt sich bei Wertänderungen:
+
+  ```console
+  $ git log -S TIMEOUT --oneline
+  dfccb28 Zahlungsanbieter anbinden
+  $ git log -G "TIMEOUT *=" --oneline
+  27e19d8 Timeout verkürzen
+  dfccb28 Zahlungsanbieter anbinden
+  ```
+
+  Der Commit „Timeout verkürzen“ hat `TIMEOUT = 30` in `TIMEOUT = 5` geändert. Das Wort `TIMEOUT` kommt danach genauso oft vor wie vorher, also findet `-S` den Commit nicht. `-G` sieht dagegen eine entfernte und eine hinzugefügte Zeile, auf die das Muster passt. Faustregel: `-S` für „Wann kam die Funktion `apply_coupon` hinein, wann verschwand sie?“, `-G` für „Wann wurde an Zeilen mit `TIMEOUT =` gedreht?“. Beide lassen sich mit `-p` kombinieren, um die Diffs gleich mitzusehen, und mit `--all`, um alle Branches zu durchsuchen. Mit `git show <commit>` schaust du dir einen Treffer vollständig an.
+
+  ## Die Geschichte einer Datei, Funktion oder Zeile
+
+  **Umbenennungen.** Git speichert keine Umbenennungen, sondern erkennt sie beim Vergleichen. `git log -- src/auth.py` hört deshalb beim Commit auf, der die Datei unter diesem Namen angelegt hat. `git log --follow -- src/auth.py` sucht weiter und zeigt auch die Commits aus der Zeit, als die Datei noch `src/api.py` hieß. `--follow` funktioniert nur für genau eine Datei.
+
+  **Funktionen.** `git log -L :rabatt:src/preise.py` zeigt jede Änderung an der Funktion `rabatt` mit dem jeweiligen Diff – nur diese Funktion, nicht den Rest der Datei. Mit `-L 40,60:src/preise.py` verfolgst du einen Zeilenbereich ([git-log · -L](https://git-scm.com/docs/git-log#Documentation/git-log.txt--Lfuncnamefile)):
+
+  ```console
+  $ git log -L :rabatt:src/preise.py --oneline
+  ee49b29 Code mit ruff format formatieren
+  diff --git a/src/preise.py b/src/preise.py
+  index cd2e254..54e6ca9 100644
+  --- a/src/preise.py
+  +++ b/src/preise.py
+  @@ -1,2 +1,2 @@
+   def rabatt(preis):
+  -  return round(preis * 0.9)
+  +    return round(preis * 0.9)
+  ded0fe9 Preisanzeige vereinfachen
+  diff --git a/src/preise.py b/src/preise.py
+  index 183f675..cd2e254 100644
+  --- a/src/preise.py
+  +++ b/src/preise.py
+  @@ -1,2 +1,2 @@
+   def rabatt(preis):
+  -  return round(preis * 0.9, 2)
+  +  return round(preis * 0.9)
+  0d1bce9 Rabattberechnung anlegen
+  diff --git a/src/preise.py b/src/preise.py
+  new file mode 100644
+  index 0000000..183f675
+  --- /dev/null
+  +++ b/src/preise.py
+  @@ -0,0 +1,2 @@
+  +def rabatt(preis):
+  +  return round(preis * 0.9, 2)
+  ```
+
+  Die Ausgabe endet mit dem Commit, der die Funktion angelegt hat. Die Regression steckt in der Mitte: „Preisanzeige vereinfachen“ hat die zwei Nachkommastellen entfernt.
+
+  **Zeilen.** [`git blame`](https://git-scm.com/docs/git-blame) zeigt für jede Zeile den Commit, der sie zuletzt geändert hat:
+
+  ```console
+  $ git blame src/preise.py
+  ^0d1bce9 (Lea Lernt    2026-03-12 09:14:05 +0100 1) def rabatt(preis):
+  ee49b295 (Jonas Keller 2026-09-02 17:40:31 +0200 2)     return round(preis * 0.9)
+  $ git blame -w src/preise.py
+  ^0d1bce9 (Lea Lernt   2026-03-12 09:14:05 +0100 1) def rabatt(preis):
+  ded0fe91 (Mara Schulz 2026-08-21 11:02:47 +0200 2)     return round(preis * 0.9)
+  ```
+
+  Das `^` markiert einen Grenz-Commit, hier den ersten Commit der History. Ohne Optionen zeigt blame für Zeile 2 den Formatierungs-Commit von Jonas – er hat nur die Einrückung geändert. `-w` ignoriert Leerraum beim Vergleich und findet die inhaltliche Änderung von Mara. Zwei weitere Optionen erkennen verschobenen Code: `-M` findet Zeilen, die innerhalb der Datei verschoben wurden, `-C` zusätzlich Zeilen, die aus anderen Dateien desselben Commits stammen – etwa wenn `login()` aus `api.py` nach `auth.py` umgezogen ist. `-C -C` und `-C -C -C` suchen noch weiter, kosten aber Zeit ([git-blame · -C](https://git-scm.com/docs/git-blame#Documentation/git-blame.txt--Cnum)).
+
+  Blame ist ein Einstieg, kein Urteil. Der gefundene Commit ist der **letzte**, der die Zeile berührt hat, nicht zwingend der, der den Fehler verursacht hat. Lies seine Nachricht und seinen Diff mit `git show`, und geh bei Bedarf mit `git blame <commit>^ -- src/preise.py` einen Schritt weiter zurück.
+
+  ### Formatierungs-Commits in blame ausblenden
+
+  Ein Commit, der das ganze Projekt mit `ruff format` oder Prettier umformatiert, übermalt blame für Tausende Zeilen. `git blame --ignore-rev <commit>` überspringt ihn einmalig. Für das ganze Team legst du die Hashes in einer versionierten Datei ab, üblicherweise `.git-blame-ignore-revs` im Wurzelverzeichnis ([git-blame · --ignore-revs-file](https://git-scm.com/docs/git-blame#Documentation/git-blame.txt---ignore-revs-filefile)):
+
+  ```text
+  # Code mit ruff format formatieren
+  ee49b295d1c7a0f3b8e64f2a9c50d7e13b6a4f8c
+  ```
+
+  ```ini title=.git/config
+  [blame]
+      ignoreRevsFile = .git-blame-ignore-revs
+  ```
+
+  Die Datei enthält volle Hashes, eine Zeile pro Commit; Zeilen mit `#` sind Kommentare. Die Einstellung `blame.ignoreRevsFile` setzt jeder Entwickler einmal mit `git config blame.ignoreRevsFile .git-blame-ignore-revs` – die Repository-Konfiguration wird nicht versioniert. GitHub wertet eine Datei mit genau diesem Namen im Wurzelverzeichnis automatisch aus ([GitHub Docs · Ignore commits in the blame view](https://docs.github.com/en/repositories/working-with-files/using-files/viewing-and-understanding-files#ignore-commits-in-the-blame-view)).
+
+  > [!PRAXIS] Formatierung als eigener Commit
+  > Mische Formatierung nie mit inhaltlichen Änderungen. Formatiere in einem eigenen Commit, der nichts anderes tut, und trage ihn danach in `.git-blame-ignore-revs` ein. Achtung bei Squash- und Rebase-Merges: Der Hash ändert sich beim Mergen. Trage deshalb den Hash ein, der nach dem Merge auf `main` liegt.
+
+  ## Bisect: binäre Suche über Commits
+
+  Bisect braucht zwei Angaben: einen Commit, in dem der Fehler vorliegt („bad“), und einen, in dem er noch nicht vorliegt („good“). Git checkt den Commit in der Mitte aus, du testest und sagst Git das Ergebnis. Jede Antwort halbiert die Menge der Verdächtigen ([git-bisect](https://git-scm.com/docs/git-bisect)).
+
+  ```text
+  v2.3.0                                              main
+    G---o---o---o---o---o---o---o---o---o---o---o---o---B
+                            ^
+                  Git checkt die Mitte aus: good oder bad?
+  ```
+
+  Bei n Commits brauchst du etwa log₂(n) Schritte: 180 Commits in acht Schritten, 1 000 Commits in zehn. Eine manuelle Sitzung, hier an einer kleinen History mit 19 Commits seit `v2.3.0`:
+
+  ```console
+  $ git bisect start
+  status: waiting for both 'good' and 'bad' commits
+  $ git bisect bad
+  status: waiting for 'good' commit(s), 'bad' commit known
+  $ git bisect good v2.3.0
+  Bisecting: 9 revisions left to test after this (roughly 3 steps)
+  [518a49823ceefd8846c9f408ea37d3d1b9c8222f] API-Doku erweitern
+  $ git bisect bad
+  Bisecting: 4 revisions left to test after this (roughly 2 steps)
+  [ba88b764ca0515ac1731ba6de72503e20102f688] Tests aufräumen
+  $ git bisect good
+  Bisecting: 2 revisions left to test after this (roughly 1 step)
+  [5b4dac33c170a4fc336c642e40a6f32e4e5a032c] Übersetzungen ergänzen
+  $ git bisect good
+  Bisecting: 0 revisions left to test after this (roughly 1 step)
+  [ded0fe919e92c30f54687316abb8702bb4071f7b] Preisanzeige vereinfachen
+  $ git bisect bad
+  Bisecting: 0 revisions left to test after this (roughly 0 steps)
+  [27122cb461ea83e1b232455d528d16e49d4d458f] Login-Timeout erhöhen
+  $ git bisect good
+  ded0fe919e92c30f54687316abb8702bb4071f7b is the first 'bad' commit
+  commit ded0fe919e92c30f54687316abb8702bb4071f7b
+  Author: Mara Schulz <mara@example.com>
+  Date:   Fri Aug 21 11:02:47 2026 +0200
+
+      Preisanzeige vereinfachen
+
+   src/preise.py | 2 +-
+   1 file changed, 1 insertion(+), 1 deletion(-)
+  $ git bisect reset
+  Previous HEAD position was 27122cb Login-Timeout erhöhen
+  Switched to branch 'main'
+  ```
+
+  Während der Sitzung steht dein Repository im Detached-HEAD-Zustand ([Branches, HEAD und Remotes](/git/branches-head)). Das Ergebnis steht danach bis zum Ende der Sitzung in `refs/bisect/bad`. `git bisect reset` beendet die Sitzung und bringt dich zurück auf den Branch, auf dem du angefangen hast. Die Sitzung gehört zum Worktree – `refs/bisect` ist pro Worktree, du kannst also in einem [zweiten Worktree](/git/stash-worktrees) bisecten und im ersten weiterarbeiten.
+
+  Die übrigen Unterbefehle ([git-bisect · log und replay](https://git-scm.com/docs/git-bisect#_bisect_log_and_bisect_replay)):
+
+  - `git bisect skip` überspringt einen Commit, den du nicht testen kannst, etwa weil er nicht baut. Git wählt einen Nachbarn.
+  - `git bisect log` zeigt alle Markierungen als abspielbares Skript. Hast du dich vertan, speicherst du das Log in eine Datei, löschst die falsche Zeile, beendest die Sitzung mit `git bisect reset` und spielst den Rest mit `git bisect replay <datei>` ab.
+  - `git bisect visualize` (kurz `view`) zeigt die noch Verdächtigen; ohne grafische Oberfläche als `git log`, deshalb funktioniert auch `git bisect view --oneline`.
+  - Eigene Begriffe: `good` und `bad` passen schlecht, wenn du nicht nach einem Fehler suchst, sondern etwa nach dem Commit, ab dem die Startseite langsam wurde. `git bisect start --term-old=schnell --term-new=langsam` erlaubt dann `git bisect schnell` und `git bisect langsam`. In einer solchen Sitzung lehnt Git `good`/`bad` und `old`/`new` ab; `git bisect terms` zeigt die gültigen Begriffe.
+
+  ## bisect run: die Suche automatisieren
+
+  Von Hand zu testen ist langsam und fehleranfällig – eine falsche Antwort, und das Ergebnis ist Unsinn. `git bisect run` führt stattdessen bei jedem Schritt einen Befehl aus und wertet seinen Exit-Code aus ([git-bisect · run](https://git-scm.com/docs/git-bisect#_bisect_run)):
+
+  | Exit-Code | Bedeutung |
+  | --- | --- |
+  | 0 | good (alt) |
+  | 1–127, außer 125 | bad (neu) |
+  | 125 | nicht testbar, überspringen wie `git bisect skip` |
+  | 128–255 | Abbruch der ganzen Suche |
+
+  Ein Prüfskript für die Rabatt-Regression:
+
+  ```bash
+  #!/usr/bin/env bash
+  # ../pruefe_rabatt.sh – liegt außerhalb des Repositorys
+  if ! python3 -m compileall -q src >/dev/null; then
+    exit 125   # Commit baut nicht: überspringen
+  fi
+  python3 -c 'from src.preise import rabatt; assert rabatt(19.99) == 17.99'
+  ```
+
+  ```console
+  $ git bisect start HEAD v2.3.0
+  Bisecting: 9 revisions left to test after this (roughly 3 steps)
+  [518a49823ceefd8846c9f408ea37d3d1b9c8222f] API-Doku erweitern
+  $ git bisect run ../pruefe_rabatt.sh
+  running '../pruefe_rabatt.sh'
+  Bisecting: 4 revisions left to test after this (roughly 2 steps)
+  [ba88b764ca0515ac1731ba6de72503e20102f688] Tests aufräumen
+  running '../pruefe_rabatt.sh'
+  …
+  running '../pruefe_rabatt.sh'
+  ded0fe919e92c30f54687316abb8702bb4071f7b is the first 'bad' commit
+  commit ded0fe919e92c30f54687316abb8702bb4071f7b
+  Author: Mara Schulz <mara@example.com>
+  Date:   Fri Aug 21 11:02:47 2026 +0200
+
+      Preisanzeige vereinfachen
+
+   src/preise.py | 2 +-
+   1 file changed, 1 insertion(+), 1 deletion(-)
+  bisect found first 'bad' commit
+  $ git bisect reset
+  Previous HEAD position was 27122cb Login-Timeout erhöhen
+  Switched to branch 'main'
+  ```
+
+  `git bisect start HEAD v2.3.0` erledigt Start, bad und good in einem Befehl – erst der schlechte, dann ein oder mehrere gute Commits. Das letzte Kommando im Skript bestimmt den Exit-Code: Die fehlgeschlagene Assertion endet mit 1, also bad.
+
+  **Das Skript muss in jedem Commit existieren.** Bisect checkt alte Commits aus. Liegt dein neuer Regressionstest nur im neuesten Commit, fehlt er in allen älteren. Kopiere ihn deshalb vor dem Start aus dem Repository heraus, etwa nach `../`. Fehlt das aufgerufene Skript, meldet der Shell-Aufruf Exit-Code 127, und Git bricht nach einer Gegenprobe mit `bogus exit code 127 for 'good' revision` ab. Tückischer ist ein Aufruf wie `python3 tests/test_rabatt.py`: Python meldet für die fehlende Datei Exit-Code 2, und Git hält jeden alten Commit für schlecht.
+
+  Vorsicht auch mit `exit -1` im Skript: Das ergibt 255 und bricht die Suche ab, statt „bad“ zu melden. Und das Skript darf getrackte Dateien nicht verändert zurücklassen, sonst scheitert der nächste Checkout.
+
+  > [!DEEP] Warum ausgerechnet 125?
+  > 126 und 127 sind in POSIX-Shells schon belegt – „nicht ausführbar“ und „nicht gefunden“. 125 ist der höchste Wert darunter. Werte ab 128 meldet eine Shell, wenn ein Prozess durch ein Signal endet; Git wertet sie deshalb als Abbruch und nicht als Testergebnis.
+
+  ## Voraussetzungen: baubare Commits und --first-parent
+
+  Bisect setzt zwei Dinge voraus. Erstens: Jeder Commit muss sich bauen und testen lassen. Ein Commit „WIP, kompiliert noch nicht“ auf `main` erzwingt `skip`, und viele übersprungene Commits machen das Ergebnis unscharf. Das ist einer der handfestesten Gründe für atomare Commits ([Gute Commits](/git/commit-hygiene)). Zweitens: Der Fehler tritt einmal auf und bleibt. Taucht er auf, verschwindet und kehrt zurück, findet Bisect irgendeinen Übergang von good zu bad, nicht zwingend den ersten.
+
+  Merge-Commits bringen ein drittes Problem. Ein Feature-Branch kann Zwischenstände enthalten, die kaputt waren und im selben Branch repariert wurden. Bisect läuft ohne weitere Angabe auch durch diese Commits und meldet womöglich einen längst behobenen Zwischenstand. `git bisect start --first-parent` folgt bei Merges nur dem ersten Elternteil, also der Linie von `main`. Das Ergebnis ist dann der Merge-Commit, der den Fehler hereingebracht hat ([git-bisect · --first-parent](https://git-scm.com/docs/git-bisect#Documentation/git-bisect.txt---first-parent)). Innerhalb dieses Branches kannst du anschließend eine zweite, kleinere Suche starten.
+
+  ```text
+            o---x---o---o      feature/rabatte   (x: kaputter Zwischenstand)
+           /             \
+  G---o---o---o-----------M---o---B    main
+  ```
+
+  Mit `--first-parent` prüft Bisect nur `G`, die `o` auf `main`, `M` und `B` – `x` wird nie ausgecheckt.
+
+  > [!INTERVIEW] „Seit dem letzten Release ist ein Test rot, dazwischen liegen 300 Commits. Wie gehst du vor?“
+  > Ich schreibe ein kleines Prüfskript außerhalb des Repositorys, das den Fehler reproduziert und mit 0 für gut, 1 für schlecht und 125 für „baut nicht“ endet. Dann `git bisect start HEAD v2.3.0` und `git bisect run ../pruefe.sh` – nach etwa neun Schritten habe ich den Commit. Den lese ich mit `git show`, schreibe einen Regressionstest und behebe den Fehler oder reverte den Commit. Bei vielen Merges nehme ich `--first-parent`.
+
+  ## Häufige Fehler
+
+  - **`-S` erwartet, `-G` gebraucht.** Eine Wertänderung wie `TIMEOUT = 30` → `TIMEOUT = 5` ändert die Anzahl der Vorkommen nicht; `git log -S TIMEOUT` findet sie nicht.
+  - **`git log` auf eine umbenannte Datei ohne `--follow`.** Die History scheint mit der Umbenennung zu beginnen.
+  - **blame als Schuldfrage lesen.** Der letzte Commit an einer Zeile ist oft eine Formatierung oder eine Verschiebung. `-w`, `-C` und `.git-blame-ignore-revs` helfen, `git show` klärt.
+  - **Good und bad vertauscht oder falsch markiert.** Ein einziger Fehler führt Bisect in die falsche Hälfte. Lieber `git bisect run` nutzen; falls es passiert ist: `bisect log`, korrigieren, `reset`, `replay`.
+  - **Prüfskript im Repository.** In alten Commits fehlt es – je nach Aufruf bricht Bisect ab oder markiert alles als schlecht.
+  - **Falsche Exit-Codes.** `exit -1` oder Werte ab 128 brechen die Suche ab; ein Testrunner, der bei fehlenden Tests nicht 0 liefert, markiert Commits fälschlich als schlecht.
+  - **`git bisect reset` vergessen.** Du bleibst im Detached HEAD, und neue Commits hängen an keinem Branch.
+
+  ## Zusammenfassung
+
+  - `git grep` durchsucht getrackte Dateien, auch in alten Revisionen, ohne Checkout.
+  - `git log -S` findet Commits, die die Anzahl eines Textes ändern; `git log -G` Commits mit geänderten Zeilen, die auf eine Regex passen.
+  - `git log --follow` verfolgt eine Datei über Umbenennungen, `git log -L` eine Funktion oder einen Zeilenbereich.
+  - `git blame` zeigt die letzte Änderung pro Zeile; `-w` ignoriert Leerraum, `-M`/`-C` erkennen verschobenen Code, `.git-blame-ignore-revs` mit `blame.ignoreRevsFile` blendet Formatierungs-Commits aus.
+  - Bisect halbiert die Verdächtigen mit jedem Schritt: `start`, `bad`, `good`, `skip`, `log`, `replay`, `reset`.
+  - `git bisect run` wertet Exit-Codes aus: 0 good, 1–127 außer 125 bad, 125 skip, ab 128 Abbruch. Das Prüfskript liegt außerhalb des Repositorys.
+  - Bisect braucht baubare, atomare Commits; bei Merge-lastiger History hilft `--first-parent`.
+exercises:
+  - id: exit-codes-bisect-run
+    type: choice
+    title: Was bedeutet dieser Exit-Code?
+    prompt: Dein Prüfskript für `git bisect run` endet mit verschiedenen Exit-Codes. Welche Aussagen stimmen?
+    options:
+      - text: "`exit 125` überspringt den aktuellen Commit, etwa wenn er nicht baut."
+        correct: true
+        why: 125 ist für „nicht testbar“ reserviert und wirkt wie `git bisect skip`.
+      - text: "`exit 1` und `exit 2` markieren den Commit beide als schlecht."
+        correct: true
+        why: Jeder Wert von 1 bis 127 außer 125 bedeutet „bad“. Deshalb zählt auch ein Absturz des Testrunners als schlecht – ein Grund, das Skript sorgfältig zu schreiben.
+      - text: "`exit -1` markiert den Commit als schlecht."
+        correct: false
+        why: "`exit -1` ergibt den Status 255. Werte ab 128 brechen die ganze Bisect-Suche ab."
+      - text: "`exit 0` bedeutet „Fehler gefunden“, also schlecht."
+        correct: false
+        why: 0 bedeutet good bzw. old – der Fehler liegt in diesem Commit noch nicht vor.
+    explanation: |
+      Bisect liest den Exit-Code wie eine Antwort auf die Frage „Ist der Fehler schon da?“: 0 nein, 1–127 ja, 125 „kann ich nicht sagen“. Alles ab 128 deutet auf ein Signal oder einen kaputten Aufruf hin, deshalb bricht Git ab, statt ein falsches Ergebnis zu liefern.
+    resources:
+      - title: git-bisect · Bisect run
+        url: https://git-scm.com/docs/git-bisect#_bisect_run
+
+  - id: manuelle-bisect-sitzung
+    type: order
+    title: Eine Sitzung von Hand
+    prompt: |
+      `main` ist kaputt, `v2.3.0` war in Ordnung. Du willst von Hand bisecten und am Ende das Protokoll für das Ticket sichern. Bring die Befehle in eine sinnvolle Reihenfolge. Gezeigt ist nur ein Testschritt; in Wirklichkeit wiederholen sich die beiden Zeilen dazu mehrmals.
+    lang: bash
+    lines: |
+      git switch main
+      git bisect start
+      git bisect bad
+      git bisect good v2.3.0
+      pytest tests/test_preise.py
+      git bisect bad
+      git bisect log > ../bisect-rabatt.log
+      git bisect reset
+    alternatives:
+      - [1, 2, 4, 3, 5, 6, 7, 8]
+    explanation: |
+      Nach `start` markierst du den aktuellen Stand als schlecht und das Release als gut – die Reihenfolge dieser beiden Markierungen ist egal. Danach checkt Git die Mitte aus, du testest und markierst. Das Protokoll musst du **vor** `git bisect reset` sichern, denn `reset` löscht die Sitzung samt `refs/bisect`. Mit dem Log kann eine Kollegin die Suche per `git bisect replay` nachvollziehen.
+    resources:
+      - title: git-bisect · Basic bisect commands
+        url: https://git-scm.com/docs/git-bisect#_basic_bisect_commands_start_bad_good
+
+  - id: pickaxe-s-gegen-g
+    type: output
+    title: Zählen oder Zeilen vergleichen?
+    prompt: Was gibt das Skript aus?
+    lang: bash
+    code: |
+      git init -q
+      printf 'TIMEOUT = 30\n' > config.py
+      git add config.py && git commit -qm "Timeout festlegen"
+      printf 'TIMEOUT = 5\n' > config.py
+      git commit -qam "Timeout verkürzen"
+      printf 'TIMEOUT = 5  # Sekunden\n' > config.py
+      git commit -qam "Einheit dokumentieren"
+      echo "S:"
+      git log -S TIMEOUT --format=%s
+      echo "G:"
+      git log -G TIMEOUT --format=%s
+    expected: |
+      S:
+      Timeout festlegen
+      G:
+      Einheit dokumentieren
+      Timeout verkürzen
+      Timeout festlegen
+    verify: true
+    explanation: |
+      `-S TIMEOUT` fragt: Hat sich die **Anzahl** der Vorkommen geändert? Das ist nur beim ersten Commit so (0 → 1). Die beiden späteren Commits ersetzen eine Zeile mit `TIMEOUT` durch eine andere – die Anzahl bleibt 1. `-G TIMEOUT` fragt dagegen: Gibt es im Diff eine hinzugefügte oder entfernte Zeile, die auf das Muster passt? Das trifft auf alle drei Commits zu. `git log` listet wie immer den neuesten zuerst.
+    resources:
+      - title: git-log · -S
+        url: https://git-scm.com/docs/git-log#Documentation/git-log.txt--Sstring
+      - title: git-log · -G
+        url: https://git-scm.com/docs/git-log#Documentation/git-log.txt--Gregex
+
+  - id: umbenennung-folgen
+    type: output
+    title: Wo ist die alte History?
+    prompt: Was gibt das Skript aus?
+    lang: bash
+    code: |
+      git init -q
+      printf 'def login():\n    pass\n' > api.py
+      git add api.py && git commit -qm "Login anlegen"
+      printf 'def login():\n    return True\n' > api.py
+      git commit -qam "Login implementieren"
+      git mv api.py auth.py
+      git commit -qm "api.py in auth.py umbenennen"
+      git log --format=%s -- auth.py
+      echo "--follow:"
+      git log --follow --format=%s -- auth.py
+    expected: |
+      api.py in auth.py umbenennen
+      --follow:
+      api.py in auth.py umbenennen
+      Login implementieren
+      Login anlegen
+    verify: true
+    explanation: |
+      Git speichert keine Umbenennung, sondern nur Snapshots. Mit dem Pfad `auth.py` gibt es die Datei erst ab dem Umbenennungs-Commit, also zeigt `git log -- auth.py` nur ihn. `--follow` erkennt beim Vergleich, dass `auth.py` aus `api.py` hervorgegangen ist, und verfolgt die History unter dem alten Namen weiter. Das funktioniert nur für eine einzelne Datei.
+    resources:
+      - title: git-log · --follow
+        url: https://git-scm.com/docs/git-log#Documentation/git-log.txt---follow
+
+  - id: blame-ohne-leerzeichen
+    type: output
+    title: Wer hat die Zeile inhaltlich geändert?
+    prompt: |
+      `git blame --line-porcelain` gibt pro Zeile unter anderem eine Zeile `summary <Betreff>` aus; `sed` schneidet den Betreff heraus. Was gibt das Skript aus?
+    lang: bash
+    code: |
+      git init -q
+      printf 'def preis(netto):\n  return netto * 1.19\n' > preise.py
+      git add preise.py && git commit -qm "Preis mit Steuer"
+      printf 'def preis(netto):\n  return netto * 1.07\n' > preise.py
+      git commit -qam "Ermäßigter Steuersatz"
+      printf 'def preis(netto):\n    return netto * 1.07\n' > preise.py
+      git commit -qam "Einrückung auf 4 Leerzeichen"
+      git blame --line-porcelain preise.py | sed -n 's/^summary //p'
+      echo "mit -w:"
+      git blame -w --line-porcelain preise.py | sed -n 's/^summary //p'
+    expected: |
+      Preis mit Steuer
+      Einrückung auf 4 Leerzeichen
+      mit -w:
+      Preis mit Steuer
+      Ermäßigter Steuersatz
+    verify: true
+    explanation: |
+      Zeile 1 hat seit dem ersten Commit niemand angefasst. Zeile 2 hat der Einrückungs-Commit zuletzt verändert – für ein normales blame zählt jedes geänderte Zeichen, auch Leerraum. Mit `-w` vergleicht blame ohne Leerraum. Dann ist die Zeile im Einrückungs-Commit unverändert, und blame sucht weiter bis zu „Ermäßigter Steuersatz“, wo sich `1.19` in `1.07` geändert hat.
+    resources:
+      - title: git-blame · -w
+        url: https://git-scm.com/docs/git-blame#Documentation/git-blame.txt--w
+
+  - id: bisect-starten
+    type: command
+    title: Start mit einem Befehl
+    prompt: Starte eine Bisect-Sitzung mit **einem einzigen Befehl**. Der aktuelle Stand ist schlecht, der Tag `v2.3.0` ist gut.
+    context: Du bist auf `main`, das Arbeitsverzeichnis ist sauber.
+    answers:
+      - git bisect start HEAD v2.3.0
+      - git bisect start main v2.3.0
+      - git bisect start @ v2.3.0
+    output: |
+      Bisecting: 89 revisions left to test after this (roughly 7 steps)
+      [7c3e91a5f0b24d68e1a9c7f35b20d4e86a1f9c02] Warenkorb cachen
+    explanation: |
+      `git bisect start <bad> <good>` ersetzt die drei Befehle `start`, `bad` und `good`. Die Reihenfolge ist fest: zuerst der schlechte, dann ein oder mehrere gute Commits. Vertauschst du sie, meldet Git, dass der „gute“ Commit kein Vorfahre des schlechten ist. Git checkt sofort den ersten Kandidaten in der Mitte aus.
+    resources:
+      - title: git-bisect · Cutting down bisection
+        url: https://git-scm.com/docs/git-bisect#_cutting_down_bisection_by_giving_more_parameters_to_bisect_start
+
+  - id: bisect-automatisch
+    type: command
+    title: Lass das Skript entscheiden
+    prompt: Die Sitzung läuft. Lass Bisect jeden Schritt automatisch mit dem Prüfskript `../pruefe_rabatt.sh` entscheiden.
+    context: |
+      `../pruefe_rabatt.sh` liegt außerhalb des Repositorys und ist ausführbar. Es endet mit 0, wenn der Rabatt stimmt, mit 1, wenn nicht, und mit 125, wenn der Commit nicht baut.
+    answers:
+      - git bisect run ../pruefe_rabatt.sh
+      - git bisect run bash ../pruefe_rabatt.sh
+      - git bisect run sh ../pruefe_rabatt.sh
+    output: |
+      running '../pruefe_rabatt.sh'
+      Bisecting: 44 revisions left to test after this (roughly 6 steps)
+      …
+      ded0fe919e92c30f54687316abb8702bb4071f7b is the first 'bad' commit
+      …
+      bisect found first 'bad' commit
+    explanation: |
+      `git bisect run` führt den Befehl nach jedem Checkout aus und markiert anhand des Exit-Codes, bis der erste schlechte Commit feststeht. Das Skript liegt außerhalb des Repositorys, weil Bisect alte Commits auscheckt, in denen es nicht existieren würde. Danach steht das Ergebnis in `refs/bisect/bad`; `git bisect reset` beendet die Sitzung.
+    resources:
+      - title: git-bisect · Bisect run
+        url: https://git-scm.com/docs/git-bisect#_bisect_run
+
+  - id: funktion-verfolgen
+    type: command
+    title: Die Geschichte einer Funktion
+    prompt: Zeige jede Änderung an der Funktion `rabatt` in `src/preise.py` mit Diff – und nur an dieser Funktion.
+    answers:
+      - git log -L :rabatt:src/preise.py
+      - git log -L:rabatt:src/preise.py
+      - git log -L ':rabatt:src/preise.py'
+    explanation: |
+      `-L :<funktion>:<datei>` sucht die Funktion über ihre Definitionszeile und verfolgt genau diesen Bereich durch die History, samt Diff pro Commit. Für einen festen Zeilenbereich schreibst du `-L 40,60:src/preise.py`. Welche Zeilen als Funktionsanfang gelten, bestimmt dieselbe Heuristik wie bei den Hunk-Überschriften im Diff; über `.gitattributes` lässt sie sich pro Sprache anpassen.
+    resources:
+      - title: git-log · -L
+        url: https://git-scm.com/docs/git-log#Documentation/git-log.txt--Lfuncnamefile
+      - title: Pro Git · Line Log Search
+        url: https://git-scm.com/book/en/v2/Git-Tools-Searching#_line_log_search
+
+  - id: historie-befragen
+    type: gap
+    title: Die richtige Frage an die History
+    prompt: Ergänze jeweils die Option, die genau die Frage im Kommentar beantwortet.
+    lang: bash
+    code: |
+      # Welche Commits haben die Anzahl der Vorkommen von "apply_coupon(" verändert?
+      git log ⟦-S⟧ 'apply_coupon(' --format='%h %s'
+      # Welche Commits haben Zeilen hinzugefügt oder entfernt, die auf die Regex passen?
+      git log ⟦-G⟧ 'TIMEOUT *=' --format='%h %s'
+      # Wer hat die Zeilen 40 bis 60 inhaltlich zuletzt geändert, Einrückung egal?
+      git blame ⟦-w⟧ -L 40,60 src/preise.py
+      # Alle Commits der Datei, auch aus der Zeit vor ihrer Umbenennung
+      git log ⟦--follow⟧ --format='%h %s' -- src/auth.py
+    gaps:
+      - label: Anzahl der Vorkommen
+        hint: Die „Pickaxe“ im engeren Sinn, ein Großbuchstabe.
+      - label: Regex auf geänderte Zeilen
+        hint: Die zweite Pickaxe-Option, ebenfalls ein Großbuchstabe.
+      - label: Leerraum ignorieren
+        hint: Dieselbe Kurzoption kennst du von `git diff`.
+      - label: Über Umbenennungen hinweg
+        hint: Eine Langoption, die nur für genau eine Datei funktioniert.
+    explanation: |
+      `-S` zählt Vorkommen und findet damit Einführung und Entfernung von Code. `-G` prüft geänderte Zeilen gegen eine Regex und findet auch Änderungen, bei denen die Anzahl gleich bleibt. `blame -w` überspringt reine Einrückungsänderungen. `--follow` erkennt Umbenennungen beim Vergleichen, weil Git sie nicht speichert.
+    resources:
+      - title: Pro Git · Git Log Searching
+        url: https://git-scm.com/book/en/v2/Git-Tools-Searching#_git_log_searching
+
+  - id: exit-minus-eins
+    type: bug
+    title: Die Suche bricht sofort ab
+    prompt: |
+      Mit diesem Prüfskript bricht `git bisect run ../pruefe_rabatt.sh` beim ersten Commit mit Rabattfehler ab:
+
+      ```text
+      error: bisect run failed: exit code 255 from '../pruefe_rabatt.sh' is < 0 or >= 128
+      ```
+
+      Welche Zeile ist falsch? Korrigiere sie so, dass ein falscher Rabatt mit dem üblichen Fehlercode als „bad“ zählt.
+    lang: bash
+    code: |
+      #!/usr/bin/env bash
+      # ../pruefe_rabatt.sh – Aufruf: git bisect run ../pruefe_rabatt.sh
+      if ! python3 -m compileall -q src >/dev/null; then
+        exit 125
+      fi
+      if python3 -c 'from src.preise import rabatt; assert rabatt(19.99) == 17.99'; then
+        exit 0
+      fi
+      exit -1
+    lines: [9]
+    fix:
+      - line: 9
+        answers: ["exit 1"]
+    explanation: |
+      Exit-Codes sind 8 Bit breit, `exit -1` wird zu 255. Git behandelt alle Werte ab 128 als Abbruch der Suche, weil sie typischerweise auf ein Signal oder einen kaputten Aufruf hindeuten. „Bad“ ist jeder Wert von 1 bis 127 außer 125; `exit 1` ist die übliche Wahl. Die 125 in Zeile 4 ist richtig: Ein Commit, der nicht baut, wird übersprungen.
+    resources:
+      - title: git-bisect · Bisect run
+        url: https://git-scm.com/docs/git-bisect#_bisect_run
+
+  - id: nur-uebersprungene-commits
+    type: explain
+    title: We cannot bisect more!
+    prompt: |
+      Das Prüfskript endet mit 125, wenn `make build` scheitert, sonst mit dem Ergebnis des Rabatttests. Erkläre, was diese Ausgabe bedeutet, warum Bisect keinen einzelnen Commit nennt und wie du weitermachst.
+    lang: console
+    code: |
+      $ git bisect run ../pruefe.sh
+      running '../pruefe.sh'
+      …
+      There are only 'skip'ped commits left to test.
+      The first 'bad' commit could be any of:
+      8d21f8749806b479c47a904633277d16ca6ab0c9
+      84a5c8d1a3c482f261d2510f9ffb4aff7d094dce
+      db66783a7e031a1154c9ff302228c2ba84ee459b
+      3adbb7f667207c136c8a75e442f92fe5c3544cb0
+      We cannot bisect more!
+      error: bisect run cannot continue any more
+      $ git bisect view --oneline
+      3adbb7f Build reparieren
+      84a5c8d Preisanzeige vereinfachen
+      8d21f87 Import-Pfade anpassen
+      db66783 Build auf Python 3.14 umstellen
+    points:
+      - Die drei Commits von „Build auf Python 3.14 umstellen“ bis „Preisanzeige vereinfachen“ bauen nicht; das Skript hat sie mit 125 übersprungen.
+      - Der letzte gute Commit liegt vor diesem Bereich, der erste als schlecht getestete ist „Build reparieren“; dazwischen kann Bisect nicht unterscheiden.
+      - Deshalb nennt Bisect alle übersprungenen Commits plus den ersten getesteten schlechten als mögliche Verursacher.
+      - "Weiter geht es, indem man die Kandidaten mit `git show` liest oder den Build-Fix im Prüfskript vorübergehend einspielt, damit sie testbar werden."
+      - Die Ursache sind nicht baubare Commits auf `main` – atomare, baubare Commits verhindern das.
+    explanation: |
+      Bisect konnte die Suche auf vier Commits eingrenzen, aber drei davon sind nicht testbar, weil der Build kaputt war. Der erste Commit danach, „Build reparieren“, ist schlecht – der Fehler kann also in ihm oder in jedem der übersprungenen Commits entstanden sein. `git bisect view --oneline` zeigt die Kandidaten lesbar. Oft reicht jetzt ein Blick auf die Diffs: „Preisanzeige vereinfachen“ ist der naheliegende Verdächtige. Sicher wird es, wenn das Prüfskript für diese Commits den Build-Fix vorübergehend anwendet – zum Beispiel per `git cherry-pick -n` des Fix-Commits vor dem Test und `git reset --hard` danach –, damit sie testbar werden. Die eigentliche Lehre: Auf `main` gehört nur, was baut.
+    resources:
+      - title: git-bisect · Avoiding testing a commit
+        url: https://git-scm.com/docs/git-bisect#_avoiding_testing_a_commit
+
+  - id: labor-regression-finden
+    type: practice
+    title: "Labor: Irgendwo in 20 Commits"
+    prompt: |
+      Führe das Labor-Skript in einem leeren Verzeichnis aus (`cd "$(mktemp -d)"`) – **nie** in einem echten Repository.
+      Seit `v2.3.0` rundet der Rabatt falsch. Der neueste Commit enthält einen Regressionstest `tests/regression.sh`, der auf `main` fehlschlägt. Dazwischen liegen 19 Commits.
+
+      Finde den verursachenden Commit mit `git bisect run`, beende die Sitzung und mache den Commit mit `git revert --no-edit` rückgängig (das Modul [Cherry-pick und Revert](/git/cherry-pick-revert) erklärt `revert` im Detail). Am Ende ist der Regressionstest grün, du bist auf `main`, und der neueste Commit ist der Revert.
+    lang: bash
+    starter: |
+      # Labor: erzeugt den kaputten Zustand
+      mkdir shop && cd shop
+      git init -q
+      printf 'def rabatt(preis):\n    return round(preis * 0.9, 2)\n' > preise.py
+      git add . && git commit -qm "Rabattberechnung anlegen"
+      git tag v2.3.0
+      i=0
+      for msg in "Logging vereinheitlichen" "README ergänzen" "Versandkosten anzeigen" \
+        "Tests aufräumen" "Warenkorb cachen" "Übersetzungen ergänzen" "Login-Timeout erhöhen" \
+        "Preisanzeige vereinfachen" "API-Doku erweitern" "Suche beschleunigen" \
+        "Newsletter-Opt-in" "Bilder komprimieren" "CI-Cache nutzen" "Lieferzeiten anzeigen" \
+        "Abhängigkeiten aktualisieren" "Fehlerseite gestalten" "Admin-Filter ergänzen" \
+        "Rechnungs-PDF anpassen" "Impressum aktualisieren"; do
+        i=$((i + 1))
+        if [ "$msg" = "Preisanzeige vereinfachen" ]; then
+          printf 'def rabatt(preis):\n    return round(preis * 0.9)\n' > preise.py
+        else
+          mkdir -p docs && printf '%s\n' "$msg" > "docs/aenderung-$i.md"
+        fi
+        git add . && git commit -qm "$msg"
+      done
+      mkdir tests
+      printf 'python3 -c "from preise import rabatt; assert rabatt(19.99) == 17.99"\n' > tests/regression.sh
+      git add tests && git commit -qm "Regressionstest für Rabatt"
+      # Deine Reparatur:
+    solution: |
+      # Labor: erzeugt den kaputten Zustand
+      mkdir shop && cd shop
+      git init -q
+      printf 'def rabatt(preis):\n    return round(preis * 0.9, 2)\n' > preise.py
+      git add . && git commit -qm "Rabattberechnung anlegen"
+      git tag v2.3.0
+      i=0
+      for msg in "Logging vereinheitlichen" "README ergänzen" "Versandkosten anzeigen" \
+        "Tests aufräumen" "Warenkorb cachen" "Übersetzungen ergänzen" "Login-Timeout erhöhen" \
+        "Preisanzeige vereinfachen" "API-Doku erweitern" "Suche beschleunigen" \
+        "Newsletter-Opt-in" "Bilder komprimieren" "CI-Cache nutzen" "Lieferzeiten anzeigen" \
+        "Abhängigkeiten aktualisieren" "Fehlerseite gestalten" "Admin-Filter ergänzen" \
+        "Rechnungs-PDF anpassen" "Impressum aktualisieren"; do
+        i=$((i + 1))
+        if [ "$msg" = "Preisanzeige vereinfachen" ]; then
+          printf 'def rabatt(preis):\n    return round(preis * 0.9)\n' > preise.py
+        else
+          mkdir -p docs && printf '%s\n' "$msg" > "docs/aenderung-$i.md"
+        fi
+        git add . && git commit -qm "$msg"
+      done
+      mkdir tests
+      printf 'python3 -c "from preise import rabatt; assert rabatt(19.99) == 17.99"\n' > tests/regression.sh
+      git add tests && git commit -qm "Regressionstest für Rabatt"
+      # Reparatur
+      # 1. Test aus dem Repository kopieren – in alten Commits fehlt er
+      cp tests/regression.sh ../regression.sh
+      # 2. Automatisch suchen
+      git bisect start HEAD v2.3.0
+      git bisect run sh ../regression.sh
+      schuldig=$(git rev-parse refs/bisect/bad)
+      # 3. Sitzung beenden und den Commit rückgängig machen
+      git bisect reset
+      git revert --no-edit "$schuldig"
+      # Kontrolle
+      test "$(git log -1 --format=%s)" = 'Revert "Preisanzeige vereinfachen"'
+      sh tests/regression.sh
+      test "$(git branch --show-current)" = main
+    checklist:
+      - Bisect meldet `Preisanzeige vereinfachen` als ersten schlechten Commit.
+      - Das Prüfskript lag während der Suche außerhalb des Repositorys.
+      - "`git branch --show-current` zeigt `main`, es läuft keine Bisect-Sitzung mehr."
+      - "`git log -1 --format=%s` zeigt `Revert \"Preisanzeige vereinfachen\"`."
+      - "`sh tests/regression.sh` endet mit Exit-Code 0."
+    verify: true
+    hints:
+      - Guter Commit ist `v2.3.0`, schlechter der aktuelle Stand. Beides passt in einen einzigen `git bisect start`.
+      - "`tests/regression.sh` gibt es nur im neuesten Commit. Was passiert, wenn Bisect einen älteren auscheckt?"
+      - Kopiere den Test nach `../`, starte `git bisect run sh ../regression.sh` und merke dir `refs/bisect/bad`, bevor du `git bisect reset` aufrufst.
+    explanation: |
+      Bisect prüft hier höchstens fünf Commits statt zwanzig. Die Falle ist der Test: Er liegt nur im neuesten Commit. Mit `git bisect run sh tests/regression.sh` fehlt die Datei in alten Commits. Ist `sh` eine Bash, meldet sie 127, und Git bricht nach einer Gegenprobe am guten Commit mit `bogus exit code 127 for 'good' revision` ab. Ist `sh` eine Dash (etwa unter Debian und Ubuntu), meldet sie 2 – dann gilt jeder alte Commit als schlecht, und Bisect beschuldigt den ersten Commit nach `v2.3.0`. Kopiert nach `../` ist der Test in jedem Schritt verfügbar. Das Ergebnis steht in `refs/bisect/bad`; merke es dir vor `git bisect reset`, denn `reset` räumt `refs/bisect` weg. `git revert` erzeugt einen neuen Commit, der die Änderung umkehrt, ohne die geteilte History umzuschreiben.
+    resources:
+      - title: git-bisect · Bisect run
+        url: https://git-scm.com/docs/git-bisect#_bisect_run
+      - title: Pro Git · Binary Search
+        url: https://git-scm.com/book/en/v2/Git-Tools-Debugging-with-Git#_binary_search
+
+  - id: labor-blame-formatierung
+    type: practice
+    title: "Labor: blame zeigt nur noch den Formatierer"
+    prompt: |
+      Führe das Labor-Skript in einem leeren Verzeichnis aus (`cd "$(mktemp -d)"`) – **nie** in einem echten Repository.
+      In `versand.py` zeigt `git blame` für die meisten Zeilen nur noch einen Formatierungs-Commit. Wer die Sperrgut-Grenze auf 30 kg gesetzt hat, ist nicht mehr zu sehen.
+
+      Richte das Repository so ein, dass `git blame versand.py` ohne weitere Optionen die inhaltlichen Commits zeigt – und zwar über eine **versionierte** Datei `.git-blame-ignore-revs`, die für das ganze Team gilt. Committe die Datei. Prüfe mit `git blame versand.py`.
+    lang: bash
+    starter: |
+      # Labor: erzeugt den kaputten Zustand
+      git init -q
+      printf 'def versand(gewicht):\n  if gewicht > 20:\n    return 12.9\n  return 4.9\n' > versand.py
+      git add . && git commit -qm "Versandkosten berechnen"
+      printf 'def versand(gewicht):\n  if gewicht > 30:\n    return 12.9\n  return 4.9\n' > versand.py
+      git commit -qam "Sperrgut erst ab 30 kg"
+      printf 'def versand(gewicht):\n    if gewicht > 30:\n        return 12.9\n    return 4.9\n' > versand.py
+      git commit -qam "Code mit ruff format formatieren"
+      printf 'def versand(gewicht):\n    if gewicht > 30:\n        return 14.9\n    return 4.9\n' > versand.py
+      git commit -qam "Sperrgutpreis erhöhen"
+      # Deine Reparatur:
+    solution: |
+      # Labor: erzeugt den kaputten Zustand
+      git init -q
+      printf 'def versand(gewicht):\n  if gewicht > 20:\n    return 12.9\n  return 4.9\n' > versand.py
+      git add . && git commit -qm "Versandkosten berechnen"
+      printf 'def versand(gewicht):\n  if gewicht > 30:\n    return 12.9\n  return 4.9\n' > versand.py
+      git commit -qam "Sperrgut erst ab 30 kg"
+      printf 'def versand(gewicht):\n    if gewicht > 30:\n        return 12.9\n    return 4.9\n' > versand.py
+      git commit -qam "Code mit ruff format formatieren"
+      printf 'def versand(gewicht):\n    if gewicht > 30:\n        return 14.9\n    return 4.9\n' > versand.py
+      git commit -qam "Sperrgutpreis erhöhen"
+      # Reparatur
+      # 1. Vollen Hash des Formatierungs-Commits eintragen (:/Text sucht in Commit-Nachrichten)
+      git rev-parse ':/Code mit ruff format' > .git-blame-ignore-revs
+      git add .git-blame-ignore-revs
+      git commit -qm "Formatierungs-Commit in blame ignorieren"
+      # 2. Lokal einschalten
+      git config blame.ignoreRevsFile .git-blame-ignore-revs
+      # Kontrolle
+      git ls-files --error-unmatch .git-blame-ignore-revs
+      test "$(git config blame.ignoreRevsFile)" = .git-blame-ignore-revs
+      test -z "$(git status --porcelain)"
+      test "$(git blame --line-porcelain versand.py | sed -n 's/^summary //p' | paste -sd ',')" = "Versandkosten berechnen,Sperrgut erst ab 30 kg,Sperrgutpreis erhöhen,Versandkosten berechnen"
+    checklist:
+      - "`.git-blame-ignore-revs` enthält den vollen Hash des Formatierungs-Commits und ist committet."
+      - "`git config blame.ignoreRevsFile` gibt `.git-blame-ignore-revs` aus."
+      - "`git blame versand.py` zeigt für Zeile 2 `Sperrgut erst ab 30 kg`, für Zeile 3 `Sperrgutpreis erhöhen` und für Zeile 4 `Versandkosten berechnen`."
+      - Der Formatierungs-Commit taucht in `git blame versand.py` nicht mehr auf.
+    verify: true
+    hints:
+      - "`git blame --ignore-rev <commit> versand.py` zeigt, wie das Ergebnis aussehen soll – aber nur für diesen einen Aufruf."
+      - Den vollen Hash liefert `git log --grep=ruff --format=%H` oder `git rev-parse ':/Code mit ruff format'`.
+      - Die Datei allein reicht nicht; blame liest sie erst, wenn `blame.ignoreRevsFile` darauf zeigt.
+    explanation: |
+      Der Formatierungs-Commit hat jede eingerückte Zeile berührt, also nennt blame ihn als letzten Autor. `.git-blame-ignore-revs` listet Commits, die blame überspringen soll; dann sucht blame für die betroffenen Zeilen weiter in die Vergangenheit und ordnet sie dem inhaltlichen Commit zu. Die Datei ist versioniert und damit für alle gleich, die Einstellung `blame.ignoreRevsFile` liegt dagegen in der lokalen Konfiguration – jede Entwicklerin setzt sie einmal, GitHub liest die Datei von selbst. `-w` hätte hier für die Einrückung auch geholfen, müsste aber bei jedem Aufruf angegeben werden und hilft nicht bei Formatierern, die Zeilen umbrechen.
+    resources:
+      - title: git-blame · --ignore-revs-file
+        url: https://git-scm.com/docs/git-blame#Documentation/git-blame.txt---ignore-revs-filefile
+      - title: GitHub Docs · Ignore commits in the blame view
+        url: https://docs.github.com/en/repositories/working-with-files/using-files/viewing-and-understanding-files#ignore-commits-in-the-blame-view
+
+  - id: labor-bisect-falsch-markiert
+    type: practice
+    title: "Labor: Eine Markierung war falsch"
+    prompt: |
+      Führe das Labor-Skript in einem leeren Verzeichnis aus (`cd "$(mktemp -d)"`) – **nie** in einem echten Repository.
+      Seit `v2.3.0` steht in `config.py` ein zu kurzes Timeout (`TIMEOUT = 3` statt `30`). Eine Kollegin hat eine Bisect-Sitzung begonnen und vier Commits von Hand markiert. Bisect nennt jetzt einen Schuldigen – aber dessen Diff ändert `config.py` gar nicht.
+
+      Finde mit `git bisect log` die falsche Markierung, entferne sie, spiele den Rest mit `git bisect replay` ab und lass die Suche danach mit `git bisect run` zu Ende laufen. Prüfe das Ergebnis mit `git log -1 --format=%s refs/bisect/bad`, bevor du die Sitzung mit `git bisect reset` beendest.
+    lang: bash
+    starter: |
+      # Labor: erzeugt den kaputten Zustand
+      mkdir shop && cd shop
+      git init -q
+      printf 'TIMEOUT = 30\n' > config.py
+      git add . && git commit -qm "Konfiguration anlegen"
+      git tag v2.3.0
+      for msg in "Logging vereinheitlichen" "Warenkorb cachen" "Suche beschleunigen" \
+        "Bilder komprimieren" "Verbindungspool einführen" "Fehlerseite gestalten" \
+        "Lieferzeiten anzeigen" "Admin-Filter ergänzen" "Impressum aktualisieren"; do
+        if [ "$msg" = "Verbindungspool einführen" ]; then printf 'TIMEOUT = 3\n' > config.py; fi
+        printf '%s\n' "$msg" >> CHANGELOG.md
+        git add . && git commit -qm "$msg"
+      done
+      # Eine Kollegin hat die Suche von Hand begonnen und die Commits markiert:
+      git bisect start main v2.3.0
+      git bisect good main~6
+      git bisect bad main~1
+      git bisect good main~3
+      git bisect bad main~2
+      # Deine Reparatur:
+    solution: |
+      # Labor: erzeugt den kaputten Zustand
+      mkdir shop && cd shop
+      git init -q
+      printf 'TIMEOUT = 30\n' > config.py
+      git add . && git commit -qm "Konfiguration anlegen"
+      git tag v2.3.0
+      for msg in "Logging vereinheitlichen" "Warenkorb cachen" "Suche beschleunigen" \
+        "Bilder komprimieren" "Verbindungspool einführen" "Fehlerseite gestalten" \
+        "Lieferzeiten anzeigen" "Admin-Filter ergänzen" "Impressum aktualisieren"; do
+        if [ "$msg" = "Verbindungspool einführen" ]; then printf 'TIMEOUT = 3\n' > config.py; fi
+        printf '%s\n' "$msg" >> CHANGELOG.md
+        git add . && git commit -qm "$msg"
+      done
+      # Eine Kollegin hat die Suche von Hand begonnen und die Commits markiert:
+      git bisect start main v2.3.0
+      git bisect good main~6
+      git bisect bad main~1
+      git bisect good main~3
+      git bisect bad main~2
+      # Reparatur
+      # 1. Protokoll sichern; main~3 ("Fehlerseite gestalten") hat schon TIMEOUT = 3,
+      #    wurde aber als good markiert
+      git bisect log > ../bisect.log
+      grep -v "$(git rev-parse main~3)" ../bisect.log > ../bisect-korrigiert.log
+      # 2. Neu aufsetzen und die richtigen Markierungen abspielen
+      git bisect reset
+      git bisect replay ../bisect-korrigiert.log
+      # 3. Den Rest automatisch entscheiden lassen
+      git bisect run grep -q 'TIMEOUT = 30' config.py
+      # Kontrolle
+      test "$(git log -1 --format=%s refs/bisect/bad)" = "Verbindungspool einführen"
+      git bisect reset
+      test "$(git branch --show-current)" = main
+    checklist:
+      - Du hast die falsch markierte Zeile in `git bisect log` gefunden, weil `config.py` in diesem Commit schon `TIMEOUT = 3` enthält.
+      - Die korrigierte Log-Datei liegt außerhalb des Repositorys und enthält die falsche Markierung nicht mehr.
+      - "`git log -1 --format=%s refs/bisect/bad` zeigt `Verbindungspool einführen`."
+      - Nach `git bisect reset` bist du wieder auf `main`.
+    verify: true
+    hints:
+      - "`git bisect log` listet jede Markierung mit vollem Hash. Prüfe jede mit `git show <hash>:config.py`."
+      - Ein Commit wurde als good markiert, obwohl darin schon `TIMEOUT = 3` steht.
+      - "Log in eine Datei außerhalb des Repositorys schreiben, beide Zeilen zu diesem Hash entfernen (`grep -v`), dann `git bisect reset` und `git bisect replay <datei>`."
+    explanation: |
+      Eine einzige falsche Markierung schickt Bisect in die falsche Hälfte: „Fehlerseite gestalten“ wurde als good markiert, obwohl der Fehler dort schon vorlag, also sucht Bisect nur noch dahinter und landet bei „Lieferzeiten anzeigen“. `git bisect log` ist ein abspielbares Protokoll. Ohne die falsche Zeile stellt `git bisect replay` alle richtigen Markierungen wieder her, ohne dass du sie erneut testen musst. Den Rest erledigt `git bisect run` mit einem Befehl, der sich nicht vertut. Die Log-Datei gehört nach außerhalb des Repositorys, damit sie nicht als untracked Datei im Projekt liegt und mit dem nächsten `git add -A` in einem Commit landet.
+    resources:
+      - title: git-bisect · log und replay
+        url: https://git-scm.com/docs/git-bisect#_bisect_log_and_bisect_replay

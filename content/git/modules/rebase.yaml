@@ -1,0 +1,827 @@
+id: rebase
+title: "Rebase: History neu aufsetzen"
+level: 2
+minutes: 160
+summary: Wie Rebase Commits auf eine neue Basis kopiert, wann du es statt Merge einsetzt, wie du Konflikte Commit für Commit löst, Branches mit --onto umpflanzt und nach dem Rebase sicher pushst.
+goals:
+  - Du erklärst, dass Rebase Commits kopiert und neu anwendet, und sagst vorher, welche Commits neue Hashes bekommen und wo die alten bleiben.
+  - Du wägst Merge und Rebase gegeneinander ab und hältst dich an die goldene Regel für geteilte History.
+  - Du hältst Branches mit `pull --rebase` und `rebase origin/main` aktuell und pflanzt Branches mit `--onto` und `--update-refs` um.
+  - Du löst Konflikte während eines Rebase, kennst die vertauschten Rollen von ours und theirs und brichst sauber ab.
+  - Du pushst umgeschriebene Branches mit `--force-with-lease` und machst einen missglückten Rebase mit `ORIG_HEAD` oder dem Reflog rückgängig.
+resources:
+  - title: git-rebase – Referenz
+    url: https://git-scm.com/docs/git-rebase
+  - title: Pro Git · Rebasing
+    url: https://git-scm.com/book/en/v2/Git-Branching-Rebasing
+  - title: git-push · --force-with-lease
+    url: https://git-scm.com/docs/git-push#Documentation/git-push.txt---force-with-lease
+  - title: git-pull – Referenz
+    url: https://git-scm.com/docs/git-pull
+lesson: |
+  Dein Branch `feature/login` ist drei Tage alt. Inzwischen sind auf `main` zwölf Commits gelandet, und GitHub zeigt im Pull Request „This branch is out-of-date with the base branch“. Du kannst `main` in deinen Branch mergen – dann entsteht ein Merge-Commit, und die History des PRs besteht aus zwei verflochtenen Linien. Oder du setzt deine Commits auf die aktuelle Spitze von `main` neu auf, als hättest du erst heute angefangen. Das zweite heißt **Rebase**.
+
+  Rebase gehört zu den mächtigsten und zugleich am häufigsten missverstandenen Befehlen in Git. Wer das Denkmodell kennt – Commits werden kopiert, nicht verschoben –, weiß vorher, was passiert, löst Konflikte ohne Panik und macht einen missglückten Rebase in Sekunden rückgängig.
+
+  ## Was Rebase tut: Commits neu anwenden
+
+  Ausgangslage: `feature/login` ist bei `B` von `main` abgezweigt. Seitdem sind auf beiden Seiten Commits entstanden.
+
+  ```text
+        D---E  feature/login (HEAD)
+       /
+  A---B---C---F  main
+  ```
+
+  Nach `git rebase main` sieht der Graph so aus:
+
+  ```text
+                D'--E'  feature/login (HEAD)
+               /
+  A---B---C---F  main
+       \
+        D---E  (alte Commits, nur noch über ORIG_HEAD und Reflog erreichbar)
+  ```
+
+  Git geht dabei in festen Schritten vor ([git-rebase](https://git-scm.com/docs/git-rebase)):
+
+  1. Es bestimmt die **Merge-Base** von `feature/login` und `main`, hier `B` ([git-merge-base](https://git-scm.com/docs/git-merge-base)).
+  2. Es sammelt die Commits, die nur auf deinem Branch liegen – genau die Menge `main..feature/login`, also `D` und `E`.
+  3. Es merkt sich die alte Spitze `E` in `ORIG_HEAD` und setzt HEAD (detached) auf `F`.
+  4. Es wendet `D` und `E` nacheinander an, jeweils wie ein Cherry-pick: Die Änderung, die `D` gegenüber seinem Elterncommit gemacht hat, wird auf den neuen Stand übertragen und als neuer Commit `D'` gespeichert.
+  5. Zum Schluss zeigt `feature/login` auf `E'`, und HEAD hängt wieder am Branch.
+
+  `D'` hat denselben Autor, dieselbe Nachricht und meist dieselbe Änderung wie `D` – aber einen anderen Hash. Ein Commit enthält den Hash seines Elterncommits und seinen vollständigen Tree. Ändert sich der Elterncommit, ändert sich zwangsläufig der eigene Hash (siehe [Das Datenmodell](/git/datenmodell)). Rebase **verschiebt** also nichts, es **kopiert** Commits und bewegt danach nur den Zeiger des aktuellen Branches. `main` bleibt, wo es war.
+
+  ```console
+  $ git log --oneline --graph --decorate --all
+  * 239c74d (HEAD -> feature/login) Passwort prüfen
+  * 229b318 Login-Formular anlegen
+  | * 20eac3c (main) README ergänzen
+  |/
+  * 335a1a3 Projekt anlegen
+  $ git rebase main
+  Successfully rebased and updated refs/heads/feature/login.
+  $ git log --oneline --graph --decorate --all
+  * 1e52613 (HEAD -> feature/login) Passwort prüfen
+  * 2df9545 Login-Formular anlegen
+  * 20eac3c (main) README ergänzen
+  * 335a1a3 Projekt anlegen
+  ```
+
+  Zwei Details sind wichtig. Erstens: Enthält `main` schon eine Änderung, die identisch in deinem Branch steckt – etwa weil ein Sicherheitsfix per Cherry-pick übernommen wurde –, überspringt Git diesen Commit und meldet `skipped previously applied commit`. Verglichen wird die [Patch-ID](https://git-scm.com/docs/git-patch-id), also der Diff ohne Zeilennummern und Hashes. Zweitens: `git rebase main feature/login` wechselt vorher selbst auf `feature/login`. Das erste Argument ist die neue Basis, das zweite der Branch, der umgeschrieben wird.
+
+  > [!MERKE]
+  > Rebase kopiert die Commits aus `upstream..branch` auf eine neue Basis und bewegt dann nur den aktuellen Branch. Die Originale bleiben im Repository, bis sie nach Ablauf des Reflogs von der Garbage Collection entfernt werden.
+
+  ## Merge oder Rebase?
+
+  Beide Befehle bringen die Änderungen von `main` in deinen Branch. Sie hinterlassen aber eine unterschiedliche History:
+
+  | | Merge | Rebase |
+  | --- | --- | --- |
+  | History | zeigt, was parallel passiert ist | linear, als wäre alles nacheinander entstanden |
+  | Bestehende Commits | bleiben unverändert | werden durch Kopien ersetzt |
+  | Konflikte | einmal, für alle Änderungen zusammen | pro Commit, dieselbe Stelle eventuell mehrfach |
+  | Schon gepushter Branch | normaler Push | Force-Push nötig |
+  | Zwischenstände | alle Commits wurden so getestet, wie sie entstanden | die Kopien sind neue Zustände, die nie jemand getestet hat |
+
+  Für Rebase spricht eine History, die sich wie eine Geschichte liest: `git log` zeigt die Commits deines Features am Stück, Reviewer sehen keine „Merge branch 'main' into feature/login“-Commits, und [git bisect](/git/bisect-historie) läuft durch eine gerade Linie. Für Merge spricht, dass nichts umgeschrieben wird: Die History bleibt ein ehrliches Protokoll, und niemand muss force-pushen. Der Merge-Commit dokumentiert außerdem, wann ein Feature integriert wurde ([Merge verstehen](/git/merge)).
+
+  Die letzte Zeile der Tabelle wird oft übersehen. Nach dem Rebase ist `D'` ein Stand, der so nie existiert hat: deine Änderung plus alles, was seitdem auf `main` kam. Wenn `F` eine Funktion umbenannt hat, die `D` benutzt, kompiliert `D'` vielleicht nicht mehr – ohne dass es einen Konflikt gab. Deshalb gehören nach jedem Rebase die Tests dazu, im Zweifel für jeden Commit (`--exec`, siehe [interaktives Rebase](/git/interactive-rebase)).
+
+  In vielen Teams gilt: Feature-Branches lokal per Rebase aktuell halten, die Integration in `main` läuft über den Pull Request – je nach Team als Merge-Commit, Squash oder „Rebase and merge“ ([GitHub · About pull request merges](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/incorporating-changes-from-a-pull-request/about-pull-request-merges)).
+
+  > [!INTERVIEW] „Merge oder Rebase – was nimmst du?“
+  > Kommt drauf an, ob die Commits schon geteilt sind. Meinen eigenen Feature-Branch rebase ich auf `main`, bevor ich den PR öffne oder aktualisiere – das gibt eine lineare, gut reviewbare History. Geteilte Branches wie `main` oder `release/2.4` rebase ich nie, weil Rebase Commits durch Kopien mit neuen Hashes ersetzt und alle anderen dann auf verwaisten Commits sitzen. Nach dem Rebase lasse ich die Tests laufen und pushe mit `--force-with-lease`.
+
+  ### Die goldene Regel
+
+  Pro Git formuliert sie so: Rebase keine Commits, die außerhalb deines Repositorys existieren und auf denen andere ihre Arbeit aufgebaut haben könnten ([Pro Git · The Perils of Rebasing](https://git-scm.com/book/en/v2/Git-Branching-Rebasing#_rebase_peril)). Was passiert, wenn du es trotzdem tust: Deine Kollegin hat `D` und `E` schon geholt und darauf `G` gebaut. Du ersetzt sie durch `D'` und `E'` und force-pushst. Beim nächsten `git pull` führt Git ihre alte Linie mit deiner neuen zusammen – dieselben Änderungen stehen dann zweimal in der History, oft mit Konflikten dazu.
+
+  Im Alltag heißt das: Lokale, nie gepushte Commits darfst du jederzeit umschreiben. Deinen eigenen PR-Branch, auf dem niemand sonst arbeitet, auch – mit `--force-with-lease`. `main`, `release/*` und Branches, an denen mehrere arbeiten, nie.
+
+  ## Aktuell bleiben mit pull --rebase
+
+  `git pull` ist `git fetch` plus Integration. Haben sich dein lokaler Branch und `origin/main` auseinanderentwickelt, weigert sich Git ohne Konfiguration und verlangt eine Entscheidung:
+
+  ```console
+  $ git pull
+  From github.com:shop/webapp
+     92f96ca..1040f7c  main       -> origin/main
+  hint: You have divergent branches and need to specify how to reconcile them.
+  …
+  fatal: Need to specify how to reconcile divergent branches.
+  $ git pull --rebase
+  Successfully rebased and updated refs/heads/main.
+  ```
+
+  `git pull --rebase` holt die neuen Commits und setzt deine lokalen, noch nicht gepushten Commits obendrauf. Das ist genau die Situation, in der Rebase ungefährlich ist: Die umgeschriebenen Commits hat noch niemand gesehen. Statt jedes Mal die Option anzugeben, stellst du es dauerhaft ein ([git-config · pull.rebase](https://git-scm.com/docs/git-config#Documentation/git-config.txt-pullrebase)):
+
+  ```ini title=.gitconfig
+  [pull]
+      rebase = true
+  [rebase]
+      autoStash = true
+  ```
+
+  Rebase braucht ein sauberes Arbeitsverzeichnis. Mit ungesicherten Änderungen bricht es mit `error: cannot rebase: You have unstaged changes.` ab. `rebase.autoStash` (oder einmalig `--autostash`) legt die Änderungen vorher in einen temporären Stash und spielt sie danach wieder ein. Die Alternative `pull.ff = only` erlaubt nur Fast-Forwards und zwingt dich, jede Divergenz bewusst zu behandeln.
+
+  > [!WARNING] autoStash ist kein Freifahrtschein
+  > Der automatische Stash wird nach dem Rebase angewendet. Kollidiert er mit den neuen Commits, bekommst du Konflikte im Arbeitsverzeichnis; der Stash bleibt dann in `git stash list` erhalten. Bei größeren lokalen Änderungen ist ein WIP-Commit übersichtlicher ([Stash und Worktrees](/git/stash-worktrees)).
+
+  ## Umpflanzen mit --onto
+
+  Die Kurzform `git rebase main` nimmt alle Commits seit der Merge-Base. Manchmal willst du genauer sagen, welche Commits wohin gehören. Dafür gibt es die Form mit drei Argumenten, `git rebase --onto <neue-basis> <alte-basis> <branch>` ([git-rebase · --onto](https://git-scm.com/docs/git-rebase#Documentation/git-rebase.txt---ontonewbase)).
+
+  Gelesen: Nimm die Commits aus `alte-basis..branch` und setze sie auf `neue-basis`. Der typische Fall: Du hast `feature/ui` versehentlich von `feature/api` statt von `main` abgezweigt. Jetzt stecken die unfertigen API-Commits `X` und `Y` in deinem Branch.
+
+  ```text
+  vorher:
+              U---V  feature/ui
+             /
+        X---Y  feature/api
+       /
+  A---B---C  main
+
+  nachher:
+            U'--V'  feature/ui
+           /
+  A---B---C  main
+       \
+        X---Y  feature/api
+  ```
+
+  `git rebase --onto main feature/api feature/ui` überträgt nur `U` und `V`; `feature/api` bleibt unverändert. Ein normales `git rebase main` hätte `X` und `Y` mitgenommen. Derselbe Befehl hilft, wenn der Basis-PR `feature/api` per Squash gemergt wurde: Auf `main` liegt dann ein einziger neuer Commit mit denselben Änderungen, aber deine Kopien von `X` und `Y` würden erneut angewendet – meist mit Konflikten. Mit `--onto` lässt du sie gezielt weg.
+
+  ### Gestapelte Branches mit --update-refs
+
+  Arbeitest du mit gestapelten PRs – `feature/ui` baut bewusst auf `feature/api` auf –, soll beim Rebase der ganze Stapel mitwandern. Ohne Zusatz bewegt Git nur den aktuellen Branch, `feature/api` zeigt danach weiter auf die alten Commits. Seit Git 2.38 versetzt `--update-refs` alle lokalen Branches, die auf umgeschriebene Commits zeigen ([git-rebase · --update-refs](https://git-scm.com/docs/git-rebase#Documentation/git-rebase.txt---update-refs)):
+
+  ```console
+  $ git switch feature/ui
+  $ git rebase --update-refs main
+  Successfully rebased and updated refs/heads/feature/ui.
+  Updated the following refs with --update-refs:
+  	refs/heads/feature/api
+  ```
+
+  Mit `git config rebase.updateRefs true` wird das zum Standard. Danach musst du beide Branches pushen.
+
+  ## Konflikte während des Rebase
+
+  Weil Rebase Commit für Commit anwendet, kann jeder einzelne Schritt einen Konflikt auslösen. Git hält dann mitten im Vorgang an:
+
+  ```console
+  $ git rebase main
+  Auto-merging config.yaml
+  CONFLICT (content): Merge conflict in config.yaml
+  error: could not apply ff59b35... Timeout für Login erhöhen
+  hint: Resolve all conflicts manually, mark them as resolved with
+  hint: "git add/rm <conflicted_files>", then run "git rebase --continue".
+  hint: You can instead skip this commit: run "git rebase --skip".
+  hint: To abort and get back to the state before "git rebase", run "git rebase --abort".
+  hint: Disable this message with "git config set advice.mergeConflict false"
+  Could not apply ff59b35... # Timeout für Login erhöhen
+  ```
+
+  Du bist jetzt in einem Detached HEAD auf der neuen Basis plus den schon übertragenen Commits. `git status` zeigt, welcher Commit gerade angewendet wird, welche noch folgen und welche Dateien betroffen sind. Die Konfliktmarker sehen so aus:
+
+  ```text
+  <<<<<<< HEAD
+  timeout: 45
+  =======
+  timeout: 60
+  >>>>>>> ff59b35 (Timeout für Login erhöhen)
+  ```
+
+  Hier steckt die gefährlichste Falle des Rebase: **ours und theirs sind vertauscht.** Beim Merge ist „ours“ dein Branch. Beim Rebase ist HEAD die neue Basis – „ours“ ist also `main`, und „theirs“ ist dein eigener Commit, der gerade neu angewendet wird. Wer im Konflikt reflexartig `git restore --ours config.yaml` oder `git checkout --ours` tippt, um „seine“ Version zu behalten, wirft seine eigene Änderung weg. Mehr zu Konfliktmarkern, `zdiff3` und `rerere` im Modul [Konflikte lösen](/git/konflikte).
+
+  Drei Wege führen weiter ([git-rebase · --continue](https://git-scm.com/docs/git-rebase#Documentation/git-rebase.txt---continue)):
+
+  - **`git rebase --continue`** – nach dem Auflösen und `git add datei`. Git erstellt den Commit (der Editor öffnet sich mit der alten Nachricht) und macht mit dem nächsten weiter.
+  - **`git rebase --skip`** – verwirft den aktuellen Commit vollständig. Nur richtig, wenn seine Änderung durch `main` überflüssig geworden ist.
+  - **`git rebase --abort`** – bricht ab und stellt den Zustand vor dem Rebase exakt wieder her.
+
+  ### Einen abgeschlossenen Rebase rückgängig machen
+
+  Ist der Rebase durch und das Ergebnis falsch, hilft `ORIG_HEAD`: `git reset --hard ORIG_HEAD` setzt den Branch auf die alte Spitze zurück. `ORIG_HEAD` wird aber von jedem `reset`, `merge` und `rebase` überschrieben. Dauerhafter ist das Reflog des Branches:
+
+  ```console
+  $ git reflog feature/login
+  1e52613 feature/login@{0}: rebase (finish): refs/heads/feature/login onto 20eac3c…
+  239c74d feature/login@{1}: commit: Passwort prüfen
+  229b318 feature/login@{2}: commit: Login-Formular anlegen
+  $ git reset --hard feature/login@{1}
+  ```
+
+  Achtung, Verwechslungsgefahr: `HEAD@{1}` ist nach einem Rebase der letzte übertragene Commit, nicht der alte Stand – das HEAD-Reflog protokolliert jeden einzelnen Schritt. Das Branch-Reflog enthält den ganzen Rebase dagegen als einen Eintrag. In PowerShell hat `@{` eine eigene Bedeutung; dort schreibst du `'feature/login@{1}'` in Anführungszeichen. Wie Reset und Reflog im Detail funktionieren: [Reset, Reflog und Recovery](/git/reset-reflog).
+
+  ## Force-Push mit Lease
+
+  Hast du `feature/login` schon gepusht, passt der Remote-Branch nach dem Rebase nicht mehr zu deinem: Die alten Commits `D` und `E` sind dort, deine Kopien nicht. Ein normaler Push wird abgelehnt, weil er kein Fast-Forward ist:
+
+  ```console
+  $ git push
+  To github.com:shop/webapp.git
+   ! [rejected]        feature/login -> feature/login (non-fast-forward)
+  error: failed to push some refs to 'github.com:shop/webapp.git'
+  hint: Updates were rejected because the tip of your current branch is behind
+  hint: its remote counterpart. If you want to integrate the remote changes,
+  hint: use 'git pull' before pushing again.
+  ```
+
+  Der Hinweis auf `git pull` ist hier falsch: Ein Pull würde die alten und die neuen Commits zusammenmergen, genau die Duplikate aus der goldenen Regel. Richtig ist ein Force-Push. `git push --force` überschreibt den Remote-Branch bedingungslos – auch dann, wenn eine Kollegin inzwischen einen Commit dazugepusht hat. `--force-with-lease` überschreibt nur, wenn der Remote-Branch noch auf dem Stand steht, den dein Remote-Tracking-Branch `origin/feature/login` kennt ([git-push · --force-with-lease](https://git-scm.com/docs/git-push#Documentation/git-push.txt---force-with-lease)). Sonst:
+
+  ```console
+  $ git push --force-with-lease
+  To github.com:shop/webapp.git
+   ! [rejected]        feature/login -> feature/login (stale info)
+  error: failed to push some refs to 'github.com:shop/webapp.git'
+  ```
+
+  Eine Lücke bleibt: Holt deine IDE im Hintergrund per `git fetch` den neuen Stand, zeigt `origin/feature/login` schon auf den Commit der Kollegin, und die Lease ist erfüllt, obwohl du ihn nie integriert hast. `--force-if-includes` schließt diese Lücke: Git prüft zusätzlich, ob der Stand des Remote-Tracking-Branches irgendwann in deinem lokalen Branch enthalten war, und lehnt sonst mit `remote ref updated since checkout` ab ([git-push · --force-if-includes](https://git-scm.com/docs/git-push#Documentation/git-push.txt---force-if-includes)). Mit `git config push.useForceIfIncludes true` gilt das bei jedem `--force-with-lease`.
+
+  > [!PRAXIS] Den PR-Branch aktualisieren
+  > Der Ablauf, den du im Team jeden Tag brauchst: `git fetch origin`, `git rebase origin/main` (nicht das lokale, vielleicht veraltete `main`), Konflikte lösen, Tests laufen lassen, `git push --force-with-lease`. Auf `main` und Release-Branches verbieten Branch-Protection-Regeln Force-Pushes ohnehin ([GitHub · About protected branches](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches)). Im Review fällt ein PR mit fünf „Merge branch 'main' into feature/…“-Commits eher negativ auf.
+
+  ## Häufige Fehler
+
+  - **Auf ein veraltetes `main` rebasen.** `git rebase main` meldet `Current branch feature/login is up to date.`, obwohl der PR veraltet ist – das lokale `main` wurde seit Tagen nicht aktualisiert. Nach `git fetch` auf `origin/main` rebasen.
+  - **`--ours` beim Rebase-Konflikt.** Behält die Version von `main` und wirft die eigene Änderung weg. Beim Rebase ist deine Seite „theirs“.
+  - **Nach dem Rebase `git pull` statt Force-Push.** Git mergt alte und neue Commits zusammen; jede Änderung steht doppelt in der History. Abhilfe: zurück auf den Stand vor dem Pull (`ORIG_HEAD`) und `git push --force-with-lease`.
+  - **`git push --force` statt `--force-with-lease`.** Überschreibt kommentarlos fremde Commits auf dem Remote-Branch.
+  - **Geteilte Branches rebasen.** Alle anderen sitzen danach auf Commits, die es auf dem Server nicht mehr gibt.
+  - **Merge-Commits verschwinden.** Rebase linearisiert: Merge-Commits im umgeschriebenen Bereich fallen weg. Wer sie erhalten will, nutzt `--rebase-merges`.
+  - **`HEAD@{1}` zum Rückgängigmachen.** Zeigt nur auf den letzten Schritt des Rebase. Richtig sind `ORIG_HEAD` oder `branch@{1}`.
+  - **Nach dem Rebase nicht testen.** Kein Konflikt heißt nicht, dass der Code noch funktioniert.
+
+  ## Zusammenfassung
+
+  - Rebase kopiert die Commits aus `upstream..branch` auf eine neue Basis. Die Kopien haben neue Hashes, weil sich ihr Elterncommit ändert; nur der aktuelle Branch bewegt sich.
+  - Merge bewahrt die tatsächliche History, Rebase erzeugt eine lineare. Umgeschriebene Commits sind ungetestete neue Zustände.
+  - Goldene Regel: Nur Commits umschreiben, auf denen niemand sonst aufbaut – lokale Commits und der eigene PR-Branch ja, `main` und geteilte Branches nie.
+  - `git pull --rebase` bzw. `pull.rebase = true` setzt lokale Commits auf den neuen Remote-Stand; `rebase.autoStash` sichert ungesicherte Änderungen.
+  - `git rebase --onto neu alt branch` überträgt nur `alt..branch`; `--update-refs` nimmt gestapelte Branches mit.
+  - Konflikte kommen pro Commit; beim Rebase ist „ours“ die neue Basis und „theirs“ dein Commit. `--continue`, `--skip`, `--abort`.
+  - Rückgängig: `git reset --hard ORIG_HEAD` direkt danach, sonst `branch@{1}` aus dem Branch-Reflog.
+  - Nach dem Rebase eines gepushten Branches: `git push --force-with-lease`, idealerweise mit `--force-if-includes`.
+exercises:
+  - id: was-rebase-tut
+    type: choice
+    title: Was passiert bei git rebase main?
+    prompt: |
+      Du stehst auf `feature/login`. Der Branch hat seit der Abzweigung drei eigene Commits, `main` fünf neue. Du führst `git rebase main` aus, ohne dass Konflikte auftreten. Welche Aussagen stimmen?
+    lang: text
+    code: |
+      A---B---C---F---H---I---J  main
+           \
+            D---E---G  feature/login (HEAD)
+    options:
+      - text: Git wendet `D`, `E` und `G` nacheinander auf `J` an; die neuen Commits bekommen andere Hashes, weil sich ihr Elterncommit ändert.
+        correct: true
+        why: Der Hash eines Commits hängt an seinem Inhalt, und dazu gehört der Hash des Elterncommits. Neue Basis heißt neue Hashes – für jeden kopierten Commit.
+      - text: "`main` zeigt danach auf dieselbe Spitze wie `feature/login`."
+        correct: false
+        why: Rebase bewegt nur den aktuellen Branch. `main` bleibt auf `J`, bis du selbst mergst oder einen PR mergen lässt.
+      - text: Die alten Commits `D`, `E` und `G` existieren weiter und sind über `ORIG_HEAD` und das Reflog erreichbar.
+        correct: true
+        why: Git löscht beim Rebase nichts. Die Originale sind nur von keinem Branch mehr erreichbar und werden erst nach Ablauf der Reflog-Frist von der Garbage Collection entfernt.
+      - text: Git erzeugt einen Commit mit zwei Eltern, der `feature/login` und `main` verbindet.
+        correct: false
+        why: Das beschreibt einen Merge-Commit. Rebase erzeugt eine lineare History ohne Merge-Commit.
+      - text: Ist die Änderung aus `E` per Cherry-pick schon identisch auf `main` gelandet, wird sie ein zweites Mal angewendet.
+        correct: false
+        why: Git vergleicht die Patch-IDs und überspringt Commits, deren Änderung bereits in der neuen Basis steckt (`skipped previously applied commit`).
+    explanation: |
+      Rebase bestimmt die Merge-Base (`B`), sammelt die Commits aus `main..feature/login` und wendet sie einzeln auf die neue Basis an. Dabei entstehen Kopien mit neuen Hashes. Danach wird nur `feature/login` auf die letzte Kopie gesetzt. Die Originale bleiben als unerreichbare Objekte liegen – das ist der Grund, warum sich jeder Rebase rückgängig machen lässt.
+    resources:
+      - title: git-rebase – Beschreibung
+        url: https://git-scm.com/docs/git-rebase#_description
+      - title: Pro Git · The Basic Rebase
+        url: https://git-scm.com/book/en/v2/Git-Branching-Rebasing#_the_basic_rebase
+
+  - id: goldene-regel
+    type: choice
+    title: Darf ich das rebasen?
+    prompt: Welche dieser Rebases sind unbedenklich? Das Team erlaubt Force-Pushes auf eigene PR-Branches, nicht aber auf `main` und `release/*`.
+    options:
+      - text: Deine drei lokalen, noch nie gepushten Commits auf `main` mit `git pull --rebase` auf den neuen Stand von `origin/main` setzen.
+        correct: true
+        why: Die umgeschriebenen Commits existieren nur bei dir. Niemand kann darauf aufgebaut haben.
+      - text: Deinen PR-Branch `feature/export`, an dem nur du arbeitest, auf `origin/main` rebasen und mit `--force-with-lease` pushen.
+        correct: true
+        why: Die Commits sind zwar gepusht, aber niemand baut darauf auf. Genau dafür gibt es `--force-with-lease`.
+      - text: "`release/2.4` auf `main` rebasen, damit die Release-History linear wird. Zwei Kolleginnen haben davon Hotfix-Branches abgezweigt."
+        correct: false
+        why: Die Hotfix-Branches basieren auf den alten Commits. Nach dem Force-Push mergen sie beim nächsten Pull die alte und die neue Linie zusammen – mit doppelten Commits.
+      - text: Einen Tippfehler in einem Commit korrigieren, der vor zwei Wochen auf `main` gelandet ist, und `main` force-pushen.
+        correct: false
+        why: "`main` teilen alle. Jeder Klon, jede CI-Pipeline und jeder Feature-Branch baut auf dem alten Commit auf. Fehler auf `main` korrigiert man mit einem neuen Commit oder einem Revert."
+      - text: Den Branch `feature/checkout`, auf dem du und ein Kollege abwechselnd pushen, ohne Absprache rebasen.
+        correct: false
+        why: Der Kollege hat die alten Commits lokal und baut darauf weiter. Auf geteilten Feature-Branches nur nach Absprache rebasen – oder `main` hineinmergen.
+    explanation: |
+      Die Frage ist nie „gepusht oder nicht?“, sondern „baut jemand auf diesen Commits auf?“. Lokale Commits und der eigene PR-Branch sind unkritisch. Sobald andere die Commits haben, erzeugt das Umschreiben verwaiste Kopien und doppelte History. Deshalb schützen Teams `main` und Release-Branches per Branch Protection gegen Force-Pushes.
+    resources:
+      - title: Pro Git · The Perils of Rebasing
+        url: https://git-scm.com/book/en/v2/Git-Branching-Rebasing#_rebase_peril
+
+  - id: konflikt-ablauf
+    type: order
+    title: Rebase mit Konflikt bis zum Push
+    prompt: |
+      Dein PR-Branch `feature/login` ist veraltet, und beim Rebase auf den aktuellen Stand von `main` gibt es einen Konflikt in `config.yaml`. Bring die Schritte in die richtige Reihenfolge – vom Aktualisieren bis zum aktualisierten PR.
+    lang: bash
+    lines: |
+      git switch feature/login
+      git fetch origin
+      git rebase origin/main
+      # Konfliktmarker in config.yaml fachlich auflösen und speichern
+      git add config.yaml
+      git rebase --continue
+      git push --force-with-lease
+    alternatives:
+      - [2, 1, 3, 4, 5, 6, 7]
+    explanation: |
+      Erst den Remote-Stand holen, dann auf `origin/main` rebasen – ob du vorher oder nachher auf den Branch wechselst, ist egal. Der Konflikt hält den Rebase an; nach dem Auflösen markiert `git add` die Datei als gelöst, und `git rebase --continue` erstellt den Commit und fährt mit den restlichen fort. Erst wenn der Rebase abgeschlossen ist, wird gepusht – mit `--force-with-lease`, weil der Remote-Branch noch die alten Commits hat. `git commit` gehört nicht in die Folge: `--continue` erledigt das.
+    resources:
+      - title: git-rebase · --continue
+        url: https://git-scm.com/docs/git-rebase#Documentation/git-rebase.txt---continue
+
+  - id: schon-uebernommen
+    type: output
+    title: Der Fix ist schon drin
+    prompt: |
+      Ein Sicherheitsfix wurde vorab per `git cherry-pick` von `feature/login` nach `main` übernommen. Was gibt das Skript aus?
+    lang: bash
+    code: |
+      git init -q
+      printf 'app\n' > app.py && git add app.py && git commit -qm "Projekt anlegen"
+      git switch -qc feature/login
+      printf 'form\n' > login.py && git add login.py && git commit -qm "Login-Formular anlegen"
+      printf 'csrf\n' > csrf.py && git add csrf.py && git commit -qm "CSRF-Schutz ergänzen"
+      git switch -q main
+      git cherry-pick feature/login > /dev/null
+      printf 'docs\n' > README.md && git add README.md && git commit -qm "README ergänzen"
+      git switch -q feature/login
+      git rebase -q main
+      git log --graph --format=%s
+    expected: |
+      * Login-Formular anlegen
+      * README ergänzen
+      * CSRF-Schutz ergänzen
+      * Projekt anlegen
+    verify: true
+    explanation: |
+      `git cherry-pick feature/login` kopiert die Spitze des Branches – „CSRF-Schutz ergänzen“ – nach `main`. Beim Rebase sammelt Git die Commits aus `main..feature/login`: „Login-Formular anlegen“ und das Original von „CSRF-Schutz ergänzen“. Letzteres hat dieselbe Patch-ID wie die Kopie auf `main`, also überspringt Git es (die Warnung `skipped previously applied commit` landet auf stderr). Übrig bleibt eine lineare History, in der der Fix genau einmal vorkommt – in der Position, die er auf `main` hat.
+    resources:
+      - title: git-rebase · --reapply-cherry-picks
+        url: https://git-scm.com/docs/git-rebase#Documentation/git-rebase.txt---reapply-cherry-picks
+      - title: git-patch-id
+        url: https://git-scm.com/docs/git-patch-id
+
+  - id: neue-hashes
+    type: output
+    title: Kopie oder Original?
+    prompt: Was gibt das Skript aus?
+    lang: bash
+    code: |
+      git init -q
+      printf 'app\n' > app.py && git add app.py && git commit -qm "Projekt anlegen"
+      git switch -qc feature/login
+      printf 'form\n' > login.py && git add login.py && git commit -qm "Login-Formular anlegen"
+      alt=$(git rev-parse HEAD)
+      git switch -q main
+      printf 'docs\n' > README.md && git add README.md && git commit -qm "README ergänzen"
+      git rebase -q main feature/login
+      git branch --show-current
+      test "$alt" = "$(git rev-parse HEAD)" && echo "gleicher Hash" || echo "neuer Hash"
+      git cat-file -t "$alt"
+      test "$alt" = "$(git rev-parse ORIG_HEAD)" && echo "ORIG_HEAD zeigt auf das Original"
+    expected: |
+      feature/login
+      neuer Hash
+      commit
+      ORIG_HEAD zeigt auf das Original
+    verify: true
+    explanation: |
+      `git rebase main feature/login` wechselt zuerst auf `feature/login` und rebased dann – deshalb ist danach `feature/login` ausgecheckt, obwohl das Skript vorher auf `main` stand. Der Login-Commit hat einen neuen Elterncommit („README ergänzen“) und damit einen neuen Hash. Das Original ist nicht gelöscht: `git cat-file -t` findet es als Objekt vom Typ `commit`, und `ORIG_HEAD` zeigt darauf. Genau darüber lässt sich der Rebase rückgängig machen.
+    resources:
+      - title: gitrevisions · ORIG_HEAD
+        url: https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt-ORIGHEAD
+      - title: git-rebase – Referenz
+        url: https://git-scm.com/docs/git-rebase
+
+  - id: pull-rebase
+    type: command
+    title: Push abgelehnt auf main
+    prompt: Hole die neuen Commits von `origin/main` und setze deine lokalen Commits obendrauf – mit **einem** Befehl und ohne Merge-Commit.
+    context: |
+      Du bist auf `main` und hast zwei lokale, noch nicht gepushte Commits. `git push` wurde abgelehnt, weil eine Kollegin inzwischen einen Commit auf `origin/main` gepusht hat. Der Upstream von `main` ist `origin/main`, `pull.rebase` ist nicht konfiguriert.
+    answers:
+      - git pull --rebase
+      - git pull -r
+      - git pull --rebase origin main
+      - git pull -r origin main
+      - git pull --rebase=true
+    output: |
+      From github.com:shop/webapp
+         92f96ca..1040f7c  main       -> origin/main
+      Successfully rebased and updated refs/heads/main.
+    explanation: |
+      `git pull --rebase` ist `git fetch` plus `git rebase origin/main`. Deine zwei Commits werden auf den neuen Commit der Kollegin kopiert, danach ist `main` ein Fast-Forward von `origin/main`, und `git push` klappt. Ein `git pull` ohne Option würde ohne Konfiguration abbrechen („Need to specify how to reconcile divergent branches“) oder – mit `pull.rebase = false` – einen überflüssigen Merge-Commit erzeugen. Die Goldene Regel ist hier nicht verletzt: Die umgeschriebenen Commits hat noch niemand gesehen.
+    resources:
+      - title: git-pull · --rebase
+        url: https://git-scm.com/docs/git-pull#Documentation/git-pull.txt---rebasetruemergesfalseinteractive
+      - title: git-config · pull.rebase
+        url: https://git-scm.com/docs/git-config#Documentation/git-config.txt-pullrebase
+
+  - id: onto-nach-squash
+    type: command
+    title: Der Basis-PR wurde gesquasht
+    prompt: Setze nur die eigenen Commits von `feature/ui` auf `main` – die alten API-Commits sollen wegfallen. Du stehst bereits auf `feature/ui`.
+    context: |
+      `feature/ui` baut auf `feature/api` auf. Der PR für `feature/api` wurde auf GitHub per **Squash** gemergt; auf `main` liegt jetzt ein einzelner Commit mit allen API-Änderungen, und dein lokales `main` ist aktuell. Dein lokaler Branch `feature/api` zeigt noch auf die drei ursprünglichen API-Commits, auf denen `feature/ui` aufsetzt. Ein normales `git rebase main` erzeugt Konflikte, weil es die drei alten API-Commits noch einmal anwenden will.
+    answers:
+      - git rebase --onto main feature/api
+      - git rebase --onto main feature/api feature/ui
+      - git rebase --onto=main feature/api
+      - git rebase --onto=main feature/api feature/ui
+    explanation: |
+      `git rebase --onto main feature/api` nimmt die Commits aus `feature/api..feature/ui` – also nur deine UI-Commits – und setzt sie auf `main`. Die ursprünglichen API-Commits haben nach dem Squash-Merge keine Verwandtschaft mit dem Squash-Commit auf `main`; Git erkennt sie nicht zuverlässig als „schon übernommen“ und würde sie erneut anwenden. Mit `--onto` schneidest du sie gezielt ab. Das dritte Argument `feature/ui` ist optional, wenn der Branch schon ausgecheckt ist.
+    resources:
+      - title: git-rebase · --onto
+        url: https://git-scm.com/docs/git-rebase#Documentation/git-rebase.txt---ontonewbase
+      - title: git-rebase · Transplanting a topic branch with --onto
+        url: https://git-scm.com/docs/git-rebase#_transplanting_a_topic_branch_with_onto
+
+  - id: rebase-konfiguration
+    type: gap
+    title: Eine rebase-freundliche Konfiguration
+    prompt: |
+      Ergänze die `~/.gitconfig`: `git pull` soll standardmäßig rebasen, ein Rebase soll lokale Änderungen automatisch wegstashen und danach wieder einspielen, gestapelte Branches sollen beim Rebase mitwandern, und jedes `--force-with-lease` soll zusätzlich prüfen, ob du den Remote-Stand tatsächlich integriert hast. Schreibe jeweils `schlüssel = wert`.
+    lang: ini
+    code: |
+      [pull]
+          ⟦rebase = true⟧
+      [rebase]
+          ⟦autoStash = true⟧
+          ⟦updateRefs = true⟧
+      [push]
+          ⟦useForceIfIncludes = true⟧
+    gaps:
+      - label: pull
+        hint: Der Schlüssel heißt wie der Befehl, der ausgeführt werden soll.
+        accept: ["rebase=true"]
+      - label: Lokale Änderungen
+        hint: Automatisch … stashen, in camelCase.
+        accept: ["autostash = true", "autostash=true", "autoStash=true"]
+      - label: Gestapelte Branches
+        hint: Entspricht der Option `--update-refs`.
+        accept: ["updaterefs = true", "updaterefs=true", "updateRefs=true"]
+      - label: Lease-Prüfung
+        hint: Entspricht der Option `--force-if-includes`, beginnt mit `use`.
+        accept: ["useforceifincludes = true", "useforceifincludes=true", "useForceIfIncludes=true"]
+    explanation: |
+      `pull.rebase = true` macht aus jedem `git pull` ein `fetch` plus `rebase`. `rebase.autoStash` erlaubt Rebases mit ungesicherten Änderungen, indem es sie vorher in einen temporären Stash legt. `rebase.updateRefs` entspricht `--update-refs` und nimmt Branches mit, die auf umgeschriebene Commits zeigen. `push.useForceIfIncludes` schaltet `--force-if-includes` bei jedem `--force-with-lease` ein und schließt damit die Lücke durch Hintergrund-Fetches. Git-Konfigurationsschlüssel sind unabhängig von Groß- und Kleinschreibung; `autostash` funktioniert also genauso.
+    resources:
+      - title: git-config · rebase.autoStash
+        url: https://git-scm.com/docs/git-config#Documentation/git-config.txt-rebaseautoStash
+      - title: git-config · rebase.updateRefs
+        url: https://git-scm.com/docs/git-config#Documentation/git-config.txt-rebaseupdateRefs
+      - title: git-config · push.useForceIfIncludes
+        url: https://git-scm.com/docs/git-config#Documentation/git-config.txt-pushuseForceIfIncludes
+
+  - id: force-with-lease
+    type: command
+    title: Den rebasten PR-Branch pushen
+    prompt: Pushe `feature/login` so, dass der Remote-Branch nur überschrieben wird, wenn er noch auf dem Stand steht, den dein Remote-Tracking-Branch kennt.
+    context: |
+      Du hast `feature/login` auf `origin/main` rebased. Der Branch war schon gepusht und hat `origin/feature/login` als Upstream. `git push` wurde mit `(non-fast-forward)` abgelehnt.
+    answers:
+      - git push --force-with-lease
+      - git push --force-with-lease origin feature/login
+      - git push --force-with-lease --force-if-includes
+      - git push --force-if-includes --force-with-lease
+      - git push --force-with-lease --force-if-includes origin feature/login
+      - git push --force-if-includes --force-with-lease origin feature/login
+    output: |
+      To github.com:shop/webapp.git
+       + e950cde...3ccae14 feature/login -> feature/login (forced update)
+    explanation: |
+      Nach dem Rebase ist dein Branch kein Nachfolger des Remote-Branches mehr, also braucht es einen Force-Push. `--force-with-lease` vergleicht vorher den Remote-Branch mit `origin/feature/login`. Hat jemand anderes inzwischen gepusht, lehnt Git mit `(stale info)` ab, statt dessen Arbeit zu überschreiben. `--force-if-includes` prüft zusätzlich, ob der bekannte Remote-Stand in deinem Branch enthalten war – wichtig, wenn die IDE im Hintergrund fetcht. `git push --force` hat keine dieser Sicherungen. Das `+` in der Ausgabe markiert ein erzwungenes Update.
+    resources:
+      - title: git-push · --force-with-lease
+        url: https://git-scm.com/docs/git-push#Documentation/git-push.txt---force-with-lease
+      - title: git-push · --force-if-includes
+        url: https://git-scm.com/docs/git-push#Documentation/git-push.txt---force-if-includes
+
+  - id: veraltetes-main
+    type: bug
+    title: Rebase erfolgreich, PR trotzdem veraltet
+    prompt: |
+      Mit diesen Befehlen aktualisierst du jeden Morgen deinen PR-Branch. Heute meldet der Rebase `Current branch feature/login is up to date.`, der Push läuft durch – aber GitHub zeigt weiterhin „This branch is out-of-date with the base branch“, und `git log feature/login..origin/main` listet drei Commits, die in deinem Branch fehlen. Dein lokales `main` hast du seit letzter Woche nicht angefasst. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: bash
+    code: |
+      # PR-Branch auf den aktuellen Stand von main bringen
+      git switch feature/login
+      git fetch origin
+      git rebase main
+      git push --force-with-lease
+    lines: [4]
+    fix:
+      - line: 4
+        answers:
+          - git rebase origin/main
+          - git rebase origin/main feature/login
+    explanation: |
+      `git fetch` aktualisiert nur die Remote-Tracking-Branches wie `origin/main`, nicht dein lokales `main`. Das lokale `main` steht noch auf dem Stand von letzter Woche, und darauf basiert dein Branch schon – also hat Rebase nichts zu tun. Richtig ist `git rebase origin/main`: Das ist der Stand, den der Server gerade hat. Alternativ ginge `git pull --rebase origin main` statt der Zeilen 3 und 4.
+    resources:
+      - title: git-fetch – Referenz
+        url: https://git-scm.com/docs/git-fetch
+      - title: git-rebase · <upstream>
+        url: https://git-scm.com/docs/git-rebase#Documentation/git-rebase.txt-upstream
+
+  - id: status-mitten-im-rebase
+    type: explain
+    title: Mitten im Rebase
+    prompt: Eine Kollegin schickt dir diese Ausgabe und fragt, was los ist und welche Zeile in `config.yaml` „ihre“ ist. Erkläre, in welchem Zustand das Repository ist, was die Konfliktmarker bedeuten und wie sie weitermachen kann.
+    lang: console
+    code: |
+      $ git status
+      interactive rebase in progress; onto f7ba434
+      Last command done (1 command done):
+         pick ff59b35 # Timeout für Login erhöhen
+      Next command to do (1 remaining command):
+         pick f41475f # Login-Formular anlegen
+        (use "git rebase --edit-todo" to view and edit)
+      You are currently rebasing branch 'feature/login' on 'f7ba434'.
+        (fix conflicts and then run "git rebase --continue")
+        (use "git rebase --skip" to skip this patch)
+        (use "git rebase --abort" to check out the original branch)
+
+      Unmerged paths:
+        (use "git restore --staged <file>..." to unstage)
+        (use "git add <file>..." to mark resolution)
+      	both modified:   config.yaml
+
+      no changes added to commit (use "git add" and/or "git commit -a")
+      $ cat config.yaml
+      <<<<<<< HEAD
+      timeout: 45
+      =======
+      timeout: 60
+      >>>>>>> ff59b35 (Timeout für Login erhöhen)
+      retries: 3
+    points:
+      - Ein Rebase von `feature/login` auf `f7ba434` (die Spitze von `main`) läuft; der erste von zwei Commits ließ sich nicht konfliktfrei anwenden, der zweite wartet noch. „interactive“ steht dort, weil auch ein normaler Rebase intern mit einer Todo-Liste arbeitet.
+      - "HEAD ist die neue Basis – der obere Teil (`timeout: 45`) kommt von `main`. Der untere Teil (`timeout: 60`) ist ihr eigener Commit „Timeout für Login erhöhen“. Beim Rebase sind ours und theirs also gegenüber dem Merge vertauscht."
+      - Weiter geht es mit fachlich richtiger Auflösung (Marker entfernen), `git add config.yaml` und `git rebase --continue`; danach folgt der zweite Commit.
+      - "`git rebase --abort` stellt den Zustand vor dem Rebase wieder her; `--skip` würde ihren Commit komplett verwerfen."
+    explanation: |
+      Das Repository steckt mitten in einem Rebase von `feature/login` auf `f7ba434`, die aktuelle Spitze von `main`. Git hat die Commits in eine Todo-Liste geschrieben – daher „interactive rebase in progress“, auch wenn sie nur `git rebase main` getippt hat. Der erste Commit, „Timeout für Login erhöhen“, kollidiert in `config.yaml`, der Login-Commit wartet. In den Markern steht oben unter `HEAD` die Version von `main` (`timeout: 45`), unten ihre eigene Änderung (`timeout: 60`). Ihre Zeile ist also die untere, beim Rebase „theirs“. Sie soll klären, welcher Wert fachlich richtig ist, die Marker entfernen, `git add config.yaml` und `git rebase --continue` ausführen. Wenn sie unsicher ist, bringt `git rebase --abort` alles auf den Stand vor dem Rebase zurück.
+    resources:
+      - title: git-rebase · Konfliktauflösung
+        url: https://git-scm.com/docs/git-rebase#Documentation/git-rebase.txt---continue
+      - title: GitHub Docs · Resolving merge conflicts after a Git rebase
+        url: https://docs.github.com/en/get-started/using-git/resolving-merge-conflicts-after-a-git-rebase
+
+  - id: labor-pr-aktualisieren
+    type: practice
+    title: "Labor: Der PR hat Konflikte"
+    prompt: |
+      Führe das Labor-Skript in einem leeren Verzeichnis in einer Bash-Sitzung aus (`cd "$(mktemp -d)"`, dann die Zeilen einfügen) – **nie** in einem echten Repository. Es simuliert einen Server (`origin.git`) und zwei Entwickler. Du bist danach als Alice in `alice/`.
+
+      Alices PR `feature/login` ist gepusht. Inzwischen wurde Bobs PR auf `main` gemergt, und GitHub meldet für Alices PR: „This branch has conflicts that must be resolved“.
+
+      Bring `feature/login` auf den aktuellen Stand von `main` auf dem Server – **ohne Merge-Commit**. Beide Einstellungen in `config.yaml`, Bobs und Alices, müssen danach erhalten sein. Aktualisiere anschließend den Remote-Branch so, dass du keine fremde Arbeit überschreiben könntest. Prüfe mit `git log --graph --format=%s --all` und `cat config.yaml`.
+    lang: bash
+    starter: |
+      # Labor: erzeugt die Ausgangslage
+      git init -q --bare origin.git
+      git init -q alice && cd alice
+      git remote add origin ../origin.git
+      printf 'timeout: 30\nretries: 3\n' > config.yaml
+      git add config.yaml && git commit -qm "Konfiguration anlegen"
+      git push -q -u origin main
+      # Alice arbeitet am Login und hat ihren Branch schon für den PR gepusht
+      git switch -qc feature/login
+      printf 'def login(user, password):\n    ...\n' > login.py
+      git add login.py && git commit -qm "Login-Formular anlegen"
+      printf 'timeout: 30\nretries: 3\nlogin_attempts: 5\n' > config.yaml
+      git commit -qam "Login-Versuche begrenzen"
+      git push -q -u origin feature/login
+      # Währenddessen landet ein PR von Bob auf main
+      cd .. && git clone -q origin.git bob && cd bob
+      printf 'timeout: 30\nretries: 3\nlog_level: info\n' > config.yaml
+      git commit -qam "Log-Level konfigurierbar machen"
+      git push -q origin main
+      cd ../alice
+      # Deine Reparatur:
+    solution: |
+      # Labor: erzeugt die Ausgangslage
+      git init -q --bare origin.git
+      git init -q alice && cd alice
+      git remote add origin ../origin.git
+      printf 'timeout: 30\nretries: 3\n' > config.yaml
+      git add config.yaml && git commit -qm "Konfiguration anlegen"
+      git push -q -u origin main
+      # Alice arbeitet am Login und hat ihren Branch schon für den PR gepusht
+      git switch -qc feature/login
+      printf 'def login(user, password):\n    ...\n' > login.py
+      git add login.py && git commit -qm "Login-Formular anlegen"
+      printf 'timeout: 30\nretries: 3\nlogin_attempts: 5\n' > config.yaml
+      git commit -qam "Login-Versuche begrenzen"
+      git push -q -u origin feature/login
+      # Währenddessen landet ein PR von Bob auf main
+      cd .. && git clone -q origin.git bob && cd bob
+      printf 'timeout: 30\nretries: 3\nlog_level: info\n' > config.yaml
+      git commit -qam "Log-Level konfigurierbar machen"
+      git push -q origin main
+      cd ../alice
+      # Reparatur
+      git fetch -q origin
+      git rebase origin/main || true
+      printf 'timeout: 30\nretries: 3\nlog_level: info\nlogin_attempts: 5\n' > config.yaml
+      git add config.yaml
+      GIT_EDITOR=true git rebase --continue
+      git push -q --force-with-lease
+      # Kontrolle
+      git merge-base --is-ancestor origin/main feature/login
+      test "$(git rev-list --count --merges origin/main..feature/login)" -eq 0
+      test "$(git log --format=%s origin/main..feature/login)" = "$(printf 'Login-Versuche begrenzen\nLogin-Formular anlegen')"
+      grep -qx 'log_level: info' config.yaml
+      grep -qx 'login_attempts: 5' config.yaml
+      test "$(wc -l < config.yaml)" -eq 4
+      test "$(git rev-parse feature/login)" = "$(git rev-parse origin/feature/login)"
+      test -z "$(git status --porcelain)"
+    checklist:
+      - Du hast vor dem Rebase `git fetch` ausgeführt und auf `origin/main` rebased, nicht auf das veraltete lokale `main`.
+      - "`git log --graph --format=%s --all` zeigt eine gerade Linie: „Login-Versuche begrenzen“, „Login-Formular anlegen“, „Log-Level konfigurierbar machen“, „Konfiguration anlegen“ – ohne Merge-Commit."
+      - "`config.yaml` enthält `log_level: info` **und** `login_attempts: 5`, keine Konfliktmarker, vier Zeilen."
+      - "`git status` meldet keinen laufenden Rebase, und das Arbeitsverzeichnis ist sauber."
+      - Du hast mit `git push --force-with-lease` gepusht; `git rev-parse feature/login origin/feature/login` zeigt zweimal denselben Hash.
+    verify: true
+    explanation: |
+      `git fetch` holt Bobs Commit nach `origin/main`; ohne Fetch hätte der Rebase nichts zu tun. Beim Rebase kollidiert Alices zweiter Commit mit Bobs Änderung, weil beide am Ende von `config.yaml` eine Zeile anhängen. Keine Seite ist „richtig“ – fachlich gehören beide Einstellungen hinein. Nach `git add` erstellt `git rebase --continue` den Commit; `GIT_EDITOR=true` übernimmt die Nachricht ohne Editor (interaktiv öffnet sich sonst dein Editor mit der alten Nachricht). Weil der Remote-Branch noch die alten Commits trägt, braucht der Push `--force-with-lease`. Hätte Alice nach dem Konflikt `git restore --ours config.yaml` genommen, wäre ihre eigene Zeile weg gewesen – beim Rebase ist „ours“ die Seite von `main`.
+    resources:
+      - title: git-rebase – Referenz
+        url: https://git-scm.com/docs/git-rebase
+      - title: GitHub Docs · Using Git rebase on the command line
+        url: https://docs.github.com/en/get-started/using-git/using-git-rebase-on-the-command-line
+
+  - id: labor-falsche-basis
+    type: practice
+    title: "Labor: Vom falschen Branch abgezweigt"
+    prompt: |
+      Führe das Labor-Skript in einem leeren Verzeichnis in einer Bash-Sitzung aus (`cd "$(mktemp -d)"`) – **nie** in einem echten Repository.
+
+      Du willst den PR für den Dark Mode öffnen, aber GitHub zeigt dir vier Commits statt zwei – zwei davon gehören zur halbfertigen Bestell-API einer Kollegin. Außerdem enthält dein Branch plötzlich eine Datei `api.py`.
+
+      Sorge dafür, dass `feature/dark-mode` genau deine beiden Dark-Mode-Commits auf dem aktuellen `main` enthält. `feature/api` darf sich nicht verändern. Prüfe mit `git log --graph --format=%s --all` und `git log --format=%s main..feature/dark-mode`.
+    lang: bash
+    starter: |
+      # Labor: erzeugt die Ausgangslage
+      git init -q
+      printf 'from flask import Flask\n' > app.py
+      git add app.py && git commit -qm "Projekt anlegen"
+      # Kollegin arbeitet an der Bestell-API (noch nicht fertig, nicht gemergt)
+      git switch -qc feature/api
+      printf 'def list_orders():\n    ...\n' > api.py
+      git add api.py && git commit -qm "Bestell-API anlegen"
+      printf 'def list_orders(page=1):\n    ...\n' > api.py
+      git commit -qam "Bestell-API paginieren"
+      # Du startest den Dark Mode – ohne vorher zurück auf main zu wechseln
+      git switch -qc feature/dark-mode
+      printf ':root { --bg: #111; }\n' > theme.css
+      git add theme.css && git commit -qm "Dark-Mode-Farben definieren"
+      printf ':root { --bg: #111; --fg: #eee; }\n' > theme.css
+      git commit -qam "Textfarbe im Dark Mode setzen"
+      # main ist inzwischen weitergelaufen
+      git switch -q main
+      printf 'name: CI\n' > ci.yml
+      git add ci.yml && git commit -qm "CI-Workflow ergänzen"
+      git switch -q feature/dark-mode
+      # Deine Reparatur:
+    solution: |
+      # Labor: erzeugt die Ausgangslage
+      git init -q
+      printf 'from flask import Flask\n' > app.py
+      git add app.py && git commit -qm "Projekt anlegen"
+      # Kollegin arbeitet an der Bestell-API (noch nicht fertig, nicht gemergt)
+      git switch -qc feature/api
+      printf 'def list_orders():\n    ...\n' > api.py
+      git add api.py && git commit -qm "Bestell-API anlegen"
+      printf 'def list_orders(page=1):\n    ...\n' > api.py
+      git commit -qam "Bestell-API paginieren"
+      # Du startest den Dark Mode – ohne vorher zurück auf main zu wechseln
+      git switch -qc feature/dark-mode
+      printf ':root { --bg: #111; }\n' > theme.css
+      git add theme.css && git commit -qm "Dark-Mode-Farben definieren"
+      printf ':root { --bg: #111; --fg: #eee; }\n' > theme.css
+      git commit -qam "Textfarbe im Dark Mode setzen"
+      # main ist inzwischen weitergelaufen
+      git switch -q main
+      printf 'name: CI\n' > ci.yml
+      git add ci.yml && git commit -qm "CI-Workflow ergänzen"
+      git switch -q feature/dark-mode
+      # Reparatur
+      git rebase --onto main feature/api feature/dark-mode
+      # Kontrolle
+      test "$(git log --format=%s main..feature/dark-mode)" = "$(printf 'Textfarbe im Dark Mode setzen\nDark-Mode-Farben definieren')"
+      git merge-base --is-ancestor main feature/dark-mode
+      test "$(git show feature/dark-mode:theme.css)" = ':root { --bg: #111; --fg: #eee; }'
+      test -z "$(git ls-tree --name-only feature/dark-mode api.py)"
+      test "$(git log --format=%s main..feature/api)" = "$(printf 'Bestell-API paginieren\nBestell-API anlegen')"
+    checklist:
+      - "`git log --format=%s main..feature/dark-mode` zeigt genau „Textfarbe im Dark Mode setzen“ und „Dark-Mode-Farben definieren“."
+      - "`feature/dark-mode` basiert auf dem aktuellen `main` – „CI-Workflow ergänzen“ ist in seiner History enthalten."
+      - Auf `feature/dark-mode` gibt es keine `api.py` mehr, `theme.css` hat den Endstand mit `--fg`.
+      - "`git log --format=%s main..feature/api` zeigt weiterhin die beiden API-Commits – der Branch der Kollegin ist unverändert."
+      - Du kannst erklären, warum `git rebase main` hier die falschen Commits mitgenommen hätte.
+    verify: true
+    explanation: |
+      Das Problem ist die Menge der Commits. `git rebase main` nimmt alles aus `main..feature/dark-mode` – das sind vier Commits, darunter die beiden API-Commits, weil sie nicht auf `main` liegen. `git rebase --onto main feature/api feature/dark-mode` schneidet an der richtigen Stelle: Es nimmt nur `feature/api..feature/dark-mode`, also deine zwei Commits, und setzt sie auf `main`. `feature/api` wird nicht angefasst, weil Rebase nur den umgeschriebenen Branch bewegt. Vorbeugen lässt sich das mit `git switch -c feature/dark-mode main` – mit ausdrücklichem Startpunkt.
+    resources:
+      - title: git-rebase · --onto
+        url: https://git-scm.com/docs/git-rebase#Documentation/git-rebase.txt---ontonewbase
+      - title: Pro Git · More Interesting Rebases
+        url: https://git-scm.com/book/en/v2/Git-Branching-Rebasing#_more_interesting_rebases
+
+  - id: labor-rebase-rueckgaengig
+    type: practice
+    title: "Labor: Der Upload-Timeout ist weg"
+    prompt: |
+      Führe das Labor-Skript in einem leeren Verzeichnis in einer Bash-Sitzung aus (`cd "$(mktemp -d)"`) – **nie** in einem echten Repository.
+
+      Ein Kollege hat `feature/upload` hastig auf `main` rebased. Seitdem brechen große Uploads nach 45 Sekunden ab, obwohl der Branch den Timeout ausdrücklich auf 120 Sekunden erhöht hatte. Er hat danach „zur Sicherheit“ noch `git reset --hard` ausgeführt.
+
+      Stelle `feature/upload` **exakt** auf den Stand vor dem Rebase zurück – dieselben Commits, nicht nachgebaut. Danach könnte er den Rebase sauber wiederholen. Prüfe mit `git log --graph --format=%s --all` und `cat config.yaml`.
+    lang: bash
+    starter: |
+      # Labor: erzeugt die Ausgangslage
+      git init -q
+      printf 'timeout: 30\nretries: 3\n' > config.yaml
+      git add config.yaml && git commit -qm "Konfiguration anlegen"
+      git switch -qc feature/upload
+      printf 'def upload(file):\n    ...\n' > upload.py
+      printf 'timeout: 120\nretries: 3\n' > config.yaml
+      git add . && git commit -qm "Datei-Upload anlegen"
+      printf 'def upload(file, max_mb=50):\n    ...\n' > upload.py
+      git commit -qam "Upload-Größe begrenzen"
+      git switch -q main
+      printf 'timeout: 45\nretries: 3\n' > config.yaml
+      git commit -qam "Timeout vereinheitlichen"
+      git switch -q feature/upload
+      # Hastiger Rebase: Konflikt mit „--ours“ gelöst, weil das ja „meine“ Seite sei
+      git rebase main > /dev/null 2>&1 || true
+      git restore --ours config.yaml
+      git add config.yaml
+      GIT_EDITOR=true git rebase --continue > /dev/null 2>&1
+      # Danach „zur Sicherheit“ noch einmal alles zurückgesetzt
+      git reset -q --hard
+      # Deine Reparatur:
+    solution: |
+      # Labor: erzeugt die Ausgangslage
+      git init -q
+      printf 'timeout: 30\nretries: 3\n' > config.yaml
+      git add config.yaml && git commit -qm "Konfiguration anlegen"
+      git switch -qc feature/upload
+      printf 'def upload(file):\n    ...\n' > upload.py
+      printf 'timeout: 120\nretries: 3\n' > config.yaml
+      git add . && git commit -qm "Datei-Upload anlegen"
+      printf 'def upload(file, max_mb=50):\n    ...\n' > upload.py
+      git commit -qam "Upload-Größe begrenzen"
+      git switch -q main
+      printf 'timeout: 45\nretries: 3\n' > config.yaml
+      git commit -qam "Timeout vereinheitlichen"
+      git switch -q feature/upload
+      # Hastiger Rebase: Konflikt mit „--ours“ gelöst, weil das ja „meine“ Seite sei
+      git rebase main > /dev/null 2>&1 || true
+      git restore --ours config.yaml
+      git add config.yaml
+      GIT_EDITOR=true git rebase --continue > /dev/null 2>&1
+      # Danach „zur Sicherheit“ noch einmal alles zurückgesetzt
+      git reset -q --hard
+      # Reparatur
+      git reflog feature/upload
+      git reset -q --hard feature/upload@{1}
+      # Kontrolle
+      test "$(git log --format=%s)" = "$(printf 'Upload-Größe begrenzen\nDatei-Upload anlegen\nKonfiguration anlegen')"
+      grep -qx 'timeout: 120' config.yaml
+      test -z "$(git status --porcelain)"
+    checklist:
+      - Du hast zuerst `ORIG_HEAD` geprüft und verstanden, warum es nicht mehr hilft (`git rev-parse ORIG_HEAD HEAD` zeigt zweimal denselben Hash).
+      - Du hast mit `git reflog feature/upload` den Eintrag vor „rebase (finish)“ gefunden.
+      - "`git log --format=%s` zeigt „Upload-Größe begrenzen“, „Datei-Upload anlegen“, „Konfiguration anlegen“ – „Timeout vereinheitlichen“ ist nicht mehr in der History des Branches."
+      - "`config.yaml` enthält wieder `timeout: 120`, und `git status --short` ist leer."
+      - Du kannst erklären, warum `git restore --ours` beim Rebase die eigene Änderung verworfen hat.
+    verify: true
+    explanation: |
+      Beim Rebase ist HEAD die neue Basis – „ours“ war also `main` mit `timeout: 45`, und die eigene Änderung auf 120 fiel still weg. `ORIG_HEAD` hätte direkt danach gerettet, aber `git reset --hard` hat es auf den aktuellen Commit gesetzt. Das Branch-Reflog führt den ganzen Rebase als einen Eintrag „rebase (finish)“; `feature/upload@{1}` ist deshalb der Stand davor. `HEAD@{1}` wäre falsch gewesen: Das HEAD-Reflog enthält jeden einzelnen Rebase-Schritt, und dort ist `@{1}` nur der letzte übertragene Commit. Beim erneuten Rebase nimmt man die eigene Seite mit `git restore --theirs` oder – besser – entscheidet die Zeile von Hand.
+    resources:
+      - title: git-reflog – Referenz
+        url: https://git-scm.com/docs/git-reflog
+      - title: gitrevisions · <refname>@{<n>}
+        url: https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt-refnamenegmaster1

@@ -1,0 +1,773 @@
+id: interactive-rebase
+title: History aufräumen mit interaktivem Rebase
+level: 3
+minutes: 180
+summary: Wie du mit der Todo-Liste von git rebase -i Commits zusammenfasst, umsortierst, aufteilst, umbenennst und entfernst, Review-Korrekturen per Autosquash einarbeitest und das Ganze auch skriptgesteuert ohne Editor erledigst.
+goals:
+  - Du liest und schreibst die Todo-Liste von `git rebase -i` und setzt `pick`, `reword`, `edit`, `squash`, `fixup`, `drop`, `exec` und `break` gezielt ein.
+  - Du arbeitest Review-Korrekturen mit `git commit --fixup` und `--autosquash` in den richtigen Commit ein.
+  - Du teilst einen Commit mit `edit` und `git reset HEAD~` auf und entfernst eine versehentlich committete Datei aus einem Commit mitten im Branch.
+  - Du steuerst interaktive Rebases mit `GIT_SEQUENCE_EDITOR` und `--exec` ohne Editor und testest jeden Commit einzeln.
+  - Du entscheidest, wann Aufräumen sinnvoll ist und wann geteilte History tabu ist.
+resources:
+  - title: git-rebase · Interactive Mode
+    url: https://git-scm.com/docs/git-rebase#_interactive_mode
+  - title: Pro Git · Rewriting History
+    url: https://git-scm.com/book/en/v2/Git-Tools-Rewriting-History
+  - title: git-commit · --fixup
+    url: https://git-scm.com/docs/git-commit#Documentation/git-commit.txt---fixupamendrewordcommit
+  - title: git · GIT_SEQUENCE_EDITOR
+    url: https://git-scm.com/docs/git#Documentation/git.txt-GITSEQUENCEEDITOR
+lesson: |
+  Dein Branch `feature/login` ist fertig, die Tests sind grün. `git log --oneline main..` zeigt aber die Wahrheit über die letzten zwei Tage: „WIP“, „tests“, „WIP“, „fix“, „Review-Anmerkungen“, „noch ein fix“. Irgendwo dazwischen steckt ein Commit, der versehentlich die `.env` mit dem Datenbankpasswort enthält. Eine Reviewerin kann aus diesen Commits nicht ablesen, was das Feature tut, und `git bisect` findet später in „WIP“ keinen sinnvollen Zwischenstand.
+
+  Interaktives Rebase macht aus dieser Liste eine History, die sich wie eine Geschichte liest: wenige Commits, jeder mit einer klaren Aufgabe und einer Nachricht, die das Warum erklärt. Das Werkzeug ist dasselbe wie im Modul [Rebase](/git/rebase) – Commits werden neu angewendet und bekommen neue Hashes. Neu ist, dass du vorher bestimmst, **wie** jeder einzelne Commit angewendet wird.
+
+  ## Die Todo-Liste: ein Skript für den Rebase
+
+  `git rebase -i <basis>` schreibt alle Commits aus `basis..HEAD` in eine Textdatei und öffnet sie im Editor. Für die letzten drei Commits ist die Basis `HEAD~3`, für den ganzen Feature-Branch `main` ([git-rebase · Interactive Mode](https://git-scm.com/docs/git-rebase#_interactive_mode)).
+
+  ```text
+  pick c7f7d11 # Login-Formular anlegen
+  pick 671a498 # WIP
+  pick 9a21098 # Passwort-Reset ergänzen
+
+  # Rebase 05cc447..9a21098 onto 05cc447 (3 commands)
+  #
+  # Commands:
+  # p, pick <commit> = use commit
+  # r, reword <commit> = use commit, but edit the commit message
+  # e, edit <commit> = use commit, but stop for amending
+  # s, squash <commit> = use commit, but meld into previous commit
+  # f, fixup [-C | -c] <commit> = like "squash" but keep only the previous
+  # …
+  ```
+
+  Drei Dinge musst du über diese Liste wissen:
+
+  1. **Die Reihenfolge ist umgekehrt zu `git log`.** Oben steht der älteste Commit, denn Git arbeitet die Liste von oben nach unten ab – wie ein Skript.
+  2. **Git liest nur Befehl und Hash.** Der Titel dahinter dient dir zur Orientierung. Seit Git 2.50 steht davor ein `#`; ältere Versionen zeigen `pick c7f7d11 Login-Formular anlegen`. Die Zeile wird trotzdem ausgeführt – das `#` macht nur den Titel zum Kommentar.
+  3. **Die Liste ist der Plan.** Zeilen umsortieren sortiert die Commits um. Eine Zeile löschen verwirft den Commit (wer davor gewarnt werden will, setzt `rebase.missingCommitsCheck` auf `warn` oder `error`). Eine leere Liste bricht den Rebase ab.
+
+  | Befehl | Wirkung |
+  | --- | --- |
+  | `pick` | Commit unverändert übernehmen |
+  | `reword` | übernehmen, Nachricht im Editor ändern |
+  | `edit` | übernehmen und anhalten – zum Ändern, Aufteilen, Ergänzen |
+  | `squash` | mit dem Commit **darüber** verschmelzen, beide Nachrichten kombinieren |
+  | `fixup` | mit dem Commit darüber verschmelzen, eigene Nachricht verwerfen; `fixup -C` nimmt stattdessen diese Nachricht |
+  | `drop` | Commit verwerfen |
+  | `exec` | Shell-Befehl ausführen; scheitert er, hält der Rebase an |
+  | `break` | anhalten, ohne einen Commit anzuwenden |
+
+  Jeder Befehl hat eine Abkürzung aus einem Buchstaben (`p`, `r`, `e`, `s`, `f`, `d`, `x`, `b`). Hält der Rebase an, zeigt `git status`, welche Befehle erledigt sind und welche folgen; `git rebase --edit-todo` öffnet den Rest der Liste erneut. `git rebase --abort` bringt jederzeit alles auf den Stand vor dem Start zurück.
+
+  > [!MERKE]
+  > Die Todo-Liste ist ein Programm, das Git von oben nach unten ausführt. `squash` und `fixup` wirken immer auf den Commit direkt darüber – nicht auf den Commit, den du im Kopf hattest.
+
+  ## Zusammenfassen: squash, fixup und Autosquash
+
+  Das häufigste Aufräumen: Kleine Nachbesserungen verschwinden in dem Commit, zu dem sie gehören.
+
+  ```text
+  pick c7f7d11 # Login-Formular anlegen
+  fixup 671a498 # WIP
+  squash 3e81b0c # Passwort prüfen
+  pick 9a21098 # Passwort-Reset ergänzen
+  ```
+
+  Hier entstehen zwei Commits. Der erste enthält Formular, WIP-Änderung und Passwortprüfung. Seine Nachricht bestimmst du im Editor, der sich wegen `squash` öffnet: Git schlägt „Login-Formular anlegen“ und „Passwort prüfen“ untereinander vor, die Nachricht von „WIP“ fehlt wegen `fixup`. Haben die zusammengefassten Commits verschiedene Autoren, zählt der des ersten.
+
+  Wenn die Nachbesserung nicht direkt unter ihrem Ziel liegt, musst du die Zeile erst dorthin verschieben. Genau das automatisiert Git, wenn du die Korrektur von Anfang an als Fixup markierst ([git-commit · --fixup](https://git-scm.com/docs/git-commit#Documentation/git-commit.txt---fixupamendrewordcommit)):
+
+  ```console
+  $ git add login.py
+  $ git commit --fixup=c7f7d11
+  $ git log --format='%h %s' main..
+  d41e9a2 fixup! Login-Formular anlegen
+  9a21098 Passwort-Reset ergänzen
+  c7f7d11 Login-Formular anlegen
+  $ git rebase -i --autosquash main
+  ```
+
+  `--fixup=<commit>` erzeugt einen Commit mit dem Titel `fixup! Login-Formular anlegen`. `--autosquash` sortiert solche Commits in der Todo-Liste direkt unter ihr Ziel und setzt den Befehl passend:
+
+  ```text
+  pick c7f7d11 # Login-Formular anlegen
+  fixup d41e9a2 # fixup! Login-Formular anlegen
+  pick 9a21098 # Passwort-Reset ergänzen
+  ```
+
+  Es gibt Varianten für jeden Zweck: `--squash=<commit>` erzeugt `squash!` und kombiniert die Nachrichten; `--fixup=amend:<commit>` erzeugt einen `amend!`-Commit, der Inhalt **und** Nachricht des Ziels ersetzt (in der Liste wird daraus `fixup -C`); `--fixup=reword:<commit>` ändert nur die Nachricht. Statt eines Hashes akzeptiert Git jede Revision, auch eine Suche in den Commit-Nachrichten: `git commit --fixup=:/Login-Formular` nimmt den jüngsten Commit, dessen Nachricht auf „Login-Formular“ passt ([gitrevisions · :/<text>](https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt-textegfixnastybug)).
+
+  Mit `git config rebase.autoSquash true` gilt `--autosquash` bei jedem interaktiven Rebase ([git-config · rebase.autoSquash](https://git-scm.com/docs/git-config#Documentation/git-config.txt-rebaseautoSquash)). Seit Git 2.44 funktioniert `git rebase --autosquash main` auch ohne `-i` – die Liste wird dann ohne Editor ausgeführt.
+
+  > [!PRAXIS] Review-Anmerkungen einarbeiten
+  > Kommentiert eine Reviewerin einen Fehler im ersten von fünf Commits, committest du die Korrektur mit `git commit --fixup=<hash>` und pushst normal. Sie sieht im PR genau die Korrektur als eigenen kleinen Diff und muss nicht alles neu lesen. Nach der Freigabe folgt `git rebase -i --autosquash origin/main` und `git push --force-with-lease`. Viele Teams erwarten genau diesen Ablauf – ein Merge mit „fixup!“-Commits in `main` fällt negativ auf.
+
+  ## Anhalten und eingreifen: edit, break und exec
+
+  `edit` wendet einen Commit an und hält danach an. Du stehst dann in einem Detached HEAD auf genau diesem Commit und kannst alles tun, was du auf einem normalen Branch tun würdest:
+
+  ```console
+  $ git rebase -i main
+  Stopped at acfd7f8...  # Login und Logging
+  You can amend the commit now, with
+
+    git commit --amend
+
+  Once you are satisfied with your changes, run
+
+    git rebase --continue
+  ```
+
+  `git commit --amend` ändert den Commit, neue Commits schiebst du mit `git commit` dazwischen. `break` hält an einer beliebigen Stelle an, ohne vorher einen Commit anzuwenden – etwa um zwischen zwei Commits einen Test von Hand auszuführen.
+
+  ### Einen Commit aufteilen
+
+  Ein Commit „Login und Logging“ mischt zwei Themen. Im Review lässt er sich schwer beurteilen, und ein späteres Revert würde beides zurücknehmen. So wird er zu zwei Commits ([git-rebase · Splitting Commits](https://git-scm.com/docs/git-rebase#_splitting_commits)):
+
+  ```bash
+  git rebase -i main            # Zeile von „Login und Logging“ auf edit setzen
+  git reset HEAD~               # Commit auflösen, Änderungen bleiben im Arbeitsverzeichnis
+  git add logging_config.py
+  git commit -m "Logging konfigurieren"
+  git add login.py              # oder git add -p für einzelne Hunks
+  git commit -m "Login-Formular anlegen"
+  git rebase --continue
+  ```
+
+  Der Schlüssel ist `git reset HEAD~` im Standardmodus `--mixed`: Der Branch-Zeiger und der Index gehen einen Commit zurück, das Arbeitsverzeichnis bleibt, wie es ist. Die Änderungen des aufgelösten Commits liegen danach als ungestagte Änderungen vor, und du stagest sie in Portionen. Stecken beide Themen in derselben Datei, teilt `git add -p` sie Hunk für Hunk auf (siehe [Gute Commits](/git/commit-hygiene)). `--hard` wäre hier fatal: Es würde die Änderungen verwerfen. Mehr zu den Reset-Modi im Modul [Reset und Reflog](/git/reset-reflog).
+
+  ### Eine Datei aus einem alten Commit entfernen
+
+  Derselbe Ablauf entfernt eine versehentlich committete `.env`: Den betroffenen Commit auf `edit` setzen, `git rm --cached .env` (die Datei bleibt lokal liegen), `.env` in die `.gitignore` eintragen und stagen, `git commit --amend --no-edit`, `git rebase --continue`. Enthält der Commit **nur** das Secret, genügt `drop`.
+
+  > [!WARNING] Gepusht ist gepusht
+  > Interaktives Rebase entfernt das Secret aus deinem Branch. Der alte Commit liegt aber weiter im lokalen Reflog – und wenn er schon gepusht war, auf dem Server, in Forks und in den Klonen deiner Kolleginnen. Ein Passwort, das jemals gepusht wurde, gilt als kompromittiert und wird rotiert. Wie man History auf dem Server bereinigt, zeigt das Modul [CI/CD rund um Git](/git/ci-cd).
+
+  ### Jeden Commit testen mit exec
+
+  Nach dem Umsortieren und Zusammenfassen sind viele Commits neue Zustände, die nie jemand getestet hat. `--exec` hängt nach jedem Commit eine `exec`-Zeile an ([git-rebase · --exec](https://git-scm.com/docs/git-rebase#Documentation/git-rebase.txt---execcmd)):
+
+  ```console
+  $ git rebase --exec "pytest -q" main
+  Executing: pytest -q
+  …
+  warning: execution failed: pytest -q
+  You can fix the problem, and then run
+
+    git rebase --continue
+  ```
+
+  Scheitert der Befehl, hält Git genau hinter dem kaputten Commit an. Du reparierst, `git commit --amend`, `git rebase --continue`. Eine History, in der jeder Commit baut und die Tests besteht, ist die Voraussetzung dafür, dass `git bisect` später zuverlässig arbeitet ([Fehlersuche in der History](/git/bisect-historie)).
+
+  ## Skriptgesteuert mit GIT_SEQUENCE_EDITOR
+
+  Git öffnet für die Todo-Liste keinen festen Editor, sondern ruft ein Programm auf und übergibt ihm den Pfad der Datei (`.git/rebase-merge/git-rebase-todo`). Welches Programm, bestimmt zuerst die Umgebungsvariable `GIT_SEQUENCE_EDITOR`, dann die Einstellung `sequence.editor`, sonst der normale Editor ([git · GIT_SEQUENCE_EDITOR](https://git-scm.com/docs/git#Documentation/git.txt-GITSEQUENCEEDITOR)). Wenn das Programm endet, liest Git die Datei wieder ein und führt sie aus. Jedes Programm, das die Datei ändert, ist also ein gültiger „Editor“ – zum Beispiel `sed`:
+
+  ```bash
+  # Zweite Zeile der Liste auf edit setzen
+  GIT_SEQUENCE_EDITOR="sed -i '2s/^pick/edit/'" git rebase -i main
+
+  # Jeden Commit mit dem Titel „WIP“ in den Commit darüber einfließen lassen
+  GIT_SEQUENCE_EDITOR="sed -i '/# WIP$/s/^pick/fixup/'" git rebase -i main
+
+  # Autosquash ausführen, ohne die Liste anzusehen
+  GIT_SEQUENCE_EDITOR=true git rebase -i --autosquash main
+
+  # Eine selbst geschriebene Liste übernehmen
+  GIT_SEQUENCE_EDITOR="cp .git/meine-todo" git rebase -i main
+  ```
+
+  `true` ist ein Programm, das nichts tut und erfolgreich endet – die Liste bleibt, wie Git sie erzeugt hat. Für Commit-Nachrichten (bei `squash`, `reword` oder `git rebase --continue`) ist ein anderer Editor zuständig: `GIT_EDITOR=true` übernimmt die vorgeschlagene Nachricht unverändert. So laufen die Labore dieses Kurses und Aufräumskripte in CI ohne jede Eingabe.
+
+  Zwei Fallen dabei: Muster wie `/# WIP$/` hängen am Format der Liste – mit Git vor 2.50 fehlt das `#`, und das Muster greift nicht. Zeilennummern wie `2s/…/` sind robuster, setzen aber voraus, dass du die Reihenfolge kennst. Und `sed -i` ist GNU-Syntax; das `sed` von macOS verlangt `sed -i ''`.
+
+  > [!DEEP] Auch ein normaler Rebase hat eine Todo-Liste
+  > `git rebase main` erzeugt intern dieselbe Liste aus `pick`-Zeilen und führt sie ohne Editor aus. Deshalb meldet `git status` auch bei einem nicht interaktiven Rebase „interactive rebase in progress“, und deshalb funktionieren `--exec`, `--autosquash` und `--update-refs` in beiden Varianten.
+
+  ## Wann aufräumen – und wann nicht
+
+  Aufräumen lohnt sich, solange die Commits nur dir gehören: vor dem Öffnen des PRs und kurz vor dem Merge, nachdem die Fixups durchs Review gegangen sind. Während eines laufenden Reviews ist es meist rücksichtsvoller, Korrekturen als Fixup-Commits obendrauf zu pushen, statt die ganze Reihe umzuschreiben – sonst muss die Reviewerin alles neu lesen. `git range-diff main ORIG_HEAD HEAD` zeigt nach einem Rebase Commit für Commit, was sich verändert hat, und hilft bei der Kontrolle ([git-range-diff](https://git-scm.com/docs/git-range-diff)).
+
+  Tabu ist, was andere schon haben: `main`, Release-Branches und geteilte Feature-Branches (die goldene Regel aus dem Modul [Rebase](/git/rebase)). Merge-Commits im umgeschriebenen Bereich verwirft ein normaler Rebase. `--rebase-merges` erhält sie; die Todo-Liste enthält dann zusätzlich `label`, `reset` und `merge`, mit denen Git die Verzweigungen nachbaut ([git-rebase · --rebase-merges](https://git-scm.com/docs/git-rebase#Documentation/git-rebase.txt---rebase-mergesrebase-cousinsno-rebase-cousins)). Wenn das Team per „Squash and merge“ integriert, landet ohnehin nur ein Commit auf `main`; aufgeräumte Commits helfen dann vor allem im Review.
+
+  Und wenn es schiefgeht: Während des Rebase bringt `git rebase --abort` alles zurück. Danach findest du den alten Stand in `ORIG_HEAD` oder im Branch-Reflog (`git reflog feature/login`).
+
+  > [!INTERVIEW] „Wie sieht dein Branch aus, bevor du ihn mergst?“
+  > Jeder Commit ist eine in sich geschlossene Änderung, die baut und die Tests besteht, mit einer Nachricht, die das Warum erklärt. Während der Entwicklung committe ich oft und klein, Review-Korrekturen als `--fixup`-Commits. Vor dem Merge fasse ich sie mit `git rebase -i --autosquash origin/main` zusammen, prüfe jeden Commit mit `--exec "pytest -q"` und pushe mit `--force-with-lease`. Geteilte Branches schreibe ich nicht um.
+
+  ## Häufige Fehler
+
+  - **Liste wie `git log` gelesen.** Die Todo-Liste beginnt mit dem ältesten Commit. Wer von unten nach oben denkt, setzt `fixup` in den falschen Commit.
+  - **`fixup` in der ersten Zeile.** Es gibt keinen Commit darüber; Git bricht mit `cannot 'fixup' without a previous commit` ab. Mit `git rebase --edit-todo` korrigieren.
+  - **Fixup unter dem falschen Commit.** `fixup` verschmilzt mit der Zeile darüber, egal was im Titel steht. Mit `--fixup=<hash>` und `--autosquash` passiert das nicht.
+  - **`git reset --hard HEAD~` beim Aufteilen.** Die Änderungen des Commits sind weg; `git add` meldet `pathspec … did not match any files`. Richtig ist `git reset HEAD~`.
+  - **Zeile versehentlich gelöscht.** Der Commit ist nach dem Rebase verschwunden. Retten über `ORIG_HEAD` oder das Reflog; vorbeugen mit `rebase.missingCommitsCheck = error`.
+  - **Secret entfernt, aber schon gepusht.** Der Rebase macht es nicht ungeschehen – Secret rotieren.
+  - **Nach dem Umbau nicht getestet.** Zusammengefasste und umsortierte Commits sind neue Zustände; `--exec` prüft jeden.
+  - **Geteilte History aufgeräumt.** Kolleginnen sitzen auf Commits, die es nicht mehr gibt.
+
+  ## Zusammenfassung
+
+  - `git rebase -i <basis>` öffnet eine Todo-Liste für `basis..HEAD`, ältester Commit oben; Git führt sie von oben nach unten aus und liest nur Befehl und Hash.
+  - `pick`, `reword`, `edit`, `squash`, `fixup` (`-C`/`-c`), `drop`, `exec`, `break`; `squash` und `fixup` wirken auf die Zeile darüber.
+  - `git commit --fixup=<rev>` plus `git rebase -i --autosquash` arbeitet Korrekturen in den richtigen Commit ein; `rebase.autoSquash` macht das zum Standard.
+  - Aufteilen: `edit`, `git reset HEAD~`, portionsweise `git add` (auch `-p`) und committen, `git rebase --continue`.
+  - `--exec "pytest -q"` testet jeden Commit und hält beim ersten Fehler an.
+  - `GIT_SEQUENCE_EDITOR` bekommt den Pfad der Todo-Liste; `sed -i`, `true` oder `cp` ersetzen den Editor. `GIT_EDITOR=true` übernimmt Commit-Nachrichten unverändert.
+  - Aufräumen nur, solange niemand auf den Commits aufbaut; Rückweg über `--abort`, `ORIG_HEAD` und Reflog.
+exercises:
+  - id: todo-liste-lesen
+    type: choice
+    title: Was macht diese Todo-Liste?
+    prompt: Du speicherst diese Todo-Liste und schließt den Editor. Welche Aussagen stimmen?
+    lang: text
+    code: |
+      pick 3f2a1c9 # Login-Formular anlegen
+      squash 8d4e7b2 # Validierung ergänzen
+      pick 1c9a0f3 # API-Client anlegen
+      fixup 5b7e2d1 # Tippfehler im Login-Formular
+    options:
+      - text: Oben steht der älteste Commit; die Liste läuft umgekehrt zu `git log`.
+        correct: true
+        why: Git arbeitet die Liste wie ein Skript von oben nach unten ab, also muss der älteste Commit zuerst kommen.
+      - text: Die Änderung aus „Tippfehler im Login-Formular“ landet im Commit „API-Client anlegen“.
+        correct: true
+        why: "`fixup` verschmilzt immer mit dem Commit direkt darüber – hier „API-Client anlegen“. Der Titel spielt keine Rolle. Die Zeile müsste unter „Login-Formular anlegen“ stehen."
+      - text: "`squash` übernimmt die Änderungen aus „Validierung ergänzen“, verwirft aber dessen Nachricht."
+        correct: false
+        why: Das tut `fixup`. `squash` öffnet den Editor mit beiden Nachrichten, damit du sie kombinierst.
+      - text: Nach dem Rebase hat der Branch vier neue Commits.
+        correct: false
+        why: "`squash` und `fixup` verschmelzen jeweils zwei Zeilen zu einem Commit – es bleiben zwei."
+      - text: Das `#` vor dem Titel macht die Zeile zum Kommentar, Git überspringt sie.
+        correct: false
+        why: Kommentarzeilen beginnen mit `#`. Hier steht das `#` erst hinter dem Hash und markiert seit Git 2.50 nur den Titel als Kommentar. Befehl und Hash werden ausgeführt.
+    explanation: |
+      Die Liste ist ein Programm: älteste Zeile zuerst, jede Zeile ein Befehl mit einem Hash. `squash` und `fixup` beziehen sich auf die vorige Zeile. Deshalb ist die Position wichtiger als der Titel – ein Fixup unter dem falschen Commit schiebt die Korrektur in eine fremde Änderung. `--autosquash` nimmt dir das Einsortieren ab.
+    resources:
+      - title: git-rebase · Interactive Mode
+        url: https://git-scm.com/docs/git-rebase#_interactive_mode
+
+  - id: review-fixup-ablauf
+    type: order
+    title: Eine Review-Anmerkung einarbeiten
+    prompt: |
+      Die Reviewerin hat in deinem PR angemerkt, dass im Commit `a1b2c3d` („API-Client anlegen“) ein Timeout fehlt. Die Korrektur in `api.py` ist fertig, aber noch nicht gestaged. `origin/main` ist aktuell. Bring die Schritte in die richtige Reihenfolge.
+    lang: bash
+    lines: |
+      git add api.py
+      git commit --fixup=a1b2c3d
+      git push
+      # Reviewerin prüft den Fixup-Commit im PR und gibt frei
+      git rebase -i --autosquash origin/main
+      git push --force-with-lease
+    explanation: |
+      Die Korrektur wird zuerst als eigener `fixup!`-Commit gepusht. Das ist ein normaler Push, weil nichts umgeschrieben wurde, und die Reviewerin sieht nur den kleinen Diff. Erst nach der Freigabe sortiert `--autosquash` den Fixup unter `a1b2c3d` und verschmilzt beide. Jetzt hat der Branch neue Hashes, also braucht der letzte Push `--force-with-lease`.
+    resources:
+      - title: git-rebase · --autosquash
+        url: https://git-scm.com/docs/git-rebase#Documentation/git-rebase.txt---autosquash
+      - title: git-commit · --fixup
+        url: https://git-scm.com/docs/git-commit#Documentation/git-commit.txt---fixupamendrewordcommit
+
+  - id: autosquash-vorhersagen
+    type: output
+    title: Wohin wandert der Fixup?
+    prompt: Was gibt das Skript aus?
+    lang: bash
+    code: |
+      git init -q
+      printf 'app\n' > app.py && git add app.py && git commit -qm "Projekt anlegen"
+      printf 'form\n' > login.py && git add login.py && git commit -qm "Login-Formular anlegen"
+      printf 'api\n' > api.py && git add api.py && git commit -qm "API-Client anlegen"
+      printf 'form v2\n' > login.py && git commit -qa --fixup=HEAD~1
+      printf 'debug\n' > debug.log && git add debug.log && git commit -qm "Debug-Log schreiben"
+      git log -1 --format=%s HEAD~1
+      GIT_SEQUENCE_EDITOR=true git rebase -q -i --autosquash HEAD~4
+      git log --format=%s
+      git show HEAD~2:login.py
+    expected: |
+      fixup! Login-Formular anlegen
+      Debug-Log schreiben
+      API-Client anlegen
+      Login-Formular anlegen
+      Projekt anlegen
+      form v2
+    verify: true
+    explanation: |
+      Beim Fixup-Commit ist `HEAD~1` der Commit „Login-Formular anlegen“, deshalb heißt er `fixup! Login-Formular anlegen`. `--autosquash` sortiert ihn in der Todo-Liste direkt unter sein Ziel und macht aus `pick` ein `fixup`. `GIT_SEQUENCE_EDITOR=true` lässt die Liste unverändert. Danach gibt es nur noch vier Commits, und die Änderung `form v2` steckt im Login-Commit (`HEAD~2`), nicht in einem eigenen. `HEAD~4` ist die Basis: Die vier Commits darüber kommen in die Liste, „Projekt anlegen“ bleibt unberührt.
+    resources:
+      - title: git-rebase · --autosquash
+        url: https://git-scm.com/docs/git-rebase#Documentation/git-rebase.txt---autosquash
+
+  - id: squash-und-drop
+    type: output
+    title: Squash, Drop und eine Nachricht
+    prompt: |
+      Was gibt das Skript aus? Die Umleitung nach `/dev/null` schluckt nur die Meldung, die Git beim Erstellen des zusammengefassten Commits ausgibt.
+    lang: bash
+    code: |
+      export GIT_EDITOR=true
+      git init -q
+      printf 'app\n' > app.py && git add app.py && git commit -qm "Projekt anlegen"
+      printf 'form\n' > login.py && git add login.py && git commit -qm "Login-Formular anlegen"
+      printf 'check\n' >> login.py && git commit -qam "Passwort prüfen"
+      printf 'check!\n' >> login.py && git commit -qam "Tippfehler korrigieren"
+      printf 'debug\n' > debug.log && git add debug.log && git commit -qm "Debug-Log schreiben"
+      GIT_SEQUENCE_EDITOR="sed -i -e '3s/^pick/squash/' -e '4s/^pick/drop/'" git rebase -q -i HEAD~4 > /dev/null
+      git log --format=%s
+      ls
+      git log -1 --format=%B
+    expected: |
+      Passwort prüfen
+      Login-Formular anlegen
+      Projekt anlegen
+      app.py
+      login.py
+      Passwort prüfen
+
+      Tippfehler korrigieren
+    verify: true
+    explanation: |
+      Die Todo-Liste enthält die vier Commits über `HEAD~4`, von oben: Login-Formular, Passwort prüfen, Tippfehler, Debug-Log. `sed` macht Zeile 3 zu `squash` und Zeile 4 zu `drop`. „Tippfehler korrigieren“ verschmilzt mit „Passwort prüfen“ darüber, „Debug-Log schreiben“ fällt weg – samt `debug.log`. Bei `squash` schlägt Git beide Nachrichten untereinander vor; weil `GIT_EDITOR=true` den Editor sofort beendet, bleibt genau dieser Vorschlag stehen. Mit `fixup` statt `squash` hätte der Commit nur „Passwort prüfen“ als Nachricht.
+    resources:
+      - title: git-rebase · Interactive Mode
+        url: https://git-scm.com/docs/git-rebase#_interactive_mode
+      - title: git-var · GIT_SEQUENCE_EDITOR
+        url: https://git-scm.com/docs/git-var#Documentation/git-var.txt-GITSEQUENCEEDITOR
+
+  - id: rebase-i-starten
+    type: command
+    title: Die letzten drei Commits bearbeiten
+    prompt: Starte ein interaktives Rebase für die letzten **drei** Commits des aktuellen Branches. Gib die Basis relativ zu `HEAD` an.
+    answers:
+      - git rebase -i HEAD~3
+      - git rebase --interactive HEAD~3
+      - git rebase -i @~3
+      - git rebase --interactive @~3
+      - git rebase -i HEAD^^^
+      - git rebase -i HEAD~~~
+    output: |
+      pick c7f7d11 # Login-Formular anlegen
+      pick 671a498 # WIP
+      pick 9a21098 # Passwort-Reset ergänzen
+
+      # Rebase 05cc447..9a21098 onto 05cc447 (3 commands)
+    explanation: |
+      Die Basis selbst wird nicht umgeschrieben – in die Liste kommen die Commits aus `HEAD~3..HEAD`, also genau drei. Ein häufiger Denkfehler ist `HEAD~2` für „die letzten drei“. Für einen Feature-Branch ist `git rebase -i main` oft bequemer, weil du nicht zählen musst. `@` ist eine Kurzform für `HEAD`.
+    resources:
+      - title: gitrevisions · <rev>~<n>
+        url: https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt-revnegHEADmaster3
+
+  - id: fixup-commit
+    type: command
+    title: Die Korrektur markieren
+    prompt: Committe die gestagte Änderung als Fixup für den Commit „API-Client anlegen“. Verwende seinen Hash.
+    context: |
+      Die Reviewerin hat einen fehlenden Timeout in „API-Client anlegen“ bemängelt. Du hast `api.py` korrigiert und gestaged.
+
+      ```console
+      $ git log --format='%h %s' main..
+      e4f5a6b Tests für die Bestellliste
+      c3d4e5f Bestellliste anzeigen
+      a1b2c3d API-Client anlegen
+      ```
+    answers:
+      - git commit --fixup=a1b2c3d
+      - git commit --fixup a1b2c3d
+    output: |
+      [feature/bestellungen 9f8e7d6] fixup! API-Client anlegen
+       1 file changed, 1 insertion(+), 1 deletion(-)
+    explanation: |
+      `--fixup=a1b2c3d` erzeugt einen Commit mit dem Titel `fixup! API-Client anlegen`. Git merkt sich das Ziel über diesen Titel. Beim nächsten `git rebase -i --autosquash main` landet er direkt unter `a1b2c3d` und wird mit `fixup` verschmolzen. Gleichwertig wären `--fixup=HEAD~2` oder `--fixup=:/API-Client`. Mit `--squash=` würdest du die Nachrichten kombinieren, mit `--fixup=amend:` auch die Nachricht ersetzen.
+    resources:
+      - title: git-commit · --fixup
+        url: https://git-scm.com/docs/git-commit#Documentation/git-commit.txt---fixupamendrewordcommit
+
+  - id: exec-jeder-commit
+    type: command
+    title: Jeden Commit testen
+    prompt: Lass nach jedem Commit deines Branches seit `main` den Befehl `pytest -q` laufen, ohne die Todo-Liste zu öffnen. Die Commits sollen dabei nicht auf eine neue Basis wandern.
+    context: Du stehst auf `feature/login`, das auf dem aktuellen `main` basiert. Du hast die Commits gerade umsortiert und willst sicher sein, dass jeder einzelne die Tests besteht.
+    answers:
+      - git rebase --exec "pytest -q" main
+      - git rebase -x "pytest -q" main
+      - git rebase main --exec "pytest -q"
+      - git rebase main -x "pytest -q"
+    explanation: |
+      `--exec` (kurz `-x`) hängt in der Todo-Liste nach jedem Commit eine Zeile `exec pytest -q` an. Ohne `-i` wird die Liste ohne Editor ausgeführt. Weil der Branch schon auf `main` basiert, ändern sich die Commits nicht; Git spielt sie nur nacheinander durch und führt dazwischen die Tests aus. Scheitert `pytest`, hält der Rebase genau hinter dem kaputten Commit an – du reparierst, `git commit --amend`, `git rebase --continue`. Die Anführungszeichen sind nötig, weil der Befehl ein Leerzeichen enthält.
+    resources:
+      - title: git-rebase · --exec
+        url: https://git-scm.com/docs/git-rebase#Documentation/git-rebase.txt---execcmd
+
+  - id: todo-liste-schreiben
+    type: gap
+    title: Die Todo-Liste ausfüllen
+    prompt: |
+      Ergänze die Befehle (ausgeschrieben oder als Abkürzung):
+
+      - „WIP“ gehört inhaltlich zum Login-Formular; seine Nachricht soll verschwinden.
+      - Im Titel „Passwort prüfn“ fehlt ein Buchstabe; der Inhalt stimmt.
+      - Die Debug-Ausgaben sollen komplett raus.
+      - „Passwort-Reset und Logging“ mischt zwei Themen – der Rebase soll dort anhalten, damit du den Commit aufteilst.
+      - Zum Schluss soll die Testsuite laufen.
+    lang: text
+    code: |
+      pick 3f2a1c9 # Login-Formular anlegen
+      ⟦fixup⟧ 8d4e7b2 # WIP
+      ⟦reword⟧ 1c9a0f3 # Passwort prüfn
+      ⟦drop⟧ 5b7e2d1 # Debug-Ausgaben
+      ⟦edit⟧ 9e3f4a8 # Passwort-Reset und Logging
+      ⟦exec⟧ pytest -q
+    gaps:
+      - label: WIP einarbeiten
+        hint: Verschmilzt mit der Zeile darüber und verwirft die eigene Nachricht.
+        accept: ["f"]
+      - label: Titel korrigieren
+        hint: Übernimmt den Commit, öffnet aber den Editor für die Nachricht.
+        accept: ["r"]
+      - label: Entfernen
+        hint: Der Commit soll gar nicht angewendet werden.
+        accept: ["d"]
+      - label: Anhalten nach dem Commit
+        hint: Übernimmt den Commit und hält danach an.
+        accept: ["e"]
+      - label: Befehl ausführen
+        hint: Führt den Rest der Zeile in der Shell aus.
+        accept: ["x"]
+    explanation: |
+      `fixup` verschmilzt „WIP“ mit dem Login-Formular darüber und verwirft „WIP“ als Nachricht – `squash` würde sie in den Editor holen. `reword` ändert nur die Nachricht. `drop` verwirft den Commit ausdrücklich; eine gelöschte Zeile hätte dieselbe Wirkung, ist aber leichter mit einem Versehen zu verwechseln. `edit` hält nach dem Anwenden an, damit du mit `git reset HEAD~` aufteilen kannst. `exec` am Ende prüft den fertigen Stand; nach jedem Commit gäbe es das mit `--exec`.
+    resources:
+      - title: git-rebase · Interactive Mode
+        url: https://git-scm.com/docs/git-rebase#_interactive_mode
+      - title: Pro Git · Rewriting History
+        url: https://git-scm.com/book/en/v2/Git-Tools-Rewriting-History
+
+  - id: aufteilen-reset-hard
+    type: bug
+    title: Beim Aufteilen ist alles weg
+    prompt: |
+      Mit dieser Befehlsfolge willst du den Commit „Login und Logging“ in zwei Commits aufteilen. Der Rebase hält wie geplant an, aber dann meldet `git add logging_config.py`:
+
+      ```text
+      fatal: pathspec 'logging_config.py' did not match any files
+      ```
+
+      `git status` zeigt „nothing to commit, working tree clean“, und weder `login.py` noch `logging_config.py` liegen noch im Verzeichnis. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: bash
+    code: |
+      # „Login und Logging“ (erster Commit nach main) in zwei Commits aufteilen
+      GIT_SEQUENCE_EDITOR="sed -i '1s/^pick/edit/'" git rebase -i main
+      git reset --hard HEAD~
+      git add logging_config.py
+      git commit -m "Logging konfigurieren"
+      git add login.py
+      git commit -m "Login-Formular anlegen"
+      git rebase --continue
+    lines: [3]
+    fix:
+      - line: 3
+        answers:
+          - git reset HEAD~
+          - git reset HEAD^
+          - git reset HEAD~1
+          - git reset --mixed HEAD~
+          - git reset --mixed HEAD^
+          - git reset --mixed HEAD~1
+          - git reset @~
+          - git reset -q HEAD~
+    explanation: |
+      `--hard` setzt Branch, Index **und** Arbeitsverzeichnis auf `HEAD~` – die Änderungen des aufgelösten Commits sind weg, und weil beide Dateien in diesem Commit neu waren, verschwinden sie ganz. Gebraucht wird der Standardmodus `--mixed`: Er setzt Branch und Index zurück, lässt das Arbeitsverzeichnis aber stehen. Dann liegen beide Dateien als ungetrackte bzw. geänderte Dateien da und lassen sich einzeln committen. `--soft` wäre ebenfalls falsch: Beide Dateien blieben gestaged, und der erste Commit würde wieder beides enthalten. Gerettet wird der Fall mit `git rebase --abort`.
+    resources:
+      - title: git-rebase · Splitting Commits
+        url: https://git-scm.com/docs/git-rebase#_splitting_commits
+      - title: git-reset – Referenz
+        url: https://git-scm.com/docs/git-reset
+
+  - id: aufraeum-skript
+    type: explain
+    title: Das Aufräumskript des Teams
+    prompt: Dieses Skript liegt im Repository deines neuen Teams. Erkläre, was jede Zeile bewirkt, welche Commits am Ende auf dem Server landen und wo die Grenzen des Skripts liegen.
+    lang: bash
+    code: |
+      #!/usr/bin/env bash
+      # aufraeumen.sh – vor dem Merge eines PRs ausführen
+      set -euo pipefail
+      git fetch origin
+      GIT_SEQUENCE_EDITOR="sed -i '/# WIP$/s/^pick/fixup/'" git rebase -i origin/main
+      git rebase --exec "pytest -q" origin/main
+      git push --force-with-lease
+    points:
+      - Git schreibt die Todo-Liste für `origin/main..HEAD` in eine Datei und ruft statt eines Editors `sed -i` mit deren Pfad auf; `sed` ändert die Datei direkt, dann führt Git sie aus.
+      - "Jede Zeile mit dem Titel „WIP“ wird von `pick` zu `fixup`: Der WIP-Commit verschmilzt mit dem Commit direkt darüber, seine Nachricht fällt weg. Steht ein WIP-Commit in der ersten Zeile, bricht der Rebase ab („cannot 'fixup' without a previous commit“)."
+      - Der zweite Rebase ändert nichts an der Basis, führt aber nach jedem Commit `pytest -q` aus und hält beim ersten kaputten Commit an; wegen `set -e` endet das Skript dann ohne Push.
+      - "`--force-with-lease` überschreibt den PR-Branch nur, wenn niemand sonst seit dem letzten Fetch gepusht hat."
+      - "Grenzen: nur für den eigenen PR-Branch; das Muster hängt am Todo-Format mit `#` (Git 2.50+); ein WIP-Commit kann auch in den falschen Commit darüber fließen."
+    explanation: |
+      Das Skript räumt einen PR-Branch vor dem Merge auf. Nach dem Fetch startet es ein interaktives Rebase auf `origin/main`, aber statt eines Editors bekommt Git `sed` als `GIT_SEQUENCE_EDITOR`. Git übergibt den Pfad der Todo-Liste, `sed -i` macht aus jeder Zeile, die auf „# WIP“ endet, eine `fixup`-Zeile. Jeder WIP-Commit verschmilzt so mit dem Commit direkt über ihm – das ist nur richtig, wenn der WIP inhaltlich dorthin gehört. Steht ein WIP in der ersten Zeile, bricht Git ab. Der zweite Rebase hat keine neue Basis, aber `--exec` spielt jeden Commit durch und startet danach `pytest -q`. Scheitert ein Test, hält der Rebase an, und `set -e` beendet das Skript, bevor gepusht wird. Zum Schluss aktualisiert `--force-with-lease` den PR-Branch, ohne fremde Pushes zu überschreiben. Geeignet ist das nur für einen Branch, auf dem niemand sonst aufbaut. Das Muster setzt das Todo-Format ab Git 2.50 voraus – mit älteren Versionen fehlt das `#`, und `sed` ändert nichts.
+    resources:
+      - title: git · GIT_SEQUENCE_EDITOR
+        url: https://git-scm.com/docs/git#Documentation/git.txt-GITSEQUENCEEDITOR
+      - title: git-config · sequence.editor
+        url: https://git-scm.com/docs/git-config#Documentation/git-config.txt-sequenceeditor
+
+  - id: labor-wip-commits
+    type: practice
+    title: "Labor: Vier Commits, zwei Themen"
+    prompt: |
+      Führe das Labor-Skript in einem leeren Verzeichnis in einer Bash-Sitzung aus (`cd "$(mktemp -d)"`, dann die Zeilen einfügen) – **nie** in einem echten Repository.
+
+      Der PR `feature/login` besteht aus „WIP“, „tests“, „WIP“, „fix“. Die Reviewerin bittet um zwei saubere Commits: zuerst **„Login-Formular mit Passwortprüfung anlegen“** mit allen Änderungen an `login.py`, darüber **„Tests für den Login ergänzen“** mit allen Änderungen unter `tests/`. Der Endstand der Dateien darf sich nicht ändern. Prüfe mit `git log --stat --format=%s main..` und `git diff "$vorher"`.
+
+      Du kannst die Todo-Liste im Editor bearbeiten oder `GIT_SEQUENCE_EDITOR` verwenden.
+    lang: bash
+    starter: |
+      # Labor: erzeugt die Ausgangslage
+      git init -q
+      printf 'from flask import Flask\n' > app.py
+      git add app.py && git commit -qm "Projekt anlegen"
+      git switch -qc feature/login
+      printf 'def login(user, password):\n    ...\n' > login.py
+      git add login.py && git commit -qm "WIP"
+      mkdir tests && printf 'def test_login():\n    ...\n' > tests/test_login.py
+      git add tests && git commit -qm "tests"
+      printf 'def login(user, password):\n    if not password:\n        raise ValueError\n' > login.py
+      git commit -qam "WIP"
+      printf 'def test_login_ohne_passwort():\n    ...\n' >> tests/test_login.py
+      git commit -qam "fix"
+      vorher=$(git rev-parse HEAD)   # merkt sich den Stand für die Kontrolle
+      # Deine Reparatur:
+    solution: |
+      # Labor: erzeugt die Ausgangslage
+      git init -q
+      printf 'from flask import Flask\n' > app.py
+      git add app.py && git commit -qm "Projekt anlegen"
+      git switch -qc feature/login
+      printf 'def login(user, password):\n    ...\n' > login.py
+      git add login.py && git commit -qm "WIP"
+      mkdir tests && printf 'def test_login():\n    ...\n' > tests/test_login.py
+      git add tests && git commit -qm "tests"
+      printf 'def login(user, password):\n    if not password:\n        raise ValueError\n' > login.py
+      git commit -qam "WIP"
+      printf 'def test_login_ohne_passwort():\n    ...\n' >> tests/test_login.py
+      git commit -qam "fix"
+      vorher=$(git rev-parse HEAD)   # merkt sich den Stand für die Kontrolle
+      # Reparatur: gewünschte Todo-Liste selbst schreiben und Git übergeben
+      cat > .git/meine-todo <<ENDE
+      pick $(git rev-parse --short HEAD~3)
+      fixup $(git rev-parse --short HEAD~1)
+      exec git commit -q --amend -m "Login-Formular mit Passwortprüfung anlegen"
+      pick $(git rev-parse --short HEAD~2)
+      fixup $(git rev-parse --short HEAD)
+      exec git commit -q --amend -m "Tests für den Login ergänzen"
+      ENDE
+      GIT_SEQUENCE_EDITOR="cp .git/meine-todo" git rebase -i main
+      # Kontrolle
+      test "$(git log --format=%s main..)" = "$(printf 'Tests für den Login ergänzen\nLogin-Formular mit Passwortprüfung anlegen')"
+      test "$(git show --format= --name-only HEAD~1)" = "login.py"
+      test "$(git show --format= --name-only HEAD)" = "tests/test_login.py"
+      git diff --quiet "$vorher" HEAD
+      test -z "$(git status --porcelain)"
+    checklist:
+      - "`git log --format=%s main..` zeigt genau zwei Commits: oben „Tests für den Login ergänzen“, darunter „Login-Formular mit Passwortprüfung anlegen“."
+      - "`git log --stat main..` zeigt: Der untere Commit ändert nur `login.py`, der obere nur `tests/test_login.py`."
+      - "`git diff \"$vorher\"` ist leer – am Inhalt hat sich nichts geändert."
+      - "`git status` meldet keinen laufenden Rebase, das Arbeitsverzeichnis ist sauber."
+      - Du kannst erklären, warum die zweite „WIP“-Zeile vor dem Umwandeln in `fixup` nach oben unter die erste wandern musste.
+    verify: true
+    explanation: |
+      Die Aufgabe braucht drei Werkzeuge: **umsortieren** (das zweite „WIP“ gehört unter das erste, „fix“ unter „tests“), **fixup** (die Nachbesserungen verschmelzen ohne ihre Nachricht) und **neue Nachrichten**. Im Editor verschiebst du die Zeilen, schreibst `fixup` davor und setzt die beiden verbleibenden Zeilen auf `reword`. Die Musterlösung schreibt dieselbe Liste als Datei und lässt sie per `GIT_SEQUENCE_EDITOR="cp …"` übernehmen; die `exec`-Zeilen setzen die Nachrichten ohne Editor. Ohne Umsortieren würde `fixup` das zweite „WIP“ in „tests“ schieben – `fixup` wirkt immer auf die Zeile darüber. Ein anderer gültiger Weg: `git reset main`, dann `git add login.py` und `git add tests` getrennt committen. Er funktioniert hier, weil die Themen sauber nach Dateien getrennt sind; bei gemischten Dateien bräuchtest du `git add -p`.
+    resources:
+      - title: Pro Git · Reordering Commits
+        url: https://git-scm.com/book/en/v2/Git-Tools-Rewriting-History#_reordering_commits
+      - title: Pro Git · Squashing Commits
+        url: https://git-scm.com/book/en/v2/Git-Tools-Rewriting-History#_squashing
+
+  - id: labor-autosquash
+    type: practice
+    title: "Labor: Der Timeout gehört in den ersten Commit"
+    prompt: |
+      Führe das Labor-Skript in einem leeren Verzeichnis in einer Bash-Sitzung aus (`cd "$(mktemp -d)"`) – **nie** in einem echten Repository.
+
+      Die Reviewerin schreibt zum ersten Commit „API-Client für Bestellungen anlegen“: „`requests.get` ohne `timeout` kann ewig hängen.“ Die Korrektur liegt schon ungestaged in `api.py`. Arbeite sie so ein, dass der Branch danach wieder genau drei Commits mit den bisherigen Titeln hat und der Timeout **im ersten Commit** steckt. Verschiebe die Korrektur nicht von Hand in der Todo-Liste. Prüfe mit `git log --format=%s main..` und `git show HEAD~2`.
+    lang: bash
+    starter: |
+      # Labor: erzeugt die Ausgangslage
+      git init -q
+      printf 'from flask import Flask\n' > app.py
+      git add app.py && git commit -qm "Projekt anlegen"
+      git switch -qc feature/bestellungen
+      printf 'import requests\n\ndef hole_bestellungen():\n    return requests.get(URL)\n' > api.py
+      git add api.py && git commit -qm "API-Client für Bestellungen anlegen"
+      printf '<ul id="bestellungen"></ul>\n' > liste.html
+      git add liste.html && git commit -qm "Bestellliste anzeigen"
+      printf 'def test_liste():\n    ...\n' > test_liste.py
+      git add test_liste.py && git commit -qm "Tests für die Bestellliste"
+      # Review: „requests.get ohne timeout kann ewig hängen“ – die Korrektur liegt schon bereit
+      printf 'import requests\n\ndef hole_bestellungen():\n    return requests.get(URL, timeout=10)\n' > api.py
+      # Deine Reparatur:
+    solution: |
+      # Labor: erzeugt die Ausgangslage
+      git init -q
+      printf 'from flask import Flask\n' > app.py
+      git add app.py && git commit -qm "Projekt anlegen"
+      git switch -qc feature/bestellungen
+      printf 'import requests\n\ndef hole_bestellungen():\n    return requests.get(URL)\n' > api.py
+      git add api.py && git commit -qm "API-Client für Bestellungen anlegen"
+      printf '<ul id="bestellungen"></ul>\n' > liste.html
+      git add liste.html && git commit -qm "Bestellliste anzeigen"
+      printf 'def test_liste():\n    ...\n' > test_liste.py
+      git add test_liste.py && git commit -qm "Tests für die Bestellliste"
+      # Review: „requests.get ohne timeout kann ewig hängen“ – die Korrektur liegt schon bereit
+      printf 'import requests\n\ndef hole_bestellungen():\n    return requests.get(URL, timeout=10)\n' > api.py
+      # Reparatur
+      git add api.py
+      git commit -q --fixup=:/API-Client
+      GIT_SEQUENCE_EDITOR=true git rebase -i --autosquash main
+      # Kontrolle
+      test "$(git log --format=%s main..)" = "$(printf 'Tests für die Bestellliste\nBestellliste anzeigen\nAPI-Client für Bestellungen anlegen')"
+      git show HEAD~2:api.py | grep -q 'timeout=10'
+      test -z "$(git status --porcelain)"
+    checklist:
+      - Du hast die Korrektur mit `git commit --fixup=…` committet; `git log --format=%s -1` zeigte vor dem Rebase `fixup! API-Client für Bestellungen anlegen`.
+      - Du hast mit `--autosquash` rebased (mit `-i` und Editor, mit `GIT_SEQUENCE_EDITOR=true` oder ohne `-i`).
+      - "`git log --format=%s main..` zeigt wieder genau drei Commits mit den ursprünglichen Titeln, keinen `fixup!`-Commit."
+      - "`git show HEAD~2:api.py` enthält `timeout=10`."
+      - "`git status --short` ist leer."
+    verify: true
+    explanation: |
+      `git commit --fixup=:/API-Client` sucht den jüngsten Commit, dessen Nachricht auf „API-Client“ passt, und erzeugt `fixup! API-Client für Bestellungen anlegen`. Ebenso ginge `--fixup=HEAD~2` oder der Hash. `--autosquash` sortiert den Fixup in der Todo-Liste unter sein Ziel und setzt `fixup` davor; `GIT_SEQUENCE_EDITOR=true` übernimmt die Liste unverändert. Weil die späteren Commits andere Dateien ändern, gibt es beim Verschieben keinen Konflikt. Ein normaler Commit „Timeout ergänzen“ obendrauf wäre funktional gleich, aber die Reviewerin wollte den Fehler dort behoben haben, wo er entstanden ist – so bleibt jeder Commit für sich korrekt.
+    resources:
+      - title: git-rebase · --autosquash
+        url: https://git-scm.com/docs/git-rebase#Documentation/git-rebase.txt---autosquash
+      - title: gitrevisions · :/<text>
+        url: https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt-textegfixnastybug
+
+  - id: labor-secret-entfernen
+    type: practice
+    title: "Labor: Das Passwort steckt im zweiten Commit"
+    prompt: |
+      Führe das Labor-Skript in einem leeren Verzeichnis in einer Bash-Sitzung aus (`cd "$(mktemp -d)"`) – **nie** in einem echten Repository.
+
+      Vor dem Push fällt dir auf: Der Commit „Datenbank anbinden“ in der Mitte deines Branches enthält neben `db.py` auch die `.env` mit dem Datenbankpasswort. Der Branch ist noch nicht gepusht.
+
+      Entferne `.env` aus **allen** Commits des Branches, behalte aber die Änderung an `db.py` und alle drei Commits mit ihren Titeln. Die Datei soll lokal erhalten bleiben und künftig ignoriert werden. Prüfe mit `git log --stat --format=%s main..` und `git status --ignored`.
+    lang: bash
+    starter: |
+      # Labor: erzeugt die Ausgangslage
+      git init -q
+      printf 'from flask import Flask\n' > app.py
+      git add app.py && git commit -qm "Projekt anlegen"
+      git switch -qc feature/datenbank
+      printf 'def login(user, password):\n    ...\n' > login.py
+      git add login.py && git commit -qm "Login-Formular anlegen"
+      printf 'import os\nDB_URL = os.environ["DB_URL"]\n' > db.py
+      printf 'DB_URL=postgres://shop:S3cret!@db.intern/shop\n' > .env
+      git add . && git commit -qm "Datenbank anbinden"
+      printf 'def reset_password(mail):\n    ...\n' > reset.py
+      git add reset.py && git commit -qm "Passwort-Reset ergänzen"
+      # Deine Reparatur:
+    solution: |
+      # Labor: erzeugt die Ausgangslage
+      git init -q
+      printf 'from flask import Flask\n' > app.py
+      git add app.py && git commit -qm "Projekt anlegen"
+      git switch -qc feature/datenbank
+      printf 'def login(user, password):\n    ...\n' > login.py
+      git add login.py && git commit -qm "Login-Formular anlegen"
+      printf 'import os\nDB_URL = os.environ["DB_URL"]\n' > db.py
+      printf 'DB_URL=postgres://shop:S3cret!@db.intern/shop\n' > .env
+      git add . && git commit -qm "Datenbank anbinden"
+      printf 'def reset_password(mail):\n    ...\n' > reset.py
+      git add reset.py && git commit -qm "Passwort-Reset ergänzen"
+      # Reparatur
+      GIT_SEQUENCE_EDITOR="sed -i '2s/^pick/edit/'" git rebase -i main
+      git rm -q --cached .env
+      printf '.env\n' > .gitignore
+      git add .gitignore
+      git commit -q --amend --no-edit
+      git rebase --continue
+      # Kontrolle
+      test -z "$(git log --format=%h main.. -- .env)"
+      test "$(git log --format=%s main..)" = "$(printf 'Passwort-Reset ergänzen\nDatenbank anbinden\nLogin-Formular anlegen')"
+      git show HEAD~1:db.py | grep -q DB_URL
+      test -f .env
+      git check-ignore -q .env
+      test -z "$(git status --porcelain)"
+    checklist:
+      - "`git log --format=%h main.. -- .env` gibt nichts aus – kein Commit des Branches enthält `.env`."
+      - "`git log --format=%s main..` zeigt weiterhin „Passwort-Reset ergänzen“, „Datenbank anbinden“, „Login-Formular anlegen“."
+      - "`git show HEAD~1 --stat` zeigt `db.py` (und `.gitignore`), aber keine `.env`."
+      - "`.env` liegt noch im Verzeichnis, `git check-ignore -v .env` nennt die Regel aus `.gitignore`, und `git status --short` ist leer."
+      - Du kannst erklären, warum ein neuer Commit „.env entfernen“ obendrauf das Problem nicht gelöst hätte.
+    verify: true
+    explanation: |
+      Ein Commit obendrauf, der `.env` löscht, lässt das Passwort im Commit „Datenbank anbinden“ stehen – jeder mit Zugriff auf die History könnte es lesen. Deshalb muss der Commit selbst geändert werden: `edit` hält direkt nach „Datenbank anbinden“ an, `git rm --cached .env` nimmt die Datei aus dem Index, lässt sie aber auf der Platte, die `.gitignore` verhindert das nächste Versehen, und `git commit --amend --no-edit` ersetzt den Commit. `git rebase --continue` wendet den Passwort-Reset-Commit auf den bereinigten Commit an. Die alten Commits mit dem Passwort liegen noch im Reflog, bis es abläuft. Wäre der Branch schon gepusht gewesen, müsste das Passwort zusätzlich rotiert werden.
+    resources:
+      - title: Pro Git · Changing Multiple Commit Messages (edit)
+        url: https://git-scm.com/book/en/v2/Git-Tools-Rewriting-History#_changing_multiple
+      - title: git-rm · --cached
+        url: https://git-scm.com/docs/git-rm
+
+  - id: labor-commit-aufteilen
+    type: practice
+    title: "Labor: Login und Logging in einem Commit"
+    prompt: |
+      Führe das Labor-Skript in einem leeren Verzeichnis in einer Bash-Sitzung aus (`cd "$(mktemp -d)"`) – **nie** in einem echten Repository.
+
+      Im Review heißt es: „Der Commit ‚Login und Logging‘ mischt zwei Dinge – bitte aufteilen.“ Mach daraus zwei Commits: zuerst **„Logging konfigurieren“** mit `logging_config.py`, darauf **„Login-Formular anlegen“** mit `login.py`. Der Commit „Logout ergänzen“ bleibt oben unverändert, der Endstand der Dateien auch. Prüfe mit `git log --stat --format=%s main..` und `git diff "$vorher"`.
+    lang: bash
+    starter: |
+      # Labor: erzeugt die Ausgangslage
+      git init -q
+      printf 'from flask import Flask\n' > app.py
+      git add app.py && git commit -qm "Projekt anlegen"
+      git switch -qc feature/login
+      printf 'def login(user, password):\n    ...\n' > login.py
+      printf 'import logging\nlogging.basicConfig(level=logging.INFO)\n' > logging_config.py
+      git add . && git commit -qm "Login und Logging"
+      printf 'def logout(user):\n    ...\n' > logout.py
+      git add logout.py && git commit -qm "Logout ergänzen"
+      vorher=$(git rev-parse HEAD)   # merkt sich den Stand für die Kontrolle
+      # Deine Reparatur:
+    solution: |
+      # Labor: erzeugt die Ausgangslage
+      git init -q
+      printf 'from flask import Flask\n' > app.py
+      git add app.py && git commit -qm "Projekt anlegen"
+      git switch -qc feature/login
+      printf 'def login(user, password):\n    ...\n' > login.py
+      printf 'import logging\nlogging.basicConfig(level=logging.INFO)\n' > logging_config.py
+      git add . && git commit -qm "Login und Logging"
+      printf 'def logout(user):\n    ...\n' > logout.py
+      git add logout.py && git commit -qm "Logout ergänzen"
+      vorher=$(git rev-parse HEAD)   # merkt sich den Stand für die Kontrolle
+      # Reparatur
+      GIT_SEQUENCE_EDITOR="sed -i '1s/^pick/edit/'" git rebase -i main
+      git reset -q HEAD~
+      git add logging_config.py
+      git commit -qm "Logging konfigurieren"
+      git add login.py
+      git commit -qm "Login-Formular anlegen"
+      git rebase --continue
+      # Kontrolle
+      test "$(git log --format=%s main..)" = "$(printf 'Logout ergänzen\nLogin-Formular anlegen\nLogging konfigurieren')"
+      test "$(git show --format= --name-only HEAD~2)" = "logging_config.py"
+      test "$(git show --format= --name-only HEAD~1)" = "login.py"
+      git diff --quiet "$vorher" HEAD
+      test -z "$(git status --porcelain)"
+    checklist:
+      - "`git log --format=%s main..` zeigt „Logout ergänzen“, „Login-Formular anlegen“, „Logging konfigurieren“ – in dieser Reihenfolge von oben."
+      - "`git log --stat main..` zeigt: Jeder der drei Commits ändert genau eine Datei."
+      - "`git diff \"$vorher\"` ist leer, `git status --short` ebenfalls."
+      - Du hast beim Aufteilen `git reset HEAD~` ohne `--hard` verwendet und kannst erklären, warum.
+    verify: true
+    explanation: |
+      `edit` hält direkt nach „Login und Logging“ an. `git reset HEAD~` löst diesen Commit auf: Branch und Index gehen einen Schritt zurück, beide Dateien bleiben im Arbeitsverzeichnis – als ungetrackte Dateien, weil sie in dem Commit neu waren. Jetzt entstehen zwei Commits aus je einer Datei. `git rebase --continue` wendet danach „Logout ergänzen“ auf den neuen zweiten Commit an. Die Reihenfolge der beiden neuen Commits bestimmst du allein durch die Reihenfolge deiner `git commit`-Aufrufe. Mischen sich zwei Themen innerhalb einer Datei, stagest du mit `git add -p` Hunk für Hunk.
+    resources:
+      - title: git-rebase · Splitting Commits
+        url: https://git-scm.com/docs/git-rebase#_splitting_commits
+      - title: Pro Git · Splitting a Commit
+        url: https://git-scm.com/book/en/v2/Git-Tools-Rewriting-History#_splitting_a_commit
