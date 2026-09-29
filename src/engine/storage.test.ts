@@ -50,6 +50,14 @@ describe('progress storage', () => {
     expect(Object.keys(merged.done).sort()).toEqual(['m/x', 'm/y']);
     expect(() => parseBackup('{"foo":1}')).toThrow();
   });
+  it('keeps valid lesson notes in backups and never overwrites an existing note on merge', () => {
+    const parsed = parseBackup(JSON.stringify({ app: 'learn.kiumu.app', exported: '2026-09-29', areas: { python: { version: 1, notes: { intro: 'Mitnehmen', second: 'Neu', blank: '  ', long: 'x'.repeat(20_001), bad: 3 } } } }));
+    expect(parsed.python.notes).toEqual({ intro: 'Mitnehmen', second: 'Neu' });
+    expect(sanitize({ version: 1 }).notes).toBeUndefined();
+    const local = freshProgress();
+    local.notes = { intro: 'Lokal' };
+    expect(mergeProgress(local, parsed.python).notes).toEqual({ intro: 'Lokal', second: 'Neu' });
+  });
   it('converts progress from kotlin.kiumu.app', () => {
     const modules = [{ id: 'bear-01', exercises: [{ id: 'bear-01/bear-001', fingerprint: 'f1' }, { id: 'bear-01/bear-002', fingerprint: 'f2' }] }];
     const old = JSON.stringify({ version: 2, activeId: 'bear-002', drafts: { 'bear-002': { g1: '"Be' } }, completed: { 'bear-001': { answers: { g1: 'val' }, at: '2026-09-28', fingerprint: 'f1' }, 'bear-002': { answers: {}, at: 'x', fingerprint: 'stale' } } });

@@ -570,7 +570,7 @@ Checkliste vor dem Commit:
 
 ## 11. IDs, Fortschritt und Änderungen
 
-Fortschritt liegt nach Anmeldung in Convex: gelöste Übungen (mit Fingerprint), Entwürfe, gelesene Lektionen, Kartenboxen, Projektschritte und die letzte Lernposition. Die alten Browser-Einträge `learn:<bereich>:v1` bleiben als importierbare Quelle unverändert. [Migration und Zustandsmodell](docs/CONVEX.md).
+Fortschritt liegt nach Anmeldung in Convex: gelöste Übungen (mit Fingerprint), Entwürfe, gelesene Lektionen, Notizen pro Lektion, Kartenboxen, Projektschritte und die letzte Lernposition. Die alten Browser-Einträge `learn:<bereich>:v1` bleiben als importierbare Quelle unverändert. [Migration und Zustandsmodell](docs/CONVEX.md).
 
 - **Übungs-ID** = `<modul>/<id>`. Wer eine ID oder den Modulnamen ändert, verliert den Fortschritt dieser Übung.
 - **Fingerprint:** Ändert sich der geprüfte Teil einer Übung (Code, Antworten, Optionen, Tests), zählt ein früherer Erfolg nicht mehr. Tippfehler in Titel oder Erklärung ändern den Fingerprint nicht.

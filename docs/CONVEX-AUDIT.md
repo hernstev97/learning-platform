@@ -22,8 +22,12 @@ Die vorhandenen Projekttexte und Schritt-IDs wurden gegen Git HEAD verglichen: a
 | `reviewCard` | `requireOwner`; Generation, IDs und Bewertung geprüft; Zähler/Box atomar aus Serverstand berechnet; Historie in derselben Transaktion |
 | `importLegacy` | `requireOwner`; begrenzte Chunks, nur fehlende Datensätze, Importbeleg in derselben Transaktion; Reset-Sperre |
 | `resetArea` | `requireOwner`; Generation geprüft; Fortschritt gelöscht und Generation atomar erhöht |
+| `note` | Ergänzt 2026-09-29: `requireOwner`; validierte Bereich-/Modul-ID |
+| `noteIndex` | Ergänzt 2026-09-29: `requireOwner`; nur Bereich- und Modul-IDs, kein Notiztext |
+| `saveNote` | Ergänzt 2026-09-29: `requireOwner`; IDs und maximal 20 000 Zeichen geprüft; idempotenter Upsert, leerer Text löscht |
+| `exportNotes` | Ergänzt 2026-09-29: `requireOwner`; höchstens 16 Notizen pro Seite |
 
-`purgeDrafts` ist eine interne Mutation, kein öffentlicher Endpunkt. Sie darf ausschließlich ältere Entwurfsgenerationen löschen. Es gibt keine öffentlichen Actions, HTTP-Endpunkte, Dateien oder clientgesteuerten Eigentümer-IDs. Ein Test enumeriert die öffentlichen Exporte und verlangt für jeden explizite Autorisierungstests.
+`purgeDrafts` und `purgeReviews` sind interne Mutationen, keine öffentlichen Endpunkte. Sie dürfen ausschließlich Entwürfe bzw. Kartenbewertungen älterer Reset-Generationen löschen. Es gibt keine öffentlichen Actions, HTTP-Endpunkte, Dateien oder clientgesteuerten Eigentümer-IDs. Ein Test enumeriert die öffentlichen Exporte und verlangt für jeden explizite Autorisierungstests. Die vier Notiz-Endpunkte durchlaufen seit 2026-09-29 dieselbe automatisierte Autorisierungsmatrix; die unten beschriebenen Direktaufrufe gegen die Produktion stammen vom 2026-09-28 und umfassen sie noch nicht.
 
 Jeder Endpunkt wurde mit erlaubtem Konto, ohne Identität, anderem Konto, anderem Issuer, inkonsistentem tokenIdentifier, fehlender Allowlist und fehlerhafter Issuer-Konfiguration geprüft. Die Entscheidung verwendet ausschließlich die von Convex validierte Identität (`issuer`, `subject`, `tokenIdentifier`); E-Mail oder Browserwerte gewähren keinen Zugriff. Der echte lokale Convex-Server lehnt auch ein unsigniertes JWT mit behaupteter Owner-ID ab. Die erfolgreichen Integrationstests verwenden lokale Admin-Impersonation für synthetische Testidentitäten; sie ersetzen keine Prüfung des echten Clerk-Logins.
 

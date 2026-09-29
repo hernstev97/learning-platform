@@ -1,4 +1,4 @@
-import { progressOf, summaryOf } from '../app.ts';
+import { hasNote, progressOf, summaryOf } from '../app.ts';
 import { resolveResume, type Resume } from '../engine/persistence.ts';
 import { areaStats } from '../engine/storage.ts';
 import { RESUME_NOTES, areaTabs, moduleBars, resumeStep } from '../ui/area-nav.ts';
@@ -65,7 +65,7 @@ const area: Page<{ name: 'area'; area: string }> = (main, route) => {
               const status = bars.done === bars.total && bars.total ? 'Fertig' : bars.done ? `${bars.done}/${bars.total}` : progress.read[m.id] ? 'Gelesen' : 'Neu';
               return html`<li><a class="module-row ${bars.done === bars.total && bars.total ? 'complete' : ''}" href="/${summary.id}/${m.id}">
                 <span class="module-number">${pad(n)}</span>
-                <span class="module-main"><span class="module-title">${m.title}</span><span class="module-summary">${m.summary}</span></span>
+                <span class="module-main"><span class="module-title">${m.title}</span><span class="module-summary">${m.summary}</span>${hasNote(summary.id, m.id) ? html`<span class="note-mark">Notiz</span>` : ''}</span>
                 <span class="module-meta"><span class="tag">${LEVELS[m.level]}</span><span class="tag">${minutes(m.minutes)}</span>${m.bear ? html`<span class="tag ink">Bear</span>` : ''}</span>
                 <span class="module-progress">${bars.markup}<span class="label">${status}</span></span>
               </a></li>`;

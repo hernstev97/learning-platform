@@ -99,6 +99,14 @@ export function validateDraft(draft: DraftInput): void {
   if (!valid(value, 0)) throw new ConvexError('INVALID_DRAFT');
 }
 
+export const NOTE_LIMIT = 20_000;
+export const noteInput = v.object({ moduleId: v.string(), text: v.string() });
+export type NoteInput = Infer<typeof noteInput>;
+export function validateNote(note: NoteInput): void {
+  assertId(note.moduleId);
+  if (note.text.length > NOTE_LIMIT) throw new ConvexError('NOTE_TOO_LARGE');
+}
+
 /** Same per-entry projection used by Convex optimistic updates and tests. */
 export function applyEntries(state: Snapshot, areaId: string, changes: Entry[], updatedAt: number): Snapshot {
   const entries = new Map(state.entries.map((e) => [`${e.areaId}:${e.key}`, e]));

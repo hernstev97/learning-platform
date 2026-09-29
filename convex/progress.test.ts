@@ -11,6 +11,7 @@ const areaId = 'python';
 const lesson: Entry = { kind: 'lesson', id: 'intro', completedAt: '2026-09-28T10:00:00.000Z' };
 const completion: Entry = { kind: 'completion', id: 'intro/first', value: { fp: 'abc123', at: '2026-09-28T10:00:00.000Z' } };
 const draft = { exerciseId: 'intro/first', fingerprint: 'abc123', json: '"print(1)"' };
+const note = { moduleId: 'intro', text: 'Offene Frage: Warum?' };
 const imported = { areaId, generation: 0, importId: 'a'.repeat(64), mode: 'legacy' as const, entries: [lesson, completion], drafts: [draft] };
 const create = () => convexTest(schema, modules);
 type Client = ReturnType<ReturnType<typeof create>['withIdentity']>;
@@ -26,6 +27,10 @@ const endpoints = [
   ['reviewCard', (t: Client) => t.mutation(api.progress.reviewCard, { areaId, generation: 0, cardId: 'first', grade: 'good', today: '2026-09-28' })],
   ['importLegacy', (t: Client) => t.mutation(api.progress.importLegacy, imported)],
   ['resetArea', (t: Client) => t.mutation(api.progress.resetArea, { areaId, generation: 0 })],
+  ['note', (t: Client) => t.query(api.progress.note, { areaId, moduleId: note.moduleId })],
+  ['noteIndex', (t: Client) => t.query(api.progress.noteIndex, {})],
+  ['exportNotes', (t: Client) => t.query(api.progress.exportNotes, { paginationOpts: { numItems: 10, cursor: null } })],
+  ['saveNote', (t: Client) => t.mutation(api.progress.saveNote, { areaId, note })],
 ] as const;
 
 describe.each(endpoints)('authorization: %s', (_name, call) => {
@@ -145,6 +150,34 @@ describe('personal state', () => {
     expect((await t.query(api.progress.snapshot, {})).entries).toEqual([]);
     expect(await t.run((ctx) => ctx.db.query('imports').collect())).toEqual([]);
     for (const json of ['"' + 'x'.repeat(60_000) + '"', '{"__proto__":{}}', '{bad']) await expect(t.mutation(api.progress.saveDraft, { areaId, generation: 0, draft: { ...draft, json } })).rejects.toThrow();
+  });
+  it('shares lesson notes across sessions, lists them without text and deletes emptied notes', async () => {
+    const t = create(); const desktop = t.withIdentity(identity); const phone = t.withIdentity(identity);
+    for (const text of ['Erste Idee', note.text, note.text]) await desktop.mutation(api.progress.saveNote, { areaId, note: { ...note, text } });
+    expect(await phone.query(api.progress.note, { areaId, moduleId: note.moduleId })).toBe(note.text);
+    expect(await phone.query(api.progress.noteIndex, {})).toEqual([{ areaId, moduleId: note.moduleId }]);
+    expect((await phone.query(api.progress.exportNotes, { paginationOpts: { cursor: null, numItems: 16 } })).page).toEqual([{ areaId, ...note }]);
+    expect(await t.run((ctx) => ctx.db.query('notes').collect())).toHaveLength(1);
+    await phone.mutation(api.progress.saveNote, { areaId, note: { ...note, text: '  \n' } });
+    expect(await desktop.query(api.progress.note, { areaId, moduleId: note.moduleId })).toBeNull();
+    expect(await desktop.query(api.progress.noteIndex, {})).toEqual([]);
+  });
+  it('keeps notes when progress is reset and imports only missing notes', async () => {
+    const t = create().withIdentity(identity);
+    await t.mutation(api.progress.saveNote, { areaId, note });
+    await t.mutation(api.progress.resetArea, { areaId, generation: 0 });
+    expect(await t.query(api.progress.note, { areaId, moduleId: note.moduleId })).toBe(note.text);
+    await t.mutation(api.progress.importLegacy, { ...imported, mode: 'backup', generation: 1, notes: [{ ...note, text: 'aus der Sicherung' }, { moduleId: 'second', text: 'neu' }, { moduleId: 'empty', text: ' ' }] });
+    expect(await t.query(api.progress.note, { areaId, moduleId: note.moduleId })).toBe(note.text);
+    expect(await t.query(api.progress.note, { areaId, moduleId: 'second' })).toBe('neu');
+    expect(await t.query(api.progress.noteIndex, {})).toHaveLength(2);
+  });
+  it('rejects oversized notes and invalid lesson IDs', async () => {
+    const t = create().withIdentity(identity);
+    await expect(t.mutation(api.progress.saveNote, { areaId, note: { ...note, text: 'x'.repeat(20_001) } })).rejects.toThrow('NOTE_TOO_LARGE');
+    await expect(t.mutation(api.progress.saveNote, { areaId, note: { ...note, moduleId: '__proto__' } })).rejects.toThrow('INVALID_ID');
+    await expect(t.mutation(api.progress.importLegacy, { ...imported, notes: Array.from({ length: 5 }, (_, i) => ({ moduleId: `m${i}`, text: 'x' })) })).rejects.toThrow('BATCH_TOO_LARGE');
+    expect(await t.query(api.progress.noteIndex, {})).toEqual([]);
   });
   it('rejects spoofed owner arguments and malformed positions', async () => {
     const t = create().withIdentity(identity);

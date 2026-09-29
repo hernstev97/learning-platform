@@ -1,4 +1,5 @@
-import { loadArea, onProgressChange, progressOf, setEntry, summaryOf } from '../app.ts';
+import { flushNote, isOffline, loadArea, onProgressChange, progressOf, saveNote, setEntry, summaryOf, watchNote } from '../app.ts';
+import { NOTE_LIMIT } from '../../convex/model.ts';
 import { isDone } from '../engine/storage.ts';
 import { moduleNumber } from '../ui/area-nav.ts';
 import { enhanceCode } from '../ui/code.ts';
@@ -34,16 +35,21 @@ const lesson: Page<{ name: 'lesson'; area: string; module: string }> = async (ma
       <aside class="lesson-aside no-print">
         <nav class="toc" aria-label="Inhalt der Lektion">
           <p class="label">Inhalt</p>
-          <ol>${module.toc.map((entry) => html`<li><a href="#${entry.id}">${entry.title}</a></li>`)}<li><a href="#uebungen">Übungen</a></li></ol>
+          <ol>${module.toc.map((entry) => html`<li><a href="#${entry.id}">${entry.title}</a></li>`)}<li><a href="#notizen">Meine Notizen</a></li><li><a href="#uebungen">Übungen</a></li></ol>
         </nav>
       </aside>
       <article class="lesson">
         <details class="toc-mobile no-print"><summary class="label">Inhalt der Lektion</summary>
-          <ol>${module.toc.map((entry) => html`<li><a href="#${entry.id}">${entry.title}</a></li>`)}<li><a href="#uebungen">Übungen</a></li></ol>
+          <ol>${module.toc.map((entry) => html`<li><a href="#${entry.id}">${entry.title}</a></li>`)}<li><a href="#notizen">Meine Notizen</a></li><li><a href="#uebungen">Übungen</a></li></ol>
         </details>
         ${module.goals.length ? html`<section class="goals"><h2 class="label">Nach diesem Modul</h2><ul>${module.goals.map((goal) => html`<li>${raw(goal)}</li>`)}</ul></section>` : ''}
         <div class="prose">${raw(module.lesson)}</div>
         ${module.resources.length ? html`<section class="resources-block"><h2 class="label">Offizielle Dokumentation</h2><ul>${module.resources.map((r) => html`<li><a class="external-link" href="${r.url}" target="_blank" rel="noopener noreferrer">${r.title}</a></li>`)}</ul></section>` : ''}
+        <section id="notizen" class="lesson-notes no-print" aria-labelledby="notes-title">
+          <h2 id="notes-title" class="label">Meine Notizen</h2>
+          <textarea id="note" rows="5" maxlength="${NOTE_LIMIT}" disabled placeholder="Notiz wird geladen …" aria-describedby="note-help"></textarea>
+          <p id="note-help" class="muted small">Eigene Erkenntnisse, Beispiele und offene Fragen zu dieser Lektion. Wird automatisch gespeichert und auf deinen Geräten synchronisiert.</p>
+        </section>
         <section id="uebungen" class="exercise-overview">
           <div class="exercise-overview-head">
             <h2 class="section-title">Übungen</h2>
@@ -75,11 +81,12 @@ const lesson: Page<{ name: 'lesson'; area: string; module: string }> = async (ma
       links.get(entry.target.id)?.setAttribute('aria-current', 'true');
     }
   }, { rootMargin: '-20% 0px -70% 0px' });
-  main.querySelectorAll('.prose h2[id], #uebungen').forEach((h) => observer.observe(h));
+  main.querySelectorAll('.prose h2[id], #notizen, #uebungen').forEach((h) => observer.observe(h));
   // Close the mobile contents before the jump so the target position is measured without it.
   const mobileToc = $<HTMLDetailsElement>('.toc-mobile', main);
   mobileToc.addEventListener('click', (event) => { if ((event.target as Element).closest('a')) mobileToc.open = false; });
   const cleanCode = enhanceCode(main);
+  const cleanNote = bindNote(main, summary.id, module.id);
   const unsubscribe = onProgressChange(() => {
     $<HTMLInputElement>('#read', main).checked = !!progress.read[module.id];
     main.querySelectorAll('.exercise-list a').forEach((link, index) => {
@@ -92,6 +99,38 @@ const lesson: Page<{ name: 'lesson'; area: string; module: string }> = async (ma
     const next = Math.max(0, module.exercises.findIndex((e) => !isDone(progress, e)));
     main.querySelectorAll<HTMLAnchorElement>('.module-actions a, .exercise-overview > a').forEach((a) => { a.href = `/${summary.id}/${module.id}/${next + 1}`; });
   });
-  return () => { observer.disconnect(); cleanCode(); unsubscribe(); };
+  return () => { observer.disconnect(); cleanCode(); cleanNote(); unsubscribe(); };
 };
+
+/** The editor keeps what is typed; a note changed elsewhere replaces it only while there are no own edits. */
+function bindNote(main: HTMLElement, areaId: string, moduleId: string): () => void {
+  const note = $<HTMLTextAreaElement>('#note', main);
+  if (isOffline()) { note.placeholder = 'Notizen sind im Offline-Modus nicht verfügbar.'; return () => {}; }
+  let known: string | null = null;
+  let offered: string | null = null;
+  const offer = (text: string | null) => {
+    offered = text;
+    main.querySelector('#refresh-note')?.remove();
+    if (text === null) return;
+    const button = document.createElement('button');
+    button.id = 'refresh-note'; button.type = 'button'; button.className = 'btn small';
+    button.textContent = 'Auf einem anderen Gerät geändert · Laden';
+    button.addEventListener('click', () => { if (offered !== null) { note.value = known = offered; offer(null); note.focus(); } });
+    note.after(button);
+  };
+  const stop = watchNote(areaId, moduleId, (text) => {
+    if (known === null) {
+      note.value = known = text;
+      note.disabled = false;
+      note.placeholder = 'Was nimmst du aus dieser Lektion mit?';
+    } else if (text === note.value) { known = text; offer(null); }
+    else if (note.value === known) { note.value = known = text; offer(null); }
+    else offer(text);
+  });
+  note.addEventListener('input', () => { offer(null); saveNote(areaId, moduleId, note.value); });
+  note.addEventListener('blur', flushNote);
+  const hidden = () => { if (document.visibilityState === 'hidden') flushNote(); };
+  document.addEventListener('visibilitychange', hidden);
+  return () => { flushNote(); stop(); document.removeEventListener('visibilitychange', hidden); };
+}
 export default lesson;

@@ -20,6 +20,8 @@ const synced = async (page: import('@playwright/test').Page) => expect(page.loca
 test.beforeEach(async ({ context }) => {
   const state = await http.query(api.progress.snapshot, {});
   for (const areaId of ['kotlin', 'python', 'beispiel']) await http.mutation(api.progress.resetArea, { areaId, generation: state.resets.find((r) => r.areaId === areaId)?.generation ?? 0 });
+  // Notes deliberately survive a reset.
+  for (const { areaId, moduleId } of await http.query(api.progress.noteIndex, {})) await http.mutation(api.progress.saveNote, { areaId, note: { moduleId, text: '' } });
   await fixture(context);
 });
 
@@ -75,7 +77,7 @@ test('temporary disconnect queues writes and reconnects using the Convex client'
 
 test('backup import preserves existing values, remains repeatable, exports drafts and survives reload', async ({ page }) => {
   const p = freshProgress(); const first = loadContent(['kotlin']).areas.kotlin.modules['bear-01'].exercises[0];
-  p.done[first.id] = { at: '2026-09-28', fp: first.fingerprint }; p.drafts[first.id] = { g1: 'val' };
+  p.done[first.id] = { at: '2026-09-28', fp: first.fingerprint }; p.drafts[first.id] = { g1: 'val' }; p.notes = { 'bear-01': 'Aus der Sicherung' };
   const backup = { app: 'learn.kiumu.app', exported: '2026-09-28', areas: { kotlin: p } };
   await page.goto('/daten');
   for (let i = 0; i < 2; i++) {
@@ -88,6 +90,7 @@ test('backup import preserves existing values, remains repeatable, exports draft
   const exported = JSON.parse(Buffer.concat(chunks).toString());
   expect(exported.areas.kotlin.drafts[first.id]).toEqual({ g1: 'val' });
   expect(exported.areas.kotlin.draftFingerprints[first.id]).toBe(first.fingerprint);
+  expect(exported.areas.kotlin.notes).toEqual({ 'bear-01': 'Aus der Sicherung' });
   await page.goto(`${base}/1`); await expect(page.locator('#feedback')).toContainText('Richtig.');
 });
 
@@ -172,4 +175,44 @@ test('a draft typed offline does not silently replace a different draft saved on
   await expect(page.locator('#answer-g1')).toHaveValue('"Bo');
   await other.reload(); await expect(other.locator('#answer-g1')).toHaveValue('"Bo');
   await phone.close();
+});
+
+test('lesson notes autosave while typing, reach another device and survive a reset', async ({ page, browser }) => {
+  const phone = await browser.newContext({ viewport: { width: 390, height: 844 } }); await fixture(phone); const other = await phone.newPage();
+  await page.goto(base); await other.goto(base);
+  await expect(page.locator('#note')).toBeEditable(); await expect(other.locator('#note')).toBeEditable();
+  // Pauses longer than the autosave delay: confirmations of earlier text arrive while newer text is typed.
+  await page.locator('#note').pressSequentially('Merke', { delay: 900 }); await synced(page);
+  await expect(page.locator('#note')).toHaveValue('Merke');
+  await expect(other.locator('#note')).toHaveValue('Merke');
+  await page.reload(); await expect(page.locator('#note')).toHaveValue('Merke');
+  await other.goto('/kotlin'); await expect(other.locator('.module-row[href="/kotlin/bear-01"] .note-mark')).toHaveText('Notiz');
+  await other.goto(base); await expect(other.locator('#note')).toBeEditable();
+  await phone.setOffline(true);
+  await other.locator('#note').fill('Frage vom Handy');
+  await expect(other.locator('#storage-status')).toContainText('1 Änderung');
+  await expect(page.locator('#note')).toHaveValue('Merke');
+  await phone.setOffline(false); await synced(other);
+  await expect(page.locator('#note')).toHaveValue('Frage vom Handy');
+  await page.goto('/daten'); page.once('dialog', (dialog) => dialog.accept());
+  await page.locator('[data-reset="kotlin"]').click(); await expect(page.locator('#data-message')).toContainText('zurückgesetzt');
+  await page.goto(base); await expect(page.locator('#note')).toHaveValue('Frage vom Handy');
+  await page.locator('#note').fill(''); await synced(page);
+  await other.goto('/kotlin'); await expect(other.locator('.note-mark')).toHaveCount(0);
+  await phone.close();
+});
+
+test('confirmations of earlier note text never look like a change from another device', async ({ page }) => {
+  // A slow connection: server messages arrive only after the next letters were typed.
+  await page.routeWebSocket(/\/sync$/, (ws) => {
+    const server = ws.connectToServer();
+    ws.onMessage((message) => server.send(message));
+    server.onMessage((message) => { setTimeout(() => ws.send(message), 1200); });
+  });
+  await page.goto(base); await expect(page.locator('#note')).toBeEditable({ timeout: 15_000 });
+  await page.evaluate(() => new MutationObserver(() => { if (document.querySelector('#refresh-note')) document.body.dataset.offered = 'true'; }).observe(document.body, { childList: true, subtree: true }));
+  await page.locator('#note').pressSequentially('Merke', { delay: 900 });
+  await synced(page);
+  await expect(page.locator('#note')).toHaveValue('Merke');
+  expect(await page.evaluate(() => document.body.dataset.offered)).toBeUndefined();
 });

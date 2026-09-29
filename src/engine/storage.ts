@@ -1,6 +1,6 @@
 // Existing progress view, legacy localStorage reader and portable JSON backups.
 import type { AreaSummary } from '../content/types.ts';
-import { GRADES, parsePosition, type Grade, type Position } from '../../convex/model.ts';
+import { GRADES, NOTE_LIMIT, parsePosition, type Grade, type Position } from '../../convex/model.ts';
 
 export const VERSION = 1;
 export const keyFor = (area: string) => `learn:${area}:v${VERSION}`;
@@ -23,6 +23,8 @@ export type AreaProgress = {
   projects: Record<string, Record<string, boolean>>;
   last: string | null;
   position?: Position;
+  /** Personal lesson notes by module id. Convex keeps them apart from progress; here only in backups and local tests. */
+  notes?: Record<string, string>;
 };
 
 type StoragePort = Pick<Storage, 'getItem' | 'setItem'>;
@@ -60,6 +62,10 @@ export function sanitize(data: unknown): AreaProgress {
   if (typeof data.last === 'string' && /^\/[a-z0-9-]+(?:\/[a-z0-9-]+){0,2}$/.test(data.last)) progress.last = data.last;
   const position = parsePosition(data.position);
   if (position) progress.position = position;
+  if (record(data.notes)) {
+    const notes = Object.entries(data.notes).filter(([id, text]) => safeKey(id) && typeof text === 'string' && text.trim() && text.length <= NOTE_LIMIT);
+    if (notes.length) progress.notes = Object.fromEntries(notes) as Record<string, string>;
+  }
   return progress;
 }
 
@@ -121,6 +127,7 @@ export function mergeProgress(local: AreaProgress, incoming: AreaProgress): Area
   for (const [id, steps] of Object.entries(incoming.projects)) merged.projects[id] = { ...steps, ...merged.projects[id] };
   merged.last ??= incoming.last;
   merged.position ??= incoming.position;
+  if (incoming.notes) merged.notes = { ...incoming.notes, ...merged.notes };
   return merged;
 }
 export function parseBackup(text: string): Record<string, AreaProgress> {

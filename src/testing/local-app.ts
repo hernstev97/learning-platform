@@ -113,3 +113,11 @@ export function visit(area: string, value: Position) {
 export function reviewCard(area: string, card: string, grade: Grade) { progressOf(area).cards[card] = schedule(progressOf(area).cards[card], grade); save(area); }
 export async function resetProgress(area: string) { replaceProgress(area, freshProgress()); }
 export async function importProgress(values: Record<string, AreaProgress>) { for (const [id, value] of Object.entries(values)) replaceProgress(id, mergeProgress(progressOf(id), value)); }
+export const hasNote = (area: string, moduleId: string) => !!progressOf(area).notes?.[moduleId];
+export function watchNote(area: string, moduleId: string, show: (text: string) => void) { show(progressOf(area).notes?.[moduleId] ?? ''); return () => {}; }
+export function saveNote(area: string, moduleId: string, text: string) {
+  const p = progressOf(area);
+  if (text.trim()) (p.notes ??= {})[moduleId] = text; else delete p.notes?.[moduleId];
+  save(area);
+}
+export const flushNote = () => {};
