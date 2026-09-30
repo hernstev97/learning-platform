@@ -1,0 +1,1010 @@
+id: sql-fensterfunktionen
+title: Fensterfunktionen und Analysemuster
+level: 3
+minutes: 190
+summary: Mit `OVER` rechnest du Rangfolgen, laufende Summen, Periodenvergleiche und Anteile, ohne Zeilen zu verlieren – und löst damit die typischen Aufgaben aus Monatsbericht, Support-Kennzahlen und SQL-Interview.
+goals:
+  - Du erklärst, worin sich eine Fensterfunktion von `GROUP BY` unterscheidet und warum ihr Ergebnis erst eine Abfrageebene weiter außen gefiltert werden kann.
+  - Du wählst zwischen `ROW_NUMBER`, `RANK` und `DENSE_RANK` passend zur fachlichen Regel bei Gleichständen und löst Top-N pro Gruppe.
+  - Du baust laufende Summen und gleitende Durchschnitte mit bewusst gewähltem Fensterrahmen und erkennst die Falle des Standardrahmens `RANGE`.
+  - Du vergleichst Perioden mit `LAG` und `LEAD` auf einem lückenlosen Kalender aus einer rekursiven CTE.
+  - Du löst Analysemuster wie Deduplizieren, Kohorten mit Wiederkaufrate sowie Durchlaufzeit und Backlog aus Ticketdaten.
+resources:
+  - title: SQLite · Window Functions
+    url: https://www.sqlite.org/windowfunctions.html
+  - title: SQLite · WITH-Klausel und rekursive CTEs
+    url: https://www.sqlite.org/lang_with.html
+  - title: SQLite · Datums- und Zeitfunktionen
+    url: https://www.sqlite.org/lang_datefunc.html
+  - title: PostgreSQL · Tutorial Window Functions
+    url: https://www.postgresql.org/docs/current/tutorial-window.html
+  - title: PostgreSQL · Window Functions (Referenz)
+    url: https://www.postgresql.org/docs/current/functions-window.html
+lesson: |
+  Der Monatsbericht von Bohnenwerk hat bisher einen festen Ablauf: Umsätze aus dem Shop-System exportieren, in Excel nach Kategorie sortieren, die drei stärksten Produkte je Kategorie markieren, eine Hilfsspalte für den kumulierten Umsatz herunterziehen, den Vormonat per `SVERWEIS` (englisch `VLOOKUP`) danebenholen. Drei Stunden Arbeit – und jede nachträglich gebuchte Stornierung verschiebt Ränge und Summen. Alle diese Schritte haben dieselbe Struktur: Jede Zeile bleibt erhalten und bekommt einen Wert dazu, der sich aus *anderen* Zeilen ergibt – dem Rang in der Kategorie, der Summe bis hierher, dem Wert des Vormonats.
+
+  Dafür gibt es **Fensterfunktionen** (Window Functions). Sie ergänzen `GROUP BY` ([SQL-Abfragen für Analysen](/data/sql-abfragen)) sowie Joins und CTEs ([Joins und Datenmodelle](/data/sql-joins)): Sie rechnen über verwandte Zeilen, ohne sie zusammenzufassen. Am Ende dieses Moduls ist der Monatsbericht eine gespeicherte Abfrage, und du kennst die Muster, die in fast jedem SQL-Interview für Analyst-Stellen vorkommen.
+
+  ## Das Denkmodell: GROUP BY verdichtet, OVER rechnet daneben
+
+  Eine Fensterfunktion ist eine Funktion mit `OVER`-Klausel. `OVER` beschreibt das **Fenster**: welche Zeilen zur aktuellen Zeile gehören (`PARTITION BY`), in welcher Reihenfolge sie betrachtet werden (`ORDER BY`) und bei Aggregaten, welcher Ausschnitt davon zählt (der Rahmen, siehe unten). Die Zahl der Ergebniszeilen ändert sich nicht ([SQLite · Window Functions](https://www.sqlite.org/windowfunctions.html#introduction_to_window_functions)). Die Beispieltabellen tragen den Nettobetrag einer Bestellung der Kürze halber direkt als Spalte `netto`.
+
+  ```sql run
+  CREATE TABLE bestellungen (bestellung_id INTEGER PRIMARY KEY, kanal TEXT, status TEXT, netto REAL);
+  INSERT INTO bestellungen VALUES
+    (1, 'Shop', 'bezahlt', 40.0), (2, 'B2B', 'bezahlt', 310.0), (3, 'Shop', 'bezahlt', 25.0),
+    (4, 'B2B', 'bezahlt', 180.0), (5, 'Shop', 'bezahlt', 45.0), (6, 'Shop', 'storniert', 60.0);
+
+  -- 1. GROUP BY verdichtet: eine Zeile je Kanal
+  SELECT kanal, SUM(netto) AS umsatz
+  FROM bestellungen
+  WHERE status = 'bezahlt'
+  GROUP BY kanal;
+
+  -- 2. OVER rechnet daneben: jede Bestellung bleibt, Kanalsumme und Anteil kommen dazu
+  SELECT bestellung_id, kanal, netto,
+         SUM(netto) OVER (PARTITION BY kanal) AS umsatz_kanal,
+         ROUND(100.0 * netto / SUM(netto) OVER (), 1) AS anteil_prozent
+  FROM bestellungen
+  WHERE status = 'bezahlt'
+  ORDER BY bestellung_id;
+
+  -- 3. Fenster über Gruppen: Anteil je Kanal
+  SELECT kanal,
+         ROUND(100.0 * SUM(netto) / SUM(SUM(netto)) OVER (), 1) AS anteil_prozent
+  FROM bestellungen
+  WHERE status = 'bezahlt'
+  GROUP BY kanal;
+
+  -- 4. Auf ein Fensterergebnis filtern: innen berechnen, außen filtern
+  WITH mit_schnitt AS (
+    SELECT bestellung_id, kanal, netto,
+           AVG(netto) OVER (PARTITION BY kanal) AS schnitt_kanal
+    FROM bestellungen
+    WHERE status = 'bezahlt'
+  )
+  SELECT bestellung_id, kanal, netto
+  FROM mit_schnitt
+  WHERE netto > schnitt_kanal;
+  ```
+
+  Abfrage 1 liefert zwei Zeilen, Abfrage 2 fünf. `SUM(netto) OVER (PARTITION BY kanal)` summiert je Kanal wie `GROUP BY kanal`, schreibt das Ergebnis aber an jede Bestellung. `SUM(netto) OVER ()` hat kein `PARTITION BY`, das Fenster ist das ganze Ergebnis – die Grundlage für jeden Anteil am Gesamt. Die `100.0` sorgt dafür, dass auch mit ganzzahligen Spalten als Kommazahl gerechnet wird (`7/2` ist in SQLite `3`).
+
+  Logisch berechnet die Datenbank Fenster **nach** `FROM`, `WHERE`, `GROUP BY` und `HAVING`, aber vor `DISTINCT`, `ORDER BY` und `LIMIT` – im Schritt `SELECT` der [Auswertungsreihenfolge](/data/sql-abfragen), zusammen mit den übrigen Ausdrücken. Das [PostgreSQL-Tutorial](https://www.postgresql.org/docs/current/tutorial-window.html) beschreibt dieselbe Regel, SQLite folgt ihr. Daraus ergibt sich:
+
+  - Fensterfunktionen stehen nur in der `SELECT`-Liste und im `ORDER BY`. Im `WHERE` gibt es ihr Ergebnis noch nicht, SQLite meldet `misuse of window function`. Wer auf einen Rang oder Durchschnitt filtern will, berechnet ihn in einer CTE und filtert außen (Abfrage 4).
+  - Das Fenster sieht nur Zeilen, die `WHERE` durchlässt; das Storno fehlt auch im Gesamtumsatz.
+  - Nach `GROUP BY` rechnet das Fenster über die Gruppenzeilen. In `SUM(SUM(netto)) OVER ()` ist das innere `SUM` das Gruppen-Aggregat, das äußere läuft über alle Gruppen (Abfrage 3).
+
+  > [!MERKE]
+  > `GROUP BY` macht aus vielen Zeilen eine. Eine Fensterfunktion lässt jede Zeile stehen und schreibt einen Wert dazu, der aus ihrem Fenster berechnet wird. Filtern auf dieses Ergebnis geht erst eine Abfrageebene weiter außen.
+
+  ## Rangfolgen und Top-N pro Gruppe
+
+  Drei Funktionen nummerieren Zeilen in der Reihenfolge des `ORDER BY` im Fenster. Sie unterscheiden sich nur bei Gleichständen ([Built-in Window Functions](https://www.sqlite.org/windowfunctions.html#built_in_window_functions)):
+
+  - `ROW_NUMBER()` zählt 1, 2, 3, 4 – auch bei gleichen Werten. Welche von zwei gleichen Zeilen zuerst kommt, ist ohne weiteres Sortierkriterium zufällig.
+  - `RANK()` gibt gleichen Werten denselben Rang und überspringt danach: 1, 2, 2, 4 – wie bei einer Siegerehrung.
+  - `DENSE_RANK()` gibt gleichen Werten denselben Rang, ohne Lücke: 1, 2, 2, 3.
+
+  ```sql run
+  CREATE TABLE produktumsatz (produkt TEXT, kategorie TEXT, umsatz REAL);
+  INSERT INTO produktumsatz VALUES
+    ('Espresso Napoli', 'Espresso', 1840.0), ('Espresso Milano', 'Espresso', 1320.0),
+    ('Crema Classica', 'Espresso', 1320.0), ('Espresso Decaf', 'Espresso', 610.0),
+    ('Filter Sidamo', 'Filter', 1150.0), ('Filter Hochland', 'Filter', 990.0),
+    ('Mühle Pro', 'Zubehör', 880.0), ('Handfilter Keramik', 'Zubehör', 420.0);
+
+  -- Drei Rangfunktionen, ein Gleichstand (Milano und Crema)
+  SELECT produkt, umsatz,
+         ROW_NUMBER() OVER (ORDER BY umsatz DESC, produkt) AS nr,
+         RANK()       OVER (ORDER BY umsatz DESC) AS rang,
+         DENSE_RANK() OVER (ORDER BY umsatz DESC) AS dichter_rang
+  FROM produktumsatz
+  WHERE kategorie = 'Espresso'
+  ORDER BY umsatz DESC, produkt;
+
+  -- Top 2 je Kategorie: in der CTE nummerieren, außen filtern
+  WITH rangliste AS (
+    SELECT kategorie, produkt, umsatz,
+           RANK() OVER (PARTITION BY kategorie ORDER BY umsatz DESC) AS rang
+    FROM produktumsatz
+  )
+  SELECT kategorie, rang, produkt, umsatz
+  FROM rangliste
+  WHERE rang <= 2
+  ORDER BY kategorie, rang, produkt;
+  ```
+
+  Das Muster heißt **Top-N pro Gruppe**: `PARTITION BY` startet die Nummerierung je Kategorie neu, die CTE macht den Rang zu einer gewöhnlichen Spalte, erst die äußere Abfrage filtert. Espresso liefert drei Zeilen, weil sich Crema Classica und Espresso Milano Platz 2 teilen. Ob das richtig ist, entscheidet die Fachseite:
+
+  - „Genau drei Produkte“ → `ROW_NUMBER()` mit eindeutigem Zusatzkriterium (`ORDER BY umsatz DESC, produkt_id`).
+  - „Alle Produkte auf den Plätzen 1 bis 3“ → `RANK()`, eventuell mehr als drei Zeilen.
+  - „Alle Produkte mit einem der drei höchsten Umsatzwerte“ → `DENSE_RANK()`.
+
+  SQLite und PostgreSQL kennen kein `QUALIFY`, mit dem manche Data-Warehouse-Dialekte direkt auf Fensterergebnisse filtern. Die CTE ist der portable Weg.
+
+  > [!INTERVIEW] „Gib die drei umsatzstärksten Produkte je Kategorie aus.“
+  > Ich nummeriere in einer CTE mit `ROW_NUMBER() OVER (PARTITION BY kategorie ORDER BY umsatz DESC, produkt_id)` und filtere außen auf `nr <= 3`, weil Fensterfunktionen im `WHERE` nicht erlaubt sind. Dann frage ich nach Gleichständen: Sollen gleichplatzierte Produkte alle erscheinen, nehme ich `RANK()`, sollen es die drei höchsten Werte sein, `DENSE_RANK()`. Ohne eindeutigen Tie-Breaker ist `ROW_NUMBER()` nicht deterministisch.
+
+  ## Laufende Summen und gleitende Durchschnitte: der Fensterrahmen
+
+  Bekommt ein Aggregat wie `SUM` oder `AVG` ein `ORDER BY` im Fenster, rechnet es nicht mehr über die ganze Partition, sondern über einen **Rahmen** (Frame) relativ zur aktuellen Zeile. Ohne Angabe gilt `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` ([Frame Specifications](https://www.sqlite.org/windowfunctions.html#frame_specifications)): vom Anfang der Partition bis zur aktuellen Zeile **einschließlich aller Zeilen mit demselben Sortierwert**, der sogenannten Peers. Das ergibt eine laufende Summe, mit einer Falle:
+
+  ```sql run
+  CREATE TABLE bestellungen (bestellung_id INTEGER PRIMARY KEY, bestelldatum TEXT, netto REAL);
+  INSERT INTO bestellungen VALUES
+    (1, '2026-03-02', 40.0), (2, '2026-03-02', 310.0),
+    (3, '2026-03-05', 25.0), (4, '2026-03-09', 180.0);
+
+  SELECT bestellung_id, bestelldatum, netto,
+         SUM(netto) OVER (ORDER BY bestelldatum) AS standard_range,
+         SUM(netto) OVER (ORDER BY bestelldatum, bestellung_id
+                          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS mit_rows
+  FROM bestellungen
+  ORDER BY bestelldatum, bestellung_id;
+  ```
+
+  Die Bestellungen 1 und 2 haben dasselbe Datum. Für `RANGE` sind sie Peers und landen gemeinsam im Rahmen, deshalb zeigt `standard_range` zweimal 350. `ROWS` zählt einzelne Zeilen: bis einschließlich der aktuellen, keine weitere. Damit die Reihenfolge innerhalb eines Tages feststeht, braucht `ROWS` ein eindeutiges Sortierkriterium wie `bestellung_id`. Der Standardrahmen erklärt auch, warum `LAST_VALUE(x) OVER (ORDER BY …)` meist den Wert der aktuellen Zeile liefert: Der Rahmen endet dort.
+
+  > [!WARNING] Ein ORDER BY im Fenster ändert das Ergebnis
+  > `SUM(netto) OVER (PARTITION BY kanal)` ist die Kanalsumme, `SUM(netto) OVER (PARTITION BY kanal ORDER BY bestelldatum)` die laufende Summe mit `RANGE`-Rahmen. Wer den Rahmen nicht ausschreibt, bekommt bei gleichen Sortierwerten stille Sprünge statt eines Fehlers.
+
+  Ein **gleitender Durchschnitt** über drei Monate braucht einen mitwandernden Rahmen: `ROWS BETWEEN 2 PRECEDING AND CURRENT ROW`, die aktuelle und die zwei vorherigen Zeilen ([Frame Boundaries](https://www.sqlite.org/windowfunctions.html#frame_boundaries)). In den ersten beiden Monaten ist der Rahmen kürzer, und `AVG` rechnet still über ein oder zwei Werte. Im Bericht blendet man solche Werte meist aus:
+
+  ```sql run
+  CREATE TABLE monatsumsatz (monat TEXT PRIMARY KEY, umsatz REAL);
+  INSERT INTO monatsumsatz VALUES
+    ('2026-01', 8200), ('2026-02', 7600), ('2026-03', 9100),
+    ('2026-04', 8800), ('2026-05', 10300), ('2026-06', 9900);
+
+  SELECT monat, umsatz,
+         SUM(umsatz) OVER (ORDER BY monat ROWS UNBOUNDED PRECEDING) AS kumuliert,
+         CASE WHEN COUNT(*) OVER letzte_3 = 3
+              THEN ROUND(AVG(umsatz) OVER letzte_3, 1) END AS schnitt_3m
+  FROM monatsumsatz
+  WINDOW letzte_3 AS (ORDER BY monat ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
+  ORDER BY monat;
+  ```
+
+  `WINDOW letzte_3 AS (…)` benennt das Fenster, damit `COUNT` und `AVG` denselben Rahmen nutzen. `ROWS UNBOUNDED PRECEDING` ist die Kurzform für `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`. Wichtig: `ROWS` zählt Zeilen, keine Monate. Fehlt ein Monat in der Tabelle, umfassen „die letzten drei Zeilen“ plötzlich vier Monate.
+
+  > [!DEEP] RANGE mit Abstand
+  > Ist das Sortierkriterium eine Zahl, rahmt `RANGE` nach Werten statt nach Zeilen. `SUM(netto) OVER (ORDER BY julianday(bestelldatum) RANGE BETWEEN 6 PRECEDING AND CURRENT ROW)` summiert die Bestellungen der letzten sieben Kalendertage, auch wenn an einzelnen Tagen nichts verkauft wurde. SQLite kann das seit Version 3.28 und verlangt dafür genau einen Ausdruck im `ORDER BY` ([Frame Type](https://www.sqlite.org/windowfunctions.html#frame_type)).
+
+  ## Vormonatsvergleich mit LAG auf lückenlosem Kalender
+
+  `LAG(ausdruck, n, standard)` liest den Wert `n` Zeilen vor der aktuellen Zeile, `LEAD` den Wert `n` Zeilen danach, jeweils in der Reihenfolge des Fensters. Ohne `n` ist es eine Zeile, ohne Standardwert gibt es `NULL`, wenn keine solche Zeile existiert. Ein Vormonatsvergleich wird damit zu einer Zeile SQL – vorausgesetzt, die Zeile davor ist auch der Monat davor.
+
+  ```sql run
+  CREATE TABLE bestellungen (bestellung_id INTEGER PRIMARY KEY, bestelldatum TEXT, status TEXT, netto REAL);
+  INSERT INTO bestellungen VALUES
+    (1, '2026-01-14', 'bezahlt', 820.0), (2, '2026-02-03', 'bezahlt', 640.0),
+    (3, '2026-02-20', 'bezahlt', 310.0), (4, '2026-03-11', 'storniert', 95.0),
+    (5, '2026-04-08', 'bezahlt', 1020.0);
+
+  -- Naiv: Der März fehlt, April wird mit Februar verglichen
+  WITH je_monat AS (
+    SELECT strftime('%Y-%m', bestelldatum) AS monat, SUM(netto) AS umsatz
+    FROM bestellungen
+    WHERE status = 'bezahlt'
+    GROUP BY monat
+  )
+  SELECT monat, umsatz, LAG(umsatz) OVER (ORDER BY monat) AS vormonat
+  FROM je_monat;
+
+  -- Lückenlos: Kalender erzeugen, Umsätze anhängen, dann vergleichen
+  WITH RECURSIVE kalender(monat) AS (
+    SELECT '2026-01-01'
+    UNION ALL
+    SELECT date(monat, '+1 month') FROM kalender WHERE monat < '2026-04-01'
+  ),
+  je_monat AS (
+    SELECT date(bestelldatum, 'start of month') AS monat, SUM(netto) AS umsatz
+    FROM bestellungen
+    WHERE status = 'bezahlt'
+    GROUP BY 1
+  ),
+  reihe AS (
+    SELECT strftime('%Y-%m', k.monat) AS monat, COALESCE(j.umsatz, 0.0) AS umsatz,
+           LAG(COALESCE(j.umsatz, 0.0)) OVER (ORDER BY k.monat) AS vormonat
+    FROM kalender AS k
+    LEFT JOIN je_monat AS j ON j.monat = k.monat
+  )
+  SELECT monat, umsatz, vormonat,
+         ROUND(100.0 * (umsatz - vormonat) / NULLIF(vormonat, 0), 1) AS veraenderung_prozent
+  FROM reihe
+  ORDER BY monat;
+  ```
+
+  Im März gab es nur ein Storno. Nach `WHERE` und `GROUP BY` existiert der März nicht mehr, und `LAG` vergleicht April mit Februar. Abhilfe schafft ein Kalender, der jeden Monat enthält. SQLite hat keine Funktion wie PostgreSQLs [`generate_series`](https://www.postgresql.org/docs/current/functions-srf.html#FUNCTIONS-SRF-SERIES), aber eine [rekursive CTE](https://www.sqlite.org/lang_with.html#recursive_common_table_expressions) erzeugt dieselbe Reihe: Der Teil vor `UNION ALL` liefert die Startzeile, der Teil danach baut aus der letzten Zeile die nächste, bis die `WHERE`-Bedingung nicht mehr zutrifft. Ein `LEFT JOIN` hängt die Umsätze an, `COALESCE` macht aus fehlenden Monaten eine 0.
+
+  Drei Details: Der Kalender beginnt am Monatsersten, denn `date('2026-01-31', '+1 month')` ergibt `2026-03-03` ([Modifikatoren](https://www.sqlite.org/lang_datefunc.html#dtmods)). `date(bestelldatum, 'start of month')` schneidet auf den Monatsanfang ab; in PostgreSQL hieße das [`date_trunc('month', bestelldatum)`](https://www.postgresql.org/docs/current/functions-datetime.html#FUNCTIONS-DATETIME-TRUNC). Und `NULLIF(vormonat, 0)` verhindert die Division durch null: SQLite liefert dabei ohnehin `NULL`, PostgreSQL bricht mit einem Fehler ab. Mit `NULLIF` ist das Verhalten überall gleich und im Code sichtbar. Auch `LAG(umsatz, 12)` ist nur auf einem lückenlosen Kalender der Vorjahresmonat.
+
+  ## Deduplizieren, Kohorten und Wiederkaufrate
+
+  `ROW_NUMBER` ist das Werkzeug für „genau eine Zeile pro Schlüssel“. Der Kundenexport aus dem CRM enthält jede Änderung als eigene Zeile, manche doppelt. Gesucht ist der aktuelle Stand je `kunde_id`:
+
+  ```sql run
+  CREATE TABLE kunden_import (import_id INTEGER PRIMARY KEY, kunde_id INTEGER, name TEXT, stadt TEXT, geaendert_am TEXT);
+  INSERT INTO kunden_import VALUES
+    (1, 10, 'Café Kranz', 'Köln', '2026-01-10 09:00'),
+    (2, 11, 'Büro Lindner', 'Bonn', '2026-01-12 14:30'),
+    (3, 10, 'Café Kranz', 'Köln-Ehrenfeld', '2026-02-03 11:15'),
+    (4, 11, 'Büro Lindner GmbH', 'Bonn', '2026-02-01 08:00'),
+    (5, 10, 'Café Kranz & Co', 'Köln-Ehrenfeld', '2026-02-03 11:15');
+
+  WITH versionen AS (
+    SELECT *,
+           ROW_NUMBER() OVER (PARTITION BY kunde_id
+                              ORDER BY geaendert_am DESC, import_id DESC) AS nr
+    FROM kunden_import
+  )
+  SELECT kunde_id, name, stadt, geaendert_am
+  FROM versionen
+  WHERE nr = 1
+  ORDER BY kunde_id;
+  ```
+
+  Die Sortierung im Fenster legt fest, welche Version gewinnt: die jüngste Änderung, bei gleichem Zeitstempel die zuletzt importierte. Ohne das zweite Kriterium wäre die Wahl zwischen den Zeilen 3 und 5 zufällig. SQLite erlaubt auch `SELECT kunde_id, name, MAX(geaendert_am) … GROUP BY kunde_id` und nimmt `name` dann aus der Zeile mit dem Maximum – eine SQLite-Besonderheit, die andere Datenbanken ablehnen und die bei Gleichstand eine beliebige Zeile liefert ([Bare columns](https://www.sqlite.org/lang_select.html#bare_columns_in_an_aggregate_query)).
+
+  Eine **Kohorte** ist eine Gruppe von Kunden mit gemeinsamem Startpunkt, meist dem Monat der ersten Bestellung. Die **Wiederkaufrate** ist der Anteil einer Kohorte, der ein weiteres Mal gekauft hat – die Antwort auf „Kommen die Neukunden aus der Februar-Aktion wieder?“. Das Muster: bezahlte Bestellungen je Kunde nummerieren, erste und zweite Bestellung per bedingter Aggregation nebeneinanderstellen, je Kohorte zählen.
+
+  ```sql run
+  CREATE TABLE bestellungen (bestellung_id INTEGER PRIMARY KEY, kunde_id INTEGER, bestelldatum TEXT, status TEXT);
+  INSERT INTO bestellungen VALUES
+    (1, 10, '2026-01-08', 'bezahlt'), (2, 11, '2026-01-19', 'bezahlt'),
+    (3, 10, '2026-02-12', 'bezahlt'), (4, 12, '2026-01-28', 'storniert'),
+    (5, 12, '2026-02-16', 'bezahlt'), (6, 13, '2026-02-25', 'bezahlt'),
+    (7, 12, '2026-03-30', 'bezahlt'), (8, 11, '2026-05-04', 'bezahlt');
+
+  WITH nummeriert AS (
+    SELECT kunde_id, bestelldatum,
+           ROW_NUMBER() OVER (PARTITION BY kunde_id ORDER BY bestelldatum, bestellung_id) AS nr
+    FROM bestellungen
+    WHERE status = 'bezahlt'
+  ),
+  je_kunde AS (
+    SELECT kunde_id,
+           MAX(CASE WHEN nr = 1 THEN bestelldatum END) AS erstkauf,
+           MAX(CASE WHEN nr = 2 THEN bestelldatum END) AS zweitkauf
+    FROM nummeriert
+    GROUP BY kunde_id
+  )
+  SELECT strftime('%Y-%m', erstkauf) AS kohorte,
+         COUNT(*) AS kunden,
+         COUNT(zweitkauf) AS wiederkaeufer,
+         COUNT(CASE WHEN julianday(zweitkauf) - julianday(erstkauf) <= 90 THEN 1 END) AS in_90_tagen
+  FROM je_kunde
+  GROUP BY kohorte
+  ORDER BY kohorte;
+  ```
+
+  `COUNT(zweitkauf)` zählt nur Kunden mit zweiter Bestellung, weil `COUNT` `NULL` ignoriert. Der Statusfilter steht **vor** der Nummerierung, sonst wäre das Storno von Kunde 12 seine „erste Bestellung“ und er landete in der Januar- statt in der Februar-Kohorte. Die Rate ist dann `ROUND(100.0 * wiederkaeufer / kunden, 1)`. Vergleiche Kohorten nur bei gleich langem Beobachtungszeitraum – eine junge Kohorte hatte weniger Zeit wiederzukaufen. Deshalb misst man „Wiederkauf innerhalb von 90 Tagen“ und wertet nur Kohorten aus, deren 90 Tage vorbei sind.
+
+  ## Prozesskennzahlen aus Tickets: Durchlaufzeit und Backlog
+
+  Dieselben Werkzeuge messen Prozesse. Der Support von Bohnenwerk erfasst jedes Anliegen als Ticket mit `erstellt_am` und, sobald erledigt, `geschlossen_am`. Zwei Kennzahlen steuern das Team: die **Durchlaufzeit** vom Eingang bis zum Abschluss und der **Backlog**, die Zahl offener Tickets am Tagesende.
+
+  ```sql run
+  CREATE TABLE tickets (ticket_id INTEGER PRIMARY KEY, erstellt_am TEXT, geschlossen_am TEXT, kategorie TEXT);
+  INSERT INTO tickets VALUES
+    (1, '2026-03-02 09:15', '2026-03-02 16:30', 'Lieferung'),
+    (2, '2026-03-02 11:00', '2026-03-04 10:00', 'Rechnung'),
+    (3, '2026-03-03 08:30', NULL, 'Qualität'),
+    (4, '2026-03-04 13:00', '2026-03-06 10:00', 'Lieferung'),
+    (5, '2026-03-05 10:20', NULL, 'Lieferung'),
+    (6, '2026-03-05 15:00', '2026-03-05 17:12', 'Rechnung');
+
+  -- Durchlaufzeit in Stunden; offene Tickets fehlen im Schnitt, deshalb daneben zählen
+  SELECT kategorie,
+         COUNT(*) - COUNT(geschlossen_am) AS offen,
+         ROUND(AVG((julianday(geschlossen_am) - julianday(erstellt_am)) * 24), 1) AS schnitt_stunden
+  FROM tickets
+  GROUP BY kategorie
+  ORDER BY kategorie;
+
+  -- Backlog am Tagesende: +1 beim Anlegen, -1 beim Schließen, laufend summiert
+  WITH RECURSIVE tage(tag) AS (
+    SELECT '2026-03-02'
+    UNION ALL
+    SELECT date(tag, '+1 day') FROM tage WHERE tag < '2026-03-06'
+  ),
+  bewegungen AS (
+    SELECT date(erstellt_am) AS tag, 1 AS delta FROM tickets
+    UNION ALL
+    SELECT date(geschlossen_am), -1 FROM tickets WHERE geschlossen_am IS NOT NULL
+  )
+  SELECT t.tag,
+         SUM(COALESCE(SUM(b.delta), 0)) OVER (ORDER BY t.tag) AS offen_abends
+  FROM tage AS t
+  LEFT JOIN bewegungen AS b ON b.tag = t.tag
+  GROUP BY t.tag
+  ORDER BY t.tag;
+  ```
+
+  `julianday` liefert Tage als Gleitkommazahl, `* 24` macht Stunden daraus; runde das Ergebnis, sonst erscheinen Werte wie `46.9999999925494`. Bei offenen Tickets ist die Differenz `NULL`, `AVG` ignoriert sie – das offene Qualitätsticket verschwindet also aus dem Schnitt, deshalb steht `offen` daneben. Ausreißer wie ein Ticket über ein langes Wochenende verzerren den Mittelwert. Den robusteren Median berechnest du in SQLite 3.39 mit `ROW_NUMBER` und `COUNT(*) OVER` selbst; eine Funktion `median()` gibt es erst ab SQLite 3.51 und auch dann nur, wenn SQLite mit der Percentile-Erweiterung gebaut wurde ([Aggregatfunktionen](https://www.sqlite.org/lang_aggfunc.html#median)).
+
+  Der Backlog funktioniert wie ein Kontostand: Jedes neue Ticket bucht +1, jedes geschlossene −1. Das innere `SUM` bildet den Saldo je Tag, das äußere `SUM(…) OVER (ORDER BY t.tag)` summiert die Salden auf, der Kalender liefert auch ruhige Tage. Der Standardrahmen passt hier, denn nach `GROUP BY t.tag` gibt es je Tag genau eine Zeile. Beginnt der Kalender erst nach dem ersten Ticket, fehlt der Anfangsbestand – dann gehören die älteren Buchungen mit in die Summe, bevor du auf den Zeitraum filterst.
+
+  > [!PRAXIS] Kennzahlen als Views
+  > Bei Bohnenwerk liegen die Abfragen dieses Moduls als Views in der Auswertungsdatenbank: `v_monatsbericht` (Umsatz, Vormonat, kumuliert, gleitender Schnitt), `v_top_produkte` und `v_support_kpi` (Durchlaufzeit, Median, Backlog). Die Excel-Mappe lädt sie per [Power Query](/data/power-query), am Monatsanfang reicht „Daten › Alle aktualisieren“. Ränge und Summen stimmen auch nach nachträglichen Stornos. Wichtiger als die gesparte Zeit: Derselbe Bericht liefert bei denselben Daten dieselben Zahlen.
+
+  ## Häufige Fehler
+
+  - **`misuse of window function`**: Die Fensterfunktion steht im `WHERE`, `GROUP BY` oder `HAVING`. In einer CTE berechnen, außen filtern.
+  - **Die laufende Summe springt**: gleiche Sortierwerte und der Standardrahmen `RANGE`. `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` mit eindeutigem Tie-Breaker schreiben.
+  - **`vormonat` ist überall leer**: `PARTITION BY monat` bildet je Monat eine Partition mit einer Zeile, `LAG` findet nie einen Vorgänger. Partitioniert wird nach dem, *innerhalb* dessen verglichen wird.
+  - **Vergleich mit dem falschen Monat**: Die Zeitreihe hat Lücken. Erst Kalender, dann `LEFT JOIN`, dann `LAG`.
+  - **Anteil ergibt 0**: `100 * anzahl / gesamt` mit ganzen Zahlen ist Integer-Division. `100.0 *` schreiben.
+  - **Filter an der falschen Stelle**: Erst nummerieren, dann Stornos entfernen ergibt falsche „erste Bestellungen“.
+
+  ## Zusammenfassung
+
+  - Fensterfunktionen rechnen über verwandte Zeilen, ohne sie zu verdichten: `PARTITION BY` teilt, `ORDER BY` ordnet, der Rahmen schneidet aus.
+  - Sie laufen nach `WHERE`, `GROUP BY` und `HAVING`; gefiltert wird eine Ebene weiter außen.
+  - `ROW_NUMBER`, `RANK` und `DENSE_RANK` unterscheiden sich nur bei Gleichständen; die fachliche Regel entscheidet.
+  - Mit `ORDER BY` im Fenster gilt `RANGE … CURRENT ROW` inklusive Peers. Laufende Summen und gleitende Durchschnitte schreiben `ROWS BETWEEN …` aus.
+  - `LAG` und `LEAD` vergleichen mit der vorherigen oder nächsten *Zeile*; Periodenvergleiche brauchen einen lückenlosen Kalender aus einer rekursiven CTE.
+  - `ROW_NUMBER() … = 1` dedupliziert auf den letzten Stand; nummerieren und bedingt aggregieren liefert Kohorten und Wiederkaufraten.
+  - Durchlaufzeit ist eine Zeitdifferenz mit `julianday`, Backlog eine laufende Summe aus +1/−1-Buchungen.
+exercises:
+  - id: fenster-im-where
+    type: choice
+    title: Filtern auf den Kanaldurchschnitt
+    prompt: |
+      Du willst im Monatsbericht nur Bestellungen sehen, die über dem Durchschnitt ihres Kanals liegen. SQLite antwortet auf die Abfrage mit `misuse of window function AVG()`. Welche Aussagen stimmen?
+    lang: sql
+    code: |
+      SELECT bestellung_id, kanal, netto
+      FROM bestellungen
+      WHERE netto > AVG(netto) OVER (PARTITION BY kanal);
+    options:
+      - text: Fensterfunktionen werden logisch erst nach `WHERE`, `GROUP BY` und `HAVING` berechnet. Beim Filtern gibt es ihr Ergebnis noch nicht.
+        correct: true
+        why: Genau deshalb erlaubt SQL sie nur in der `SELECT`-Liste und im `ORDER BY` der Abfrage.
+      - text: Richtig ist, den Kanaldurchschnitt in einer CTE als Spalte zu berechnen und in der äußeren Abfrage zu filtern.
+        correct: true
+        why: In der äußeren Abfrage ist der Durchschnitt eine gewöhnliche Spalte, auf die `WHERE` zugreifen darf.
+      - text: Mit `HAVING netto > AVG(netto) OVER (PARTITION BY kanal)` klappt es, weil `HAVING` nach der Gruppierung läuft.
+        correct: false
+        why: Fensterfunktionen werden auch erst nach `HAVING` berechnet und sind dort ebenso verboten. Ohne `GROUP BY` lehnt SQLite das `HAVING` hier sogar schon vorher ab (`HAVING clause on a non-aggregate query`).
+      - text: Es reicht, im `SELECT` `AVG(netto) OVER (PARTITION BY kanal) AS schnitt` zu schreiben und im `WHERE` auf `schnitt` zu filtern.
+        correct: false
+        why: "SQLite erlaubt Aliase im `WHERE` zwar als Besonderheit, bei Fensterfunktionen aber nicht: `misuse of aliased window function schnitt`. PostgreSQL erlaubt Aliase im `WHERE` grundsätzlich nicht."
+      - text: Ohne `OVER` ginge es – `WHERE netto > AVG(netto)` vergleicht mit dem Durchschnitt.
+        correct: false
+        why: Aggregatfunktionen sind im `WHERE` ebenso verboten (`misuse of aggregate function AVG()`), und ohne `PARTITION BY` fehlt außerdem die Aufteilung nach Kanal.
+    explanation: |
+      Die logische Auswertungsreihenfolge ist `FROM` → `WHERE` → `GROUP BY` → `HAVING` → `SELECT` (hier entstehen auch die Fensterwerte) → `DISTINCT` → `ORDER BY` → `LIMIT`. Zum Zeitpunkt von `WHERE` steht noch nicht fest, welche Zeilen im Fenster landen – das Fenster hängt ja davon ab, was `WHERE` durchlässt. Deshalb berechnest du den Durchschnitt eine Ebene tiefer (CTE oder Unterabfrage) und filterst außen. Manche Data-Warehouse-Dialekte bieten dafür `QUALIFY`; SQLite und PostgreSQL nicht.
+    resources:
+      - title: PostgreSQL · Tutorial Window Functions
+        url: https://www.postgresql.org/docs/current/tutorial-window.html
+      - title: SQLite · Window Functions (Einführung)
+        url: https://www.sqlite.org/windowfunctions.html#introduction_to_window_functions
+
+  - id: top-n-aufbauen
+    type: order
+    title: Die drei Besten je Kategorie
+    prompt: Bring die Zeilen in eine Reihenfolge, die je Kategorie genau die drei umsatzstärksten Produkte aus `produktumsatz` liefert. Bei gleichem Umsatz gewinnt die kleinere `produkt_id`.
+    lang: sql
+    lines: |
+      WITH rangliste AS (
+          SELECT kategorie, produkt, umsatz,
+                 ROW_NUMBER() OVER (PARTITION BY kategorie ORDER BY umsatz DESC, produkt_id) AS nr
+          FROM produktumsatz
+      )
+      SELECT kategorie, nr, produkt, umsatz
+      FROM rangliste
+      WHERE nr <= 3
+      ORDER BY kategorie, nr;
+    hints:
+      - Die Fensterfunktion kann nicht in derselben Abfrage gefiltert werden, in der sie berechnet wird.
+      - Innen wird nummeriert, außen gefiltert und sortiert.
+    explanation: |
+      Die Nummerierung muss in der CTE stehen, weil `nr` erst nach `WHERE` berechnet wird – in derselben Abfrage ließe sich nicht darauf filtern. `PARTITION BY kategorie` startet die Zählung je Kategorie bei 1, `ORDER BY umsatz DESC, produkt_id` legt die Reihenfolge fest und macht sie durch den Tie-Breaker eindeutig. Erst die äußere Abfrage behandelt `nr` wie eine gewöhnliche Spalte, filtert auf die ersten drei und sortiert das Ergebnis. Die Reihenfolge im Fenster und die Reihenfolge der Ausgabe sind zwei getrennte `ORDER BY`.
+    resources:
+      - title: SQLite · The PARTITION BY Clause
+        url: https://www.sqlite.org/windowfunctions.html#the_partition_by_clause
+      - title: SQLite · WITH-Klausel
+        url: https://www.sqlite.org/lang_with.html
+
+  - id: raenge-bei-gleichstand
+    type: output
+    title: Gleichstand auf Platz 2
+    prompt: |
+      Was gibt das Skript aus? Schreibe die Ausgabe wie die `sqlite3`-Kommandozeile im Standardmodus: Werte durch `|` getrennt, keine Kopfzeile, eine Zeile pro Ergebniszeile.
+    lang: sql
+    code: |
+      CREATE TABLE produktumsatz (produkt TEXT, umsatz INTEGER);
+      INSERT INTO produktumsatz VALUES
+        ('Napoli', 1840), ('Milano', 1320), ('Crema', 1320),
+        ('Decaf', 610), ('Kenia', 610), ('Brasil', 480);
+
+      WITH r AS (
+        SELECT produkt,
+               RANK()       OVER (ORDER BY umsatz DESC) AS rang,
+               DENSE_RANK() OVER (ORDER BY umsatz DESC) AS dichter_rang
+        FROM produktumsatz
+      )
+      SELECT produkt, rang, dichter_rang
+      FROM r
+      WHERE dichter_rang <= 3
+      ORDER BY dichter_rang, produkt;
+    expected: |
+      Napoli|1|1
+      Crema|2|2
+      Milano|2|2
+      Decaf|4|3
+      Kenia|4|3
+    hints:
+      - "`RANK` überspringt nach einem Gleichstand Plätze, `DENSE_RANK` nicht."
+      - Brasil hat den vierthöchsten Umsatzwert. Welcher dichte Rang ist das?
+    explanation: |
+      Milano und Crema teilen sich den zweiten Platz. `RANK` zählt danach so weiter, als hätte jede Zeile einen eigenen Platz belegt: Decaf und Kenia bekommen Rang 4, Rang 3 gibt es nicht. `DENSE_RANK` nummeriert die verschiedenen Umsatzwerte durch, also 1, 2, 3, 4. Der Filter `dichter_rang <= 3` liefert deshalb fünf Produkte – alle mit einem der drei höchsten Werte – und Brasil (dichter Rang 4) fällt heraus. Ein Filter auf `rang <= 3` hätte nur drei Zeilen geliefert. Innerhalb eines Gleichstands sortiert das äußere `ORDER BY … produkt` alphabetisch.
+    resources:
+      - title: SQLite · Built-in Window Functions
+        url: https://www.sqlite.org/windowfunctions.html#built_in_window_functions
+
+  - id: rahmen-vergleichen
+    type: output
+    title: Drei Summen, drei Rahmen
+    prompt: |
+      Was gibt das Skript aus? Schreibe die Ausgabe wie die `sqlite3`-Kommandozeile im Standardmodus: Werte durch `|` getrennt, keine Kopfzeile.
+    lang: sql
+    code: |
+      CREATE TABLE bestellungen (bestellung_id INTEGER PRIMARY KEY, tag TEXT, betrag INTEGER);
+      INSERT INTO bestellungen VALUES
+        (1, '2026-03-02', 40), (2, '2026-03-02', 310), (3, '2026-03-03', 25),
+        (4, '2026-03-04', 100), (5, '2026-03-04', 80);
+
+      SELECT bestellung_id,
+             SUM(betrag) OVER (ORDER BY tag) AS a,
+             SUM(betrag) OVER (ORDER BY tag, bestellung_id ROWS UNBOUNDED PRECEDING) AS b,
+             SUM(betrag) OVER () AS c
+      FROM bestellungen
+      ORDER BY bestellung_id;
+    expected: |
+      1|350|40|555
+      2|350|350|555
+      3|375|375|555
+      4|555|475|555
+      5|555|555|555
+    hints:
+      - Ohne Rahmenangabe gilt mit `ORDER BY` der Rahmen `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`. Welche Zeilen sind für Bestellung 1 „Peers“?
+      - Ohne `ORDER BY` im Fenster gehören alle Zeilen der Partition zum Rahmen.
+    explanation: |
+      Spalte `a` nutzt den Standardrahmen `RANGE`: Bestellungen mit demselben `tag` sind Peers und zählen gemeinsam. Deshalb haben 1 und 2 beide 350, 4 und 5 beide 555. Spalte `b` zählt mit `ROWS` einzelne Zeilen in der eindeutigen Reihenfolge `tag, bestellung_id` – eine echte laufende Summe (40, 350, 375, 475, 555). Spalte `c` hat kein `ORDER BY`, der Rahmen ist die ganze Partition, also überall die Gesamtsumme 555. Ein einziges `ORDER BY` im Fenster macht aus der Gesamtsumme eine laufende Summe.
+    resources:
+      - title: SQLite · Frame Specifications
+        url: https://www.sqlite.org/windowfunctions.html#frame_specifications
+      - title: SQLite · Frame Type
+        url: https://www.sqlite.org/windowfunctions.html#frame_type
+
+  - id: anteil-kategorie-und-gesamt
+    type: sql
+    title: Zwei Anteile in einer Abfrage
+    prompt: |
+      Berechne den Nettoumsatz je Produkt aus **bezahlten** Bestellungen. Nettoumsatz einer Position: `menge * einzelpreis * (1 - rabatt)`. Zeige daneben zwei Anteile in Prozent: am Umsatz der eigenen Kategorie und am Gesamtumsatz aller bezahlten Bestellungen. Produkte ohne bezahlten Umsatz erscheinen nicht.
+
+      Spalten: `kategorie`, `produkt` (der Produktname), `umsatz` (auf zwei Stellen gerundet), `anteil_kategorie` und `anteil_gesamt` (in Prozent, auf eine Stelle gerundet). Sortierung: nach `kategorie`, innerhalb der Kategorie größter Umsatz zuerst.
+    schema: |
+      CREATE TABLE produkte (produkt_id INTEGER PRIMARY KEY, name TEXT, kategorie TEXT, einkaufspreis REAL, listenpreis REAL, aktiv INTEGER);
+      INSERT INTO produkte VALUES
+        (1, 'Espresso Napoli', 'Espresso', 7.10, 14.90, 1),
+        (2, 'Crema Classica', 'Espresso', 6.40, 13.50, 1),
+        (3, 'Filter Hochland', 'Filter', 5.80, 12.90, 1),
+        (4, 'Filter Sidamo', 'Filter', 7.90, 16.50, 1),
+        (5, 'Mühle Pro', 'Zubehör', 38.00, 79.00, 1),
+        (6, 'Handfilter Keramik', 'Zubehör', 9.50, 24.00, 1);
+      CREATE TABLE bestellungen (bestellung_id INTEGER PRIMARY KEY, kunde_id INTEGER, bestelldatum TEXT, kanal TEXT, status TEXT, versandkosten REAL);
+      INSERT INTO bestellungen VALUES
+        (101, 10, '2026-03-02', 'Shop', 'bezahlt', 4.90),
+        (102, 11, '2026-03-03', 'B2B', 'bezahlt', 0),
+        (103, 12, '2026-03-05', 'Shop', 'storniert', 4.90),
+        (104, 13, '2026-03-09', 'B2B', 'bezahlt', 0),
+        (105, 10, '2026-03-12', 'Shop', 'retourniert', 4.90);
+      CREATE TABLE positionen (bestellung_id INTEGER, position INTEGER, produkt_id INTEGER, menge INTEGER, einzelpreis REAL, rabatt REAL, PRIMARY KEY (bestellung_id, position));
+      INSERT INTO positionen VALUES
+        (101, 1, 1, 2, 14.90, 0),
+        (101, 2, 6, 1, 24.00, 0),
+        (102, 1, 1, 20, 14.90, 0.1),
+        (102, 2, 3, 10, 12.90, 0.1),
+        (103, 1, 5, 1, 79.00, 0),
+        (104, 1, 4, 12, 16.50, 0.05),
+        (104, 2, 5, 1, 79.00, 0),
+        (104, 3, 2, 6, 13.50, 0.05),
+        (105, 1, 2, 2, 13.50, 0);
+    starter: |
+      SELECT pr.kategorie, pr.name AS produkt,
+             ROUND(SUM(p.menge * p.einzelpreis * (1 - p.rabatt)), 2) AS umsatz
+      FROM positionen AS p
+      JOIN bestellungen AS b ON b.bestellung_id = p.bestellung_id
+      JOIN produkte AS pr ON pr.produkt_id = p.produkt_id
+      WHERE b.status = 'bezahlt'
+      GROUP BY pr.produkt_id, pr.kategorie, pr.name
+      ORDER BY pr.kategorie, umsatz DESC;
+    solution: |
+      WITH je_produkt AS (
+        SELECT pr.kategorie, pr.name AS produkt,
+               SUM(p.menge * p.einzelpreis * (1 - p.rabatt)) AS umsatz
+        FROM positionen AS p
+        JOIN bestellungen AS b ON b.bestellung_id = p.bestellung_id
+        JOIN produkte AS pr ON pr.produkt_id = p.produkt_id
+        WHERE b.status = 'bezahlt'
+        GROUP BY pr.produkt_id, pr.kategorie, pr.name
+      )
+      SELECT kategorie, produkt,
+             ROUND(umsatz, 2) AS umsatz,
+             ROUND(100.0 * umsatz / SUM(umsatz) OVER (PARTITION BY kategorie), 1) AS anteil_kategorie,
+             ROUND(100.0 * umsatz / SUM(umsatz) OVER (), 1) AS anteil_gesamt
+      FROM je_produkt
+      ORDER BY kategorie, umsatz DESC;
+    ordered: true
+    hints:
+      - Beide Anteile teilen den Produktumsatz durch eine Summe über mehrere Zeilen – einmal über die Kategorie, einmal über alles.
+      - "`SUM(umsatz) OVER (PARTITION BY kategorie)` ist die Kategoriesumme, `SUM(umsatz) OVER ()` die Gesamtsumme – beide an jeder Zeile."
+      - Berechne den Produktumsatz in einer CTE und die Anteile außen. Ohne CTE geht es mit `SUM(SUM(…)) OVER (…)` direkt nach dem `GROUP BY`.
+    explanation: |
+      Zwei Fenster in einer Abfrage: `PARTITION BY kategorie` summiert je Kategorie, `OVER ()` ohne Partition über alle Produktzeilen. Beide Summen stehen an jeder Zeile, die Zeilen bleiben erhalten – mit `GROUP BY` bräuchtest du dafür zwei zusätzliche Aggregationen und Joins zurück auf die Produktebene. Weil `WHERE b.status = 'bezahlt'` vor den Fenstern wirkt, enthalten auch die Nenner nur bezahlte Bestellungen; die stornierte Mühle und die retournierte Crema zählen nirgends. Gerundet wird erst am Ende: Wer mit bereits gerundeten Umsätzen weiterrechnet, trägt Rundungsfehler in die Anteile.
+    resources:
+      - title: SQLite · The PARTITION BY Clause
+        url: https://www.sqlite.org/windowfunctions.html#the_partition_by_clause
+      - title: PostgreSQL · Window Function Calls
+        url: https://www.postgresql.org/docs/current/sql-expressions.html#SYNTAX-WINDOW-FUNCTIONS
+
+  - id: top2-je-kategorie
+    type: sql
+    title: Die zwei höchsten Umsätze je Kategorie
+    prompt: |
+      Für die Startseite des Shops sollen je Kategorie alle Produkte erscheinen, deren Umsatz einer der **zwei höchsten Umsatzwerte** ihrer Kategorie ist. Produkte mit gleichem Umsatz teilen sich einen Rang, der nächstniedrigere Umsatz bekommt den nächsten Rang ohne Lücke (1, 1, 2). Bei Gleichständen können also mehr als zwei Produkte je Kategorie erscheinen.
+
+      Spalten: `kategorie`, `produkt`, `umsatz`, `rang`. Sortierung: nach `kategorie`, dann `rang`, dann `produkt`.
+    schema: |
+      CREATE TABLE produktumsatz (produkt_id INTEGER PRIMARY KEY, produkt TEXT, kategorie TEXT, umsatz REAL);
+      INSERT INTO produktumsatz VALUES
+        (1, 'Espresso Napoli', 'Espresso', 1840.0),
+        (2, 'Crema Classica', 'Espresso', 1320.0),
+        (3, 'Espresso Milano', 'Espresso', 1320.0),
+        (4, 'Espresso Decaf', 'Espresso', 610.0),
+        (5, 'Filter Sidamo', 'Filter', 1150.0),
+        (6, 'Filter Hochland', 'Filter', 1150.0),
+        (7, 'Filter Kolumbien', 'Filter', 990.0),
+        (8, 'Filter Brasil', 'Filter', 640.0),
+        (9, 'Mühle Pro', 'Zubehör', 880.0),
+        (10, 'Handfilter Keramik', 'Zubehör', 420.0),
+        (11, 'Dosierlöffel', 'Zubehör', 95.0);
+    starter: |
+      SELECT kategorie, produkt, umsatz
+      FROM produktumsatz
+      ORDER BY kategorie, umsatz DESC;
+    solution: |
+      WITH rangliste AS (
+        SELECT kategorie, produkt, umsatz,
+               DENSE_RANK() OVER (PARTITION BY kategorie ORDER BY umsatz DESC) AS rang
+        FROM produktumsatz
+      )
+      SELECT kategorie, produkt, umsatz, rang
+      FROM rangliste
+      WHERE rang <= 2
+      ORDER BY kategorie, rang, produkt;
+    ordered: true
+    hints:
+      - Welche der drei Rangfunktionen vergibt nach einem Gleichstand den nächsten Rang ohne Lücke?
+      - Die Rangfolge beginnt je Kategorie neu – dafür sorgt `PARTITION BY`.
+      - Berechne den Rang in einer CTE und filtere außen auf `rang <= 2`.
+    explanation: |
+      `DENSE_RANK()` nummeriert die verschiedenen Umsatzwerte je Kategorie ohne Lücke und bildet damit „die zwei höchsten Umsatzwerte“ ab. Bei Filter teilen sich Sidamo und Hochland Rang 1, Kolumbien hat den zweithöchsten Wert und ist mit Rang 2 dabei – mit `RANK()` bekäme Kolumbien Rang 3 und fiele heraus. Bei Espresso teilen sich Crema Classica und Milano Rang 2. Mit `ROW_NUMBER()` fiele eines der gleichauf liegenden Produkte willkürlich weg. Welche Funktion richtig ist, steht in der fachlichen Regel, nicht im SQL.
+    resources:
+      - title: SQLite · Built-in Window Functions
+        url: https://www.sqlite.org/windowfunctions.html#built_in_window_functions
+      - title: PostgreSQL · Window Functions (rank, dense_rank, row_number)
+        url: https://www.postgresql.org/docs/current/functions-window.html
+
+  - id: monatsbericht-rahmen
+    type: gap
+    title: Drei Kennzahlen, drei Fenster
+    prompt: |
+      Die Tabelle `monatsumsatz` enthält für jeden Monat ab Januar 2025 genau eine Zeile (`jahr`, `monat` als Datum des Monatsersten, `umsatz`), ohne Lücken. Ergänze die Fenster so, dass jede Spalte tut, was ihr Kommentar sagt.
+    lang: sql
+    code: |
+      SELECT monat,
+             umsatz,
+             -- Umsatz seit Jahresbeginn, beginnt jedes Jahr neu
+             SUM(umsatz) OVER (⟦PARTITION BY jahr⟧ ORDER BY monat) AS umsatz_ytd,
+             -- Durchschnitt aus diesem und den zwei vorherigen Monaten
+             AVG(umsatz) OVER (ORDER BY monat ⟦ROWS BETWEEN 2 PRECEDING AND CURRENT ROW⟧) AS schnitt_3m,
+             -- Differenz zum selben Monat des Vorjahres
+             umsatz - ⟦LAG(umsatz, 12)⟧ OVER (ORDER BY monat) AS diff_vorjahresmonat
+      FROM monatsumsatz
+      ORDER BY monat;
+    gaps:
+      - label: Neustart je Jahr
+        hint: Die laufende Summe soll innerhalb jedes Jahres getrennt laufen.
+        accept:
+          - partition by jahr
+          - PARTITION BY strftime('%Y', monat)
+          - partition by strftime('%Y', monat)
+          - PARTITION BY substr(monat, 1, 4)
+          - partition by substr(monat, 1, 4)
+      - label: Rahmen für drei Monate
+        hint: Zähle Zeilen, nicht Werte – zwei davor bis zur aktuellen.
+        accept:
+          - rows between 2 preceding and current row
+          - ROWS 2 PRECEDING
+          - rows 2 preceding
+      - label: Wert von vor zwölf Zeilen
+        hint: Die Funktion für „Wert einer früheren Zeile“ nimmt als zweites Argument den Abstand.
+        accept:
+          - lag(umsatz, 12)
+          - LAG(umsatz, 12, NULL)
+          - lag(umsatz, 12, null)
+    explanation: |
+      `PARTITION BY jahr` lässt die Summe jedes Jahr bei null beginnen; weil `monat` je Jahr eindeutig ist, ist der Standardrahmen `RANGE` hier unproblematisch. Der gleitende Durchschnitt braucht einen Rahmen aus Zeilen: `ROWS BETWEEN 2 PRECEDING AND CURRENT ROW`, kurz `ROWS 2 PRECEDING`. Ohne ihn wäre `AVG … OVER (ORDER BY monat)` ein kumulierter Durchschnitt seit Januar 2025. `LAG(umsatz, 12)` greift zwölf Zeilen zurück – das ist nur deshalb der Vorjahresmonat, weil die Reihe lückenlos ist; in den ersten zwölf Monaten ist das Ergebnis `NULL`.
+    resources:
+      - title: SQLite · Frame Boundaries
+        url: https://www.sqlite.org/windowfunctions.html#frame_boundaries
+      - title: SQLite · Built-in Window Functions (lag, lead)
+        url: https://www.sqlite.org/windowfunctions.html#built_in_window_functions
+
+  - id: laufende-summe-je-kanal
+    type: sql
+    title: Umsatz seit Monatsanfang je Kanal
+    prompt: |
+      Zeige für jede **bezahlte** Bestellung im **März 2026** den kumulierten Umsatz ihres Kanals seit Monatsanfang, einschließlich dieser Bestellung. Bestellungen am selben Tag zählen in der Reihenfolge ihrer `bestellung_id`. Die Spalte `netto` ist der Nettobetrag der Bestellung.
+
+      Spalten: `kanal`, `bestellung_id`, `bestelldatum`, `netto`, `kumuliert` (auf zwei Stellen gerundet). Sortierung: nach `kanal`, dann `bestelldatum`, dann `bestellung_id`.
+    schema: |
+      CREATE TABLE bestellungen (bestellung_id INTEGER PRIMARY KEY, kunde_id INTEGER, bestelldatum TEXT, kanal TEXT, status TEXT, netto REAL);
+      INSERT INTO bestellungen VALUES
+        (199, 14, '2026-02-27', 'Shop', 'bezahlt', 55.00),
+        (201, 10, '2026-03-02', 'Shop', 'bezahlt', 38.50),
+        (202, 11, '2026-03-02', 'B2B', 'bezahlt', 412.00),
+        (203, 12, '2026-03-02', 'Shop', 'bezahlt', 22.90),
+        (204, 13, '2026-03-04', 'Shop', 'storniert', 61.00),
+        (205, 15, '2026-03-05', 'B2B', 'bezahlt', 288.40),
+        (206, 16, '2026-03-05', 'B2B', 'bezahlt', 150.00),
+        (207, 10, '2026-03-06', 'Shop', 'bezahlt', 45.80),
+        (208, 17, '2026-03-09', 'Shop', 'retourniert', 30.00),
+        (209, 11, '2026-03-10', 'B2B', 'bezahlt', 96.20);
+    starter: |
+      SELECT kanal, bestellung_id, bestelldatum, netto
+      FROM bestellungen
+      ORDER BY kanal, bestelldatum, bestellung_id;
+    solution: |
+      SELECT kanal, bestellung_id, bestelldatum, netto,
+             ROUND(SUM(netto) OVER (
+               PARTITION BY kanal
+               ORDER BY bestelldatum, bestellung_id
+               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+             ), 2) AS kumuliert
+      FROM bestellungen
+      WHERE status = 'bezahlt'
+        AND bestelldatum >= '2026-03-01' AND bestelldatum < '2026-04-01'
+      ORDER BY kanal, bestelldatum, bestellung_id;
+    ordered: true
+    hints:
+      - Die Summe startet je Kanal neu und läuft in Datumsreihenfolge.
+      - An Tagen mit zwei Bestellungen im selben Kanal muss die erste einen kleineren Wert zeigen als die zweite. Was macht der Standardrahmen mit gleichen Sortierwerten?
+      - "`ORDER BY bestelldatum, bestellung_id` im Fenster und am besten `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`."
+    explanation: |
+      Mit `ORDER BY bestelldatum` allein sind die B2B-Bestellungen 205 und 206 (beide am 5. März) Peers: Der Standardrahmen `RANGE` nimmt beide zugleich auf, und beide zeigen 850.4. Erst der Tie-Breaker `bestellung_id` macht die Reihenfolge eindeutig; `ROWS` drückt zusätzlich aus, dass Zeile für Zeile summiert wird. Der Zeitraumfilter gehört ins `WHERE`, damit die Februar-Bestellung 199 gar nicht erst ins Fenster kommt, und `status = 'bezahlt'` entfernt Storno und Retoure, bevor summiert wird.
+    resources:
+      - title: SQLite · Frame Specifications
+        url: https://www.sqlite.org/windowfunctions.html#frame_specifications
+      - title: PostgreSQL · Window Function Calls (frame_clause)
+        url: https://www.postgresql.org/docs/current/sql-expressions.html#SYNTAX-WINDOW-FUNCTIONS
+
+  - id: vormonat-lueckenlos
+    type: sql
+    title: Vormonatsvergleich ohne Lücken
+    prompt: |
+      Berechne den Umsatz aus **bezahlten** Bestellungen je Monat von **Januar bis Juni 2026**. Jeder dieser sechs Monate erscheint, auch ohne bezahlte Bestellung (Umsatz 0). Dazu der Umsatz des Vormonats und die Veränderung in Euro. Für Januar sind `vormonat` und `veraenderung` leer (`NULL`), auch wenn es im Dezember 2025 Umsatz gab. Die Spalte `netto` ist der Nettobetrag der Bestellung.
+
+      Spalten: `monat` (Text im Format `2026-01`), `umsatz`, `vormonat`, `veraenderung` (alle drei auf zwei Stellen gerundet). Sortierung: nach `monat`.
+    schema: |
+      CREATE TABLE bestellungen (bestellung_id INTEGER PRIMARY KEY, kunde_id INTEGER, bestelldatum TEXT, kanal TEXT, status TEXT, netto REAL);
+      INSERT INTO bestellungen VALUES
+        (90, 12, '2025-12-18', 'B2B', 'bezahlt', 1500.00),
+        (101, 10, '2026-01-09', 'Shop', 'bezahlt', 420.50),
+        (102, 11, '2026-01-27', 'B2B', 'bezahlt', 980.00),
+        (103, 13, '2026-02-12', 'B2B', 'bezahlt', 1210.30),
+        (104, 10, '2026-03-04', 'Shop', 'storniert', 75.00),
+        (105, 14, '2026-04-02', 'Shop', 'bezahlt', 310.00),
+        (106, 11, '2026-04-21', 'B2B', 'bezahlt', 1045.70),
+        (107, 15, '2026-06-15', 'Shop', 'bezahlt', 690.20),
+        (108, 12, '2026-07-01', 'B2B', 'bezahlt', 880.00);
+    starter: |
+      SELECT strftime('%Y-%m', bestelldatum) AS monat,
+             ROUND(SUM(netto), 2) AS umsatz
+      FROM bestellungen
+      WHERE status = 'bezahlt'
+      GROUP BY monat
+      ORDER BY monat;
+    solution: |
+      WITH RECURSIVE kalender(monat) AS (
+        SELECT '2026-01-01'
+        UNION ALL
+        SELECT date(monat, '+1 month') FROM kalender WHERE monat < '2026-06-01'
+      ),
+      je_monat AS (
+        SELECT date(bestelldatum, 'start of month') AS monat, SUM(netto) AS umsatz
+        FROM bestellungen
+        WHERE status = 'bezahlt'
+        GROUP BY 1
+      ),
+      reihe AS (
+        SELECT k.monat, COALESCE(j.umsatz, 0) AS umsatz
+        FROM kalender AS k
+        LEFT JOIN je_monat AS j ON j.monat = k.monat
+      )
+      SELECT strftime('%Y-%m', monat) AS monat,
+             ROUND(umsatz, 2) AS umsatz,
+             ROUND(LAG(umsatz) OVER (ORDER BY monat), 2) AS vormonat,
+             ROUND(umsatz - LAG(umsatz) OVER (ORDER BY monat), 2) AS veraenderung
+      FROM reihe
+      ORDER BY monat;
+    ordered: true
+    hints:
+      - Der Starter lässt März und Mai aus. `LAG` würde April deshalb mit Februar vergleichen.
+      - Erzeuge die sechs Monate mit einer rekursiven CTE und hänge die Umsätze per `LEFT JOIN` an; `COALESCE` macht aus fehlenden Umsätzen eine 0.
+      - Achte darauf, dass der Status-Filter die Kalendermonate nicht wieder entfernt – er gehört in die Umsatz-CTE oder in die `ON`-Bedingung, nicht in ein `WHERE` nach dem `LEFT JOIN`.
+    explanation: |
+      `LAG` vergleicht mit der vorherigen **Zeile**. Ohne Kalender fehlen März (nur ein Storno) und Mai (keine Bestellung), und April würde mit Februar verglichen. Die rekursive CTE erzeugt alle sechs Monatsersten, das `LEFT JOIN` behält sie auch ohne Umsatz, `COALESCE` setzt 0 ein. Weil der Kalender im Januar 2026 beginnt, sieht `LAG` den Dezember nie – Januar bekommt korrekt `NULL`. Ein häufiger Fehler ist `WHERE b.status = 'bezahlt'` nach einem `LEFT JOIN` auf die Bestellungen: Er wirft die leeren Monate wieder hinaus, weil ihr Status `NULL` ist.
+    resources:
+      - title: SQLite · Rekursive CTEs
+        url: https://www.sqlite.org/lang_with.html#recursive_common_table_expressions
+      - title: SQLite · Datums-Modifikatoren
+        url: https://www.sqlite.org/lang_datefunc.html#dtmods
+      - title: PostgreSQL · generate_series
+        url: https://www.postgresql.org/docs/current/functions-srf.html#FUNCTIONS-SRF-SERIES
+
+  - id: letzter-stand-je-kunde
+    type: sql
+    title: Der aktuelle Stand aus dem CRM-Export
+    prompt: |
+      Der CRM-Export `kunden_import` enthält für jede Änderung an einem Kunden eine Zeile, manche Zeilen doppelt. Gib je `kunde_id` genau eine Zeile mit dem aktuellen Stand aus: die mit dem jüngsten `geaendert_am`. Haben mehrere Zeilen denselben jüngsten Zeitstempel, gilt die mit der höchsten `import_id`.
+
+      Spalten: `kunde_id`, `name`, `stadt`, `segment`. Die Reihenfolge der Zeilen spielt keine Rolle.
+    schema: |
+      CREATE TABLE kunden_import (import_id INTEGER PRIMARY KEY, kunde_id INTEGER, name TEXT, stadt TEXT, segment TEXT, geaendert_am TEXT);
+      INSERT INTO kunden_import VALUES
+        (1, 10, 'Café Kranz', 'Köln', 'Café', '2026-01-10 09:00'),
+        (2, 11, 'Büro Lindner', 'Bonn', 'Büro', '2026-01-12 14:30'),
+        (3, 12, 'Anna Vogt', 'Düsseldorf', 'Privat', '2026-01-15 10:00'),
+        (4, 10, 'Café Kranz', 'Köln-Ehrenfeld', 'Café', '2026-02-03 11:15'),
+        (5, 11, 'Lindner Steuerberatung', 'Bonn', 'Büro', '2026-02-01 08:00'),
+        (6, 10, 'Café Kranz & Co', 'Köln-Ehrenfeld', 'Café', '2026-02-03 11:15'),
+        (7, 11, 'Büro Lindner', 'Bonn', 'Büro', '2026-01-12 14:30'),
+        (8, 13, 'Bistro Südstadt', 'Köln', 'Café', '2026-02-10 16:40'),
+        (9, 12, 'Anna Vogt', 'Neuss', 'Privat', '2026-01-09 18:05');
+    starter: |
+      SELECT DISTINCT kunde_id, name, stadt, segment
+      FROM kunden_import;
+    solution: |
+      WITH versionen AS (
+        SELECT kunde_id, name, stadt, segment,
+               ROW_NUMBER() OVER (
+                 PARTITION BY kunde_id
+                 ORDER BY geaendert_am DESC, import_id DESC
+               ) AS nr
+        FROM kunden_import
+      )
+      SELECT kunde_id, name, stadt, segment
+      FROM versionen
+      WHERE nr = 1;
+    hints:
+      - "`DISTINCT` entfernt nur vollständig gleiche Zeilen. Gesucht ist eine Zeile je Schlüssel."
+      - Nummeriere die Versionen je Kunde, die gewünschte Version bekommt Nummer 1.
+      - "`ROW_NUMBER() OVER (PARTITION BY kunde_id ORDER BY geaendert_am DESC, import_id DESC)` und außen `WHERE nr = 1`."
+    explanation: |
+      `ROW_NUMBER` vergibt je Kunde eindeutige Nummern in der Reihenfolge des Fensters; die Zeile mit Nummer 1 ist der gewünschte Stand. Der Tie-Breaker `import_id DESC` entscheidet bei Kunde 10 zwischen den Importen 4 und 6 mit identischem Zeitstempel. Die höchste `import_id` allein wäre falsch: Import 9 hat bei Kunde 12 einen älteren Stand nachgeliefert. `GROUP BY kunde_id` mit `MAX(geaendert_am)` und „nackten“ Spalten funktioniert nur in SQLite und wählt bei Gleichstand eine beliebige Zeile.
+    resources:
+      - title: SQLite · Built-in Window Functions (row_number)
+        url: https://www.sqlite.org/windowfunctions.html#built_in_window_functions
+      - title: SQLite · Bare columns in an aggregate query
+        url: https://www.sqlite.org/lang_select.html#bare_columns_in_an_aggregate_query
+
+  - id: vormonat-bleibt-leer
+    type: bug
+    title: Der Vormonat bleibt leer
+    prompt: |
+      Die Abfrage soll neben jedem Monatsumsatz den Umsatz des Vormonats zeigen. Die Monate und Umsätze stimmen, aber die Spalte `vormonat` ist in **jeder** Zeile leer, obwohl es für Februar bis Juni Vormonatsumsätze gibt. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: sql
+    code: |
+      WITH je_monat AS (
+        SELECT strftime('%Y-%m', bestelldatum) AS monat,
+               SUM(netto) AS umsatz
+        FROM bestellungen
+        WHERE status = 'bezahlt'
+        GROUP BY monat
+      )
+      SELECT monat,
+             umsatz,
+             LAG(umsatz) OVER (PARTITION BY monat ORDER BY monat) AS vormonat
+      FROM je_monat
+      ORDER BY monat;
+    lines: [10]
+    fix:
+      - line: 10
+        answers:
+          - LAG(umsatz) OVER (ORDER BY monat) AS vormonat
+          - lag(umsatz) over (order by monat) as vormonat
+          - LAG(umsatz, 1) OVER (ORDER BY monat) AS vormonat
+          - lag(umsatz, 1) over (order by monat) as vormonat
+          - LAG(umsatz) OVER (ORDER BY monat ASC) AS vormonat
+          - LAG(umsatz) OVER (ORDER BY monat) vormonat
+    hints:
+      - Wie viele Zeilen enthält eine Partition, wenn nach dem Monat partitioniert wird und es je Monat nur eine Zeile gibt?
+    explanation: |
+      `PARTITION BY monat` zerlegt das Ergebnis in eine Partition je Monat. Nach dem `GROUP BY` hat jeder Monat genau eine Zeile, also hat jede Partition eine Zeile – und `LAG` findet darin nie einen Vorgänger, das Ergebnis ist immer `NULL`. Die Partition beschreibt, *innerhalb* welcher Gruppe verglichen wird (etwa je Kanal), `ORDER BY` beschreibt, *in welcher Reihenfolge*. Hier gibt es nur eine Reihe, also entfällt `PARTITION BY`. Fehlen Monate ganz, bräuchte die Abfrage zusätzlich einen Kalender.
+    resources:
+      - title: SQLite · The PARTITION BY Clause
+        url: https://www.sqlite.org/windowfunctions.html#the_partition_by_clause
+
+  - id: median-durchlaufzeit
+    type: explain
+    title: Ein Median ohne MEDIAN
+    prompt: |
+      Eine Kollegin aus dem Support-Team fragt, wie diese Abfrage den Median der Durchlaufzeit berechnet – SQLite 3.39 hat doch keine Funktion dafür – und warum ihr Ergebnis für Lieferungen (14.0 Stunden) so viel kleiner ist als der Durchschnitt (37.5 Stunden). Die vier geschlossenen Lieferungs-Tickets dauerten 2, 4, 24 und 120 Stunden, ein fünftes ist noch offen. Erkläre es ihr.
+    lang: sql
+    code: |
+      WITH dauer AS (
+        SELECT kategorie,
+               (julianday(geschlossen_am) - julianday(erstellt_am)) * 24 AS stunden
+        FROM tickets
+        WHERE geschlossen_am IS NOT NULL
+      ),
+      sortiert AS (
+        SELECT kategorie, stunden,
+               ROW_NUMBER() OVER (PARTITION BY kategorie ORDER BY stunden) AS nr,
+               COUNT(*) OVER (PARTITION BY kategorie) AS n
+        FROM dauer
+      )
+      SELECT kategorie, ROUND(AVG(stunden), 1) AS median_stunden
+      FROM sortiert
+      WHERE nr IN ((n + 1) / 2, (n + 2) / 2)
+      GROUP BY kategorie
+      ORDER BY kategorie;
+    points:
+      - Nur geschlossene Tickets fließen ein; bei offenen ist die Durchlaufzeit noch unbekannt (`NULL`).
+      - "`ROW_NUMBER` nummeriert die Tickets je Kategorie aufsteigend nach Dauer, `COUNT(*) OVER` schreibt die Anzahl `n` an jede Zeile, ohne Zeilen zu verdichten."
+      - "Die Integer-Division wählt die Mitte: Bei ungeradem `n` zweimal dieselbe Position (n = 5: 3 und 3), bei geradem `n` die beiden mittleren (n = 4: 2 und 3)."
+      - "`AVG` über diese eine oder zwei Zeilen ergibt den Median."
+      - Der Median ist unempfindlich gegen einzelne Ausreißer wie ein Ticket über das Wochenende, der Durchschnitt nicht – deshalb die große Differenz.
+    explanation: |
+      Die erste CTE rechnet für jedes geschlossene Ticket die Durchlaufzeit in Stunden aus; offene Tickets bleiben draußen, weil sie noch keine haben. Die zweite CTE nummeriert je Kategorie nach Dauer aufsteigend und schreibt mit `COUNT(*) OVER (PARTITION BY kategorie)` die Anzahl `n` an jede Zeile – beides Fensterfunktionen, die Zeilen bleiben erhalten. Der Filter nutzt die Integer-Division von SQLite: Bei `n = 4` ergeben `(n + 1) / 2` und `(n + 2) / 2` die Positionen 2 und 3, bei `n = 5` zweimal die 3. `AVG` über diese Zeilen ist der Median: bei Lieferung der Mittelwert aus 4 und 24 Stunden. Ein einzelnes Ticket mit 120 Stunden zieht den Durchschnitt auf 37.5 hoch, den Median nicht – deshalb berichtet man Durchlaufzeiten meist als Median. SQLite ab 3.51 (mit Percentile-Erweiterung) und PostgreSQL (`percentile_cont(0.5) WITHIN GROUP (ORDER BY stunden)`) haben dafür eigene Funktionen.
+    resources:
+      - title: SQLite · Aggregatfunktionen (median ab 3.51)
+        url: https://www.sqlite.org/lang_aggfunc.html#median
+      - title: PostgreSQL · Ordered-Set Aggregate Functions
+        url: https://www.postgresql.org/docs/current/functions-aggregate.html#FUNCTIONS-ORDEREDSET-TABLE
+
+  - id: wiederkaufrate-kohorten
+    type: sql
+    title: Kommen die Neukunden wieder?
+    prompt: |
+      Die Geschäftsführung will wissen, ob Neukunden wiederkommen. Ordne jeden Kunden der **Kohorte** seiner ersten **bezahlten** Bestellung zu (Monat im Format `2026-01`). Ein Kunde ist **Wiederkäufer**, wenn seine zweite bezahlte Bestellung höchstens 60 Tage nach der ersten liegt. Stornierte und retournierte Bestellungen zählen nirgends mit.
+
+      Spalten: `kohorte`, `kunden` (Anzahl Kunden der Kohorte), `wiederkaeufer`, `rate_prozent` (Anteil der Wiederkäufer in Prozent, auf eine Stelle gerundet). Sortierung: nach `kohorte`.
+    schema: |
+      CREATE TABLE bestellungen (bestellung_id INTEGER PRIMARY KEY, kunde_id INTEGER, bestelldatum TEXT, kanal TEXT, status TEXT);
+      INSERT INTO bestellungen VALUES
+        (1, 1, '2026-01-05', 'Shop', 'bezahlt'),
+        (2, 2, '2026-01-12', 'Shop', 'bezahlt'),
+        (3, 3, '2026-01-20', 'Shop', 'storniert'),
+        (4, 4, '2026-01-25', 'B2B', 'bezahlt'),
+        (5, 3, '2026-02-03', 'Shop', 'bezahlt'),
+        (6, 1, '2026-02-10', 'Shop', 'bezahlt'),
+        (7, 5, '2026-02-14', 'Shop', 'bezahlt'),
+        (8, 6, '2026-02-20', 'B2B', 'bezahlt'),
+        (9, 3, '2026-02-25', 'Shop', 'bezahlt'),
+        (10, 5, '2026-03-01', 'Shop', 'retourniert'),
+        (11, 7, '2026-03-03', 'Shop', 'bezahlt'),
+        (12, 8, '2026-03-10', 'B2B', 'bezahlt'),
+        (13, 9, '2026-03-15', 'Shop', 'storniert'),
+        (14, 7, '2026-03-17', 'Shop', 'bezahlt'),
+        (15, 2, '2026-03-28', 'Shop', 'bezahlt'),
+        (16, 3, '2026-04-01', 'Shop', 'bezahlt'),
+        (17, 6, '2026-04-20', 'B2B', 'bezahlt');
+    starter: |
+      SELECT kunde_id, MIN(bestelldatum) AS erstkauf, COUNT(*) AS bestellungen
+      FROM bestellungen
+      WHERE status = 'bezahlt'
+      GROUP BY kunde_id;
+    solution: |
+      WITH nummeriert AS (
+        SELECT kunde_id, bestelldatum,
+               ROW_NUMBER() OVER (PARTITION BY kunde_id ORDER BY bestelldatum, bestellung_id) AS nr
+        FROM bestellungen
+        WHERE status = 'bezahlt'
+      ),
+      je_kunde AS (
+        SELECT kunde_id,
+               MAX(CASE WHEN nr = 1 THEN bestelldatum END) AS erstkauf,
+               MAX(CASE WHEN nr = 2 THEN bestelldatum END) AS zweitkauf
+        FROM nummeriert
+        GROUP BY kunde_id
+      )
+      SELECT strftime('%Y-%m', erstkauf) AS kohorte,
+             COUNT(*) AS kunden,
+             COUNT(CASE WHEN julianday(zweitkauf) - julianday(erstkauf) <= 60 THEN 1 END) AS wiederkaeufer,
+             ROUND(100.0 * COUNT(CASE WHEN julianday(zweitkauf) - julianday(erstkauf) <= 60 THEN 1 END)
+                   / COUNT(*), 1) AS rate_prozent
+      FROM je_kunde
+      GROUP BY kohorte
+      ORDER BY kohorte;
+    ordered: true
+    hints:
+      - Filtere zuerst auf bezahlte Bestellungen und nummeriere dann je Kunde nach Datum – sonst ist ein Storno die „erste Bestellung“.
+      - Mit bedingter Aggregation (`MAX(CASE WHEN nr = 1 THEN … END)`) oder `LEAD(bestelldatum)` bekommst du erste und zweite Bestellung in eine Zeile.
+      - "Tage zwischen zwei Daten: `julianday(b) - julianday(a)`. Für den Anteil `100.0 *` schreiben, sonst rechnet SQLite mit ganzen Zahlen."
+    explanation: |
+      Kunde 3 zeigt, warum der Statusfilter vor der Nummerierung stehen muss: Seine erste Bestellung im Januar war storniert, seine Kohorte ist deshalb der Februar. Kunde 2 hat zwar wieder gekauft, aber erst nach 75 Tagen; Kunde 5 hat innerhalb von 60 Tagen erneut bestellt, die Bestellung aber retourniert – beide zählen nicht. Kunde 6 liegt mit 59 Tagen knapp innerhalb. Die Rate braucht `100.0`, sonst ergibt `100 * 1 / 3` in SQLite 33 statt 33.3. Ob man „zweite Bestellung“ per `ROW_NUMBER` und bedingter Aggregation oder per `LEAD` bestimmt, ist gleichwertig.
+    resources:
+      - title: SQLite · Built-in Window Functions (row_number, lead)
+        url: https://www.sqlite.org/windowfunctions.html#built_in_window_functions
+      - title: SQLite · Datums- und Zeitfunktionen (julianday)
+        url: https://www.sqlite.org/lang_datefunc.html
+
+  - id: backlog-am-tagesende
+    type: sql
+    title: Wie viele Tickets sind abends offen?
+    prompt: |
+      Das Support-Team will den Backlog für die Woche vom **2. bis 8. März 2026** sehen: die Zahl der Tickets, die am Ende jedes Tages offen sind. Ein Ticket ist am Ende eines Tages offen, wenn es an diesem Tag oder früher erstellt wurde und bis dahin nicht geschlossen ist (`geschlossen_am` leer oder an einem späteren Tag). Jeder der sieben Tage erscheint, auch wenn sich nichts bewegt hat. Achtung: Einige Tickets stammen aus dem Februar.
+
+      Spalten: `tag` (Text im Format `2026-03-02`), `offen`. Sortierung: nach `tag`.
+    schema: |
+      CREATE TABLE tickets (ticket_id INTEGER PRIMARY KEY, kunde_id INTEGER, erstellt_am TEXT, geschlossen_am TEXT, kategorie TEXT, prioritaet TEXT);
+      INSERT INTO tickets VALUES
+        (1, 10, '2026-02-20 09:00', '2026-02-25 13:00', 'Rechnung', 'normal'),
+        (2, 11, '2026-02-27 10:00', '2026-03-03 12:00', 'Lieferung', 'hoch'),
+        (3, 12, '2026-02-28 15:30', NULL, 'Qualität', 'normal'),
+        (4, 13, '2026-03-02 08:10', '2026-03-02 17:00', 'Lieferung', 'hoch'),
+        (5, 10, '2026-03-02 09:45', '2026-03-05 11:20', 'Rechnung', 'normal'),
+        (6, 14, '2026-03-03 14:00', NULL, 'Lieferung', 'normal'),
+        (7, 15, '2026-03-04 07:55', '2026-03-05 16:30', 'Qualität', 'hoch'),
+        (8, 11, '2026-03-06 10:00', '2026-03-09 09:00', 'Lieferung', 'niedrig'),
+        (9, 16, '2026-03-06 18:20', '2026-03-10 10:00', 'Rechnung', 'normal');
+    starter: |
+      WITH RECURSIVE tage(tag) AS (
+        SELECT '2026-03-02'
+        UNION ALL
+        SELECT date(tag, '+1 day') FROM tage WHERE tag < '2026-03-08'
+      )
+      SELECT tag
+      FROM tage;
+    solution: |
+      WITH RECURSIVE tage(tag) AS (
+        SELECT '2026-03-02'
+        UNION ALL
+        SELECT date(tag, '+1 day') FROM tage WHERE tag < '2026-03-08'
+      ),
+      bewegungen AS (
+        SELECT date(erstellt_am) AS tag, 1 AS delta FROM tickets
+        UNION ALL
+        SELECT date(geschlossen_am), -1 FROM tickets WHERE geschlossen_am IS NOT NULL
+        UNION ALL
+        SELECT tag, 0 FROM tage
+      ),
+      verlauf AS (
+        SELECT tag, SUM(SUM(delta)) OVER (ORDER BY tag) AS offen
+        FROM bewegungen
+        GROUP BY tag
+      )
+      SELECT tag, offen
+      FROM verlauf
+      WHERE tag BETWEEN '2026-03-02' AND '2026-03-08'
+      ORDER BY tag;
+    ordered: true
+    hints:
+      - "Denk an einen Kontostand: Jedes neue Ticket bucht +1, jedes geschlossene −1. Der Backlog am Abend ist die laufende Summe aller Buchungen bis zu diesem Tag."
+      - Die Tickets aus dem Februar bilden den Anfangsbestand. Summiere über alle Buchungen und filtere den Zeitraum erst danach – oder zähle je Kalendertag direkt, welche Tickets zu diesem Zeitpunkt offen waren.
+      - "Mit `UNION ALL SELECT tag, 0 FROM tage` erscheinen auch Tage ohne Buchung in der laufenden Summe."
+    explanation: |
+      Die laufende Summe über +1/−1-Buchungen ist das Standardmuster für Bestände: Lager, offene Rechnungen, Backlog. Entscheidend ist der Anfangsbestand: Ticket 2 und 3 sind am 2. März noch aus dem Februar offen. Deshalb läuft die Summe über alle Tage und der Zeitraum wird erst in der äußeren Abfrage gefiltert – ein Filter im `WHERE` derselben Ebene würde die Februar-Buchungen vor der Fensterberechnung entfernen. Ticket 4 wird am selben Tag angelegt und geschlossen; +1 und −1 heben sich auf. Gleichwertig ist ein `LEFT JOIN` vom Kalender auf `tickets` mit der Bedingung „bis zu diesem Tag erstellt und bis dahin nicht geschlossen“ und `COUNT` je Tag – ohne Fensterfunktion, aber mit einem Join pro Tag und Ticket.
+    resources:
+      - title: SQLite · Aggregate Window Functions
+        url: https://www.sqlite.org/windowfunctions.html#aggregate_window_functions
+      - title: SQLite · Rekursive CTEs
+        url: https://www.sqlite.org/lang_with.html#recursive_common_table_expressions

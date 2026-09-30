@@ -1,0 +1,933 @@
+id: sql-abfragen
+title: SQL-Abfragen für Analysen
+level: 1
+minutes: 150
+summary: Mit SELECT, WHERE, GROUP BY und HAVING Fragen an eine Tabelle stellen – mit sicherem Umgang mit NULL, Datumswerten und den Typregeln von SQLite, damit der Monatsbericht jedes Mal nach denselben Regeln rechnet.
+goals:
+  - Du schreibst Abfragen mit `SELECT`, `WHERE`, `ORDER BY` und `LIMIT` und erklärst ihre logische Auswertungsreihenfolge.
+  - Du rechnest mit Ausdrücken, Aliasen und `CASE` und umgehst die Integer-Division.
+  - Du sagst voraus, wie sich `NULL` in Vergleichen, `CASE` und Aggregatfunktionen verhält, und unterscheidest `COUNT(*)` von `COUNT(spalte)`.
+  - Du gruppierst mit `GROUP BY` und filterst an der richtigen Stelle – Zeilen mit `WHERE`, Gruppen mit `HAVING`.
+  - Du wertest ISO-Datumswerte mit `strftime` und `date` nach Monaten aus und erkennst Zahlen, die als Text gespeichert sind.
+resources:
+  - title: SQLite · SELECT
+    url: https://sqlite.org/lang_select.html
+  - title: SQLite · Aggregatfunktionen
+    url: https://sqlite.org/lang_aggfunc.html
+  - title: SQLite · NULL Handling in SQLite
+    url: https://sqlite.org/nulls.html
+  - title: SQLite · Datums- und Zeitfunktionen
+    url: https://sqlite.org/lang_datefunc.html
+  - title: SQLite · Datentypen und Typaffinität
+    url: https://sqlite.org/datatype3.html
+lesson: |
+  Bei Bohnenwerk beginnt jeder Monat gleich: Der Webshop exportiert die Bestellungen, jemand filtert in Excel nach Status und Kanal, kopiert Zwischenergebnisse in ein zweites Blatt, baut eine PivotTable und tippt die Kennzahlen in den Monatsbericht. Das dauert rund drei Stunden. Kommt im Export eine Spalte dazu oder vergisst jemand einen Filter, stimmen die Zahlen nicht mehr, und niemand merkt es. Dieselben Fragen lassen sich als SQL-Abfrage aufschreiben: „Wie viele bezahlte Bestellungen gab es je Kanal, wie hoch war der Warenwert, wie viele wurden storniert?“ Die Abfrage liegt als Datei neben dem Bericht, läuft in Sekunden und rechnet jeden Monat nach denselben Regeln.
+
+  SQL (Structured Query Language) ist **deklarativ**: Du beschreibst das Ergebnis, nicht den Weg dorthin. Die Datenbank entscheidet selbst, wie sie die Zeilen findet. Das macht Abfragen kurz, verlangt aber ein genaues Bild davon, was jede Klausel mit den Zeilen macht. Dieses Modul baut dieses Bild für Abfragen auf **einer** Tabelle auf; Abfragen über mehrere Tabellen folgen in [Joins und Datenmodelle abfragen](/data/sql-joins). Alle Beispiele laufen im Browser mit SQLite 3.39 – ändere sie und führe sie erneut aus. Jeder Block legt seine Tabellen selbst an.
+
+  ## Die Grundform: SELECT, FROM, WHERE, ORDER BY, LIMIT
+
+  Eine Abfrage liefert immer eine neue Tabelle, die **Ergebnismenge**. `FROM` nennt die Quelle, `WHERE` behält nur die Zeilen, für die die Bedingung wahr ist, `SELECT` legt die Spalten fest, `ORDER BY` sortiert und `LIMIT` schneidet nach einer Anzahl Zeilen ab ([SQLite · SELECT](https://sqlite.org/lang_select.html)). Der Block legt eine kleine Tabelle `bestellungen` an, wie sie der Shop-Export liefert. Die Spalte `warenwert` ist der Nettowarenwert einer Bestellung ohne Versand.
+
+  ```sql run
+  CREATE TABLE bestellungen (
+    bestellung_id INTEGER PRIMARY KEY,
+    kunde_id      INTEGER,
+    bestelldatum  TEXT,
+    kanal         TEXT,
+    status        TEXT,
+    warenwert     REAL,
+    versandkosten REAL
+  );
+  INSERT INTO bestellungen VALUES
+    (1001, 1, '2026-03-02', 'Shop', 'bezahlt',      38.90, 4.90),
+    (1002, 2, '2026-03-03', 'B2B',  'bezahlt',     412.00, 0),
+    (1003, 3, '2026-03-05', 'Shop', 'storniert',    21.50, 4.90),
+    (1004, 1, '2026-03-09', 'Shop', 'bezahlt',      64.20, 0),
+    (1005, 4, '2026-03-12', 'B2B',  'retourniert', 129.00, 0),
+    (1006, 5, '2026-03-14', 'Shop', 'bezahlt',      17.80, 4.90),
+    (1007, 2, '2026-03-20', 'B2B',  'bezahlt',     288.50, NULL),
+    (1008, 6, '2026-03-28', 'Shop', 'bezahlt',      92.40, 0);
+
+  SELECT bestellung_id, bestelldatum, warenwert
+  FROM bestellungen
+  WHERE kanal = 'Shop' AND status = 'bezahlt'
+  ORDER BY warenwert DESC
+  LIMIT 3;
+  ```
+
+  Drei Regeln gelten schon hier:
+
+  - **Text steht in einfachen Anführungszeichen**, also `'bezahlt'`. Doppelte Anführungszeichen bezeichnen im SQL-Standard Namen von Spalten und Tabellen. SQLite akzeptiert `"bezahlt"` aus Kompatibilitätsgründen trotzdem als Text, solange keine Spalte so heißt ([SQLite · Quirks](https://sqlite.org/quirks.html#dblquote)); PostgreSQL meldet einen Fehler.
+  - **Ohne `ORDER BY` gibt es keine Reihenfolge.** Die Zeilen kommen in einer beliebigen Reihenfolge, die sich mit einem neuen Index oder einer neuen Version ändern kann. `LIMIT 3` ohne `ORDER BY` heißt „drei beliebige Zeilen“, nicht „die drei größten“. Bei Gleichstand im Sortierkriterium entscheidet ein zweites Kriterium, etwa `ORDER BY warenwert DESC, bestellung_id`.
+  - **`AND` bindet stärker als `OR`.** `WHERE kanal = 'Shop' OR kanal = 'B2B' AND status = 'bezahlt'` bedeutet `kanal = 'Shop' OR (kanal = 'B2B' AND status = 'bezahlt')` und liefert auch stornierte Shop-Bestellungen. Setze Klammern oder nutze `IN`: `WHERE kanal IN ('Shop', 'B2B') AND status = 'bezahlt'`.
+
+  ## Rechnen in der Abfrage: Ausdrücke, Aliase und CASE
+
+  In `SELECT` darf jeder Ausdruck stehen, auch eine Rechnung über mehrere Spalten. Der Nettowert einer Bestellposition ist `menge * einzelpreis * (1 - rabatt)`. Mit `AS` bekommt das Ergebnis einen Namen, den **Alias**, und `ROUND(x, 2)` rundet auf Cent.
+
+  `CASE` macht aus einer Geschäftsregel eine Spalte ([SQLite · CASE](https://sqlite.org/lang_expr.html#case)). Die Bedingungen werden von oben nach unten geprüft, die erste wahre gewinnt. Trifft keine zu und fehlt `ELSE`, ist das Ergebnis `NULL`.
+
+  ```sql run
+  CREATE TABLE positionen (
+    bestellung_id INTEGER, position INTEGER, produkt_id INTEGER,
+    menge INTEGER, einzelpreis REAL, rabatt REAL
+  );
+  INSERT INTO positionen VALUES
+    (1001, 1, 11,  2, 12.90, 0),
+    (1002, 1, 12, 20, 14.50, 0.1),
+    (1002, 2, 31,  1, 39.00, 0.2),
+    (1004, 1, 21,  3, 11.40, 0.05),
+    (1006, 1, 22,  1, 17.80, NULL);
+
+  SELECT bestellung_id, position,
+         ROUND(menge * einzelpreis * (1 - rabatt), 2) AS netto,
+         CASE
+           WHEN rabatt >= 0.1 THEN 'Großkunde'
+           WHEN rabatt > 0    THEN 'Aktion'
+           ELSE 'Listenpreis'
+         END AS preisart
+  FROM positionen
+  ORDER BY netto DESC;
+  ```
+
+  Die letzte Zeile zeigt schon das Thema des übernächsten Abschnitts: Weil `rabatt` fehlt, ist auch `netto` leer – jede Rechnung mit `NULL` ergibt `NULL`. `CASE` hat die Position als „Listenpreis“ eingeordnet, weil keine Bedingung wahr war. Ob das fachlich stimmt, entscheidet nicht SQL, sondern du.
+
+  Besonders nützlich ist `CASE` innerhalb einer Aggregatfunktion: `SUM(CASE WHEN status = 'bezahlt' THEN warenwert END)` summiert nur bezahlte Bestellungen, während `COUNT(*)` daneben alle zählt. Diese **bedingte Aggregation** ist das SQL-Gegenstück zu einer PivotTable, die Werte auf Spalten verteilt ([Intelligente Tabellen und PivotTables](/data/tabellen-pivot)). In SQLite ist ein Vergleich selbst eine Zahl (1 für wahr, 0 für falsch), deshalb zählt `SUM(status = 'storniert')` die stornierten Bestellungen. In PostgreSQL ist das Ergebnis vom Typ `boolean` und lässt sich nicht summieren; dort schreibst du `COUNT(*) FILTER (WHERE status = 'storniert')` – das versteht SQLite seit Version 3.30 ebenfalls – oder die `CASE`-Form.
+
+  ## Die logische Auswertungsreihenfolge
+
+  Geschrieben wird eine Abfrage in der Reihenfolge `SELECT … FROM … WHERE … GROUP BY … HAVING … ORDER BY … LIMIT`. Gedanklich ausgewertet wird sie anders:
+
+  | Schritt | Klausel | Was passiert |
+  | --- | --- | --- |
+  | 1 | `FROM` | Quelltabelle bestimmen |
+  | 2 | `WHERE` | Zeilen filtern |
+  | 3 | `GROUP BY` | Zeilen zu Gruppen zusammenfassen |
+  | 4 | `HAVING` | Gruppen filtern |
+  | 5 | `SELECT` | Ausdrücke berechnen, Aliase vergeben |
+  | 6 | `DISTINCT` | doppelte Ergebniszeilen entfernen |
+  | 7 | `ORDER BY` | sortieren |
+  | 8 | `LIMIT` | abschneiden |
+
+  Das ist ein Denkmodell, kein Ausführungsplan: Der Optimierer darf intern anders vorgehen, solange das Ergebnis dasselbe ist. Aber es erklärt fast jede Fehlermeldung. Ein Alias entsteht in Schritt 5. `ORDER BY netto` funktioniert deshalb, `WHERE netto > 100` ist im Standard ein Fehler, weil `WHERE` in Schritt 2 den Namen noch nicht kennt. SQLite ist hier nachsichtig und löst den Alias trotzdem auf; PostgreSQL meldet `column "netto" does not exist`. Aus demselben Grund gibt es Aggregatfunktionen wie `COUNT(*)` erst ab Schritt 3 und nicht im `WHERE`.
+
+  ```sql run
+  CREATE TABLE positionen (bestellung_id INTEGER, menge INTEGER, einzelpreis REAL);
+  INSERT INTO positionen VALUES (1001, 2, 12.90), (1002, 20, 14.50), (1004, 3, 11.40);
+
+  -- Läuft nur in SQLite: Alias im WHERE
+  SELECT bestellung_id, menge * einzelpreis AS brutto
+  FROM positionen
+  WHERE brutto > 30;
+
+  -- Portabel: Ausdruck wiederholen
+  SELECT bestellung_id, menge * einzelpreis AS brutto
+  FROM positionen
+  WHERE menge * einzelpreis > 30;
+  ```
+
+  Wer eine Abfrage in PostgreSQL oder einem anderen System weiterverwenden will, wiederholt den Ausdruck oder baut die Abfrage in Stufen mit einer Unterabfrage oder einem CTE (siehe [Joins und Datenmodelle abfragen](/data/sql-joins)).
+
+  > [!MERKE]
+  > `FROM` → `WHERE` → `GROUP BY` → `HAVING` → `SELECT` → `DISTINCT` → `ORDER BY` → `LIMIT`. Was in einem Schritt entsteht, kennen nur die späteren Schritte.
+
+  ## NULL: unbekannt ist weder 0 noch leer
+
+  `NULL` steht für „Wert unbekannt oder nicht vorhanden“: die Versandkosten einer B2B-Bestellung, die noch nicht abgerechnet ist, das Abschlussdatum eines offenen Tickets, die Region eines Kunden, der sie nie angegeben hat. `NULL` ist nicht `0` und nicht der leere Text `''`. SQL rechnet damit in einer **dreiwertigen Logik**: Ein Vergleich ist wahr, falsch oder unbekannt. Jeder Vergleich mit `NULL` – auch `NULL = NULL` – ist unbekannt, und `WHERE` behält nur Zeilen, deren Bedingung **wahr** ist ([SQLite · NULL Handling](https://sqlite.org/nulls.html)).
+
+  ```sql run
+  CREATE TABLE kunden (kunde_id INTEGER PRIMARY KEY, name TEXT, region TEXT);
+  INSERT INTO kunden VALUES
+    (1, 'Café Lindner', 'Nord'),
+    (2, 'Büro Hansen & Partner', 'West'),
+    (3, 'Mara Voss', NULL),
+    (4, 'Jonas Albers', 'Süd');
+
+  SELECT NULL = NULL AS gleich, NULL IS NULL AS ist_null, 1 + NULL AS summe;
+
+  SELECT name FROM kunden WHERE region <> 'Nord';
+
+  SELECT name FROM kunden WHERE region IS NOT 'Nord';
+
+  SELECT name, COALESCE(region, 'unbekannt') AS region FROM kunden;
+  ```
+
+  Die zweite Abfrage übersieht Mara Voss: `NULL <> 'Nord'` ist unbekannt, nicht wahr. Das ist der häufigste NULL-Fehler in Berichten – „alle außer Nord“ verliert stillschweigend alle Kunden ohne Region. Drei Werkzeuge helfen:
+
+  - `IS NULL` und `IS NOT NULL` prüfen auf fehlende Werte. `= NULL` ist nie wahr, die Abfrage liefert dann ohne Fehlermeldung nichts.
+  - `IS` und `IS NOT` vergleichen in SQLite wie `=` und `<>`, behandeln `NULL` aber wie einen gewöhnlichen Wert ([SQLite · IS und IS NOT](https://sqlite.org/lang_expr.html#isisnot)). Im SQL-Standard und in PostgreSQL heißt das `IS NOT DISTINCT FROM` bzw. `IS DISTINCT FROM`; SQLite 3.39 kennt beide Schreibweisen.
+  - `COALESCE(a, b, …)` liefert den ersten Wert, der nicht `NULL` ist. Damit ersetzt du fehlende Werte für die Anzeige oder für eine Rechnung, in der „fehlt“ fachlich 0 bedeutet: `warenwert + COALESCE(versandkosten, 0)`.
+
+  Auch ein einfaches `CASE region WHEN NULL THEN 'unbekannt' … END` trifft nie zu, weil es intern mit `=` vergleicht. Schreibe `CASE WHEN region IS NULL THEN …`. Beim Sortieren gilt `NULL` in SQLite als kleiner als jeder andere Wert und steht bei `ASC` vorn, bei `DESC` hinten; `NULLS FIRST` und `NULLS LAST` ändern das.
+
+  > [!WARNING] COALESCE ist eine fachliche Entscheidung
+  > `COALESCE(versandkosten, 0)` behauptet: „Fehlende Versandkosten sind null Euro.“ Für die Frage „Was haben wir bisher berechnet?“ stimmt das, für eine Rechnungsprüfung nicht – dort ist ein fehlender Wert ein Befund. Ersetze `NULL` deshalb erst dort, wo du die Bedeutung kennst, und zähle die ersetzten Fälle mit aus.
+
+  ## Gruppieren und Aggregieren: GROUP BY, WHERE und HAVING
+
+  Aggregatfunktionen verdichten viele Zeilen zu einem Wert: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` ([SQLite · Aggregatfunktionen](https://sqlite.org/lang_aggfunc.html)). Mit `GROUP BY` entsteht **eine Ergebniszeile je Gruppe**, ohne `GROUP BY` eine Zeile für die ganze Tabelle. Alle Aggregatfunktionen außer `COUNT(*)` übergehen `NULL`:
+
+  | Ausdruck | rechnet mit |
+  | --- | --- |
+  | `COUNT(*)` | allen Zeilen der Gruppe |
+  | `COUNT(versandkosten)` | Zeilen, in denen `versandkosten` nicht `NULL` ist |
+  | `COUNT(DISTINCT kunde_id)` | verschiedenen Werten, ohne `NULL` |
+  | `SUM(x)` | Werten ungleich `NULL`; nur `NULL` in der Gruppe ergibt `NULL` |
+  | `AVG(x)` | Werten ungleich `NULL`: deren Summe geteilt durch deren Anzahl |
+
+  Für Berichte heißt das: `AVG(versandkosten)` ist der Durchschnitt über die Bestellungen, deren Versandkosten bekannt sind, nicht über alle. `SUM` über eine Gruppe ohne bekannten Wert ergibt `NULL`; SQLites eigene Funktion `TOTAL(x)` liefert dort `0.0`.
+
+  ```sql run
+  CREATE TABLE bestellungen (
+    bestellung_id INTEGER, kunde_id INTEGER, kanal TEXT, status TEXT,
+    warenwert REAL, versandkosten REAL
+  );
+  INSERT INTO bestellungen VALUES
+    (1001, 1, 'Shop', 'bezahlt',      38.90, 4.90),
+    (1002, 2, 'B2B',  'bezahlt',     412.00, 0),
+    (1003, 3, 'Shop', 'storniert',    21.50, 4.90),
+    (1004, 1, 'Shop', 'bezahlt',      64.20, 0),
+    (1005, 4, 'B2B',  'retourniert', 129.00, 0),
+    (1007, 2, 'B2B',  'bezahlt',     288.50, NULL),
+    (1008, 5, 'Shop', 'bezahlt',      92.40, NULL);
+
+  SELECT kanal,
+         COUNT(*)                     AS bestellungen,
+         COUNT(versandkosten)         AS mit_versand,
+         COUNT(DISTINCT kunde_id)     AS kunden,
+         ROUND(SUM(warenwert), 2)     AS warenwert,
+         ROUND(AVG(versandkosten), 2) AS versand_schnitt
+  FROM bestellungen
+  GROUP BY kanal
+  ORDER BY kanal;
+  ```
+
+  Jede Spalte in `SELECT` muss entweder in `GROUP BY` stehen oder in einer Aggregatfunktion. Der SQL-Standard und PostgreSQL erzwingen das. SQLite erlaubt „nackte“ Spalten und nimmt dann den Wert aus einer beliebigen Zeile der Gruppe ([SQLite · Bare columns](https://sqlite.org/lang_select.html#bareagg)): `SELECT kanal, status, COUNT(*) … GROUP BY kanal` läuft ohne Fehler und zeigt einen Status, der für die Gruppe nichts bedeutet. Behandle das als Fehler, auch wenn SQLite schweigt.
+
+  ### WHERE oder HAVING
+
+  Beide filtern, aber zu verschiedenen Zeitpunkten (Schritt 2 und 4 der Auswertungsreihenfolge). `WHERE` entscheidet über **Zeilen**, bevor gruppiert wird. `HAVING` entscheidet über **Gruppen**, nachdem die Aggregate berechnet sind. Das [PostgreSQL-Tutorial zu Aggregatfunktionen](https://www.postgresql.org/docs/current/tutorial-agg.html) zeigt den Unterschied an einer kleinen Wettertabelle. Die Frage „Welche Kunden haben mindestens zwei bezahlte Bestellungen?“ braucht beides:
+
+  ```sql run
+  CREATE TABLE bestellungen (bestellung_id INTEGER, kunde_id INTEGER, status TEXT);
+  INSERT INTO bestellungen VALUES
+    (1001, 1, 'bezahlt'),   (1004, 1, 'bezahlt'),
+    (1002, 2, 'bezahlt'),   (1007, 2, 'storniert'), (1009, 2, 'retourniert'),
+    (1003, 3, 'storniert'), (1010, 3, 'storniert');
+
+  SELECT kunde_id, COUNT(*) AS bezahlte
+  FROM bestellungen
+  WHERE status = 'bezahlt'
+  GROUP BY kunde_id
+  HAVING COUNT(*) >= 2;
+  ```
+
+  Stünde die Statusbedingung im `HAVING`, zählte `COUNT(*)` alle Bestellungen mit, auch stornierte – und SQLite meldete nicht einmal einen Fehler, weil `status` dort als nackte Spalte gilt. Umgekehrt scheitert eine Aggregatfunktion im `WHERE`, weil es beim Filtern der Zeilen noch keine Gruppen gibt:
+
+  ```sql run fails
+  CREATE TABLE bestellungen (bestellung_id INTEGER, kunde_id INTEGER, status TEXT);
+  INSERT INTO bestellungen VALUES (1001, 1, 'bezahlt'), (1004, 1, 'bezahlt');
+
+  SELECT kunde_id FROM bestellungen WHERE COUNT(*) >= 2 GROUP BY kunde_id;
+  ```
+
+  Faustregel: Bedingungen über einzelne Zeilen gehören ins `WHERE`, Bedingungen über Aggregate ins `HAVING`. Das ist auch schneller, weil weniger Zeilen gruppiert werden. `DISTINCT` schließlich entfernt doppelte Ergebniszeilen: `SELECT DISTINCT kanal, status FROM bestellungen` liefert jede vorkommende Kombination einmal, dasselbe wie `GROUP BY kanal, status` ohne Aggregat.
+
+  > [!INTERVIEW] „Was ist der Unterschied zwischen WHERE und HAVING?“
+  > `WHERE` filtert Zeilen vor der Gruppierung und kann keine Aggregatfunktionen verwenden. `HAVING` filtert Gruppen danach und arbeitet mit Aggregaten wie `COUNT(*) >= 2`. Bei „Kunden mit mindestens zwei bezahlten Bestellungen“ steht der Status im `WHERE` und die Anzahl im `HAVING`. Steht der Status im `HAVING`, werden stornierte Bestellungen mitgezählt – in SQLite sogar ohne Fehlermeldung.
+
+  ## Datum und Typen: was SQLite anders macht
+
+  SQLite hat keinen eigenen Datumstyp. Datumswerte stehen als ISO-8601-Text in der Tabelle (`'2026-03-14'`, `'2026-03-14 09:30'`), und die Datumsfunktionen rechnen mit diesem Text ([SQLite · Datums- und Zeitfunktionen](https://sqlite.org/lang_datefunc.html)). Weil ISO-Text vom Groben zum Feinen geht, sortiert und vergleicht er sich auch als Text chronologisch richtig.
+
+  | Ausdruck | Ergebnis |
+  | --- | --- |
+  | `strftime('%Y-%m', '2026-03-14')` | `2026-03` |
+  | `date('2026-03-14', 'start of month')` | `2026-03-01` |
+  | `date('2026-03-14', 'start of month', '+1 month', '-1 day')` | `2026-03-31` |
+  | `julianday('2026-03-20') - julianday('2026-03-14')` | `6.0` |
+  | `date('14.03.2026')` | `NULL` – das deutsche Format kennt SQLite nicht |
+
+  In PostgreSQL gibt es echte Typen `date` und `timestamp`, und der Monatsanfang hieße `date_trunc('month', bestelldatum)` ([PostgreSQL · date_trunc](https://www.postgresql.org/docs/current/functions-datetime.html#FUNCTIONS-DATETIME-TRUNC)). Für Zeiträume nimmst du in beiden Systemen ein **halboffenes Intervall**: ab dem Ersten, vor dem Ersten des Folgemonats.
+
+  ```sql run
+  CREATE TABLE tickets (ticket_id INTEGER, erstellt_am TEXT, geschlossen_am TEXT, kategorie TEXT);
+  INSERT INTO tickets VALUES
+    (1, '2026-02-27 16:40', '2026-03-02 10:15', 'Lieferung'),
+    (2, '2026-03-03 08:05', '2026-03-03 11:30', 'Rechnung'),
+    (3, '2026-03-17 13:20', NULL,               'Qualität'),
+    (4, '2026-03-31 17:45', '2026-04-01 09:00', 'Lieferung'),
+    (5, '2026-04-02 10:00', NULL,               'Lieferung');
+
+  SELECT strftime('%Y-%m', erstellt_am) AS monat,
+         COUNT(*)                       AS tickets,
+         COUNT(geschlossen_am)          AS geschlossen
+  FROM tickets
+  GROUP BY monat
+  ORDER BY monat;
+
+  SELECT COUNT(*) AS maerz_between
+  FROM tickets
+  WHERE erstellt_am BETWEEN '2026-03-01' AND '2026-03-31';
+
+  SELECT COUNT(*) AS maerz_halboffen
+  FROM tickets
+  WHERE erstellt_am >= '2026-03-01' AND erstellt_am < '2026-04-01';
+  ```
+
+  Die `BETWEEN`-Variante verliert das Ticket vom 31. März um 17:45: Als Text ist `'2026-03-31 17:45'` größer als `'2026-03-31'`.
+
+  ### Typaffinität und Integer-Division
+
+  SQLite typisiert flexibel: Eine Spalte hat eine bevorzugte Speicherklasse, die **Typaffinität**, aber kein striktes Typsystem ([SQLite · Type Affinity](https://sqlite.org/datatype3.html#type_affinity)). Eine Spalte `INTEGER` wandelt `'12'` beim Einfügen in die Zahl 12 um. Eine Spalte `TEXT` – etwa aus einem Import-Werkzeug, das alle Spalten als Text anlegt – speichert Zahlen dagegen als Text. Dann sortiert `ORDER BY menge` alphabetisch (`'100' < '12' < '9'`), und `MAX(menge)` liefert `'9'`. `SUM` rechnet trotzdem richtig, weil es Text, der wie eine Zahl aussieht, als Zahl liest. Abhilfe schafft `CAST(menge AS INTEGER)` in der Abfrage oder besser eine Tabelle mit passenden Typen.
+
+  Die zweite Falle ist die **Integer-Division**: Sind beide Operanden ganze Zahlen, ist das Ergebnis eine ganze Zahl, abgeschnitten in Richtung null ([SQLite · Operatoren](https://sqlite.org/lang_expr.html#binaryops)). `7 / 2` ergibt `3`, und eine Quote wie `SUM(status = 'storniert') / COUNT(*)` ergibt fast immer `0`. PostgreSQL rechnet mit `integer` genauso. Mache einen Operanden zur Kommazahl, bevor geteilt wird: `100.0 * storniert / gesamt`.
+
+  ```sql run
+  CREATE TABLE import_positionen (produkt TEXT, menge TEXT);
+  INSERT INTO import_positionen VALUES
+    ('Espresso Classico', '9'), ('Filter Hausmischung', '12'), ('Entkalker', '100');
+
+  SELECT produkt FROM import_positionen ORDER BY menge DESC LIMIT 1;
+
+  SELECT MAX(menge), MAX(CAST(menge AS INTEGER)), SUM(menge) FROM import_positionen;
+
+  SELECT 7 / 2, 7 / 2.0, 2 / 5 AS quote, ROUND(100.0 * 2 / 5, 1) AS quote_prozent;
+  ```
+
+  > [!PRAXIS] Aus drei Stunden werden fünf Minuten
+  > Bei Bohnenwerk liegt der Monatsbericht heute als `monatsbericht.sql` im Team-Ordner. Die Regeln, die früher nur im Kopf der Kollegin standen – „Umsatz heißt bezahlt, Retouren zählen nicht, Versand kommt extra“ –, stehen dort als `WHERE`, `CASE` und Kommentar. Nach dem Import des Exports läuft die Abfrage in Sekunden. Zur Kontrolle gleichst du Zeilenzahl und Gesamtwarenwert mit dem Shop-Backend ab ([Datenqualität messen und sichern](/data/datenqualitaet)). Der Rest der früheren drei Stunden entfällt, und der Bericht rechnet jeden Monat gleich.
+
+  ## Häufige Fehler
+
+  - **`= NULL` statt `IS NULL`.** Die Abfrage liefert ohne Fehlermeldung keine Zeile. Fehlende Werte prüfst du mit `IS NULL`.
+  - **`<>` oder `NOT IN` übersehen `NULL`.** „Alle außer Nord“ verliert Kunden ohne Region. Ergänze `OR region IS NULL` oder nutze `IS NOT`.
+  - **Quote ist 0.** Integer-Division: `100.0 *` voranstellen oder `CAST(… AS REAL)` verwenden.
+  - **Zu hohe Anzahlen in einer gefilterten Gruppierung.** Eine Zeilenbedingung steht im `HAVING` statt im `WHERE`. SQLite rechnet dann mit einer nackten Spalte, andere Datenbanken melden einen Fehler.
+  - **Fehlermeldung `misuse of aggregate`.** Eine Aggregatfunktion steht im `WHERE`; die Bedingung gehört ins `HAVING`.
+  - **`LIMIT` ohne eindeutiges `ORDER BY`.** Das Ergebnis ändert sich zwischen zwei Läufen. Sortiere mit einem Tie-Breaker, zum Beispiel der ID.
+  - **Monatsende fehlt.** `BETWEEN '2026-03-01' AND '2026-03-31'` verliert Zeitstempel vom 31. Halboffene Intervalle verwenden.
+  - **Datumsfunktionen liefern `NULL`.** Das Datum steht als `14.03.2026` in der Tabelle. Erst ins ISO-Format bringen ([CSV-Import und Datenbereinigung](/data/csv-import)).
+  - **`LIKE` findet Umlaute nicht.** `LIKE` ignoriert in SQLite Groß- und Kleinschreibung nur bei ASCII-Buchstaben: `'Köln' LIKE 'köln'` ist wahr, `'Überlingen' LIKE 'über%'` nicht. In PostgreSQL unterscheidet `LIKE` immer, `ILIKE` nie.
+
+  ## Zusammenfassung
+
+  - Eine Abfrage beschreibt eine Ergebnistabelle. Reihenfolge gibt es nur mit `ORDER BY`, Text steht in einfachen Anführungszeichen.
+  - Logische Reihenfolge: `FROM` → `WHERE` → `GROUP BY` → `HAVING` → `SELECT` → `DISTINCT` → `ORDER BY` → `LIMIT`. Aliase kennt erst `ORDER BY` sicher.
+  - `NULL` ist unbekannt: Vergleiche damit sind nie wahr, Rechnungen ergeben `NULL`. Prüfe mit `IS NULL`, ersetze bewusst mit `COALESCE`.
+  - `COUNT(*)` zählt Zeilen, `COUNT(spalte)` bekannte Werte, `COUNT(DISTINCT spalte)` verschiedene Werte. `SUM` und `AVG` übergehen `NULL`.
+  - `WHERE` filtert Zeilen, `HAVING` filtert Gruppen. Jede Spalte neben einem Aggregat gehört ins `GROUP BY`.
+  - `CASE` übersetzt Regeln in Spalten; in Aggregaten leistet es, was in Excel eine PivotTable leistet.
+  - Datumswerte sind ISO-Text: `strftime('%Y-%m', …)` für Monate, halboffene Intervalle für Zeiträume.
+  - Ganze Zahlen teilen ganzzahlig, als Text gespeicherte Zahlen sortieren alphabetisch.
+exercises:
+  - id: ausser-nord
+    type: choice
+    title: Alle außer Nord
+    prompt: |
+      Für eine Werbeaktion brauchst du alle Kunden, die **nicht** in der Region Nord sind – ausdrücklich auch die, deren Region unbekannt ist (`region` ist `NULL`). Welche Bedingungen liefern in SQLite genau diese Kunden?
+    lang: sql
+    code: |
+      SELECT kunde_id, name
+      FROM kunden
+      WHERE …;
+    options:
+      - text: "`region <> 'Nord'`"
+        correct: false
+        why: Für Kunden ohne Region ist `NULL <> 'Nord'` unbekannt, nicht wahr. `WHERE` behält nur wahre Bedingungen, diese Kunden fehlen.
+      - text: "`region <> 'Nord' OR region IS NULL`"
+        correct: true
+        why: Der zweite Teil holt die Kunden ohne Region ausdrücklich zurück. Diese Form funktioniert in jeder Datenbank.
+      - text: "`region IS NOT 'Nord'`"
+        correct: true
+        why: "`IS NOT` behandelt `NULL` in SQLite wie einen gewöhnlichen Wert: `NULL IS NOT 'Nord'` ist wahr. Standard-SQL schreibt dafür `region IS DISTINCT FROM 'Nord'`."
+      - text: "`NOT (region = 'Nord')`"
+        correct: false
+        why: "`region = 'Nord'` ist für `NULL` unbekannt, und `NOT unbekannt` bleibt unbekannt. Die Verneinung rettet die fehlenden Werte nicht."
+      - text: "`region NOT IN ('Nord', NULL)`"
+        correct: false
+        why: "`x NOT IN ('Nord', NULL)` bedeutet `x <> 'Nord' AND x <> NULL`. Der zweite Vergleich ist immer unbekannt, die Bedingung wird für keine Zeile wahr – das Ergebnis ist leer."
+    explanation: |
+      SQL rechnet mit drei Wahrheitswerten. Jeder Vergleich mit `NULL` ist unbekannt, und `WHERE` lässt nur wahre Bedingungen durch. Deshalb musst du fehlende Werte ausdrücklich behandeln: mit `OR region IS NULL`, mit `IS NOT` (SQLite) bzw. `IS DISTINCT FROM` (Standard) oder mit `COALESCE(region, '') <> 'Nord'`. Ein `NULL` in einer `NOT IN`-Liste ist besonders tückisch, weil es das Ergebnis vollständig leert.
+    resources:
+      - title: SQLite · NULL Handling in SQLite
+        url: https://sqlite.org/nulls.html
+      - title: SQLite · Die Operatoren IS und IS NOT
+        url: https://sqlite.org/lang_expr.html#isisnot
+
+  - id: auswertungsreihenfolge
+    type: order
+    title: Geschrieben ist nicht ausgewertet
+    prompt: |
+      Bring die Klauseln dieser Abfrage in die **logische Auswertungsreihenfolge**: oben der Schritt, den die Datenbank gedanklich zuerst ausführt, unten der letzte.
+    lang: sql
+    lines: |
+      FROM bestellungen
+      WHERE status = 'bezahlt'
+      GROUP BY kunde_id
+      HAVING COUNT(*) >= 2
+      SELECT kunde_id, COUNT(*) AS bezahlte
+      ORDER BY bezahlte DESC
+      LIMIT 5
+    hints:
+      - Bevor gefiltert werden kann, muss feststehen, woher die Zeilen kommen.
+      - "`HAVING` braucht fertige Gruppen, `ORDER BY` darf den Alias `bezahlte` benutzen."
+    explanation: |
+      Zuerst liefert `FROM` die Zeilen, `WHERE` wirft die unbezahlten hinaus, `GROUP BY` bildet eine Gruppe je Kunde, `HAVING` behält nur Gruppen mit mindestens zwei Zeilen. Erst danach berechnet `SELECT` die Ausgabespalten und vergibt den Alias `bezahlte` – deshalb kann `ORDER BY` ihn verwenden, `WHERE` im Standard aber nicht. `LIMIT` schneidet zuletzt ab, sonst wären es nicht die fünf größten Werte. Die Reihenfolge ist ein Denkmodell: Der Optimierer darf anders vorgehen, solange das Ergebnis gleich bleibt.
+    resources:
+      - title: SQLite · Simple Select Processing
+        url: https://sqlite.org/lang_select.html#simpleselect
+      - title: PostgreSQL · SELECT (Beschreibung der Verarbeitungsschritte)
+        url: https://www.postgresql.org/docs/current/sql-select.html
+
+  - id: null-zaehlen
+    type: output
+    title: Was zählt COUNT?
+    prompt: |
+      Was gibt das Skript aus? Schreibe die Ausgabe so, wie die `sqlite3`-Kommandozeile sie im Standardmodus (Listenmodus) zeigt: eine Zeile je Ergebniszeile, Werte durch `|` getrennt, keine Spaltenüberschriften, `NULL` als leerer Wert, Kommazahlen mit Punkt (`2.5`, `3.0`).
+    lang: sql
+    code: |
+      CREATE TABLE bestellungen (bestellung_id INTEGER, kunde_id INTEGER, versandkosten REAL);
+      INSERT INTO bestellungen VALUES
+        (1001, 1,    4.50),
+        (1002, 2,    0),
+        (1003, 1,    NULL),
+        (1004, 3,    4.50),
+        (1005, NULL, NULL);
+
+      SELECT COUNT(*), COUNT(kunde_id), COUNT(DISTINCT kunde_id), COUNT(versandkosten)
+      FROM bestellungen;
+
+      SELECT SUM(versandkosten), AVG(versandkosten)
+      FROM bestellungen;
+
+      SELECT COUNT(*)
+      FROM bestellungen
+      WHERE versandkosten = NULL;
+    expected: |
+      5|4|3|3
+      9.0|3.0
+      0
+    hints:
+      - "`COUNT(*)` zählt Zeilen, `COUNT(spalte)` nur Zeilen, in denen die Spalte einen Wert hat."
+      - "`AVG` teilt durch die Anzahl der bekannten Werte, nicht durch die Anzahl der Zeilen."
+    explanation: |
+      `COUNT(*)` zählt alle fünf Zeilen. `COUNT(kunde_id)` übergeht die Gastbestellung ohne Kunde (4), `COUNT(DISTINCT kunde_id)` zählt die verschiedenen Kunden 1, 2 und 3. `versandkosten` ist dreimal bekannt – die `0` ist ein Wert, kein fehlender. `AVG` ist deshalb 9.0 / 3 = 3.0 und nicht 9.0 / 5 = 1.8. Der Vergleich `= NULL` ist für jede Zeile unbekannt, also zählt die letzte Abfrage keine Zeile; richtig wäre `WHERE versandkosten IS NULL` mit dem Ergebnis 2.
+    resources:
+      - title: SQLite · count(X) und count(*)
+        url: https://sqlite.org/lang_aggfunc.html#count
+      - title: SQLite · avg(X)
+        url: https://sqlite.org/lang_aggfunc.html#avg
+
+  - id: zahlen-die-keine-sind
+    type: output
+    title: Quoten und Zahlen aus Text
+    prompt: |
+      Was gibt das Skript aus? Schreibe die Ausgabe im Listenmodus der `sqlite3`-Kommandozeile: eine Zeile je Ergebniszeile, Werte durch `|` getrennt, keine Spaltenüberschriften, Kommazahlen mit Punkt (`2.5`).
+    lang: sql
+    code: |
+      CREATE TABLE bestellungen (bestellung_id INTEGER, status TEXT);
+      INSERT INTO bestellungen VALUES
+        (1, 'bezahlt'), (2, 'storniert'), (3, 'bezahlt'), (4, 'storniert'),
+        (5, 'retourniert'), (6, 'bezahlt'), (7, 'storniert'), (8, 'bezahlt');
+
+      SELECT COUNT(*),
+             SUM(status = 'storniert'),
+             SUM(status = 'storniert') / COUNT(*),
+             100 * SUM(status = 'storniert') / COUNT(*),
+             ROUND(100.0 * SUM(status = 'storniert') / COUNT(*), 1)
+      FROM bestellungen;
+
+      CREATE TABLE import_positionen (produkt TEXT, menge TEXT);
+      INSERT INTO import_positionen VALUES
+        ('Crema Rossa', '8'), ('Filter Hausmischung', '15'), ('Milchkännchen', '120');
+
+      SELECT MAX(menge), MAX(CAST(menge AS INTEGER)), SUM(menge)
+      FROM import_positionen;
+    expected: |
+      8|3|0|37|37.5
+      8|120|143
+    hints:
+      - Ein Vergleich wie `status = 'storniert'` ist in SQLite die Zahl 1 oder 0.
+      - Zwei ganze Zahlen teilen sich ganzzahlig. Und wie vergleicht man Texte?
+    explanation: |
+      Drei von acht Bestellungen sind storniert. `3 / 8` sind zwei ganze Zahlen, das Ergebnis wird auf `0` abgeschnitten. `100 * 3 / 8` rechnet von links nach rechts `300 / 8` und schneidet `37.5` auf `37` ab. Erst `100.0` macht die Rechnung zur Kommazahl: `37.5`. In der zweiten Tabelle ist `menge` Text. `MAX` vergleicht dann Texte Zeichen für Zeichen, und `'8'` ist größer als `'15'` und `'120'`, weil `8` größer als `1` ist. Nach `CAST` vergleicht `MAX` Zahlen, und `SUM` wandelt den Text ohnehin in Zahlen um: 143.
+    resources:
+      - title: SQLite · Operatoren (Integer-Division)
+        url: https://sqlite.org/lang_expr.html#binaryops
+      - title: SQLite · Typaffinität
+        url: https://sqlite.org/datatype3.html#type_affinity
+
+  - id: case-und-sortierung
+    type: output
+    title: CASE trifft NULL
+    prompt: |
+      Was gibt das Skript aus? Schreibe die Ausgabe im Listenmodus der `sqlite3`-Kommandozeile: eine Zeile je Ergebniszeile, Werte durch `|` getrennt, keine Spaltenüberschriften, `NULL` als leerer Wert.
+    lang: sql
+    code: |
+      CREATE TABLE kunden (kunde_id INTEGER, name TEXT, region TEXT);
+      INSERT INTO kunden VALUES
+        (1, 'Café Lindner', 'Nord'),
+        (2, 'Mara Voss', NULL),
+        (3, 'Büro Hansen', 'West');
+
+      SELECT name,
+             CASE region WHEN NULL THEN 'unbekannt' ELSE region END,
+             CASE WHEN region IS NULL THEN 'unbekannt' ELSE region END
+      FROM kunden
+      ORDER BY region;
+    expected: |
+      Mara Voss||unbekannt
+      Café Lindner|Nord|Nord
+      Büro Hansen|West|West
+    hints:
+      - "Die einfache Form `CASE region WHEN x` vergleicht intern mit `region = x`."
+      - Wo sortiert SQLite `NULL` bei aufsteigender Sortierung ein?
+    explanation: |
+      Die einfache `CASE`-Form prüft `region = NULL`, und dieser Vergleich ist nie wahr. Für Mara Voss greift deshalb `ELSE region`, und das ist `NULL` – in der Ausgabe ein leerer Wert zwischen zwei `|`. Nur die gesuchte Form mit `WHEN region IS NULL` erkennt den fehlenden Wert. SQLite behandelt `NULL` beim Sortieren als kleiner als jeden anderen Wert, deshalb steht Mara Voss bei `ORDER BY region` ganz oben. PostgreSQL sortiert `NULL` bei aufsteigender Sortierung dagegen ans Ende; mit `NULLS FIRST` oder `NULLS LAST` legst du es in beiden Systemen fest.
+    resources:
+      - title: SQLite · Der CASE-Ausdruck
+        url: https://sqlite.org/lang_expr.html#case
+      - title: SQLite · ORDER BY und NULLS FIRST/LAST
+        url: https://sqlite.org/lang_select.html#nullslast
+
+  - id: monatsbericht-luecken
+    type: gap
+    title: Bezahlte Bestellungen je Monat
+    prompt: |
+      Die Abfrage soll je Monat die Anzahl der **bezahlten** Bestellungen, die Zahl verschiedener Kunden und den Warenwert liefern – und nur Monate mit mindestens 20 bezahlten Bestellungen zeigen. `bestelldatum` ist ISO-Text wie `'2026-03-14'`. Ergänze die Lücken.
+    lang: sql
+    code: |
+      SELECT ⟦strftime('%Y-%m', bestelldatum)⟧ AS monat,
+             COUNT(*) AS bestellungen,
+             COUNT(⟦DISTINCT⟧ kunde_id) AS kunden,
+             ROUND(SUM(warenwert), 2) AS warenwert
+      FROM bestellungen
+      ⟦WHERE⟧ status = 'bezahlt'
+      GROUP BY monat
+      ⟦HAVING⟧ COUNT(*) >= 20
+      ORDER BY monat;
+    gaps:
+      - label: Monatsschlüssel
+        hint: Eine SQLite-Funktion formatiert ein Datum mit Platzhaltern wie `%Y` und `%m`.
+        accept:
+          - "STRFTIME('%Y-%m', bestelldatum)"
+          - "substr(bestelldatum, 1, 7)"
+          - "SUBSTR(bestelldatum, 1, 7)"
+          - "date(bestelldatum, 'start of month')"
+      - label: Verschiedene Kunden
+        hint: Ein Schlüsselwort in `COUNT(…)` zählt jeden Wert nur einmal.
+        accept: ["distinct"]
+      - label: Zeilen filtern
+        hint: Der Status gehört zu einer einzelnen Bestellung, nicht zu einer Gruppe.
+        accept: ["where"]
+      - label: Gruppen filtern
+        hint: Diese Bedingung verwendet ein Aggregat und wird nach dem Gruppieren geprüft.
+        accept: ["having"]
+    explanation: |
+      `strftime('%Y-%m', bestelldatum)` macht aus jedem Datum einen Monatsschlüssel wie `2026-03`; bei ISO-Text liefert `substr(bestelldatum, 1, 7)` dasselbe. `COUNT(DISTINCT kunde_id)` zählt Kunden mit mehreren Bestellungen nur einmal. Der Status ist eine Eigenschaft der einzelnen Zeile und gehört deshalb ins `WHERE` – dann zählt `COUNT(*)` nur bezahlte Bestellungen. `COUNT(*) >= 20` ist eine Bedingung über die Gruppe und gehört ins `HAVING`. Dass `GROUP BY monat` den Alias verwenden darf, ist eine Erweiterung von SQLite (und PostgreSQL); portabel wiederholst du den Ausdruck.
+    resources:
+      - title: SQLite · strftime
+        url: https://sqlite.org/lang_datefunc.html#strftm
+      - title: SQLite · count(X)
+        url: https://sqlite.org/lang_aggfunc.html#count
+
+  - id: top-bestellungen
+    type: sql
+    title: Die drei größten Shop-Bestellungen im März
+    prompt: |
+      Die Vertriebsleitung will die drei **bezahlten Shop-Bestellungen aus dem März 2026** mit dem höchsten Gesamtbetrag sehen. Gesamtbetrag = `warenwert` plus `versandkosten`; fehlende Versandkosten (`NULL`) zählen als 0.
+
+      Spalten: `bestellung_id`, `bestelldatum`, `gesamt` (auf zwei Nachkommastellen gerundet). Sortierung: größter Gesamtbetrag zuerst. Genau drei Zeilen.
+    schema: |
+      CREATE TABLE bestellungen (
+        bestellung_id INTEGER PRIMARY KEY,
+        kunde_id      INTEGER,
+        bestelldatum  TEXT,
+        kanal         TEXT,
+        status        TEXT,
+        warenwert     REAL,
+        versandkosten REAL
+      );
+      INSERT INTO bestellungen VALUES
+        (1101,  7, '2026-02-27', 'Shop', 'bezahlt',     149.00, 4.90),
+        (1102,  3, '2026-03-02', 'Shop', 'bezahlt',      58.40, 4.90),
+        (1103, 12, '2026-03-04', 'B2B',  'bezahlt',     640.00, 0),
+        (1104,  5, '2026-03-06', 'Shop', 'storniert',   212.50, 0),
+        (1105,  8, '2026-03-11', 'Shop', 'bezahlt',      96.80, NULL),
+        (1106,  3, '2026-03-15', 'Shop', 'bezahlt',      71.20, 4.90),
+        (1107,  9, '2026-03-19', 'Shop', 'retourniert', 134.00, 4.90),
+        (1108,  4, '2026-03-23', 'Shop', 'bezahlt',      88.00, 4.90),
+        (1109, 10, '2026-03-31', 'Shop', 'bezahlt',      64.90, 4.90),
+        (1110,  6, '2026-04-01', 'Shop', 'bezahlt',     180.00, 0);
+    starter: |
+      SELECT bestellung_id, bestelldatum, warenwert + versandkosten AS gesamt
+      FROM bestellungen
+      WHERE kanal = 'Shop'
+      ORDER BY gesamt DESC;
+    solution: |
+      SELECT bestellung_id,
+             bestelldatum,
+             ROUND(warenwert + COALESCE(versandkosten, 0), 2) AS gesamt
+      FROM bestellungen
+      WHERE kanal = 'Shop'
+        AND status = 'bezahlt'
+        AND bestelldatum >= '2026-03-01'
+        AND bestelldatum < '2026-04-01'
+      ORDER BY gesamt DESC
+      LIMIT 3;
+    ordered: true
+    hints:
+      - Drei Bedingungen fehlen im `WHERE`; ein Zeitraum lässt sich als „ab dem 1. März, vor dem 1. April“ schreiben.
+      - Schau dir Bestellung 1105 an. Was ergibt `96.80 + NULL`?
+      - "`ROUND(warenwert + COALESCE(versandkosten, 0), 2) AS gesamt`, dann `ORDER BY gesamt DESC LIMIT 3`."
+    explanation: |
+      Ohne `COALESCE` ist der Gesamtbetrag von Bestellung 1105 `NULL`, und `NULL` landet bei absteigender Sortierung in SQLite ganz hinten – die größte bezahlte März-Bestellung im Shop fiele aus den Top 3. Die B2B-Bestellung 1103, die stornierte 1104, die Retoure 1107 und die Bestellungen vom Februar und April sind die übrigen Fallen: Jede wäre ohne den passenden Filter weit oben gelandet. `LIMIT` wirkt erst nach `ORDER BY`; ohne Sortierung wären es drei beliebige Zeilen.
+    resources:
+      - title: SQLite · coalesce()
+        url: https://sqlite.org/lang_corefunc.html#coalesce
+      - title: SQLite · LIMIT und OFFSET
+        url: https://sqlite.org/lang_select.html#limitoffset
+
+  - id: groessenklassen
+    type: sql
+    title: Bestellungen in Größenklassen
+    prompt: |
+      Für die Versandplanung sollen die **bezahlten** Bestellungen nach Warenwert in Klassen eingeteilt werden:
+
+      - `klein`: unter 50 EUR
+      - `mittel`: ab 50 bis unter 200 EUR
+      - `groß`: ab 200 EUR
+      - `unbekannt`: Warenwert fehlt (`NULL`)
+
+      Liefere je Klasse eine Zeile. Spalten: `klasse`, `bestellungen` (Anzahl) und `warenwert` (Summe, auf zwei Nachkommastellen gerundet; bei `unbekannt` bleibt sie `NULL`). Die Reihenfolge der Zeilen ist egal.
+    schema: |
+      CREATE TABLE bestellungen (
+        bestellung_id INTEGER PRIMARY KEY,
+        kunde_id      INTEGER,
+        status        TEXT,
+        warenwert     REAL
+      );
+      INSERT INTO bestellungen VALUES
+        (2001, 1, 'bezahlt',      18.90),
+        (2002, 2, 'bezahlt',      50.00),
+        (2003, 3, 'bezahlt',      49.99),
+        (2004, 4, 'storniert',   320.00),
+        (2005, 5, 'bezahlt',     200.00),
+        (2006, 2, 'bezahlt',     612.40),
+        (2007, 6, 'bezahlt',       NULL),
+        (2008, 7, 'bezahlt',     134.50),
+        (2009, 1, 'retourniert',  75.00),
+        (2010, 8, 'bezahlt',      27.30);
+    starter: |
+      SELECT CASE
+               WHEN warenwert < 50 THEN 'klein'
+               ELSE 'groß'
+             END AS klasse,
+             COUNT(*) AS bestellungen
+      FROM bestellungen
+      GROUP BY klasse;
+    solution: |
+      SELECT CASE
+               WHEN warenwert IS NULL THEN 'unbekannt'
+               WHEN warenwert < 50 THEN 'klein'
+               WHEN warenwert < 200 THEN 'mittel'
+               ELSE 'groß'
+             END AS klasse,
+             COUNT(*) AS bestellungen,
+             ROUND(SUM(warenwert), 2) AS warenwert
+      FROM bestellungen
+      WHERE status = 'bezahlt'
+      GROUP BY klasse;
+    hints:
+      - "`CASE` prüft von oben nach unten, die erste wahre Bedingung gewinnt. Wo muss die Prüfung auf `NULL` stehen, damit sie nicht im `ELSE` landet?"
+      - Achte auf die Grenzen 50 und 200. Bestellung 2002 gehört zu `mittel`, 2005 zu `groß`.
+      - "Reihenfolge der `WHEN`-Zweige: `IS NULL`, `< 50`, `< 200`, dann `ELSE 'groß'`. Dazu `WHERE status = 'bezahlt'` und `GROUP BY klasse`."
+    explanation: |
+      Weil `CASE` die erste wahre Bedingung nimmt, reicht `WHEN warenwert < 200` für `mittel` – alles unter 50 wurde schon vorher als `klein` einsortiert. Ohne eigenen `IS NULL`-Zweig fiele die Bestellung ohne Warenwert ins `ELSE` und würde als `groß` gezählt, denn `NULL < 50` ist nicht wahr. Die Grenzwerte 50,00 und 200,00 zeigen, ob `<` und `>=` richtig verteilt sind. Die Summe der Klasse `unbekannt` bleibt `NULL`, weil `SUM` nur bekannte Werte addiert.
+    resources:
+      - title: SQLite · Der CASE-Ausdruck
+        url: https://sqlite.org/lang_expr.html#case
+      - title: SQLite · sum() und total()
+        url: https://sqlite.org/lang_aggfunc.html#sumunc
+
+  - id: kennzahlen-je-kanal
+    type: sql
+    title: Kanalübersicht mit Stornoquote
+    prompt: |
+      Erstelle die Kanalübersicht für den März-Bericht. Alle Bestellungen in der Tabelle stammen aus dem März. Je `kanal` eine Zeile mit:
+
+      - `bestellungen`: alle Bestellungen des Kanals
+      - `storniert`: Anzahl der Bestellungen mit Status `storniert`
+      - `storno_quote`: Anteil stornierter Bestellungen in Prozent, auf eine Nachkommastelle gerundet (zum Beispiel `12.5`)
+      - `ohne_versandkosten`: Anzahl der Bestellungen, bei denen `versandkosten` fehlt (`NULL`) – eine `0` ist ein bekannter Wert
+
+      Sortiere nach `kanal` aufsteigend.
+    schema: |
+      CREATE TABLE bestellungen (
+        bestellung_id INTEGER PRIMARY KEY,
+        kanal         TEXT,
+        status        TEXT,
+        versandkosten REAL
+      );
+      INSERT INTO bestellungen VALUES
+        (3001, 'Shop', 'bezahlt',     4.90),
+        (3002, 'Shop', 'storniert',   4.90),
+        (3003, 'B2B',  'bezahlt',     0),
+        (3004, 'Shop', 'bezahlt',     NULL),
+        (3005, 'B2B',  'bezahlt',     NULL),
+        (3006, 'Shop', 'retourniert', 4.90),
+        (3007, 'Shop', 'bezahlt',     0),
+        (3008, 'B2B',  'storniert',   NULL),
+        (3009, 'Shop', 'storniert',   4.90),
+        (3010, 'B2B',  'bezahlt',     0),
+        (3011, 'Shop', 'bezahlt',     4.90),
+        (3012, 'B2B',  'bezahlt',     0);
+    starter: |
+      SELECT kanal,
+             COUNT(*) AS bestellungen
+      FROM bestellungen
+      GROUP BY kanal;
+    solution: |
+      SELECT kanal,
+             COUNT(*) AS bestellungen,
+             SUM(status = 'storniert') AS storniert,
+             ROUND(100.0 * SUM(status = 'storniert') / COUNT(*), 1) AS storno_quote,
+             COUNT(*) - COUNT(versandkosten) AS ohne_versandkosten
+      FROM bestellungen
+      GROUP BY kanal
+      ORDER BY kanal;
+    ordered: true
+    hints:
+      - Stornierte zählst du mit `SUM(status = 'storniert')` oder `COUNT(CASE WHEN status = 'storniert' THEN 1 END)`.
+      - Bekommst du eine Quote von `0.0`? Dann teilen zwei ganze Zahlen. Beginne die Rechnung mit `100.0 *`.
+      - "Fehlende Werte: `COUNT(*) - COUNT(versandkosten)` oder `SUM(versandkosten IS NULL)`."
+    explanation: |
+      Ein `WHERE status = 'storniert'` würde die übrigen Bestellungen entfernen und `bestellungen` verfälschen. Deshalb zählst du bedingt innerhalb der Gruppe. Die Quote braucht eine Kommazahl im Zähler, sonst ergibt 2 / 7 eine ganzzahlige 0. `COUNT(versandkosten)` zählt die bekannten Werte einschließlich der Nullen; die Differenz zu `COUNT(*)` sind genau die fehlenden. Für Shop ergibt das 7 Bestellungen, 2 storniert, 28.6 % und einen fehlenden Versandwert, für B2B 5, 1, 20.0 % und 2.
+    resources:
+      - title: SQLite · count(X) und count(*)
+        url: https://sqlite.org/lang_aggfunc.html#count
+      - title: SQLite · Operatoren (Integer-Division)
+        url: https://sqlite.org/lang_expr.html#binaryops
+
+  - id: stammkunden
+    type: sql
+    title: Stammkunden im ersten Quartal
+    prompt: |
+      Das Marketing will Stammkunden belohnen: Kunden mit **mindestens zwei bezahlten Bestellungen im ersten Quartal 2026** (Januar bis März), deren bezahlte Q1-Bestellungen zusammen **mindestens 100 EUR** Warenwert haben.
+
+      Spalten: `kunde_id`, `bestellungen` (Anzahl der bezahlten Q1-Bestellungen) und `warenwert` (deren Summe, auf zwei Nachkommastellen gerundet). Sortierung: `warenwert` absteigend.
+    schema: |
+      CREATE TABLE bestellungen (
+        bestellung_id INTEGER PRIMARY KEY,
+        kunde_id      INTEGER,
+        bestelldatum  TEXT,
+        status        TEXT,
+        warenwert     REAL
+      );
+      INSERT INTO bestellungen VALUES
+        (4001, 1, '2026-01-12', 'bezahlt',      60.00),
+        (4002, 1, '2026-03-02', 'bezahlt',      55.00),
+        (4003, 2, '2026-01-20', 'bezahlt',     120.00),
+        (4004, 2, '2026-02-03', 'retourniert',  45.00),
+        (4005, 3, '2026-02-14', 'bezahlt',      38.00),
+        (4006, 3, '2026-03-09', 'bezahlt',      42.00),
+        (4007, 4, '2025-12-30', 'bezahlt',      95.00),
+        (4008, 4, '2026-02-10', 'bezahlt',      70.00),
+        (4009, 5, '2026-01-07', 'bezahlt',      70.00),
+        (4010, 5, '2026-03-18', 'bezahlt',      48.50),
+        (4011, 6, '2026-02-21', 'bezahlt',     100.00),
+        (4012, 6, '2026-03-31', 'bezahlt',      50.00);
+    starter: |
+      SELECT kunde_id,
+             COUNT(*) AS bestellungen,
+             ROUND(SUM(warenwert), 2) AS warenwert
+      FROM bestellungen
+      GROUP BY kunde_id;
+    solution: |
+      SELECT kunde_id,
+             COUNT(*) AS bestellungen,
+             ROUND(SUM(warenwert), 2) AS warenwert
+      FROM bestellungen
+      WHERE status = 'bezahlt'
+        AND bestelldatum >= '2026-01-01'
+        AND bestelldatum < '2026-04-01'
+      GROUP BY kunde_id
+      HAVING COUNT(*) >= 2 AND SUM(warenwert) >= 100
+      ORDER BY warenwert DESC;
+    ordered: true
+    hints:
+      - Zwei Bedingungen betreffen einzelne Bestellungen, zwei betreffen die Summe je Kunde. Welche gehören wohin?
+      - Kunde 2 hat zwei Bestellungen im Quartal, aber nur eine davon ist bezahlt. Kunde 4 hat eine bezahlte Bestellung im Dezember 2025.
+      - "`WHERE status = 'bezahlt' AND bestelldatum >= '2026-01-01' AND bestelldatum < '2026-04-01'`, danach `HAVING COUNT(*) >= 2 AND SUM(warenwert) >= 100`."
+    explanation: |
+      Status und Datum sind Eigenschaften einzelner Bestellungen und gehören ins `WHERE`. Nur so zählen `COUNT(*)` und `SUM(warenwert)` ausschließlich bezahlte Q1-Bestellungen. Anzahl und Summe je Kunde entstehen erst durch das Gruppieren und gehören ins `HAVING`. Die Fallen: Kunde 2 käme ohne Statusfilter auf zwei Bestellungen und 165 EUR, Kunde 4 ohne Datumsfilter ebenfalls, Kunde 3 scheitert an der 100-EUR-Grenze. Übrig bleiben die Kunden 6, 5 und 1.
+    resources:
+      - title: PostgreSQL-Tutorial · Aggregate Functions (WHERE und HAVING)
+        url: https://www.postgresql.org/docs/current/tutorial-agg.html
+      - title: SQLite · SELECT – WHERE-Klausel
+        url: https://sqlite.org/lang_select.html#whereclause
+
+  - id: offen-prozent-null
+    type: bug
+    title: Kein Ticket ist offen – angeblich
+    prompt: |
+      Die Abfrage soll je Ticketkategorie zeigen, wie viel Prozent der Tickets noch offen sind (`geschlossen_am` ist `NULL`). Die Spalte `offen` stimmt, etwa 3 offene von 8 Tickets bei „Lieferung“. Aber `offen_prozent` zeigt für jede Kategorie mit geschlossenen Tickets `0.0`. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: sql
+    code: |
+      SELECT kategorie,
+             COUNT(*) AS tickets,
+             COUNT(*) - COUNT(geschlossen_am) AS offen,
+             ROUND((COUNT(*) - COUNT(geschlossen_am)) / COUNT(*) * 100, 1) AS offen_prozent
+      FROM tickets
+      GROUP BY kategorie
+      ORDER BY offen_prozent DESC;
+    lines: [4]
+    fix:
+      - line: 4
+        answers:
+          - "ROUND(100.0 * (COUNT(*) - COUNT(geschlossen_am)) / COUNT(*), 1) AS offen_prozent"
+          - "ROUND((COUNT(*) - COUNT(geschlossen_am)) * 100.0 / COUNT(*), 1) AS offen_prozent"
+          - "ROUND((COUNT(*) - COUNT(geschlossen_am)) * 1.0 / COUNT(*) * 100, 1) AS offen_prozent"
+          - "ROUND(1.0 * (COUNT(*) - COUNT(geschlossen_am)) / COUNT(*) * 100, 1) AS offen_prozent"
+          - "ROUND((COUNT(*) - COUNT(geschlossen_am)) / (COUNT(*) * 1.0) * 100, 1) AS offen_prozent"
+          - "ROUND((COUNT(*) - COUNT(geschlossen_am)) / (1.0 * COUNT(*)) * 100, 1) AS offen_prozent"
+          - "ROUND(CAST(COUNT(*) - COUNT(geschlossen_am) AS REAL) / COUNT(*) * 100, 1) AS offen_prozent"
+          - "ROUND((COUNT(*) - COUNT(geschlossen_am)) / CAST(COUNT(*) AS REAL) * 100, 1) AS offen_prozent"
+          - "ROUND(100.0 * SUM(geschlossen_am IS NULL) / COUNT(*), 1) AS offen_prozent"
+    hints:
+      - Welchen Typ haben `COUNT(*) - COUNT(geschlossen_am)` und `COUNT(*)`?
+      - "3 / 8 ergibt in SQLite `0`. Erst danach wird mit 100 multipliziert."
+    explanation: |
+      `COUNT` liefert ganze Zahlen. `3 / 8` ist deshalb eine Integer-Division mit dem Ergebnis `0`, und `0 * 100` bleibt `0`; `ROUND` macht daraus nur `0.0`. Nur Kategorien, in denen alle Tickets offen sind, zeigen `100.0`, weil dort `n / n = 1` ist. Die Reparatur macht einen Operanden zur Kommazahl, bevor geteilt wird: `100.0 * offen / tickets`. Die Multiplikation mit `100` **nach** der Division hilft nicht, weil der Nachkommaanteil zu dem Zeitpunkt schon verloren ist.
+    resources:
+      - title: SQLite · Operatoren (Integer-Division)
+        url: https://sqlite.org/lang_expr.html#binaryops
+      - title: SQLite · CAST-Ausdrücke
+        url: https://sqlite.org/lang_expr.html#castexpr
+
+  - id: having-status
+    type: bug
+    title: Stammkunden, die keine sind
+    prompt: |
+      Die Abfrage soll Kunden mit **mindestens zwei bezahlten Bestellungen** seit Januar 2026 liefern. Die Liste enthält aber auch Kunden, die nur eine bezahlte und mehrere stornierte Bestellungen haben, und `bezahlte_bestellungen` zählt stornierte mit. SQLite meldet keinen Fehler. Finde die fehlerhaften Zeilen und korrigiere sie, ohne Zeilen hinzuzufügen oder zu löschen.
+    lang: sql
+    code: |
+      SELECT kunde_id,
+             COUNT(*) AS bezahlte_bestellungen
+      FROM bestellungen
+      WHERE bestelldatum >= '2026-01-01'
+      GROUP BY kunde_id
+      HAVING status = 'bezahlt' AND COUNT(*) >= 2
+      ORDER BY kunde_id;
+    lines: [4, 6]
+    fix:
+      - line: 4
+        answers:
+          - "WHERE bestelldatum >= '2026-01-01' AND status = 'bezahlt'"
+          - "WHERE status = 'bezahlt' AND bestelldatum >= '2026-01-01'"
+      - line: 6
+        answers:
+          - "HAVING COUNT(*) >= 2"
+    hints:
+      - Wann wird `HAVING` ausgewertet – vor oder nach dem Zählen?
+      - "`status` steht in keiner Aggregatfunktion und nicht im `GROUP BY`. Welchen Wert hat es für eine ganze Gruppe?"
+    explanation: |
+      `HAVING` prüft Gruppen, nachdem `COUNT(*)` alle Bestellungen seit Januar gezählt hat – stornierte eingeschlossen. `status` ist dort eine nackte Spalte: SQLite nimmt den Wert aus irgendeiner Zeile der Gruppe, PostgreSQL würde die Abfrage mit einem Fehler ablehnen. Ob ein Kunde erscheint, hängt so vom Zufall der gewählten Zeile ab. Der Status ist eine Eigenschaft der einzelnen Bestellung und gehört ins `WHERE`, damit nur bezahlte Bestellungen gezählt werden; im `HAVING` bleibt die Bedingung über die Gruppe.
+    resources:
+      - title: SQLite · Bare columns in an aggregate query
+        url: https://sqlite.org/lang_select.html#bareagg
+      - title: SQLite · Quirks – nicht gruppierte Spalten
+        url: https://sqlite.org/quirks.html#aggregate_queries_can_contain_non_aggregate_result_columns_that_are_not_in_the_group_by_clause
+
+  - id: ticket-auswertung-erklaeren
+    type: explain
+    title: Was die Ticket-Auswertung verschweigt
+    prompt: |
+      Deine Teamleiterin will die Ticket-Auswertung für März im Wochenmeeting zeigen und fragt: „Was genau bedeuten `offen` und `tage_bis_abschluss` – und fehlt da etwas?“ Erkläre, was die Abfrage Schritt für Schritt tut und wie die beiden Spalten mit offenen Tickets umgehen.
+    lang: sql
+    code: |
+      SELECT kategorie,
+             COUNT(*) AS tickets,
+             COUNT(*) - COUNT(geschlossen_am) AS offen,
+             ROUND(AVG(julianday(geschlossen_am) - julianday(erstellt_am)), 1) AS tage_bis_abschluss
+      FROM tickets
+      WHERE erstellt_am >= '2026-03-01' AND erstellt_am < '2026-04-01'
+      GROUP BY kategorie
+      HAVING COUNT(*) >= 5
+      ORDER BY offen DESC;
+    points:
+      - Das halboffene Intervall im `WHERE` erfasst alle im März erstellten Tickets, auch solche vom 31. März mit Uhrzeit.
+      - "`COUNT(geschlossen_am)` zählt nur Tickets mit Abschlussdatum; die Differenz zu `COUNT(*)` ist die Zahl der offenen Tickets."
+      - Für offene Tickets ist die Differenz der Julianischen Tage `NULL`, und `AVG` übergeht sie. `tage_bis_abschluss` beschreibt nur geschlossene Tickets und wirkt deshalb zu gut, wenn viele lange offen sind.
+      - "`HAVING` entfernt nach dem Gruppieren Kategorien mit weniger als fünf März-Tickets; `ORDER BY` darf den Alias `offen` nutzen, weil es nach `SELECT` ausgewertet wird."
+    explanation: |
+      Die Abfrage nimmt alle Tickets, die im März erstellt wurden. Das Intervall „ab 1. März, vor 1. April“ erfasst auch Zeitstempel am 31. März, was `BETWEEN … AND '2026-03-31'` nicht täte. Je Kategorie zählt sie alle Tickets und zieht die geschlossenen ab – `COUNT(geschlossen_am)` übergeht `NULL` –, das ergibt `offen`. Für `tage_bis_abschluss` rechnet sie je Ticket die Tage zwischen Erstellung und Abschluss aus. Bei offenen Tickets ist das `NULL`, und `AVG` lässt diese Tickets weg: Der Wert ist die mittlere Bearbeitungszeit der **erledigten** Tickets. Ein Ticket, das seit drei Wochen offen ist, macht den Schnitt nicht schlechter – im Meeting sollte man das dazusagen oder zusätzlich das Alter der offenen Tickets zeigen. Kategorien mit weniger als fünf Tickets fallen durch `HAVING` weg, und sortiert wird nach der Zahl offener Tickets.
+    resources:
+      - title: SQLite · avg(X)
+        url: https://sqlite.org/lang_aggfunc.html#avg
+      - title: SQLite · julianday() und Zeitwerte
+        url: https://sqlite.org/lang_datefunc.html#time_values
+
+  - id: monatsbericht
+    type: sql
+    title: Der Monatsbericht in einer Abfrage
+    prompt: |
+      Jetzt der ganze Monatsbericht, der bei Bohnenwerk bisher drei Stunden Excel-Arbeit kostete. Die Tabelle `bestellungen` enthält den Export des ersten Quartals. Liefere je Monat eine Zeile mit:
+
+      - `monat` im Format `2026-01`
+      - `bestellungen`: alle Bestellungen des Monats, gleich welcher Status
+      - `bezahlt`: Anzahl der bezahlten Bestellungen
+      - `umsatz`: Warenwert der **bezahlten** Bestellungen, auf zwei Nachkommastellen gerundet
+      - `storno_quote`: Anteil stornierter an allen Bestellungen des Monats in Prozent, auf eine Nachkommastelle gerundet
+
+      Sortiere chronologisch.
+    schema: |
+      CREATE TABLE bestellungen (
+        bestellung_id INTEGER PRIMARY KEY,
+        kunde_id      INTEGER,
+        bestelldatum  TEXT,
+        kanal         TEXT,
+        status        TEXT,
+        warenwert     REAL
+      );
+      INSERT INTO bestellungen VALUES
+        (5001, 1, '2026-01-08', 'Shop', 'bezahlt',     120.00),
+        (5002, 2, '2026-01-19', 'Shop', 'storniert',    45.00),
+        (5003, 3, '2026-01-31', 'B2B',  'bezahlt',      88.50),
+        (5004, 1, '2026-02-01', 'Shop', 'bezahlt',      64.00),
+        (5005, 4, '2026-02-09', 'Shop', 'retourniert',  99.00),
+        (5006, 5, '2026-02-17', 'B2B',  'bezahlt',     410.00),
+        (5007, 2, '2026-02-26', 'Shop', 'bezahlt',      18.90),
+        (5008, 6, '2026-03-03', 'B2B',  'storniert',   250.00),
+        (5009, 3, '2026-03-10', 'Shop', 'bezahlt',      72.30),
+        (5010, 7, '2026-03-16', 'Shop', 'storniert',    38.00),
+        (5011, 1, '2026-03-24', 'B2B',  'bezahlt',     129.90),
+        (5012, 8, '2026-03-31', 'Shop', 'bezahlt',      54.00);
+    starter: |
+      SELECT strftime('%Y-%m', bestelldatum) AS monat,
+             COUNT(*) AS bestellungen
+      FROM bestellungen
+      GROUP BY monat;
+    solution: |
+      SELECT strftime('%Y-%m', bestelldatum) AS monat,
+             COUNT(*) AS bestellungen,
+             SUM(status = 'bezahlt') AS bezahlt,
+             ROUND(SUM(CASE WHEN status = 'bezahlt' THEN warenwert END), 2) AS umsatz,
+             ROUND(100.0 * SUM(status = 'storniert') / COUNT(*), 1) AS storno_quote
+      FROM bestellungen
+      GROUP BY monat
+      ORDER BY monat;
+    ordered: true
+    hints:
+      - Ein `WHERE status = 'bezahlt'` würde die stornierten Bestellungen entfernen, die du für `bestellungen` und `storno_quote` brauchst.
+      - Summiere bedingt – `CASE` ohne `ELSE` liefert `NULL`, und `SUM` übergeht `NULL`.
+      - "`ROUND(SUM(CASE WHEN status = 'bezahlt' THEN warenwert END), 2) AS umsatz` und `ROUND(100.0 * SUM(status = 'storniert') / COUNT(*), 1) AS storno_quote`."
+    explanation: |
+      Die Kennzahlen beziehen sich auf unterschiedliche Teilmengen desselben Monats: `bestellungen` auf alle, `bezahlt` und `umsatz` auf bezahlte, die Quote auf stornierte. Ein Filter im `WHERE` würde alle Kennzahlen gleichzeitig treffen. Die bedingte Aggregation mit `CASE` innerhalb von `SUM` wertet die Bedingung dagegen je Kennzahl aus – dasselbe Prinzip wie eine PivotTable mit mehreren Wertfeldern. Die Retoure im Februar zählt bei `bestellungen` und im Nenner der Stornoquote mit, aber weder beim Umsatz noch als Storno. Der Februar zeigt `0.0` als Quote, weil `SUM` über lauter Nullen `0` ergibt und nicht `NULL`.
+    resources:
+      - title: SQLite · Der CASE-Ausdruck
+        url: https://sqlite.org/lang_expr.html#case
+      - title: SQLite · strftime
+        url: https://sqlite.org/lang_datefunc.html#strftm
