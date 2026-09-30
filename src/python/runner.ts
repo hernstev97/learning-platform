@@ -1,12 +1,19 @@
 // Main-thread side of the Python worker: queues jobs, reports loading state, enforces a time limit.
+import type { SqlValue } from '../content/types.ts';
 import type { Job } from './worker.ts';
 
 export type TestResult = { name: string; ok: boolean; message: string };
 export type ExerciseResult = { stdout: string; error: string | null; tests: TestResult[] };
 export type SnippetResult = { stdout: string; error: string | null };
-export type RunnerState = 'idle' | 'loading' | 'ready' | 'running';
+/** `cells` are the values as the sqlite3 shell prints them; `rows` keep the raw values for comparing. */
+export type SqlResultSet = { columns: string[]; rows: SqlValue[][]; cells: string[][]; truncated: boolean };
+export type SqlResult = SqlResultSet & { error: string | null };
+export type SqlScriptResult = { results: SqlResultSet[]; text: string; error: string | null };
+export type RunnerState = 'idle' | 'loading' | 'packages' | 'ready' | 'running';
 
 const TIME_LIMIT = 10_000;
+/** Loading packages such as pandas (about 8 MB) happens before the time limit starts. */
+const PACKAGE_LIMIT = 120_000;
 let worker: Worker | null = null;
 let booted = false;
 let nextId = 1;
@@ -42,7 +49,10 @@ function spawn(): Worker {
   return created;
 }
 
-function send<T>(job: Omit<Job, 'id'> | { kind: 'boot' }, limit: number | null): Promise<T> {
+/** A job without its id, per kind (the runner assigns ids). */
+type WithoutId<J> = J extends unknown ? Omit<J, 'id'> : never;
+type NewJob = WithoutId<Job>;
+function send<T>(job: NewJob | { kind: 'boot' }, limit: number | null): Promise<T> {
   worker ??= spawn();
   const id = nextId++;
   const current = worker;
@@ -83,10 +93,14 @@ export async function ensurePython(): Promise<void> {
   await booting;
 }
 
-function run<T>(job: Omit<Job, 'id'>): Promise<T> {
+function run<T>(job: NewJob, imports: string): Promise<T> {
   // Pyodide and the harness share globals/cwd/stdout. Async snippets must never overlap.
   const result = queue.then(async () => {
     await ensurePython();
+    // Already loaded packages make this a few milliseconds; only a real download or first import shows the notice.
+    const slow = setTimeout(() => setState('packages'), 300);
+    try { await send({ kind: 'prepare', code: imports }, PACKAGE_LIMIT); }
+    finally { clearTimeout(slow); }
     setState('running');
     try { return await send<T>(job, TIME_LIMIT); }
     finally { if (state === 'running') setState('ready'); }
@@ -94,5 +108,16 @@ function run<T>(job: Omit<Job, 'id'>): Promise<T> {
   queue = result.catch(() => {});
   return result;
 }
-export const runExercise = (setup: string, code: string, tests: { name: string; code: string }[]) => run<ExerciseResult>({ kind: 'exercise', setup, code, tests });
-export const runSnippet = (code: string) => run<SnippetResult>({ kind: 'snippet', code });
+export const runExercise = (setup: string, code: string, tests: { name: string; code: string }[]) =>
+  run<ExerciseResult>({ kind: 'exercise', setup, code, tests }, [setup, code, ...tests.map((test) => test.code)].join('\n'));
+export const runSnippet = (code: string) => run<SnippetResult>({ kind: 'snippet', code }, code);
+export const runSql = (schema: string, query: string, solution: string) => run<{ actual: SqlResult; expected: SqlResult }>({ kind: 'sql', schema, query, solution }, 'import sqlite3');
+export const runSqlScript = (code: string) => run<SqlScriptResult>({ kind: 'sql-script', code }, 'import sqlite3');
+
+/** The runner's state as a short notice for the learner. */
+export function runnerNotice(state: RunnerState, idle: string): string {
+  if (state === 'loading') return 'Python wird geladen (einmalig ca. 12 MB) …';
+  if (state === 'packages') return 'Bibliotheken wie pandas werden geladen (einmalig einige MB) …';
+  if (state === 'running') return 'Läuft …';
+  return idle;
+}

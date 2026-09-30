@@ -1,10 +1,12 @@
 import type { Answers, BugExercise, ChoiceExercise, CommandExercise, Gap, GapExercise, OrderExercise, OutputExercise } from '../content/types.ts';
+import { excelTokens } from './excel.ts';
 
 // Deliberately a source-reconstruction checker, not a compiler.
 // Preserve literals, identifier boundaries and compound operators; whitespace between tokens may vary.
 const KOTLIN = /"""[\s\S]*?"""|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`[^`]*`|[A-Za-z_$][\w$]*|\d+(?:\.\d+)?(?:[fFLl])?|\?\.|\?:|!!|->|===|!==|==|!=|<=|>=|&&|\|\||\+\+|--|::|\.\.<|\.\.|\+=|-=|[^\s]/g;
 const RUST = /r(#*)"[\s\S]*?"\1|b?"(?:\\.|[^"\\])*"|b?'(?:\\u\{[0-9a-fA-F]+\}|\\.|[^'\\])'|'[A-Za-z_]\w*|[A-Za-z_]\w*!?|\d[\d_]*(?:\.\d[\d_]*)?(?:[eE][+-]?\d+)?(?:[iu](?:8|16|32|64|128|size)|f32|f64)?|::|->|=>|\.\.=|\.\.|==|!=|<=|>=|&&|\|\||\+=|-=|\*=|\/=|%=|<<|>>|[^\s]/g;
 const PYTHON = /[rRbBfFuU]{0,2}(?:"""[\s\S]*?"""|'''[\s\S]*?'''|"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*')|[A-Za-z_]\w*|\d[\d_]*(?:\.\d[\d_]*)?(?:[eE][+-]?\d+)?j?|\*\*=|\/\/=|\*\*|\/\/|:=|->|==|!=|<=|>=|\+=|-=|\*=|\/=|%=|<<|>>|\.\.\.|[^\s]/g;
+const SQL = /'(?:[^']|'')*'|"(?:[^"]|"")*"|`[^`]*`|\[[^\]\n]*\]|[A-Za-z_][\w$]*|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|<>|!=|<=|>=|\|\||::|->>|->|[^\s]/g;
 const SHELL = /'[^']*'|"(?:\\.|[^"\\])*"|\$\(|\$\{|&&|\|\||>>|<<-?|[0-9]?>&[0-9]|&>|[0-9]>|[^\s'"|&;<>()]+|[^\s]/g;
 
 export type Lang = string;
@@ -14,6 +16,8 @@ const family = (lang: Lang) => {
   if (['rust', 'rs'].includes(l)) return 'rust';
   if (['python', 'py', 'python3', 'pycon'].includes(l)) return 'python';
   if (['bash', 'sh', 'shell', 'zsh', 'fish', 'console', 'terminal'].includes(l)) return 'shell';
+  if (['excel', 'xlsx', 'formula'].includes(l)) return 'excel';
+  if (['sql', 'sqlite', 'postgresql', 'postgres'].includes(l)) return 'sql';
   return 'generic';
 };
 
@@ -31,8 +35,21 @@ export function tokens(value: string, lang: Lang = 'kotlin'): string[] {
     case 'rust': return value.match(RUST) ?? [];
     case 'python': return (value.match(PYTHON) ?? []).map(canonicalPythonString);
     case 'shell': return shellTokens(value);
+    // German and English Excel: SUMMEWENNS(…;…) = SUMIFS(…,…), function names and references in any case.
+    case 'excel': return excelTokens(value);
+    case 'sql': return sqlTokens(value);
     default: return value.match(KOTLIN) ?? [];
   }
+}
+
+/**
+ * SQL: keywords, functions and names are case-insensitive (`count(*)` = `COUNT(*)`), string literals are not.
+ * `!=` equals `<>`, and a closing `;` is optional.
+ */
+function sqlTokens(value: string): string[] {
+  const out = (value.match(SQL) ?? []).map((token) => /^[A-Za-z_]/.test(token) ? token.toLowerCase() : token === '!=' ? '<>' : token);
+  while (out.at(-1) === ';') out.pop();
+  return out;
 }
 
 const plainWord = /^[\w./:@%+=,~-]+$/;

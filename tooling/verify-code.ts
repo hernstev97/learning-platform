@@ -1,4 +1,4 @@
-// pnpm verify [bereich ...]
+// pnpm verify [bereich | bereich/modul ...]
 // Executes what can be executed locally, so published solutions are known to work:
 //  - Python `code` exercises: the solution passes every test, the starter fails at least one.
 //  - Python/Rust `output` exercises: the program prints exactly the expected output.
@@ -7,23 +7,33 @@
 //  - Shell `output` exercises only with `verify: true` (they run in a throwaway directory).
 //  - Shell `practice` exercises with `verify: true`: the solution runs under `set -euo pipefail`
 //    in a throwaway directory and must exit 0 (used for Git break-and-repair labs).
-// Needs python3 and rustc. Kotlin is not compiled (no toolchain dependency); the Bear course is
-// checked by its own generator instead.
+//  - SQL (`sql` exercises, `output` exercises and lesson blocks marked `run`) runs in Pyodide under Node,
+//    i.e. with exactly the SQLite version of the browser: solutions return rows, starters do not already.
+//  - Python that imports pandas or numpy runs in a virtual environment with the versions Pyodide ships
+//    (node_modules/.cache/verify-python, created with uv on first use).
+// Needs python3 and rustc, for pandas also uv. Kotlin is not compiled (no toolchain dependency); the Bear
+// course is checked by its own generator instead.
 import { spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { availableParallelism, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { ROOT, loadContent } from './content.ts';
 import { assemble, fixedCode, gapSolution, normalizeOutput } from '../src/engine/answers.ts';
-import type { BugExercise, GapExercise, OrderExercise, OutputExercise } from '../src/content/types.ts';
+import { compareSql } from '../src/engine/sql.ts';
+import type { BugExercise, GapExercise, OrderExercise, OutputExercise, SqlExercise } from '../src/content/types.ts';
 
 type Job = { label: string; run: () => Promise<string | null> };
 const HARNESS = join(ROOT, 'src/python/harness.py');
 const only = process.argv.slice(2).filter((arg) => !arg.startsWith('--'));
 const root = process.argv.includes('--fixtures') ? join(ROOT, 'tooling/fixtures') : join(ROOT, 'content');
-const loaded = loadContent(only, root, { allowMissing: process.argv.includes('--allow-missing') });
-if (loaded.errors.length) { console.error('Inhalte sind ungültig – erst pnpm content:check beheben.'); process.exit(1); }
+const loaded = loadContent(only.map((arg) => arg.split('/')[0]), root, { allowMissing: process.argv.includes('--allow-missing') });
+// `bereich/modul` checks single modules, e.g. while other modules of the same area are still being written.
+const modules = only.filter((arg) => arg.includes('/'));
+const selected = (area: string, module: string) => !modules.length || modules.includes(`${area}/${module}`) || only.includes(area);
+const relevant = loaded.errors.filter((issue) => !modules.length || issue.file.endsWith('/area.yaml') || modules.some((m) => issue.file.endsWith(`${m.replace('/', '/modules/')}.yaml`)));
+if (relevant.length) { console.error('Inhalte sind ungültig – erst pnpm content:check beheben.'); process.exit(1); }
 
 function exec(command: string, args: string[], options: { input?: string; cwd?: string; timeout?: number; env?: Record<string, string> } = {}): Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean }> {
   return new Promise((resolve) => {
@@ -41,12 +51,54 @@ function exec(command: string, args: string[], options: { input?: string; cwd?: 
   });
 }
 
-async function python(job: object): Promise<any> {
-  const result = await exec('python3', [HARNESS], { input: JSON.stringify(job), timeout: 15000 });
+// pandas and numpy in the browser's versions, pinned by Pyodide's lock file.
+const DATA_PACKAGES = ['numpy', 'pandas', 'python-dateutil', 'pytz', 'six'];
+const USES_DATA = /^\s*(?:import|from)\s+(?:pandas|numpy)\b/m;
+let dataPython: Promise<string> | null = null;
+function dataEnvironment(): Promise<string> {
+  dataPython ??= (async () => {
+    const lock = JSON.parse(readFileSync(join(ROOT, 'node_modules/pyodide/pyodide-lock.json'), 'utf8'));
+    const pins = DATA_PACKAGES.map((name) => `${name}==${lock.packages[name].version}`);
+    const dir = join(ROOT, 'node_modules/.cache/verify-python', createHash('sha256').update(pins.join(' ')).digest('hex').slice(0, 12));
+    const bin = join(dir, 'bin/python');
+    if (existsSync(bin)) return bin;
+    for (const args of [['venv', '--quiet', '--python', '3.14', dir], ['pip', 'install', '--quiet', '--python', bin, ...pins]]) {
+      const result = await exec('uv', args, { timeout: 300000 });
+      if (result.code !== 0) throw new Error(`uv ${args[0]} fehlgeschlagen (für pandas-Übungen wird uv gebraucht):\n${result.stderr.trim()}`);
+    }
+    return bin;
+  })();
+  return dataPython;
+}
+
+async function python(job: { code: string; setup?: string; tests?: { code: string }[] } & Record<string, unknown>): Promise<any> {
+  const source = [job.setup ?? '', job.code, ...(job.tests ?? []).map((test) => test.code)].join('\n');
+  const interpreter = USES_DATA.test(source) ? await dataEnvironment() : 'python3';
+  const result = await exec(interpreter, [HARNESS], { input: JSON.stringify(job), timeout: 15000 });
   if (result.timedOut) throw new Error('Zeitüberschreitung (15 s)');
   if (result.code !== 0) throw new Error(result.stderr.trim().split('\n').slice(-5).join('\n'));
   return JSON.parse(result.stdout);
 }
+
+// One Pyodide instance for all SQL checks: the same SQLite (and harness) as in the browser.
+type Harness = (call: string, args: Record<string, unknown>) => any;
+let sqlHarness: Promise<Harness> | null = null;
+function pyodideHarness(): Promise<Harness> {
+  sqlHarness ??= (async () => {
+    const { loadPyodide } = await import('pyodide');
+    const pyodide = await loadPyodide({ stdout: () => {}, stderr: () => {} });
+    pyodide.FS.writeFile('/home/pyodide/harness.py', readFileSync(HARNESS, 'utf8'));
+    pyodide.runPython('import sys\nsys.path.insert(0, "/home/pyodide")\nimport harness, json');
+    return (call, args) => {
+      pyodide.globals.set('args', pyodide.toPy(args));
+      return JSON.parse(String(pyodide.runPython(`json.dumps(harness.${call})`)));
+    };
+  })();
+  return sqlHarness;
+}
+const sqlScript = async (code: string): Promise<{ text: string; error: string | null }> => (await pyodideHarness())('run_sql_script(args["code"])', { code });
+/** Comments and whitespace only: nothing to run. */
+const blankSql = (code: string) => !code.replace(/--[^\n]*|\/\*[\s\S]*?\*\//g, '').trim();
 
 const EXTERNAL_CRATE = /^\s*(?:use|extern crate)\s+(?!std\b|core\b|alloc\b|crate\b|self\b|super\b)([a-z_][a-z0-9_]*)/m;
 const externalCrate = (code: string) => code.match(EXTERNAL_CRATE)?.[1] ?? (/#\[tokio::|\b(?:serde|tokio|anyhow|thiserror|clap|rayon|axum|reqwest)::/.test(code) ? 'extern' : null);
@@ -98,7 +150,8 @@ const diff = (expected: string, actual: string) => `erwartet:\n${expected.replac
 const jobs: Job[] = [];
 let skipped = 0;
 
-for (const { area, file, exercise: authored, normalized } of loaded.raw) {
+for (const { area, module, file, exercise: authored, normalized } of loaded.raw) {
+  if (!selected(area, module)) continue;
   const label = `${file} › ${normalized.id} (${normalized.type})`;
   const lang = 'lang' in normalized ? normalized.lang : '';
   if (authored.verify === false) { skipped++; continue; }
@@ -132,7 +185,27 @@ for (const { area, file, exercise: authored, normalized } of loaded.raw) {
         const { stdout } = await bash(ex.code);
         return normalizeOutput(stdout) === normalizeOutput(ex.expected[0]) ? null : diff(normalizeOutput(ex.expected[0]), normalizeOutput(stdout));
       } });
+    } else if (lang === 'sql') {
+      jobs.push({ label, run: async () => {
+        const result = await sqlScript(ex.code);
+        if (result.error) return `SQL wirft einen Fehler:\n${result.error}`;
+        return normalizeOutput(result.text) === normalizeOutput(ex.expected[0]) ? null : diff(normalizeOutput(ex.expected[0]), normalizeOutput(result.text));
+      } });
     } else skipped++;
+  } else if (normalized.type === 'sql') {
+    const ex = normalized as SqlExercise;
+    jobs.push({ label, run: async () => {
+      const harness = await pyodideHarness();
+      const run = (query: string) => harness('run_sql_exercise(args["schema"], args["query"], args["solution"])', { schema: ex.schema, query, solution: ex.solution });
+      const { expected } = run(ex.solution);
+      if (expected.error) return `Musterlösung wirft einen Fehler:\n${expected.error}`;
+      if (!expected.rows.length) return 'Musterlösung liefert keine Zeilen – eine Aufgabe mit leerem Ergebnis lässt sich nicht sinnvoll prüfen.';
+      if (!blankSql(ex.starter)) {
+        const { actual } = run(ex.starter);
+        if (compareSql(expected, actual, ex.ordered).ok) return 'Die Startabfrage liefert bereits das erwartete Ergebnis.';
+      }
+      return null;
+    } });
   } else if (normalized.type === 'practice' && ['bash', 'sh', 'shell'].includes(lang) && authored.verify === true) {
     jobs.push({ label, run: async () => {
       const result = await bash(normalized.solution, { strict: true });
@@ -164,7 +237,7 @@ for (const { area, file, exercise: authored, normalized } of loaded.raw) {
 const FENCE = /^```(\S+)([^\n]*)\n([\s\S]*?)^```\s*$/gm;
 for (const areaId of Object.keys(loaded.areas)) {
   for (const module of Object.values(loaded.areas[areaId].modules)) {
-    if (module.bear) continue;
+    if (module.bear || !selected(areaId, module.id)) continue;
     const file = join(root, areaId, 'modules', `${module.id}.yaml`);
     const lesson = String(parseYaml(readFileSync(file, 'utf8')).lesson ?? '');
     let n = 0;
@@ -176,6 +249,12 @@ for (const areaId of Object.keys(loaded.areas)) {
       if (lang === 'python' && flags.includes('run')) {
         jobs.push({ label, run: async () => {
           const result = await python({ kind: 'snippet', code });
+          if (flags.includes('fails')) return result.error ? null : 'als "fails" markiert, läuft aber fehlerfrei';
+          return result.error ? `Codeblock wirft einen Fehler:\n${result.error}` : null;
+        } });
+      } else if (lang === 'sql' && flags.includes('run')) {
+        jobs.push({ label, run: async () => {
+          const result = await sqlScript(code);
           if (flags.includes('fails')) return result.error ? null : 'als "fails" markiert, läuft aber fehlerfrei';
           return result.error ? `Codeblock wirft einen Fehler:\n${result.error}` : null;
         } });

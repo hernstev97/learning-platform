@@ -2,7 +2,7 @@
 import type { BugExercise, CodeExercise, ExplainExercise, OrderExercise, PracticeExercise } from '../content/types.ts';
 import { fixedCode, isBugFixCorrect, isBugSelectionCorrect, isOrderCorrect } from '../engine/answers.ts';
 import { highlight } from '../engine/highlight.ts';
-import { onRunnerState, runExercise } from '../python/runner.ts';
+import { onRunnerState, runExercise, runnerNotice } from '../python/runner.ts';
 import { autosize, editorKeys, outputMarkup, playgroundUrl } from '../ui/code.ts';
 import { $, $$, escape, html, icons, raw } from '../ui/dom.ts';
 import { codeCard, langName } from './basic.ts';
@@ -152,7 +152,7 @@ export const code: ExerciseRenderer<CodeExercise, string> = (exercise, ctx) => (
       editor.dispatchEvent(new Event('input'));
     });
     const unsubscribe = onRunnerState((state) => {
-      stateLabel.innerHTML = state === 'loading' ? 'Python wird geladen (einmalig ca. 12 MB) …' : state === 'running' ? 'Läuft …' : RUNNER_IDLE;
+      stateLabel.innerHTML = runnerNotice(state, RUNNER_IDLE);
     });
     return () => { active = false; unsubscribe(); };
   },

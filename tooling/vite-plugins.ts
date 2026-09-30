@@ -74,7 +74,8 @@ export function content(): Plugin {
 const PYODIDE_FILES = ['pyodide.mjs', 'pyodide.asm.mjs', 'pyodide.asm.wasm', 'python_stdlib.zip', 'pyodide-lock.json'];
 /**
  * Self-hosts the Pyodide runtime under /pyodide/ (copied from node_modules into public/, not committed),
- * plus the few extra wheels exercises may import (vendor/pyodide: tzdata, beautifulsoup4, PyYAML).
+ * plus the extra wheels exercises may import (vendor/pyodide: tzdata, beautifulsoup4, PyYAML, pandas with numpy).
+ * Wheels must match the file names and hashes in node_modules/pyodide/pyodide-lock.json.
  */
 export function pyodide(): Plugin {
   return {
@@ -83,12 +84,15 @@ export function pyodide(): Plugin {
       const from = join(ROOT, 'node_modules/pyodide');
       const to = join(ROOT, 'public/pyodide');
       const version = JSON.parse(readFileSync(join(from, 'package.json'), 'utf8')).version as string;
+      const wheels = readdirSync(join(ROOT, 'vendor/pyodide')).sort();
+      // A new wheel copies everything again, not only a new Pyodide version.
+      const expected = [version, ...wheels].join('\n');
       const stamp = join(to, 'VERSION');
-      if (existsSync(stamp) && readFileSync(stamp, 'utf8') === version) return;
+      if (existsSync(stamp) && readFileSync(stamp, 'utf8') === expected) return;
       mkdirSync(to, { recursive: true });
       for (const file of PYODIDE_FILES) copyFileSync(join(from, file), join(to, file));
-      for (const file of readdirSync(join(ROOT, 'vendor/pyodide'))) copyFileSync(join(ROOT, 'vendor/pyodide', file), join(to, file));
-      writeFileSync(stamp, version);
+      for (const file of wheels) copyFileSync(join(ROOT, 'vendor/pyodide', file), join(to, file));
+      writeFileSync(stamp, expected);
     },
   };
 }

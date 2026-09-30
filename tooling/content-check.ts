@@ -1,11 +1,16 @@
-// pnpm content:check [bereich ...] [--quiet]
-// Validates content/ and prints errors, warnings and a size overview.
-import { formatIssues, loadContent } from './content.ts';
+// pnpm content:check [bereich | bereich/modul ...] [--quiet]
+// Validates content/ and prints errors, warnings and a size overview. With `bereich/modul`, only problems of
+// these modules (and of area.yaml) are reported.
+import { formatIssues, loadContent, type Issue } from './content.ts';
 
 const args = process.argv.slice(2);
 const quiet = args.includes('--quiet');
 const only = args.filter((arg) => !arg.startsWith('--'));
-const loaded = loadContent(only, undefined, { allowMissing: args.includes('--allow-missing') });
+const loaded = loadContent(only.map((arg) => arg.split('/')[0]), undefined, { allowMissing: args.includes('--allow-missing') });
+const modules = only.filter((arg) => arg.includes('/'));
+const relevant = (issue: Issue) => !modules.length || issue.file.endsWith('/area.yaml') || modules.some((m) => issue.file.endsWith(`${m.replace('/', '/modules/')}.yaml`));
+loaded.errors = loaded.errors.filter(relevant);
+loaded.warnings = loaded.warnings.filter(relevant);
 
 for (const area of loaded.catalog.areas) {
   const c = area.counts;

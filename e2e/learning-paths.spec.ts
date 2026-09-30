@@ -23,6 +23,7 @@ async function solve(page: Page, exercise: Exercise) {
       await page.locator('#command').press('Enter');
       break;
     case 'code':
+    case 'sql':
       await page.locator('#editor').fill(exercise.solution);
       await page.locator('#run').click();
       break;
@@ -52,7 +53,7 @@ async function solve(page: Page, exercise: Exercise) {
       await page.locator('#check').click();
       break;
   }
-  await expect(page.locator('#feedback')).toContainText('Richtig.', { timeout: exercise.type === 'code' ? 90_000 : 10_000 });
+  await expect(page.locator('#feedback')).toContainText('Richtig.', { timeout: exercise.type === 'code' || exercise.type === 'sql' ? 90_000 : 10_000 });
 }
 
 for (const area of loaded.catalog.areas) {
@@ -114,14 +115,14 @@ for (const area of loaded.catalog.areas) {
     expect(errors).toEqual([]);
   });
 
-  if (['python', 'automation'].includes(area.id)) test(`${area.id}: every runnable solution passes in the actual browser runtime`, async ({ page }) => {
-    test.setTimeout(240_000);
+  if (['python', 'automation', 'data'].includes(area.id)) test(`${area.id}: every runnable solution passes in the actual browser runtime`, async ({ page }) => {
+    test.setTimeout(480_000);
     const errors: string[] = [];
     page.on('pageerror', (error) => errors.push(error.message));
     await page.goto(`/${area.id}`);
     let executed = 0;
     for (const module of Object.values(loaded.areas[area.id].modules)) {
-      const runnable = module.exercises.map((exercise, index) => ({ exercise, index })).filter(({ exercise }) => exercise.type === 'code');
+      const runnable = module.exercises.map((exercise, index) => ({ exercise, index })).filter(({ exercise }) => exercise.type === 'code' || exercise.type === 'sql');
       if (!runnable.length) continue;
       await page.locator(`.topnav a[data-area="${area.id}"]`).click();
       await page.locator(`.module-row[href="/${area.id}/${module.id}"]`).click();

@@ -96,6 +96,140 @@ async def run_snippet(code):
     return {"stdout": out.getvalue(), "error": error}
 
 
+SQL_LIMIT = 1000
+
+
+def _sql_cell(value):
+    """A value as the sqlite3 command-line shell prints it in list mode (NULL is empty, reals keep a decimal point)."""
+    if value is None:
+        return ""
+    if isinstance(value, float):
+        text = "%.15g" % value
+        return text if any(c in text for c in ".eni") else text + ".0"
+    if isinstance(value, bytes):
+        return value.hex()
+    return str(value)
+
+
+def _sql_statements(script):
+    """Splits a script into complete statements; semicolons inside strings and comments do not count."""
+    import sqlite3
+
+    statements, current = [], ""
+    for char in script:
+        current += char
+        if char == ";" and sqlite3.complete_statement(current):
+            statements.append(current)
+            current = ""
+    if current.strip():
+        statements.append(current)
+    return [s for s in statements if _sql_has_code(s)]
+
+
+def _sql_has_code(statement):
+    """False for statements made only of whitespace, `;` and comments."""
+    text = statement
+    while True:
+        text = text.strip().lstrip(";").strip()
+        if text.startswith("--"):
+            text = text.partition("\n")[2]
+        elif text.startswith("/*"):
+            text = text.partition("*/")[2]
+        else:
+            return bool(text)
+
+
+def _sql_result(cursor):
+    rows = cursor.fetchmany(SQL_LIMIT + 1)
+    return {
+        "columns": [d[0] for d in cursor.description],
+        "rows": [[v.hex() if isinstance(v, bytes) else v for v in row] for row in rows[:SQL_LIMIT]],
+        "cells": [[_sql_cell(v) for v in row] for row in rows[:SQL_LIMIT]],
+        "truncated": len(rows) > SQL_LIMIT,
+    }
+
+
+def _sql_error(exc):
+    return f"{type(exc).__name__}: {exc}"
+
+
+def run_sql(schema, query):
+    """One query against a fresh in-memory database built from `schema`: {columns, rows, cells, truncated, error}."""
+    import sqlite3
+
+    empty = {"columns": [], "rows": [], "cells": [], "truncated": False}
+    con = sqlite3.connect(":memory:")
+    try:
+        try:
+            con.executescript(schema)
+        except sqlite3.Error as exc:
+            return {**empty, "error": "Die Tabellen der Übung ließen sich nicht anlegen: " + _sql_error(exc)}
+        statements = _sql_statements(query)
+        if not statements:
+            return {**empty, "error": "Die Abfrage ist leer."}
+        if len(statements) > 1:
+            return {**empty, "error": f"Das sind {len(statements)} Anweisungen. Gesucht ist genau eine Abfrage (SELECT, gern mit WITH davor)."}
+        try:
+            cursor = con.execute(statements[0])
+        except sqlite3.Error as exc:
+            return {**empty, "error": _sql_error(exc)}
+        if cursor.description is None:
+            return {**empty, "error": "Die Anweisung liefert keine Zeilen. Gesucht ist eine Abfrage mit SELECT."}
+        return {**_sql_result(cursor), "error": None}
+    finally:
+        con.close()
+
+
+def run_sql_exercise(schema, query, solution):
+    """The learner's query and the model solution, each against its own fresh database."""
+    return {"actual": run_sql(schema, query), "expected": run_sql(schema, solution)}
+
+
+def run_sql_script(script):
+    """Lesson blocks and `output` exercises: runs every statement in order and returns each result set.
+
+    `text` is what the sqlite3 shell prints in its default list mode: values separated by |, no header.
+    """
+    import sqlite3
+
+    con = sqlite3.connect(":memory:")
+    results, error = [], None
+    try:
+        for statement in _sql_statements(script):
+            try:
+                cursor = con.execute(statement)
+            except sqlite3.Error as exc:
+                error = _sql_error(exc)
+                break
+            if cursor.description is not None:
+                results.append(_sql_result(cursor))
+    finally:
+        con.close()
+    text = "".join("|".join(row) + "\n" for result in results for row in result["cells"])
+    return {"results": results, "text": text, "error": error}
+
+
+def warm_imports(code):
+    """Imports the top-level modules `code` imports, so their (slow) first import does not count against the time limit."""
+    import importlib
+
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            names.add(node.module.split(".")[0])
+    for name in sorted(names):
+        try:
+            importlib.import_module(name)
+        except Exception:  # noqa: BLE001 - the learner's run reports it
+            pass
+
+
 if __name__ == "__main__":
     # CLI for `pnpm verify`: reads a JSON job from stdin, prints a JSON result.
     import json

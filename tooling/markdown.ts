@@ -14,19 +14,21 @@ export const slug = (value: string) => value.toLowerCase()
 const LABELS: Record<string, string> = {
   kotlin: 'Kotlin', rust: 'Rust', python: 'Python', shell: 'Shell', console: 'Terminal', yaml: 'YAML', toml: 'TOML', json: 'JSON',
   sql: 'SQL', xml: 'XML', dockerfile: 'Dockerfile', ini: 'Konfiguration', diff: 'Diff', text: 'Text',
+  excel: 'Excel-Formel', powerquery: 'Power Query (M)', csv: 'CSV',
 };
 
 /** Render a fenced code block; shared by lessons and exercise code. */
 export function codeBlock(text: string, info = ''): string {
   const [lang = '', ...flags] = info.trim().split(/\s+/);
   const name = languageOf(lang);
-  const runnable = flags.includes('run') && name === 'python';
+  // Python runs as a script; SQL runs statement by statement against a fresh in-memory SQLite database.
+  const runnable = flags.includes('run') && (name === 'python' || name === 'sql');
   const playground = name === 'rust' && /\bfn main\s*\(/.test(text) && !flags.includes('norun') && !flags.includes('nocheck');
   const title = flags.find((flag) => flag.startsWith('title='))?.slice(6).replace(/_/g, ' ');
   const label = title ?? LABELS[name] ?? (lang || 'Text');
-  const attrs = [`data-lang="${escape(name)}"`, runnable ? 'data-run="python"' : '', playground ? 'data-playground="rust"' : ''].filter(Boolean).join(' ');
+  const attrs = [`data-lang="${escape(name)}"`, runnable ? `data-run="${name}"` : '', playground ? 'data-playground="rust"' : ''].filter(Boolean).join(' ');
   const body = runnable
-    ? `<textarea class="code-editor" wrap="off" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Python-Code, editierbar">${escape(text)}</textarea>`
+    ? `<textarea class="code-editor" wrap="off" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="${name === 'sql' ? 'SQL' : 'Python'}-Code, editierbar">${escape(text)}</textarea>`
     : `<pre tabindex="0"><code>${highlight(text, name)}</code></pre>`;
   return `<div class="codeblock" ${attrs}><div class="codeblock-bar"><span>${escape(label)}</span></div>${body}</div>`;
 }

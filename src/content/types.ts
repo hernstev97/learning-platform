@@ -38,8 +38,16 @@ export type BugFix = { line: number; answers: string[] };
 export type BugExercise = ExerciseBase & { type: 'bug'; lang: string; code: string; lines: number[]; fixes: BugFix[] };
 /** Explain code in your own words; `explanation` is the model answer, `points` the self-check. */
 export type ExplainExercise = ExerciseBase & { type: 'explain'; lang: string; code: string; points: string[] };
+export type SqlValue = string | number | null;
+/** Build-time preview of a table the exercise's schema creates: the first rows (`cells` as the sqlite3 shell prints them) and the total row count. */
+export type SqlTable = { name: string; columns: string[]; rows: SqlValue[][]; cells: string[][]; total: number };
+/**
+ * Write a query; it runs in the browser (SQLite in Pyodide) against a fresh database built from `schema` and must return
+ * the same columns and rows as `solution`. Row order only counts when `ordered` is set.
+ */
+export type SqlExercise = ExerciseBase & { type: 'sql'; lang: 'sql'; schema: string; tables: SqlTable[]; starter: string; solution: string; ordered: boolean };
 
-export type Exercise = GapExercise | ChoiceExercise | OrderExercise | OutputExercise | CommandExercise | CodeExercise | PracticeExercise | BugExercise | ExplainExercise;
+export type Exercise = GapExercise | ChoiceExercise | OrderExercise | OutputExercise | CommandExercise | CodeExercise | PracticeExercise | BugExercise | ExplainExercise | SqlExercise;
 export type ExerciseType = Exercise['type'];
 
 export type TocEntry = { id: string; title: string };

@@ -138,7 +138,7 @@ export function safeDraft(exercise: Exercise, value: unknown): unknown {
     case 'gap': return strings(value) ? value : undefined;
     case 'choice': return numbers(value, exercise.options.length) ? value : undefined;
     case 'order': return numbers(value, exercise.lines.length) && value.length === exercise.lines.length ? value : undefined;
-    case 'output': case 'code': return typeof value === 'string' ? value : undefined;
+    case 'output': case 'code': case 'sql': return typeof value === 'string' ? value : undefined;
     case 'command': return record(value) && typeof value.value === 'string' && Array.isArray(value.history) && value.history.every((x) => typeof x === 'string') ? value : undefined;
     case 'practice': return record(value) && typeof value.code === 'string' && numbers(value.checked, exercise.checklist.length) ? value : undefined;
     case 'explain': return record(value) && typeof value.text === 'string' && typeof value.revealed === 'boolean' && numbers(value.checked, exercise.points.length) ? value : undefined;

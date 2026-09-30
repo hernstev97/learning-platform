@@ -7,7 +7,7 @@ import { failOnce, type ExerciseRenderer } from './types.ts';
 
 export const codeCard = (code: string, lang: string, label: string, gaps = false) =>
   `<div class="codeblock exercise-code" data-lang="${escape(lang)}"><div class="codeblock-bar"><span>${escape(label)}</span></div><pre tabindex="0"><code>${gaps ? highlightWithGaps(code, lang) : highlight(code, lang)}</code></pre></div>`;
-export const LANG_NAMES: Record<string, string> = { kotlin: 'Kotlin', rust: 'Rust', python: 'Python', bash: 'Bash', sh: 'Shell', shell: 'Shell', console: 'Terminal', yaml: 'YAML', toml: 'TOML', json: 'JSON', sql: 'SQL', dockerfile: 'Dockerfile', ini: 'Konfiguration', xml: 'XML', gradle: 'Gradle', kts: 'Gradle Kotlin DSL' };
+export const LANG_NAMES: Record<string, string> = { kotlin: 'Kotlin', rust: 'Rust', python: 'Python', bash: 'Bash', sh: 'Shell', shell: 'Shell', console: 'Terminal', yaml: 'YAML', toml: 'TOML', json: 'JSON', sql: 'SQL', dockerfile: 'Dockerfile', ini: 'Konfiguration', xml: 'XML', gradle: 'Gradle', kts: 'Gradle Kotlin DSL', excel: 'Excel-Formel', powerquery: 'Power Query (M)', m: 'Power Query (M)', csv: 'CSV' };
 export const langName = (lang: string) => LANG_NAMES[lang] ?? (lang ? lang.toUpperCase() : 'Code');
 
 export const gap: ExerciseRenderer<GapExercise, Answers> = (exercise, ctx) => {

@@ -67,6 +67,30 @@ describe('Answer checking per language', () => {
     expect(shellTokens(`find . -name '*.log'`)).not.toEqual(shellTokens(`find . -name *.log`));
     expect(shellTokens(`echo "$HOME"`)).not.toEqual(shellTokens(`echo '$HOME'`));
   });
+  it('reads German and English Excel formulas alike', () => {
+    const same = (a: string, b: string) => expect(tokens(a, 'excel'), `${a} = ${b}`).toEqual(tokens(b, 'excel'));
+    const differ = (a: string, b: string) => expect(tokens(a, 'excel'), `${a} ≠ ${b}`).not.toEqual(tokens(b, 'excel'));
+    same('=SUMMEWENNS(Umsatz[Betrag];Umsatz[Region];"Nord")', '=sumifs(umsatz[betrag], umsatz[region], "Nord")');
+    same('=WENNFEHLER(SVERWEIS(A2;$F$2:$G$20;2;FALSCH);"fehlt")', 'IFERROR(VLOOKUP(A2,$F$2:$G$20,2,FALSE),"fehlt")');
+    same('=ZÄHLENWENNS(Tickets[Status];"offen")', '=COUNTIFS(Tickets[Status],"offen")');
+    same('=RUNDEN(B2*0,19;2)', '=ROUND(B2*0.19,2)');
+    same('=A1*0,19', '=A1*0.19');
+    same('=SUM(1,2)', '=SUMME(1;2)');
+    same('=Umsatz[[#Alle];[Betrag]]', '=Umsatz[[#All],[Betrag]]');
+    same('=[@Menge]*[@Preis]', '=[@menge] * [@preis]');
+    same('=MODUS.EINF(B:B)', '=MODE.SNGL(B:B)');
+    differ('=$A$1*B2', '=A1*B2');
+    differ('=MITTELWERT(B2:B9)', '=MEDIAN(B2:B9)');
+    differ('=WENN(A2="Nord";1;0)', '=WENN(A2="nord";1;0)');
+    const gap = byId('excel-formel').gaps[0];
+    for (const ok of ['SUMMEWENNS', 'summewenns', 'SUMIFS']) expect(isGapCorrect(gap, ok, 'excel')).toBe(true);
+    expect(isGapCorrect(gap, 'SUMMEWENN', 'excel')).toBe(false);
+  });
+  it('compares SQL case-insensitively except inside strings', () => {
+    expect(tokens('select count(*) from kunden where region != \'Nord\';', 'sql')).toEqual(tokens('SELECT COUNT(*) FROM Kunden WHERE region <> \'Nord\'', 'sql'));
+    expect(tokens("WHERE region = 'nord'", 'sql')).not.toEqual(tokens("WHERE region = 'Nord'", 'sql'));
+    expect(tokens('a >= 1', 'sql')).not.toEqual(tokens('a > = 1', 'sql'));
+  });
   it('checks every fixture exercise type', () => {
     expect(isGapExerciseCorrect(byId('lueckentext'), { g1: 'def', g2: '2*x' })).toBe(true);
     expect(isChoiceCorrect(byId('auswahl'), [0, 2])).toBe(true);
