@@ -437,6 +437,21 @@ test('malformed addresses render the not-found page without an unhandled excepti
   expect(errors).toEqual([]);
 });
 
+test('loading pandas in one block leaves the results of other blocks alone', async ({ page }) => {
+  test.setTimeout(120_000);
+  await page.goto('/python/python-einstieg');
+  const blocks = page.locator('.codeblock[data-run="python"]');
+  await expect(blocks.nth(1)).toBeVisible();
+  await blocks.nth(0).locator('textarea').fill('print("erster")');
+  await blocks.nth(0).getByRole('button', { name: 'Ausführen' }).click();
+  await expect(blocks.nth(0).locator('.run-output')).toContainText('erster', { timeout: 90_000 });
+  // The first pandas import takes seconds and switches the runner to its "packages" notice.
+  await blocks.nth(1).locator('textarea').fill('import pandas as pd\nprint(pd.Series([1, 2]).sum())');
+  await blocks.nth(1).getByRole('button', { name: 'Ausführen' }).click();
+  await expect(blocks.nth(1).locator('.run-output')).toContainText('3', { timeout: 90_000 });
+  await expect(blocks.nth(0).locator('.run-output')).toContainText('erster');
+});
+
 test('two asynchronous Python snippets keep their output isolated', async ({ page }) => {
   test.setTimeout(120_000);
   await page.goto('/python/python-einstieg');

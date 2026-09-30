@@ -122,7 +122,8 @@ export function enhanceCode(root: ParentNode): () => void {
       };
       run.addEventListener('click', execute);
       editorKeys(editor, execute);
-      cleanups.push(onRunnerState((state) => { if ((state === 'loading' || state === 'packages') && !output.hidden) output.textContent = runnerNotice(state, ''); }));
+      // Only the block that is running (or queued) shows the loading notice; other blocks keep their results.
+      cleanups.push(onRunnerState((state) => { if ((state === 'loading' || state === 'packages') && run.disabled) output.textContent = runnerNotice(state, ''); }));
       bar.append(reset, run);
     } else {
       bar.append(copyButton(() => codeOf(block)));
