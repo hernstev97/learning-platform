@@ -71,7 +71,7 @@ Eine vollständige, minimale Vorlage mit jeder Übungsart liegt in [`tooling/fix
 
 1. **Lehrplan entwerfen.** Schreibe zuerst die Liste der Module auf: 10–16 Module in 2–4 Tracks, vom Einstieg bis zum Profi-Niveau. Frage dich bei jedem Modul: *Was kann ich danach, was ich vorher nicht konnte?* Und: *Würde ein Arbeitgeber das erwarten?*
 2. **Ordner anlegen:** `content/<bereich>/` mit `area.yaml` (Abschnitt 4). Die Ordner-ID ist kurz, klein und kebab-case, zum Beispiel `go`, `typescript`, `devops`.
-3. **Farbe wählen.** Eine kräftige Farbe, auf der schwarzer Text gut lesbar ist (Kontrast ≥ 4,5 : 1 zu `#0B0B0B`). Vorhandene Farben nicht wiederholen: `#A98BFF` Kotlin, `#FF6A3D` Rust, `#FFD400` Linux, `#4D8BFF` Python, `#2BD97C` Automation, `#FF5CA8` Git. Gute freie Kandidaten: `#22D3EE` (Cyan), `#C6F432` (Limette), `#FF9F1C` (Orange-Gelb).
+3. **Farbe wählen.** Eine kräftige Farbe, auf der schwarzer Text gut lesbar ist (Kontrast ≥ 4,5 : 1 zu `#0B0B0B`). Vorhandene Farben nicht wiederholen: `#A98BFF` Kotlin, `#FF6A3D` Rust, `#FFD400` Linux, `#4D8BFF` Python, `#2BD97C` Automation, `#FF5CA8` Git, `#22D3EE` Data Analysis. Gute freie Kandidaten: `#C6F432` (Limette), `#FF9F1C` (Orange-Gelb).
 4. **Module schreiben** (Abschnitte 5–7). Ein Modul pro Datei, Dateiname = Modul-ID.
 5. **Karten, Projekte, Glossar, Spickzettel, Berufsseite** ergänzen (Abschnitt 8).
 6. **Prüfen:** `pnpm content:check <bereich>`, dann `pnpm verify <bereich>`, dann `pnpm test` und `pnpm build`.
@@ -174,16 +174,19 @@ Richtwert: 3–6 Callouts pro Lektion, davon mindestens ein `INTERVIEW` und ein 
 
 ### Codeblöcke
 
-Codeblöcke immer mit Sprache angeben. Unterstützt werden `kotlin`, `rust`, `python`, `bash`/`sh`, `console`, `yaml`, `toml`, `json`, `sql`, `xml`, `dockerfile`, `ini` (auch für systemd-Units), `diff` und `text`.
+Codeblöcke immer mit Sprache angeben. Unterstützt werden `kotlin`, `rust`, `python`, `bash`/`sh`, `console`, `yaml`, `toml`, `json`, `sql`, `xml`, `dockerfile`, `ini` (auch für systemd-Units), `diff`, `excel` (Formeln), `powerquery` (Power Query M, auch `m`), `csv` und `text`.
 
 | Info-String | Wirkung |
 | --- | --- |
 | ` ```python run ` | Block wird im Browser editierbar und mit Pyodide ausführbar. `pnpm verify` führt ihn aus; er darf keinen Fehler werfen. |
 | ` ```python run fails ` | Ausführbar, soll aber absichtlich eine Exception zeigen. `pnpm verify` prüft, dass er fehlschlägt. |
+| ` ```sql run ` | Block wird editierbar und läuft Anweisung für Anweisung gegen eine frische SQLite-Datenbank im Browser; jede Ergebnismenge erscheint als Tabelle. Der Block legt seine Tabellen selbst an (`CREATE TABLE`, `INSERT`). `pnpm verify` führt ihn aus; `sql run fails` erwartet einen Fehler. |
 | ` ```rust ` mit `fn main` | Bekommt einen Link zum Rust Playground. `pnpm verify` kompiliert ihn. |
 | ` ```rust nocheck ` | Absichtlich nicht kompilierender Code (etwa um einen Borrow-Checker-Fehler zu zeigen). Kein Playground-Link, keine Prüfung. |
 | ` ```console ` | Terminal-Sitzung: Zeilen mit `$ ` oder `# ` am Anfang sind Befehle, der Rest ist Ausgabe. |
 | ` ```yaml title=docker-compose.yml ` | Eigene Beschriftung statt Sprachname (Unterstriche werden zu Leerzeichen). |
+
+SQL läuft im Browser mit **SQLite 3.39** (die Version in Pyodide), nicht mit der neueren SQLite auf dem Rechner. Fensterfunktionen, `RIGHT`/`FULL JOIN`, `IS DISTINCT FROM`, JSON-Funktionen und Mathefunktionen (`sqrt`, `ln`, `floor`) gibt es; `string_agg`, `concat`, `median` und `percentile` nicht. `pnpm verify` prüft SQL deshalb mit genau dieser Version.
 
 Python-Blöcke mit `run` laufen mit denselben Einschränkungen wie `code`-Übungen (siehe dort): frisches Verzeichnis, kein Netzwerk, keine Threads oder Prozesse, kein `input()`, kein `asyncio.run()` – `await` auf oberster Ebene funktioniert aber. Blöcke, die Threads oder Netzwerk zeigen, deshalb **ohne** `run` schreiben. Rust-Blöcke, die Crates wie `serde` oder `tokio` benutzen, werden nicht kompiliert; sie bekommen trotzdem einen Playground-Link, weil der Playground die beliebtesten Crates mitbringt.
 
@@ -196,7 +199,7 @@ Gemeinsame Felder aller Übungen:
 | Feld | Pflicht | Inhalt |
 | --- | --- | --- |
 | `id` | ja | kebab-case, eindeutig im Modul. Nie ändern, sobald veröffentlicht (Fortschritt hängt daran). |
-| `type` | ja | `gap`, `choice`, `order`, `output`, `command`, `code`, `practice`, `bug`, `explain` |
+| `type` | ja | `gap`, `choice`, `order`, `output`, `command`, `code`, `practice`, `bug`, `explain`, `sql` |
 | `title` | ja | Kurz, neugierig machend, keine Lösung verraten |
 | `prompt` | ja | Markdown. Die Aufgabe, eindeutig formuliert. |
 | `explanation` | ja | Markdown. Erscheint nach dem Lösen: *warum* das richtig ist, was dahintersteckt, typische Verwechslungen. 2–6 Sätze. |
@@ -214,7 +217,7 @@ Die Übungen eines Moduls stehen in dieser Reihenfolge. Jede Stufe setzt die vor
 | --- | --- | --- | --- |
 | 1. Verstehen | Kernbegriffe und Denkmodell sitzen | `choice`, `order` | 1–3 |
 | 2. Vorhersagen | Code im Kopf ausführen | `output` | 2–3 |
-| 3. Schreiben | Syntax und Idiome aktiv produzieren | `gap`, `command`, `code` | 3–5 |
+| 3. Schreiben | Syntax und Idiome aktiv produzieren | `gap`, `command`, `code`, `sql` | 3–5 |
 | 4. Fehler finden | Bugs erkennen, erklären, beheben | `bug` (oder `code` mit fehlerhaftem Startcode) | 1–2 |
 | 5. Erklären | Bestehende Implementierungen in eigenen Worten erklären | `explain` | 1–2 |
 | 6. Anwenden | Eine kleine, realistische Aufgabe lösen | `code`, `practice` | 1–2 |
@@ -231,6 +234,7 @@ Die Übungen eines Moduls stehen in dieser Reihenfolge. Jede Stufe setzt die vor
 | `gap` | Code schreiben (gezielt) | Schlüsselwörter, Ausdrücke, ganze Zeilen in echtem Code |
 | `command` | Befehle aus dem Kopf schreiben | Linux, Git, Cargo, Gradle, uv |
 | `code` | Code schreiben (frei, mit Tests) – nur Python | Funktionen schreiben, die im Browser automatisch geprüft werden |
+| `sql` | Abfragen schreiben, die im Browser laufen | Filtern, Gruppieren, Joins, Fensterfunktionen – verglichen wird das Ergebnis, nicht der Text |
 | `bug` | Fehler finden und beheben | Off-by-one, falsche Bedingung, Race Condition, Sicherheitslücke, falscher Befehl |
 | `explain` | Bestehende Implementierung erklären | Code lesen und in eigenen Worten wiedergeben – wie im Code-Review oder Interview |
 | `practice` | Größere Aufgaben mit Musterlösung | Rust/Kotlin-Programme, Konfigurationen, Skripte |
@@ -260,9 +264,11 @@ Python- und Automation-Module haben mindestens drei `code`-Übungen, davon gern 
 
 - Lücken stehen direkt im Code zwischen `⟦` und `⟧` (U+27E6/U+27E7). Der Inhalt ist die Musterantwort.
 - Geprüft wird **tokenweise** je nach `lang`: Leerraum zwischen Tokens ist egal, Groß-/Kleinschreibung und Zeichen nicht. In Python gelten `'a'` und `"a"` als gleich.
-- Mehrdeutigkeit vermeiden: Wenn mehrere Schreibweisen richtig sind, alle in `accept` aufnehmen oder die Aufgabe enger formulieren.
+- Mehrdeutigkeit vermeiden: Wenn mehrere Schreibweisen richtig sind, alle in `accept` aufnehmen oder die Aufgabe enger formulieren. Alternativen, die der Vergleich ohnehin gleich behandelt, sind überflüssig; die Lösung zeigt sie nicht an.
 - Mehrzeilige Lücken sind möglich (Einrückung ist für die Prüfung egal).
 - Rust-Code mit `fn main` wird nach dem Einsetzen der Musterantworten kompiliert.
+- **SQL** (`lang: sql`): Schlüsselwörter, Funktionen und Namen ohne Groß-/Kleinschreibung (`count(*)` = `COUNT(*)`), `!=` = `<>`, ein `;` am Ende ist optional. Text in Anführungszeichen bleibt exakt.
+- **Excel-Formeln** (`lang: excel`): Deutsche und englische Schreibweise sind gleichwertig. `=SUMMEWENNS(B:B;A:A;"Nord")` = `=SUMIFS(B:B,A:A,"Nord")`: Funktionsnamen werden übersetzt, Groß-/Kleinschreibung von Funktionen, Bezügen und strukturierten Verweisen ist egal, `;` gilt als `,`, das Dezimalkomma als Punkt, das führende `=` ist optional. `$A$1` und `A1` bleiben verschieden, Text in Anführungszeichen ebenso. Die Übersetzungstabelle steht in `src/engine/excel.ts`; neue Funktionen dort ergänzen. Das gilt auch für `bug`-Korrekturen. Excel selbst läuft nicht – Formeln werden verglichen, nicht berechnet.
 
 ### `choice` – Auswahl
 
@@ -329,7 +335,7 @@ Die Plattform mischt die Zeilen deterministisch. 4–10 Zeilen sind ideal. Zeile
   explanation: …
 ```
 
-Verglichen wird zeilenweise ohne Leerraum am Zeilenende und ohne Leerzeilen am Anfang oder Ende. Für Shell-Code (`lang: bash`) kann `verify: true` gesetzt werden; dann führt `pnpm verify` ihn in einem leeren Wegwerf-Verzeichnis aus. Ausgaben mit Zeitstempeln, PIDs, Commit-Hashes oder Zufall sind ungeeignet.
+Verglichen wird zeilenweise ohne Leerraum am Zeilenende und ohne Leerzeilen am Anfang oder Ende. SQL (`lang: sql`) führt `pnpm verify` immer aus: Der Code legt seine Tabellen selbst an, erwartet wird die Ausgabe der `sqlite3`-Kommandozeile im Standardmodus – Werte durch `|` getrennt, keine Kopfzeile, `NULL` als leerer Wert, Kommazahlen mit Punkt (`3.0`, `12.5`). Sag das im Prompt. Für Shell-Code (`lang: bash`) kann `verify: true` gesetzt werden; dann führt `pnpm verify` ihn in einem leeren Wegwerf-Verzeichnis aus. Ausgaben mit Zeitstempeln, PIDs, Commit-Hashes oder Zufall sind ungeeignet.
 
 Git läuft dabei ohne System- und globale Konfiguration, mit fester Identität, `init.defaultBranch=main`, ohne Editor und Pager und mit englischen Meldungen (`GIT_ENV` in `tooling/verify-code.ts`). Verglichen wird nur stdout; viele Git-Meldungen landen auf stderr.
 
@@ -385,7 +391,7 @@ Alles andere (Langoptionen wie `--all`, `sudo`, andere Pfade, Reihenfolge von Ar
 
 Laufzeitumgebung (Browser und `pnpm verify` identisch, siehe `src/python/harness.py`):
 
-- Pyodide mit **Python 3.14** und der Standardbibliothek (inklusive `sqlite3`, `json`, `csv`, `re`, `pathlib`, `shutil`, `zipfile`, `hashlib`, `email`, `html.parser`, `xml.etree`, `tomllib`, `unittest.mock`). Zusätzlich verfügbar: `bs4` (BeautifulSoup), `yaml` (PyYAML) und `zoneinfo` mit Zeitzonendaten.
+- Pyodide mit **Python 3.14** und der Standardbibliothek (inklusive `sqlite3`, `json`, `csv`, `re`, `pathlib`, `shutil`, `zipfile`, `hashlib`, `email`, `html.parser`, `xml.etree`, `tomllib`, `unittest.mock`). Zusätzlich verfügbar: `bs4` (BeautifulSoup), `yaml` (PyYAML), `zoneinfo` mit Zeitzonendaten sowie **pandas 3.0 mit numpy 2.4**. Beim ersten `import pandas` lädt der Browser einmalig etwa 8 MB; das zählt nicht zum Zeitlimit. pandas 3 hat Copy-on-Write und einen eigenen `str`-Datentyp für Text – Beispiele und erwartete Ausgaben müssen dazu passen. `pnpm verify` führt pandas-Code in einer virtuellen Umgebung mit denselben Versionen aus (angelegt mit `uv`). Nicht verfügbar: matplotlib, openpyxl, pyarrow – Code dafür als `python` ohne `run` oder als `practice`.
 - **Nicht verfügbar:** Netzwerk, `subprocess`, Threads (`threading`, `ThreadPoolExecutor`), `multiprocessing`-Prozesse, `input()`. Für diese Themen `explain`, `output` (nur deterministisch), `bug` oder `practice` verwenden – oder die Aufgabe so schneiden, dass die Logik als reine Funktion testbar ist (zum Beispiel eine Funktion, die die Befehlsliste für `subprocess.run` *baut*, oder ein Abrufer, der als Parameter übergeben wird).
 - **Async:** Tests dürfen `await` auf oberster Ebene verwenden (`assert await hole(1) == …`). `asyncio.gather`, `TaskGroup`, `asyncio.timeout` und `asyncio.sleep` funktionieren. Niemals `asyncio.run()` im Lernenden-Code oder in Tests aufrufen – im Browser läuft bereits eine Event-Loop.
 - Jeder Lauf startet in einem frischen, leeren Arbeitsverzeichnis. `setup` kann dort Dateien anlegen.
@@ -396,6 +402,36 @@ Laufzeitumgebung (Browser und `pnpm verify` identisch, siehe `src/python/harness
 - **Tests selbst schreiben lassen:** Der Lernende kann auch eine Testfunktion schreiben, die die Tests gegen eine richtige und eine fehlerhafte Implementierung aus `setup` laufen lassen („Schreibe einen Test, der den Bug fängt“). Das trainiert Testdenken besser als jede Theorie.
 
 3–6 Tests pro Aufgabe: Normalfall, Randfälle (leer, eins, viele), Fehlerfall. Für Automation-Aufgaben externe Dienste mit einfachen Fake-Objekten simulieren (zum Beispiel eine Funktion `hole_seite(url)` als Parameter übergeben), statt echte HTTP-Aufrufe zu machen.
+
+### `sql` – SQL-Abfrage (läuft im Browser)
+
+```yaml
+- id: umsatz-je-region
+  type: sql
+  title: Umsatz je Region
+  prompt: |
+    Berechne den Nettoumsatz je Region. Spalten `region` und `umsatz`, größter Umsatz zuerst.
+  schema: |                    # Pflicht: baut die Datenbank auf, vor jedem Lauf neu
+    CREATE TABLE bestellungen (bestellung_id INTEGER PRIMARY KEY, region TEXT NOT NULL, betrag REAL);
+    INSERT INTO bestellungen (region, betrag) VALUES ('Nord', 120.5), ('Süd', 80), ('Nord', 40);
+  starter: |                   # optional: was im Editor steht; darf das Ergebnis nicht schon liefern
+    SELECT region, betrag
+    FROM bestellungen;
+  solution: |                  # Pflicht: eine Abfrage (SELECT, gern mit WITH davor)
+    SELECT region, SUM(betrag) AS umsatz
+    FROM bestellungen
+    GROUP BY region
+    ORDER BY umsatz DESC;
+  ordered: true                # optional: Reihenfolge der Zeilen zählt (verlangt ORDER BY in der Lösung)
+  explanation: …
+```
+
+- Die Abfrage des Lernenden und die Musterlösung laufen im Browser (SQLite 3.39 in Pyodide) gegen je eine frische Datenbank aus `schema`. Verglichen wird das **Ergebnis**: Spaltenzahl, Spaltennamen (ohne Groß-/Kleinschreibung), Werte (3 = 3.0, Rundungsrauschen unter 10⁻⁹ zählt nicht) und – nur mit `ordered: true` – die Reihenfolge. Jede richtige Formulierung wird also akzeptiert.
+- Der Prompt nennt deshalb **Spaltennamen, Rundung und Sortierung** ausdrücklich („Spalten `region` und `umsatz`, auf zwei Stellen gerundet“). Ohne diese Angaben ist die Aufgabe nicht eindeutig lösbar.
+- Die Tabellen erscheinen über dem Editor als Vorschau (bis zu 12 Zeilen je Tabelle, erzeugt beim Build), das vollständige `schema` aufklappbar. Halte Tabellen klein genug, dass man das Ergebnis im Kopf nachrechnen kann – meist 5–20 Zeilen – und baue die Fallen ein, um die es geht (`NULL`, Duplikate, Kunden ohne Bestellung, gleiche Werte bei Rangfolgen).
+- Die Rückmeldung nennt die erste Abweichung („Spalte 2 heißt `summe`, erwartet ist `umsatz`“, „Deine Abfrage liefert 5 Zeilen, erwartet sind 4“, „Die Zeile (West, 0) gehört so nicht ins Ergebnis“), ohne das erwartete Ergebnis zu verraten.
+- `pnpm verify` führt die Musterlösung mit derselben SQLite-Version aus: Sie muss Zeilen liefern, und der `starter` darf das erwartete Ergebnis noch nicht liefern.
+- SQL-Module mischen `sql` mit `output` (`lang: sql`, siehe oben), `gap`, `bug` und `explain`; `sql` ersetzt dort die `code`-Übungen.
 
 ### `bug` – Fehler finden und beheben
 
@@ -561,7 +597,9 @@ pnpm test:e2e                  # Browser-Tests (Playwright)
 pnpm build                     # TypeScript + Produktionsbuild
 ```
 
-`pnpm verify` braucht lokal `python3` und `rustc` (Edition 2024). Kotlin wird nicht kompiliert; Kotlin-Aufgaben daher besonders sorgfältig gegen die offizielle Dokumentation prüfen.
+`pnpm verify` braucht lokal `python3` und `rustc` (Edition 2024), für pandas-Code zusätzlich `uv`: Beim ersten Lauf entsteht unter `node_modules/.cache/verify-python/` eine virtuelle Umgebung mit genau den pandas- und numpy-Versionen des Browsers (aus `pyodide-lock.json`). SQL prüft `verify` in Pyodide unter Node, also mit derselben SQLite wie im Browser. Kotlin wird nicht kompiliert; Kotlin-Aufgaben daher besonders sorgfältig gegen die offizielle Dokumentation prüfen. Excel-Formeln und Power-Query-Code laufen nirgends; sie brauchen besonders sorgfältige Prüfung gegen die Microsoft-Dokumentation.
+
+`content:check` und `verify` nehmen auch einzelne Module: `pnpm verify data/sql-joins`. Dann zählen nur Fehler dieses Moduls und der `area.yaml` – praktisch, solange andere Module desselben Bereichs noch entstehen.
 
 Checkliste vor dem Commit:
 
@@ -589,7 +627,7 @@ Fortschritt liegt nach Anmeldung in Convex: gelöste Übungen (mit Fingerprint),
 ## 12. YAML-Fallen
 
 - Code und Markdown **immer** als Blockliteral `|` schreiben. Darin braucht nichts escaped zu werden.
-- Einzeilige Werte, die mit `` ` ``, `*`, `&`, `!`, `[`, `{`, `>`, `|`, `%`, `@`, `#` oder `"` beginnen oder `: ` bzw. ` #` enthalten, in Anführungszeichen setzen: `text: "`list`"`.
+- Einzeilige Werte, die mit `` ` ``, `*`, `&`, `!`, `[`, `{`, `>`, `|`, `%`, `@`, `#` oder `"` beginnen oder `: ` bzw. ` #` enthalten, in Anführungszeichen setzen: `text: "`list`"`. Das gilt auch für Listeneinträge: ``- Die Datei enthält `timeout: 30`.`` wird ohne Anführungszeichen zu einem Objekt. `content:check` meldet solche Einträge in Checklisten, Kernpunkten, Zielen und Antwortlisten als Fehler.
 - Farben quoten: `color: "#FF6A3D"` – ohne Anführungszeichen ist es ein Kommentar.
 - `yes`, `no`, `on`, `off` sind in YAML 1.2 Strings, aber `true`/`false` sind Booleans. `correct:` braucht echte Booleans.
 - Einrückung in Blockliteralen: der Inhalt muss mindestens so weit eingerückt sein wie die erste Zeile. Python-Code darin normal weiter einrücken.

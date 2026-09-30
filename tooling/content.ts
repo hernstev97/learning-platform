@@ -3,12 +3,13 @@
 import { createHash } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { parse as parseYaml } from 'yaml';
 import { createMarkdown, codeBlock, slug } from './markdown.ts';
 import { escape } from '../src/engine/highlight.ts';
 import { shuffledOrder, tokens } from '../src/engine/answers.ts';
 import type {
-  Area, AreaSummary, Card, Catalog, Exercise, GlossaryEntry, Level, Module, ModuleSummary, Project, Resource, TopicSummary, TrackSummary,
+  Area, AreaSummary, Card, Catalog, Exercise, GlossaryEntry, Level, Module, ModuleSummary, Project, Resource, SqlTable, SqlValue, TopicSummary, TrackSummary,
 } from '../src/content/types.ts';
 
 export const ROOT = join(import.meta.dirname, '..');
@@ -16,7 +17,7 @@ export const CONTENT = join(ROOT, 'content');
 export const RESERVED = ['karten', 'projekte', 'spickzettel', 'glossar', 'beruf', 'wiederholen'];
 /** Top-level pages that an area folder must not shadow. */
 export const RESERVED_AREAS = ['daten', 'wiederholen'];
-const TYPES = ['gap', 'choice', 'order', 'output', 'command', 'code', 'practice', 'bug', 'explain'] as const;
+const TYPES = ['gap', 'choice', 'order', 'output', 'command', 'code', 'practice', 'bug', 'explain', 'sql'] as const;
 const ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const validId = (id: unknown): id is string => typeof id === 'string' && id.length <= 120 && ID.test(id) && !['constructor', 'prototype'].includes(id);
 
@@ -73,13 +74,18 @@ function fields(obj: Obj, where: string, report: Reporter, allowed: string[]) {
     if (!Array.isArray(value)) { report.error(where, `"${key}" muss eine Liste sein`); return []; }
     return value;
   };
+  /** A list of plain values. YAML reads an unquoted `- Text: mit Doppelpunkt` as an object; that must not become "[object Object]". */
+  const texts = (key: string, required = false): string[] => list(key, required).map((item, i) => {
+    if (item !== null && typeof item === 'object') report.error(where, `"${key}[${i}]" ist kein Text – YAML hat ": " als Schlüssel gelesen; setze den Eintrag in Anführungszeichen`);
+    return String(item);
+  });
   const num = (key: string, fallback: number, min = 0, max = Infinity): number => {
     const value = obj[key];
     if (value === undefined) return fallback;
     if (typeof value !== 'number' || !Number.isFinite(value) || value < min || value > max) { report.error(where, `"${key}" muss eine Zahl zwischen ${min} und ${max} sein`); return fallback; }
     return value;
   };
-  return { str, list, num };
+  return { str, list, texts, num };
 }
 
 function resources(value: unknown, where: string, report: Reporter): Resource[] {
@@ -103,6 +109,60 @@ const level = (value: unknown, where: string, report: Reporter): Level => {
 };
 const trimCode = (value: string) => value.replace(/^\n+/, '').replace(/\s+$/, '');
 
+const PREVIEW_ROWS = 12;
+/**
+ * Builds the database of a `sql` exercise at build time and previews every table it creates, so the learner sees the
+ * data before Python (and with it SQLite) is loaded. Node's SQLite is newer than Pyodide's; `pnpm verify` runs the
+ * queries themselves with the browser's version.
+ */
+function sqlTables(schema: string): { tables: SqlTable[]; error: string | null } {
+  const db = new DatabaseSync(':memory:');
+  const value = (v: unknown): SqlValue => v === null || typeof v === 'number' || typeof v === 'string' ? v : typeof v === 'bigint' ? Number(v) : Buffer.from(v as Uint8Array).toString('hex');
+  // Like the harness (and the sqlite3 shell): REAL keeps its decimal point, so 80.0 does not look like the integer 80.
+  const cell = (v: SqlValue, type: unknown) => {
+    if (v === null) return '';
+    if (type !== 'real') return String(v);
+    const text = String(Number((v as number).toPrecision(15)));
+    return /[.eEn]/.test(text) ? text : `${text}.0`;
+  };
+  try {
+    db.exec(schema);
+    const names = db.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY rowid").all().map((row) => String(row.name));
+    const tables = names.map((name) => {
+      const quoted = `"${name.replace(/"/g, '""')}"`;
+      const columns = db.prepare(`PRAGMA table_info(${quoted})`).all().map((column) => String(column.name));
+      const total = Number(db.prepare(`SELECT COUNT(*) AS n FROM ${quoted}`).get()!.n);
+      const quotedColumns = columns.map((column) => `"${column.replace(/"/g, '""')}"`);
+      const statement = db.prepare(`SELECT ${[...quotedColumns, ...quotedColumns.map((column) => `typeof(${column})`)].join(', ')} FROM ${quoted} LIMIT ${PREVIEW_ROWS}`);
+      statement.setReturnArrays(true);
+      const raw = statement.all() as unknown as unknown[][];
+      const rows = raw.map((row) => row.slice(0, columns.length).map(value));
+      const cells = rows.map((row, r) => row.map((v, c) => cell(v, raw[r][columns.length + c])));
+      return { name, columns, rows, cells, total };
+    });
+    return { tables, error: null };
+  } catch (error) {
+    return { tables: [], error: (error as Error).message };
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Drops alternatives the comparison already treats as equal (`count(*)` next to `COUNT(*)` in SQL, `SUMIFS` next to
+ * `SUMMEWENNS` in Excel), so the solution does not list them. Fingerprints keep using the authored list: removing an
+ * equivalent spelling must not invalidate earlier progress.
+ */
+function distinctAnswers(answers: string[], language: string): string[] {
+  const seen = new Set<string>();
+  return answers.filter((answer) => {
+    const key = JSON.stringify(tokens(answer, language));
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 const COMMON = ['id', 'type', 'title', 'prompt', 'explanation', 'wiki', 'hints', 'resources'];
 const BY_TYPE: Record<string, string[]> = {
   gap: ['lang', 'code', 'gaps'],
@@ -114,6 +174,7 @@ const BY_TYPE: Record<string, string[]> = {
   practice: ['lang', 'starter', 'solution', 'checklist', 'verify'],
   bug: ['lang', 'code', 'lines', 'fix', 'verify'],
   explain: ['lang', 'code', 'points'],
+  sql: ['schema', 'starter', 'solution', 'ordered', 'verify'],
 };
 
 function exercise(raw: Obj, moduleId: string, where: string, report: Reporter): Exercise | null {
@@ -143,15 +204,17 @@ function exercise(raw: Obj, moduleId: string, where: string, report: Reporter): 
       if (!answers.length) report.error(where, 'code enthält keine Lücke ⟦…⟧');
       if (/[⟦⟧]/.test(code.replace(/⟦\d+⟧/g, ''))) report.error(where, 'unpaarige Lückenklammern ⟦ ⟧');
       if (gapMeta.length && gapMeta.length !== answers.length) report.error(where, `"gaps" hat ${gapMeta.length} Einträge, der Code aber ${answers.length} Lücken`);
+      const authoredAnswers: string[][] = [];
       const gaps = answers.map((answer, i) => {
         const meta = gapMeta[i] ?? {};
         const g = fields(meta, `${where} › gaps[${i}]`, report, ['label', 'hint', 'accept']);
         if (!answer.trim() || !tokens(answer, language).length) report.error(where, `Lücke ${i + 1} ist leer`);
-        const accept = g.list<string>('accept').map(String);
+        const accept = g.texts('accept');
         if (!meta.hint) report.warn(where, `Lücke ${i + 1} hat keinen Hinweis`);
-        return { id: `g${i + 1}`, label: g.str('label', false) || `Lücke ${i + 1}`, answers: [answer, ...accept], hint: inline(g.str('hint', false)), multiline: answer.includes('\n') || answer.length > 65 };
+        authoredAnswers.push([answer, ...accept]);
+        return { id: `g${i + 1}`, label: g.str('label', false) || `Lücke ${i + 1}`, answers: distinctAnswers([answer, ...accept], language), hint: inline(g.str('hint', false)), multiline: answer.includes('\n') || answer.length > 65 };
       });
-      return { ...base, type, lang: language, code, gaps, fingerprint: fingerprint([type, language, code, gaps.map((g) => g.answers)]) };
+      return { ...base, type, lang: language, code, gaps, fingerprint: fingerprint([type, language, code, authoredAnswers]) };
     }
     case 'choice': {
       const options = f.list<Obj>('options', true).map((option, i) => {
@@ -169,7 +232,7 @@ function exercise(raw: Obj, moduleId: string, where: string, report: Reporter): 
     case 'order': {
       const language = lang();
       const rawLines = raw.lines;
-      const lines: string[] = Array.isArray(rawLines) ? rawLines.map(String) : typeof rawLines === 'string' ? trimCode(rawLines).split('\n') : [];
+      const lines: string[] = Array.isArray(rawLines) ? f.texts('lines') : typeof rawLines === 'string' ? trimCode(rawLines).split('\n') : [];
       if (lines.length < 3) report.error(where, '"lines" braucht mindestens drei Zeilen');
       if (lines.some((line) => !line.trim())) report.error(where, '"lines" darf keine Leerzeilen enthalten');
       const alternatives = f.list<number[]>('alternatives').map((alt, i) => {
@@ -180,12 +243,12 @@ function exercise(raw: Obj, moduleId: string, where: string, report: Reporter): 
       return { ...base, type, lang: language, lines, alternatives, shuffled: shuffledOrder(lines.length, base.id), fingerprint: fingerprint([type, lines, alternatives]) };
     }
     case 'output': {
-      const expected = [f.str('expected'), ...f.list<string>('accept').map(String)].map((value) => value.replace(/\n$/, ''));
+      const expected = [f.str('expected'), ...f.texts('accept')].map((value) => value.replace(/\n$/, ''));
       const code = trimCode(f.str('code'));
       return { ...base, type, lang: lang(), code, expected, fingerprint: fingerprint([type, code, expected]) };
     }
     case 'command': {
-      const answers = f.list<string>('answers', true).map(String);
+      const answers = f.texts('answers', true);
       if (!answers.length) report.error(where, '"answers" braucht mindestens einen Befehl');
       const context = f.str('context', false);
       const output = f.str('output', false);
@@ -204,7 +267,7 @@ function exercise(raw: Obj, moduleId: string, where: string, report: Reporter): 
       return { ...base, type, lang: 'python', starter, solution, setup, tests, fingerprint: fingerprint([type, tests, setup]) };
     }
     case 'practice': {
-      const checklist = f.list<string>('checklist', true).map((item) => inline(String(item)));
+      const checklist = f.texts('checklist', true).map((item) => inline(item));
       if (!checklist.length) report.error(where, '"checklist" braucht mindestens einen Punkt');
       const solution = trimCode(f.str('solution'));
       return { ...base, type, lang: lang(), starter: trimCode(f.str('starter', false)), solution, checklist, fingerprint: fingerprint([type, base.title, checklist]) };
@@ -216,22 +279,35 @@ function exercise(raw: Obj, moduleId: string, where: string, report: Reporter): 
       const lines = f.list<number>('lines', true);
       if (!lines.length) report.error(where, '"lines" braucht mindestens eine fehlerhafte Zeile');
       for (const line of lines) if (!Number.isInteger(line) || line < 1 || line > count) report.error(where, `Zeile ${line} gibt es nicht (Code hat ${count} Zeilen)`);
+      const authoredFixes: { line: number; answers: string[] }[] = [];
       const fixes = f.list<Obj>('fix').map((fix, i) => {
         const ff = fields(fix ?? {}, `${where} › fix[${i}]`, report, ['line', 'answers']);
         const line = fix?.line;
         if (!lines.includes(line)) report.error(`${where} › fix[${i}]`, `"line" ${line} ist keine der fehlerhaften Zeilen`);
-        const answers = ff.list<string>('answers', true).map(String);
+        const answers = ff.texts('answers', true);
         const original = code.split('\n')[line - 1] ?? '';
         if (answers.some((answer) => tokens(answer, language).join(' ') === tokens(original, language).join(' '))) report.error(`${where} › fix[${i}]`, 'eine akzeptierte Korrektur ist identisch mit der fehlerhaften Zeile');
-        return { line: Number(line), answers };
+        authoredFixes.push({ line: Number(line), answers });
+        return { line: Number(line), answers: distinctAnswers(answers, language) };
       });
-      return { ...base, type, lang: language, code, lines: [...lines].sort((a, b) => a - b), fixes, fingerprint: fingerprint([type, code, lines, fixes]) };
+      return { ...base, type, lang: language, code, lines: [...lines].sort((a, b) => a - b), fixes, fingerprint: fingerprint([type, code, lines, authoredFixes]) };
     }
     case 'explain': {
-      const points = f.list<string>('points', true).map((point) => inline(String(point)));
+      const points = f.texts('points', true).map((point) => inline(point));
       if (points.length < 2) report.error(where, '"points" braucht mindestens zwei Kernpunkte');
       const code = trimCode(f.str('code'));
       return { ...base, type, lang: lang(), code, points, fingerprint: fingerprint([type, code, points]) };
+    }
+    case 'sql': {
+      const schema = trimCode(f.str('schema'));
+      const solution = trimCode(f.str('solution'));
+      if (raw.ordered !== undefined && typeof raw.ordered !== 'boolean') report.error(where, '"ordered" muss true oder false sein');
+      const ordered = raw.ordered === true;
+      if (ordered && !/\border\s+by\b/i.test(solution)) report.error(where, '"ordered: true" verlangt eine Lösung mit ORDER BY');
+      const { tables, error } = schema ? sqlTables(schema) : { tables: [], error: null };
+      if (error) report.error(where, `"schema" lässt sich nicht ausführen: ${error}`);
+      else if (schema && !tables.length) report.error(where, '"schema" legt keine Tabelle an');
+      return { ...base, type, lang: 'sql', schema, tables, starter: trimCode(f.str('starter', false)), solution, ordered, fingerprint: fingerprint([type, schema, solution, ordered]) };
     }
   }
   return null;
@@ -272,7 +348,7 @@ function loadModule(areaId: string, moduleId: string, report: Reporter, raw: Raw
   if (noResources > exercises.length / 2) report.warn(where, `${noResources} Übungen ohne Doku-Link (resources)`);
   return {
     id: moduleId, title: f.str('title'), summary: f.str('summary'), level: level(data.level, where, report), minutes: f.num('minutes', 60, 5, 600),
-    goals: f.list<string>('goals').map((goal) => inline(String(goal))), lesson, toc, resources: resources(data.resources, where, report), exercises, bear: false,
+    goals: f.texts('goals').map((goal) => inline(goal)), lesson, toc, resources: resources(data.resources, where, report), exercises, bear: false,
   };
 }
 
@@ -372,7 +448,7 @@ function loadArea(dir: string, raw: RawExercise[], sink: { errors: Issue[]; warn
         seen.add(cid);
         const moduleId = c.str('module', false) || null;
         if (moduleId && (!modules[moduleId] || modules[moduleId].bear)) r.error(where, `"module: ${moduleId}" ist kein Modul dieses Bereichs`);
-        const tags = c.list<string>('tags').map(String);
+        const tags = c.texts('tags');
         if (!moduleId && !tags.length) r.warn(where, 'weder "module" noch "tags" – die Karte lässt sich keinem Thema zuordnen');
         cards.push({ id: cid, question: block(c.str('q')), answer: block(c.str('a')), tags, level: level(card?.level, where, r), module: moduleId });
       });
@@ -414,8 +490,8 @@ function loadArea(dir: string, raw: RawExercise[], sink: { errors: Issue[]; warn
         if (projects.some((p) => p.id === pid)) r.error(where, `Projekt-id "${pid}" doppelt`);
         projects.push({
           id: pid, title: p.str('title'), capstone: project?.capstone === true, level: level(project?.level, where, r), hours: p.num('hours', 10, 1, 500), summary: inline(p.str('summary')),
-          brief: block(p.str('brief')), skills: p.list<string>('skills').map(String), steps, acceptance,
-          stretch: p.list<string>('stretch').map((s) => inline(String(s))), portfolio: block(p.str('portfolio', false)),
+          brief: block(p.str('brief')), skills: p.texts('skills'), steps, acceptance,
+          stretch: p.texts('stretch').map((s) => inline(s)), portfolio: block(p.str('portfolio', false)),
         });
       });
       const capstones = projects.filter((project) => project.capstone);
@@ -477,7 +553,7 @@ function loadArea(dir: string, raw: RawExercise[], sink: { errors: Issue[]; warn
   }
   const summary: AreaSummary = {
     id, title: f.str('title'), short: f.str('short', false) || f.str('title'), tagline: f.str('tagline'), description: f.str('description'), color,
-    outcomes: f.list<string>('outcomes').map((o) => inline(String(o))), tracks, modules: moduleSummaries,
+    outcomes: f.texts('outcomes').map((o) => inline(o)), tracks, modules: moduleSummaries,
     cards: cards.map((c) => c.id), topics, projects: projects.map((p) => ({ id: p.id, title: p.title, capstone: p.capstone, level: p.level, hours: p.hours, summary: p.summary, steps: [...p.steps.map((s) => s.id), ...p.acceptance.map((a) => a.id)] })),
     counts: {
       modules: moduleSummaries.length, exercises: moduleSummaries.reduce((n, m) => n + m.exercises.length, 0), cards: cards.length,

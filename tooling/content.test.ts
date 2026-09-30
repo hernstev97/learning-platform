@@ -10,7 +10,7 @@ describe('content', () => {
     const loaded = loadContent(undefined, join(import.meta.dirname, 'fixtures'));
     expect(formatIssues(loaded.errors)).toBe('');
     const types = new Set(loaded.areas.beispiel.modules['alle-typen'].exercises.map((e) => e.type));
-    expect([...types].sort()).toEqual(['bug', 'choice', 'code', 'command', 'explain', 'gap', 'order', 'output', 'practice']);
+    expect([...types].sort()).toEqual(['bug', 'choice', 'code', 'command', 'explain', 'gap', 'order', 'output', 'practice', 'sql']);
     expect(loaded.catalog.areas[0].projects.filter((p) => p.capstone)).toHaveLength(1);
   });
   it('published content is valid', () => {
@@ -23,6 +23,35 @@ describe('content', () => {
       expect(area.projects.filter((project) => project.capstone), `${area.id}: Abschlussprojekt`).toHaveLength(1);
       expect(area.pages, `${area.id}: Nachschlagen und Beruf`).toEqual({ cheatsheet: true, career: true, glossary: true });
     }
+  });
+  it('previews the tables of SQL exercises and rejects broken schemas', () => {
+    const loaded = loadContent(undefined, join(import.meta.dirname, 'fixtures'));
+    const sql = loaded.areas.beispiel.modules['alle-typen'].exercises.find((e) => e.type === 'sql')!;
+    expect(sql.type === 'sql' && sql.tables).toEqual([{ name: 'bestellungen', columns: ['id', 'region', 'betrag'], rows: [[1, 'Nord', 120.5], [2, 'Süd', 80], [3, 'Nord', 40], [4, 'West', null]], cells: [['1', 'Nord', '120.5'], ['2', 'Süd', '80.0'], ['3', 'Nord', '40.0'], ['4', 'West', '']], total: 4 }]);
+    const root = mkdtempSync(join(tmpdir(), 'learning-sql-'));
+    try {
+      cpSync(join(import.meta.dirname, 'fixtures/beispiel'), join(root, 'beispiel'), { recursive: true });
+      const file = join(root, 'beispiel/modules/alle-typen.yaml');
+      writeFileSync(file, readFileSync(file, 'utf8').replace('CREATE TABLE bestellungen (id', 'CREATE TABLE bestellungen (region TEXT, id').replace('    ordered: true', '    ordered: yes'));
+      const messages = loadContent(undefined, root).errors.map((issue) => issue.message).join('\n');
+      expect(messages).toContain('"schema" lässt sich nicht ausführen: duplicate column name: region');
+      expect(messages).toContain('"ordered" muss true oder false sein');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it('reports list items that YAML read as objects instead of text', () => {
+    const root = mkdtempSync(join(tmpdir(), 'learning-yaml-'));
+    try {
+      cpSync(join(import.meta.dirname, 'fixtures/beispiel'), join(root, 'beispiel'), { recursive: true });
+      const file = join(root, 'beispiel/modules/alle-typen.yaml');
+      writeFileSync(file, readFileSync(file, 'utf8').replace('- Die Reihenfolge der Arme ist korrekt.', '- Die Reihenfolge der Arme: korrekt.'));
+      expect(loadContent(undefined, root).errors.map((issue) => issue.message)).toContain('"checklist[1]" ist kein Text – YAML hat ": " als Schlüssel gelesen; setze den Eintrag in Anführungszeichen');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it('makes Python and SQL blocks runnable, other languages not', () => {
+    expect(codeBlock('SELECT 1;', 'sql run')).toContain('data-run="sql"');
+    expect(codeBlock('print(1)', 'python run')).toContain('data-run="python"');
+    expect(codeBlock('SELECT 1;', 'sql')).not.toContain('data-run');
+    expect(codeBlock('=SUMME(A1:A3)', 'excel run')).not.toContain('data-run');
   });
   it('does not offer deliberately invalid Rust snippets as executable playground examples', () => {
     expect(codeBlock('fn main() { invalid }', 'rust nocheck')).not.toContain('data-playground');

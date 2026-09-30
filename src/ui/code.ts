@@ -1,6 +1,7 @@
 // Adds copy buttons, Rust Playground links and Python run buttons to rendered code blocks.
-import { onRunnerState, runSnippet } from '../python/runner.ts';
+import { onRunnerState, runnerNotice, runSnippet, runSqlScript, type SqlResultSet } from '../python/runner.ts';
 import { $$, escape, icons } from './dom.ts';
+import { rowCount, sqlTableMarkup } from './sql-table.ts';
 
 export const playgroundUrl = (code: string) => `https://play.rust-lang.org/?version=stable&mode=debug&edition=2024&code=${encodeURIComponent(code)}`;
 
@@ -59,6 +60,13 @@ export function outputMarkup(stdout: string, error: string | null): string {
   return out + (out && err ? '\n' : '') + err || '<span class="run-label">Ausgabe</span>(keine Ausgabe)';
 }
 
+/** Every result set of a SQL block as a table; statements without a result (CREATE, INSERT) show nothing. */
+function sqlOutputMarkup(results: SqlResultSet[], error: string | null): string {
+  const tables = results.map((result, i) => `<span class="run-label">${results.length > 1 ? `Ergebnis ${i + 1} · ` : 'Ergebnis · '}${rowCount(result.rows.length)}${result.truncated ? ' (gekürzt)' : ''}</span>${sqlTableMarkup(result.columns, result.rows, result.cells)}`).join('');
+  const err = error ? `<span class="run-label">Fehler</span>${escape(error)}` : '';
+  return tables + err || '<span class="run-label">Ergebnis</span>(keine Ergebnismenge – nur SELECT liefert Zeilen)';
+}
+
 export function enhanceCode(root: ParentNode): () => void {
   const cleanups: (() => void)[] = [];
   for (const block of $$<HTMLElement>('.codeblock', root)) {
@@ -74,7 +82,8 @@ export function enhanceCode(root: ParentNode): () => void {
       link.addEventListener('pointerdown', () => { link.href = playgroundUrl(codeOf(block)); });
       bar.append(link);
     }
-    if (block.dataset.run === 'python') {
+    const language = block.dataset.run;
+    if (language === 'python' || language === 'sql') {
       const editor = block.querySelector<HTMLTextAreaElement>('textarea')!;
       const original = editor.value;
       autosize(editor, 2);
@@ -97,9 +106,15 @@ export function enhanceCode(root: ParentNode): () => void {
         output.className = 'run-output';
         output.textContent = 'Läuft …';
         try {
-          const result = await runSnippet(editor.value);
-          output.classList.toggle('error', !!result.error);
-          output.innerHTML = outputMarkup(result.stdout, result.error);
+          if (language === 'sql') {
+            const result = await runSqlScript(editor.value);
+            output.classList.toggle('error', !!result.error);
+            output.innerHTML = sqlOutputMarkup(result.results, result.error);
+          } else {
+            const result = await runSnippet(editor.value);
+            output.classList.toggle('error', !!result.error);
+            output.innerHTML = outputMarkup(result.stdout, result.error);
+          }
         } catch (error) {
           output.classList.add('error');
           output.textContent = (error as Error).message;
@@ -107,7 +122,8 @@ export function enhanceCode(root: ParentNode): () => void {
       };
       run.addEventListener('click', execute);
       editorKeys(editor, execute);
-      cleanups.push(onRunnerState((state) => { if (state === 'loading' && !output.hidden) output.textContent = 'Python wird geladen (einmalig ca. 12 MB) …'; }));
+      // Only the block that is running (or queued) shows the loading notice; other blocks keep their results.
+      cleanups.push(onRunnerState((state) => { if ((state === 'loading' || state === 'packages') && run.disabled) output.textContent = runnerNotice(state, ''); }));
       bar.append(reset, run);
     } else {
       bar.append(copyButton(() => codeOf(block)));

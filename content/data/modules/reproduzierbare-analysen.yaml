@@ -1,0 +1,996 @@
+id: reproduzierbare-analysen
+title: Reproduzierbare Analyse-Workflows
+level: 3
+minutes: 180
+summary: Rohdaten unverändert, eine Pipeline aus reinen Funktionen, Parameter statt fest verdrahteter Werte, festgehaltene Umgebung und Tests – damit der Monatsbericht mit einem Befehl entsteht und jede Zahl nachvollziehbar bleibt.
+goals:
+  - Du erklärst ein Analyseergebnis als Funktion von Rohdaten, Code, Parametern und Umgebung und hältst jeden dieser Eingänge fest.
+  - Du legst ein Analyseprojekt mit `data/raw`, `data/processed`, `src`, `tests` und `reports` an und entscheidest, was in Git gehört.
+  - Du schreibst Bereinigung, Prüfung und Auswertung als reine Funktionen mit dem Stichtag als Parameter und machst Ergebnisse unabhängig von Zeilenreihenfolge und Zeitzone.
+  - Du sicherst Rohdaten mit SHA-256-Prüfsummen und beschreibst sie in einem Datenwörterbuch.
+  - Du hältst die Umgebung mit `pyproject.toml` und `uv.lock` fest und prüfst Transformationen mit Tests, die einen echten Fehler fangen.
+resources:
+  - title: uv · Project structure and files
+    url: https://docs.astral.sh/uv/concepts/projects/layout/
+  - title: uv · Locking and syncing
+    url: https://docs.astral.sh/uv/concepts/projects/sync/
+  - title: Python · hashlib
+    url: https://docs.python.org/3/library/hashlib.html
+  - title: pandas · testing.assert_frame_equal
+    url: https://pandas.pydata.org/docs/reference/api/pandas.testing.assert_frame_equal.html
+  - title: Microsoft Learn · Angewendete Schritte in Power Query
+    url: https://learn.microsoft.com/de-de/power-query/applied-steps
+lesson: |
+  Im April meldet die Geschäftsführung von Bohnenwerk eine Unstimmigkeit: Der Märzbericht hat für Februar 184 312 € Nettoumsatz gezeigt, der Aprilbericht zeigt für denselben Februar 186 050 €. Niemand hat bewusst etwas geändert. Nach einem halben Tag Suche ist klar: Die Rohdatei wurde in Excel geöffnet und wieder gespeichert, ein Kollege hat „nur schnell“ zwei Stornos gelöscht, und das Auswertungsskript filtert mit `date.today()`. Jede dieser Kleinigkeiten ist harmlos. Zusammen machen sie jede Zahl im Bericht angreifbar.
+
+  **Reproduzierbar** heißt: Mit denselben Rohdaten, demselben Code, denselben Parametern und derselben Umgebung entsteht dasselbe Ergebnis – heute, in drei Monaten und auf dem Rechner einer Kollegin. Das ist keine akademische Übung, sondern der Weg zu einem schnellen, verlässlichen Monatsprozess. Wenn jeder Schritt Code ist, dauert der Bericht so lange wie ein Befehl, und jede Abweichung lässt sich auf eine konkrete Änderung zurückführen. Dieses Modul setzt voraus, dass du pandas kennst ([pandas: Daten laden und bereinigen](/data/pandas-grundlagen)). uv und pytest werden hier angewendet, nicht eingeführt; die Grundlagen stehen in [Tooling & Packaging](/python/tooling-packaging) und [Testen mit pytest](/python/testen-pytest).
+
+  ## Reproduzierbar heißt: gleiche Eingänge, gleiches Ergebnis
+
+  Das Denkmodell ist eine Funktion: **Ergebnis = f(Rohdaten, Code, Parameter, Umgebung)**. Ändert sich einer der vier Eingänge unbemerkt, ändert sich das Ergebnis ohne Erklärung. Jeder Eingang braucht deshalb einen festen Ort:
+
+  | Eingang | Festhalten durch | Typischer Bruch |
+  | --- | --- | --- |
+  | Rohdaten | unverändert ablegen, Prüfsumme | Datei in Excel geöffnet und gespeichert, Zeilen von Hand gelöscht |
+  | Code | Git | Korrektur direkt in der Ergebnisdatei |
+  | Parameter | Kommandozeile oder Konfiguration, im Bericht mit ausgegeben | `date.today()`, fest verdrahteter Pfad |
+  | Umgebung | `pyproject.toml` und `uv.lock` | pandas-Update ändert Verhalten |
+
+  Daraus folgt eine Arbeitsregel, an der du dein Projekt jederzeit prüfen kannst: **Alles außer den Rohdaten muss sich neu erzeugen lassen.** Zwischenstände und Berichte sind Wegwerfprodukte. Wenn du dich nicht traust, den Ordner mit den Zwischenständen zu löschen und neu zu rechnen, ist das Projekt nicht reproduzierbar – irgendwo steckt Handarbeit, die nur in einer Datei existiert.
+
+  > [!MERKE]
+  > Rohdaten werden gelesen, nie geschrieben. Jede Korrektur ist ein Schritt im Code, jede Einstellung ein Parameter, jede Bibliotheksversion steht in der Lockdatei. Dann ist jedes Ergebnis erklärbar und jederzeit wiederholbar.
+
+  ## Rohdaten, Zwischenstände, Ergebnisse: die Projektstruktur
+
+  Eine feste Ordnerstruktur macht die Regel sichtbar. Jeder im Team weiß, wo Exporte landen, was gelöscht werden darf und wo der Einstieg ist:
+
+  ```text
+  monatsbericht/
+  ├── pyproject.toml            # Projekt und Abhängigkeiten
+  ├── uv.lock                   # aufgelöste Versionen, von uv verwaltet
+  ├── README.md                 # Befehl, Voraussetzungen, Herkunft der Daten
+  ├── data/
+  │   ├── raw/                  # Exporte, unverändert, schreibgeschützt
+  │   │   ├── 2026-09_bestellungen.csv
+  │   │   └── MANIFEST.sha256   # Prüfsummen der Rohdateien
+  │   └── processed/            # Zwischenstände, jederzeit neu erzeugbar
+  ├── docs/
+  │   └── datenwoerterbuch.md   # Was bedeutet jede Spalte?
+  ├── src/monatsbericht/
+  │   ├── pipeline.py           # reine Funktionen: bereinigen, prüfen, auswerten
+  │   └── cli.py                # Einstieg: Parameter lesen, Dateien lesen und schreiben
+  ├── tests/
+  │   └── test_pipeline.py
+  └── reports/                  # Ergebnisse: CSV, PNG, Textbericht
+  ```
+
+  **Git für Code, nicht für große Daten.** In Git gehört alles, was Menschen schreiben: Code, Tests, `pyproject.toml`, `uv.lock`, README, Datenwörterbuch und das Manifest mit den Prüfsummen. Die Rohdaten selbst liegen auf einem Laufwerk mit Leserechten oder in einem Objektspeicher. Sie sind oft groß, ändern sich als Ganzes und enthalten Kundendaten, die nicht in jeden Klon eines Repositorys gehören. `data/processed/`, `reports/` und `.venv/` sind erzeugt und kommen in die `.gitignore`. Mit `data/raw/*` und der Ausnahme `!data/raw/MANIFEST.sha256` bleibt das Manifest versioniert, obwohl der Ordnerinhalt ignoriert wird ([gitignore](https://git-scm.com/docs/gitignore)).
+
+  **Notebook oder Skript?** Ein Jupyter-Notebook ist gut zum Erkunden: Daten ansehen, Hypothesen prüfen, Diagramme ausprobieren. Für den Monatsbericht taugt es schlecht. Zellen lassen sich in beliebiger Reihenfolge ausführen, der Zustand im Speicher weicht dann vom sichtbaren Code ab, und Diffs sind schwer zu lesen. Bewährt hat sich: im Notebook erkunden, stabile Schritte als Funktionen nach `pipeline.py` verschieben, das Notebook importiert sie nur noch. Der Bericht selbst läuft als Skript mit einem Befehl.
+
+  ## Die Pipeline als Kette reiner Funktionen
+
+  Jede Analyse durchläuft dieselben Stufen: **einlesen → bereinigen → prüfen → auswerten → berichten**. Der Trick besteht darin, Ein- und Ausgabe an die Ränder zu legen. Nur `lies_export` und `schreibe_bericht` berühren Dateien. Alles dazwischen sind **reine Funktionen**: Ihr Ergebnis hängt nur von den Argumenten ab, sie ändern ihre Eingabe nicht und lesen weder Uhr noch Dateien noch globale Variablen. Solche Funktionen kannst du mit einem DataFrame aus fünf Zeilen testen, und sie liefern bei gleicher Eingabe immer dasselbe.
+
+  ```python run
+  from io import StringIO
+  import pandas as pd
+
+  ROH = StringIO(
+      "bestellung_id;bestelldatum;kanal;status;betrag\n"
+      "1003;02.09.2026;Shop;bezahlt;49,90\n"
+      "1001;01.09.2026;B2B;bezahlt;310,00\n"
+      "1002;01.09.2026;shop ;storniert;25,00\n"
+      "1004;30.09.2026;b2b;bezahlt;128,40\n"
+  )
+  KANAELE = {"shop": "Shop", "b2b": "B2B"}
+
+  def lies_export(quelle) -> pd.DataFrame:
+      return pd.read_csv(quelle, sep=";", decimal=",")
+
+  def bereinige(roh: pd.DataFrame) -> pd.DataFrame:
+      return (
+          roh.assign(
+              bestelldatum=pd.to_datetime(roh["bestelldatum"], format="%d.%m.%Y"),
+              kanal=roh["kanal"].str.strip().str.lower().map(KANAELE),
+          )
+          .sort_values("bestellung_id")
+          .reset_index(drop=True)
+      )
+
+  def pruefe(df: pd.DataFrame) -> pd.DataFrame:
+      fehler = []
+      if df["bestellung_id"].duplicated().any():
+          fehler.append("bestellung_id nicht eindeutig")
+      if df["kanal"].isna().any():
+          fehler.append("unbekannter Kanal")
+      if fehler:
+          raise ValueError("; ".join(fehler))
+      return df
+
+  def werte_aus(df: pd.DataFrame) -> pd.DataFrame:
+      bezahlt = df[df["status"] == "bezahlt"]
+      return bezahlt.groupby("kanal", as_index=False)["betrag"].sum()
+
+  ergebnis = lies_export(ROH).pipe(bereinige).pipe(pruefe).pipe(werte_aus)
+  print(ergebnis)
+  ```
+
+  Drei Details tragen die Reproduzierbarkeit. `assign` gibt einen neuen DataFrame zurück, statt die Eingabe zu verändern. `sort_values("bestellung_id")` macht das Ergebnis unabhängig davon, in welcher Reihenfolge der Shop die Zeilen exportiert. Und `pruefe` bricht laut ab, statt unbekannte Kanäle still zu verwerfen – ein Export mit neuem Kanal „Marktplatz“ soll auffallen, nicht fehlen. [`DataFrame.pipe`](https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.pipe.html) verkettet die Stufen lesbar von links nach rechts.
+
+  ## Parameter und Determinismus: Stichtag, Sortierung, Zeitzonen
+
+  **Der Stichtag ist ein Parameter.** Ein Skript, das den Berichtsmonat aus `date.today()` ableitet, erzeugt am 2. Oktober einen anderen Bericht als am 30. September, obwohl beide Läufe den September meinen. Der Stichtag kommt deshalb von außen, alles andere wird daraus berechnet – auch der Vormonat. Mit [`argparse`](https://docs.python.org/3/library/argparse.html) und `type=date.fromisoformat` wird eine ungültige Eingabe schon beim Start abgelehnt:
+
+  ```python run
+  import argparse
+  from datetime import date, timedelta
+
+  def berichtszeitraum(stichtag: date) -> tuple[date, date]:
+      """Erster Tag des Monats bis einschließlich Stichtag."""
+      return stichtag.replace(day=1), stichtag
+
+  parser = argparse.ArgumentParser(prog="monatsbericht")
+  parser.add_argument("--stichtag", type=date.fromisoformat, required=True)
+  args = parser.parse_args(["--stichtag", "2026-09-30"])   # im Skript: parse_args()
+
+  von, bis = berichtszeitraum(args.stichtag)
+  vormonat_bis = von - timedelta(days=1)
+  print(f"Bericht {von:%d.%m.%Y} bis {bis:%d.%m.%Y}")
+  print(f"Vormonat {vormonat_bis.replace(day=1):%d.%m.%Y} bis {vormonat_bis:%d.%m.%Y}")
+  ```
+
+  Schreib die Parameter in den Bericht („Stichtag 30.09.2026, Export vom 01.10.2026, Code-Version a3f9c1e“). Dann ist später nachvollziehbar, womit er entstanden ist.
+
+  **Reihenfolge ist kein Zufall.** Exporte garantieren keine Zeilenreihenfolge. Alles, was „die erste“ oder „die letzte“ Zeile nimmt, hängt davon ab: `drop_duplicates(keep="last")`, `groupby(…).first()`, `head`. Stammdaten-Exporte enthalten zum Beispiel oft mehrere Versionen desselben Kunden:
+
+  ```python run
+  import pandas as pd
+
+  export = pd.DataFrame({
+      "kunde_id": [7, 9, 7],
+      "stadt": ["Köln", "Essen", "Bonn"],
+      "geaendert_am": ["2026-09-02", "2026-09-01", "2026-08-15"],
+  })
+  naiv = export.drop_duplicates("kunde_id", keep="last")
+  aktuell = (
+      export.sort_values(["kunde_id", "geaendert_am"])
+      .drop_duplicates("kunde_id", keep="last")
+  )
+  print(naiv["stadt"].tolist())
+  print(aktuell["stadt"].tolist())
+  ```
+
+  Die naive Variante behält für Kunde 7 den ältesten Stand „Bonn“, weil er zufällig zuletzt in der Datei steht. Erst die Sortierung nach Schlüssel und Änderungsdatum macht „letzter Stand“ zu einer fachlichen Aussage ([`drop_duplicates`](https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.drop_duplicates.html)). Sortiere nach einem **eindeutigen** Schlüssel, dann ist das Ergebnis eindeutig, egal welchen Sortieralgorithmus pandas verwendet. `groupby` sortiert die Gruppenschlüssel standardmäßig, das hilft zusätzlich. Zieht die Pipeline Stichproben für die Sichtprüfung, bekommen sie einen festen Startwert: `df.sample(n=20, random_state=2026)` wählt bei jedem Lauf dieselben Zeilen.
+
+  **Zeitzonen entscheiden über den Monat.** Der Webshop speichert Zeitpunkte in UTC. Eine Bestellung am 31. März um 23:30 UTC ist in Köln schon der 1. April – in Deutschland gilt seit dem 29. März 2026 Sommerzeit, UTC+2. Welcher Monat gilt, ist eine fachliche Festlegung; bei Bohnenwerk ist es die deutsche Zeit, und sie steht im Datenwörterbuch. [`zoneinfo`](https://docs.python.org/3/library/zoneinfo.html) kennt die Umstellungen:
+
+  ```python run
+  from datetime import datetime
+  from zoneinfo import ZoneInfo
+
+  bestellt = datetime.fromisoformat("2026-03-31T23:30:00+00:00")
+  koeln = bestellt.astimezone(ZoneInfo("Europe/Berlin"))
+  print("UTC:   ", bestellt.strftime("%Y-%m %H:%M"))
+  print("Berlin:", koeln.strftime("%Y-%m %H:%M"))
+  ```
+
+  In pandas erledigt das `Series.dt.tz_convert("Europe/Berlin")` für eine ganze Spalte ([Time zone handling](https://pandas.pydata.org/docs/user_guide/timeseries.html#time-zone-handling)).
+
+  > [!WARNING] Zeitstempel im Ergebnis
+  > Ein Bericht, der „Erstellt am 01.10.2026 08:14“ in die CSV schreibt, ist bei jedem Lauf anders – ein Vergleich zweier Läufe per Prüfsumme meldet dann immer eine Änderung. Laufzeitinformationen gehören in ein getrenntes Protokoll, die Ergebnisdateien enthalten nur Daten, sortiert und mit fester Spaltenreihenfolge.
+
+  ## Herkunft sichern: Prüfsummen und Datenwörterbuch
+
+  Eine **Prüfsumme** ist ein Fingerabdruck der Bytes einer Datei. SHA-256 liefert 64 Hexadezimalzeichen; ändert sich ein einziges Byte, ändert sich der Fingerabdruck vollständig. Ein Speichern in Excel ändert fast immer Bytes: Trennzeichen, Anführungszeichen, Datumsformat oder ein vorangestelltes BOM. [`hashlib.file_digest`](https://docs.python.org/3/library/hashlib.html#hashlib.file_digest) berechnet die Summe, ohne die Datei komplett in den Speicher zu laden:
+
+  ```python run
+  import hashlib
+  from pathlib import Path
+
+  roh = Path("2026-09_bestellungen.csv")
+  roh.write_bytes("bestellung_id;betrag\n1001;310,00\n".encode("utf-8"))
+
+  def sha256(pfad: Path) -> str:
+      with pfad.open("rb") as datei:
+          return hashlib.file_digest(datei, "sha256").hexdigest()
+
+  erwartet = sha256(roh)
+  print(erwartet[:16], "…")
+
+  # Jemand öffnet die Datei in Excel und speichert als „CSV UTF-8“ – mit BOM
+  roh.write_bytes("\ufeffbestellung_id;betrag\n1001;310,00\n".encode("utf-8"))
+  print("unverändert:", sha256(roh) == erwartet)
+  ```
+
+  Beim Ablegen eines Exports schreibst du die Prüfsumme in `data/raw/MANIFEST.sha256`. Unter Linux erzeugt `sha256sum *.csv > MANIFEST.sha256` im Ordner `data/raw/` eine Zeile je Datei mit Prüfsumme und Namen, und `sha256sum --check MANIFEST.sha256` prüft sie später; unter macOS heißt das Werkzeug `shasum -a 256`. Die Pipeline vergleicht zu Beginn jeder Ausführung und bricht bei einer Abweichung ab. Damit ist die Frage „Rechnen wir noch mit denselben Daten?“ in einer Sekunde beantwortet.
+
+  Das **Datenwörterbuch** beantwortet die zweite Frage: „Was bedeutet diese Spalte?“ Es beschreibt je Tabelle die Herkunft und die Granularität und je Spalte Typ, Einheit, Bedeutung und erlaubte Werte. Maschinenlesbar abgelegt, kann `pruefe()` seine Regeln direkt daraus beziehen:
+
+  ```yaml
+  tabelle: bestellungen
+  quelle: Webshop-Export „Bestellungen alle Kanäle“, abgerufen am ersten Werktag des Folgemonats
+  granularitaet: eine Zeile je Bestellung
+  spalten:
+    - name: bestellung_id
+      typ: Ganzzahl
+      bedeutung: Bestellnummer aus dem Shop-System, eindeutig
+    - name: bestelldatum
+      typ: Datum (im Export TT.MM.JJJJ)
+      bedeutung: Kalendertag der Bestellung in deutscher Zeit (Europe/Berlin)
+    - name: status
+      typ: Text
+      erlaubt: [bezahlt, storniert, retourniert]
+      bedeutung: Nur „bezahlt“ zählt zum Umsatz
+    - name: betrag
+      typ: Dezimalzahl
+      einheit: EUR netto ohne Versandkosten
+  ```
+
+  Das klingt nach Bürokratie, spart aber genau die Rückfragen, die jeden Monat Zeit kosten: „Ist das brutto oder netto?“, „Zählen Retouren mit?“, „Welcher Tag gilt bei Bestellungen um Mitternacht?“ Wer die Antwort einmal aufschreibt, muss sie nicht mehr in E-Mails suchen.
+
+  ## Umgebung, Tests und die Excel-Seite
+
+  **Umgebung festhalten.** `pyproject.toml` beschreibt, was das Projekt braucht, `uv.lock` hält fest, welche Versionen daraus aufgelöst wurden. Die Lockdatei gehört laut uv-Dokumentation in die Versionskontrolle und wird nicht von Hand bearbeitet ([Project structure and files](https://docs.astral.sh/uv/concepts/projects/layout/)). Wie beides entsteht, zeigt [Tooling & Packaging](/python/tooling-packaging); für die Analyse zählt, dass der Bericht mit genau den getesteten Versionen läuft:
+
+  ```toml
+  [project]
+  name = "monatsbericht"
+  version = "1.4.0"
+  requires-python = ">=3.13"
+  dependencies = ["pandas>=3.0,<4", "matplotlib>=3.10"]
+
+  [project.scripts]
+  monatsbericht = "monatsbericht.cli:main"
+
+  [build-system]
+  requires = ["hatchling"]
+  build-backend = "hatchling.build"
+
+  [dependency-groups]
+  dev = ["pytest>=8"]
+  ```
+
+  ```console
+  $ uv sync --locked
+  $ uv run --locked pytest
+  $ uv run --locked monatsbericht --stichtag 2026-09-30
+  ```
+
+  `--locked` bricht mit einem Fehler ab, wenn `uv.lock` nicht mehr zu `pyproject.toml` passt, statt die Lockdatei still neu aufzulösen ([Checking the lockfile](https://docs.astral.sh/uv/concepts/projects/sync/#checking-the-lockfile)). Ein pandas-Update passiert dann bewusst, mit eigenem Commit und Testlauf, und nicht nebenbei beim Monatsabschluss.
+
+  **Transformationen testen.** Reine Funktionen lassen sich mit kleinen, von Hand nachgerechneten DataFrames prüfen. Ein guter Test enthält genau die Fallen, um die es geht – eine stornierte Bestellung, eine Retoure, einen Kanal in Kleinschreibung – und vergleicht mit [`assert_frame_equal`](https://pandas.pydata.org/docs/reference/api/pandas.testing.assert_frame_equal.html) Werte, Spalten und Datentypen auf einmal. Fixtures, Parametrisierung und den Aufbau einer Testsuite behandelt [Testen mit pytest](/python/testen-pytest).
+
+  ```python run
+  import pandas as pd
+
+  def werte_aus(df: pd.DataFrame) -> pd.DataFrame:
+      bezahlt = df[df["status"] == "bezahlt"]
+      return bezahlt.groupby("kanal", as_index=False)["betrag"].sum()
+
+  def test_werte_aus_zaehlt_nur_bezahlte_bestellungen():
+      eingabe = pd.DataFrame({
+          "kanal": ["Shop", "Shop", "B2B", "B2B"],
+          "status": ["bezahlt", "storniert", "bezahlt", "retourniert"],
+          "betrag": [49.5, 25.0, 310.0, 128.5],
+      })
+      erwartet = pd.DataFrame({"kanal": ["B2B", "Shop"], "betrag": [310.0, 49.5]})
+      pd.testing.assert_frame_equal(werte_aus(eingabe), erwartet)
+
+  test_werte_aus_zaehlt_nur_bezahlte_bestellungen()   # pytest ruft Testfunktionen selbst auf
+  print("Test bestanden")
+  ```
+
+  **Die Excel-Seite.** Dasselbe Prinzip gilt ohne Python. Power Query zeichnet jede Transformation als Schritt auf; die [angewendeten Schritte](https://learn.microsoft.com/de-de/power-query/applied-steps) sind das Rezept, und „Daten › Alle aktualisieren“ wendet es auf den neuen Export an. Damit das reproduzierbar bleibt, gelten dieselben Regeln: Die Quelldatei wird nur gelesen, Korrekturen sind Schritte statt Handarbeit in der geladenen Tabelle, und Pfad und Stichtag sind [Parameter](https://learn.microsoft.com/de-de/power-query/power-query-query-parameters) (Start › Parameter verwalten › Neuer Parameter). Manuelle Zwischenschritte – Spalten löschen, Werte überschreiben, Zeilen herauskopieren – gehen beim nächsten Aktualisieren verloren oder, schlimmer, bleiben als einzige Kopie in einer Datei. Wie Power Query im Detail funktioniert, zeigt [Power Query: Importe wiederholbar machen](/data/power-query).
+
+  ```powerquery
+  let
+      Quelle = Csv.Document(File.Contents(Exportdatei), [Delimiter = ";", Encoding = 65001]),
+      #"Höher gestufte Header" = Table.PromoteHeaders(Quelle, [PromoteAllScalars = true]),
+      #"Geänderter Typ mit Gebietsschema" = Table.TransformColumnTypes(
+          #"Höher gestufte Header",
+          {{"bestelldatum", type date}, {"betrag", type number}},
+          "de-DE"
+      ),
+      #"Gefilterte Zeilen" = Table.SelectRows(
+          #"Geänderter Typ mit Gebietsschema",
+          each [status] = "bezahlt" and [bestelldatum] <= Stichtag
+      )
+  in
+      #"Gefilterte Zeilen"
+  ```
+
+  > [!PRAXIS]
+  > Bei Bohnenwerk hat der Monatsbericht früher rund drei Stunden gedauert: Exporte öffnen, Spalten löschen, `SVERWEIS` (englisch `VLOOKUP`), PivotTable, Diagramme kopieren. Heute legt jemand die Exporte in `data/raw/` ab, trägt die Prüfsummen ins Manifest ein und startet `uv run --locked monatsbericht --stichtag 2026-09-30`. Nach zwei Minuten liegen Kennzahlen und Diagramme in `reports/`. Wird heute eine alte Zahl angezweifelt, genügt ein Lauf mit dem damaligen Stichtag, etwa `--stichtag 2026-08-31`, auf dem damaligen Commit, um zu zeigen, welche Rohdaten und welcher Code zu welcher Zahl geführt haben.
+
+  > [!INTERVIEW] „Wie stellst du sicher, dass deine Analyse reproduzierbar ist?“
+  > Ich halte die vier Eingänge fest: Rohdaten bleiben unverändert und bekommen Prüfsummen, der Code liegt in Git, Parameter wie der Stichtag kommen von außen und stehen im Bericht, die Umgebung ist mit einer Lockdatei fixiert. Dazwischen ist die Pipeline eine Kette reiner Funktionen mit Tests. Die Probe: Ich lösche alle Zwischenstände, starte einen Befehl und bekomme byte-identische Ergebnisse.
+
+  ## Häufige Fehler
+
+  - **Rohdaten „repariert“.** Symptom: Die Prüfsumme stimmt nicht mehr, ein alter Bericht lässt sich nicht nachrechnen. Rohdaten nur lesen, Korrekturen als Code, Exporte nach dem Ablegen schreibschützen.
+  - **`date.today()` oder `datetime.now()` in der Auswertung.** Derselbe Bericht ergibt je nach Tag andere Zahlen. Stichtag als Parameter übergeben.
+  - **Ergebnis hängt an der Zeilenreihenfolge.** `drop_duplicates`, `first()` oder `head()` ohne vorherige Sortierung. Nach einem eindeutigen Schlüssel sortieren.
+  - **Monatsgrenzen in UTC.** Bestellungen kurz vor Mitternacht landen im falschen Monat. Zeitzone festlegen, dokumentieren, umrechnen.
+  - **`uv.lock` fehlt im Repository.** Auf einem anderen Rechner wird neu aufgelöst, und eine neue pandas-Version rechnet anders. Lockdatei committen, mit `--locked` ausführen.
+  - **Funktionen verändern ihre Eingabe.** `df["x"] = …` in einer Hilfsfunktion ändert den DataFrame des Aufrufers. Mit `assign` oder einer Kopie arbeiten und das im Test prüfen.
+  - **Tests, die den Fehler nicht fangen.** Testdaten ohne Storno oder Retoure prüfen nichts. Jeder Test enthält die Falle, gegen die er schützen soll.
+  - **Manueller Zwischenschritt in Excel.** Beim nächsten „Alle aktualisieren“ ist die Korrektur weg. Korrekturen als Power-Query-Schritt aufzeichnen.
+
+  ## Zusammenfassung
+
+  - Ergebnis = f(Rohdaten, Code, Parameter, Umgebung); jeder Eingang hat einen festen Ort.
+  - Rohdaten werden nur gelesen; alles andere lässt sich aus Rohdaten und Code neu erzeugen und darf gelöscht werden.
+  - Git versioniert Code, Tests, `pyproject.toml`, `uv.lock`, Datenwörterbuch und Manifest – nicht die Rohdaten.
+  - Die Pipeline ist eine Kette reiner Funktionen; Dateien werden nur am Anfang gelesen und am Ende geschrieben.
+  - Der Stichtag ist ein Parameter; Sortierung nach eindeutigem Schlüssel, feste Seeds und eine festgelegte Zeitzone machen Ergebnisse deterministisch.
+  - SHA-256-Prüfsummen zeigen, ob die Rohdaten noch dieselben sind; das Datenwörterbuch sagt, was sie bedeuten.
+  - `uv run --locked` führt den Bericht mit genau den getesteten Versionen aus; Tests enthalten die Fallen, gegen die sie schützen.
+  - In Excel sind Power-Query-Schritte das Rezept; Handarbeit in der geladenen Tabelle ist nicht reproduzierbar.
+exercises:
+  - id: was-bricht-reproduzierbarkeit
+    type: choice
+    title: Welcher Bericht lässt sich nicht wiederholen?
+    prompt: |
+      Der Septemberbericht soll im Dezember für eine Prüfung mit genau denselben Zahlen neu erzeugt werden. Welche dieser Eigenschaften des Projekts verhindern das?
+    options:
+      - text: "Die Auswertung bestimmt den Monatsanfang mit `date.today().replace(day=1)`."
+        correct: true
+        why: Im Dezember ergibt das den 1. Dezember. Der Bericht rechnet dann einen anderen Zeitraum, obwohl niemand etwas geändert hat.
+      - text: Die Bereinigung schreibt die korrigierte CSV an dieselbe Stelle in `data/raw/` zurück.
+        correct: true
+        why: Die ursprünglichen Rohdaten sind überschrieben. Ein zweiter Lauf bereinigt bereits Bereinigtes, und niemand kann mehr zeigen, was im Export stand.
+      - text: "`pyproject.toml` verlangt `pandas>=3.0`, eine `uv.lock` gibt es nicht."
+        correct: true
+        why: Ohne Lockdatei löst uv im Dezember neu auf und installiert womöglich eine neuere pandas-Version mit anderem Verhalten.
+      - text: "`data/processed/` wird bei jedem Lauf gelöscht und neu erzeugt."
+        correct: false
+        why: Das ist gewollt. Zwischenstände sind Wegwerfprodukte; dass sie sich jederzeit neu erzeugen lassen, ist gerade der Beweis für Reproduzierbarkeit.
+      - text: "Die Stichprobe für die Sichtprüfung zieht `df.sample(n=20, random_state=2026)`."
+        correct: false
+        why: Mit festem `random_state` wählt pandas bei jedem Lauf dieselben Zeilen. Zufall mit festem Startwert ist deterministisch.
+    explanation: |
+      Ein Ergebnis ist eine Funktion aus Rohdaten, Code, Parametern und Umgebung. `date.today()` macht die Uhr zu einem versteckten Parameter, das Überschreiben der Rohdaten zerstört den ersten Eingang, und ohne Lockdatei ist die Umgebung nicht festgelegt. Gelöschte Zwischenstände und Zufall mit festem Startwert sind dagegen unproblematisch: Beides entsteht bei jedem Lauf gleich.
+    resources:
+      - title: uv · Project structure and files · The lockfile
+        url: https://docs.astral.sh/uv/concepts/projects/layout/#the-lockfile
+      - title: pandas · DataFrame.sample
+        url: https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.sample.html
+
+  - id: pipeline-reihenfolge
+    type: order
+    title: Der Ablauf von main
+    prompt: |
+      Bring die Zeilen von `main` in die richtige Reihenfolge. Die Rohdatei wird erst gelesen, wenn feststeht, dass sie unverändert ist; ausgewertet wird nur, was geprüft ist, und der Bericht wird nur geschrieben, wenn alle Prüfungen bestanden sind.
+    lang: python
+    lines: |
+      def main(stichtag: date, roh: Path, ziel: Path) -> None:
+          pruefe_manifest(roh.parent / "MANIFEST.sha256")
+          rohdaten = lies_export(roh)
+          sauber = bereinige(rohdaten)
+          pruefe(sauber)
+          kennzahlen = werte_aus(sauber, stichtag)
+          schreibe_bericht(kennzahlen, stichtag, ziel)
+    explanation: |
+      Die Prüfsummenkontrolle steht vor dem Einlesen: Stimmt sie nicht, rechnet die Pipeline gar nicht erst mit fremden Daten. Danach folgen die Stufen einlesen → bereinigen → prüfen → auswerten → berichten. Nur die erste und die letzte Stufe berühren Dateien; alles dazwischen sind reine Funktionen. Weil `pruefe` bei einem Fehler eine Exception wirft, erreicht ein fehlerhafter Datenstand nie `schreibe_bericht` – es gibt dann keinen halb richtigen Bericht.
+    resources:
+      - title: pandas · DataFrame.pipe
+        url: https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.pipe.html
+
+  - id: dedupe-reihenfolge
+    type: output
+    title: Welcher Stand bleibt übrig?
+    prompt: Was gibt das Programm aus?
+    lang: python
+    code: |
+      import pandas as pd
+
+      export = pd.DataFrame({
+          "kunde_id": [12, 15, 12, 15],
+          "segment": ["Büro", "Café", "Café", "Privat"],
+          "geaendert_am": ["2026-09-03", "2026-07-20", "2026-06-11", "2026-09-01"],
+      })
+      a = export.drop_duplicates("kunde_id", keep="last")
+      b = export.sort_values("geaendert_am").drop_duplicates("kunde_id", keep="last")
+      print(a["segment"].tolist())
+      print(b["segment"].tolist())
+      print(b.index.tolist())
+    expected: |
+      ['Café', 'Privat']
+      ['Privat', 'Büro']
+      [3, 0]
+    explanation: |
+      Ohne Sortierung behält `keep="last"` die letzte Zeile **in der Datei**: für Kunde 12 Zeile 2 (Café, Juni), für Kunde 15 Zeile 3 (Privat). Für Kunde 12 ist das der älteste Stand. Nach der Sortierung nach Datum ist die Reihenfolge 2, 1, 3, 0; der letzte Eintrag je Kunde ist Zeile 3 (15, Privat) und Zeile 0 (12, Büro, September). `drop_duplicates` behält den ursprünglichen Index und die aktuelle Reihenfolge, deshalb `[3, 0]`. Erst die Sortierung macht „letzter Stand“ zu einer fachlichen Aussage statt zu einem Zufall des Exports.
+    resources:
+      - title: pandas · DataFrame.drop_duplicates
+        url: https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.drop_duplicates.html
+
+  - id: zeitzone-monat
+    type: output
+    title: In welchem Monat wurde bestellt?
+    prompt: |
+      Der Webshop liefert Bestellzeitpunkte in UTC. Was gibt das Programm aus?
+    lang: python
+    code: |
+      import pandas as pd
+
+      zeiten = pd.Series(pd.to_datetime([
+          "2026-03-31T21:45:00Z",
+          "2026-03-31T22:30:00Z",
+          "2026-10-31T23:15:00Z",
+      ]))
+      print(zeiten.dt.strftime("%Y-%m").tolist())
+      lokal = zeiten.dt.tz_convert("Europe/Berlin")
+      print(lokal.dt.strftime("%Y-%m").tolist())
+    expected: |
+      ['2026-03', '2026-03', '2026-10']
+      ['2026-03', '2026-04', '2026-11']
+    explanation: |
+      Ende März gilt in Deutschland schon Sommerzeit (seit dem 29. März 2026, UTC+2): 21:45 UTC ist 23:45 Uhr am 31. März, 22:30 UTC aber 00:30 Uhr am 1. April. Ende Oktober gilt wieder Winterzeit (seit dem 25. Oktober 2026, UTC+1): 23:15 UTC ist 00:15 Uhr am 1. November. Wer Monatsgrenzen in UTC zieht, verschiebt solche Bestellungen in den falschen Monat. `tz_convert` rechnet mit den Regeln der IANA-Zeitzonendatenbank, der Versatz ist also nicht fest.
+    resources:
+      - title: pandas · Series.dt.tz_convert
+        url: https://pandas.pydata.org/docs/reference/api/pandas.Series.dt.tz_convert.html
+      - title: pandas · Time zone handling
+        url: https://pandas.pydata.org/docs/user_guide/timeseries.html#time-zone-handling
+
+  - id: berichtszeitraum
+    type: code
+    title: Alles aus dem Stichtag ableiten
+    prompt: |
+      Schreibe `berichtszeitraum(stichtag)`. `stichtag` ist ein `date` und muss der letzte Tag eines Monats sein, sonst wirf einen `ValueError`. Gib ein Dictionary mit vier `date`-Werten zurück:
+
+      - `"von"`: erster Tag des Stichtagsmonats
+      - `"bis"`: der Stichtag
+      - `"vormonat_von"` und `"vormonat_bis"`: erster und letzter Tag des Monats davor
+
+      Die Funktion darf die aktuelle Uhrzeit nicht verwenden.
+    lang: python
+    starter: |
+      from datetime import date, timedelta
+
+      def berichtszeitraum(stichtag: date) -> dict[str, date]:
+          von = stichtag.replace(day=1)
+          # Vormonat und Prüfung auf Monatsende fehlen noch
+          return {"von": von, "bis": stichtag}
+    solution: |
+      from datetime import date, timedelta
+
+      def berichtszeitraum(stichtag: date) -> dict[str, date]:
+          if (stichtag + timedelta(days=1)).day != 1:
+              raise ValueError(f"Stichtag {stichtag.isoformat()} ist kein Monatsende")
+          von = stichtag.replace(day=1)
+          vormonat_bis = von - timedelta(days=1)
+          return {
+              "von": von,
+              "bis": stichtag,
+              "vormonat_von": vormonat_bis.replace(day=1),
+              "vormonat_bis": vormonat_bis,
+          }
+    tests:
+      - name: September 2026
+        code: |
+          from datetime import date
+          ergebnis = berichtszeitraum(date(2026, 9, 30))
+          erwartet = {"von": date(2026, 9, 1), "bis": date(2026, 9, 30), "vormonat_von": date(2026, 8, 1), "vormonat_bis": date(2026, 8, 31)}
+          assert ergebnis == erwartet, f"bekommen {ergebnis}"
+      - name: März mit kurzem Februar davor
+        code: |
+          from datetime import date
+          ergebnis = berichtszeitraum(date(2026, 3, 31))
+          assert ergebnis["vormonat_von"] == date(2026, 2, 1) and ergebnis["vormonat_bis"] == date(2026, 2, 28), f"bekommen {ergebnis}"
+      - name: Januar mit Vormonat im Vorjahr
+        code: |
+          from datetime import date
+          ergebnis = berichtszeitraum(date(2026, 1, 31))
+          assert ergebnis["vormonat_von"] == date(2025, 12, 1) and ergebnis["vormonat_bis"] == date(2025, 12, 31), f"bekommen {ergebnis}"
+      - name: Schaltjahr
+        code: |
+          from datetime import date
+          ergebnis = berichtszeitraum(date(2028, 2, 29))
+          assert ergebnis["von"] == date(2028, 2, 1) and ergebnis["vormonat_bis"] == date(2028, 1, 31), f"bekommen {ergebnis}"
+      - name: Kein Monatsende wird abgelehnt
+        code: |
+          from datetime import date
+          for tag in [date(2026, 9, 15), date(2026, 2, 27), date(2028, 2, 28)]:
+              try:
+                  berichtszeitraum(tag)
+              except ValueError:
+                  pass
+              else:
+                  assert False, f"{tag} ist kein Monatsende – erwartet ist ein ValueError."
+    hints:
+      - Ein Tag ist ein Monatsende, wenn der Tag danach der Erste eines Monats ist.
+      - "Der letzte Tag des Vormonats ist der Tag vor `von`: `von - timedelta(days=1)`."
+    explanation: |
+      Alles, was der Bericht an Zeiträumen braucht, folgt aus einem einzigen Parameter. Die Funktion ist rein: Sie liest keine Uhr, und dieselbe Eingabe ergibt immer dasselbe Ergebnis – auch in drei Monaten. Die Monatsend-Prüfung über „der nächste Tag ist ein Erster“ kommt ohne Tabelle der Monatslängen aus und behandelt Schaltjahre automatisch. Ein Stichtag mitten im Monat wird abgelehnt, weil ein halber Monat im Vergleich mit einem vollen Vormonat einen Einbruch vortäuschen würde.
+    resources:
+      - title: Python · datetime.date
+        url: https://docs.python.org/3/library/datetime.html#date-objects
+      - title: Python · datetime.timedelta
+        url: https://docs.python.org/3/library/datetime.html#timedelta-objects
+
+  - id: bereinigen-ohne-nebenwirkung
+    type: code
+    title: Bereinigen ohne Nebenwirkungen
+    prompt: |
+      Die Bereinigung verändert den DataFrame des Aufrufers und scheitert an Beträgen mit Tausenderpunkt. Schreibe `bereinige(roh)` als reine Funktion neu. `roh` enthält Text aus dem CSV-Export: `bestellung_id` (Zahl), `bestelldatum` (`"14.03.2026"`), `kanal` (`"Shop"`, `" b2b"`, `"shop "` …), `betrag` (`"49,90"`, `"1.250,00"`).
+
+      Gib einen **neuen** DataFrame zurück mit denselben Spalten in derselben Reihenfolge, in dem
+
+      - `bestelldatum` ein Datumstyp ist,
+      - `kanal` genau `"Shop"` oder `"B2B"` lautet,
+      - `betrag` eine Kommazahl (`float`) ist,
+      - die Zeilen nach `bestellung_id` sortiert sind und der Index bei 0 beginnt.
+
+      `roh` darf nicht verändert werden.
+    lang: python
+    starter: |
+      import pandas as pd
+
+      def bereinige(roh: pd.DataFrame) -> pd.DataFrame:
+          roh["kanal"] = roh["kanal"].str.strip()
+          roh["betrag"] = roh["betrag"].str.replace(",", ".").astype(float)
+          return roh
+    solution: |
+      import pandas as pd
+
+      KANAELE = {"shop": "Shop", "b2b": "B2B"}
+
+      def bereinige(roh: pd.DataFrame) -> pd.DataFrame:
+          betrag = (
+              roh["betrag"]
+              .str.replace(".", "", regex=False)
+              .str.replace(",", ".", regex=False)
+              .astype(float)
+          )
+          return (
+              roh.assign(
+                  bestelldatum=pd.to_datetime(roh["bestelldatum"], format="%d.%m.%Y"),
+                  kanal=roh["kanal"].str.strip().str.lower().map(KANAELE),
+                  betrag=betrag,
+              )
+              .sort_values("bestellung_id")
+              .reset_index(drop=True)
+          )
+    setup: |
+      import pandas as pd
+
+      def beispiel():
+          return pd.DataFrame({
+              "bestellung_id": [1003, 1001, 1002],
+              "bestelldatum": ["02.09.2026", "01.09.2026", "01.09.2026"],
+              "kanal": ["Shop", " b2b", "shop "],
+              "betrag": ["49,90", "1.250,00", "25,00"],
+          })
+    tests:
+      - name: Werte und Typen
+        code: |
+          import pandas as pd
+          ergebnis = bereinige(beispiel())
+          assert ergebnis["kanal"].tolist() == ["B2B", "Shop", "Shop"], f"Kanäle: {ergebnis['kanal'].tolist()}"
+          assert ergebnis["betrag"].tolist() == [1250.0, 25.0, 49.9], f"Beträge: {ergebnis['betrag'].tolist()}"
+          assert pd.api.types.is_datetime64_any_dtype(ergebnis["bestelldatum"]), f"bestelldatum hat den Typ {ergebnis['bestelldatum'].dtype}"
+          assert ergebnis.loc[0, "bestelldatum"] == pd.Timestamp("2026-09-01"), f"Datum der ersten Zeile: {ergebnis.loc[0, 'bestelldatum']}"
+      - name: Sortiert, Index ab 0, Spalten unverändert
+        code: |
+          ergebnis = bereinige(beispiel())
+          assert ergebnis["bestellung_id"].tolist() == [1001, 1002, 1003], f"Reihenfolge: {ergebnis['bestellung_id'].tolist()}"
+          assert ergebnis.index.tolist() == [0, 1, 2], f"Index: {ergebnis.index.tolist()}"
+          assert list(ergebnis.columns) == ["bestellung_id", "bestelldatum", "kanal", "betrag"], f"Spalten: {list(ergebnis.columns)}"
+      - name: Eingabe bleibt unverändert
+        code: |
+          import pandas as pd
+          roh = beispiel()
+          try:
+              bereinige(roh)
+          finally:
+              pd.testing.assert_frame_equal(roh, beispiel(), obj="roh nach dem Aufruf")
+      - name: Reihenfolge im Export spielt keine Rolle
+        code: |
+          import pandas as pd
+          vorwaerts = bereinige(beispiel())
+          rueckwaerts = bereinige(beispiel().iloc[::-1])
+          pd.testing.assert_frame_equal(vorwaerts, rueckwaerts, obj="Ergebnis bei umgekehrter Zeilenfolge")
+    hints:
+      - "`roh.assign(spalte=…)` liefert einen neuen DataFrame; `roh[\"spalte\"] = …` verändert den des Aufrufers."
+      - "Beim Betrag erst den Tausenderpunkt entfernen, dann das Komma durch einen Punkt ersetzen – jeweils mit `regex=False`."
+      - "Kanal: `.str.strip().str.lower().map({\"shop\": \"Shop\", \"b2b\": \"B2B\"})`. Datum: `pd.to_datetime(…, format=\"%d.%m.%Y\")`."
+    explanation: |
+      `roh["kanal"] = …` ändert das Objekt, das der Aufrufer übergeben hat – auch mit Copy-on-Write in pandas 3, denn Copy-on-Write schützt abgeleitete Objekte, nicht das Original vor direkter Zuweisung. Wer danach `roh` noch einmal verwendet, rechnet mit veränderten Daten, und ein zweiter Aufruf „bereinigt“ Bereinigtes. `assign` erzeugt einen neuen DataFrame. Die Reihenfolge der Ersetzungen beim Betrag zählt: Erst der Tausenderpunkt weg, dann das Dezimalkomma zum Punkt, sonst wird aus `1.250,00` die ungültige Zahl `1.250.00`. Die Sortierung nach `bestellung_id` macht das Ergebnis unabhängig von der Exportreihenfolge – der letzte Test prüft genau das.
+    resources:
+      - title: pandas · DataFrame.assign
+        url: https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.assign.html
+      - title: pandas · Copy-on-Write
+        url: https://pandas.pydata.org/docs/user_guide/copy_on_write.html
+
+  - id: manifest-pruefen
+    type: code
+    title: Sind die Rohdaten noch dieselben?
+    prompt: |
+      Schreibe `pruefe_manifest(ordner, manifest)`. `manifest` ordnet Dateinamen ihre SHA-256-Prüfsumme (Hex-String) zu. Vergleiche mit den Dateien in `ordner` und gib eine **sortierte** Liste von Meldungen zurück:
+
+      - `"fehlt: <name>"` – im Manifest, aber nicht im Ordner
+      - `"geändert: <name>"` – Prüfsumme stimmt nicht
+      - `"neu: <name>"` – im Ordner, aber nicht im Manifest
+
+      Sind alle Dateien unverändert, ist die Liste leer. Die Vorbereitung legt `data/raw/` mit zwei Exporten an; `MANIFEST` enthält ihre korrekten Prüfsummen.
+    lang: python
+    starter: |
+      import hashlib
+      from pathlib import Path
+
+      def pruefe_manifest(ordner: Path, manifest: dict[str, str]) -> list[str]:
+          probleme = []
+          for name in manifest:
+              if not (Path(ordner) / name).exists():
+                  probleme.append(f"fehlt: {name}")
+          return probleme
+    solution: |
+      import hashlib
+      from pathlib import Path
+
+      def sha256(pfad: Path) -> str:
+          with pfad.open("rb") as datei:
+              return hashlib.file_digest(datei, "sha256").hexdigest()
+
+      def pruefe_manifest(ordner: Path, manifest: dict[str, str]) -> list[str]:
+          ordner = Path(ordner)
+          vorhanden = {p.name for p in ordner.iterdir() if p.is_file()}
+          probleme = []
+          for name, erwartet in manifest.items():
+              if name not in vorhanden:
+                  probleme.append(f"fehlt: {name}")
+              elif sha256(ordner / name) != erwartet:
+                  probleme.append(f"geändert: {name}")
+          for name in vorhanden - manifest.keys():
+              probleme.append(f"neu: {name}")
+          return sorted(probleme)
+    setup: |
+      import hashlib
+      import shutil
+      from pathlib import Path
+
+      ROH = Path("data/raw")
+      ROH.mkdir(parents=True)
+      (ROH / "2026-09_bestellungen.csv").write_text("bestellung_id;betrag\n1001;310,00\n", encoding="utf-8")
+      (ROH / "2026-09_kunden.csv").write_text("kunde_id;stadt\n7;Köln\n", encoding="utf-8")
+      MANIFEST = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in ROH.iterdir()}
+
+      def kopie(name: str) -> Path:
+          return Path(shutil.copytree(ROH, name))
+    tests:
+      - name: Alles unverändert
+        code: |
+          ergebnis = pruefe_manifest(ROH, MANIFEST)
+          assert ergebnis == [], f"erwartet [], bekommen {ergebnis}"
+      - name: Datei in Excel gespeichert (BOM ergänzt)
+        code: |
+          ordner = kopie("fall_bom")
+          (ordner / "2026-09_bestellungen.csv").write_bytes("\ufeffbestellung_id;betrag\n1001;310,00\n".encode("utf-8"))
+          ergebnis = pruefe_manifest(ordner, MANIFEST)
+          assert ergebnis == ["geändert: 2026-09_bestellungen.csv"], f"bekommen {ergebnis}"
+      - name: Datei fehlt
+        code: |
+          ordner = kopie("fall_fehlt")
+          (ordner / "2026-09_kunden.csv").unlink()
+          ergebnis = pruefe_manifest(ordner, MANIFEST)
+          assert ergebnis == ["fehlt: 2026-09_kunden.csv"], f"bekommen {ergebnis}"
+      - name: Unerwartete Datei
+        code: |
+          ordner = kopie("fall_neu")
+          (ordner / "notizen.txt").write_text("Stornos gelöscht", encoding="utf-8")
+          ergebnis = pruefe_manifest(ordner, MANIFEST)
+          assert ergebnis == ["neu: notizen.txt"], f"bekommen {ergebnis}"
+      - name: Mehrere Probleme, sortiert
+        code: |
+          ordner = kopie("fall_alles")
+          (ordner / "2026-09_kunden.csv").unlink()
+          (ordner / "2026-09_bestellungen.csv").write_text("bestellung_id;betrag\n1001;31,00\n", encoding="utf-8")
+          (ordner / "2026-10_bestellungen.csv").write_text("bestellung_id;betrag\n", encoding="utf-8")
+          ergebnis = pruefe_manifest(ordner, MANIFEST)
+          erwartet = ["fehlt: 2026-09_kunden.csv", "geändert: 2026-09_bestellungen.csv", "neu: 2026-10_bestellungen.csv"]
+          assert ergebnis == erwartet, f"bekommen {ergebnis}"
+    hints:
+      - "`hashlib.sha256(pfad.read_bytes()).hexdigest()` liefert die Prüfsumme als Hex-String; `hashlib.file_digest` liest große Dateien stückweise."
+      - "Die Dateinamen im Ordner bekommst du mit `{p.name for p in Path(ordner).iterdir() if p.is_file()}`. Mengendifferenz findet die neuen."
+      - Sammle alle Meldungen und gib `sorted(probleme)` zurück, damit die Ausgabe nicht von der Reihenfolge im Dateisystem abhängt.
+    explanation: |
+      Die Prüfsumme vergleicht Bytes, nicht Inhalte: Auch ein unsichtbares BOM, das Excel beim Speichern als „CSV UTF-8“ voranstellt, ändert sie. Genau das ist gewollt, denn schon ein anderes Trennzeichen oder Datumsformat kann das Einlesen verändern. Neue Dateien zu melden ist genauso wichtig wie fehlende: Eine Notiz oder ein zweiter Export im Rohdatenordner ist ein Hinweis auf Handarbeit. `sorted` macht die Meldungen deterministisch, denn `iterdir` garantiert keine Reihenfolge.
+    resources:
+      - title: Python · hashlib.file_digest
+        url: https://docs.python.org/3/library/hashlib.html#hashlib.file_digest
+      - title: Python · pathlib.Path.iterdir
+        url: https://docs.python.org/3/library/pathlib.html#pathlib.Path.iterdir
+
+  - id: test-faengt-bug
+    type: code
+    title: Ein Test, der den Fehler fängt
+    prompt: |
+      Die Vorbereitung definiert drei Implementierungen von `umsatz_je_kanal(bestellungen)`, die ein Dictionary `{kanal: umsatz}` liefern. Umsatz sind nur Bestellungen mit Status `"bezahlt"`; `"storniert"` und `"retourniert"` zählen nicht.
+
+      - `umsatz_je_kanal_richtig` ist korrekt.
+      - `umsatz_je_kanal_ohne_filter` zählt alle Bestellungen.
+      - `umsatz_je_kanal_nur_storno` schließt nur Stornos aus.
+
+      Schreibe `pruefe_umsatz_je_kanal(funktion)`: Die Funktion baut einen kleinen DataFrame mit den Spalten `kanal`, `status` und `betrag`, ruft `funktion` damit auf und prüft das Ergebnis mit `assert`. Sie muss bei der richtigen Implementierung durchlaufen und bei beiden fehlerhaften einen `AssertionError` werfen.
+    lang: python
+    starter: |
+      import pandas as pd
+
+      def pruefe_umsatz_je_kanal(funktion):
+          bestellungen = pd.DataFrame({
+              "kanal": ["Shop", "B2B"],
+              "status": ["bezahlt", "bezahlt"],
+              "betrag": [49.5, 310.0],
+          })
+          assert funktion(bestellungen) == {"Shop": 49.5, "B2B": 310.0}
+    solution: |
+      import pandas as pd
+
+      def pruefe_umsatz_je_kanal(funktion):
+          bestellungen = pd.DataFrame({
+              "kanal": ["Shop", "Shop", "B2B", "B2B", "Shop"],
+              "status": ["bezahlt", "storniert", "bezahlt", "retourniert", "bezahlt"],
+              "betrag": [49.5, 25.0, 310.0, 128.5, 20.5],
+          })
+          ergebnis = funktion(bestellungen)
+          assert ergebnis == {"B2B": 310.0, "Shop": 70.0}, f"erwartet B2B 310.0 und Shop 70.0, bekommen {ergebnis}"
+    setup: |
+      import pandas as pd
+
+      def umsatz_je_kanal_richtig(bestellungen):
+          bezahlt = bestellungen[bestellungen["status"] == "bezahlt"]
+          return bezahlt.groupby("kanal")["betrag"].sum().to_dict()
+
+      def umsatz_je_kanal_ohne_filter(bestellungen):
+          return bestellungen.groupby("kanal")["betrag"].sum().to_dict()
+
+      def umsatz_je_kanal_nur_storno(bestellungen):
+          gueltig = bestellungen[bestellungen["status"] != "storniert"]
+          return gueltig.groupby("kanal")["betrag"].sum().to_dict()
+    tests:
+      - name: Die richtige Implementierung besteht
+        code: |
+          try:
+              pruefe_umsatz_je_kanal(umsatz_je_kanal_richtig)
+          except AssertionError as fehler:
+              assert False, f"Dein Test schlägt bei der korrekten Implementierung an: {fehler}"
+      - name: Fängt die Implementierung ohne Filter
+        code: |
+          try:
+              pruefe_umsatz_je_kanal(umsatz_je_kanal_ohne_filter)
+          except AssertionError:
+              pass
+          else:
+              assert False, "Dein Test lässt eine Implementierung durch, die stornierte Bestellungen mitzählt."
+      - name: Fängt die Implementierung, die Retouren mitzählt
+        code: |
+          try:
+              pruefe_umsatz_je_kanal(umsatz_je_kanal_nur_storno)
+          except AssertionError:
+              pass
+          else:
+              assert False, "Dein Test lässt eine Implementierung durch, die Retouren als Umsatz zählt. Enthalten deine Testdaten eine Retoure?"
+    hints:
+      - Ein Test fängt nur Fehler, deren Auslöser in den Testdaten vorkommt. Welche Status fehlen im Startcode?
+      - Nimm je Kanal mindestens eine bezahlte Bestellung und verteile eine stornierte und eine retournierte Bestellung auf die Kanäle. Rechne das erwartete Ergebnis von Hand aus.
+      - Wähle Beträge, die sich exakt addieren lassen (etwa 49.5 und 20.5), damit der Vergleich mit `==` nicht an Rundungsrauschen scheitert.
+    explanation: |
+      Der Startcode ist ein Test, der immer grün ist – er enthält keine einzige Bestellung, die nicht zählen darf, und kann deshalb keinen Filterfehler bemerken. Ein wirksamer Test enthält die Fallen, gegen die er schützen soll: eine Stornierung **und** eine Retoure, verteilt auf verschiedene Kanäle, damit auch eine Verwechslung der Kanäle auffällt. So prüfst du einen Test selbst: Er muss gegen eine absichtlich kaputte Implementierung rot werden. In pytest wäre `pruefe_umsatz_je_kanal` mit `@pytest.mark.parametrize` über mehrere Implementierungen oder Datensätze ein üblicher nächster Schritt.
+    resources:
+      - title: pandas · testing.assert_frame_equal
+        url: https://pandas.pydata.org/docs/reference/api/pandas.testing.assert_frame_equal.html
+
+  - id: uv-sync-locked
+    type: command
+    title: Genau die getesteten Versionen
+    prompt: |
+      Installiere die Projektumgebung genau nach `uv.lock`. Passt die Lockdatei nicht mehr zu `pyproject.toml`, soll der Befehl mit einem Fehler abbrechen, statt die Lockdatei neu aufzulösen.
+    context: |
+      Du hast das Repository `monatsbericht` auf einem neuen Laptop geklont und stehst im Projektordner. uv ist installiert, eine `.venv` gibt es noch nicht.
+    answers:
+      - uv sync --locked
+    explanation: |
+      `uv sync` legt die Projektumgebung an und installiert die Abhängigkeiten aus der Lockdatei. Ohne Option würde uv eine veraltete Lockdatei automatisch aktualisieren. `--locked` verbietet das: Ist `uv.lock` nicht mehr aktuell, bricht der Befehl ab. Das macht eine Abweichung sichtbar, statt still andere Versionen zu installieren. `--frozen` wäre das Gegenstück ohne Prüfung – es nutzt die Lockdatei, auch wenn sie veraltet ist.
+    resources:
+      - title: uv · Locking and syncing · Checking the lockfile
+        url: https://docs.astral.sh/uv/concepts/projects/sync/#checking-the-lockfile
+      - title: uv · Syncing the environment
+        url: https://docs.astral.sh/uv/concepts/projects/sync/#syncing-the-environment
+
+  - id: determinismus-luecken
+    type: gap
+    title: Vier Zeilen, vier Zufälle weniger
+    prompt: |
+      Ergänze die Pipeline so, dass jede Zeile bei jedem Lauf dasselbe Ergebnis liefert: dieselbe Stichprobe, die Monatszuordnung nach deutscher Zeit, der jeweils neueste Kundenstand und eine Prüfsumme der Rohdatei mit SHA-256.
+    lang: python
+    code: |
+      stichprobe = bestellungen.sample(n=20, ⟦random_state⟧=2026)
+      bestellungen["bestellt_lokal"] = bestellungen["bestellt_um"].dt.⟦tz_convert⟧("Europe/Berlin")
+      kunden_aktuell = kunden.sort_values(["kunde_id", "geaendert_am"]).drop_duplicates("kunde_id", keep=⟦"last"⟧)
+      pruefsumme = hashlib.⟦sha256⟧(pfad.read_bytes()).hexdigest()
+    gaps:
+      - label: Fester Startwert
+        hint: Der Parameter von `sample`, der den Zufallsgenerator initialisiert.
+      - label: Zeitzone umrechnen
+        hint: Die Spalte ist bereits zeitzonenbehaftet (UTC); gesucht ist die Umrechnung, nicht das Zuweisen einer Zeitzone.
+      - label: Neuester Stand
+        hint: Nach der Sortierung steht der neueste Eintrag je Kunde unten.
+      - label: Hashfunktion
+        hint: Die Funktion aus `hashlib` für SHA-256.
+    explanation: |
+      `random_state` macht die Stichprobe wiederholbar. `tz_convert` rechnet zeitzonenbehaftete Zeitpunkte in eine andere Zone um; `tz_localize` wäre falsch, denn es weist naiven Zeitpunkten erst eine Zone zu und scheitert bei bereits UTC-behafteten Werten. `keep="last"` nach der Sortierung nach Kunde und Änderungsdatum behält den neuesten Stand – ohne Sortierung wäre es der zufällig letzte in der Datei. `hashlib.sha256` liefert den Fingerabdruck, den das Manifest speichert.
+    resources:
+      - title: pandas · DataFrame.sample
+        url: https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.sample.html
+      - title: pandas · Series.dt.tz_convert
+        url: https://pandas.pydata.org/docs/reference/api/pandas.Series.dt.tz_convert.html
+
+  - id: today-im-filter
+    type: bug
+    title: Der Septemberbericht ist plötzlich leer
+    prompt: |
+      Am 30. September liefert `werte_aus(bestellungen, date(2026, 9, 30))` die richtigen Umsätze je Kanal. Am 2. Oktober erzeugt ein Kollege denselben Septemberbericht mit demselben Stichtag und denselben Rohdaten neu – und das Ergebnis ist leer. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: python
+    code: |
+      from datetime import date
+      import pandas as pd
+
+      def werte_aus(bestellungen: pd.DataFrame, stichtag: date) -> pd.Series:
+          von = pd.Timestamp(date.today().replace(day=1))
+          bis = pd.Timestamp(stichtag)
+          im_monat = bestellungen[bestellungen["bestelldatum"].between(von, bis)]
+          bezahlt = im_monat[im_monat["status"] == "bezahlt"]
+          return bezahlt.groupby("kanal")["betrag"].sum()
+    lines: [5]
+    fix:
+      - line: 5
+        answers:
+          - von = pd.Timestamp(stichtag.replace(day=1))
+          - von = pd.Timestamp(stichtag).replace(day=1)
+          - von = pd.Timestamp(stichtag.year, stichtag.month, 1)
+          - von = pd.Timestamp(year=stichtag.year, month=stichtag.month, day=1)
+    explanation: |
+      `date.today()` macht die Uhr zu einem versteckten Parameter. Am 30. September ergab das zufällig den richtigen Monatsanfang, am 2. Oktober den 1. Oktober – und der Zeitraum vom 1. Oktober bis 30. September ist leer. Leitet man den Monatsanfang aus dem Stichtag ab, hängt das Ergebnis nur noch von den Argumenten ab. Genau solche Fehler fallen in Tests nicht auf, wenn man sie am selben Tag schreibt, an dem man sie ausführt; ein Test mit einem Stichtag aus der Vergangenheit hätte ihn sofort gezeigt.
+    resources:
+      - title: pandas · Series.between
+        url: https://pandas.pydata.org/docs/reference/api/pandas.Series.between.html
+      - title: Python · datetime.date.replace
+        url: https://docs.python.org/3/library/datetime.html#datetime.date.replace
+
+  - id: rohdaten-ueberschrieben
+    type: bug
+    title: Beim zweiten Lauf schlägt die Prüfsumme an
+    prompt: |
+      Die Funktion soll eine Rohdatei aus `data/raw/` bereinigen und das Ergebnis nach `data/processed/` schreiben. Der erste Lauf klappt. Beim zweiten Lauf meldet die Manifest-Prüfung `geändert: 2026-09_kunden.csv`, und in `data/processed/` liegt keine Datei. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: python
+    code: |
+      from pathlib import Path
+      import pandas as pd
+
+      def bereinige_datei(roh: Path, ziel_ordner: Path) -> Path:
+          df = pd.read_csv(roh, sep=";", decimal=",", encoding="utf-8-sig")
+          df = df.assign(stadt=df["stadt"].str.strip().str.title())
+          ziel = ziel_ordner / roh.name
+          df.to_csv(roh, sep=";", decimal=",", index=False, encoding="utf-8")
+          return ziel
+    lines: [8]
+    fix:
+      - line: 8
+        answers:
+          - df.to_csv(ziel, sep=";", decimal=",", index=False, encoding="utf-8")
+          - df.to_csv(ziel, sep=";", decimal=",", encoding="utf-8", index=False)
+          - df.to_csv(ziel, index=False, sep=";", decimal=",", encoding="utf-8")
+    explanation: |
+      Die Funktion berechnet `ziel`, schreibt aber in `roh` – sie überschreibt den Export mit der bereinigten Fassung. Das ändert die Bytes (ohne BOM, andere Schreibweise der Städte), also schlägt die Prüfsumme an. Schlimmer: Der Originalexport ist verloren, und jeder weitere Lauf bereinigt bereits Bereinigtes. Rohdaten werden nur gelesen; eine zusätzliche Absicherung ist, den Ordner `data/raw/` nach dem Ablegen schreibzuschützen, damit ein solcher Fehler sofort mit `PermissionError` scheitert.
+    resources:
+      - title: pandas · DataFrame.to_csv
+        url: https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.to_csv.html
+
+  - id: power-query-rezept
+    type: explain
+    title: Warum diese Abfrage den Monatsabschluss ersetzt
+    prompt: |
+      Die Teamleitung fragt, warum der Import in Excel jetzt „reproduzierbar“ sein soll, obwohl immer noch Excel im Spiel ist. `Exportdatei` und `Stichtag` sind Power-Query-Parameter. Erkläre anhand der Abfrage, was sie im Vergleich zum früheren Kopieren und Nacharbeiten von Hand leistet und was du dabei beachten musst.
+    lang: powerquery
+    code: |
+      let
+          Quelle = Csv.Document(File.Contents(Exportdatei), [Delimiter = ";", Encoding = 65001]),
+          #"Höher gestufte Header" = Table.PromoteHeaders(Quelle, [PromoteAllScalars = true]),
+          #"Geänderter Typ mit Gebietsschema" = Table.TransformColumnTypes(
+              #"Höher gestufte Header",
+              {{"kunde_id", Int64.Type}, {"angelegt_am", type date}},
+              "de-DE"
+          ),
+          #"Gekürzter Text" = Table.TransformColumns(#"Geänderter Typ mit Gebietsschema", {{"stadt", Text.Trim, type text}}),
+          #"Ersetzter Wert" = Table.ReplaceValue(#"Gekürzter Text", "köln", "Köln", Replacer.ReplaceValue, {"stadt"}),
+          #"Gefilterte Zeilen" = Table.SelectRows(#"Ersetzter Wert", each [angelegt_am] <= Stichtag)
+      in
+          #"Gefilterte Zeilen"
+    points:
+      - Jeder Schritt ist aufgezeichnet und wird bei „Daten › Alle aktualisieren“ in derselben Reihenfolge auf den neuen Export angewendet; die Liste der angewendeten Schritte ist zugleich die Dokumentation.
+      - Die Quelldatei wird nur gelesen; die Korrektur „köln“ → „Köln“ ist ein Schritt statt einer Handänderung im Export oder in der geladenen Tabelle.
+      - "`Exportdatei` und `Stichtag` sind Parameter: Ein neuer Monat heißt Parameter ändern, nicht Abfrage umbauen; ein alter Stand lässt sich mit dem alten Stichtag erneut erzeugen."
+      - Die Typumwandlung mit Gebietsschema `de-DE` liest Datumsangaben unabhängig von den Regionseinstellungen des Rechners gleich.
+      - Handänderungen in der geladenen Ergebnistabelle gehen beim Aktualisieren verloren; Korrekturen müssen deshalb als Schritt in die Abfrage.
+    explanation: |
+      Früher bestand der Import aus Handgriffen, die nirgends aufgeschrieben waren: Datei öffnen, Leerzeichen entfernen, „köln“ suchen und ersetzen, Zeilen nach Datum filtern. Die Abfrage macht aus diesen Handgriffen ein Rezept. Jeder Schritt steht unter „Angewendete Schritte“ und wird beim Aktualisieren identisch wiederholt, die Quelldatei bleibt dabei unverändert. Pfad und Stichtag sind Parameter, deshalb erzeugt dieselbe Abfrage den Septemberbericht heute und im Dezember gleich. Der Typ mit Gebietsschema `de-DE` sorgt dafür, dass `01.03.2026` auf jedem Rechner der 1. März ist, auch mit englischen Regionseinstellungen. Die Grenze: Wer in der geladenen Tabelle von Hand etwas überschreibt, verliert es beim nächsten Aktualisieren – Korrekturen gehören als Schritt in die Abfrage, damit sie dokumentiert und wiederholbar sind.
+    resources:
+      - title: Microsoft Learn · Angewendete Schritte in Power Query
+        url: https://learn.microsoft.com/de-de/power-query/applied-steps
+      - title: Microsoft Learn · Parameter in Power Query
+        url: https://learn.microsoft.com/de-de/power-query/power-query-query-parameters
+      - title: Microsoft Learn · Table.TransformColumnTypes
+        url: https://learn.microsoft.com/de-de/powerquery-m/table-transformcolumntypes
+
+  - id: monatsbericht-projekt
+    type: practice
+    title: Der Monatsbericht als reproduzierbares Projekt
+    prompt: |
+      Baue lokal das Projekt `monatsbericht` so auf, wie es die Lektion beschreibt. Ausgangspunkt ist ein Export `data/raw/2026-09_bestellungen.csv` mit den Spalten `bestellung_id`, `bestelldatum` (`TT.MM.JJJJ`), `kanal`, `status` und `betrag` (Dezimalkomma). Lege dir dafür 10–20 Zeilen mit Stornos, Retouren und uneinheitlichen Kanalnamen selbst an.
+
+      1. `uv init --package monatsbericht`, danach `uv add pandas` und `uv add --dev pytest`. Stelle den Eintrag unter `[project.scripts]` auf `monatsbericht = "monatsbericht.cli:main"` um.
+      2. Ordner `data/raw`, `data/processed`, `reports`, `docs`, `tests` und eine `.gitignore`, die Rohdaten (außer dem Manifest), Zwischenstände, Berichte und `.venv` ausschließt.
+      3. `src/monatsbericht/pipeline.py` mit den reinen Funktionen `bereinige`, `pruefe` und `werte_aus(df, stichtag)`.
+      4. `src/monatsbericht/cli.py` mit `main()`: Manifest prüfen, einlesen, Pipeline, Ergebnis als CSV nach `reports/<monat>_kennzahlen.csv` schreiben. Der Stichtag kommt als `--stichtag`.
+      5. Im Ordner `data/raw/`: `sha256sum *.csv > MANIFEST.sha256`. Dazu `tests/test_pipeline.py` und `docs/datenwoerterbuch.md`.
+    lang: python
+    solution: |
+      # src/monatsbericht/cli.py
+      import argparse
+      import hashlib
+      from datetime import date
+      from pathlib import Path
+
+      import pandas as pd
+
+      from monatsbericht.pipeline import bereinige, pruefe, werte_aus
+
+      ROH = Path("data/raw")
+      BERICHTE = Path("reports")
+
+
+      def pruefe_manifest(manifest: Path) -> None:
+          for zeile in manifest.read_text(encoding="utf-8").splitlines():
+              erwartet, name = zeile.split(maxsplit=1)
+              pfad = manifest.parent / name.lstrip("*")
+              with pfad.open("rb") as datei:
+                  if hashlib.file_digest(datei, "sha256").hexdigest() != erwartet:
+                      raise SystemExit(f"Rohdatei verändert: {pfad}")
+
+
+      def lies_export(pfad: Path) -> pd.DataFrame:
+          return pd.read_csv(pfad, sep=";", decimal=",", encoding="utf-8-sig", dtype={"betrag": "str"})
+
+
+      def schreibe_bericht(kennzahlen: pd.DataFrame, stichtag: date) -> Path:
+          BERICHTE.mkdir(exist_ok=True)
+          ziel = BERICHTE / f"{stichtag:%Y-%m}_kennzahlen.csv"
+          kennzahlen.sort_values("kanal").to_csv(ziel, sep=";", decimal=",", index=False, encoding="utf-8")
+          return ziel
+
+
+      def main() -> None:
+          parser = argparse.ArgumentParser(prog="monatsbericht")
+          parser.add_argument("--stichtag", type=date.fromisoformat, required=True)
+          args = parser.parse_args()
+          pruefe_manifest(ROH / "MANIFEST.sha256")
+          roh = lies_export(ROH / f"{args.stichtag:%Y-%m}_bestellungen.csv")
+          kennzahlen = werte_aus(pruefe(bereinige(roh)), args.stichtag)
+          print(f"Bericht geschrieben: {schreibe_bericht(kennzahlen, args.stichtag)}")
+    checklist:
+      - "`uv run --locked pytest` ist grün, und mindestens ein Test schlägt fehl, wenn du in `werte_aus` den Statusfilter entfernst."
+      - "Zwei Läufe von `uv run --locked monatsbericht --stichtag 2026-09-30` erzeugen byte-identische Dateien in `reports/` (`sha256sum reports/*` vergleichen)."
+      - "Nach `rm -rf data/processed reports` stellt ein einziger Lauf alle Ergebnisse wieder her."
+      - "`(cd data/raw && sha256sum --check MANIFEST.sha256)` meldet nach dem Lauf weiterhin `OK` – die Pipeline schreibt nie in `data/raw/`."
+      - "`grep -rn \"today()\\|now()\" src/` findet nichts; der Berichtsmonat folgt nur aus `--stichtag`."
+      - "`git status` zeigt `pyproject.toml`, `uv.lock`, `src/`, `tests/`, `docs/` und das Manifest, aber keine Rohdaten, keine Berichte und keine `.venv`."
+      - "`docs/datenwoerterbuch.md` beschreibt Quelle, Granularität und jede Spalte mit Typ, Einheit und erlaubten Werten; die README nennt den Startbefehl."
+    explanation: |
+      Das Projekt setzt jede Regel der Lektion an genau einer Stelle um: Das Manifest bewacht die Rohdaten, `cli.py` ist die einzige Stelle mit Dateizugriffen, `pipeline.py` enthält nur reine Funktionen, der Stichtag ist der einzige Parameter, und `uv.lock` fixiert die Umgebung. Die Checkliste prüft Eigenschaften, nicht Code: Ob ein Projekt reproduzierbar ist, zeigt sich daran, dass Löschen und Neuerzeugen byte-identische Ergebnisse liefert. `uv init --package` legt das src-Layout mit einem Build-System an, damit der Befehl `monatsbericht` aus `[project.scripts]` installiert wird. Die sortierte Ausgabe ohne Erstellungszeitpunkt ist die Voraussetzung dafür, dass zwei Läufe dieselbe Prüfsumme haben.
+    resources:
+      - title: uv · Working on projects
+        url: https://docs.astral.sh/uv/guides/projects/
+      - title: Git · gitignore
+        url: https://git-scm.com/docs/gitignore

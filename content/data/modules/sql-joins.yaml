@@ -1,0 +1,1044 @@
+id: sql-joins
+title: Joins und Datenmodelle abfragen
+level: 2
+minutes: 180
+summary: Tabellen über Schlüssel verbinden, ohne Zeilen zu verlieren oder doppelt zu zählen – mit INNER und LEFT JOIN, Anti- und Semi-Joins, CTEs, UNION ALL und Self-Joins über das Datenmodell von Bohnenwerk.
+goals:
+  - Du sagst vorher, welche und wie viele Zeilen ein `INNER JOIN` oder `LEFT JOIN` liefert, und bestimmst die Granularität des Ergebnisses.
+  - Du erkennst Fan-out nach 1:n-Joins und verhinderst doppelt gezählte Beträge, indem du vor dem Join verdichtest.
+  - Du setzt Bedingungen bei einem `LEFT JOIN` bewusst ins `ON` oder ins `WHERE`.
+  - Du findest Zeilen ohne Partner mit `NOT EXISTS` oder `LEFT JOIN … IS NULL` und erklärst, warum `NOT IN` an `NULL` scheitert.
+  - Du baust mehrstufige Auswertungen mit CTEs und kombinierst Ergebnisse mit `UNION ALL` und Self-Joins.
+resources:
+  - title: SQLite · SELECT – FROM-Klausel und Joins
+    url: https://sqlite.org/lang_select.html#fromclause
+  - title: SQLite · WITH-Klausel (CTEs)
+    url: https://sqlite.org/lang_with.html
+  - title: SQLite · EXISTS, IN und NOT IN
+    url: https://sqlite.org/lang_expr.html#exists_op
+  - title: PostgreSQL · Joined Tables
+    url: https://www.postgresql.org/docs/current/queries-table-expressions.html#QUERIES-JOIN
+  - title: PostgreSQL · WITH Queries
+    url: https://www.postgresql.org/docs/current/queries-with.html
+lesson: |
+  Der Monatsbericht aus [SQL-Abfragen für Analysen](/data/sql-abfragen) kam mit einer Tabelle aus, weil der Shop-Export den Warenwert schon je Bestellung mitlieferte. Im echten Datenmodell von Bohnenwerk steht der Umsatz aber in `positionen`, das Datum in `bestellungen`, die Region in `kunden` und die Kategorie in `produkte`. Die Fragen des Vertriebs – Umsatz je Region und Kategorie, Kunden ohne Bestellung, Kosten je Kanal – verbinden diese Tabellen. In Excel hieß das bisher: vier Blätter, `XVERWEIS`-Spalten und jeden Monat die Frage, ob die Formeln bis zur letzten Zeile reichen. In SQL ist es ein **Join**.
+
+  Joins sind schnell geschrieben und liefern fast immer ein Ergebnis, auch wenn sie falsch sind. Ein falscher Join wirft keinen Fehler, er liefert plausibel aussehende, falsche Zahlen – doppelt gezählte Versandkosten, verschwundene Kunden, eine Umsatzsumme, die niemand abstimmt. Dieses Modul baut das Denkmodell dafür auf: Welche Zeilen entstehen, wie viele, und was bedeutet eine Zeile des Ergebnisses? Schlüssel und Granularität kennst du aus [Saubere Tabellen und Datenmodelle](/data/tabellenmodelle). So hängen die Tabellen zusammen:
+
+  ```text
+  kunden 1 ───< bestellungen 1 ───< positionen >─── 1 produkte
+     1
+     └──────< tickets
+  ```
+
+  Das Zeichen `<` steht für „viele“: Ein Kunde hat viele Bestellungen, eine Bestellung viele Positionen, ein Produkt kommt in vielen Positionen vor. `bestellungen.kunde_id` ist ein **Fremdschlüssel**, der auf den **Primärschlüssel** `kunden.kunde_id` zeigt.
+
+  ## INNER JOIN: Zeilen über Schlüssel verbinden
+
+  Ein Join kombiniert Zeilen zweier Tabellen. Gedanklich bildet die Datenbank alle Paare aus einer Zeile links und einer Zeile rechts und behält die Paare, für die die `ON`-Bedingung wahr ist ([SQLite · FROM-Klausel](https://sqlite.org/lang_select.html#fromclause)). In Wirklichkeit nutzt sie Indizes und prüft nicht jedes Paar, das Ergebnis ist aber dasselbe. Beim `INNER JOIN` – kurz `JOIN` – fällt jede Zeile weg, die keinen Partner findet.
+
+  ```sql run
+  CREATE TABLE kunden (
+    kunde_id INTEGER PRIMARY KEY, name TEXT, region TEXT, segment TEXT
+  );
+  CREATE TABLE bestellungen (
+    bestellung_id INTEGER PRIMARY KEY, kunde_id INTEGER, bestelldatum TEXT,
+    kanal TEXT, status TEXT, versandkosten REAL
+  );
+  INSERT INTO kunden VALUES
+    (1, 'Café Lindner',          'Nord', 'Café'),
+    (2, 'Büro Hansen & Partner', 'West', 'Büro'),
+    (3, 'Mara Voss',             'Süd',  'Privat'),
+    (4, 'Jonas Albers',          'Ost',  'Privat');
+  INSERT INTO bestellungen VALUES
+    (1001, 1,    '2026-03-02', 'B2B',  'bezahlt',   0),
+    (1002, 2,    '2026-03-03', 'B2B',  'bezahlt',   0),
+    (1003, 3,    '2026-03-05', 'Shop', 'storniert', 4.90),
+    (1004, 1,    '2026-03-09', 'B2B',  'bezahlt',   0),
+    (1005, NULL, '2026-03-12', 'Shop', 'bezahlt',   4.90);
+
+  SELECT b.bestellung_id, b.bestelldatum, k.name, k.region
+  FROM bestellungen AS b
+  JOIN kunden AS k ON k.kunde_id = b.kunde_id
+  ORDER BY b.bestellung_id;
+  ```
+
+  Das Ergebnis hat vier Zeilen, eine je Bestellung mit bekanntem Kunden. Café Lindner erscheint zweimal, weil es zwei Bestellungen hat: Die Kundendaten werden je Bestellung wiederholt. Zwei Datensätze fehlen ohne jede Warnung – die Gastbestellung 1005, deren `kunde_id` `NULL` ist (`NULL = 1` ist nie wahr), und Jonas Albers, der nie bestellt hat.
+
+  Zwei Gewohnheiten machen Joins lesbar: Tabellen bekommen kurze Aliase (`AS b`, `AS k`), und jede Spalte wird mit ihrem Alias qualifiziert (`k.name`). Das verhindert Mehrdeutigkeiten, wenn beide Tabellen eine Spalte gleichen Namens haben, und zeigt beim Lesen sofort, woher ein Wert kommt. Aus Excel kennst du den Join als `XVERWEIS` von der Bestellliste in die Kundenliste. `XVERWEIS` liefert aber nur den ersten Treffer; ein Join liefert **alle** Treffer, und daraus entstehen die Fallen weiter unten. In Power Query heißt derselbe Vorgang „Zusammenführen“ und bietet dieselben Join-Arten an ([Microsoft Learn · Übersicht über Zusammenführungsabfragen](https://learn.microsoft.com/de-de/power-query/merge-queries-overview)).
+
+  ## LEFT JOIN: alle Zeilen der linken Tabelle behalten
+
+  Ein `LEFT JOIN` (ausführlich `LEFT OUTER JOIN`) behält jede Zeile der linken Tabelle. Findet sie keinen Partner, werden die Spalten der rechten Tabelle mit `NULL` aufgefüllt. Die Frage „Wie viele Bestellungen hat jeder Kunde?“ braucht das, sonst fehlen die Kunden ohne Bestellung.
+
+  ```sql run
+  CREATE TABLE kunden (kunde_id INTEGER PRIMARY KEY, name TEXT);
+  CREATE TABLE bestellungen (bestellung_id INTEGER PRIMARY KEY, kunde_id INTEGER, status TEXT);
+  INSERT INTO kunden VALUES
+    (1, 'Café Lindner'), (2, 'Büro Hansen & Partner'), (3, 'Mara Voss'), (4, 'Jonas Albers');
+  INSERT INTO bestellungen VALUES
+    (1001, 1, 'bezahlt'), (1002, 2, 'bezahlt'), (1003, 3, 'storniert'),
+    (1004, 1, 'bezahlt'), (1005, NULL, 'bezahlt');
+
+  SELECT k.name,
+         COUNT(*)               AS zeilen,
+         COUNT(b.bestellung_id) AS bestellungen
+  FROM kunden AS k
+  LEFT JOIN bestellungen AS b ON b.kunde_id = k.kunde_id
+  GROUP BY k.kunde_id, k.name
+  ORDER BY k.kunde_id;
+  ```
+
+  Jonas Albers erscheint jetzt, mit einer Zeile, deren Bestellspalten `NULL` sind. Deshalb zählt `COUNT(*)` für ihn `1`: Es zählt Zeilen, und die aufgefüllte Zeile ist eine. `COUNT(b.bestellung_id)` zählt nur echte Bestellungen und liefert die richtige `0`. Nach einem `LEFT JOIN` zählst du deshalb eine Spalte der rechten Tabelle, am besten ihren Primärschlüssel.
+
+  `RIGHT JOIN` ist das Spiegelbild und selten nötig, weil man die Tabellen auch vertauschen kann. `FULL JOIN` behält die Zeilen beider Seiten und hilft beim Abgleich zweier Listen, etwa Shop-Export gegen Buchhaltung: Zeilen mit `NULL` auf der einen Seite fehlen in der jeweils anderen Quelle. SQLite kennt beide seit Version 3.39 ([SQLite · RIGHT und FULL JOIN](https://sqlite.org/lang_select.html#rjoin)).
+
+  ### Filter im ON oder im WHERE
+
+  Jetzt die häufigste Join-Falle. Gesucht sind alle Kunden mit der Anzahl ihrer **bezahlten** Bestellungen:
+
+  ```sql run
+  CREATE TABLE kunden (kunde_id INTEGER PRIMARY KEY, name TEXT);
+  CREATE TABLE bestellungen (bestellung_id INTEGER PRIMARY KEY, kunde_id INTEGER, status TEXT);
+  INSERT INTO kunden VALUES
+    (1, 'Café Lindner'), (2, 'Büro Hansen & Partner'), (3, 'Mara Voss'), (4, 'Jonas Albers');
+  INSERT INTO bestellungen VALUES
+    (1001, 1, 'bezahlt'), (1002, 2, 'bezahlt'), (1003, 3, 'storniert'), (1004, 1, 'bezahlt');
+
+  -- Bedingung im WHERE
+  SELECT k.name, COUNT(b.bestellung_id) AS bezahlte
+  FROM kunden AS k
+  LEFT JOIN bestellungen AS b ON b.kunde_id = k.kunde_id
+  WHERE b.status = 'bezahlt'
+  GROUP BY k.kunde_id, k.name;
+
+  -- Bedingung im ON
+  SELECT k.name, COUNT(b.bestellung_id) AS bezahlte
+  FROM kunden AS k
+  LEFT JOIN bestellungen AS b ON b.kunde_id = k.kunde_id AND b.status = 'bezahlt'
+  GROUP BY k.kunde_id, k.name;
+  ```
+
+  Die erste Abfrage verliert Mara Voss und Jonas Albers. Der Grund liegt in der Auswertungsreihenfolge: Der `LEFT JOIN` erzeugt zuerst die aufgefüllte Zeile für Jonas Albers mit `b.status` gleich `NULL`, danach wirft `WHERE b.status = 'bezahlt'` genau diese Zeile wieder hinaus – und ebenso die Zeile von Mara Voss mit ihrer stornierten Bestellung. Übrig bleibt das Ergebnis eines `INNER JOIN`. SQLite erkennt das sogar selbst und führt den `LEFT JOIN` intern als gewöhnlichen Join aus ([SQLite · OUTER JOIN Strength Reduction](https://sqlite.org/optoverview.html#leftjoinreduction)). In der zweiten Abfrage gehört die Statusbedingung zum Join: Sie entscheidet nur, **welche** Bestellungen als Partner infrage kommen. Kunden ohne passenden Partner bleiben mit `NULL` erhalten. Die PostgreSQL-Dokumentation zeigt denselben Unterschied an einem eigenen Beispiel ([PostgreSQL · Joined Tables](https://www.postgresql.org/docs/current/queries-table-expressions.html#QUERIES-JOIN)).
+
+  > [!MERKE]
+  > Bei einem `LEFT JOIN` gehören Bedingungen an die **rechte** Tabelle ins `ON`, Bedingungen an die **linke** Tabelle (`k.segment = 'Café'`) ins `WHERE`. Jede Bedingung an die rechte Tabelle im `WHERE`, die für `NULL` nicht wahr werden kann – also fast jede außer `IS NULL` –, macht aus dem `LEFT JOIN` einen `INNER JOIN`.
+
+  ## Granularität und Fan-out: wenn Summen nach dem Join wachsen
+
+  Jede Tabelle hat eine **Granularität**: Was ist eine Zeile? In `bestellungen` ist es eine Bestellung, in `positionen` eine Bestellposition. Verbindest du eine Tabelle mit einer feineren (1:n), hat das Ergebnis die feinere Granularität, und die Werte der gröberen Tabelle werden je Partnerzeile wiederholt. Für Spalten wie `kanal` ist das harmlos, für Beträge nicht: Die Versandkosten einer Bestellung mit drei Positionen stehen danach dreimal im Ergebnis, und `SUM` addiert sie dreimal. Dieses Auffächern heißt **Fan-out**.
+
+  ```sql run
+  CREATE TABLE bestellungen (bestellung_id INTEGER PRIMARY KEY, kanal TEXT, versandkosten REAL);
+  CREATE TABLE positionen (
+    bestellung_id INTEGER, position INTEGER, menge INTEGER, einzelpreis REAL, rabatt REAL
+  );
+  INSERT INTO bestellungen VALUES (1001, 'Shop', 4.90), (1002, 'Shop', 4.90), (1003, 'B2B', 9.50);
+  INSERT INTO positionen VALUES
+    (1001, 1,  2, 12.90, 0),   (1001, 2,  1,  8.50, 0), (1001, 3, 1, 14.90, 0.1),
+    (1002, 1,  1, 17.80, 0),
+    (1003, 1, 20, 14.50, 0.1), (1003, 2, 10, 11.40, 0.1);
+
+  -- Abstimmsumme direkt aus der Quelle
+  SELECT SUM(versandkosten) AS versand_quelle FROM bestellungen;
+
+  -- Fan-out: jede Bestellung so oft, wie sie Positionen hat
+  SELECT COUNT(*) AS zeilen, SUM(b.versandkosten) AS versand_nach_join
+  FROM bestellungen AS b
+  JOIN positionen AS p ON p.bestellung_id = b.bestellung_id;
+
+  -- Erst verdichten, dann verbinden
+  WITH netto_je_bestellung AS (
+    SELECT bestellung_id, SUM(menge * einzelpreis * (1 - rabatt)) AS netto
+    FROM positionen
+    GROUP BY bestellung_id
+  )
+  SELECT COUNT(*) AS zeilen,
+         SUM(b.versandkosten)   AS versand,
+         ROUND(SUM(n.netto), 2) AS warenwert
+  FROM bestellungen AS b
+  JOIN netto_je_bestellung AS n ON n.bestellung_id = b.bestellung_id;
+  ```
+
+  Die Versandkosten wachsen von 19.3 auf 38.6, ohne dass sich an den Daten etwas geändert hat. Das Gegenmittel: **erst auf die Granularität des Ergebnisses verdichten, dann verbinden**. Der CTE `netto_je_bestellung` (mehr dazu unten) fasst die Positionen zu einer Zeile je Bestellung zusammen. Danach passt der Join 1:1, und jede Bestellung steht mit ihren Versandkosten genau einmal im Ergebnis. `COUNT(DISTINCT …)` rettet nur Anzahlen, keine Summen: `SUM(DISTINCT versandkosten)` addiert gleiche Beträge verschiedener Bestellungen nur einmal und liefert eine andere falsche Zahl.
+
+  Noch tückischer ist ein Join mit **zwei** feineren Tabellen gleichzeitig, etwa Kunden mit ihren Positionen **und** ihren Tickets. Dann entsteht je Kunde jede Kombination aus Position und Ticket: Fünf Positionen und zwei Tickets ergeben zehn Zeilen, der Umsatz ist verdoppelt und die Ticketzahl verfünffacht. Auch hier gilt: jede Seite getrennt verdichten, dann verbinden.
+
+  > [!PRAXIS] Abstimmsummen gegen stille Fehler
+  > Bevor bei Bohnenwerk ein Bericht mit Joins an die Geschäftsführung geht, prüft das Controlling zwei Dinge: die Zeilenzahl vor und nach jedem Join und eine **Abstimmsumme**, etwa die Versandkosten direkt aus `bestellungen` gegen die Versandkosten im Bericht. Weichen sie ab, hat ein Join aufgefächert oder Zeilen verloren. Die Prüfabfrage liegt neben dem Bericht und läuft jeden Monat mit ([Datenqualität messen und sichern](/data/datenqualitaet)). Früher fielen solche Fehler erst auf, wenn die Buchhaltung andere Zahlen hatte.
+
+  ## Anti-Join und Semi-Join: wer hat keine, wer hat mindestens eine
+
+  Zwei Fragen tauchen in jeder Analyse auf: Welche Kunden haben **keine** Bestellung (Anti-Join)? Welche haben **mindestens eine** (Semi-Join)? Beide wollen nur Zeilen der linken Tabelle, jede höchstens einmal. Die rechte Tabelle prüft nur, ob es einen Partner gibt.
+
+  ```sql run
+  CREATE TABLE kunden (kunde_id INTEGER PRIMARY KEY, name TEXT);
+  CREATE TABLE bestellungen (bestellung_id INTEGER PRIMARY KEY, kunde_id INTEGER, status TEXT);
+  INSERT INTO kunden VALUES
+    (1, 'Café Lindner'), (2, 'Büro Hansen & Partner'), (3, 'Mara Voss'), (4, 'Jonas Albers');
+  INSERT INTO bestellungen VALUES
+    (1001, 1, 'bezahlt'), (1002, 2, 'bezahlt'), (1003, 1, 'bezahlt'), (1004, NULL, 'bezahlt');
+
+  -- Anti-Join mit LEFT JOIN
+  SELECT k.name
+  FROM kunden AS k
+  LEFT JOIN bestellungen AS b ON b.kunde_id = k.kunde_id
+  WHERE b.bestellung_id IS NULL;
+
+  -- Anti-Join mit NOT EXISTS
+  SELECT k.name
+  FROM kunden AS k
+  WHERE NOT EXISTS (SELECT 1 FROM bestellungen AS b WHERE b.kunde_id = k.kunde_id);
+
+  -- Falle: NOT IN mit NULL in der Unterabfrage
+  SELECT k.name
+  FROM kunden AS k
+  WHERE k.kunde_id NOT IN (SELECT kunde_id FROM bestellungen);
+
+  -- Semi-Join: mindestens eine Bestellung, jeder Kunde genau einmal
+  SELECT k.name
+  FROM kunden AS k
+  WHERE EXISTS (SELECT 1 FROM bestellungen AS b WHERE b.kunde_id = k.kunde_id);
+  ```
+
+  Die ersten beiden Varianten liefern Mara Voss und Jonas Albers. Der `LEFT JOIN … IS NULL` nutzt die aufgefüllten Zeilen: Nur Kunden ohne Partner haben dort `NULL` im Primärschlüssel der rechten Tabelle. `NOT EXISTS` fragt je Kunde, ob die Unterabfrage mindestens eine Zeile findet ([SQLite · EXISTS](https://sqlite.org/lang_expr.html#exists_op)). Die Unterabfrage ist **korreliert**: Sie bezieht sich mit `k.kunde_id` auf die aktuelle Zeile der äußeren Abfrage.
+
+  Die `NOT IN`-Variante liefert gar nichts. Die Gastbestellung hat `kunde_id` `NULL`, und `3 NOT IN (1, 2, 1, NULL)` bedeutet `3 <> 1 AND 3 <> 2 AND 3 <> 1 AND 3 <> NULL`. Der letzte Vergleich ist unbekannt, also ist es die ganze Bedingung ([SQLite · IN und NOT IN](https://sqlite.org/lang_expr.html#in_op)). Ein einziges `NULL` in der Unterabfrage leert das Ergebnis. Der Semi-Join mit `EXISTS` liefert Café Lindner dagegen genau einmal, obwohl es zwei Bestellungen hat; ein `JOIN` hätte es zweimal geliefert.
+
+  > [!WARNING] NOT IN nur für Listen ohne NULL
+  > Schreibe Anti-Joins mit `NOT EXISTS` oder `LEFT JOIN … IS NULL`. `NOT IN` mit einer Unterabfrage ist nur sicher, wenn die Spalte keine `NULL`-Werte enthalten kann – und das ändert sich mit der ersten Gastbestellung, ohne dass jemand die Abfrage anfasst.
+
+  > [!INTERVIEW] „Wie findest du Kunden ohne Bestellung?“
+  > Mit einem Anti-Join: `NOT EXISTS` mit einer korrelierten Unterabfrage oder `LEFT JOIN bestellungen … WHERE b.bestellung_id IS NULL`. `NOT IN` vermeide ich, weil ein einziges `NULL` in der Unterabfrage das Ergebnis leert. Soll die Prüfung nur bestimmte Bestellungen betreffen, etwa bezahlte, gehört die Bedingung in die Unterabfrage bzw. ins `ON` – im äußeren `WHERE` würde sie die Kunden ohne Bestellung wieder entfernen.
+
+  ## Unterabfragen und CTEs: Abfragen in Stufen bauen
+
+  Eine Unterabfrage ist eine Abfrage in einer Abfrage. Sie steht an drei Stellen: als einzelner Wert (`(SELECT SUM(…) FROM …)`, etwa für einen Anteil am Gesamt), als Tabelle im `FROM` und als Prüfung mit `EXISTS` oder `IN`. Verschachtelte Unterabfragen liest man von innen nach außen, und das wird schnell unübersichtlich.
+
+  Ein **CTE** (Common Table Expression) gibt einem Zwischenergebnis mit `WITH name AS (…)` einen Namen ([SQLite · WITH](https://sqlite.org/lang_with.html), [PostgreSQL · WITH Queries](https://www.postgresql.org/docs/current/queries-with.html)). Mehrere CTEs, durch Kommas getrennt, bilden eine Pipeline, die von oben nach unten gelesen wird; jeder Schritt darf die vorherigen verwenden. Der Umsatzbericht je Region mit Anteil am Gesamtumsatz sieht so aus:
+
+  ```sql run
+  CREATE TABLE kunden (kunde_id INTEGER PRIMARY KEY, name TEXT, region TEXT);
+  CREATE TABLE bestellungen (bestellung_id INTEGER PRIMARY KEY, kunde_id INTEGER, status TEXT);
+  CREATE TABLE positionen (
+    bestellung_id INTEGER, position INTEGER, menge INTEGER, einzelpreis REAL, rabatt REAL
+  );
+  INSERT INTO kunden VALUES
+    (1, 'Café Lindner', 'Nord'), (2, 'Büro Hansen & Partner', 'West'), (3, 'Mara Voss', 'West');
+  INSERT INTO bestellungen VALUES
+    (1001, 1, 'bezahlt'), (1002, 2, 'bezahlt'), (1003, 3, 'storniert'), (1004, 3, 'bezahlt');
+  INSERT INTO positionen VALUES
+    (1001, 1, 10, 14.50, 0.1), (1002, 1, 20, 12.90, 0.1), (1002, 2, 2, 39.00, 0),
+    (1003, 1,  1, 17.80, 0),   (1004, 1,  2, 12.90, 0);
+
+  WITH netto_je_bestellung AS (
+    SELECT bestellung_id, SUM(menge * einzelpreis * (1 - rabatt)) AS netto
+    FROM positionen
+    GROUP BY bestellung_id
+  ),
+  umsatz_je_region AS (
+    SELECT k.region, SUM(n.netto) AS umsatz
+    FROM bestellungen AS b
+    JOIN kunden AS k ON k.kunde_id = b.kunde_id
+    JOIN netto_je_bestellung AS n ON n.bestellung_id = b.bestellung_id
+    WHERE b.status = 'bezahlt'
+    GROUP BY k.region
+  )
+  SELECT region,
+         ROUND(umsatz, 2) AS umsatz,
+         ROUND(100.0 * umsatz / (SELECT SUM(umsatz) FROM umsatz_je_region), 1) AS anteil_prozent
+  FROM umsatz_je_region
+  ORDER BY umsatz DESC;
+  ```
+
+  Jeder Schritt hat eine klare Granularität: `netto_je_bestellung` eine Zeile je Bestellung, `umsatz_je_region` eine je Region. Zum Prüfen ersetzt du die letzte Abfrage vorübergehend durch `SELECT * FROM netto_je_bestellung` und siehst das Zwischenergebnis. Der Anteil nutzt eine skalare Unterabfrage über den CTE; mit Fensterfunktionen geht das kürzer mit `SUM(umsatz) OVER ()` ([Fensterfunktionen und Analysemuster](/data/sql-fensterfunktionen)).
+
+  ## UNION ALL, UNION und Self-Join
+
+  Ein Join verbindet Tabellen nebeneinander, `UNION ALL` stapelt Ergebnisse untereinander ([SQLite · Compound Select](https://sqlite.org/lang_select.html#compound)). Beide Abfragen müssen gleich viele Spalten liefern. Zugeordnet wird nach Position, die Spaltennamen kommen aus der ersten Abfrage. So entsteht ein Kontaktverlauf aus Bestellungen und Tickets:
+
+  ```sql run
+  CREATE TABLE bestellungen (bestellung_id INTEGER PRIMARY KEY, kunde_id INTEGER, bestelldatum TEXT);
+  CREATE TABLE tickets (ticket_id INTEGER PRIMARY KEY, kunde_id INTEGER, erstellt_am TEXT, kategorie TEXT);
+  INSERT INTO bestellungen VALUES
+    (1001, 1, '2026-03-02'), (1004, 1, '2026-03-09'), (1006, 1, '2026-03-09'), (1002, 2, '2026-03-03');
+  INSERT INTO tickets VALUES
+    (501, 1, '2026-03-04 09:12', 'Lieferung'), (502, 2, '2026-03-03 15:40', 'Rechnung');
+
+  SELECT kunde_id, bestelldatum AS datum, 'Bestellung' AS art
+  FROM bestellungen
+  UNION ALL
+  SELECT kunde_id, date(erstellt_am), 'Ticket: ' || kategorie
+  FROM tickets
+  ORDER BY kunde_id, datum;
+  ```
+
+  `UNION` ohne `ALL` entfernt zusätzlich doppelte Zeilen. Das kostet einen Sortier- oder Hash-Schritt und ist fachlich riskant: Die beiden Bestellungen von Kunde 1 am 9. März sehen im Kontaktverlauf gleich aus und würden zu einer verschmolzen – ersetze im Block `UNION ALL` durch `UNION` und vergleiche. Nimm `UNION ALL`, solange du nicht ausdrücklich eine Menge ohne Duplikate willst, etwa „alle Kunden-IDs mit irgendeinem Kontakt“.
+
+  Eine Tabelle kann sich auch mit sich selbst verbinden, über zwei verschiedene Aliase: ein **Self-Join**. Im Empfehlungsprogramm von Bohnenwerk speichert `kunden.geworben_von` die `kunde_id` des Kunden, der geworben hat:
+
+  ```sql run
+  CREATE TABLE kunden (kunde_id INTEGER PRIMARY KEY, name TEXT, geworben_von INTEGER);
+  INSERT INTO kunden VALUES
+    (1, 'Café Lindner', NULL),
+    (2, 'Büro Hansen & Partner', 1),
+    (3, 'Mara Voss', 1),
+    (4, 'Jonas Albers', 3);
+
+  SELECT k.name AS kunde, w.name AS geworben_von
+  FROM kunden AS k
+  LEFT JOIN kunden AS w ON w.kunde_id = k.geworben_von
+  ORDER BY k.kunde_id;
+  ```
+
+  `k` ist der geworbene Kunde, `w` der Werber. Der `LEFT JOIN` behält Kunden, die niemand geworben hat. Dasselbe Muster verbindet Mitarbeiter mit Vorgesetzten oder eine Bestellung mit der vorherigen Bestellung desselben Kunden.
+
+  ## Häufige Fehler
+
+  - **Summen sind nach dem Join zu hoch.** Fan-out: Werte der gröberen Tabelle werden je Partnerzeile wiederholt. Vor dem Join verdichten und die Abstimmsumme prüfen.
+  - **Kunden mit 0 fehlen.** Eine Bedingung an die rechte Tabelle eines `LEFT JOIN` steht im `WHERE`. Ins `ON` verschieben.
+  - **Kunden ohne Bestellung zählen 1.** Nach dem `LEFT JOIN` steht `COUNT(*)` statt `COUNT(b.bestellung_id)`.
+  - **Der Anti-Join liefert nichts.** `NOT IN` über eine Spalte mit `NULL`. `NOT EXISTS` verwenden.
+  - **Zeilen verschwinden still.** Ein `INNER JOIN` verwirft Zeilen mit `NULL` im Fremdschlüssel und Waisen ohne Partner. Zeilenzahlen vor und nach dem Join vergleichen; `LEFT JOIN … IS NULL` findet die Waisen.
+  - **`ambiguous column name: kunde_id`.** Beide Tabellen haben die Spalte. Mit dem Alias qualifizieren: `k.kunde_id`.
+  - **Korrelation vergessen.** In der Unterabfrage vergleicht `WHERE t.kunde_id = kunde_id` die Ticketspalte mit sich selbst, weil der innere Name Vorrang hat. Spalten der äußeren Abfrage immer mit Alias ansprechen.
+  - **Falscher Schlüssel.** `ON p.bestellung_id = b.kunde_id` läuft ohne Fehler und liefert Unsinn. Schlüsselpaare aus dem Datenmodell ablesen; ungewöhnliche Zeilenzahlen sind das Warnsignal.
+  - **`UNION` statt `UNION ALL`.** Legitime gleiche Zeilen verschwinden, Anzahlen und Summen sinken.
+
+  ## Zusammenfassung
+
+  - Ein Join bildet gedanklich alle Zeilenpaare und behält die, für die `ON` wahr ist. `INNER JOIN` verwirft Zeilen ohne Partner ohne Warnung.
+  - `LEFT JOIN` behält alle Zeilen links und füllt rechts mit `NULL`. Zähle danach eine Spalte der rechten Tabelle.
+  - Bedingungen an die rechte Tabelle eines `LEFT JOIN` gehören ins `ON`, sonst wird er zum `INNER JOIN`.
+  - Das Ergebnis hat die Granularität der feinsten beteiligten Tabelle. Beträge gröberer Tabellen vorher verdichten, Zeilenzahlen und Abstimmsummen prüfen.
+  - Anti-Join mit `NOT EXISTS` oder `LEFT JOIN … IS NULL`, nie mit `NOT IN` über eine Spalte mit `NULL`. Semi-Join mit `EXISTS`.
+  - CTEs zerlegen eine Abfrage in benannte Schritte mit klarer Granularität, die sich einzeln prüfen lassen.
+  - `UNION ALL` stapelt Ergebnisse, `UNION` entfernt zusätzlich Duplikate. Spalten werden nach Position zugeordnet.
+  - Ein Self-Join verbindet eine Tabelle über zwei Aliase mit sich selbst.
+exercises:
+  - id: union-oder-union-all
+    type: choice
+    title: Zwei Exporte, eine Summe
+    prompt: |
+      Die Positionen für März kommen aus zwei Exporten: `positionen_shop` und `positionen_b2b`. Du stapelst beide und berechnest die verkaufte Menge je Produkt. Welche Aussagen über diese Abfrage stimmen?
+    lang: sql
+    code: |
+      SELECT produkt_id, SUM(menge) AS menge
+      FROM (
+        SELECT produkt_id, menge FROM positionen_shop
+        UNION ALL
+        SELECT produkt_id, menge FROM positionen_b2b
+      )
+      GROUP BY produkt_id;
+    options:
+      - text: "`UNION ALL` hängt alle Zeilen beider Abfragen aneinander, auch identische – für eine Summe ist das richtig."
+        correct: true
+        why: Jede Position soll mit ihrer Menge in die Summe eingehen. Zwei Bestellungen über je 1 × Produkt 11 sind zwei verschiedene Verkäufe, auch wenn die Zeilen gleich aussehen.
+      - text: Mit `UNION` wäre die Summe sicherer, weil doppelt exportierte Zeilen verschwinden.
+        correct: false
+        why: "`UNION` entfernt alle gleichen Zeilen, auch legitime: Zweimal `(11, 1)` wird zu einer Zeile, die Menge sinkt. Doppelt exportierte Positionen erkennst du am Schlüssel (`bestellung_id`, `position`), nicht an gleichen Werten."
+      - text: Stünde in der zweiten Abfrage `SELECT menge, produkt_id`, würden die Mengen des B2B-Exports als Produkt-IDs gruppiert – ohne Fehlermeldung.
+        correct: true
+        why: "`UNION ALL` ordnet Spalten nach ihrer Position zu, nicht nach ihrem Namen. Solange die Anzahl stimmt, gibt es keinen Fehler."
+      - text: Beide Abfragen müssen gleich viele Spalten liefern; die Spaltennamen des Ergebnisses stammen aus der ersten Abfrage.
+        correct: true
+        why: So ist ein zusammengesetztes `SELECT` definiert. Aliase in der zweiten Abfrage werden ignoriert.
+      - text: "`UNION ALL` verbindet die beiden Exporte über `produkt_id`, wie ein Join."
+        correct: false
+        why: "`UNION ALL` stapelt Zeilen untereinander und vergleicht keine Schlüssel. Ein Join stellt Zeilen nebeneinander."
+    explanation: |
+      Ein Join verbindet Tabellen nebeneinander über eine Bedingung, `UNION ALL` stapelt Ergebnisse untereinander. Dabei zählt nur die Position der Spalten, und die Namen kommen aus der ersten Abfrage. `UNION` ohne `ALL` behandelt das Ergebnis als Menge und entfernt jede Wiederholung – bei Zeilen ohne eindeutigen Schlüssel verschwinden damit echte Verkäufe. Deshalb ist `UNION ALL` der Normalfall, und Duplikate prüfst du gezielt über den Schlüssel.
+    resources:
+      - title: SQLite · Compound Select Statements
+        url: https://sqlite.org/lang_select.html#compound
+      - title: PostgreSQL · Combining Queries (UNION, INTERSECT, EXCEPT)
+        url: https://www.postgresql.org/docs/current/queries-union.html
+
+  - id: join-kette-ordnen
+    type: order
+    title: Von der Position zur Kategorie
+    prompt: |
+      Die Abfrage soll den Nettoumsatz der bezahlten Bestellungen je Produktkategorie liefern, größter zuerst. Sie beginnt bei der Tabelle, deren Beträge summiert werden. Bring die Zeilen in eine gültige Reihenfolge.
+    lang: sql
+    lines: |
+      SELECT pr.kategorie,
+             ROUND(SUM(p.menge * p.einzelpreis * (1 - p.rabatt)), 2) AS umsatz
+      FROM positionen AS p
+      JOIN bestellungen AS b ON b.bestellung_id = p.bestellung_id
+      JOIN produkte AS pr ON pr.produkt_id = p.produkt_id
+      WHERE b.status = 'bezahlt'
+      GROUP BY pr.kategorie
+      ORDER BY umsatz DESC;
+    alternatives:
+      - [1, 2, 3, 5, 4, 6, 7, 8]
+    hints:
+      - Die Umsatzbeträge stehen in `positionen`. Von dort aus führen zwei n:1-Joins zu den anderen Tabellen.
+      - Die beiden `JOIN`-Zeilen sind voneinander unabhängig; beide Reihenfolgen gelten.
+    explanation: |
+      `positionen` hat die feinste Granularität und enthält die Beträge. Beide Joins gehen von dort aus in Richtung „1“: Jede Position hat genau eine Bestellung und genau ein Produkt. Deshalb entsteht kein Fan-out, das Ergebnis hat vor dem Gruppieren genau eine Zeile je Position. Die Reihenfolge der beiden `JOIN`-Zeilen ist egal. `WHERE` filtert die Positionen unbezahlter Bestellungen vor dem Gruppieren, `ORDER BY` kommt zuletzt und kennt den Alias `umsatz`.
+    resources:
+      - title: SQLite · SELECT – FROM-Klausel und Joins
+        url: https://sqlite.org/lang_select.html#fromclause
+
+  - id: fan-out-zaehlen
+    type: output
+    title: Wie viele Versandkosten?
+    prompt: |
+      Was gibt das Skript aus? Schreibe die Ausgabe im Listenmodus der `sqlite3`-Kommandozeile: eine Zeile je Ergebniszeile, Werte durch `|` getrennt, keine Spaltenüberschriften, Kommazahlen mit Punkt (`2.5`).
+    lang: sql
+    code: |
+      CREATE TABLE bestellungen (bestellung_id INTEGER PRIMARY KEY, kunde_id INTEGER, versandkosten REAL);
+      CREATE TABLE positionen (bestellung_id INTEGER, position INTEGER, produkt_id INTEGER, menge INTEGER);
+      INSERT INTO bestellungen VALUES (1001, 1, 4.90), (1002, 2, 0), (1003, 1, 6.50);
+      INSERT INTO positionen VALUES
+        (1001, 1, 11, 2), (1001, 2, 12, 1),
+        (1002, 1, 11, 5),
+        (1003, 1, 21, 1), (1003, 2, 22, 1), (1003, 3, 31, 2);
+
+      SELECT COUNT(*), SUM(versandkosten) FROM bestellungen;
+
+      SELECT COUNT(*), COUNT(DISTINCT b.bestellung_id), SUM(b.versandkosten), SUM(p.menge)
+      FROM bestellungen AS b
+      JOIN positionen AS p ON p.bestellung_id = b.bestellung_id;
+    expected: |
+      3|11.4
+      6|3|29.3|12
+    hints:
+      - Wie viele Zeilen entstehen je Bestellung, wenn sie mit ihren Positionen verbunden wird?
+      - Bestellung 1003 hat drei Positionen. Wie oft steht ihr Versandbetrag im Ergebnis?
+    explanation: |
+      In `bestellungen` stehen drei Zeilen mit 4.90 + 0 + 6.50 = 11.4 Versandkosten. Nach dem Join hat das Ergebnis die Granularität von `positionen`: sechs Zeilen. `COUNT(DISTINCT b.bestellung_id)` zeigt, dass es weiterhin drei Bestellungen sind. Die Versandkosten stehen aber je Position einmal da: 2 × 4.90 + 1 × 0 + 3 × 6.50 = 29.3. `SUM(p.menge)` stimmt dagegen, weil die Menge zur feinsten Tabelle gehört.
+    resources:
+      - title: SQLite · SELECT – FROM-Klausel und Joins
+        url: https://sqlite.org/lang_select.html#fromclause
+
+  - id: left-join-zaehlen
+    type: output
+    title: Drei Abfragen, drei Antworten
+    prompt: |
+      Was gibt das Skript aus? Schreibe die Ausgabe im Listenmodus der `sqlite3`-Kommandozeile: eine Zeile je Ergebniszeile, Werte durch `|` getrennt, keine Spaltenüberschriften. Die Ergebnisse der drei Abfragen stehen direkt untereinander.
+    lang: sql
+    code: |
+      CREATE TABLE kunden (kunde_id INTEGER PRIMARY KEY, name TEXT);
+      CREATE TABLE bestellungen (bestellung_id INTEGER PRIMARY KEY, kunde_id INTEGER, status TEXT);
+      INSERT INTO kunden VALUES (1, 'Lindner'), (2, 'Hansen'), (3, 'Voss');
+      INSERT INTO bestellungen VALUES
+        (1001, 1, 'bezahlt'), (1002, 1, 'storniert'), (1003, 2, 'storniert');
+
+      SELECT k.name, COUNT(*), COUNT(b.bestellung_id)
+      FROM kunden AS k
+      LEFT JOIN bestellungen AS b ON b.kunde_id = k.kunde_id
+      GROUP BY k.kunde_id
+      ORDER BY k.kunde_id;
+
+      SELECT k.name, COUNT(b.bestellung_id)
+      FROM kunden AS k
+      LEFT JOIN bestellungen AS b ON b.kunde_id = k.kunde_id
+      WHERE b.status = 'bezahlt'
+      GROUP BY k.kunde_id
+      ORDER BY k.kunde_id;
+
+      SELECT k.name, COUNT(b.bestellung_id)
+      FROM kunden AS k
+      LEFT JOIN bestellungen AS b ON b.kunde_id = k.kunde_id AND b.status = 'bezahlt'
+      GROUP BY k.kunde_id
+      ORDER BY k.kunde_id;
+    expected: |
+      Lindner|2|2
+      Hansen|1|1
+      Voss|1|0
+      Lindner|1
+      Lindner|1
+      Hansen|0
+      Voss|0
+    hints:
+      - Voss hat keine Bestellung. Wie viele Zeilen erzeugt der `LEFT JOIN` für sie, und was steht in `b.bestellung_id`?
+      - In der zweiten Abfrage wird nach dem Join gefiltert. Was passiert mit Zeilen, in denen `b.status` `NULL` oder `'storniert'` ist?
+    explanation: |
+      Die erste Abfrage liefert je Kunde eine Gruppe. Voss hat keine Bestellung, der `LEFT JOIN` erzeugt für sie eine aufgefüllte Zeile – `COUNT(*)` zählt sie als 1, `COUNT(b.bestellung_id)` zählt 0. In der zweiten Abfrage entfernt `WHERE b.status = 'bezahlt'` nach dem Join alle Zeilen außer Lindners bezahlter Bestellung: Hansen (nur storniert) und Voss (`NULL`) verschwinden, der `LEFT JOIN` wirkt wie ein `INNER JOIN`. In der dritten Abfrage schränkt die Bedingung im `ON` nur die Partner ein, alle drei Kunden bleiben erhalten.
+    resources:
+      - title: SQLite · OUTER JOIN Strength Reduction
+        url: https://sqlite.org/optoverview.html#leftjoinreduction
+      - title: SQLite · count(X) und count(*)
+        url: https://sqlite.org/lang_aggfunc.html#count
+
+  - id: not-in-null
+    type: output
+    title: Wer hat kein Ticket?
+    prompt: |
+      Was gibt das Skript aus? Jede der vier Abfragen liefert eine Zahl. Schreibe sie untereinander, eine je Zeile – so wie die `sqlite3`-Kommandozeile sie im Listenmodus ausgibt.
+    lang: sql
+    code: |
+      CREATE TABLE kunden (kunde_id INTEGER PRIMARY KEY, name TEXT);
+      CREATE TABLE tickets (ticket_id INTEGER PRIMARY KEY, kunde_id INTEGER, kategorie TEXT);
+      INSERT INTO kunden VALUES (1, 'Lindner'), (2, 'Hansen'), (3, 'Voss'), (4, 'Albers');
+      INSERT INTO tickets VALUES
+        (501, 1, 'Lieferung'), (502, 1, 'Qualität'), (503, 3, 'Rechnung'), (504, NULL, 'Lieferung');
+
+      SELECT COUNT(*) FROM kunden
+      WHERE kunde_id NOT IN (SELECT kunde_id FROM tickets);
+
+      SELECT COUNT(*) FROM kunden AS k
+      WHERE NOT EXISTS (SELECT 1 FROM tickets AS t WHERE t.kunde_id = k.kunde_id);
+
+      SELECT COUNT(*) FROM kunden
+      WHERE kunde_id IN (SELECT kunde_id FROM tickets);
+
+      SELECT COUNT(*) FROM kunden AS k
+      JOIN tickets AS t ON t.kunde_id = k.kunde_id;
+    expected: |
+      0
+      2
+      2
+      3
+    hints:
+      - Ticket 504 hat keine `kunde_id`. Was ergibt `2 <> NULL`?
+      - "`IN` braucht einen Treffer, `NOT IN` muss alle Vergleiche bestehen."
+    explanation: |
+      Die Unterabfrage liefert `1, 1, 3, NULL`. Für Hansen bedeutet `NOT IN`: `2 <> 1 AND 2 <> 1 AND 2 <> 3 AND 2 <> NULL` – der letzte Vergleich ist unbekannt, also zählt Hansen nicht, ebenso wenig Albers. Ergebnis 0. `NOT EXISTS` fragt je Kunde nur, ob ein passendes Ticket existiert, und findet Hansen und Albers. `IN` braucht nur einen Treffer, das `NULL` stört dort nicht: Lindner und Voss. Der Join zählt dagegen Zeilen, nicht Kunden – Lindner hat zwei Tickets, also 3.
+    resources:
+      - title: SQLite · Die Operatoren IN und NOT IN
+        url: https://sqlite.org/lang_expr.html#in_op
+      - title: PostgreSQL · NOT IN mit Unterabfragen
+        url: https://www.postgresql.org/docs/current/functions-subquery.html#FUNCTIONS-SUBQUERY-NOTIN
+
+  - id: anti-und-semi-join
+    type: gap
+    title: Keine Bestellung, mindestens ein Ticket
+    prompt: |
+      Ergänze die beiden Abfragen. Die erste soll alle Kunden **ohne jede Bestellung** liefern, die zweite alle Kunden mit **mindestens einem Qualitäts-Ticket**, jeden genau einmal.
+    lang: sql
+    code: |
+      -- 1. Kunden ohne jede Bestellung
+      SELECT k.kunde_id, k.name
+      FROM kunden AS k
+      ⟦LEFT JOIN⟧ bestellungen AS b ON b.kunde_id = k.kunde_id
+      WHERE b.bestellung_id ⟦IS NULL⟧;
+
+      -- 2. Kunden mit mindestens einem Qualitäts-Ticket, jeder genau einmal
+      SELECT k.kunde_id, k.name
+      FROM kunden AS k
+      WHERE ⟦EXISTS⟧ (
+        SELECT 1
+        FROM tickets AS t
+        WHERE t.kunde_id = ⟦k.kunde_id⟧
+          AND t.kategorie = 'Qualität'
+      );
+    gaps:
+      - label: Join-Art
+        hint: Die Kunden ohne Partner müssen im Zwischenergebnis erhalten bleiben.
+        accept: ["LEFT OUTER JOIN", "left join", "left outer join"]
+      - label: Kein Partner
+        hint: Bei Kunden ohne Bestellung ist der Primärschlüssel der rechten Tabelle aufgefüllt.
+        accept: ["is null"]
+      - label: Existenzprüfung
+        hint: Ein Operator, der wahr ist, sobald die Unterabfrage mindestens eine Zeile liefert.
+        accept: ["exists"]
+      - label: Korrelation
+        hint: Die Unterabfrage muss sich auf den Kunden der äußeren Abfrage beziehen – mit dessen Alias.
+    explanation: |
+      Der `LEFT JOIN` behält alle Kunden; wer keine Bestellung hat, bekommt `NULL` in allen Spalten von `b`. `WHERE b.bestellung_id IS NULL` behält genau diese Zeilen – der Primärschlüssel eignet sich, weil er bei echten Bestellungen nie `NULL` ist. `EXISTS` ist wahr, sobald die Unterabfrage eine Zeile liefert, und erzeugt keine Duplikate, auch bei drei Qualitäts-Tickets. Die Korrelation braucht den Alias `k`: Ohne ihn würde `kunde_id` in der Unterabfrage als `t.kunde_id` gelesen, die Bedingung wäre für jedes Ticket mit Kunde wahr, und jeder Kunde erschiene, sobald es irgendein Qualitäts-Ticket gibt.
+    resources:
+      - title: SQLite · Der EXISTS-Operator
+        url: https://sqlite.org/lang_expr.html#exists_op
+      - title: SQLite · Korrelierte Unterabfragen
+        url: https://sqlite.org/lang_expr.html#cosub
+
+  - id: umsatz-je-region
+    type: sql
+    title: Umsatz je Region
+    prompt: |
+      Berechne den Nettoumsatz der **bezahlten** Bestellungen je Region der Kunden. Nettoumsatz einer Position = `menge * einzelpreis * (1 - rabatt)`. Gastbestellungen ohne `kunde_id` gehören zu keiner Region und zählen nicht; Regionen ohne Umsatz erscheinen nicht.
+
+      Spalten: `region` und `umsatz` (auf zwei Nachkommastellen gerundet). Sortierung: größter Umsatz zuerst.
+    schema: |
+      CREATE TABLE kunden (
+        kunde_id INTEGER PRIMARY KEY, name TEXT, stadt TEXT, region TEXT, segment TEXT
+      );
+      CREATE TABLE bestellungen (
+        bestellung_id INTEGER PRIMARY KEY, kunde_id INTEGER, bestelldatum TEXT,
+        kanal TEXT, status TEXT, versandkosten REAL
+      );
+      CREATE TABLE positionen (
+        bestellung_id INTEGER, position INTEGER, produkt_id INTEGER,
+        menge INTEGER, einzelpreis REAL, rabatt REAL,
+        PRIMARY KEY (bestellung_id, position)
+      );
+      INSERT INTO kunden VALUES
+        (1, 'Café Lindner',          'Köln',    'West', 'Café'),
+        (2, 'Büro Hansen & Partner', 'Hamburg', 'Nord', 'Büro'),
+        (3, 'Mara Voss',             'München', 'Süd',  'Privat'),
+        (4, 'Jonas Albers',          'Leipzig', 'Ost',  'Privat'),
+        (5, 'Kaffeebar Nordlicht',   'Kiel',    'Nord', 'Café'),
+        (6, 'Lena Brandt',           'Bonn',    'West', 'Privat');
+      INSERT INTO bestellungen VALUES
+        (1001, 1,    '2026-03-02', 'B2B',  'bezahlt',     0),
+        (1002, 2,    '2026-03-03', 'B2B',  'bezahlt',     0),
+        (1003, 3,    '2026-03-05', 'Shop', 'storniert',   4.90),
+        (1004, 1,    '2026-03-09', 'B2B',  'bezahlt',     0),
+        (1005, NULL, '2026-03-12', 'Shop', 'bezahlt',     4.90),
+        (1006, 5,    '2026-03-14', 'B2B',  'bezahlt',     0),
+        (1007, 6,    '2026-03-20', 'Shop', 'retourniert', 4.90),
+        (1008, 3,    '2026-03-28', 'Shop', 'bezahlt',     4.90);
+      INSERT INTO positionen VALUES
+        (1001, 1, 11, 10, 14.50, 0.1),
+        (1001, 2, 31,  1, 39.00, 0),
+        (1002, 1, 12, 20, 12.90, 0.15),
+        (1003, 1, 21,  2, 11.40, 0),
+        (1004, 1, 11,  6, 14.50, 0.1),
+        (1004, 2, 12,  4, 12.90, 0.1),
+        (1005, 1, 22,  1, 17.80, 0),
+        (1006, 1, 11,  8, 14.50, 0.05),
+        (1006, 2, 32,  2, 24.90, 0),
+        (1007, 1, 21,  3, 11.40, 0),
+        (1008, 1, 22,  2, 17.80, 0),
+        (1008, 2, 31,  1, 39.00, 0.2);
+    starter: |
+      SELECT b.bestellung_id, b.kunde_id, b.status
+      FROM bestellungen AS b;
+    solution: |
+      SELECT k.region,
+             ROUND(SUM(p.menge * p.einzelpreis * (1 - p.rabatt)), 2) AS umsatz
+      FROM positionen AS p
+      JOIN bestellungen AS b ON b.bestellung_id = p.bestellung_id
+      JOIN kunden AS k ON k.kunde_id = b.kunde_id
+      WHERE b.status = 'bezahlt'
+      GROUP BY k.region
+      ORDER BY umsatz DESC;
+    ordered: true
+    hints:
+      - Die Beträge stehen in `positionen`, der Status in `bestellungen`, die Region in `kunden`. Du brauchst zwei Joins.
+      - "Schlüsselpaare: `positionen.bestellung_id` → `bestellungen.bestellung_id` und `bestellungen.kunde_id` → `kunden.kunde_id`."
+      - "`WHERE b.status = 'bezahlt'`, `GROUP BY k.region`, `ORDER BY umsatz DESC`."
+    explanation: |
+      Die Abfrage startet bei der Tabelle mit den Beträgen und geht über zwei n:1-Joins zu Bestellung und Kunde. Weil jede Position genau eine Bestellung und jede Bestellung höchstens einen Kunden hat, entsteht kein Fan-out. Der `INNER JOIN` auf `kunden` lässt die Gastbestellung 1005 fallen, und `WHERE` entfernt die stornierte 1003 und die Retoure 1007. Region Ost erscheint nicht, weil Jonas Albers nichts bestellt hat. Ergebnis: Nord 379.3, West 294.24, Süd 66.8.
+    resources:
+      - title: SQLite · SELECT – FROM-Klausel und Joins
+        url: https://sqlite.org/lang_select.html#fromclause
+      - title: PostgreSQL · Joined Tables
+        url: https://www.postgresql.org/docs/current/queries-table-expressions.html#QUERIES-JOIN
+
+  - id: ohne-bezahlte-bestellung
+    type: sql
+    title: Kunden ohne bezahlte Bestellung
+    prompt: |
+      Der Vertriebsinnendienst will Kunden anrufen, die **noch nie eine bezahlte Bestellung** hatten – egal ob sie gar nicht bestellt oder nur storniert haben. Die Startabfrage sieht richtig aus, liefert aber keine einzige Zeile.
+
+      Spalten: `kunde_id` und `name`. Sortierung: `kunde_id` aufsteigend.
+    schema: |
+      CREATE TABLE kunden (
+        kunde_id INTEGER PRIMARY KEY, name TEXT, region TEXT, segment TEXT
+      );
+      CREATE TABLE bestellungen (
+        bestellung_id INTEGER PRIMARY KEY, kunde_id INTEGER, bestelldatum TEXT, status TEXT
+      );
+      INSERT INTO kunden VALUES
+        (1, 'Café Lindner',          'West', 'Café'),
+        (2, 'Büro Hansen & Partner', 'Nord', 'Büro'),
+        (3, 'Mara Voss',             'Süd',  'Privat'),
+        (4, 'Jonas Albers',          'Ost',  'Privat'),
+        (5, 'Kaffeebar Nordlicht',   'Nord', 'Café'),
+        (6, 'Lena Brandt',           'West', 'Privat');
+      INSERT INTO bestellungen VALUES
+        (1001, 1,    '2026-03-02', 'bezahlt'),
+        (1002, 2,    '2026-03-03', 'bezahlt'),
+        (1003, 2,    '2026-03-06', 'storniert'),
+        (1004, 3,    '2026-03-09', 'storniert'),
+        (1005, NULL, '2026-03-12', 'bezahlt'),
+        (1006, 5,    '2026-03-14', 'bezahlt'),
+        (1007, 6,    '2026-03-20', 'storniert'),
+        (1008, 6,    '2026-03-27', 'storniert');
+    starter: |
+      SELECT k.kunde_id, k.name
+      FROM kunden AS k
+      WHERE k.kunde_id NOT IN (
+        SELECT kunde_id FROM bestellungen WHERE status = 'bezahlt'
+      )
+      ORDER BY k.kunde_id;
+    solution: |
+      SELECT k.kunde_id, k.name
+      FROM kunden AS k
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM bestellungen AS b
+        WHERE b.kunde_id = k.kunde_id
+          AND b.status = 'bezahlt'
+      )
+      ORDER BY k.kunde_id;
+    ordered: true
+    hints:
+      - Schau dir die Gastbestellung 1005 an. Was liefert die Unterabfrage, und was ergibt `3 <> NULL`?
+      - "Nimm `NOT EXISTS` mit einer korrelierten Unterabfrage – oder einen `LEFT JOIN` mit der Statusbedingung im `ON` und `WHERE b.bestellung_id IS NULL`."
+      - "`WHERE NOT EXISTS (SELECT 1 FROM bestellungen AS b WHERE b.kunde_id = k.kunde_id AND b.status = 'bezahlt')`."
+    explanation: |
+      Die Unterabfrage der Startabfrage liefert `1, 2, NULL, 5`, weil die bezahlte Gastbestellung keine `kunde_id` hat. Mit einem `NULL` in der Liste wird `NOT IN` für keinen Kunden wahr. `NOT EXISTS` prüft je Kunde, ob eine bezahlte Bestellung existiert, und ist gegen `NULL` unempfindlich. Die Statusbedingung gehört in die Unterabfrage: Mara Voss und Lena Brandt haben Bestellungen, aber keine bezahlte. Ein `LEFT JOIN` mit `WHERE b.status <> 'bezahlt'` wäre falsch – er fände Büro Hansen & Partner wegen der Stornierung und verlöre Jonas Albers, dessen `b.status` `NULL` ist. Ergebnis: Kunden 3, 4 und 6.
+    resources:
+      - title: SQLite · Der EXISTS-Operator
+        url: https://sqlite.org/lang_expr.html#exists_op
+      - title: SQLite · Die Operatoren IN und NOT IN
+        url: https://sqlite.org/lang_expr.html#in_op
+
+  - id: produkte-im-maerz
+    type: sql
+    title: Alle aktiven Produkte, auch die ohne Verkauf
+    prompt: |
+      Für die Sortimentsplanung brauchst du **alle aktiven Produkte** (`aktiv = 1`) mit der Menge, die im **März 2026** in **bezahlten** Bestellungen verkauft wurde. Produkte ohne Verkauf im März erscheinen mit `0`.
+
+      Spalten: `produkt_id`, `name`, `menge_maerz`. Sortierung: `menge_maerz` absteigend, bei Gleichstand `produkt_id` aufsteigend.
+    schema: |
+      CREATE TABLE produkte (
+        produkt_id INTEGER PRIMARY KEY, name TEXT, kategorie TEXT,
+        einkaufspreis REAL, listenpreis REAL, aktiv INTEGER
+      );
+      CREATE TABLE bestellungen (
+        bestellung_id INTEGER PRIMARY KEY, kunde_id INTEGER, bestelldatum TEXT, status TEXT
+      );
+      CREATE TABLE positionen (
+        bestellung_id INTEGER, position INTEGER, produkt_id INTEGER,
+        menge INTEGER, einzelpreis REAL, rabatt REAL,
+        PRIMARY KEY (bestellung_id, position)
+      );
+      INSERT INTO produkte VALUES
+        (11, 'Espresso Classico 1 kg',    'Espresso',  9.80, 14.50, 1),
+        (12, 'Crema Rossa 1 kg',          'Espresso',  8.90, 12.90, 1),
+        (21, 'Filter Hausmischung 500 g', 'Filter',    5.10, 11.40, 1),
+        (22, 'Äthiopien Sidamo 500 g',    'Filter',    7.40, 17.80, 1),
+        (31, 'Handmühle Keramik',         'Zubehör',  21.00, 39.00, 1),
+        (32, 'Milchkännchen 350 ml',      'Zubehör',   9.50, 24.90, 1),
+        (33, 'Entkalker 3er-Pack',        'Zubehör',   4.20,  9.90, 0);
+      INSERT INTO bestellungen VALUES
+        (1001, 1, '2026-02-26', 'bezahlt'),
+        (1002, 2, '2026-03-03', 'bezahlt'),
+        (1003, 3, '2026-03-05', 'storniert'),
+        (1004, 1, '2026-03-09', 'bezahlt'),
+        (1005, 4, '2026-03-31', 'bezahlt'),
+        (1006, 5, '2026-04-01', 'bezahlt');
+      INSERT INTO positionen VALUES
+        (1001, 1, 21,  5, 11.40, 0),
+        (1002, 1, 11, 10, 14.50, 0.1),
+        (1002, 2, 33,  3,  9.90, 0),
+        (1003, 1, 22,  4, 17.80, 0),
+        (1004, 1, 11,  2, 14.50, 0),
+        (1004, 2, 21,  3, 11.40, 0),
+        (1005, 1, 12,  5, 12.90, 0.05),
+        (1005, 2, 31,  1, 39.00, 0),
+        (1006, 1, 32,  2, 24.90, 0);
+    starter: |
+      SELECT pr.produkt_id, pr.name, SUM(p.menge) AS menge_maerz
+      FROM produkte AS pr
+      LEFT JOIN positionen AS p ON p.produkt_id = pr.produkt_id
+      GROUP BY pr.produkt_id, pr.name
+      ORDER BY menge_maerz DESC, pr.produkt_id;
+    solution: |
+      WITH maerz AS (
+        SELECT p.produkt_id, SUM(p.menge) AS menge
+        FROM positionen AS p
+        JOIN bestellungen AS b ON b.bestellung_id = p.bestellung_id
+        WHERE b.status = 'bezahlt'
+          AND b.bestelldatum >= '2026-03-01'
+          AND b.bestelldatum < '2026-04-01'
+        GROUP BY p.produkt_id
+      )
+      SELECT pr.produkt_id,
+             pr.name,
+             COALESCE(m.menge, 0) AS menge_maerz
+      FROM produkte AS pr
+      LEFT JOIN maerz AS m ON m.produkt_id = pr.produkt_id
+      WHERE pr.aktiv = 1
+      ORDER BY menge_maerz DESC, pr.produkt_id;
+    ordered: true
+    hints:
+      - Status und Datum stehen in `bestellungen`. Filterst du sie nach dem `LEFT JOIN` im `WHERE`, verschwinden die Produkte ohne März-Verkauf.
+      - Berechne die März-Mengen je Produkt zuerst in einem CTE (Positionen `JOIN` Bestellungen, gefiltert, gruppiert) und verbinde dann `produkte` per `LEFT JOIN` damit.
+      - "`COALESCE(m.menge, 0) AS menge_maerz` macht aus fehlenden Mengen eine `0`; `WHERE pr.aktiv = 1` betrifft die linke Tabelle und darf ins `WHERE`."
+    explanation: |
+      Die Frage hat zwei Teile: „welche Produkte“ (alle aktiven, linke Tabelle) und „welche Verkäufe zählen“ (bezahlt, März). Der CTE beantwortet den zweiten Teil und liefert eine Zeile je verkauftem Produkt. Der `LEFT JOIN` hängt diese Mengen an die Produktliste, ohne Produkte zu verlieren, und `COALESCE` macht aus dem fehlenden Partner eine `0`. Die Fallen: Die Februar-Bestellung würde Produkt 21 auf 8 heben, die stornierte Bestellung Produkt 22 auf 4, die April-Bestellung Produkt 32 auf 2, und der inaktive Entkalker gehört nicht in die Liste. Ein zweiter `LEFT JOIN` auf `bestellungen` mit den Bedingungen im `ON` reicht nicht: Die Positionen aus Februar und April blieben erhalten und würden mitsummiert.
+    resources:
+      - title: SQLite · WITH-Klausel (CTEs)
+        url: https://sqlite.org/lang_with.html
+      - title: SQLite · coalesce()
+        url: https://sqlite.org/lang_corefunc.html#coalesce
+
+  - id: versand-ohne-doppelzaehlung
+    type: sql
+    title: Versandkosten ohne Doppelzählung
+    prompt: |
+      Das Controlling will je Kanal Warenwert und Versandkosten der **bezahlten** Bestellungen sehen. Alle Bestellungen stammen aus dem März. Die Startabfrage liefert plausible, aber falsche Zahlen: Die Versandkosten liegen deutlich über der Summe in `bestellungen`, und `bestellungen` ist zu hoch. Repariere sie.
+
+      Spalten: `kanal`, `bestellungen` (Anzahl bezahlter Bestellungen), `warenwert` (Summe der Positionen `menge * einzelpreis * (1 - rabatt)`) und `versandkosten`, beide Beträge auf zwei Nachkommastellen gerundet. Sortierung: `kanal` aufsteigend.
+    schema: |
+      CREATE TABLE bestellungen (
+        bestellung_id INTEGER PRIMARY KEY, kunde_id INTEGER, bestelldatum TEXT,
+        kanal TEXT, status TEXT, versandkosten REAL
+      );
+      CREATE TABLE positionen (
+        bestellung_id INTEGER, position INTEGER, produkt_id INTEGER,
+        menge INTEGER, einzelpreis REAL, rabatt REAL,
+        PRIMARY KEY (bestellung_id, position)
+      );
+      INSERT INTO bestellungen VALUES
+        (1001, 1, '2026-03-02', 'Shop', 'bezahlt',    4.90),
+        (1002, 2, '2026-03-03', 'B2B',  'bezahlt',   12.00),
+        (1003, 3, '2026-03-05', 'Shop', 'storniert',  4.90),
+        (1004, 4, '2026-03-09', 'Shop', 'bezahlt',    0),
+        (1005, 5, '2026-03-12', 'B2B',  'bezahlt',    8.50),
+        (1006, 6, '2026-03-14', 'Shop', 'bezahlt',    4.90);
+      INSERT INTO positionen VALUES
+        (1001, 1, 11,  1, 14.50, 0),
+        (1001, 2, 21,  2, 11.40, 0),
+        (1002, 1, 11, 20, 14.50, 0.1),
+        (1002, 2, 12, 10, 12.90, 0.1),
+        (1002, 3, 31,  2, 39.00, 0.2),
+        (1003, 1, 22,  1, 17.80, 0),
+        (1004, 1, 31,  1, 39.00, 0),
+        (1004, 2, 32,  1, 24.90, 0),
+        (1004, 3, 22,  2, 17.80, 0.05),
+        (1005, 1, 12, 12, 12.90, 0.1),
+        (1006, 1, 22,  1, 17.80, 0);
+    starter: |
+      SELECT b.kanal,
+             COUNT(*) AS bestellungen,
+             ROUND(SUM(p.menge * p.einzelpreis * (1 - p.rabatt)), 2) AS warenwert,
+             ROUND(SUM(b.versandkosten), 2) AS versandkosten
+      FROM bestellungen AS b
+      JOIN positionen AS p ON p.bestellung_id = b.bestellung_id
+      WHERE b.status = 'bezahlt'
+      GROUP BY b.kanal
+      ORDER BY b.kanal;
+    solution: |
+      WITH netto_je_bestellung AS (
+        SELECT bestellung_id, SUM(menge * einzelpreis * (1 - rabatt)) AS netto
+        FROM positionen
+        GROUP BY bestellung_id
+      )
+      SELECT b.kanal,
+             COUNT(*) AS bestellungen,
+             ROUND(SUM(n.netto), 2) AS warenwert,
+             ROUND(SUM(b.versandkosten), 2) AS versandkosten
+      FROM bestellungen AS b
+      JOIN netto_je_bestellung AS n ON n.bestellung_id = b.bestellung_id
+      WHERE b.status = 'bezahlt'
+      GROUP BY b.kanal
+      ORDER BY b.kanal;
+    ordered: true
+    hints:
+      - Welche Granularität hat das Ergebnis des Joins? Wie oft steht Bestellung 1002 darin?
+      - Der Warenwert stimmt, er gehört zur Positionsebene. Versandkosten und Anzahl gehören zur Bestellebene.
+      - Verdichte `positionen` in einem CTE auf eine Zeile je Bestellung (`GROUP BY bestellung_id`) und verbinde erst dann mit `bestellungen`.
+    explanation: |
+      Nach dem Join mit `positionen` steht jede Bestellung so oft im Ergebnis, wie sie Positionen hat. Die B2B-Bestellung 1002 mit drei Positionen trägt ihre 12.00 EUR Versand dreimal bei, und `COUNT(*)` zählt Positionen statt Bestellungen. Verdichtest du die Positionen vorher auf eine Zeile je Bestellung, passt der Join 1:1: Shop hat 3 bezahlte Bestellungen mit 152.82 EUR Warenwert und 9.80 EUR Versand, B2B 2 mit 578.82 EUR und 20.50 EUR. `SUM(DISTINCT b.versandkosten)` wäre keine Reparatur: Im Shop kostet der Versand zweimal 4.90 EUR, `DISTINCT` würde nur einmal 4.90 zählen. `COUNT(DISTINCT b.bestellung_id)` repariert dagegen die Anzahl.
+    resources:
+      - title: SQLite · WITH-Klausel (CTEs)
+        url: https://sqlite.org/lang_with.html
+      - title: SQLite · Aggregatfunktionen mit DISTINCT
+        url: https://sqlite.org/lang_aggfunc.html#aggfunclist
+
+  - id: empfehlungen
+    type: sql
+    title: Wer hat wen geworben?
+    prompt: |
+      Im Empfehlungsprogramm enthält `kunden.geworben_von` die `kunde_id` des werbenden Kunden (`NULL`, wenn niemand geworben hat). Liste alle Kunden, die **mindestens einen anderen geworben** haben, mit der Anzahl geworbener Kunden und wie viele davon schon **mindestens eine bezahlte Bestellung** haben.
+
+      Spalten: `werber` (Name des werbenden Kunden), `geworben`, `davon_mit_kauf`. Sortierung: `geworben` absteigend, bei Gleichstand `werber` aufsteigend.
+    schema: |
+      CREATE TABLE kunden (
+        kunde_id INTEGER PRIMARY KEY, name TEXT, segment TEXT, geworben_von INTEGER
+      );
+      CREATE TABLE bestellungen (
+        bestellung_id INTEGER PRIMARY KEY, kunde_id INTEGER, bestelldatum TEXT, status TEXT
+      );
+      INSERT INTO kunden VALUES
+        (1, 'Café Lindner',          'Café',   NULL),
+        (2, 'Büro Hansen & Partner', 'Büro',   1),
+        (3, 'Mara Voss',             'Privat', 1),
+        (4, 'Jonas Albers',          'Privat', 3),
+        (5, 'Kaffeebar Nordlicht',   'Café',   1),
+        (6, 'Lena Brandt',           'Privat', 3),
+        (7, 'Tom Okafor',            'Privat', NULL),
+        (8, 'Praxis Dr. Yilmaz',     'Büro',   6);
+      INSERT INTO bestellungen VALUES
+        (1001, 2, '2026-03-02', 'bezahlt'),
+        (1002, 2, '2026-03-16', 'bezahlt'),
+        (1003, 3, '2026-03-05', 'storniert'),
+        (1004, 4, '2026-03-09', 'bezahlt'),
+        (1005, 6, '2026-03-12', 'storniert'),
+        (1006, 5, '2026-03-14', 'bezahlt'),
+        (1007, 8, '2026-03-20', 'bezahlt'),
+        (1008, 7, '2026-03-23', 'bezahlt');
+    starter: |
+      SELECT k.name, k.geworben_von
+      FROM kunden AS k
+      WHERE k.geworben_von IS NOT NULL;
+    solution: |
+      SELECT w.name AS werber,
+             COUNT(DISTINCT k.kunde_id) AS geworben,
+             COUNT(DISTINCT b.kunde_id) AS davon_mit_kauf
+      FROM kunden AS k
+      JOIN kunden AS w ON w.kunde_id = k.geworben_von
+      LEFT JOIN bestellungen AS b ON b.kunde_id = k.kunde_id AND b.status = 'bezahlt'
+      GROUP BY w.kunde_id, w.name
+      ORDER BY geworben DESC, werber;
+    ordered: true
+    hints:
+      - Du brauchst `kunden` zweimal – einmal als geworbenen Kunden (`k`), einmal als Werber (`w`). Welche Spalte zeigt von `k` auf `w`?
+      - Büro Hansen & Partner hat zwei bezahlte Bestellungen. Wie oft steht er nach einem Join mit `bestellungen` im Ergebnis?
+      - "Zähle mit `COUNT(DISTINCT k.kunde_id)` und `COUNT(DISTINCT b.kunde_id)`, die Bestellungen per `LEFT JOIN … ON b.kunde_id = k.kunde_id AND b.status = 'bezahlt'`. Alternativ: `SUM(EXISTS (…))` je geworbenem Kunden."
+    explanation: |
+      Der Self-Join `k.geworben_von = w.kunde_id` stellt jedem geworbenen Kunden seinen Werber zur Seite; wer niemanden geworben hat, taucht als `w` nie auf. Die Bestellungen hängen per `LEFT JOIN` an, damit geworbene Kunden ohne Kauf erhalten bleiben – und mit der Statusbedingung im `ON`, damit stornierte Bestellungen nicht als Kauf zählen. Weil Büro Hansen & Partner zwei bezahlte Bestellungen hat, fächert der Join auf; `COUNT(DISTINCT …)` zählt deshalb Kunden statt Zeilen. Ergebnis: Café Lindner 3 geworben, davon 2 mit Kauf; Mara Voss 2 und 1; Lena Brandt 1 und 1.
+    resources:
+      - title: PostgreSQL · Joined Tables (Self-Join mit Aliasen)
+        url: https://www.postgresql.org/docs/current/queries-table-expressions.html#QUERIES-TABLE-ALIASES
+      - title: SQLite · count(X) und count(DISTINCT X)
+        url: https://sqlite.org/lang_aggfunc.html#count
+
+  - id: left-join-wird-inner
+    type: bug
+    title: Die Cafés ohne Kauf fehlen
+    prompt: |
+      Die Abfrage soll **alle Café-Kunden** mit der Anzahl ihrer bezahlten Bestellungen zeigen, auch Cafés mit `0`. Im Ergebnis fehlen aber genau die Cafés ohne bezahlte Bestellung – etwa die „Kaffeebar Nordlicht“, die bisher nur storniert hat. Finde die fehlerhaften Zeilen und korrigiere sie, ohne Zeilen hinzuzufügen oder zu löschen.
+    lang: sql
+    code: |
+      SELECT k.name,
+             COUNT(b.bestellung_id) AS bezahlte_bestellungen
+      FROM kunden AS k
+      LEFT JOIN bestellungen AS b ON b.kunde_id = k.kunde_id
+      WHERE k.segment = 'Café' AND b.status = 'bezahlt'
+      GROUP BY k.kunde_id, k.name
+      ORDER BY k.name;
+    lines: [4, 5]
+    fix:
+      - line: 4
+        answers:
+          - "LEFT JOIN bestellungen AS b ON b.kunde_id = k.kunde_id AND b.status = 'bezahlt'"
+          - "LEFT JOIN bestellungen AS b ON b.status = 'bezahlt' AND b.kunde_id = k.kunde_id"
+          - "LEFT JOIN bestellungen AS b ON k.kunde_id = b.kunde_id AND b.status = 'bezahlt'"
+          - "LEFT JOIN bestellungen AS b ON b.status = 'bezahlt' AND k.kunde_id = b.kunde_id"
+          - "LEFT OUTER JOIN bestellungen AS b ON b.kunde_id = k.kunde_id AND b.status = 'bezahlt'"
+          - "LEFT OUTER JOIN bestellungen AS b ON k.kunde_id = b.kunde_id AND b.status = 'bezahlt'"
+      - line: 5
+        answers:
+          - "WHERE k.segment = 'Café'"
+    hints:
+      - Welche Werte hat `b.status` für ein Café ohne Bestellung, und welche für eines mit nur stornierten Bestellungen?
+      - Eine Bedingung betrifft die linke Tabelle, die andere die rechte. Wo gehört jede hin?
+    explanation: |
+      Der `LEFT JOIN` behält zunächst alle Kunden. Danach verlangt das `WHERE`, dass `b.status` `'bezahlt'` ist – für Cafés ohne Bestellung ist `b.status` aber `NULL`, für die Kaffeebar Nordlicht `'storniert'`. Beide Zeilen fallen heraus, der `LEFT JOIN` wirkt wie ein `INNER JOIN`. Die Statusbedingung betrifft die rechte Tabelle und gehört ins `ON`: Dort bestimmt sie nur, welche Bestellungen als Partner zählen. Die Segmentbedingung betrifft die linke Tabelle und bleibt im `WHERE`. `COUNT(b.bestellung_id)` liefert für Cafés ohne passenden Partner dann `0`.
+    resources:
+      - title: SQLite · OUTER JOIN Strength Reduction
+        url: https://sqlite.org/optoverview.html#leftjoinreduction
+      - title: PostgreSQL · Joined Tables (ON gegen WHERE bei äußeren Joins)
+        url: https://www.postgresql.org/docs/current/queries-table-expressions.html#QUERIES-JOIN
+
+  - id: exists-erklaeren
+    type: explain
+    title: EXISTS oder JOIN?
+    prompt: |
+      Im Code-Review schlägt ein Kollege vor, die Unterabfrage durch `JOIN tickets AS t ON t.kunde_id = k.kunde_id AND t.kategorie = 'Qualität'` zu ersetzen, „weil Joins schneller sind“. Erkläre, was die Abfrage zählt, wie `EXISTS` hier arbeitet und was sich mit seinem Vorschlag am Ergebnis ändern würde.
+    lang: sql
+    code: |
+      SELECT k.segment,
+             COUNT(*) AS kunden_mit_reklamation
+      FROM kunden AS k
+      WHERE EXISTS (
+        SELECT 1
+        FROM tickets AS t
+        WHERE t.kunde_id = k.kunde_id
+          AND t.kategorie = 'Qualität'
+      )
+      GROUP BY k.segment
+      ORDER BY kunden_mit_reklamation DESC;
+    points:
+      - Die Unterabfrage ist korreliert – sie bezieht sich über `k.kunde_id` auf die aktuelle Kundenzeile und wird gedanklich je Kunde geprüft.
+      - "`EXISTS` fragt nur, ob mindestens ein Qualitäts-Ticket existiert. `SELECT 1` ist beliebig, und jeder Kunde zählt höchstens einmal (Semi-Join)."
+      - Mit dem vorgeschlagenen `JOIN` entsteht je Qualitäts-Ticket eine Zeile. Ein Kunde mit drei Reklamationen würde dreimal gezählt; nötig wäre `COUNT(DISTINCT k.kunde_id)`.
+      - Das Ergebnis ist die Zahl der Kunden je Segment mit mindestens einem Qualitäts-Ticket. Segmente ohne solche Kunden erscheinen nicht, Tickets ohne `kunde_id` spielen keine Rolle.
+    explanation: |
+      Die Abfrage zählt je Segment die Kunden, die mindestens eine Reklamation zur Qualität haben. Für jede Kundenzeile prüft `EXISTS`, ob die korrelierte Unterabfrage – Tickets dieses Kunden mit Kategorie „Qualität“ – mindestens eine Zeile liefert; welche Spalten sie auswählt, ist egal, deshalb `SELECT 1`. Das ist ein Semi-Join: Die Tickets verändern die Zahl der Kundenzeilen nicht, sie filtern nur. Mit dem vorgeschlagenen Join würde jede Reklamation eine eigene Zeile erzeugen, und `COUNT(*)` zählte Tickets statt Kunden – ein Café mit drei Reklamationen stünde dreimal in der Statistik. Das ließe sich mit `COUNT(DISTINCT k.kunde_id)` reparieren, drückt die Absicht aber schlechter aus. Zur Geschwindigkeit: `EXISTS` braucht nur ein Ja oder Nein, die Datenbank darf nach dem ersten Treffer aufhören, und PostgreSQL plant solche Abfragen als Semi-Join. Ob eine Variante schneller ist, zeigt der Ausführungsplan (`EXPLAIN QUERY PLAN` in SQLite, `EXPLAIN` in PostgreSQL), nicht eine Faustregel.
+    resources:
+      - title: SQLite · Der EXISTS-Operator
+        url: https://sqlite.org/lang_expr.html#exists_op
+      - title: PostgreSQL · EXISTS
+        url: https://www.postgresql.org/docs/current/functions-subquery.html#FUNCTIONS-SUBQUERY-EXISTS
+
+  - id: kategoriebericht
+    type: sql
+    title: Der Kategoriebericht für März
+    prompt: |
+      Der Kategoriebericht für März 2026: Je Produktkategorie der Nettoumsatz der **bezahlten** März-Bestellungen, die Anzahl der Bestellungen, in denen die Kategorie vorkommt, und ihr Anteil am gesamten März-Umsatz. Kategorien ohne Umsatz im März erscheinen nicht.
+
+      Spalten: `kategorie`, `umsatz` (Summe von `menge * einzelpreis * (1 - rabatt)`, zwei Nachkommastellen), `bestellungen` (Anzahl **verschiedener** Bestellungen), `anteil_prozent` (Anteil am März-Umsatz aller Kategorien in Prozent, eine Nachkommastelle). Sortierung: `umsatz` absteigend.
+    schema: |
+      CREATE TABLE produkte (
+        produkt_id INTEGER PRIMARY KEY, name TEXT, kategorie TEXT,
+        einkaufspreis REAL, listenpreis REAL, aktiv INTEGER
+      );
+      CREATE TABLE bestellungen (
+        bestellung_id INTEGER PRIMARY KEY, kunde_id INTEGER, bestelldatum TEXT, status TEXT
+      );
+      CREATE TABLE positionen (
+        bestellung_id INTEGER, position INTEGER, produkt_id INTEGER,
+        menge INTEGER, einzelpreis REAL, rabatt REAL,
+        PRIMARY KEY (bestellung_id, position)
+      );
+      INSERT INTO produkte VALUES
+        (11, 'Espresso Classico 1 kg',    'Espresso',  9.80, 14.50, 1),
+        (12, 'Crema Rossa 1 kg',          'Espresso',  8.90, 12.90, 1),
+        (21, 'Filter Hausmischung 500 g', 'Filter',    5.10, 11.40, 1),
+        (22, 'Äthiopien Sidamo 500 g',    'Filter',    7.40, 17.80, 1),
+        (31, 'Handmühle Keramik',         'Zubehör',  21.00, 39.00, 1),
+        (32, 'Milchkännchen 350 ml',      'Zubehör',   9.50, 24.90, 1);
+      INSERT INTO bestellungen VALUES
+        (1001, 1, '2026-02-26', 'bezahlt'),
+        (1002, 2, '2026-03-03', 'bezahlt'),
+        (1003, 3, '2026-03-05', 'storniert'),
+        (1004, 1, '2026-03-09', 'bezahlt'),
+        (1005, 4, '2026-03-18', 'bezahlt'),
+        (1006, 5, '2026-03-27', 'bezahlt');
+      INSERT INTO positionen VALUES
+        (1001, 1, 11,  4, 14.50, 0),
+        (1002, 1, 11, 10, 14.50, 0.1),
+        (1002, 2, 12, 10, 12.90, 0.1),
+        (1002, 3, 31,  1, 39.00, 0.2),
+        (1003, 1, 22,  3, 17.80, 0),
+        (1004, 1, 21,  4, 11.40, 0),
+        (1004, 2, 22,  1, 17.80, 0),
+        (1005, 1, 11,  2, 14.50, 0),
+        (1005, 2, 32,  1, 24.90, 0),
+        (1006, 1, 21,  2, 11.40, 0.05);
+    starter: |
+      SELECT pr.kategorie,
+             SUM(p.menge * p.einzelpreis * (1 - p.rabatt)) AS umsatz
+      FROM positionen AS p
+      JOIN produkte AS pr ON pr.produkt_id = p.produkt_id
+      GROUP BY pr.kategorie;
+    solution: |
+      WITH maerz AS (
+        SELECT pr.kategorie,
+               p.bestellung_id,
+               p.menge * p.einzelpreis * (1 - p.rabatt) AS netto
+        FROM positionen AS p
+        JOIN bestellungen AS b ON b.bestellung_id = p.bestellung_id
+        JOIN produkte AS pr ON pr.produkt_id = p.produkt_id
+        WHERE b.status = 'bezahlt'
+          AND b.bestelldatum >= '2026-03-01'
+          AND b.bestelldatum < '2026-04-01'
+      )
+      SELECT kategorie,
+             ROUND(SUM(netto), 2) AS umsatz,
+             COUNT(DISTINCT bestellung_id) AS bestellungen,
+             ROUND(100.0 * SUM(netto) / (SELECT SUM(netto) FROM maerz), 1) AS anteil_prozent
+      FROM maerz
+      GROUP BY kategorie
+      ORDER BY umsatz DESC;
+    ordered: true
+    hints:
+      - Baue zuerst einen CTE mit den relevanten März-Positionen, ihrer Kategorie, der Bestellnummer und dem Nettobetrag.
+      - Bestellung 1002 enthält zwei Espresso-Positionen. Zählt sie für Espresso einmal oder zweimal?
+      - "Den Gesamtumsatz liefert eine skalare Unterabfrage über denselben CTE: `(SELECT SUM(netto) FROM maerz)`. Denk an `100.0 *` vor der Division."
+    explanation: |
+      Der CTE legt die Grundmenge einmal fest – bezahlte März-Positionen mit Kategorie und Nettobetrag –, und alle Kennzahlen rechnen darauf. So kann der Anteil nicht versehentlich eine andere Grundmenge verwenden als der Umsatz. `COUNT(*)` würde Positionen zählen: Bestellung 1002 enthält zwei Espresso-Produkte, Bestellung 1004 zwei Filterkaffees. `COUNT(DISTINCT bestellung_id)` zählt jede Bestellung je Kategorie einmal. Die Februar-Bestellung und die Stornierung fallen durch das `WHERE` im CTE weg. Ergebnis: Espresso 275.6 in 2 Bestellungen (66.1 %), Filter 85.06 in 2 (20.4 %), Zubehör 56.1 in 2 (13.5 %).
+    resources:
+      - title: SQLite · WITH-Klausel (CTEs)
+        url: https://sqlite.org/lang_with.html
+      - title: SQLite · Subquery Expressions
+        url: https://sqlite.org/lang_expr.html#subq

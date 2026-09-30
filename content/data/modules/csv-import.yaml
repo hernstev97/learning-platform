@@ -1,0 +1,942 @@
+id: csv-import
+title: CSV-Import und Datenbereinigung
+level: 1
+minutes: 170
+summary: Encoding, Trennzeichen, Dezimalkomma und Datumsformate deutscher Exporte sicher einlesen, Excels automatische „Korrekturen“ vermeiden und jeden Bereinigungsschritt nachvollziehbar machen.
+goals:
+  - Du untersuchst einen Export mit `file`, `head`, `tail` und `wc -l`, bevor du ihn öffnest, und wandelst sein Encoding mit `iconv` um.
+  - Du erkennst UTF-8, BOM und Windows-1252 an ihren Symptomen und dekodierst mit einer begründeten Rückfallregel.
+  - Du wandelst Dezimalkomma, Tausenderpunkt und deutsche Datumsangaben verlustfrei in `Decimal` und `date` um und erhältst führende Nullen.
+  - Du erklärst, was Excel beim Doppelklick auf eine CSV umwandelt, und importierst stattdessen über „Daten › Aus Text/CSV“ mit Typen und Gebietsschema.
+  - Du bereinigst Leerzeichen, Schreibweisen, fehlende Werte und Dubletten nachvollziehbar und protokollierst jeden Schritt.
+resources:
+  - title: Python · csv
+    url: https://docs.python.org/3/library/csv.html
+  - title: Python · codecs · Standard Encodings
+    url: https://docs.python.org/3/library/codecs.html#standard-encodings
+  - title: Microsoft Support · Importieren oder Exportieren von Textdateien
+    url: https://support.microsoft.com/de-de/excel/get-started/import-or-export-text-txt-or-csv-files
+  - title: Microsoft Learn · Power Query Text/CSV-Connector
+    url: https://learn.microsoft.com/de-de/power-query/connectors/text-csv
+  - title: Microsoft Support · Beibehalten führender Nullen und großer Zahlen
+    url: https://support.microsoft.com/de-de/excel/keeping-leading-zeros-and-large-numbers
+lesson: |
+  Am ersten Werktag jedes Monats exportiert das Shopsystem von Bohnenwerk die Datei `bestellungen_2026-03.csv`. Lea aus dem Vertriebsinnendienst öffnet sie per Doppelklick in Excel – und beginnt zu reparieren. Die Leipziger PLZ `04109` ist zu `4109` geworden, ganz unten steht eine Summenzeile, und „Leipzig“ gibt es in drei Schreibweisen. In der Versandliste aus demselben System wird die Sendungsnummer `00340434161094012345` zu `3,40434E+17`. Ihr Kollege aus dem Controlling liest den Export mit Python ein und bekommt einen `UnicodeDecodeError`. Nach 45 Minuten Handarbeit stimmt die Liste ungefähr. Nächsten Monat beginnt alles von vorn.
+
+  Jede dieser Macken hat eine technische Ursache, und jede lässt sich beim Import einmal richtig lösen, statt sie danach jeden Monat von Hand zu flicken. Dieses Modul zeigt, wie ein deutscher CSV-Export aufgebaut ist, woran du Encoding-Probleme erkennst, wie du Zahlen und Datumswerte verlustfrei einliest und wie du die Bereinigung so festhältst, dass sie wiederholbar und prüfbar ist. Die Grundlagen des Python-Moduls `csv` – `DictReader`, `DictWriter`, `newline=""`, Schreiben mit Quoting – stehen im Modul [Datenformate zuverlässig verarbeiten](/automation/datenformate) und werden hier vorausgesetzt. pandas folgt im Modul [pandas: Daten laden und bereinigen](/data/pandas-grundlagen); hier arbeitest du bewusst ohne, damit du siehst, was `read_csv` später für dich erledigt.
+
+  ## Erst hinschauen: die Datei im Terminal untersuchen
+
+  Bevor ein Programm eine Datei interpretiert, schaust du sie roh an. Vier Befehle genügen:
+
+  ```console
+  $ file bestellungen_2026-03.csv
+  bestellungen_2026-03.csv: ISO-8859 text, with CRLF line terminators
+  $ head -n 3 bestellungen_2026-03.csv
+  bestellung_id;kunde_id;bestelldatum;plz;stadt;versandkosten;warenwert
+  1001;1;02.03.2026;50667;K�ln;0,00;1.250,50
+  1002;3;02.03.2026;04109;Leipzig ;4,90;41,40
+  $ tail -n 2 bestellungen_2026-03.csv
+  1187;4;31.03.2026;53111;Bonn;4,90;205,93
+  Summe;;;;;;48.317,20
+  $ wc -l bestellungen_2026-03.csv
+  189 bestellungen_2026-03.csv
+  ```
+
+  Daraus liest du ab: `file` hat kein UTF-8 gefunden, sondern eine 8-Bit-Kodierung. „ISO-8859“ ist nur eine Vermutung aus den Bytes; ein Export von einem deutschen Windows-System ist fast immer Windows-1252. Das `�` in `head` zeigt dasselbe von der anderen Seite: Das Terminal erwartet UTF-8 und kann das Byte für „ö“ nicht darstellen. Trennzeichen ist das Semikolon, Zahlen haben Dezimalkomma und Tausenderpunkt, Datumswerte das Format `TT.MM.JJJJ`. `Leipzig ` hat ein Leerzeichen am Ende, und die letzte Zeile ist keine Bestellung. `wc -l` zählt 189 Zeilenumbrüche: Kopfzeile, 187 Bestellungen und die Summenzeile. Diese Zahl notierst du, damit du am Ende prüfen kannst, dass keine Zeile verloren ging. Zeilenumbrüche sind aber keine Datensätze – ein Feld mit Umbruch in Anführungszeichen zählt doppelt, eine letzte Zeile ohne Umbruch gar nicht.
+
+  Mit `iconv` wandelst du das Encoding in eine neue Datei um; die Rohdatei bleibt unverändert ([iconv(1)](https://man7.org/linux/man-pages/man1/iconv.1.html)):
+
+  ```console
+  $ iconv -f WINDOWS-1252 -t UTF-8 bestellungen_2026-03.csv > bestellungen_2026-03.utf8.csv
+  $ file bestellungen_2026-03.utf8.csv
+  bestellungen_2026-03.utf8.csv: Unicode text, UTF-8 text, with CRLF line terminators
+  ```
+
+  Wie Pipes, `grep` und `awk` beim Untersuchen größerer Dateien helfen, zeigt das Linux-Modul [Textverarbeitung & Pipes](/linux/textverarbeitung).
+
+  ## Encoding und Trennzeichen: wie aus Bytes Felder werden
+
+  Eine Datei enthält Bytes, keine Buchstaben. Erst ein **Encoding** legt fest, welches Byte welches Zeichen bedeutet. Für deutsche Exporte sind zwei wichtig:
+
+  - **UTF-8** kodiert jedes Unicode-Zeichen mit 1 bis 4 Bytes. ASCII-Zeichen brauchen eins, „ö“ zwei (`C3 B6`), „€“ drei. UTF-8 ist heute der Standard.
+  - **Windows-1252** (`cp1252`) kennt höchstens 256 Zeichen und kodiert jedes mit einem Byte, „ö“ als `F6`, „€“ als `80`. Ältere Windows-Programme und viele ERP-Exporte schreiben es noch. Das oft verwechselte ISO-8859-1 (Latin-1) unterscheidet sich im Bereich `80`–`9F`: Dort fehlt unter anderem das Euro-Zeichen.
+
+  Liest ein Programm die Bytes mit dem falschen Encoding, entsteht **Mojibake**, Zeichensalat mit Muster:
+
+  ```python run
+  text = "Köln"
+  print(text.encode("utf-8"), text.encode("cp1252"))
+  print(text.encode("utf-8").decode("cp1252"))       # UTF-8 als Windows-1252 gelesen
+  print("KÃ¶ln".encode("cp1252").decode("utf-8"))    # rückgängig gemacht
+  try:
+      text.encode("cp1252").decode("utf-8")           # Windows-1252 als UTF-8 gelesen
+  except UnicodeDecodeError as fehler:
+      print(fehler)
+  ```
+
+  | Du siehst | Ursache |
+  | --- | --- |
+  | `KÃ¶ln`, `GrÃ¼n` | UTF-8-Bytes wurden als Windows-1252 gelesen. |
+  | `K�ln` oder `UnicodeDecodeError` | Windows-1252-Bytes wurden als UTF-8 gelesen. |
+  | `ï»¿bestellung_id` in der ersten Spalte | UTF-8 mit BOM wurde als Windows-1252 gelesen. |
+  | `KeyError: 'bestellung_id'`, obwohl die Spalte da ist | UTF-8 mit BOM wurde als `utf-8` statt `utf-8-sig` gelesen. |
+
+  Das **BOM** (Byte Order Mark) sind die drei Bytes `EF BB BF` am Dateianfang. Excel schreibt sie, wenn du „CSV UTF-8“ speicherst, als Hinweis „diese Datei ist UTF-8“. Python liest sie mit `utf-8` als unsichtbares Zeichen `\ufeff` mit, das dann am ersten Spaltennamen klebt. Das Encoding `utf-8-sig` entfernt ein vorhandenes BOM und liest Dateien ohne BOM genauso wie `utf-8` ([codecs · utf-8-sig](https://docs.python.org/3/library/codecs.html#module-encodings.utf_8_sig)):
+
+  ```python run
+  import csv
+  import io
+
+  roh = "\ufeffbestellung_id;stadt\n1001;Köln\n".encode("utf-8")
+  for encoding in ["utf-8", "utf-8-sig"]:
+      zeile = next(csv.DictReader(io.StringIO(roh.decode(encoding), newline=""), delimiter=";"))
+      print(encoding, list(zeile))
+  ```
+
+  Welches Encoding eine Datei hat, steht nirgends verbindlich drin. Eine belastbare Regel ergibt sich aus dem Aufbau von UTF-8: Bytes ab `80` dürfen dort nur in bestimmten Folgen auftreten. Ein Windows-1252-„ö“ (`F6`) gefolgt von „l“ ist keine gültige Folge, deshalb scheitert ein strenges UTF-8-Dekodieren an echten Windows-1252-Umlauten fast immer. Umgekehrt beweist ein erfolgreiches Windows-1252-Dekodieren wenig: Es akzeptiert fast jedes Byte, Latin-1 sogar jedes.
+
+  > [!MERKE]
+  > Erst streng als UTF-8 (`utf-8-sig`) dekodieren. Scheitert das, ist Windows-1252 die naheliegende Rückfallregel. Nie `errors="ignore"` oder Latin-1 „weil es immer klappt“ – beides wirft keinen Fehler und liefert trotzdem falschen Text. Welche Encodings Python kennt, listet [Standard Encodings](https://docs.python.org/3/library/codecs.html#standard-encodings); Grundlagen zu Unicode und Bytes hat das Modul [Strings, Encodings und Dateien](/python/strings-dateien).
+
+  ### Trennzeichen und Quoting: warum das Semikolon
+
+  CSV heißt „comma-separated values“, doch ein deutsches Excel schreibt Semikolons. Der Grund ist das Dezimalkomma: Wenn `4,90` eine Zahl ist, kann das Komma nicht gleichzeitig Felder trennen. Excel nimmt das Listentrennzeichen aus den Regionaleinstellungen von Windows, in Deutschland das Semikolon. Enthält ein Feld selbst ein Semikolon, einen Zeilenumbruch oder ein Anführungszeichen, steht es in Anführungszeichen; ein Anführungszeichen im Feld wird verdoppelt:
+
+  ```csv
+  bestellung_id;kunde;lieferhinweis;warenwert
+  1003;"Café Luna; Filiale Ehrenfeld";"Bitte ""vor 10 Uhr"" liefern";318,20
+  1004;Kanzlei Berger & Partner;"Empfang
+  2. OG";96,00
+  ```
+
+  Ein `split(";")` zerlegt das falsch, ein echter CSV-Parser nicht. Das Modul `csv` braucht dafür nur das Trennzeichen ([Dialects and Formatting Parameters](https://docs.python.org/3/library/csv.html#csv-fmt-params)):
+
+  ```python run
+  import csv
+  import io
+
+  text = ('bestellung_id;kunde;lieferhinweis;warenwert\n'
+          '1003;"Café Luna; Filiale Ehrenfeld";"Bitte ""vor 10 Uhr"" liefern";318,20\n'
+          '1004;Kanzlei Berger & Partner;"Empfang\n2. OG";96,00\n')
+  for zeile in csv.reader(io.StringIO(text, newline=""), delimiter=";"):
+      print(len(zeile), zeile)
+  ```
+
+  Drei Datensätze mit je vier Feldern, obwohl die Datei vier physische Zeilen hat. `csv.Sniffer` kann Trennzeichen raten; für einen bekannten Export legst du den Dialekt einmal fest und schreibst ihn ins Datenwörterbuch.
+
+  ## Zahlen und Datumswerte aus deutschen Exporten
+
+  Alle Werte aus einer CSV sind zunächst Text. Welche Spalte eine Zahl ist, entscheidest du. `float("4,90")` scheitert am Komma; `"1.250,50"` braucht zwei Schritte: erst den Tausenderpunkt entfernen, dann das Komma durch einen Punkt ersetzen. Die Reihenfolge zählt – umgekehrt wird aus `1.250,50` erst `1.250.50` und dann `125050`. Für Geldbeträge nimmst du [`Decimal`](https://docs.python.org/3/library/decimal.html) statt `float`, weil `float` Dezimalbrüche nur angenähert speichert:
+
+  ```python run
+  from decimal import Decimal
+
+  def zahl_de(text: str) -> Decimal:
+      return Decimal(text.strip().replace(".", "").replace(",", "."))
+
+  print(zahl_de("1.250,50"))
+  print(zahl_de("4,90") * 3)
+  print(sum([4.90, 4.90, 4.90]))
+  ```
+
+  Diese Minimalversion hat Lücken: An leeren Feldern und `n/a` scheitert sie, und ein englisch formatiertes `4.90` macht sie still zu `490`. Deshalb prüft ein robuster Parser das Format, bevor er umwandelt – das übst du in den Aufgaben.
+
+  > [!WARNING] Das Format hängt an der Quelle, nicht am Wert
+  > `1.250` ist in einem deutschen Export 1250, in einem englischen 1,25. Am einzelnen Wert lässt sich das nicht entscheiden. Lege das Zahlenformat je Quelle fest und brich mit einer Fehlermeldung ab, wenn ein Wert nicht dazu passt, statt pro Zeile zu raten.
+
+  Datumswerte liest du mit `datetime.strptime` und einem Formatstring ein ([Format Codes](https://docs.python.org/3/library/datetime.html#format-codes)) und gibst sie im ISO-Format `JJJJ-MM-TT` weiter. Nur dieses Format sortiert auch als Text richtig, und SQLite rechnet nur damit:
+
+  ```python run
+  from datetime import date, datetime, timedelta
+
+  text = "03.04.2026"
+  print(datetime.strptime(text, "%d.%m.%Y").date())     # deutsch: 3. April
+  print(datetime.strptime(text, "%m.%d.%Y").date())     # amerikanisch gelesen: 4. März
+  print(sorted(["14.03.2026", "02.04.2026", "28.02.2026"]))
+  print(date(1899, 12, 30) + timedelta(days=46095))     # Excel-Seriennummer
+  ```
+
+  `03.04.2026` ist in beiden Lesarten gültig; ein falsches Format fällt erst ab dem 13. Tag eines Monats auf. Die letzte Zeile zeigt einen dritten Fall: Wer in Excel Werte statt Datumsformat exportiert, bekommt Seriennummern. Excel zählt Tage ab dem 1.1.1900 als Tag 1 und hält 1900 fälschlich für ein Schaltjahr; deshalb rechnest du für alle Daten ab März 1900 ab dem 30.12.1899 ([Excel und das Jahr 1900](https://learn.microsoft.com/de-de/office/troubleshoot/excel/wrongly-assumes-1900-is-leap-year)).
+
+  ## Excel: Doppelklick oder „Daten › Aus Text/CSV“
+
+  Beim Doppelklick auf eine CSV rät Excel alles selbst. Ohne BOM liest es die Datei in der Codepage des Systems, auf einem deutschen Windows also Windows-1252 – ein UTF-8-Export wird zu „KÃ¶ln“. Dann wandelt es jeden Wert um, der wie eine Zahl oder ein Datum aussieht: `01067` wird `1067`, die Röstcharge `12.3` wird zum 12. März, und Zahlen mit mehr als 15 Stellen verlieren ihre letzten Ziffern, weil Excel nur 15 signifikante Stellen speichert ([Beibehalten führender Nullen und großer Zahlen](https://support.microsoft.com/de-de/excel/keeping-leading-zeros-and-large-numbers)). In Excel für Microsoft 365 lassen sich diese Umwandlungen unter Datei › Optionen › Daten › Automatische Datenkonvertierung abschalten ([Datenimport- und Analyseoptionen](https://support.microsoft.com/de-de/excel/data-import-and-analysis-options-in-excel)). Das hilft aber nur auf dem eigenen Rechner.
+
+  > [!WARNING] Nie die Rohdatei zurückspeichern
+  > Wer die per Doppelklick geöffnete CSV wieder als CSV speichert, schreibt die Umwandlungen in die Datei: Die führenden Nullen, die abgeschnittenen Ziffern und das ursprüngliche Datumsformat sind danach für immer weg.
+
+  Der verlässliche Weg ist **Daten › Aus Text/CSV**. Der Dialog zeigt eine Vorschau und drei Einstellungen: **Dateiursprung** (das Encoding, etwa „65001: Unicode (UTF-8)“ oder „1252: Westeuropäisch (Windows)“), **Trennzeichen** und **Datentyperkennung**. Power Query leitet UTF-8 nur ab, wenn die Datei mit einem BOM beginnt ([Text/CSV-Connector](https://learn.microsoft.com/de-de/power-query/connectors/text-csv)); stell den Dateiursprung also selbst ein. Mit **Daten transformieren** landest du im Power Query-Editor. Dort setzt du Kennungen und PLZ auf Text und Beträge und Datumswerte über Rechtsklick › Typ ändern › Mit Gebietsschema… auf „Deutsch (Deutschland)“. Der Editor schreibt jeden Schritt als M-Code mit:
+
+  ```powerquery
+  let
+      Quelle = Csv.Document(File.Contents("C:\Bohnenwerk\Export\bestellungen_2026-03.csv"), [Delimiter = ";", Encoding = 1252, QuoteStyle = QuoteStyle.Csv]),
+      #"Höher gestufte Header" = Table.PromoteHeaders(Quelle, [PromoteAllScalars = true]),
+      #"Geänderter Typ mit Gebietsschema" = Table.TransformColumnTypes(
+          #"Höher gestufte Header",
+          {{"bestelldatum", type date}, {"versandkosten", type number}, {"warenwert", type number}},
+          "de-DE"
+      ),
+      #"Geänderter Typ" = Table.TransformColumnTypes(
+          #"Geänderter Typ mit Gebietsschema",
+          {{"kunde_id", Int64.Type}, {"plz", type text}, {"stadt", type text}}
+      )
+  in
+      #"Geänderter Typ"
+  ```
+
+  `Encoding = 1252` ist der Dateiursprung, `"de-DE"` das Gebietsschema für Dezimalkomma und `TT.MM.JJJJ`. `QuoteStyle.Csv` sorgt dafür, dass ein Zeilenumbruch in Anführungszeichen zum Feld gehört; mit `QuoteStyle.None` beginnt dort eine neue Zeile ([Csv.Document](https://learn.microsoft.com/de-de/powerquery-m/csv-document)). Im nächsten Monat ersetzt Lea nur noch die Datei und klickt auf Aktualisieren. Wie du daraus mit Filtern, Ordner-Import und Parametern eine vollständige Monatsroutine baust, zeigt das Modul [Power Query](/data/power-query).
+
+  ## Text bereinigen: Leerzeichen, Schreibweisen, fehlende Werte, Dubletten
+
+  Nach dem Einlesen sind die Werte typrichtig, aber noch nicht einheitlich. Vier Arten von Bereinigung kommen in fast jedem Export vor.
+
+  **Leerraum.** `"Leipzig "` und `"Leipzig"` sind für jeden Vergleich verschieden. Pythons `str.strip()` entfernt Leerraum am Rand, auch das geschützte Leerzeichen `\xa0`, das beim Kopieren aus Webseiten und PDFs entsteht. Excels `GLÄTTEN` (englisch `TRIM`) entfernt dagegen nur das normale Leerzeichen, nicht Zeichen 160 ([GLÄTTEN](https://support.microsoft.com/de-de/excel/functions/trim-function)).
+
+  **Schreibweisen.** „köln“, „KÖLN“ und „Koeln“ meinen dieselbe Stadt. `.title()` hilft nicht („Frankfurt Am Main“), und Raten ist keine Regel. Vergleiche über einen normalisierten Schlüssel und lege die gültige Schreibweise in einer **Zuordnungstabelle** fest. `casefold()` ist für den Vergleich gründlicher als `lower()` („Straße“ und „STRASSE“ werden gleich). Manche Quellen liefern „ö“ als zwei Zeichen (o plus kombinierendes Trema); `unicodedata.normalize("NFC", …)` vereinheitlicht das:
+
+  ```python run
+  import unicodedata
+
+  STAEDTE = {"köln": "Köln", "koeln": "Köln", "leipzig": "Leipzig"}
+
+  def stadt(roh: str) -> str:
+      schluessel = unicodedata.normalize("NFC", roh).strip().casefold()
+      return STAEDTE.get(schluessel, roh.strip())
+
+  for roh in ["Leipzig ", "\xa0KÖLN", "Koeln", "Ko\u0308ln", "Bonn"]:
+      print(repr(roh), "->", stadt(roh))
+  ```
+
+  Unbekannte Werte wie „Bonn“ bleiben stehen, wie sie sind. Die Zuordnungstabelle wächst mit jedem Export um die neuen Varianten; sie ist Teil der Dokumentation.
+
+  **Fehlende Werte.** Exporte kennen viele Arten, nichts zu sagen. Entscheidend ist, was jede fachlich bedeutet:
+
+  | Im Export | Bedeutung | Behandlung |
+  | --- | --- | --- |
+  | leeres Feld | nicht erfasst, unbekannt | fehlend (`None`) |
+  | `n/a`, `-`, `k. A.` | ausdrücklich „keine Angabe“ | fehlend, Liste je Quelle festhalten |
+  | `0`, `0,00` | ein echter Wert: kostenloser Versand | bleibt 0 |
+  | `?`, `xxx`, `9999` | Platzhalter bei der Erfassung | nicht raten: aussortieren und nachfragen |
+
+  Fehlende Werte mit 0 zu füllen ist bequem und falsch: Der Durchschnitt der Versandkosten sinkt, obwohl niemand kostenlos versandt hat.
+
+  **Dubletten.** Eine exakte Dublette – jede Spalte gleich – entsteht, wenn ein Export doppelt lief oder sich Zeiträume überlappen. Sie wird entfernt und gezählt. Prüfe erst nach dem Trimmen und Umwandeln, sonst sind `"Leipzig "` und `"Leipzig"` verschieden. Gleicher Schlüssel mit anderem Inhalt (Bestellung 1044 einmal `bezahlt`, einmal `storniert`) ist dagegen keine Dublette, sondern ein fachlicher Konflikt: Welche Zeile gilt, entscheidet eine dokumentierte Regel, etwa „letzter Stand“. Solche Zeilen gehören in eine Quarantäne, bis die Regel steht – mehr dazu im Modul [Datenqualität](/data/datenqualitaet).
+
+  ## Bereinigung dokumentieren: Rohdaten bleiben unverändert
+
+  Eine Bereinigung ist nur so gut wie ihre Nachvollziehbarkeit. Drei Regeln machen sie prüfbar:
+
+  1. **Rohdaten sind schreibgeschützt.** Die Originaldatei wird archiviert und nie bearbeitet. Jede Korrektur passiert in Code oder in Power-Query-Schritten und schreibt eine neue Datei.
+  2. **Jeder Schritt zählt mit.** Wie viele Zeilen wurden gelesen, wie viele als Summenzeile oder Dublette entfernt, wie viele Werte vereinheitlicht oder als fehlend markiert?
+  3. **Das Ergebnis wird abgeglichen.** Die Summe der bereinigten Beträge muss zur Summenzeile des Exports passen. Die Summenzeile ist keine Beobachtung, aber ein nützlicher Kontrollwert.
+
+  Am Ende jedes Laufs entsteht ein kurzes Protokoll:
+
+  ```text
+  Bereinigungsprotokoll bestellungen_2026-03.csv
+  Quelle        Shop-Export vom 2026-04-01, Windows-1252 (UTF-8 schlug fehl)
+  Rohdatei      189 Zeilen laut wc -l, unverändert archiviert
+  Gelesen       188 Datensätze
+  Summenzeile   1 entfernt; warenwert 48.317,20 = Summe der Datensätze
+  Dubletten     2 exakte Dubletten entfernt (1071, 1102)
+  Stadt         37 Werte über staedte.csv vereinheitlicht
+  Versand       3 Werte fehlend (n/a), nicht mit 0 gefüllt
+  Behalten      185 Bestellungen
+  ```
+
+  > [!PRAXIS] Von 45 Minuten auf wenige Sekunden
+  > Bei Bohnenwerk ersetzt ein Python-Skript die monatliche Handarbeit: Es liest den Export mit Rückfallregel für das Encoding, entfernt Summenzeile und Dubletten, vereinheitlicht Städte über die Zuordnungstabelle und schreibt eine UTF-8-Datei plus Protokoll. Weicht die Summe von der Summenzeile ab oder taucht ein unbekanntes Zahlenformat auf, bricht es mit einer klaren Meldung ab. Lea prüft nur noch das Protokoll. Weil jeder Schritt im Code steht, kann auch eine Vertretung den Monatsabschluss machen.
+
+  > [!INTERVIEW] „Woran erkennst du, in welchem Encoding eine Datei vorliegt?“
+  > Sicher wissen kann ich es nur von der Quelle, deshalb frage ich zuerst dort nach. Technisch prüfe ich die Bytes: Ein BOM `EF BB BF` spricht für UTF-8, `file` gibt einen Hinweis. Der belastbarste Test ist, streng als UTF-8 zu dekodieren – echte Windows-1252-Umlaute scheitern daran fast immer. Scheitert es, lese ich Windows-1252 und kontrolliere bekannte Werte wie „Köln“ oder das Euro-Zeichen. Latin-1 oder `errors="ignore"` nutze ich nicht als Rettung, weil beides nie einen Fehler wirft und trotzdem falschen Text liefern kann.
+
+  ## Häufige Fehler
+
+  - **Doppelklick und zurückspeichern.** Führende Nullen, lange Nummern und Datumsformate sind danach dauerhaft zerstört. Rohdatei archivieren, über „Daten › Aus Text/CSV“ importieren.
+  - **`errors="ignore"` oder Latin-1 als Rettung.** Der Fehler verschwindet, die Umlaute auch. Streng dekodieren, begründet zurückfallen.
+  - **`KeyError` beim ersten Spaltennamen.** Ein BOM klebt als `\ufeff` davor. `encoding="utf-8-sig"` verwenden.
+  - **`split(";")` statt CSV-Parser.** Semikolons und Zeilenumbrüche in Anführungszeichen zerlegen die Zeile.
+  - **Komma vor dem Punkt ersetzt.** Aus `1.250,50` wird `125050`. Erst Tausenderpunkte entfernen, dann das Komma ersetzen – und das Format vorher prüfen.
+  - **Kennungen als Zahl eingelesen.** PLZ, Artikelnummern und Kundennummern mit führender Null bleiben Text.
+  - **Fehlende Werte mit 0 gefüllt.** Durchschnitte und Anteile stimmen nicht mehr. Fehlend bleibt fehlend, bis die Bedeutung geklärt ist.
+  - **Dubletten vor dem Trimmen gesucht.** `"Leipzig "` und `"Leipzig"` gelten als verschieden, die Dublette bleibt.
+
+  ## Zusammenfassung
+
+  - Erst hinschauen: `file`, `head`, `tail` und `wc -l` zeigen Encoding, Trennzeichen, Formate und Summenzeilen, bevor ein Programm etwas interpretiert.
+  - Encoding bestimmt, wie Bytes zu Zeichen werden. Streng als `utf-8-sig` lesen, bei Fehler auf Windows-1252 zurückfallen; Mojibake verrät die Richtung des Fehlers.
+  - Deutsche Exporte trennen mit `;` und quoten Felder mit `"`. Ein echter CSV-Parser ist Pflicht.
+  - Beträge: Format je Quelle festlegen, erst Tausenderpunkt entfernen, dann Komma ersetzen, in `Decimal` rechnen. Datumswerte mit `strptime` lesen und als ISO-Datum weitergeben.
+  - Excel „korrigiert“ beim Doppelklick führende Nullen, lange Zahlen und datumsähnliche Werte. „Daten › Aus Text/CSV“ mit Dateiursprung, Typen und Gebietsschema ist wiederholbar.
+  - Leerraum trimmen, Schreibweisen über eine Zuordnungstabelle vereinheitlichen, fehlende Werte als fehlend markieren, Dubletten nach dem Umwandeln entfernen.
+  - Rohdaten bleiben unverändert; jeder Schritt wird gezählt, protokolliert und gegen die Summenzeile abgeglichen.
+exercises:
+  - id: mojibake-diagnose
+    type: choice
+    title: Was ist mit „Köln“ passiert?
+    prompt: |
+      Nach dem Import eines Kundenexports steht in Excel in der ersten Kopfzelle `ï»¿kunde_id` und in der Spalte `stadt` „KÃ¶ln“ und „DÃ¼sseldorf“. Was ist passiert?
+    options:
+      - text: Die Datei ist UTF-8 mit BOM und wurde als Windows-1252 gelesen.
+        correct: true
+        why: "„ö“ besteht in UTF-8 aus den Bytes `C3 B6`, die Windows-1252 als „Ã“ und „¶“ zeigt. Die BOM-Bytes `EF BB BF` erscheinen als „ï»¿“."
+      - text: Die Datei ist Windows-1252 und wurde als UTF-8 gelesen.
+        correct: false
+        why: Dann wäre das einzelne Byte `F6` für „ö“ ungültiges UTF-8. Du sähest ein Ersatzzeichen `�` oder bekämst einen `UnicodeDecodeError`, aber kein „Ã¶“.
+      - text: Das Trennzeichen wurde falsch erkannt, deshalb sind die Zeichen verrutscht.
+        correct: false
+        why: Ein falsches Trennzeichen verteilt Werte falsch auf Spalten, verändert aber keine einzelnen Buchstaben.
+      - text: Der Schriftart in Excel fehlen die Umlaute.
+        correct: false
+        why: Excel zeigt „ö“ an anderen Stellen korrekt. Das Problem liegt in der Übersetzung von Bytes zu Zeichen, nicht in der Darstellung.
+    explanation: |
+      Mojibake hat ein Muster, aus dem du die Richtung ablesen kannst. Zwei Zeichen wie „Ã¶“ für einen Umlaut heißen: Mehrbyte-UTF-8 wurde als Einbyte-Kodierung gelesen. „ï»¿“ am Anfang ist das BOM, das ein UTF-8-fähiger Leser stillschweigend entfernt hätte. Die Lösung ist, beim Import den Dateiursprung „65001: Unicode (UTF-8)“ zu wählen, nicht „Ã¶“ per Suchen und Ersetzen zu reparieren.
+    hints:
+      - Wie viele Zeichen stehen im Ergebnis dort, wo ein „ö“ sein sollte?
+      - Welche Kodierung braucht für „ö“ zwei Bytes?
+    resources:
+      - title: Python · Unicode HOWTO
+        url: https://docs.python.org/3/howto/unicode.html
+      - title: Microsoft Learn · Text/CSV-Connector (Dateiursprung)
+        url: https://learn.microsoft.com/de-de/power-query/connectors/text-csv
+
+  - id: bereinigungs-pipeline
+    type: order
+    title: Der Weg vom Export zur sauberen Datei
+    prompt: Bring die Schritte der monatlichen Bereinigung des Bestellexports in eine Reihenfolge, in der jeder Schritt auf dem vorigen aufbauen kann.
+    lang: text
+    lines: |
+      Rohdatei unverändert archivieren und die Zeilenzahl mit wc -l notieren
+      Encoding bestimmen und die Bytes zu Text dekodieren
+      Text mit Trennzeichen ; und Quoting in Datensätze zerlegen
+      Summenzeile am Dateiende erkennen, entfernen und im Protokoll zählen
+      Textfelder trimmen und Schreibweisen über die Zuordnungstabelle vereinheitlichen
+      Beträge und Datumswerte aus den getrimmten Feldern in Decimal und date umwandeln
+      Exakte Dubletten auf den umgewandelten Werten erkennen und entfernen
+      Bereinigte Datei neu schreiben und Protokoll mit allen Zählern ablegen
+    alternatives:
+      - [1, 2, 3, 5, 4, 6, 7, 8]
+    explanation: |
+      Zuerst wird die Rohdatei gesichert, damit jeder spätere Schritt wiederholbar ist. Ohne Encoding gibt es keinen Text, ohne Parser keine Felder. Die Summenzeile muss vor der Umwandlung weg, sonst scheitert `strptime` an ihrem leeren Datum; ob du vorher oder nachher trimmst, ist egal. Umgewandelt wird nach dem Trimmen, und Dubletten suchst du erst auf den bereinigten Werten, sonst sind `"Leipzig "` und `"Leipzig"` oder `4,9` und `4,90` verschieden. Zum Schluss entsteht eine neue Datei – die Rohdatei bleibt, wie sie war.
+    hints:
+      - Welcher Schritt würde an der Summenzeile scheitern?
+      - Wann sind zwei Zeilen, die sich nur in Leerzeichen unterscheiden, gleich?
+    resources:
+      - title: Python · csv
+        url: https://docs.python.org/3/library/csv.html
+
+  - id: bytes-und-zeichen
+    type: output
+    title: Bytes zählen
+    prompt: Was gibt dieses Programm aus?
+    lang: python
+    code: |
+      text = "Rösterei Köln"
+      utf8 = text.encode("utf-8")
+      print(len(text), len(utf8), len(text.encode("cp1252")))
+      falsch = utf8.decode("cp1252")
+      print(len(falsch), falsch.encode("cp1252").decode("utf-8") == text)
+      try:
+          text.encode("cp1252").decode("utf-8")
+      except UnicodeDecodeError:
+          print("UnicodeDecodeError")
+    expected: |
+      13 15 13
+      15 True
+      UnicodeDecodeError
+    explanation: |
+      Der Text hat 13 Zeichen. In UTF-8 braucht jedes „ö“ zwei Bytes, also 15 Bytes; Windows-1252 kodiert jedes Zeichen mit einem Byte, also 13. Liest man die 15 UTF-8-Bytes als Windows-1252, wird jedes Byte ein eigenes Zeichen – 15 Zeichen Mojibake („RÃ¶sterei KÃ¶ln“). Weil dabei nichts verloren ging, lässt sich der Fehler exakt umkehren. Umgekehrt ist das Windows-1252-Byte `F6` gefolgt von „s“ ungültiges UTF-8, und das strenge Dekodieren bricht ab – genau darauf beruht die Rückfallregel.
+    resources:
+      - title: Python · str.encode und bytes.decode
+        url: https://docs.python.org/3/library/stdtypes.html#bytes.decode
+
+  - id: bom-und-quoting
+    type: output
+    title: Ein Export aus Excel, Feld für Feld
+    prompt: Was gibt dieses Programm aus?
+    lang: python
+    code: |
+      import csv
+      import io
+
+      roh = '\ufeffkunde;stadt;notiz\n"Café Luna; Ehrenfeld";Köln ;"Tür ""hinten"""\n'.encode("utf-8")
+      ohne_sig = next(csv.DictReader(io.StringIO(roh.decode("utf-8"), newline=""), delimiter=";"))
+      print("kunde" in ohne_sig)
+      zeile = next(csv.DictReader(io.StringIO(roh.decode("utf-8-sig"), newline=""), delimiter=";"))
+      print(len(zeile))
+      print(zeile["kunde"])
+      print(repr(zeile["stadt"]))
+      print(zeile["notiz"])
+    expected: |
+      False
+      3
+      Café Luna; Ehrenfeld
+      'Köln '
+      Tür "hinten"
+    explanation: |
+      Mit `utf-8` bleibt das BOM als `\ufeff` am ersten Spaltennamen hängen; der Schlüssel heißt `"\ufeffkunde"`, deshalb ist `"kunde"` nicht enthalten. `utf-8-sig` entfernt das BOM. Das Semikolon in Anführungszeichen gehört zum Feld, die Zeile hat drei Felder. Der Parser entfernt die umschließenden Anführungszeichen und macht aus `""` ein einzelnes `"`. Leerzeichen am Feldende lässt er stehen – `'Köln '` musst du selbst trimmen.
+    resources:
+      - title: Python · codecs · utf-8-sig
+        url: https://docs.python.org/3/library/codecs.html#module-encodings.utf_8_sig
+      - title: Python · csv · Formatting Parameters
+        url: https://docs.python.org/3/library/csv.html#csv-fmt-params
+
+  - id: datum-mehrdeutig
+    type: output
+    title: Welcher Tag ist gemeint?
+    prompt: Was gibt dieses Programm aus?
+    lang: python
+    code: |
+      from datetime import date, datetime, timedelta
+
+      text = "03.04.2026"
+      print(datetime.strptime(text, "%d.%m.%Y").date())
+      print(datetime.strptime(text, "%m.%d.%Y").date())
+      print(sorted(["14.03.2026", "02.04.2026", "28.02.2026"])[0])
+      print(date(1899, 12, 30) + timedelta(days=46100))
+    expected: |
+      2026-04-03
+      2026-03-04
+      02.04.2026
+      2026-03-19
+    explanation: |
+      `strptime` liest den Text nach dem angegebenen Format; ein `date` wird im ISO-Format ausgegeben. `03.04.2026` passt zu beiden Formaten und ergibt einmal den 3. April, einmal den 4. März – ohne Fehler. Als Text sortiert `02.04.2026` vor `14.03.2026` und `28.02.2026`, weil zeichenweise verglichen wird und „0“ vor „1“ und „2“ kommt. Excel-Seriennummer 46100 ist fünf Tage nach 46095, dem 14. März 2026, also der 19. März.
+    hints:
+      - "`%d` ist der Tag, `%m` der Monat."
+      - Textvergleich schaut zuerst auf das erste Zeichen.
+    resources:
+      - title: Python · strftime() and strptime() Format Codes
+        url: https://docs.python.org/3/library/datetime.html#format-codes
+      - title: Microsoft Support · Datumssysteme in Excel
+        url: https://support.microsoft.com/de-de/office/datumssysteme-in-excel-e7fe7167-48a9-4b96-bb53-5612a800b487
+
+  - id: zeile-umwandeln
+    type: gap
+    title: Eine Exportzeile typisieren
+    prompt: |
+      `zeile` kommt aus einem `csv.DictReader` und enthält nur Text, etwa `{"bestellung_id": "1001", "bestelldatum": "02.03.2026", "plz": "01067", "versandkosten": "1.250,50"}`. Ergänze die Umwandlung: Datum im deutschen Format, PLZ mit führender Null, Betrag mit Tausenderpunkt und Dezimalkomma.
+    lang: python
+    code: |
+      from datetime import datetime
+      from decimal import Decimal
+
+
+      def zeile_umwandeln(zeile: dict) -> dict:
+          return {
+              "bestellung_id": int(zeile["bestellung_id"]),
+              "bestelldatum": datetime.⟦strptime⟧(zeile["bestelldatum"], ⟦"%d.%m.%Y"⟧).date(),
+              "plz": ⟦zeile["plz"]⟧,
+              "versandkosten": Decimal(zeile["versandkosten"].⟦replace(".", "").replace(",", ".")⟧),
+          }
+    gaps:
+      - label: Text in Datum
+        hint: Die Methode, die einen Text nach einem Format liest („string parse time“).
+      - label: Format
+        hint: Tag, Monat und vierstelliges Jahr, getrennt durch Punkte.
+      - label: PLZ
+        hint: Eine PLZ ist eine Kennung. Wie bleibt die führende Null erhalten?
+        accept: ['zeile["plz"].strip()']
+      - label: Betrag
+        hint: Zwei `replace`-Aufrufe hintereinander – in welcher Reihenfolge?
+    explanation: |
+      `strptime` braucht das Format der Quelle: `%d.%m.%Y` für `02.03.2026`. Die PLZ wird nicht umgewandelt, weil `int("01067")` die Null verliert – Kennungen bleiben Text. Beim Betrag entfernst du zuerst die Tausenderpunkte und ersetzt dann das Komma; umgekehrt würde aus `1.250,50` erst `1.250.50` und dann `125050`. `Decimal` statt `float` hält den Betrag exakt.
+    resources:
+      - title: Python · datetime.strptime
+        url: https://docs.python.org/3/library/datetime.html#datetime.datetime.strptime
+      - title: Python · decimal
+        url: https://docs.python.org/3/library/decimal.html
+
+  - id: iconv-umwandeln
+    type: command
+    title: Den Export nach UTF-8 bringen
+    prompt: |
+      Wandle `bestellungen_2026-03.csv` von Windows-1252 nach UTF-8 um und schreibe das Ergebnis nach `bestellungen_2026-03.utf8.csv`. Die Rohdatei soll unverändert bleiben. Nutze die Kurzoptionen von `iconv`.
+    context: |
+      ```console
+      $ file bestellungen_2026-03.csv
+      bestellungen_2026-03.csv: ISO-8859 text, with CRLF line terminators
+      ```
+    answers:
+      - iconv -f WINDOWS-1252 -t UTF-8 bestellungen_2026-03.csv > bestellungen_2026-03.utf8.csv
+      - iconv -f WINDOWS-1252 -t utf-8 bestellungen_2026-03.csv > bestellungen_2026-03.utf8.csv
+      - iconv -f windows-1252 -t UTF-8 bestellungen_2026-03.csv > bestellungen_2026-03.utf8.csv
+      - iconv -f windows-1252 -t utf-8 bestellungen_2026-03.csv > bestellungen_2026-03.utf8.csv
+      - iconv -f CP1252 -t UTF-8 bestellungen_2026-03.csv > bestellungen_2026-03.utf8.csv
+      - iconv -f CP1252 -t utf-8 bestellungen_2026-03.csv > bestellungen_2026-03.utf8.csv
+      - iconv -f cp1252 -t UTF-8 bestellungen_2026-03.csv > bestellungen_2026-03.utf8.csv
+      - iconv -f cp1252 -t utf-8 bestellungen_2026-03.csv > bestellungen_2026-03.utf8.csv
+      - iconv -t UTF-8 -f WINDOWS-1252 bestellungen_2026-03.csv > bestellungen_2026-03.utf8.csv
+      - iconv -t utf-8 -f WINDOWS-1252 bestellungen_2026-03.csv > bestellungen_2026-03.utf8.csv
+      - iconv -t UTF-8 -f windows-1252 bestellungen_2026-03.csv > bestellungen_2026-03.utf8.csv
+      - iconv -t utf-8 -f windows-1252 bestellungen_2026-03.csv > bestellungen_2026-03.utf8.csv
+      - iconv -t UTF-8 -f CP1252 bestellungen_2026-03.csv > bestellungen_2026-03.utf8.csv
+      - iconv -t utf-8 -f CP1252 bestellungen_2026-03.csv > bestellungen_2026-03.utf8.csv
+      - iconv -t UTF-8 -f cp1252 bestellungen_2026-03.csv > bestellungen_2026-03.utf8.csv
+      - iconv -t utf-8 -f cp1252 bestellungen_2026-03.csv > bestellungen_2026-03.utf8.csv
+      - iconv -f WINDOWS-1252 -t UTF-8 -o bestellungen_2026-03.utf8.csv bestellungen_2026-03.csv
+      - iconv -f WINDOWS-1252 -t utf-8 -o bestellungen_2026-03.utf8.csv bestellungen_2026-03.csv
+      - iconv -f windows-1252 -t UTF-8 -o bestellungen_2026-03.utf8.csv bestellungen_2026-03.csv
+      - iconv -f windows-1252 -t utf-8 -o bestellungen_2026-03.utf8.csv bestellungen_2026-03.csv
+      - iconv -f CP1252 -t UTF-8 -o bestellungen_2026-03.utf8.csv bestellungen_2026-03.csv
+      - iconv -f CP1252 -t utf-8 -o bestellungen_2026-03.utf8.csv bestellungen_2026-03.csv
+      - iconv -f cp1252 -t UTF-8 -o bestellungen_2026-03.utf8.csv bestellungen_2026-03.csv
+      - iconv -f cp1252 -t utf-8 -o bestellungen_2026-03.utf8.csv bestellungen_2026-03.csv
+    output: |
+      $ file bestellungen_2026-03.utf8.csv
+      bestellungen_2026-03.utf8.csv: Unicode text, UTF-8 text, with CRLF line terminators
+    explanation: |
+      `-f` (from) nennt das Encoding der Eingabe, `-t` (to) das gewünschte Ziel. Ohne Umleitung schreibt `iconv` auf die Standardausgabe; `> neue_datei` oder `-o neue_datei` legt eine neue Datei an. Leite nie in die Eingabedatei selbst um: Die Shell leert sie, bevor `iconv` sie liest. `file` meldet „ISO-8859“, weil es Windows-1252 an den Bytes nicht sicher von ISO-8859-1 unterscheiden kann; für einen deutschen Windows-Export ist Windows-1252 die richtige Wahl, weil es auch das Euro-Zeichen kennt. `iconv -l` listet alle Namen, die deine Version akzeptiert.
+    hints:
+      - "`iconv` braucht die Quellkodierung, die Zielkodierung und die Eingabedatei."
+      - "`-f` für die Quelle, `-t` für das Ziel, die Ausgabe per `>` in die neue Datei."
+    resources:
+      - title: iconv(1)
+        url: https://man7.org/linux/man-pages/man1/iconv.1.html
+
+  - id: dekodieren-mit-fallback
+    type: code
+    title: Repariere das Dekodieren
+    prompt: |
+      Der Import von Bohnenwerk bekommt Exporte aus zwei Systemen: der Webshop schreibt UTF-8 (manchmal mit BOM), das ERP Windows-1252. Bisher dekodiert `dekodiere(roh)` alles als Latin-1 – das wirft nie einen Fehler, liefert aber falsche Zeichen. Schreibe die Funktion neu:
+
+      - Erst streng als UTF-8 dekodieren; ein BOM wird dabei entfernt. Rückgabe: `(text, "utf-8")`.
+      - Scheitert das, streng als Windows-1252 dekodieren. Rückgabe: `(text, "cp1252")`.
+      - Scheitert auch das, `ValueError` auslösen.
+    lang: python
+    starter: |
+      def dekodiere(roh: bytes) -> tuple[str, str]:
+          return roh.decode("latin-1"), "latin-1"
+    solution: |
+      def dekodiere(roh: bytes) -> tuple[str, str]:
+          try:
+              return roh.decode("utf-8-sig"), "utf-8"
+          except UnicodeDecodeError:
+              pass
+          try:
+              return roh.decode("cp1252"), "cp1252"
+          except UnicodeDecodeError as fehler:
+              raise ValueError("Weder UTF-8 noch Windows-1252") from fehler
+    tests:
+      - name: UTF-8 ohne BOM
+        code: |
+          ergebnis = dekodiere("Köln;4,90\n".encode("utf-8"))
+          assert ergebnis == ("Köln;4,90\n", "utf-8"), f"erwartet ('Köln;4,90\\n', 'utf-8'), bekommen {ergebnis!r}"
+      - name: UTF-8 mit BOM – das BOM verschwindet
+        code: |
+          text, encoding = dekodiere(b"\xef\xbb\xbfkunde_id;stadt\n1;K\xc3\xb6ln\n")
+          assert encoding == "utf-8", f"erwartet 'utf-8', bekommen {encoding!r}"
+          assert text == "kunde_id;stadt\n1;Köln\n", f"Das BOM gehört nicht in den Text: {text!r}"
+      - name: Windows-1252 mit Umlauten und Euro-Zeichen
+        code: |
+          ergebnis = dekodiere("Grüße aus Köln;12,50 €\n".encode("cp1252"))
+          assert ergebnis == ("Grüße aus Köln;12,50 €\n", "cp1252"), f"bekommen {ergebnis!r}"
+      - name: Reines ASCII gilt als UTF-8
+        code: |
+          assert dekodiere(b"id;menge\n1;2\n") == ("id;menge\n1;2\n", "utf-8")
+          assert dekodiere(b"") == ("", "utf-8"), "Eine leere Datei ist gültiges UTF-8"
+      - name: Weder UTF-8 noch Windows-1252
+        code: |
+          try:
+              ergebnis = dekodiere(b"K\x81ln")
+          except ValueError:
+              pass
+          else:
+              assert False, f"Byte 0x81 ist in beiden Kodierungen ungültig – erwartet ValueError, bekommen {ergebnis!r}"
+    explanation: |
+      Die Reihenfolge ist der Kern: UTF-8 hat strenge Regeln für Bytes ab `0x80`, Windows-1252-Umlaute verletzen sie fast immer. Deshalb ist ein erfolgreiches strenges UTF-8-Dekodieren ein starkes Indiz, ein erfolgreiches Windows-1252-Dekodieren dagegen kaum eins. `utf-8-sig` entfernt ein vorhandenes BOM und liest Dateien ohne BOM wie `utf-8`. Latin-1 als Rückfall wäre falsch: Es wirft nie einen Fehler und macht aus dem Euro-Zeichen (`0x80`) ein unsichtbares Steuerzeichen. Weil `UnicodeDecodeError` eine Unterklasse von `ValueError` ist, würde auch der unveränderte Fehler den letzten Test bestehen; die eigene Meldung ist für das Protokoll trotzdem hilfreicher.
+    hints:
+      - Zwei `try`-Blöcke hintereinander, der erste mit `utf-8-sig`.
+      - "`bytes.decode` ist ohne `errors`-Argument streng und wirft `UnicodeDecodeError`."
+    resources:
+      - title: Python · Standard Encodings
+        url: https://docs.python.org/3/library/codecs.html#standard-encodings
+      - title: Python · codecs · utf-8-sig
+        url: https://docs.python.org/3/library/codecs.html#module-encodings.utf_8_sig
+
+  - id: betrag-parsen
+    type: code
+    title: Beträge aus dem deutschen Export
+    prompt: |
+      Schreibe `betrag(text)` für die Betragsspalten des Webshop-Exports. Der Export ist deutsch formatiert: Tausenderpunkt, Dezimalkomma, manchmal ein angehängtes `€`, manchmal Leerraum (auch das geschützte Leerzeichen `\xa0`).
+
+      - Rückgabe ist ein `Decimal`, etwa `Decimal("1250.50")` für `"1.250,50 €"`. Negative Beträge (Gutschriften) wie `"-12,50"` sind erlaubt.
+      - Leer, `-`, `n/a` und `k. A.` (Groß-/Kleinschreibung egal) bedeuten „fehlend“: Rückgabe `None`. `0` und `0,00` sind echte Nullen.
+      - Alles, was nicht zum deutschen Format passt, löst `ValueError` aus – auch ein englisch formatiertes `4.90`.
+    lang: python
+    starter: |
+      from decimal import Decimal
+
+
+      def betrag(text: str) -> Decimal | None:
+          return Decimal(text.replace(",", "."))
+    solution: |
+      import re
+      from decimal import Decimal
+
+      FEHLEND = {"", "-", "n/a", "k. a."}
+      DEUTSCH = re.compile(r"-?(\d{1,3}(\.\d{3})+|\d+)(,\d+)?")
+
+
+      def betrag(text: str) -> Decimal | None:
+          sauber = text.strip().removesuffix("€").strip()
+          if sauber.casefold() in FEHLEND:
+              return None
+          if not DEUTSCH.fullmatch(sauber):
+              raise ValueError(f"Kein Betrag im deutschen Format: {text!r}")
+          return Decimal(sauber.replace(".", "").replace(",", "."))
+    tests:
+      - name: Dezimalkomma
+        code: |
+          ergebnis = betrag("4,90")
+          assert isinstance(ergebnis, Decimal), f"erwartet Decimal, bekommen {type(ergebnis).__name__}"
+          assert ergebnis == Decimal("4.90"), f"erwartet 4.90, bekommen {ergebnis}"
+      - name: Tausenderpunkt, Euro-Zeichen und Leerraum
+        code: |
+          for text in ["1.250,50", "1250,50", "\xa01.250,50 €", "1.250,50€"]:
+              assert betrag(text) == Decimal("1250.50"), f"{text!r} ergibt {betrag(text)}, erwartet 1250.50"
+          assert betrag("12.345.678,9") == Decimal("12345678.9")
+      - name: Gutschrift
+        code: |
+          assert betrag("-12,50") == Decimal("-12.50"), f"bekommen {betrag('-12,50')}"
+      - name: Fehlend ist None, 0 bleibt 0
+        code: |
+          for text in ["", "  ", "-", "n/a", "N/A", "k. A."]:
+              assert betrag(text) is None, f"{text!r} bedeutet fehlend, bekommen {betrag(text)!r}"
+          for text in ["0", "0,00"]:
+              assert betrag(text) == 0 and betrag(text) is not None, f"{text!r} ist eine echte Null"
+      - name: Falsches Format ist ein Fehler
+        code: |
+          for text in ["4.90", "1.25,00", "12,3,4", "zwölf", "4,90 USD"]:
+              try:
+                  ergebnis = betrag(text)
+              except ValueError:
+                  continue
+              assert False, f"{text!r} passt nicht zum deutschen Format – erwartet ValueError, bekommen {ergebnis!r}"
+    explanation: |
+      Die Funktion trennt drei Fälle: fehlend, gültig, ungültig. Fehlende Werte werden `None`, nicht 0 – sonst sinkt jeder Durchschnitt. Gültige Werte prüft ein regulärer Ausdruck gegen das deutsche Format, bevor umgewandelt wird: Tausenderpunkte nur vor Dreiergruppen, höchstens ein Komma. Ohne diese Prüfung würde `4.90` still zu 490 und `1.25,00` zu 125. `Decimal("…")` allein löst bei kaputtem Text `decimal.InvalidOperation` aus, das keine Unterklasse von `ValueError` ist; die eigene Prüfung liefert den erwarteten Fehlertyp und eine Meldung mit dem Originalwert fürs Protokoll.
+    hints:
+      - Erst Leerraum und `€` entfernen, dann die Fehlend-Werte mit `casefold()` prüfen.
+      - "Ein Muster für das deutsche Format: optionales Minus, Ziffern mit Tausenderpunkten oder ohne, optional Komma und Nachkommastellen."
+      - "`re.fullmatch(r\"-?(\\d{1,3}(\\.\\d{3})+|\\d+)(,\\d+)?\", text)`, danach Punkte entfernen und das Komma ersetzen."
+    resources:
+      - title: Python · decimal
+        url: https://docs.python.org/3/library/decimal.html
+      - title: Python · re.fullmatch
+        url: https://docs.python.org/3/library/re.html#re.fullmatch
+
+  - id: bom-keyerror
+    type: bug
+    title: Die Spalte, die da ist und doch fehlt
+    prompt: |
+      Die Vertriebsassistenz speichert die Kundenliste neuerdings in Excel als „CSV UTF-8“. Seitdem bricht das Einlesen ab:
+
+      ```text
+      KeyError: 'kunde_id'
+      ```
+
+      In einem Texteditor beginnt die Datei mit `kunde_id;name;stadt`. Mit den alten Exporten lief derselbe Code fehlerfrei. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: python
+    code: |
+      import csv
+      from pathlib import Path
+
+      def lies_kunden(pfad: Path) -> list[dict]:
+          with pfad.open(encoding="utf-8", newline="") as datei:
+              zeilen = list(csv.DictReader(datei, delimiter=";"))
+          return [{"kunde_id": int(z["kunde_id"]), "stadt": z["stadt"].strip()} for z in zeilen]
+    lines: [5]
+    fix:
+      - line: 5
+        answers:
+          - 'with pfad.open(encoding="utf-8-sig", newline="") as datei:'
+          - 'with pfad.open(newline="", encoding="utf-8-sig") as datei:'
+          - 'with pfad.open(encoding="utf_8_sig", newline="") as datei:'
+          - 'with pfad.open(newline="", encoding="utf_8_sig") as datei:'
+    explanation: |
+      Excel schreibt bei „CSV UTF-8“ ein BOM an den Dateianfang. Mit `encoding="utf-8"` liest Python es als Zeichen `\ufeff` mit, und der erste Spaltenname heißt `"\ufeffkunde_id"` – im Editor unsichtbar, für das Dictionary ein anderer Schlüssel. `utf-8-sig` entfernt ein vorhandenes BOM und liest Dateien ohne BOM unverändert, funktioniert also mit alten und neuen Exporten. `print(reader.fieldnames)` hätte den Fehler mit `repr` sofort gezeigt.
+    hints:
+      - Lass dir die Spaltennamen mit `repr` ausgeben – was steht vor `kunde_id`?
+      - Welches Encoding entfernt ein BOM?
+    resources:
+      - title: Python · codecs · utf-8-sig
+        url: https://docs.python.org/3/library/codecs.html#module-encodings.utf_8_sig
+
+  - id: gebietsschema-falsch
+    type: bug
+    title: Versand für 490 Euro
+    prompt: |
+      Ein Kollege hat die Power-Query-Abfrage für den Bestellexport angepasst, damit sie „auf allen Rechnern gleich läuft“. Seitdem zeigt sie Versandkosten von 490 statt 4,90, und bei allen Bestellungen ab dem 13. eines Monats steht in `bestelldatum` ein Fehler. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: powerquery
+    code: |
+      let
+          Quelle = Csv.Document(File.Contents("C:\Bohnenwerk\Export\bestellungen_2026-03.csv"), [Delimiter = ";", Encoding = 1252, QuoteStyle = QuoteStyle.Csv]),
+          #"Höher gestufte Header" = Table.PromoteHeaders(Quelle, [PromoteAllScalars = true]),
+          #"Geänderter Typ mit Gebietsschema" = Table.TransformColumnTypes(
+              #"Höher gestufte Header",
+              {{"bestelldatum", type date}, {"versandkosten", type number}, {"warenwert", type number}},
+              "en-US"
+          ),
+          #"Geänderter Typ" = Table.TransformColumnTypes(
+              #"Geänderter Typ mit Gebietsschema",
+              {{"kunde_id", Int64.Type}, {"plz", type text}}
+          )
+      in
+          #"Geänderter Typ"
+    lines: [7]
+    fix:
+      - line: 7
+        answers:
+          - '"de-DE"'
+    explanation: |
+      Das Gebietsschema in `Table.TransformColumnTypes` beschreibt, wie die **Quelle** formatiert ist, nicht wie der Rechner eingestellt ist. Der Export ist deutsch: Dezimalkomma und `TT.MM.JJJJ`. Mit `"en-US"` ist das Komma ein Tausendertrennzeichen, aus `4,90` wird 490, und `14.03.2026` hätte einen 14. Monat. Die Tage 1 bis 12 sind die gefährlicheren Fälle: Sie können still als Monat gelesen werden. Mit `"de-DE"` liefert die Abfrage auf jedem Rechner dasselbe Ergebnis, unabhängig von dessen Spracheinstellung.
+    hints:
+      - Welche Zeile legt fest, wie Zahlen und Datumswerte gelesen werden?
+      - Das Gebietsschema beschreibt die Datei, nicht den Rechner.
+    resources:
+      - title: Microsoft Learn · Table.TransformColumnTypes
+        url: https://learn.microsoft.com/de-de/powerquery-m/table-transformcolumntypes
+      - title: Microsoft Learn · Datentypen und Gebietsschema in Power Query
+        url: https://learn.microsoft.com/de-de/power-query/data-types#document-or-project-locale
+
+  - id: import-abfrage-erklaeren
+    type: explain
+    title: Warum diese Abfrage den Doppelklick ersetzt
+    prompt: |
+      Leas Teamleiter fragt, warum sie für den Monatsexport „so eine komplizierte Abfrage“ braucht, statt die CSV per Doppelklick zu öffnen. Erkläre ihm, was die Schritte tun und was dadurch besser wird.
+    lang: powerquery
+    code: |
+      let
+          Quelle = Csv.Document(File.Contents("C:\Bohnenwerk\Export\bestellungen_2026-03.csv"), [Delimiter = ";", Encoding = 1252, QuoteStyle = QuoteStyle.Csv]),
+          #"Höher gestufte Header" = Table.PromoteHeaders(Quelle, [PromoteAllScalars = true]),
+          #"Gefilterte Zeilen" = Table.SelectRows(#"Höher gestufte Header", each [bestellung_id] <> "Summe"),
+          #"Geänderter Typ mit Gebietsschema" = Table.TransformColumnTypes(
+              #"Gefilterte Zeilen",
+              {{"bestelldatum", type date}, {"versandkosten", type number}, {"warenwert", type number}},
+              "de-DE"
+          ),
+          #"Geänderter Typ" = Table.TransformColumnTypes(
+              #"Geänderter Typ mit Gebietsschema",
+              {{"bestellung_id", Int64.Type}, {"plz", type text}, {"artikel_nr", type text}}
+          )
+      in
+          #"Geänderter Typ"
+    points:
+      - Encoding (1252) und Trennzeichen (`;`) sind festgelegt statt geraten; Umlaute und Spalten stimmen auf jedem Rechner.
+      - "`QuoteStyle.Csv` behandelt Zeilenumbrüche in Anführungszeichen als Teil des Feldes."
+      - Die Summenzeile wird entfernt, bevor Typen gesetzt werden – sonst entstünde eine falsche Bestellung oder eine Fehlerzeile.
+      - Beträge und Datum werden mit dem Gebietsschema der Quelle (de-DE) gelesen; PLZ und Artikelnummer bleiben Text und behalten führende Nullen.
+      - Die Rohdatei bleibt unverändert, und nächsten Monat genügt Aktualisieren – die Schritte sind zugleich die Dokumentation.
+    explanation: |
+      Beim Doppelklick rät Excel Encoding, Trennzeichen und Typen, und es rät bei jedem Öffnen neu: PLZ verlieren die Null, lange Nummern Ziffern, ein UTF-8-Export bekommt Mojibake. Die Abfrage legt dagegen alles ausdrücklich fest. `Csv.Document` liest mit Windows-1252, Semikolon und CSV-Quoting, sodass auch ein Lieferhinweis mit Zeilenumbruch in seinem Feld bleibt. Die Kopfzeile wird höher gestuft, dann filtert `Table.SelectRows` die Summenzeile heraus – vor der Typumwandlung, weil „Summe“ keine Bestellnummer ist. Der erste Typ-Schritt liest Datum und Beträge mit dem deutschen Gebietsschema der Quelle; der zweite setzt Kennungen, PLZ und Artikelnummer ausdrücklich auf Text beziehungsweise Ganzzahl.
+
+      Der größte Vorteil ist nicht der einzelne Schritt, sondern die Wiederholbarkeit: Die Rohdatei wird nie verändert, im nächsten Monat wird sie ersetzt und die Abfrage aktualisiert. Jeder Schritt steht sichtbar unter „Angewendete Schritte“, also kann jemand anderes nachvollziehen und prüfen, was mit den Daten passiert ist.
+    resources:
+      - title: Microsoft Learn · Csv.Document
+        url: https://learn.microsoft.com/de-de/powerquery-m/csv-document
+      - title: Microsoft Learn · Table.SelectRows
+        url: https://learn.microsoft.com/de-de/powerquery-m/table-selectrows
+
+  - id: export-bereinigen
+    type: code
+    title: Der Monatsexport, bereinigt und protokolliert
+    prompt: |
+      Schreibe `bereinige(zeilen)`. `zeilen` ist eine Liste von Dictionaries aus einem `csv.DictReader` (alle Werte Text) mit den Spalten `bestellung_id`, `bestelldatum`, `stadt` und `versandkosten`. Die Hilfsfunktionen `betrag` und `datum` und die Zuordnungstabelle `STAEDTE` sind schon da. Die Tests nutzen diesen Export (als Liste `EXPORT` verfügbar):
+
+      | bestellung_id | bestelldatum | stadt | versandkosten |
+      | --- | --- | --- | --- |
+      | 1001 | 02.03.2026 | Köln | 0,00 |
+      | 1002 | 05.03.2026 | `Leipzig␣` | 4,90 |
+      | 1003 | 09.03.2026 | `␣köln` | n/a |
+      | 1002 | 05.03.2026 | Leipzig | 4,90 |
+      | 1004 | 13.03.2026 | `KOELN` + `\xa0` | 6,50 |
+      | 1005 | 31.03.2026 | Bonn | 4,30 |
+      | Summe | | | 15,70 |
+
+      Regeln:
+
+      - Jeder Wert wird getrimmt. Eine Zeile, deren `bestellung_id` mit „Summe“ beginnt, wird entfernt und gezählt.
+      - Jede übrige Zeile wird zu `{"bestellung_id": int, "bestelldatum": date, "stadt": str, "versandkosten": Decimal | None}`. Die Stadt wird über `STAEDTE` (Schlüssel: `casefold()` des getrimmten Werts) vereinheitlicht; unbekannte Städte bleiben getrimmt stehen.
+      - Exakte Dubletten – nach der Umwandlung gleiche Zeilen – werden entfernt und gezählt; die erste bleibt, die Reihenfolge bleibt erhalten.
+      - Rückgabe: `(saubere_zeilen, protokoll)` mit `protokoll = {"gelesen": …, "summenzeilen": …, "dubletten": …, "behalten": …}`.
+      - Die übergebene Liste und ihre Dictionaries bleiben unverändert.
+    lang: python
+    setup: |
+      EXPORT = [
+          {"bestellung_id": "1001", "bestelldatum": "02.03.2026", "stadt": "Köln", "versandkosten": "0,00"},
+          {"bestellung_id": "1002", "bestelldatum": "05.03.2026", "stadt": "Leipzig ", "versandkosten": "4,90"},
+          {"bestellung_id": "1003", "bestelldatum": "09.03.2026", "stadt": " köln", "versandkosten": "n/a"},
+          {"bestellung_id": "1002", "bestelldatum": "05.03.2026", "stadt": "Leipzig", "versandkosten": "4,90"},
+          {"bestellung_id": "1004", "bestelldatum": "13.03.2026", "stadt": "KOELN\xa0", "versandkosten": "6,50"},
+          {"bestellung_id": "1005", "bestelldatum": "31.03.2026", "stadt": "Bonn", "versandkosten": "4,30"},
+          {"bestellung_id": "Summe", "bestelldatum": "", "stadt": "", "versandkosten": "15,70"},
+      ]
+    starter: |
+      from datetime import date, datetime
+      from decimal import Decimal
+
+      STAEDTE = {"köln": "Köln", "koeln": "Köln", "leipzig": "Leipzig", "hamburg": "Hamburg"}
+      FEHLEND = {"", "-", "n/a", "k. a."}
+
+
+      def betrag(text: str) -> Decimal | None:
+          text = text.strip()
+          if text.casefold() in FEHLEND:
+              return None
+          return Decimal(text.replace(".", "").replace(",", "."))
+
+
+      def datum(text: str) -> date:
+          return datetime.strptime(text.strip(), "%d.%m.%Y").date()
+
+
+      def bereinige(zeilen: list[dict]) -> tuple[list[dict], dict]:
+          saubere = []
+          protokoll = {"gelesen": len(zeilen), "summenzeilen": 0, "dubletten": 0, "behalten": 0}
+          for zeile in zeilen:
+              ...
+          return saubere, protokoll
+    solution: |
+      from datetime import date, datetime
+      from decimal import Decimal
+
+      STAEDTE = {"köln": "Köln", "koeln": "Köln", "leipzig": "Leipzig", "hamburg": "Hamburg"}
+      FEHLEND = {"", "-", "n/a", "k. a."}
+
+
+      def betrag(text: str) -> Decimal | None:
+          text = text.strip()
+          if text.casefold() in FEHLEND:
+              return None
+          return Decimal(text.replace(".", "").replace(",", "."))
+
+
+      def datum(text: str) -> date:
+          return datetime.strptime(text.strip(), "%d.%m.%Y").date()
+
+
+      def bereinige(zeilen: list[dict]) -> tuple[list[dict], dict]:
+          saubere = []
+          gesehen = set()
+          protokoll = {"gelesen": len(zeilen), "summenzeilen": 0, "dubletten": 0, "behalten": 0}
+          for zeile in zeilen:
+              werte = {spalte: wert.strip() for spalte, wert in zeile.items()}
+              if werte["bestellung_id"].casefold().startswith("summe"):
+                  protokoll["summenzeilen"] += 1
+                  continue
+              sauber = {
+                  "bestellung_id": int(werte["bestellung_id"]),
+                  "bestelldatum": datum(werte["bestelldatum"]),
+                  "stadt": STAEDTE.get(werte["stadt"].casefold(), werte["stadt"]),
+                  "versandkosten": betrag(werte["versandkosten"]),
+              }
+              schluessel = tuple(sauber.values())
+              if schluessel in gesehen:
+                  protokoll["dubletten"] += 1
+                  continue
+              gesehen.add(schluessel)
+              saubere.append(sauber)
+          protokoll["behalten"] = len(saubere)
+          return saubere, protokoll
+    tests:
+      - name: Eine Zeile wird vollständig typisiert
+        code: |
+          saubere, _ = bereinige(EXPORT)
+          assert saubere, "Es kommen keine Zeilen zurück"
+          erwartet = {"bestellung_id": 1001, "bestelldatum": date(2026, 3, 2), "stadt": "Köln", "versandkosten": Decimal("0.00")}
+          assert saubere[0] == erwartet, f"erwartet {erwartet!r}, bekommen {saubere[0]!r}"
+      - name: Städte sind vereinheitlicht
+        code: |
+          saubere, _ = bereinige(EXPORT)
+          staedte = [z["stadt"] for z in saubere]
+          assert staedte == ["Köln", "Leipzig", "Köln", "Köln", "Bonn"], f"bekommen {staedte!r}"
+      - name: Fehlend bleibt fehlend, 0 bleibt 0
+        code: |
+          saubere, _ = bereinige(EXPORT)
+          nach_id = {z["bestellung_id"]: z for z in saubere}
+          assert nach_id[1003]["versandkosten"] is None, f"n/a muss None werden, bekommen {nach_id[1003]['versandkosten']!r}"
+          assert nach_id[1001]["versandkosten"] == 0 and nach_id[1001]["versandkosten"] is not None, "0,00 ist ein echter Wert"
+      - name: Summenzeile und Dublette entfernt, Protokoll stimmt
+        code: |
+          saubere, protokoll = bereinige(EXPORT)
+          ids = [z["bestellung_id"] for z in saubere]
+          assert ids == [1001, 1002, 1003, 1004, 1005], f"erwartet die Bestellungen 1001 bis 1005 in Exportreihenfolge, bekommen {ids!r}"
+          erwartet = {"gelesen": 7, "summenzeilen": 1, "dubletten": 1, "behalten": 5}
+          assert protokoll == erwartet, f"erwartet {erwartet!r}, bekommen {protokoll!r}"
+      - name: Abgleich mit der Summenzeile
+        code: |
+          saubere, _ = bereinige(EXPORT)
+          summe = sum(z["versandkosten"] for z in saubere if z["versandkosten"] is not None)
+          assert summe == Decimal("15.70"), f"Die Versandkosten müssen zur Summenzeile 15,70 passen, bekommen {summe}"
+      - name: Rohdaten bleiben unverändert
+        code: |
+          import copy
+          vorher = copy.deepcopy(EXPORT)
+          bereinige(EXPORT)
+          assert EXPORT == vorher, "bereinige darf die übergebenen Zeilen nicht verändern"
+    explanation: |
+      Die Reihenfolge der Schritte entscheidet: erst trimmen, dann die Summenzeile erkennen (sonst scheitert `datum` an ihrem leeren Feld), dann umwandeln und vereinheitlichen, zuletzt Dubletten auf den **bereinigten** Werten suchen. Nur so ist `"Leipzig "` mit 4,90 dieselbe Bestellung wie `"Leipzig"` mit 4,90. Ein Set aus Tupeln merkt sich, was schon da war, und hält die Exportreihenfolge. Die neuen Dictionaries lassen die Rohdaten unberührt. Der Abgleich mit der Summenzeile zeigt, warum das wichtig ist: Mit der Dublette wären es 20,60 statt 15,70, und das Protokoll erklärt die Differenz, bevor jemand danach fragt.
+    hints:
+      - "Trimme zuerst alle Werte der Zeile in ein neues Dictionary: `{spalte: wert.strip() for spalte, wert in zeile.items()}`."
+      - Prüfe die Summenzeile vor jeder Umwandlung und überspringe sie mit `continue`.
+      - "Merke dir bereits gesehene Zeilen als `tuple(sauber.values())` in einem Set."
+    resources:
+      - title: Python · str.strip
+        url: https://docs.python.org/3/library/stdtypes.html#str.strip
+      - title: Python · str.casefold
+        url: https://docs.python.org/3/library/stdtypes.html#str.casefold
+
+  - id: excel-import-praxis
+    type: practice
+    title: Doppelklick gegen „Aus Text/CSV“
+    prompt: |
+      Probiere den Unterschied in Excel selbst aus. Speichere diesen Text mit einem Editor als `bestellungen_test.csv` in UTF-8 ohne BOM (der Windows-Editor tut das beim Speichern als „UTF-8“):
+
+      ```csv
+      bestellung_id;bestelldatum;kunde;plz;stadt;artikel_nr;charge;sendungsnummer;versandkosten;warenwert
+      1001;02.03.2026;Café Luna;50667;Köln;0012;12.3;00340434161094012345;0,00;1.250,50
+      1002;05.03.2026;Jana Wolff;04109;Leipzig ;0107;12.3;00340434161094012352;4,90;41,40
+      1003;09.03.2026;Kanzlei Berger & Partner;20095;Hamburg;0012;14.3;00340434161094012369;6,50;318,20
+      1004;13.03.2026;Tim Albers;01067;dresden;0215;14.3;00340434161094012376;4,90;89,90
+      Summe;;;;;;;;16,30;1.700,00
+      ```
+
+      1. Öffne die Datei per Doppelklick und notiere, was mit Umlauten, PLZ, Artikelnummern, Charge und Sendungsnummer passiert. Schließe sie **ohne zu speichern**.
+      2. Importiere sie in eine leere Mappe über Daten › Aus Text/CSV mit dem passenden Dateiursprung und Trennzeichen, dann Daten transformieren.
+      3. Entferne im Power Query-Editor die Summenzeile, setze die Typen (Kennungen als Text, Datum und Beträge mit Gebietsschema) und kürze die Stadt. Lade das Ergebnis.
+      4. Ergänze in der CSV eine Bestellung `1005` und aktualisiere die Abfrage.
+    lang: powerquery
+    solution: |
+      let
+          Quelle = Csv.Document(File.Contents("C:\Daten\bestellungen_test.csv"), [Delimiter = ";", Encoding = 65001, QuoteStyle = QuoteStyle.Csv]),
+          #"Höher gestufte Header" = Table.PromoteHeaders(Quelle, [PromoteAllScalars = true]),
+          #"Gefilterte Zeilen" = Table.SelectRows(#"Höher gestufte Header", each [bestellung_id] <> "Summe"),
+          #"Geänderter Typ mit Gebietsschema" = Table.TransformColumnTypes(
+              #"Gefilterte Zeilen",
+              {{"bestelldatum", type date}, {"versandkosten", type number}, {"warenwert", type number}},
+              "de-DE"
+          ),
+          #"Geänderter Typ" = Table.TransformColumnTypes(
+              #"Geänderter Typ mit Gebietsschema",
+              {{"bestellung_id", Int64.Type}, {"kunde", type text}, {"plz", type text}, {"stadt", type text},
+               {"artikel_nr", type text}, {"charge", type text}, {"sendungsnummer", type text}}
+          ),
+          #"Gekürzter Text" = Table.TransformColumns(#"Geänderter Typ", {{"stadt", Text.Trim, type text}})
+      in
+          #"Gekürzter Text"
+    checklist:
+      - "Beim Doppelklick hast du die Umwandlungen gesehen: „KÃ¶ln“ statt „Köln“, PLZ `1067` und Artikelnummer `12` ohne führende Null, Charge `12.3` als Datum, Sendungsnummer in wissenschaftlicher Notation – und die Datei nicht gespeichert."
+      - "Im Importdialog stehen Dateiursprung „65001: Unicode (UTF-8)“ und Trennzeichen Semikolon; die Vorschau zeigt „Köln“ korrekt."
+      - "`plz`, `artikel_nr`, `charge` und `sendungsnummer` sind Text und zeigen `01067`, `0012`, `12.3` und alle 20 Ziffern."
+      - "`bestelldatum` ist ein Datum (13.03.2026 ist der 13. März), `versandkosten` und `warenwert` sind Zahlen; die Summe von `warenwert` ist 1700 und passt zur entfernten Summenzeile."
+      - "„Leipzig “ hat nach dem Kürzen kein Leerzeichen mehr."
+      - Nach dem Ergänzen der Bestellung 1005 und Daten › Alle aktualisieren erscheint sie ohne weitere Handgriffe in der Tabelle.
+    explanation: |
+      Die Datei ist UTF-8 ohne BOM, also rät Excel beim Doppelklick die Systemcodepage und erzeugt Mojibake; danach wandelt es alles um, was wie Zahl oder Datum aussieht. Die 20-stellige Sendungsnummer übersteigt die 15 signifikanten Stellen, die Excel speichert, und verliert Ziffern. Beim Import legst du Encoding, Trennzeichen und Typen selbst fest. Das Gebietsschema „de-DE“ beschreibt das Format der Datei – Dezimalkomma und `TT.MM.JJJJ` –, nicht die Einstellung deines Rechners. Die Summenzeile filterst du vor dem Typwechsel heraus und nutzt sie als Kontrollwert: 1.250,50 + 41,40 + 318,20 + 89,90 = 1.700,00. Dass die neue Bestellung nach dem Aktualisieren von selbst erscheint, ist der eigentliche Gewinn: Aus der monatlichen Handarbeit wird ein Klick.
+    resources:
+      - title: Microsoft Support · Importieren oder Exportieren von Textdateien
+        url: https://support.microsoft.com/de-de/excel/get-started/import-or-export-text-txt-or-csv-files
+      - title: Microsoft Support · Beibehalten führender Nullen und großer Zahlen
+        url: https://support.microsoft.com/de-de/excel/keeping-leading-zeros-and-large-numbers
+      - title: Microsoft Learn · Text.Trim
+        url: https://learn.microsoft.com/de-de/powerquery-m/text-trim

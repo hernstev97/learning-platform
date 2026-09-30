@@ -1,0 +1,1199 @@
+id: automationen
+title: Kleine Automationen für Analysen
+level: 2
+minutes: 180
+summary: Wiederkehrende Auswertungen einmal sauber bauen – Monatsdateien idempotent zusammenführen, neue und geänderte Dateien erkennen, einen Kennzahlenbericht erzeugen und für jede Aufgabe das passende Werkzeug zwischen Power Query, SQL, Python und Office Scripts wählen.
+goals:
+  - Du wählst für eine wiederkehrende Aufgabe begründet zwischen Excel mit Power Query, SQL, Python und Office Scripts oder VBA.
+  - Du führst Monatsexporte aus einem Ordner so zusammen, dass ein zweiter Lauf keine Duplikate erzeugt und der jüngste Stand einer Bestellung gewinnt.
+  - Du erkennst neue und geänderte Dateien über ein Manifest mit Prüfsummen und aktualisierst es erst nach erfolgreicher Verarbeitung.
+  - Du erzeugst aus dem Bestand einen Kennzahlenbericht als Text mit deutschem Zahlenformat und als Excel-Datei.
+  - Du baust Protokoll, Trockenlauf und Exit-Codes ein und weißt, wie der Job zeitgesteuert läuft.
+resources:
+  - title: pandas · IO tools (Text, CSV, Excel)
+    url: https://pandas.pydata.org/docs/user_guide/io.html
+  - title: Python · pathlib
+    url: https://docs.python.org/3/library/pathlib.html
+  - title: Python · hashlib
+    url: https://docs.python.org/3/library/hashlib.html
+  - title: Unterschiede zwischen Office-Skripts und VBA-Makros
+    url: https://learn.microsoft.com/de-de/office/dev/scripts/resources/vba-differences
+lesson: |
+  Mit Power Query ist der Monatsimport bei Bohnenwerk wiederholbar geworden (siehe [Power Query: Importe wiederholbar machen](/data/power-query)). Aus drei Stunden Kopieren wurden fünf Minuten. Trotzdem muss am zweiten Arbeitstag jemand Excel öffnen, auf **Alle aktualisieren** klicken, die Prüfblätter ansehen und die Kennzahlen in eine Mail an die Geschäftsführung tippen. Ist Merle im Urlaub, kommt der Bericht eine Woche später. Und wenn ein Export korrigiert nachgeliefert wird, weiß niemand genau, ob der verschickte Bericht noch stimmt.
+
+  Dieses Modul schließt den Kreis zur Prozessautomatisierung. Du entscheidest zuerst, welches Werkzeug eine wiederkehrende Aufgabe tragen soll. Dann baust du in Python einen kleinen Monatsjob: Er führt die Exporte aus einem Ordner zusammen, erkennt neue und geänderte Dateien, prüft die Daten, schreibt Bestand und Bericht und protokolliert, was er getan hat. Ein zweiter Lauf richtet keinen Schaden an. Die allgemeinen Grundlagen – Idempotenz, Trockenlauf, Zeitsteuerung, Benachrichtigungen – stehen im Bereich Automation, etwa in [Automatisieren mit Verstand](/automation/automatisieren-denken). Hier geht es um das, was bei Analysen dazukommt: Daten, die sich wiederholen, nachträglich korrigiert werden und am Ende eine Summe ergeben müssen, der die Geschäftsführung glaubt.
+
+  ## Welches Werkzeug für welche Aufgabe?
+
+  Für wiederkehrende Auswertungen gibt es vier naheliegende Werkzeuge. Keines ist immer richtig; entscheidend ist, wo die Daten liegen, wer den Lauf auslöst und ob er ohne Menschen funktionieren muss.
+
+  | | Excel mit Power Query | SQL | Python mit pandas | Office Scripts / VBA |
+  | --- | --- | --- | --- | --- |
+  | Stärke | Import und Umformung für Menschen, die in Excel arbeiten; Ergebnis direkt als Tabelle oder PivotTable | Große Datenmengen dort filtern, verknüpfen und aggregieren, wo sie liegen | Beliebige Quellen, Prüfungen, Dateien erzeugen und verschieben, Mails, Tests | Die Arbeitsmappe selbst verändern: Blätter, Formate, Schaltflächen |
+  | Wer startet den Lauf? | ein Mensch mit **Alle aktualisieren** | Datenbank, BI-Werkzeug oder ein Skript | ein Zeitplaner (cron, systemd, Aufgabenplanung, CI) | ein Mensch per Schaltfläche; Office Scripts auch ein Power Automate-Flow |
+  | Läuft ohne geöffnetes Excel | nein | ja | ja | Office Scripts über Power Automate ja, VBA nein |
+  | Versionieren und testen | kaum | ja, Abfragen als Dateien | ja, mit Git und Tests | eingeschränkt |
+  | Typische Grenze | Aktualisieren braucht Excel und Zugriff auf die Quelle | braucht eine Datenbank | braucht eine gepflegte Laufzeitumgebung | VBA nur auf dem Desktop; Office Scripts können in Power Automate keine Power Query-Abfragen aktualisieren |
+
+  Daraus folgen vier Faustregeln:
+
+  1. **Das Ergebnis lebt in Excel und jemand öffnet die Datei ohnehin?** Power Query. Der Import ist dokumentiert, und niemand muss Python installieren.
+  2. **Die Daten liegen in einer Datenbank?** Rechne mit SQL dort, wo sie liegen, etwa als View, und hole nur das Ergebnis nach Excel oder Python.
+  3. **Der Lauf soll ohne Menschen stattfinden, Dateien prüfen und erzeugen oder eine Mail schicken?** Python mit einem Zeitplaner.
+  4. **Die Arbeitsmappe selbst soll sich verändern** – Blätter anlegen, formatieren, eine Schaltfläche für Kolleginnen? Office Scripts in Excel für das Web oder VBA auf dem Desktop ([Unterschiede zwischen Office-Skripts und VBA-Makros](https://learn.microsoft.com/de-de/office/dev/scripts/resources/vba-differences)).
+
+  Kombinationen sind der Normalfall. Eine SQL-View liefert Monatssummen, Power Query holt sie in die Arbeitsmappe der Geschäftsführung. Ein Python-Job schreibt eine bereinigte CSV in einen Ordner, und eine PivotTable liest sie über Power Query. Die Daten fließen dorthin, wo Menschen arbeiten; die Logik steht dort, wo sie sich prüfen lässt.
+
+  > [!INTERVIEW] „Wann nimmst du Python statt Power Query?“
+  > Wenn der Ablauf ohne Menschen laufen soll, wenn er Dateien prüfen, verschieben oder erzeugen muss oder wenn ich ihn versionieren und testen will. Power Query ist stark, solange jemand in Excel arbeitet und auf **Alle aktualisieren** klickt. Sobald der Bericht um sieben Uhr in der Mail liegen soll, brauche ich einen Zeitplaner und damit ein Skript. Oft kombiniere ich beides: Python bereitet die Daten auf, Excel zeigt sie.
+
+  ## Ein Ordner voller Monatsdateien: zusammenführen ohne Doppelzählung
+
+  Der Shop legt jeden Monat eine Datei `bestellungen_JJJJ-MM.csv` in den Ordner `eingang`: Semikolon, Dezimalkomma, Datum als `TT.MM.JJJJ`, UTF-8 mit BOM, manchmal eine Summenzeile. Ein fester Dateiname je Monat ist die erste Automatisierungsentscheidung, denn er macht aus „irgendwelche Dateien“ einen prüfbaren Vertrag. Der Block liest alle gültigen Monatsdateien und merkt sich in `quelle`, woher jede Zeile stammt:
+
+  ```python run
+  from pathlib import Path
+  import pandas as pd
+
+  eingang = Path("eingang")
+  eingang.mkdir()
+  kopf = "bestellung_id;kunde_id;bestelldatum;kanal;status;warenwert\n"
+  (eingang / "bestellungen_2026-01.csv").write_text(
+      kopf + "10001;17;05.01.2026;Shop;bezahlt;48,90\n10002;23;12.01.2026;B2B;bezahlt;1.240,00\n",
+      encoding="utf-8-sig")
+  (eingang / "bestellungen_2026-02.csv").write_text(
+      kopf + "10003;8;02.02.2026;Shop;storniert;21,50\n10004;41;09.02.2026;Shop;bezahlt;64,20\n"
+      "Summe;;;;;85,70\n", encoding="utf-8-sig")
+  (eingang / "notizen.txt").write_text("Rückfragen an den Shop\n", encoding="utf-8")
+
+  def lade_monat(pfad: Path) -> pd.DataFrame:
+      df = pd.read_csv(pfad, sep=";", decimal=",", thousands=".", encoding="utf-8-sig",
+                       dtype={"bestellung_id": "str"},
+                       parse_dates=["bestelldatum"], date_format="%d.%m.%Y")
+      df = df[df["bestellung_id"] != "Summe"]              # Summenzeile per Bedingung entfernen
+      return df.astype({"bestellung_id": "int64", "kunde_id": "int64"}).assign(quelle=pfad.name)
+
+  dateien = sorted(eingang.glob("bestellungen_*.csv"))
+  alle = pd.concat([lade_monat(p) for p in dateien], ignore_index=True)
+  print([p.name for p in dateien])
+  print(alle.shape)
+  print(alle.groupby("quelle")["warenwert"].sum().to_dict())
+  ```
+
+  Das `sorted` ist kein Schmuck. `Path.glob` und `Path.iterdir` liefern Dateien in keiner festgelegten Reihenfolge ([pathlib · Path.glob](https://docs.python.org/3/library/pathlib.html#pathlib.Path.glob)); auf dem Laptop und auf dem Server kann sie verschieden sein. Sobald „der jüngste Stand gewinnt“, hängt das Ergebnis an dieser Reihenfolge.
+
+  > [!WARNING] Tausenderpunkt trifft Datum
+  > `thousands="."` gilt für jede Spalte, die pandas als Zahl lesen kann – auch für `02.03.2026`. Ohne `parse_dates` oder `dtype` wird daraus die Ganzzahl 2032026, ohne Fehlermeldung ([pandas · read_csv](https://pandas.pydata.org/docs/reference/api/pandas.read_csv.html)). Lies Datumsspalten deshalb ausdrücklich als Datum oder als Text.
+
+  Jetzt zum eigentlichen Problem. Läuft der Monatsjob zweimal – nach einem Abbruch, weil der Zeitplaner doppelt startet oder weil jemand ihn von Hand noch einmal anstößt –, darf der Bestand nicht wachsen. Eine Operation ist **idempotent**, wenn ein zweiter Lauf denselben Zustand ergibt wie der erste. Für Datenbestände gibt es drei Strategien:
+
+  1. **Vollständig neu aufbauen.** Jeder Lauf liest alle Rohdateien und schreibt den Bestand komplett neu. Idempotent ohne jede Buchführung; für einige hundert Monatsdateien schnell genug. Das ist der Standard, bis er zu langsam wird.
+  2. **Upsert über einen fachlichen Schlüssel.** Alter Bestand und neue Zeilen werden vereint, und je `bestellung_id` bleibt die jüngste Zeile ([pandas · drop_duplicates](https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.drop_duplicates.html)). Nötig, wenn Rohdaten nach der Verarbeitung archiviert oder gelöscht werden.
+  3. **Inkrementell mit Manifest.** Nur neue Dateien werden verarbeitet und angehängt; ein Manifest merkt sich, was schon drin ist. Am schnellsten, aber am fehleranfälligsten.
+
+  Der Unterschied zwischen Anhängen und Zielzustand in zehn Zeilen:
+
+  ```python run
+  from pathlib import Path
+  import pandas as pd
+
+  def anhaengen(ziel: Path, neu: pd.DataFrame) -> None:          # Aktion – nicht idempotent
+      neu.to_csv(ziel, mode="a", header=not ziel.exists(), index=False)
+
+  def aktualisieren(ziel: Path, neu: pd.DataFrame) -> None:      # Zielzustand – idempotent
+      gesamt = pd.concat([pd.read_csv(ziel), neu]) if ziel.exists() else neu
+      gesamt = gesamt.drop_duplicates(subset="bestellung_id", keep="last").sort_values("bestellung_id")
+      tmp = ziel.with_suffix(".tmp")
+      gesamt.to_csv(tmp, index=False)
+      tmp.replace(ziel)                                          # erst jetzt wird der Bestand ersetzt
+
+  maerz = pd.DataFrame({"bestellung_id": [10231, 10232], "status": ["bezahlt", "bezahlt"]})
+  for lauf in range(2):                                          # zweiter Lauf, etwa nach einem Abbruch
+      anhaengen(Path("naiv.csv"), maerz)
+      aktualisieren(Path("bestand.csv"), maerz)
+  print(len(pd.read_csv("naiv.csv")), len(pd.read_csv("bestand.csv")))
+
+  # Der April-Export enthält eine Statusänderung zu einer Märzbestellung
+  april = pd.DataFrame({"bestellung_id": [10232, 10301], "status": ["retourniert", "bezahlt"]})
+  aktualisieren(Path("bestand.csv"), april)
+  print(pd.read_csv("bestand.csv").to_dict("records"))
+  ```
+
+  `aktualisieren` schreibt zuerst in eine temporäre Datei und ersetzt den Bestand dann mit `Path.replace`. Das entspricht [`os.replace`](https://docs.python.org/3/library/os.html#os.replace): Innerhalb eines Dateisystems ist der Austausch atomar, ein Absturz mitten im Schreiben hinterlässt also nie einen halben Bestand. Mehr dazu steht in [Dateien und Ordner automatisieren](/automation/dateien-ordner).
+
+  > [!MERKE]
+  > Ein Monatslauf ist idempotent, wenn ein zweiter Lauf mit denselben Dateien denselben Bestand und denselben Bericht erzeugt. Beschreibe den Zielzustand („jede Bestellung genau einmal, im jüngsten Stand“), nicht die Aktion („hänge die neuen Zeilen an“).
+
+  ## Neue und geänderte Dateien erkennen
+
+  Auch beim vollständigen Neuaufbau willst du wissen, was sich seit dem letzten Lauf geändert hat: Nur dann lohnt ein neuer Bericht, und ein korrigierter Export eines schon berichteten Monats braucht einen Hinweis an die Empfänger. Dafür führt der Job ein **Manifest**, eine kleine JSON-Datei mit Dateiname und Prüfsumme je verarbeiteter Datei.
+
+  Die Änderungszeit taugt dafür nicht. Kopieren oder erneutes Herunterladen ändert sie, ohne dass sich Daten ändern, und ein Werkzeug kann eine Datei überschreiben und die alte Zeit übernehmen. Eine Prüfsumme über den Inhalt vergleicht dagegen die Bytes. [`hashlib.file_digest`](https://docs.python.org/3/library/hashlib.html#hashlib.file_digest) berechnet sie seit Python 3.11 direkt aus einer geöffneten Datei:
+
+  ```python run
+  import hashlib
+  import re
+  from pathlib import Path
+
+  MUSTER = re.compile(r"bestellungen_\d{4}-\d{2}\.csv")
+
+  def pruefsumme(pfad: Path) -> str:
+      with pfad.open("rb") as datei:
+          return hashlib.file_digest(datei, "sha256").hexdigest()
+
+  def plane(eingang: Path, manifest: dict[str, str]) -> dict[str, list[str]]:
+      plan = {"neu": [], "geaendert": [], "unveraendert": [], "ignoriert": []}
+      for pfad in sorted(eingang.iterdir()):
+          if not MUSTER.fullmatch(pfad.name):
+              plan["ignoriert"].append(pfad.name)
+          elif pfad.name not in manifest:
+              plan["neu"].append(pfad.name)
+          elif manifest[pfad.name] != pruefsumme(pfad):
+              plan["geaendert"].append(pfad.name)
+          else:
+              plan["unveraendert"].append(pfad.name)
+      return plan
+
+  eingang = Path("eingang")
+  eingang.mkdir()
+  kopf = "bestellung_id;warenwert\n"
+  (eingang / "bestellungen_2026-01.csv").write_text(kopf + "10001;48,90\n", encoding="utf-8")
+  (eingang / "bestellungen_2026-02.csv").write_text(kopf + "10003;21,50\n", encoding="utf-8")
+  manifest = {p.name: pruefsumme(p) for p in eingang.iterdir()}      # Stand nach dem Februarlauf
+
+  # Anfang April: Februar kommt korrigiert, März ist neu, dazu ein doppelter Download
+  (eingang / "bestellungen_2026-02.csv").write_text(kopf + "10003;12,50\n", encoding="utf-8")
+  (eingang / "bestellungen_2026-03.csv").write_text(kopf + "10231;64,20\n", encoding="utf-8")
+  (eingang / "bestellungen_2026-03 (1).csv").write_text(kopf + "10231;64,20\n", encoding="utf-8")
+  for art, namen in plane(eingang, manifest).items():
+      print(f"{art:<13} {namen}")
+  ```
+
+  Drei Regeln machen daraus einen verlässlichen Ablauf:
+
+  - **Der Name ist ein Vertrag.** `fullmatch` lässt `bestellungen_2026-03 (1).csv` nicht durch. Ein `glob("*.csv")` hätte den März doppelt gezählt. Ignorierte Dateien kommen ins Protokoll, damit jemand den doppelten Download aufräumt.
+  - **Das Manifest wird zuletzt geschrieben**, erst wenn Bestand und Bericht fertig sind. Bricht der Lauf vorher ab, gelten die Dateien beim nächsten Lauf weiter als neu und werden noch einmal verarbeitet. Umgekehrt wären sie als erledigt markiert, obwohl ihre Daten fehlen.
+  - **Fehlalarme sind harmlos, verpasste Änderungen nicht.** Ein erneuter Export mit Windows-Zeilenenden ändert die Prüfsumme, obwohl die Daten gleich sind. Weil die Verarbeitung idempotent ist, kostet so ein Fehlalarm nur einen überflüssigen Lauf.
+
+  ## Vom Bestand zum Bericht: Kennzahlen als Text und als Excel-Datei
+
+  Der Monatsbericht für die Geschäftsführung braucht wenige Zahlen: Warenwert der bezahlten Bestellungen, ihre Anzahl, die Stornoquote und den Vergleich zum Vormonat. Formatiere sie so, wie sie in einer deutschen Mail stehen sollen. Das `locale`-Modul hilft dabei wenig, weil es von den Spracheinstellungen des Rechners abhängt, auf dem der Job läuft. Robuster ist das Formatieren mit Tausenderkomma und das anschließende Tauschen von Komma und Punkt ([Format Specification Mini-Language](https://docs.python.org/3/library/string.html#format-specification-mini-language)):
+
+  ```python run
+  import pandas as pd
+
+  def zahl(wert: float, stellen: int = 2, vorzeichen: bool = False) -> str:
+      text = f"{wert:{'+' if vorzeichen else ''},.{stellen}f}"      # 1,466.60
+      return text.translate(str.maketrans(",.", ".,"))               # 1.466,60
+
+  bestellungen = pd.DataFrame({
+      "monat":     ["2026-02"] * 3 + ["2026-03"] * 4,
+      "status":    ["bezahlt", "bezahlt", "storniert", "bezahlt", "bezahlt", "storniert", "bezahlt"],
+      "warenwert": [48.90, 1240.00, 21.50, 64.20, 1310.00, 17.80, 92.40],
+  })
+
+  def kennzahlen(df: pd.DataFrame, monat: str) -> dict:
+      m = df[df["monat"] == monat]
+      bezahlt = m[m["status"] == "bezahlt"]
+      return {"umsatz": bezahlt["warenwert"].sum(), "anzahl": len(bezahlt),
+              "stornoquote": (m["status"] == "storniert").mean()}
+
+  jetzt, vorher = kennzahlen(bestellungen, "2026-03"), kennzahlen(bestellungen, "2026-02")
+  veraenderung = (jetzt["umsatz"] / vorher["umsatz"] - 1) * 100
+  punkte = (jetzt["stornoquote"] - vorher["stornoquote"]) * 100
+  print("Monatsbericht 2026-03")
+  print(f"Warenwert bezahlt: {zahl(jetzt['umsatz'])} EUR ({zahl(veraenderung, 1, True)} % zum Vormonat)")
+  print(f"Bezahlte Bestellungen: {jetzt['anzahl']}")
+  print(f"Stornoquote: {zahl(jetzt['stornoquote'] * 100, 1)} % ({zahl(punkte, 1, True)} Prozentpunkte)")
+  ```
+
+  Die Stornoquote sinkt von 33,3 % auf 25,0 %: um 8,3 **Prozentpunkte**, nicht um 8,3 Prozent. Der Unterschied gehört in jeden Bericht mit Quoten (siehe [Deskriptive Statistik](/data/deskriptive-statistik)). Den Text schickt der Job als Mail. Wie man eine `EmailMessage` baut und den Versand robust macht, zeigt [Benachrichtigungen ohne Nachrichtenflut](/automation/benachrichtigungen).
+
+  Für die Excel-Fassung schreibt pandas mehrere Blätter in eine Datei. [`DataFrame.to_excel`](https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.to_excel.html) braucht dafür das Paket `openpyxl`. Im Browser gibt es das nicht, deshalb läuft dieser Block nur lokal (`uv add pandas openpyxl`):
+
+  ```python
+  ziel = Path("berichte") / f"monatsbericht_{monat}.xlsx"      # Name nach Berichtsmonat, nicht nach Laufdatum
+  tmp = ziel.with_name(ziel.name + ".tmp")
+  with pd.ExcelWriter(tmp, engine="openpyxl") as writer:
+      kennzahlen_tabelle.to_excel(writer, sheet_name="Kennzahlen", index=False)
+      je_kanal.to_excel(writer, sheet_name="Kanäle", index=False)
+  tmp.replace(ziel)
+  ```
+
+  Zwei Details machen den Bericht wiederholbar. Der Dateiname enthält den **Berichtsmonat**, nicht das Laufdatum; ein zweiter Lauf überschreibt denselben Bericht, statt einen zweiten danebenzulegen. Und pandas schreibt Werte, keine Formeln – die Datei ist ein Ergebnis, keine Rechenvorlage. Soll die Geschäftsführung in Excel weiterfiltern, schreibe den Bestand als CSV in einen Ordner, den eine Power Query-Arbeitsmappe liest.
+
+  ## Excel selbst automatisieren: Alle aktualisieren, VBA und Office Scripts
+
+  Manchmal soll die Excel-Arbeitsmappe der Mittelpunkt bleiben. Dann gibt es drei Stufen. **Daten › Alle aktualisieren** (Strg+Alt+F5) aktualisiert alle Abfragen und PivotTables. In den Eigenschaften einer Abfrage (**Daten › Abfragen & Verbindungen**, Rechtsklick › **Eigenschaften**) stellst du ein, dass sie beim Öffnen der Datei oder alle n Minuten aktualisiert wird ([Aktualisieren einer externen Datenverbindung](https://support.microsoft.com/de-de/office/aktualisieren-einer-externen-datenverbindung-in-excel-1524175f-777a-48fc-8fc7-c8514b984440)). Beides setzt ein geöffnetes Excel voraus.
+
+  Ein VBA-Makro in einer `.xlsm`-Datei kann dieselbe Aktualisierung per Schaltfläche auslösen und danach speichern. [`Workbook.RefreshAll`](https://learn.microsoft.com/de-de/office/vba/api/excel.workbook.refreshall) aktualisiert alle externen Datenbereiche und PivotTables der Arbeitsmappe:
+
+  ```vba
+  Sub MonatsberichtAktualisieren()
+      ThisWorkbook.RefreshAll
+      ThisWorkbook.Save
+  End Sub
+  ```
+
+  Laufen Abfragen im Hintergrund, kehrt `RefreshAll` zurück, bevor alle Daten geladen sind, und das Makro speichert womöglich einen halben Stand. Schalte die Hintergrundaktualisierung in den Eigenschaften der Abfragen deshalb aus, wenn ein Makro nach dem Aktualisieren weiterarbeitet. VBA läuft nur in den Desktop-Versionen von Excel, nicht in Excel für das Web.
+
+  Office Scripts sind das Gegenstück für die Cloud: TypeScript, das in Excel für das Web, unter Windows und auf dem Mac läuft und sich aus einem Power Automate-Flow nach Zeitplan starten lässt:
+
+  ```typescript
+  function main(workbook: ExcelScript.Workbook) {
+    workbook.refreshAllDataConnections();
+    const blatt = workbook.getWorksheet("Bericht");
+    blatt.getRange("A1").setValue("Stand: automatisch aktualisiert");
+  }
+  ```
+
+  > [!NOTE] Die Grenze von Office Scripts in Power Automate
+  > Aus einem Power Automate-Flow heraus aktualisieren Office Scripts die meisten Daten nicht: `refreshAllDataConnections` wirkt dort nur auf Power BI-Quellen, `PivotTable.refresh` tut nichts – beide melden trotzdem Erfolg ([Problembehandlung für Power Automate mit Office-Skripts](https://learn.microsoft.com/de-de/office/dev/scripts/testing/power-automate-troubleshooting)). Eine Power Query-Abfrage auf einen Ordner lässt sich so nicht nach Zeitplan aktualisieren. Für den unbeaufsichtigten Lauf ist ein Skript mit Zeitplaner der verlässlichere Weg.
+
+  ## Protokoll, Trockenlauf und Zeitplan
+
+  Ein Job, der nachts läuft, muss morgens erklären können, was er getan hat. Protokolliere mit dem Modul `logging` ([logging.basicConfig](https://docs.python.org/3/library/logging.html#logging.basicConfig)) die gefundenen Dateien, die Zeilen je Datei, die Summen, die geschriebenen Dateien und jede Warnung – aber keine ganzen Datensätze mit Kundennamen. Ein **Trockenlauf** zeigt den Plan, ohne etwas zu schreiben. Und der **Exit-Code** sagt dem Zeitplaner, ob es geklappt hat: `0` für Erfolg, alles andere für Fehler.
+
+  ```python run
+  import argparse
+  import logging
+  import sys
+
+  log = logging.getLogger("monatsbericht")
+
+  def main(argv: list[str]) -> int:
+      parser = argparse.ArgumentParser(prog="monatsbericht", description="Monatsbericht Bohnenwerk")
+      parser.add_argument("--monat", required=True, help="Berichtsmonat, z. B. 2026-03")
+      parser.add_argument("--dry-run", action="store_true", help="nur anzeigen, nichts schreiben")
+      args = parser.parse_args(argv)
+      logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(levelname)s %(message)s", force=True)
+
+      plan = {"neu": ["bestellungen_2026-03.csv"], "geaendert": ["bestellungen_2026-02.csv"]}  # sonst: plane(…)
+      log.info("Berichtsmonat %s: %d neu, %d geändert", args.monat, len(plan["neu"]), len(plan["geaendert"]))
+      if plan["geaendert"]:
+          log.warning("Bereits berichtete Monate haben sich geändert: %s", ", ".join(plan["geaendert"]))
+      if args.dry_run:
+          log.info("Trockenlauf – würde schreiben: berichte/monatsbericht_%s.xlsx", args.monat)
+          return 0
+      # laden, prüfen, Bestand neu aufbauen, Bericht schreiben, Manifest speichern
+      return 0
+
+  print("Exit-Code:", main(["--monat", "2026-03", "--dry-run"]))
+  ```
+
+  Im echten Skript schreibt `logging` zusätzlich in eine Datei wie `logs/monatsbericht.log`, am besten mit Zeitstempel im Format (`%(asctime)s`). Das Muster „erst planen, dann handeln“ stammt aus [Automatisieren mit Verstand](/automation/automatisieren-denken); dort steht auch, wie du Planen und Ausführen sauber trennst.
+
+  Für den Zeitplan wiederholt dieses Modul nichts, was im Bereich Automation schon steht: cron und systemd-Timer mit verpassten Läufen und Überschneidungsschutz erklärt [Jobs zeitgesteuert ausführen](/automation/zeitsteuerung), geplante Läufe in GitHub Actions [Deployment & Continuous Integration](/automation/deployment-ci). Für Bohnenwerk reicht ein Eintrag, der am 2. jedes Monats um 6:15 Uhr startet – auf dem Linux-Server als crontab-Zeile:
+
+  ```text title=crontab
+  15 6 2 * * cd /srv/bohnenwerk && /usr/local/bin/uv run monatsbericht.py --monat "$(date -d 'last month' +\%Y-\%m)" >> logs/cron.log 2>&1
+  ```
+
+  Auf einem Windows-Rechner übernimmt die Aufgabenplanung diese Rolle, eingerichtet über die Oberfläche oder mit [`schtasks /create`](https://learn.microsoft.com/de-de/windows-server/administration/windows-commands/schtasks-create):
+
+  ```text title=Eingabeaufforderung
+  schtasks /create /tn "Bohnenwerk Monatsbericht" /tr "C:\Bohnenwerk\monatsbericht.cmd" /sc monthly /d 2 /st 06:15
+  ```
+
+  Beide Zeitpläne starten den Job einmal. Weil der Job idempotent ist, darfst du ihn jederzeit von Hand wiederholen – etwa nachdem der Shop einen korrigierten Export geliefert hat.
+
+  > [!PRAXIS]
+  > Der Monatsjob von Bohnenwerk läuft am 2. um 6:15 Uhr auf dem Büroserver. Er liest den Exportordner, baut den Bestand neu auf, prüft Status, Beträge und doppelte Bestellnummern und schreibt `monatsbericht_2026-03.xlsx` sowie eine Mail mit vier Kennzahlen. Findet er einen Fehler, schreibt er keinen Bericht, endet mit Exit-Code 1 und schickt stattdessen „Bericht nicht erstellt“ mit dem Grund. Merle liest um acht die Mail, statt selbst zu aktualisieren und Kennzahlen abzutippen. Kommt ein korrigierter Februar-Export, meldet der nächste Lauf „geändert: bestellungen_2026-02.csv“, und der Bericht wird als korrigierte Fassung neu verschickt.
+
+  ## Häufige Fehler
+
+  - **Anhängen ohne Schlüssel.** Der zweite Lauf verdoppelt Umsätze. Lösung: Bestand neu aufbauen oder per `drop_duplicates(subset=…, keep="last")` auf den fachlichen Schlüssel reduzieren.
+  - **Dateien unsortiert verarbeitet.** „Der jüngste Stand gewinnt“ hängt dann von der Reihenfolge des Dateisystems ab, und zwei Rechner rechnen verschieden. Lösung: `sorted(…)` über Namen mit sortierbarem Datum `JJJJ-MM`.
+  - **`glob("*.csv")` statt Namensvertrag.** Doppelte Downloads und Testdateien fließen ein. Lösung: `re.fullmatch` mit festem Muster, Rest ins Protokoll.
+  - **Manifest vor der Verarbeitung gespeichert.** Nach einem Abbruch gilt eine Datei als erledigt, ihre Daten fehlen. Lösung: Manifest als letzten Schritt schreiben.
+  - **Änderungszeit statt Inhalt.** Kopierte Dateien gelten als neu, überschriebene mit alter Zeit als unverändert. Lösung: SHA-256 über den Inhalt.
+  - **`thousands="."` ohne Datumstyp.** Datumswerte werden zu großen Ganzzahlen. Lösung: `parse_dates` mit `date_format` oder `dtype`.
+  - **Bericht nach Laufdatum benannt.** Der Märzbericht heißt `…_2026-04.xlsx`, Wiederholungen erzeugen neue Dateien. Lösung: Berichtsmonat im Namen.
+  - **Stilles Scheitern.** Ein `except Exception: pass` oder ein Job ohne Protokoll und Exit-Code fällt erst auf, wenn der Bericht fehlt. Lösung: Fehler protokollieren, Exit-Code ungleich 0, Benachrichtigung.
+  - **Office Script soll Power Query nach Zeitplan aktualisieren.** In Power Automate passiert dabei nichts, der Flow meldet trotzdem Erfolg. Lösung: Aktualisieren beim Öffnen oder ein Skript außerhalb von Excel.
+
+  ## Zusammenfassung
+
+  - Werkzeugwahl nach drei Fragen: Wo liegen die Daten, wer startet den Lauf, muss er ohne Menschen funktionieren? Power Query für Excel-Nutzer, SQL in der Datenbank, Python für unbeaufsichtigte Jobs, Office Scripts oder VBA für die Arbeitsmappe selbst.
+  - Ein Monatslauf ist idempotent, wenn ein zweiter Lauf denselben Bestand und Bericht erzeugt. Vollständiger Neuaufbau ist der einfachste Weg, Upsert über den fachlichen Schlüssel der zweite.
+  - Dateien sortiert und über ein festes Namensmuster verarbeiten; `glob` und `iterdir` garantieren keine Reihenfolge.
+  - Ein Manifest mit SHA-256-Prüfsummen erkennt neue und geänderte Dateien. Es wird erst nach erfolgreichem Schreiben aktualisiert; Bestand und Bericht werden atomar ersetzt.
+  - Kennzahlen im deutschen Format ohne `locale`, Quoten mit Prozentpunkten vergleichen, Berichte nach Berichtsmonat benennen. Excel-Ausgabe braucht `openpyxl`.
+  - Protokoll, Trockenlauf und Exit-Code machen einen nächtlichen Job überprüfbar; Zeitplan und Mailversand stehen im Bereich Automation.
+exercises:
+  - id: werkzeug-waehlen
+    type: choice
+    title: Montag, sieben Uhr, Kennzahlen im Postfach
+    prompt: |
+      Die Geschäftsführung von Bohnenwerk will jeden Montag um 7 Uhr eine Mail mit den Kennzahlen der Vorwoche. Die Bestellexporte liegen als CSV auf einem Netzlaufwerk; eine Excel-Arbeitsmappe mit Power Query-Abfragen auf diesen Ordner gibt es schon. Am Montagmorgen ist niemand im Büro. Welche Lösung trägt?
+    options:
+      - text: Ein Python-Skript, das die CSV-Dateien liest, die Kennzahlen berechnet und die Mail verschickt, gestartet von der Aufgabenplanung oder cron auf einem Rechner mit Zugriff auf das Netzlaufwerk.
+        correct: true
+        why: Das Skript braucht weder Excel noch einen Menschen, protokolliert seinen Lauf und meldet Fehler über den Exit-Code. Die bestehende Arbeitsmappe kann für die interaktive Analyse bleiben.
+      - text: Ein Office Script, das ein Power Automate-Flow montags startet; es ruft `refreshAllDataConnections()` auf und schickt danach die Werte aus der Arbeitsmappe per Mail.
+        correct: false
+        why: In Power Automate aktualisiert `refreshAllDataConnections` nur Power BI-Quellen. Die Power Query-Abfrage auf den Ordner bleibt auf dem alten Stand, und der Flow meldet trotzdem Erfolg.
+      - text: In den Abfrageeigenschaften „Aktualisierung alle 60 Minuten“ einstellen.
+        correct: false
+        why: Die Aktualisierung läuft nur, solange die Arbeitsmappe in einem Excel geöffnet ist, und sie verschickt keine Mail.
+      - text: Ein VBA-Makro in `Workbook_Open`, das `ThisWorkbook.RefreshAll` aufruft und die Mail über Outlook sendet.
+        correct: false
+        why: Das Makro läuft erst, wenn jemand die Datei in Excel für den Desktop öffnet. Am Montagmorgen ist niemand da, der das tut.
+    explanation: |
+      Die entscheidende Anforderung ist „ohne Menschen zu einer festen Zeit“. Power Query und VBA brauchen ein geöffnetes Excel, und Office Scripts können in Power Automate keine Power Query-Verbindungen aktualisieren. Ein Skript mit Zeitplaner erfüllt die Anforderung und bleibt überprüfbar: Protokoll, Exit-Code und eine Fehlermail, wenn etwas nicht stimmt. Die Excel-Arbeitsmappe wird dadurch nicht überflüssig – sie bleibt das Werkzeug für Rückfragen und Detailanalysen.
+    resources:
+      - title: Problembehandlung für Power Automate mit Office-Skripts
+        url: https://learn.microsoft.com/de-de/office/dev/scripts/testing/power-automate-troubleshooting
+      - title: Aktualisieren einer externen Datenverbindung in Excel
+        url: https://support.microsoft.com/de-de/office/aktualisieren-einer-externen-datenverbindung-in-excel-1524175f-777a-48fc-8fc7-c8514b984440
+
+  - id: monatslauf-ablauf
+    type: order
+    title: Der Monatslauf in der richtigen Reihenfolge
+    prompt: |
+      Bring die Zeilen des Monatslaufs in die richtige Reihenfolge. Regeln: Der Trockenlauf liest nur und zeigt den Plan. Geprüft wird vor jedem Schreiben. Das Manifest wird als Letztes gespeichert, damit ein Abbruch keine Datei als erledigt markiert. Bestand und Bericht dürfen in beliebiger Reihenfolge geschrieben werden.
+    lang: python
+    lines: |
+      def monatslauf(eingang: Path, arbeit: Path, monat: str, dry_run: bool) -> int:
+          manifest = lade_manifest(arbeit / "manifest.json")
+          plan = plane(eingang, manifest)
+          if dry_run:
+              return zeige(plan)
+          bestand = baue_bestand_neu(eingang)
+          pruefe(bestand)
+          schreibe_atomar(bestand, arbeit / "bestand.csv")
+          schreibe_bericht(bestand, monat, arbeit / f"monatsbericht_{monat}.xlsx")
+          speichere_manifest(arbeit / "manifest.json", plan)
+          return 0
+    alternatives:
+      - [1, 2, 3, 4, 5, 6, 7, 9, 8, 10, 11]
+    hints:
+      - Der Plan braucht das Manifest, der Trockenlauf braucht den Plan.
+      - "`pruefe` wirft bei Fehlern eine Ausnahme – alles, was danach kommt, passiert nur mit geprüften Daten."
+    explanation: |
+      Ohne Manifest kein Plan, ohne Plan kein Trockenlauf – und der Trockenlauf endet, bevor irgendetwas gebaut oder geschrieben wird. Danach wird der Bestand aus allen Rohdateien neu aufgebaut und geprüft, bevor eine Datei entsteht. Bestand und Bericht sind voneinander unabhängig; ihre Reihenfolge ist frei. Das Manifest kommt zuletzt: Bricht der Lauf beim Schreiben ab, gelten die Dateien beim nächsten Lauf weiter als neu, und nichts geht verloren.
+    resources:
+      - title: Python · os.replace
+        url: https://docs.python.org/3/library/os.html#os.replace
+
+  - id: datum-wird-zahl
+    type: output
+    title: Ein Datum mit Tausenderpunkt
+    prompt: Was gibt das Programm aus?
+    lang: python
+    code: |
+      import io
+      import pandas as pd
+
+      export = io.StringIO(
+          "bestellung_id;bestelldatum;warenwert\n"
+          "10231;02.03.2026;1.240,00\n"
+          "10232;14.03.2026;48,90\n"
+      )
+      df = pd.read_csv(export, sep=";", decimal=",", thousands=".")
+      print(df["warenwert"].tolist())
+      print(df["bestelldatum"].tolist())
+      print(df["bestelldatum"].dtype)
+    expected: |
+      [1240.0, 48.9]
+      [2032026, 14032026]
+      int64
+    hints:
+      - "`thousands` gilt nicht nur für die Spalte `warenwert`."
+      - Was bleibt von `02.03.2026` übrig, wenn man alle Tausenderpunkte entfernt?
+    explanation: |
+      `thousands="."` erlaubt pandas, Punkte in jeder Spalte als Tausendertrennzeichen zu überspringen, die es als Zahl lesen kann. `02.03.2026` wird so zu `02032026` und damit zur Ganzzahl 2032026, die Spalte bekommt den Typ `int64` – ohne Warnung. Die Beträge sind dagegen richtig. Lies Datumsspalten deshalb ausdrücklich mit `parse_dates=["bestelldatum"]` und `date_format="%d.%m.%Y"` oder zunächst als Text mit `dtype={"bestelldatum": "str"}`.
+    resources:
+      - title: pandas · read_csv
+        url: https://pandas.pydata.org/docs/reference/api/pandas.read_csv.html
+
+  - id: zweimal-angehaengt
+    type: output
+    title: Zweimal derselbe Monat
+    prompt: Was gibt das Programm aus?
+    lang: python
+    code: |
+      import pandas as pd
+
+      def upsert(bestand: pd.DataFrame, neu: pd.DataFrame) -> pd.DataFrame:
+          return (pd.concat([bestand, neu], ignore_index=True)
+                    .drop_duplicates(subset="bestellung_id", keep="last")
+                    .reset_index(drop=True))
+
+      bestand = pd.DataFrame({"bestellung_id": [10231, 10232], "warenwert": [50.0, 1240.0]})
+      neu = pd.DataFrame({"bestellung_id": [10232, 10301], "warenwert": [1250.0, 20.0]})
+
+      einmal = upsert(bestand, neu)
+      zweimal = upsert(einmal, neu)
+      print(len(pd.concat([bestand, neu, neu])))
+      print(len(einmal), len(zweimal))
+      print(zweimal["warenwert"].tolist())
+    expected: |
+      6
+      3 3
+      [50.0, 1250.0, 20.0]
+    explanation: |
+      Reines Anhängen (`concat`) zählt jede Zeile, auch doppelt gelieferte: 2 + 2 + 2 = 6. `upsert` behält je `bestellung_id` nur die letzte Zeile. Beim ersten Lauf ersetzt die neue Zeile 10232 die alte (1240 → 1250), 10301 kommt dazu – drei Zeilen. Der zweite Lauf mit denselben Daten ändert nichts mehr: Das ist Idempotenz. `keep="last"` funktioniert aber nur, weil `neu` hinter `bestand` steht; die Reihenfolge der Teile entscheidet, welcher Stand gewinnt.
+    resources:
+      - title: pandas · DataFrame.drop_duplicates
+        url: https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.drop_duplicates.html
+      - title: pandas · concat
+        url: https://pandas.pydata.org/docs/reference/api/pandas.concat.html
+
+  - id: pruefsumme-vergleichen
+    type: output
+    title: Gleiche Daten, andere Bytes
+    prompt: Was gibt das Programm aus?
+    lang: python
+    code: |
+      import hashlib
+      from pathlib import Path
+
+      def pruefsumme(pfad: Path) -> str:
+          with pfad.open("rb") as datei:
+              return hashlib.file_digest(datei, "sha256").hexdigest()
+
+      datei = Path("bestellungen_2026-03.csv")
+      datei.write_text("bestellung_id;warenwert\n10231;48,90\n", encoding="utf-8")
+      manifest = {datei.name: pruefsumme(datei)}
+
+      datei.write_text("bestellung_id;warenwert\n10231;48,90\n", encoding="utf-8")        # erneut heruntergeladen
+      print(pruefsumme(datei) == manifest[datei.name])
+      datei.write_bytes("bestellung_id;warenwert\r\n10231;48,90\r\n".encode("utf-8"))    # Windows-Zeilenenden
+      print(pruefsumme(datei) == manifest[datei.name])
+      datei.write_text("bestellung_id;warenwert\n10231;48,90\n", encoding="utf-8-sig")    # mit BOM
+      print(pruefsumme(datei) == manifest[datei.name])
+      print(len(manifest[datei.name]))
+    expected: |
+      True
+      False
+      False
+      64
+    explanation: |
+      Die Prüfsumme hängt nur an den Bytes. Dieselben Bytes, neu geschrieben, ergeben dieselbe Summe – egal, wie sich die Änderungszeit verschoben hat. Windows-Zeilenenden (`\r\n`) und ein BOM ändern die Bytes und damit die Summe, obwohl die Daten gleich bleiben. Für einen Monatsjob ist das ein harmloser Fehlalarm: Die Datei wird noch einmal verarbeitet, und weil die Verarbeitung idempotent ist, bleibt der Bestand gleich. Ein SHA-256-Wert als Hexadezimaltext ist immer 64 Zeichen lang.
+    resources:
+      - title: Python · hashlib.file_digest
+        url: https://docs.python.org/3/library/hashlib.html#hashlib.file_digest
+
+  - id: manifest-schreiben
+    type: gap
+    title: Prüfsumme und Manifest
+    prompt: |
+      Ergänze die beiden Hilfsfunktionen. `pruefsumme` berechnet SHA-256 über die Bytes der Datei. `speichere_manifest` schreibt das Manifest so, dass ein Absturz mitten im Schreiben nie eine halbe `manifest.json` hinterlässt.
+    lang: python
+    code: |
+      import hashlib
+      import json
+      from pathlib import Path
+
+      def pruefsumme(pfad: Path) -> str:
+          with pfad.open(⟦"rb"⟧) as datei:
+              return hashlib.⟦file_digest⟧(datei, "sha256").hexdigest()
+
+      def speichere_manifest(pfad: Path, manifest: dict[str, str]) -> None:
+          tmp = pfad.with_suffix(".tmp")
+          tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+          ⟦tmp.replace(pfad)⟧
+    gaps:
+      - label: Dateimodus
+        hint: Eine Prüfsumme wird über Bytes berechnet, nicht über Text.
+      - label: Funktion aus hashlib
+        hint: Seit Python 3.11 berechnet eine Funktion den Hash direkt aus einem Dateiobjekt.
+      - label: Atomar ersetzen
+        hint: Die temporäre Datei soll die alte ersetzen – mit einer Methode von `Path` oder einer Funktion aus `os`.
+        accept: ["os.replace(tmp, pfad)"]
+    explanation: |
+      `"rb"` öffnet die Datei binär; eine Prüfsumme über dekodierten Text würde von Encoding und Zeilenenden abhängen. `hashlib.file_digest` liest die Datei in Blöcken und liefert ein Hash-Objekt, `hexdigest()` den Text für das Manifest. `tmp.replace(pfad)` entspricht `os.replace`: Innerhalb eines Dateisystems ersetzt es die Zieldatei atomar – wer sie liest, sieht entweder das alte oder das neue Manifest. `sort_keys=True` sorgt für eine stabile Reihenfolge, sodass ein Diff nur echte Änderungen zeigt. Unter Linux und macOS ersetzt auch `rename` atomar; unter Windows scheitert es, wenn das Ziel schon existiert, deshalb ist `replace` die portable Wahl.
+    resources:
+      - title: Python · hashlib.file_digest
+        url: https://docs.python.org/3/library/hashlib.html#hashlib.file_digest
+      - title: Python · os.replace
+        url: https://docs.python.org/3/library/os.html#os.replace
+
+  - id: trockenlauf-schalter
+    type: gap
+    title: Ein Schalter für den Trockenlauf
+    prompt: |
+      Ergänze den Anfang von `main`. `--dry-run` ist ein Schalter ohne Wert. Das Protokoll soll Meldungen ab der Stufe INFO in die Datei schreiben. Im Trockenlauf wird nur der Plan protokolliert.
+    lang: python
+    code: |
+      def main(argv: list[str]) -> int:
+          parser = argparse.ArgumentParser(prog="monatsbericht")
+          parser.add_argument("--monat", required=True, help="Berichtsmonat JJJJ-MM")
+          parser.add_argument("--dry-run", action=⟦"store_true"⟧, help="nur anzeigen, nichts schreiben")
+          args = parser.parse_args(argv)
+          logging.basicConfig(filename="logs/monatsbericht.log", encoding="utf-8", level=⟦logging.INFO⟧,
+                              format="%(asctime)s %(levelname)s %(message)s")
+          plan = plane(EINGANG, lade_manifest(MANIFEST))
+          log.info("Monat %s: neu=%s geaendert=%s", args.monat, plan["neu"], plan["geaendert"])
+          if ⟦args.dry_run⟧:
+              return 0
+    gaps:
+      - label: Schalter ohne Wert
+        hint: Die Aktion speichert `True`, wenn die Option angegeben ist.
+      - label: Protokollstufe
+        hint: Die Stufe für normale Ablaufmeldungen, als Konstante aus `logging`.
+        accept: ['"INFO"', "20"]
+      - label: Wert des Schalters
+        hint: argparse macht aus Bindestrichen im Optionsnamen Unterstriche.
+    explanation: |
+      `action="store_true"` macht aus `--dry-run` einen Schalter: angegeben `True`, sonst `False`. argparse legt das Attribut als `args.dry_run` an, weil Bindestriche in Attributnamen nicht erlaubt sind. `level=logging.INFO` (gleichwertig `"INFO"` oder `20`) lässt INFO, WARNING, ERROR und CRITICAL ins Protokoll, DEBUG nicht. Der Trockenlauf protokolliert den Plan und endet, bevor irgendetwas geschrieben wird – so lässt sich ein neuer Monat gefahrlos ansehen.
+    resources:
+      - title: Python · argparse (action)
+        url: https://docs.python.org/3/library/argparse.html#action
+      - title: Python · logging.basicConfig
+        url: https://docs.python.org/3/library/logging.html#logging.basicConfig
+
+  - id: neue-dateien-erkennen
+    type: code
+    title: Was ist neu im Eingangsordner?
+    prompt: |
+      Schreibe `plane(eingang: Path, manifest: dict[str, str]) -> dict[str, list[str]]`.
+
+      - Berücksichtigt werden nur Dateien direkt in `eingang`, deren Name **genau** dem Muster `bestellungen_JJJJ-MM.csv` entspricht, etwa `bestellungen_2026-03.csv`. Alles andere wird ignoriert.
+      - `"neu"`: Name steht nicht im Manifest. `"geaendert"`: Name steht im Manifest, aber die SHA-256-Prüfsumme des Inhalts weicht ab. `"unveraendert"`: Prüfsumme stimmt.
+      - `"fehlend"`: Namen aus dem Manifest, zu denen es keine Datei mehr gibt – ein Monat ist aus dem Ordner verschwunden.
+      - Jede Liste ist alphabetisch sortiert. Die Funktion verändert keine Dateien.
+
+      `pruefsumme(pfad)` ist schon vorhanden. Im Ordner `eingang` liegen: `bestellungen_2026-01.csv`, `bestellungen_2026-02.csv`, `bestellungen_2026-03.csv`, `bestellungen_2026-03 (1).csv`, `bestellungen_2026-4.csv`, `notizen.txt` und ein Unterordner `archiv`.
+    lang: python
+    setup: |
+      from pathlib import Path
+      eingang = Path("eingang")
+      (eingang / "archiv").mkdir(parents=True)
+      kopf = "bestellung_id;kunde_id;bestelldatum;kanal;status;warenwert\n"
+      inhalte = {
+          "bestellungen_2026-01.csv": "10001;17;05.01.2026;Shop;bezahlt;48,90\n",
+          "bestellungen_2026-02.csv": "10003;8;02.02.2026;Shop;storniert;21,50\n",
+          "bestellungen_2026-03.csv": "10231;23;02.03.2026;B2B;bezahlt;1.240,00\n",
+          "bestellungen_2026-03 (1).csv": "10231;23;02.03.2026;B2B;bezahlt;1.240,00\n",
+          "bestellungen_2026-4.csv": "10301;41;01.04.2026;Shop;bezahlt;19,90\n",
+          "archiv/bestellungen_2025-12.csv": "9990;17;15.12.2025;Shop;bezahlt;30,00\n",
+      }
+      for name, zeilen in inhalte.items():
+          (eingang / name).write_text(kopf + zeilen, encoding="utf-8")
+      (eingang / "notizen.txt").write_text("Rückfragen an den Shop\n", encoding="utf-8")
+    starter: |
+      import hashlib
+      from pathlib import Path
+
+      def pruefsumme(pfad: Path) -> str:
+          with pfad.open("rb") as datei:
+              return hashlib.file_digest(datei, "sha256").hexdigest()
+
+      def plane(eingang: Path, manifest: dict[str, str]) -> dict[str, list[str]]:
+          plan = {"neu": [], "geaendert": [], "unveraendert": [], "fehlend": []}
+          for pfad in eingang.glob("*.csv"):
+              plan["neu"].append(pfad.name)
+          return plan
+    solution: |
+      import hashlib
+      import re
+      from pathlib import Path
+
+      MUSTER = re.compile(r"bestellungen_\d{4}-\d{2}\.csv")
+
+      def pruefsumme(pfad: Path) -> str:
+          with pfad.open("rb") as datei:
+              return hashlib.file_digest(datei, "sha256").hexdigest()
+
+      def plane(eingang: Path, manifest: dict[str, str]) -> dict[str, list[str]]:
+          plan = {"neu": [], "geaendert": [], "unveraendert": [], "fehlend": []}
+          vorhanden = set()
+          for pfad in sorted(eingang.iterdir()):
+              if not pfad.is_file() or not MUSTER.fullmatch(pfad.name):
+                  continue
+              vorhanden.add(pfad.name)
+              if pfad.name not in manifest:
+                  plan["neu"].append(pfad.name)
+              elif manifest[pfad.name] != pruefsumme(pfad):
+                  plan["geaendert"].append(pfad.name)
+              else:
+                  plan["unveraendert"].append(pfad.name)
+          plan["fehlend"] = sorted(set(manifest) - vorhanden)
+          return plan
+    tests:
+      - name: Leeres Manifest – alle gültigen Dateien sind neu
+        code: |
+          plan = plane(Path("eingang"), {})
+          assert plan["neu"] == ["bestellungen_2026-01.csv", "bestellungen_2026-02.csv", "bestellungen_2026-03.csv"], f"neu ist {plan['neu']!r}"
+          assert plan["geaendert"] == [] and plan["unveraendert"] == [] and plan["fehlend"] == [], f"bekommen: {plan!r}"
+      - name: Doppelte Downloads, falsche Namen und Unterordner werden ignoriert
+        code: |
+          plan = plane(Path("eingang"), {})
+          alle = [name for namen in plan.values() for name in namen]
+          for fremd in ["bestellungen_2026-03 (1).csv", "bestellungen_2026-4.csv", "notizen.txt", "archiv", "bestellungen_2025-12.csv"]:
+              assert fremd not in alle, f"{fremd} gehört in keine Liste – nur Namen wie bestellungen_2026-03.csv direkt im Ordner zählen"
+      - name: Unveränderte und geänderte Dateien
+        code: |
+          januar = Path("eingang/bestellungen_2026-01.csv")
+          manifest = {"bestellungen_2026-01.csv": pruefsumme(januar), "bestellungen_2026-02.csv": "0" * 64}
+          plan = plane(Path("eingang"), manifest)
+          assert plan["unveraendert"] == ["bestellungen_2026-01.csv"], f"unveraendert ist {plan['unveraendert']!r}"
+          assert plan["geaendert"] == ["bestellungen_2026-02.csv"], f"geaendert ist {plan['geaendert']!r} – vergleiche die SHA-256-Prüfsumme"
+          assert plan["neu"] == ["bestellungen_2026-03.csv"], f"neu ist {plan['neu']!r}"
+      - name: Verschwundene Monate werden gemeldet
+        code: |
+          manifest = {"bestellungen_2025-11.csv": "a" * 64, "bestellungen_2025-10.csv": "b" * 64}
+          plan = plane(Path("eingang"), manifest)
+          assert plan["fehlend"] == ["bestellungen_2025-10.csv", "bestellungen_2025-11.csv"], f"fehlend ist {plan['fehlend']!r}"
+      - name: Leerer Ordner, keine Nebenwirkungen
+        code: |
+          vorher = sorted(p.name for p in Path("eingang").iterdir())
+          Path("leer").mkdir(exist_ok=True)
+          plan = plane(Path("leer"), {})
+          assert plan == {"neu": [], "geaendert": [], "unveraendert": [], "fehlend": []}, f"bekommen: {plan!r}"
+          assert sorted(p.name for p in Path("eingang").iterdir()) == vorher, "plane darf keine Dateien anlegen, verschieben oder löschen"
+    hints:
+      - Ein regulärer Ausdruck mit `fullmatch` prüft den ganzen Namen, `glob("*.csv")` lässt zu viel durch.
+      - "`sorted(eingang.iterdir())` liefert eine feste Reihenfolge; Unterordner erkennst du mit `pfad.is_file()`."
+      - "Für `fehlend`: Mengen helfen – `set(manifest) - vorhanden`."
+    explanation: |
+      Das Namensmuster ist der Vertrag mit dem Exportsystem: `bestellungen_\d{4}-\d{2}\.csv` mit `fullmatch` lässt weder doppelte Downloads noch Tippfehler wie `2026-4` durch, und `iterdir` schaut nicht in Unterordner. Die Prüfsumme vergleicht den Inhalt statt der Änderungszeit, deshalb erkennt der Plan einen korrigierten Export auch dann, wenn Name und Größe gleich bleiben. `fehlend` ist die Gegenrichtung: Verschwindet ein Monat aus dem Ordner, würde ein Neuaufbau ihn stillschweigend aus dem Bestand entfernen – das soll ein Mensch vorher sehen. Weil `plane` nichts verändert, ist sie zugleich der Trockenlauf.
+    resources:
+      - title: Python · pathlib.Path.iterdir
+        url: https://docs.python.org/3/library/pathlib.html#pathlib.Path.iterdir
+      - title: Python · re.fullmatch
+        url: https://docs.python.org/3/library/re.html#re.fullmatch
+
+  - id: monat-laden
+    type: code
+    title: Ein Shop-Export, sauber geladen
+    prompt: |
+      Schreibe `lade_monat(pfad: Path) -> pd.DataFrame` für einen Shop-Export von Bohnenwerk. Die Datei ist UTF-8 mit BOM, Trennzeichen `;`, Dezimalkomma, Tausenderpunkt, Datum `TT.MM.JJJJ`. Manche Exporte enden mit einer Summenzeile, deren `bestellung_id` `Summe` lautet, und in `kanal` stehen gelegentlich Leerzeichen am Rand.
+
+      Ergebnis:
+
+      - keine Summenzeile;
+      - `bestellung_id` und `kunde_id` als Ganzzahlen, `bestelldatum` als Datum (`datetime64`), `warenwert` als Kommazahl;
+      - `kanal` ohne Leerzeichen am Rand;
+      - eine zusätzliche Spalte `quelle` mit dem Dateinamen.
+
+      Im Arbeitsverzeichnis liegen `bestellungen_2026-03.csv` (mit Summenzeile) und `bestellungen_2026-04.csv` (ohne).
+    lang: python
+    setup: |
+      from pathlib import Path
+      kopf = "bestellung_id;kunde_id;bestelldatum;kanal;status;warenwert\n"
+      Path("bestellungen_2026-03.csv").write_text(
+          kopf
+          + "10231;17;02.03.2026;Shop ;bezahlt;48,90\n"
+          + "10232;23;02.03.2026;B2B;bezahlt;1.240,00\n"
+          + "10233;8;14.03.2026; Shop;storniert;21,50\n"
+          + "10234;41;31.03.2026;Shop;bezahlt;64,20\n"
+          + "Summe;;;;;1.374,60\n",
+          encoding="utf-8-sig")
+      Path("bestellungen_2026-04.csv").write_text(
+          kopf + "10301;17;01.04.2026;Shop;bezahlt;19,90\n", encoding="utf-8-sig")
+    starter: |
+      from pathlib import Path
+      import pandas as pd
+
+      def lade_monat(pfad: Path) -> pd.DataFrame:
+          return pd.read_csv(pfad, sep=";")
+    solution: |
+      from pathlib import Path
+      import pandas as pd
+
+      def lade_monat(pfad: Path) -> pd.DataFrame:
+          df = pd.read_csv(pfad, sep=";", decimal=",", thousands=".", encoding="utf-8-sig",
+                           dtype={"bestellung_id": "str"},
+                           parse_dates=["bestelldatum"], date_format="%d.%m.%Y")
+          df = df[df["bestellung_id"] != "Summe"]
+          return df.astype({"bestellung_id": "int64", "kunde_id": "int64"}).assign(
+              kanal=df["kanal"].str.strip(),
+              quelle=pfad.name,
+          ).reset_index(drop=True)
+    tests:
+      - name: Summenzeile entfernt, IDs als Ganzzahl
+        code: |
+          df = lade_monat(Path("bestellungen_2026-03.csv"))
+          assert len(df) == 4, f"erwartet 4 Bestellungen, bekommen {len(df)} – ist die Summenzeile noch drin?"
+          assert pd.api.types.is_integer_dtype(df["bestellung_id"]), f"bestellung_id hat den Typ {df['bestellung_id'].dtype}"
+          assert pd.api.types.is_integer_dtype(df["kunde_id"]), f"kunde_id hat den Typ {df['kunde_id'].dtype}"
+          assert df["bestellung_id"].tolist() == [10231, 10232, 10233, 10234], f"bestellung_id: {df['bestellung_id'].tolist()!r}"
+      - name: Beträge mit Dezimalkomma und Tausenderpunkt
+        code: |
+          df = lade_monat(Path("bestellungen_2026-03.csv"))
+          werte = [round(float(w), 2) for w in df["warenwert"]]
+          assert werte == [48.9, 1240.0, 21.5, 64.2], f"warenwert: {werte!r}"
+      - name: Datum als Datum, nicht als Zahl
+        code: |
+          df = lade_monat(Path("bestellungen_2026-03.csv"))
+          assert pd.api.types.is_datetime64_any_dtype(df["bestelldatum"]), f"bestelldatum hat den Typ {df['bestelldatum'].dtype} – Vorsicht mit thousands='.'"
+          assert df["bestelldatum"].dt.day.tolist() == [2, 2, 14, 31], f"Tage: {df['bestelldatum'].dt.day.tolist()!r}"
+          assert set(df["bestelldatum"].dt.month) == {3}, "alle Bestellungen stammen aus dem März"
+      - name: Kanal bereinigt, Herkunft vermerkt
+        code: |
+          df = lade_monat(Path("bestellungen_2026-03.csv"))
+          assert df["kanal"].tolist() == ["Shop", "B2B", "Shop", "Shop"], f"kanal: {df['kanal'].tolist()!r}"
+          assert df["quelle"].tolist() == ["bestellungen_2026-03.csv"] * 4, f"quelle: {df['quelle'].tolist()!r}"
+      - name: Export ohne Summenzeile
+        code: |
+          df = lade_monat(Path("bestellungen_2026-04.csv"))
+          assert len(df) == 1 and df["bestellung_id"].tolist() == [10301], f"bekommen: {df.to_dict('records')!r}"
+          assert df["quelle"].tolist() == ["bestellungen_2026-04.csv"]
+    hints:
+      - "`read_csv` kennt `sep`, `decimal`, `thousands` und `encoding`. `utf-8-sig` entfernt das BOM."
+      - "Mit `thousands=\".\"` wird ein Datum wie `02.03.2026` zur Zahl, wenn du es nicht ausdrücklich als Datum liest: `parse_dates=[…]` und `date_format=\"%d.%m.%Y\"`."
+      - Lies `bestellung_id` zuerst als Text, filtere `Summe` heraus und wandle danach mit `astype` in `int64` um.
+    explanation: |
+      Die Summenzeile macht `bestellung_id` zu einer Textspalte und `kunde_id` wegen der leeren Zelle zu einer Kommazahl. Deshalb liest die Lösung die ID zuerst als Text, entfernt die Summenzeile über eine Bedingung und wandelt erst danach in Ganzzahlen um. `parse_dates` mit `date_format` schützt das Datum vor `thousands="."`, das sonst `02.03.2026` in 2032026 verwandeln würde. `str.strip()` vereinheitlicht `"Shop "` und `" Shop"`, sonst zählt eine Gruppierung nach Kanal vier statt zwei Kanäle. `quelle` hält fest, aus welcher Datei jede Zeile stammt – beim Zusammenführen vieler Monate die wichtigste Spur, wenn eine Zahl nicht stimmt.
+    resources:
+      - title: pandas · read_csv
+        url: https://pandas.pydata.org/docs/reference/api/pandas.read_csv.html
+      - title: pandas · DataFrame.astype
+        url: https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.astype.html
+
+  - id: idempotent-zusammenfuehren
+    type: code
+    title: Repariere den Monatsimport, der doppelt zählt
+    prompt: |
+      `aktualisiere_bestand(eingang: Path, bestand: Path) -> int` soll die Monatsdateien aus `eingang` zu einem Bestand zusammenführen, ihn als CSV (Komma als Trennzeichen, ohne Index) nach `bestand` schreiben und die Zahl der Bestellungen im Bestand zurückgeben. Der Startcode hängt bei jedem Lauf an – nach dem zweiten Lauf ist jeder Umsatz doppelt. Repariere die Funktion:
+
+      - Nur Dateien, deren Name genau `bestellungen_JJJJ-MM.csv` lautet. Sie haben die Spalten `bestellung_id;status;warenwert` mit Dezimalkomma.
+      - Ein zweiter Lauf mit denselben Dateien erzeugt exakt denselben Bestand.
+      - Kommt eine `bestellung_id` in mehreren Monaten vor (Statusänderung), gilt die Zeile aus dem jüngsten Monat.
+      - Der Bestand ist nach `bestellung_id` sortiert.
+      - Gibt es keine einzige Monatsdatei, wirf einen `ValueError` und lass `bestand` unangetastet.
+    lang: python
+    setup: |
+      from pathlib import Path
+      eingang = Path("eingang")
+      eingang.mkdir()
+      kopf = "bestellung_id;status;warenwert\n"
+      (eingang / "bestellungen_2026-02.csv").write_text(kopf + "10003;storniert;21,50\n10004;bezahlt;64,20\n", encoding="utf-8")
+      (eingang / "bestellungen_2026-03.csv").write_text(kopf + "10231;bezahlt;48,90\n10232;bezahlt;1240,00\n", encoding="utf-8")
+      (eingang / "bestellungen_2026-03 (1).csv").write_text(kopf + "10231;bezahlt;48,90\n99999;bezahlt;1,00\n", encoding="utf-8")
+    starter: |
+      from pathlib import Path
+      import pandas as pd
+
+      def aktualisiere_bestand(eingang: Path, bestand: Path) -> int:
+          for pfad in eingang.glob("bestellungen_*.csv"):
+              monat = pd.read_csv(pfad, sep=";", decimal=",")
+              monat.to_csv(bestand, mode="a", header=not bestand.exists(), index=False)
+          return len(pd.read_csv(bestand))
+    solution: |
+      import re
+      from pathlib import Path
+      import pandas as pd
+
+      MUSTER = re.compile(r"bestellungen_\d{4}-\d{2}\.csv")
+
+      def aktualisiere_bestand(eingang: Path, bestand: Path) -> int:
+          dateien = sorted(p for p in eingang.iterdir() if MUSTER.fullmatch(p.name))
+          if not dateien:
+              raise ValueError(f"keine Monatsdateien in {eingang}")
+          teile = [pd.read_csv(p, sep=";", decimal=",") for p in dateien]
+          gesamt = (pd.concat(teile, ignore_index=True)
+                      .drop_duplicates(subset="bestellung_id", keep="last")
+                      .sort_values("bestellung_id"))
+          tmp = bestand.with_name(bestand.name + ".tmp")
+          gesamt.to_csv(tmp, index=False)
+          tmp.replace(bestand)
+          return len(gesamt)
+    tests:
+      - name: Erster Lauf
+        code: |
+          n = aktualisiere_bestand(Path("eingang"), Path("bestand.csv"))
+          ids = pd.read_csv("bestand.csv")["bestellung_id"].tolist()
+          assert ids == [10003, 10004, 10231, 10232], f"Bestand enthält {ids!r}"
+          assert n == 4, f"Rückgabe {n!r}, erwartet 4"
+      - name: Zweiter Lauf ändert nichts
+        code: |
+          vorher = Path("bestand.csv").read_text(encoding="utf-8")
+          n = aktualisiere_bestand(Path("eingang"), Path("bestand.csv"))
+          assert n == 4, f"nach dem zweiten Lauf {n} Bestellungen – der Import zählt doppelt"
+          assert Path("bestand.csv").read_text(encoding="utf-8") == vorher, "der zweite Lauf hat bestand.csv verändert"
+      - name: Doppelter Download fließt nicht ein
+        code: |
+          ids = pd.read_csv("bestand.csv")["bestellung_id"].tolist()
+          assert 99999 not in ids, "bestellungen_2026-03 (1).csv ist kein gültiger Monatsexport"
+      - name: Neuer Monat mit Statusänderung
+        code: |
+          Path("eingang/bestellungen_2026-04.csv").write_text(
+              "bestellung_id;status;warenwert\n10232;retourniert;1240,00\n10301;bezahlt;19,90\n", encoding="utf-8")
+          n = aktualisiere_bestand(Path("eingang"), Path("bestand.csv"))
+          df = pd.read_csv("bestand.csv")
+          assert n == 5 and len(df) == 5, f"erwartet 5 Bestellungen, bekommen {len(df)}"
+          status = df.set_index("bestellung_id")["status"].to_dict()
+          assert status[10232] == "retourniert", f"10232 hat Status {status[10232]!r} – der jüngste Monat muss gewinnen"
+          assert df["bestellung_id"].tolist() == sorted(df["bestellung_id"]), "Bestand ist nicht nach bestellung_id sortiert"
+      - name: Leerer Ordner
+        code: |
+          Path("leer").mkdir(exist_ok=True)
+          try:
+              aktualisiere_bestand(Path("leer"), Path("leer_bestand.csv"))
+          except ValueError:
+              pass
+          else:
+              raise AssertionError("ohne Monatsdatei wird ein ValueError erwartet")
+          assert not Path("leer_bestand.csv").exists(), "ohne Monatsdatei darf kein Bestand entstehen"
+    hints:
+      - Statt anzuhängen, baue den Bestand bei jedem Lauf aus allen Monatsdateien neu auf und überschreibe die Datei.
+      - "`drop_duplicates(subset=\"bestellung_id\", keep=\"last\")` behält die zuletzt gelesene Zeile – lies die Dateien deshalb sortiert, ältester Monat zuerst."
+      - "Den Dateinamen prüfst du mit `re.compile(r\"bestellungen_\\d{4}-\\d{2}\\.csv\").fullmatch(name)`."
+    explanation: |
+      Der Startcode beschreibt eine Aktion („hänge an“) und ist deshalb nicht idempotent; außerdem lässt `glob("bestellungen_*.csv")` den doppelten Download durch. Die Lösung beschreibt den Zielzustand: Bei jedem Lauf entsteht der Bestand vollständig neu aus den gültigen Rohdateien, jede Bestellung genau einmal, im Stand des jüngsten Monats. Dafür müssen die Dateien sortiert gelesen werden – `iterdir` garantiert keine Reihenfolge, und `keep="last"` nimmt die zuletzt gelesene Zeile. Das Schreiben über eine temporäre Datei mit `replace` sorgt dafür, dass ein Abbruch nie einen halben Bestand hinterlässt.
+    resources:
+      - title: pandas · DataFrame.drop_duplicates
+        url: https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.drop_duplicates.html
+      - title: Python · pathlib.Path.glob
+        url: https://docs.python.org/3/library/pathlib.html#pathlib.Path.glob
+
+  - id: kennzahlen-bericht
+    type: code
+    title: Vier Zeilen für die Geschäftsführung
+    prompt: |
+      Schreibe `bericht(df: pd.DataFrame, monat: str) -> str`. `df` hat die Spalten `monat` (Text `JJJJ-MM`), `status` und `warenwert`. Gib genau vier Zeilen zurück, verbunden mit `\n`, ohne Zeilenumbruch am Ende:
+
+      ```text
+      Monatsbericht 2026-03
+      Warenwert bezahlt: 1.466,60 EUR (+13,8 % zum Vormonat)
+      Bezahlte Bestellungen: 3
+      Stornoquote: 25,0 %
+      ```
+
+      - **Warenwert bezahlt:** Summe von `warenwert` über `status == "bezahlt"` im Monat; deutsches Format mit Tausenderpunkt und zwei Nachkommastellen.
+      - **Vergleich:** Veränderung zum Warenwert bezahlt des Kalender-Vormonats (für `2026-01` ist das `2025-12`) in Prozent, eine Nachkommastelle, immer mit Vorzeichen. Ist der Vormonatswert 0 oder gibt es ihn nicht, steht dort `(kein Vormonat)`.
+      - **Stornoquote:** Anteil der Bestellungen mit `status == "storniert"` an allen Bestellungen des Monats, eine Nachkommastelle. Hat der Monat keine Bestellungen, steht dort `–` (Gedankenstrich).
+    lang: python
+    setup: |
+      import pandas as pd
+      daten = pd.DataFrame({
+          "monat":     ["2026-02"] * 3 + ["2026-03"] * 4,
+          "status":    ["bezahlt", "bezahlt", "storniert", "bezahlt", "bezahlt", "storniert", "bezahlt"],
+          "warenwert": [48.90, 1240.00, 21.50, 64.20, 1310.00, 17.80, 92.40],
+      })
+    starter: |
+      import pandas as pd
+
+      def bericht(df: pd.DataFrame, monat: str) -> str:
+          m = df[df["monat"] == monat]
+          umsatz = m["warenwert"].sum()
+          return f"Monatsbericht {monat}\nWarenwert bezahlt: {umsatz:.2f} EUR"
+    solution: |
+      import pandas as pd
+
+      def zahl(wert: float, stellen: int = 2, vorzeichen: bool = False) -> str:
+          text = f"{wert:{'+' if vorzeichen else ''},.{stellen}f}"
+          return text.translate(str.maketrans(",.", ".,"))
+
+      def bericht(df: pd.DataFrame, monat: str) -> str:
+          vormonat = str(pd.Period(monat, freq="M") - 1)
+
+          def bezahlt(m: str) -> float:
+              auswahl = df[(df["monat"] == m) & (df["status"] == "bezahlt")]
+              return float(auswahl["warenwert"].sum())
+
+          diesen = df[df["monat"] == monat]
+          umsatz, umsatz_vorher = bezahlt(monat), bezahlt(vormonat)
+          anzahl = int((diesen["status"] == "bezahlt").sum())
+          if umsatz_vorher:
+              vergleich = f"{zahl((umsatz / umsatz_vorher - 1) * 100, 1, True)} % zum Vormonat"
+          else:
+              vergleich = "kein Vormonat"
+          if len(diesen):
+              quote = f"{zahl((diesen['status'] == 'storniert').mean() * 100, 1)} %"
+          else:
+              quote = "–"
+          return "\n".join([
+              f"Monatsbericht {monat}",
+              f"Warenwert bezahlt: {zahl(umsatz)} EUR ({vergleich})",
+              f"Bezahlte Bestellungen: {anzahl}",
+              f"Stornoquote: {quote}",
+          ])
+    tests:
+      - name: Normalfall März
+        code: |
+          erwartet = "Monatsbericht 2026-03\nWarenwert bezahlt: 1.466,60 EUR (+13,8 % zum Vormonat)\nBezahlte Bestellungen: 3\nStornoquote: 25,0 %"
+          bekommen = bericht(daten, "2026-03")
+          assert bekommen == erwartet, f"erwartet:\n{erwartet}\nbekommen:\n{bekommen}"
+      - name: Ohne Vormonat
+        code: |
+          bekommen = bericht(daten, "2026-02").splitlines()
+          assert bekommen[1] == "Warenwert bezahlt: 1.288,90 EUR (kein Vormonat)", f"Zeile 2: {bekommen[1]!r}"
+          assert bekommen[3] == "Stornoquote: 33,3 %", f"Zeile 4: {bekommen[3]!r}"
+      - name: Jahreswechsel und negatives Vorzeichen
+        code: |
+          jw = pd.DataFrame({"monat": ["2025-12", "2026-01", "2026-01"], "status": ["bezahlt", "bezahlt", "retourniert"], "warenwert": [2500.0, 2250.0, 80.0]})
+          bekommen = bericht(jw, "2026-01").splitlines()
+          assert bekommen[1] == "Warenwert bezahlt: 2.250,00 EUR (-10,0 % zum Vormonat)", f"Zeile 2: {bekommen[1]!r} – Vormonat von 2026-01 ist 2025-12"
+          assert bekommen[3] == "Stornoquote: 0,0 %", f"Zeile 4: {bekommen[3]!r}"
+      - name: Große Beträge
+        code: |
+          gross = pd.DataFrame({"monat": ["2026-06"], "status": ["bezahlt"], "warenwert": [1234567.891]})
+          bekommen = bericht(gross, "2026-06").splitlines()
+          assert bekommen[1] == "Warenwert bezahlt: 1.234.567,89 EUR (kein Vormonat)", f"Zeile 2: {bekommen[1]!r}"
+      - name: Monat ohne Bestellungen
+        code: |
+          erwartet = "Monatsbericht 2026-04\nWarenwert bezahlt: 0,00 EUR (-100,0 % zum Vormonat)\nBezahlte Bestellungen: 0\nStornoquote: –"
+          bekommen = bericht(daten, "2026-04")
+          assert bekommen == erwartet, f"erwartet:\n{erwartet}\nbekommen:\n{bekommen}"
+    hints:
+      - "`f\"{1466.6:,.2f}\"` ergibt `1,466.60`. Tausche danach Komma und Punkt, etwa mit `str.maketrans(\",.\", \".,\")`."
+      - "Das Pluszeichen erzwingt das Formatfeld `+`: `f\"{13.787:+.1f}\"` ergibt `+13.8`."
+      - "Den Vormonat liefert `pd.Period(\"2026-01\", freq=\"M\") - 1` – als Text `2025-12`."
+    explanation: |
+      Die Formatierung hängt nicht von den Spracheinstellungen des Rechners ab: Python schreibt mit `,` als Tausender- und `.` als Dezimaltrennzeichen, `translate` tauscht beide in einem Schritt. `pd.Period` rechnet mit Kalendermonaten und erledigt den Jahreswechsel, den ein selbst gebautes `monat - 1` auf Text nicht kann. Die Sonderfälle sind fachliche Entscheidungen: Ohne Vormonatsumsatz gibt es keine sinnvolle prozentuale Veränderung, und ohne Bestellungen keine Quote – eine Division durch null würde `nan` oder einen Fehler liefern. Weil die Funktion einen String zurückgibt und nichts verschickt, lässt sie sich testen; der Versand ist ein eigener Schritt.
+    resources:
+      - title: Python · Format Specification Mini-Language
+        url: https://docs.python.org/3/library/string.html#format-specification-mini-language
+      - title: pandas · Period
+        url: https://pandas.pydata.org/docs/reference/api/pandas.Period.html
+
+  - id: reihenfolge-der-dateien
+    type: bug
+    title: Laptop sagt retourniert, Server sagt bezahlt
+    prompt: |
+      Bestellung 10232 wurde im März bezahlt und im April retourniert; der April-Export enthält sie deshalb noch einmal mit Status `retourniert`. Merle führt `baue_bestand_neu` auf ihrem Laptop aus und sieht `retourniert`. Auf dem Büroserver liefert dieselbe Funktion mit demselben Ordnerinhalt `bezahlt`. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: python
+    code: |
+      MUSTER = re.compile(r"bestellungen_\d{4}-\d{2}\.csv")
+
+      def baue_bestand_neu(eingang: Path) -> pd.DataFrame:
+          dateien = [p for p in eingang.iterdir() if MUSTER.fullmatch(p.name)]
+          teile = [pd.read_csv(p, sep=";", decimal=",") for p in dateien]
+          alle = pd.concat(teile, ignore_index=True)
+          return alle.drop_duplicates(subset="bestellung_id", keep="last")
+    lines: [4]
+    fix:
+      - line: 4
+        answers:
+          - "dateien = sorted(p for p in eingang.iterdir() if MUSTER.fullmatch(p.name))"
+          - "dateien = sorted([p for p in eingang.iterdir() if MUSTER.fullmatch(p.name)])"
+          - "dateien = sorted((p for p in eingang.iterdir() if MUSTER.fullmatch(p.name)), key=lambda p: p.name)"
+          - "dateien = sorted([p for p in eingang.iterdir() if MUSTER.fullmatch(p.name)], key=lambda p: p.name)"
+    hints:
+      - "`keep=\"last\"` nimmt die Zeile, die zuletzt gelesen wurde. Wovon hängt ab, welche das ist?"
+      - Die Python-Dokumentation sagt über `iterdir`, dass die Einträge in beliebiger Reihenfolge kommen.
+    explanation: |
+      `Path.iterdir` liefert die Einträge in beliebiger Reihenfolge; welche das ist, hängt vom Dateisystem ab. Auf dem Laptop kam der April zufällig nach dem März, auf dem Server davor – und `keep="last"` behält die zuletzt gelesene Zeile. Weil die Dateinamen das Datum als `JJJJ-MM` enthalten, sortiert `sorted` sie chronologisch, und der jüngste Monat gewinnt auf jedem Rechner. Solche Fehler fallen in Tests auf einem einzigen Rechner oft nie auf; deshalb gehört jede Reihenfolge, von der ein Ergebnis abhängt, ausdrücklich in den Code.
+    resources:
+      - title: Python · pathlib.Path.iterdir
+        url: https://docs.python.org/3/library/pathlib.html#pathlib.Path.iterdir
+
+  - id: monatsjob-erklaeren
+    type: explain
+    title: Warum man diesen Job zweimal starten darf
+    prompt: Eine Kollegin übernimmt den Monatsjob während Merles Urlaub und fragt, ob sie ihn nach einem korrigierten Export einfach noch einmal starten darf und was passiert, wenn er mittendrin abbricht. Erkläre ihr anhand des Codes, welche Entscheidungen den Job sicher machen.
+    lang: python
+    code: |
+      def monatslauf(eingang: Path, arbeit: Path, monat: str, dry_run: bool = False) -> int:
+          manifest_pfad = arbeit / "manifest.json"
+          manifest = json.loads(manifest_pfad.read_text(encoding="utf-8")) if manifest_pfad.exists() else {}
+          dateien = gueltige_dateien(eingang)                 # sortiert, nur bestellungen_JJJJ-MM.csv
+          plan = plane(dateien, manifest)
+          log.info("Monat %s: neu=%s geaendert=%s", monat, plan["neu"], plan["geaendert"])
+          if dry_run or not (plan["neu"] or plan["geaendert"]):
+              return 0
+          alle = pd.concat([lade_monat(p) for p in dateien], ignore_index=True)
+          fehler = pruefe(alle)
+          if fehler:
+              log.error("Bericht nicht erstellt: %s", "; ".join(fehler))
+              return 1
+          bestand = alle.drop_duplicates(subset="bestellung_id", keep="last").sort_values("bestellung_id")
+          schreibe_atomar(bestand, arbeit / "bestand.csv")
+          schreibe_bericht(bestand, monat, arbeit / f"monatsbericht_{monat}.xlsx")
+          speichere_manifest(manifest_pfad, {p.name: pruefsumme(p) for p in dateien})
+          return 0
+    points:
+      - Der Bestand wird bei jedem Lauf vollständig aus allen gültigen Rohdateien neu aufgebaut; ein zweiter Lauf erzeugt denselben Bestand, nichts wird doppelt angehängt.
+      - Das Manifest entscheidet nur, ob sich ein Lauf lohnt; ein korrigierter Export ändert die Prüfsumme und löst einen neuen Lauf aus.
+      - Geprüft wird vor jedem Schreiben; bei Fehlern entsteht kein Bericht, der Job endet mit Exit-Code 1 und protokolliert den Grund.
+      - Bestand und Bericht werden atomar ersetzt, der Bericht heißt nach dem Berichtsmonat – eine Wiederholung überschreibt dieselben Dateien.
+      - Das Manifest wird zuletzt gespeichert; bricht der Lauf vorher ab, gelten die Dateien beim nächsten Lauf weiter als neu oder geändert, und nichts geht verloren.
+    explanation: |
+      Ja, sie darf ihn jederzeit neu starten. Der Job hängt nichts an: Er liest bei jedem Lauf alle gültigen Monatsdateien – sortiert, damit der jüngste Stand gewinnt – und baut den Bestand komplett neu. Das Manifest mit den Prüfsummen sagt nur, ob sich seit dem letzten Lauf etwas geändert hat; ein korrigierter Export hat eine andere Prüfsumme und löst deshalb einen neuen Lauf aus. Bevor irgendetwas geschrieben wird, prüft der Job die Daten. Findet er Fehler, schreibt er keinen Bericht, protokolliert den Grund und endet mit Exit-Code 1, damit der Zeitplaner oder die Fehlermail anschlägt. Bestand und Bericht werden über temporäre Dateien atomar ersetzt, und der Bericht heißt nach dem Berichtsmonat, also überschreibt eine Wiederholung dieselbe Datei. Das Manifest kommt ganz zum Schluss: Bricht der Lauf vorher ab, sieht der nächste Lauf dieselben Dateien wieder als neu oder geändert und holt alles nach. Mit `dry_run=True` sieht sie vorher, was passieren würde.
+    resources:
+      - title: Python · os.replace
+        url: https://docs.python.org/3/library/os.html#os.replace
+
+  - id: monatsjob-lokal
+    type: practice
+    title: Der Monatsjob als echtes Werkzeug
+    prompt: |
+      Baue den Monatsjob von Bohnenwerk lokal als Kommandozeilenprogramm und plane ihn ein.
+
+      1. Lege ein Projekt an (`uv init monatsbericht`, dann `uv add pandas openpyxl`) mit den Ordnern `eingang`, `arbeit` und einem Skript `monatsbericht.py`.
+      2. Das Skript nimmt `--eingang`, `--arbeit`, `--monat JJJJ-MM` und `--dry-run` entgegen und protokolliert nach `arbeit/monatsbericht.log` und auf die Konsole.
+      3. Es verarbeitet nur Dateien `bestellungen_JJJJ-MM.csv` in sortierter Reihenfolge, protokolliert ignorierte Dateien als Warnung und führt ein Manifest mit SHA-256-Prüfsummen. Fehlt eine Datei, die schon verarbeitet wurde, bricht es ab.
+      4. Es baut den Bestand vollständig neu auf, prüft ihn (Beträge lesbar, bekannter Status, keine doppelte `bestellung_id` innerhalb einer Datei) und bricht bei Fehlern mit Exit-Code 1 ab, ohne etwas zu schreiben.
+      5. Es schreibt `bestand.csv`, `monatsbericht_JJJJ-MM.xlsx` mit den Blättern „Kennzahlen“ und „Kanäle“ und `mail_JJJJ-MM.txt` mit den Kennzahlen – alles atomar und zuletzt das Manifest.
+      6. Richte einen Zeitplan ein: crontab oder systemd-Timer unter Linux, Aufgabenplanung unter Windows.
+
+      Teste mit drei Monatsdateien wie im Modul, einem doppelten Download und einer Datei mit `n/a` als Warenwert.
+    lang: python
+    solution: |
+      """Monatsbericht Bohnenwerk: Monatsexporte zusammenführen, prüfen, berichten."""
+      import argparse
+      import hashlib
+      import json
+      import logging
+      import re
+      import sys
+      from pathlib import Path
+
+      import pandas as pd
+
+      MUSTER = re.compile(r"bestellungen_\d{4}-\d{2}\.csv")
+      STATUS = {"bezahlt", "storniert", "retourniert"}
+      log = logging.getLogger("monatsbericht")
+
+
+      def pruefsumme(pfad: Path) -> str:
+          with pfad.open("rb") as datei:
+              return hashlib.file_digest(datei, "sha256").hexdigest()
+
+
+      def gueltige_dateien(eingang: Path) -> list[Path]:
+          dateien = []
+          for pfad in sorted(eingang.iterdir()):
+              if pfad.is_file() and MUSTER.fullmatch(pfad.name):
+                  dateien.append(pfad)
+              else:
+                  log.warning("Ignoriert: %s", pfad.name)
+          return dateien
+
+
+      def plane(dateien: list[Path], manifest: dict[str, str]) -> dict[str, list[str]]:
+          plan = {"neu": [], "geaendert": [], "fehlend": sorted(set(manifest) - {p.name for p in dateien})}
+          for pfad in dateien:
+              if pfad.name not in manifest:
+                  plan["neu"].append(pfad.name)
+              elif manifest[pfad.name] != pruefsumme(pfad):
+                  plan["geaendert"].append(pfad.name)
+          return plan
+
+
+      def lade_monat(pfad: Path) -> pd.DataFrame:
+          df = pd.read_csv(pfad, sep=";", decimal=",", thousands=".", encoding="utf-8-sig",
+                           dtype={"bestellung_id": "str"},
+                           parse_dates=["bestelldatum"], date_format="%d.%m.%Y")
+          df = df[df["bestellung_id"] != "Summe"]
+          log.info("%s: %d Zeilen", pfad.name, len(df))
+          return df.astype({"bestellung_id": "int64"}).assign(kanal=df["kanal"].str.strip(), quelle=pfad.name)
+
+
+      def pruefe(alle: pd.DataFrame) -> list[str]:
+          fehler = []
+          if not pd.api.types.is_numeric_dtype(alle["warenwert"]) or alle["warenwert"].isna().any():
+              fehler.append("warenwert ist nicht in jeder Zeile eine Zahl")
+          if alle["bestelldatum"].isna().any():
+              fehler.append("bestelldatum fehlt oder ist nicht lesbar")
+          unbekannt = set(alle["status"]) - STATUS
+          if unbekannt:
+              fehler.append(f"unbekannter Status: {sorted(unbekannt)}")
+          doppelt = alle[alle.duplicated(subset=["quelle", "bestellung_id"])]
+          if len(doppelt):
+              fehler.append(f"doppelte bestellung_id in einer Datei: {sorted(set(doppelt['bestellung_id']))}")
+          return fehler
+
+
+      def zahl(wert: float, stellen: int = 2, vorzeichen: bool = False) -> str:
+          text = f"{wert:{'+' if vorzeichen else ''},.{stellen}f}"
+          return text.translate(str.maketrans(",.", ".,"))
+
+
+      def schreibe_bericht(bestand: pd.DataFrame, monat: str, arbeit: Path) -> None:
+          m = bestand[bestand["bestelldatum"].dt.strftime("%Y-%m") == monat]
+          bezahlt = m[m["status"] == "bezahlt"]
+          quote = (m["status"] == "storniert").mean() if len(m) else float("nan")
+          kennzahlen = pd.DataFrame({
+              "kennzahl": ["Warenwert bezahlt (EUR)", "Bezahlte Bestellungen", "Stornoquote"],
+              "wert": [round(bezahlt["warenwert"].sum(), 2), len(bezahlt), round(quote, 4)],
+          })
+          je_kanal = bezahlt.groupby("kanal", as_index=False)["warenwert"].sum()
+          ziel = arbeit / f"monatsbericht_{monat}.xlsx"
+          tmp = ziel.with_name(ziel.name + ".tmp")
+          with pd.ExcelWriter(tmp, engine="openpyxl") as writer:
+              kennzahlen.to_excel(writer, sheet_name="Kennzahlen", index=False)
+              je_kanal.to_excel(writer, sheet_name="Kanäle", index=False)
+          tmp.replace(ziel)
+          text = "\n".join([
+              f"Monatsbericht {monat}",
+              f"Warenwert bezahlt: {zahl(bezahlt['warenwert'].sum())} EUR",
+              f"Bezahlte Bestellungen: {len(bezahlt)}",
+              f"Stornoquote: {zahl(quote * 100, 1) + ' %' if len(m) else '–'}",
+          ])
+          schreibe_text(arbeit / f"mail_{monat}.txt", text + "\n")
+
+
+      def schreibe_text(ziel: Path, inhalt: str) -> None:
+          tmp = ziel.with_name(ziel.name + ".tmp")
+          tmp.write_text(inhalt, encoding="utf-8")
+          tmp.replace(ziel)
+
+
+      def main(argv: list[str] | None = None) -> int:
+          parser = argparse.ArgumentParser(prog="monatsbericht", description="Monatsbericht Bohnenwerk")
+          parser.add_argument("--eingang", type=Path, required=True)
+          parser.add_argument("--arbeit", type=Path, required=True)
+          parser.add_argument("--monat", required=True, help="Berichtsmonat JJJJ-MM")
+          parser.add_argument("--dry-run", action="store_true", help="nur anzeigen, nichts schreiben")
+          args = parser.parse_args(argv)
+          args.arbeit.mkdir(parents=True, exist_ok=True)
+          logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
+                              handlers=[logging.FileHandler(args.arbeit / "monatsbericht.log", encoding="utf-8"),
+                                        logging.StreamHandler()])
+
+          manifest_pfad = args.arbeit / "manifest.json"
+          manifest = json.loads(manifest_pfad.read_text(encoding="utf-8")) if manifest_pfad.exists() else {}
+          dateien = gueltige_dateien(args.eingang)
+          plan = plane(dateien, manifest)
+          log.info("Monat %s: neu=%s geaendert=%s fehlend=%s", args.monat, plan["neu"], plan["geaendert"], plan["fehlend"])
+          for name in plan["geaendert"]:
+              log.warning("Bereits verarbeitete Datei hat sich geändert: %s", name)
+          if plan["fehlend"]:
+              # Ein Neuaufbau ohne diese Dateien würde ihre Monate still aus dem Bestand löschen.
+              log.error("Bereits verarbeitete Monatsdateien fehlen: %s", ", ".join(plan["fehlend"]))
+              return 1
+          if args.dry_run:
+              log.info("Trockenlauf: nichts geschrieben")
+              return 0
+          if not dateien:
+              log.error("Keine Monatsdateien in %s", args.eingang)
+              return 1
+          if not (plan["neu"] or plan["geaendert"]):
+              log.info("Keine neuen oder geänderten Dateien – nichts zu tun")
+              return 0
+
+          alle = pd.concat([lade_monat(p) for p in dateien], ignore_index=True)
+          fehler = pruefe(alle)
+          if fehler:
+              for meldung in fehler:
+                  log.error(meldung)
+              log.error("Bericht nicht erstellt")
+              return 1
+          bestand = alle.drop_duplicates(subset="bestellung_id", keep="last").sort_values("bestellung_id")
+          tmp = args.arbeit / "bestand.csv.tmp"
+          bestand.to_csv(tmp, index=False)
+          tmp.replace(args.arbeit / "bestand.csv")
+          schreibe_bericht(bestand, args.monat, args.arbeit)
+          schreibe_text(manifest_pfad, json.dumps({p.name: pruefsumme(p) for p in dateien}, indent=2, sort_keys=True))
+          log.info("Fertig: %d Bestellungen im Bestand", len(bestand))
+          return 0
+
+
+      if __name__ == "__main__":
+          sys.exit(main())
+    checklist:
+      - "`uv run monatsbericht.py --eingang eingang --arbeit arbeit --monat 2026-03 --dry-run` protokolliert neue und geänderte Dateien und legt keine Datei außer dem Protokoll an."
+      - Ein zweiter Lauf ohne neue Dateien meldet „nichts zu tun“, endet mit Exit-Code 0, und `sha256sum arbeit/bestand.csv` ist unverändert.
+      - Eine Datei `bestellungen_2026-03 (1).csv` im Eingang erscheint als Warnung „Ignoriert“ und verändert den Bestand nicht.
+      - Verschiebst du eine bereits verarbeitete Monatsdatei aus dem Eingang, nennt das Protokoll sie als fehlend, der Lauf endet mit Exit-Code 1, und `bestand.csv` bleibt unverändert.
+      - Eine neue Monatsdatei mit `n/a` als Warenwert führt zu Exit-Code 1 (`echo $?` bzw. `echo %ERRORLEVEL%`), es entsteht kein neuer Bericht, und `manifest.json` bleibt unverändert.
+      - Nach dem Korrigieren meldet der nächste Lauf dieselbe Datei weiterhin als neu – das Manifest kennt sie noch nicht – und erzeugt `monatsbericht_JJJJ-MM.xlsx` mit den Blättern „Kennzahlen“ und „Kanäle“.
+      - Der Zeitplan ist eingerichtet (`crontab -l`, `systemctl list-timers` oder die Aufgabenplanung zeigt den Eintrag), und ein geplanter Lauf steht im Protokoll.
+    hints:
+      - Beginne mit `plane` und dem Trockenlauf; erst wenn der Plan stimmt, kommen Laden, Prüfen und Schreiben dazu.
+      - Teste Exit-Codes, indem du `main([...])` in einer kleinen Testdatei aufrufst und das Ergebnis mit `assert` prüfst.
+    explanation: |
+      Die Musterlösung setzt die Entscheidungen des Moduls um: ein Namensvertrag mit sortierter Verarbeitung, ein Manifest mit Prüfsummen, ein Bestand, der bei jedem Lauf vollständig neu entsteht – und deshalb der Abbruch, wenn eine bereits verarbeitete Datei fehlt, sonst verschwände ihr Monat still aus dem Bestand –, Prüfungen vor dem Schreiben, atomare Ausgaben und das Manifest als letzter Schritt. Der Exit-Code ist die Schnittstelle zum Zeitplaner – nur so erfährt cron, systemd oder die Aufgabenplanung, dass etwas schiefging, und nur so kann eine Fehlermail anschlagen. Die Kennzahlen stehen als Werte im Excel-Blatt und als formatierter Text in der Mail-Datei; den Versand selbst übernimmt ein eigener Schritt, wie in [Benachrichtigungen ohne Nachrichtenflut](/automation/benachrichtigungen) beschrieben. Für das Einplanen gelten die Regeln aus [Jobs zeitgesteuert ausführen](/automation/zeitsteuerung), etwa zu verpassten Läufen und Überschneidungen.
+    resources:
+      - title: uv · Projekte anlegen
+        url: https://docs.astral.sh/uv/concepts/projects/init/
+      - title: pandas · ExcelWriter
+        url: https://pandas.pydata.org/docs/reference/api/pandas.ExcelWriter.html
+      - title: schtasks create
+        url: https://learn.microsoft.com/de-de/windows-server/administration/windows-commands/schtasks-create

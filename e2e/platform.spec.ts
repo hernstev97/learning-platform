@@ -253,7 +253,41 @@ test('practice, bug and explain exercises', async ({ page }) => {
   for (const box of await page.locator('[data-point]').all()) await box.check();
   await expect(page.locator('#feedback')).toContainText('Richtig.');
   await page.goto('/beispiel');
-  await expect(page.locator('.module-row .label').last()).toHaveText('3/10');
+  await expect(page.locator('.module-row .label').last()).toHaveText('3/12');
+});
+
+test('SQL runs in the browser: table preview, result table, feedback and runnable lesson blocks', async ({ page }) => {
+  await page.goto(`${base}/11`);
+  await expect(page.locator('.sql-table summary')).toContainText('bestellungen');
+  await expect(page.locator('.sql-table .sql-null')).toHaveText('NULL');
+  await page.locator('#run').click();
+  await expect(page.locator('#feedback')).toContainText('Spalte 2 heißt „betrag“, erwartet ist „umsatz“', { timeout: 60_000 });
+  await page.locator('#editor').fill('SELECT region, betrag AS umsatz FROM bestellungen');
+  await page.locator('#run').click();
+  await expect(page.locator('#feedback')).toContainText('Deine Abfrage liefert 4 Zeilen, erwartet sind 3 Zeilen.');
+  await page.locator('#editor').fill('SELECT region, SUM(betrag) AS umsatz FROM bestellungen GROUP BY region ORDER BY region DESC');
+  await page.locator('#run').click();
+  await expect(page.locator('#feedback')).toContainText('Reihenfolge');
+  await expect(page.locator('#sql-result tbody tr')).toHaveCount(3);
+  await page.locator('#editor').fill('SELECT nope FROM bestellungen');
+  await page.locator('#run').click();
+  await expect(page.locator('#sql-result')).toContainText('no such column: nope');
+  await page.locator('#editor').fill('SELECT region, SUM(betrag) AS umsatz\nFROM bestellungen\nGROUP BY region\nORDER BY umsatz DESC;');
+  await page.keyboard.press('Control+Enter');
+  await expect(page.locator('#feedback')).toContainText('Richtig.');
+  await page.reload();
+  await expect(page.locator('#feedback')).toContainText(/Richtig.|Gelöst./);
+
+  await page.goto(`${base}/12`);
+  await page.locator('#answer-g1').fill('sumifs');
+  await page.locator('#answer-g2').fill('"Nord"');
+  await expect(page.locator('#feedback')).toContainText('Richtig.');
+
+  await page.goto(base);
+  const block = page.locator('.codeblock[data-run="sql"]');
+  await block.getByRole('button', { name: 'Ausführen' }).click();
+  await expect(block.locator('.run-output table')).toContainText('160.5', { timeout: 60_000 });
+  await expect(page.locator('.codeblock[data-lang="excel"] .syntax-fn')).toHaveText('SUMMEWENNS');
 });
 
 test('cards, projects, reference pages and data export', async ({ page }) => {
@@ -290,8 +324,8 @@ test('cards, projects, reference pages and data export', async ({ page }) => {
 test('lesson python blocks run, pages stay within the viewport on mobile', async ({ page }) => {
   test.setTimeout(120_000);
   await page.goto(base);
-  await page.locator('.codeblock[data-run] button', { hasText: 'Ausführen' }).click();
-  await expect(page.locator('.run-output')).toContainText('Hallo, Grace!', { timeout: 90_000 });
+  await page.locator('.codeblock[data-run="python"] button', { hasText: 'Ausführen' }).click();
+  await expect(page.locator('.codeblock[data-run="python"] .run-output')).toContainText('Hallo, Grace!', { timeout: 90_000 });
   await page.setViewportSize({ width: 360, height: 800 });
   for (const path of ['/', '/beispiel', base, `${base}/1`, `${base}/3`, `${base}/9`, '/beispiel/karten', '/beispiel/projekte/abschluss']) {
     await page.goto(path);
@@ -389,7 +423,7 @@ test('unsaved work can be exported and merged when browser storage is blocked', 
   backup.areas.beispiel.read = { 'alle-typen': '2026-09-28' };
   await page.locator('#import-file').setInputFiles({ name: 'backup.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(backup)) });
   await expect(page.locator('#data-message')).toContainText('übernommen');
-  await expect(page.locator('.data-table tr', { hasText: 'Beispielbereich' })).toContainText('1 / 10');
+  await expect(page.locator('.data-table tr', { hasText: 'Beispielbereich' })).toContainText('1 / 12');
 });
 
 test('malformed addresses render the not-found page without an unhandled exception', async ({ page }) => {
@@ -401,6 +435,21 @@ test('malformed addresses render the not-found page without an unhandled excepti
   await page.goto('/#%E0%A4%A');
   await expect(page.locator('.hero-title')).toBeVisible();
   expect(errors).toEqual([]);
+});
+
+test('loading pandas in one block leaves the results of other blocks alone', async ({ page }) => {
+  test.setTimeout(120_000);
+  await page.goto('/python/python-einstieg');
+  const blocks = page.locator('.codeblock[data-run="python"]');
+  await expect(blocks.nth(1)).toBeVisible();
+  await blocks.nth(0).locator('textarea').fill('print("erster")');
+  await blocks.nth(0).getByRole('button', { name: 'Ausführen' }).click();
+  await expect(blocks.nth(0).locator('.run-output')).toContainText('erster', { timeout: 90_000 });
+  // The first pandas import takes seconds and switches the runner to its "packages" notice.
+  await blocks.nth(1).locator('textarea').fill('import pandas as pd\nprint(pd.Series([1, 2]).sum())');
+  await blocks.nth(1).getByRole('button', { name: 'Ausführen' }).click();
+  await expect(blocks.nth(1).locator('.run-output')).toContainText('3', { timeout: 90_000 });
+  await expect(blocks.nth(0).locator('.run-output')).toContainText('erster');
 });
 
 test('two asynchronous Python snippets keep their output isolated', async ({ page }) => {

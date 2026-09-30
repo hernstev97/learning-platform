@@ -4,10 +4,11 @@ import type { Exercise } from '../content/types.ts';
 import { highlight } from '../engine/highlight.ts';
 import { bug, code, explain, order, practice } from '../exercises/advanced.ts';
 import { choice, command, gap, output } from '../exercises/basic.ts';
+import { sql } from '../exercises/sql.ts';
 import type { ExerciseRenderer, Feedback } from '../exercises/types.ts';
 import { $, TYPE_LABELS, TYPE_VERBS, escape, html, icons, raw, type Raw } from './dom.ts';
 
-const RENDERERS: Record<Exercise['type'], ExerciseRenderer<any, any>> = { gap, choice, order, output, command, code, practice, bug, explain };
+const RENDERERS: Record<Exercise['type'], ExerciseRenderer<any, any>> = { gap, choice, order, output, command, code, practice, bug, explain, sql };
 
 export type ExerciseHooks = {
   areaId: string;

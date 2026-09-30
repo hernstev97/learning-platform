@@ -11,7 +11,13 @@ type Pyodide = {
   globals: { set(name: string, value: unknown): void };
   toPy(value: unknown): unknown;
 };
-export type Job = { id: number; kind: 'exercise' | 'snippet'; code: string; setup?: string; tests?: { name: string; code: string }[] };
+export type Job =
+  | { id: number; kind: 'exercise'; code: string; setup?: string; tests?: { name: string; code: string }[] }
+  | { id: number; kind: 'snippet'; code: string }
+  | { id: number; kind: 'sql'; schema: string; query: string; solution: string }
+  | { id: number; kind: 'sql-script'; code: string }
+  /** Loads and imports the packages `code` needs (pandas takes seconds the first time), outside the time limit. */
+  | { id: number; kind: 'prepare'; code: string };
 
 let ready: Promise<Pyodide> | null = null;
 function boot(): Promise<Pyodide> {
@@ -32,13 +38,22 @@ self.onmessage = async (event: MessageEvent<Job | { id: number; kind: 'boot' }>)
   try {
     const pyodide = await boot();
     if (job.kind === 'boot') { self.postMessage({ id: job.id, result: { ready: true } }); return; }
-    const all = [job.setup ?? '', job.code, ...(job.tests ?? []).map((test) => test.code)].join('\n');
-    try { await pyodide.loadPackagesFromImports(all); } catch { /* unknown imports surface as ImportError in Python */ }
-    if (/zoneinfo|ZoneInfo/.test(all)) await pyodide.loadPackage('tzdata');
+    if (job.kind === 'prepare') {
+      try { await pyodide.loadPackagesFromImports(job.code); } catch { /* unknown imports surface as ImportError in Python */ }
+      if (/zoneinfo|ZoneInfo/.test(job.code)) await pyodide.loadPackage('tzdata');
+      pyodide.globals.set('source', job.code);
+      pyodide.runPython('harness.warm_imports(source)');
+      self.postMessage({ id: job.id, result: { ready: true } });
+      return;
+    }
     pyodide.globals.set('job', pyodide.toPy(job));
     const json = job.kind === 'exercise'
       ? await pyodide.runPythonAsync('json.dumps(await harness.run_exercise(job.get("setup") or "", job["code"], job["tests"]))')
-      : await pyodide.runPythonAsync('json.dumps(await harness.run_snippet(job["code"]))');
+      : job.kind === 'sql'
+        ? pyodide.runPython('json.dumps(harness.run_sql_exercise(job["schema"], job["query"], job["solution"]))')
+        : job.kind === 'sql-script'
+          ? pyodide.runPython('json.dumps(harness.run_sql_script(job["code"]))')
+          : await pyodide.runPythonAsync('json.dumps(await harness.run_snippet(job["code"]))');
     self.postMessage({ id: job.id, result: JSON.parse(String(json)) });
   } catch (error) {
     self.postMessage({ id: job.id, error: String((error as Error)?.message ?? error) });

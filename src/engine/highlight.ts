@@ -65,11 +65,30 @@ const LANGUAGES: Record<string, Language> = {
     rules: [[/^\+[^\n]*/my, 'string'], [/^-[^\n]*/my, 'number'], [/^@@[^\n]*/my, 'annotation']],
     keywords: words(''),
   },
+  // Excel formulas, German or English: =SUMMEWENNS(Umsatz[Betrag];Umsatz[Region];"Nord")
+  excel: {
+    rules: [
+      [/"(?:[^"]|"")*"?/y, 'string'], [/'(?:[^'\n]|'')*'!/y, 'type'], [/\[(?:[^[\]\n]|\[[^[\]\n]*\])*\]/y, 'key'],
+      [/#[A-Za-zÄÖÜäöü/0-9]+[!?]?/y, 'annotation'], [/[A-Za-zÄÖÜäöüß_][\wÄÖÜäöüß.]*(?=\()/y, 'fn'], [/\$?[A-Za-z]{1,3}\$?\d+\b/y, 'variable'], number,
+    ],
+    keywords: words('WAHR FALSCH TRUE FALSE'),
+  },
+  // Power Query M: let … in, each, #"Schritt mit Leerzeichen", Table.SelectRows(…)
+  powerquery: {
+    rules: [...cStyle, [/#"(?:[^"]|"")*"?/y, 'key'], [/"(?:[^"]|"")*"?/y, 'string'], [/#[a-z]+/y, 'annotation'], number],
+    keywords: words(`let in each if then else try otherwise catch type meta as is not and or true false null error section shared`),
+    calls: true,
+  },
+  csv: {
+    rules: [[/"(?:[^"]|"")*"?/y, 'string']],
+    keywords: words(''),
+  },
 };
 const ALIASES: Record<string, string> = {
   kt: 'kotlin', kts: 'kotlin', gradle: 'kotlin', java: 'kotlin', groovy: 'kotlin', rs: 'rust', py: 'python', python3: 'python',
   bash: 'shell', sh: 'shell', zsh: 'shell', fish: 'shell', terminal: 'shell', yml: 'yaml', jsonc: 'json', docker: 'dockerfile',
   containerfile: 'dockerfile', systemd: 'ini', service: 'ini', conf: 'ini', cfg: 'ini', html: 'xml', svg: 'xml', pycon: 'python',
+  xlsx: 'excel', formula: 'excel', m: 'powerquery', pq: 'powerquery', tsv: 'csv',
 };
 export const languageOf = (lang: string | undefined | null) => {
   const l = (lang ?? '').toLowerCase();
