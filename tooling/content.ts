@@ -367,10 +367,12 @@ function loadModule(areaId: string, moduleId: string, report: Reporter, raw: Raw
   };
 }
 
-const FENCE = /^```(\S+)([^\n]*)\n([\s\S]*?)^```\s*$/gm;
+// As in CommonMark: backticks or tildes, at least three, closed by a fence of the same character that is at least as
+// long. A four-backtick block can thus show a three-backtick one.
+const FENCE = /^((`|~)\2{2,})(\S+)([^\n]*)\n([\s\S]*?)^\1\2*[ \t]*$/gm;
 /** Fenced code blocks of a lesson in Markdown; `vm` marks shell and console blocks for the lesson's terminal. */
 export function lessonBlocks(lesson: string): { n: number; lang: string; flags: string[]; code: string; vm: boolean }[] {
-  return [...lesson.matchAll(FENCE)].map(([, lang, flagText, code], i) => {
+  return [...lesson.matchAll(FENCE)].map(([, , , lang, flagText, code], i) => {
     const flags = flagText.trim().split(/\s+/);
     return { n: i + 1, lang, flags, code, vm: flags.includes('vm') && ['shell', 'console'].includes(languageOf(lang)) };
   });

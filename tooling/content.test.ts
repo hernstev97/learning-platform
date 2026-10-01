@@ -80,6 +80,9 @@ describe('content', () => {
     const module = loadContent(undefined, join(import.meta.dirname, 'fixtures')).areas.beispiel.modules['alle-typen'];
     expect({ lab: module.lab, vm: module.vm }).toEqual({ lab: "printf 'Ada\\nLinus\\nGrace\\n' > /home/ops/namen.txt\ngroupadd -f lernende && usermod -aG lernende ops", vm: true });
     expect(lessonBlocks('```console vm fails\n$ false\n```\n```python run\nprint(1)\n```\n').map((b) => [b.n, b.vm, b.flags])).toEqual([[1, true, ['vm', 'fails']], [2, false, ['run']]]);
+    // A block closes only on a fence of the same character that is at least as long; tilde fences count too.
+    const nested = '````markdown\n```console vm\n$ ls\n```\n````\n~~~console vm\n$ uptime\n~~~\n';
+    expect(lessonBlocks(nested).map((b) => [b.n, b.lang, b.vm, b.code])).toEqual([[1, 'markdown', false, '```console vm\n$ ls\n```\n'], [2, 'console', true, '$ uptime\n']]);
     const root = mkdtempSync(join(tmpdir(), 'learning-vm-'));
     try {
       cpSync(join(import.meta.dirname, 'fixtures/beispiel'), join(root, 'beispiel'), { recursive: true });
