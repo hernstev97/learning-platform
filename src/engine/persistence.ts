@@ -143,6 +143,8 @@ export function safeDraft(exercise: Exercise, value: unknown): unknown {
     case 'practice': return record(value) && typeof value.code === 'string' && numbers(value.checked, exercise.checklist.length) ? value : undefined;
     case 'explain': return record(value) && typeof value.text === 'string' && typeof value.revealed === 'boolean' && numbers(value.checked, exercise.points.length) ? value : undefined;
     case 'bug': return record(value) && numbers(value.selected, exercise.code.split('\n').length + 1) && typeof value.found === 'boolean' && strings(value.fixes) ? value : undefined;
+    // The VM's state is not saved; a scenario always starts from its snapshot.
+    case 'scenario': return undefined;
   }
 }
 

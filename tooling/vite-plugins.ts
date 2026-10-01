@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { transformWithOxc, type Plugin, type ViteDevServer } from 'vite';
 import type { WorkerConfig } from '../src/service-worker.ts';
@@ -97,10 +97,38 @@ export function pyodide(): Plugin {
   };
 }
 
+/**
+ * Self-hosts the Linux VM for scenario exercises under /vm/: v86 from node_modules plus the images from vendor/vm
+ * (built by `pnpm vm:build`, see tooling/vm). Copied into public/vm (not committed), like Pyodide.
+ */
+export function vm(): Plugin {
+  return {
+    name: 'self-hosted-vm',
+    configResolved() {
+      const to = join(ROOT, 'public/vm');
+      const expected = vmVersion();
+      const stamp = join(to, 'VERSION');
+      if (existsSync(stamp) && readFileSync(stamp, 'utf8') === expected) return;
+      rmSync(to, { recursive: true, force: true });
+      mkdirSync(to, { recursive: true });
+      for (const file of ['libv86.mjs', 'v86.wasm']) copyFileSync(join(ROOT, 'node_modules/v86/build', file), join(to, file));
+      cpSync(join(ROOT, 'vendor/vm'), to, { recursive: true });
+      writeFileSync(stamp, expected);
+    },
+  };
+}
+
+/** Changes with v86 and with every image build; names the service worker's VM cache. */
+export function vmVersion(): string {
+  const v86 = JSON.parse(readFileSync(join(ROOT, 'node_modules/v86/package.json'), 'utf8')).version as string;
+  const images = readdirSync(join(ROOT, 'vendor/vm')).sort().map((image) => readFileSync(join(ROOT, 'vendor/vm', image, 'manifest.json'), 'utf8'));
+  return createHash('sha256').update([v86, ...images].join('\n')).digest('hex').slice(0, 12);
+}
+
 const files = (dir: string): string[] => existsSync(dir) ? readdirSync(dir, { recursive: true, encoding: 'utf8' }).filter((name) => statSync(join(dir, name)).isFile()) : [];
 /**
  * Emits /sw.js from src/service-worker.ts in production builds. It precaches every built file (app shell and all
- * content chunks) plus fonts, icons and the manifest from public/; Pyodide is only cached once it is used.
+ * content chunks) plus fonts, icons and the manifest from public/; Pyodide and the Linux VM are only cached once used.
  * The cache version changes with any of these files, so each deployment installs a fresh, consistent set.
  */
 export function serviceWorker(): Plugin {
@@ -117,7 +145,7 @@ export function serviceWorker(): Plugin {
         const item = bundle[name];
         hash.update(name).update(item.type === 'chunk' ? item.code : item.source);
       }
-      const extra = files(publicDir).map((name) => name.split('\\').join('/')).filter((name) => !name.startsWith('pyodide/') && /\.(woff2|svg|png|webmanifest)$/.test(name)).sort();
+      const extra = files(publicDir).map((name) => name.split('\\').join('/')).filter((name) => !name.startsWith('pyodide/') && !name.startsWith('vm/') && /\.(woff2|svg|png|webmanifest)$/.test(name)).sort();
       for (const name of extra) hash.update(name).update(readFileSync(join(publicDir, name)));
       const runtime = createHash('sha256');
       for (const name of files(join(publicDir, 'pyodide')).sort()) runtime.update(name).update(readFileSync(join(publicDir, 'pyodide', name)));
@@ -125,6 +153,7 @@ export function serviceWorker(): Plugin {
         version: hash.digest('hex').slice(0, 12),
         files: [...built, ...extra].map((name) => `/${name}`),
         pyodide: runtime.digest('hex').slice(0, 12),
+        vm: vmVersion(),
       };
       const source = join(ROOT, 'src/service-worker.ts');
       const { code } = await transformWithOxc(readFileSync(source, 'utf8'), relative(ROOT, source), { lang: 'ts' });

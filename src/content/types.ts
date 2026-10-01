@@ -47,7 +47,16 @@ export type SqlTable = { name: string; columns: string[]; rows: SqlValue[][]; ce
  */
 export type SqlExercise = ExerciseBase & { type: 'sql'; lang: 'sql'; schema: string; tables: SqlTable[]; starter: string; solution: string; ordered: boolean };
 
-export type Exercise = GapExercise | ChoiceExercise | OrderExercise | OutputExercise | CommandExercise | CodeExercise | PracticeExercise | BugExercise | ExplainExercise | SqlExercise;
+/** One check of a scenario: a bash script run as root in the VM, passed when it exits with 0. */
+export type ScenarioCheck = { name: string; run: string };
+/**
+ * Diagnose and repair a broken system in a real Linux VM in the browser (src/vm/). `setup` (bash, as root) builds the
+ * fault into the base snapshot, the learner works freely in the terminal, and `checks` judge the repaired state, not
+ * the way there. `solution` is the model answer; `pnpm vm:verify` runs it to prove the scenario can be solved.
+ */
+export type ScenarioExercise = ExerciseBase & { type: 'scenario'; setup: string; checks: ScenarioCheck[]; solution: string };
+
+export type Exercise = GapExercise | ChoiceExercise | OrderExercise | OutputExercise | CommandExercise | CodeExercise | PracticeExercise | BugExercise | ExplainExercise | SqlExercise | ScenarioExercise;
 export type ExerciseType = Exercise['type'];
 
 export type TocEntry = { id: string; title: string };

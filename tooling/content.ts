@@ -17,7 +17,7 @@ export const CONTENT = join(ROOT, 'content');
 export const RESERVED = ['karten', 'projekte', 'spickzettel', 'glossar', 'beruf', 'wiederholen'];
 /** Top-level pages that an area folder must not shadow. */
 export const RESERVED_AREAS = ['daten', 'wiederholen'];
-const TYPES = ['gap', 'choice', 'order', 'output', 'command', 'code', 'practice', 'bug', 'explain', 'sql'] as const;
+const TYPES = ['gap', 'choice', 'order', 'output', 'command', 'code', 'practice', 'bug', 'explain', 'sql', 'scenario'] as const;
 const ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const validId = (id: unknown): id is string => typeof id === 'string' && id.length <= 120 && ID.test(id) && !['constructor', 'prototype'].includes(id);
 
@@ -175,6 +175,7 @@ const BY_TYPE: Record<string, string[]> = {
   bug: ['lang', 'code', 'lines', 'fix', 'verify'],
   explain: ['lang', 'code', 'points'],
   sql: ['schema', 'starter', 'solution', 'ordered', 'verify'],
+  scenario: ['setup', 'checks', 'solution'],
 };
 
 function exercise(raw: Obj, moduleId: string, where: string, report: Reporter): Exercise | null {
@@ -308,6 +309,15 @@ function exercise(raw: Obj, moduleId: string, where: string, report: Reporter): 
       if (error) report.error(where, `"schema" lässt sich nicht ausführen: ${error}`);
       else if (schema && !tables.length) report.error(where, '"schema" legt keine Tabelle an');
       return { ...base, type, lang: 'sql', schema, tables, starter: trimCode(f.str('starter', false)), solution, ordered, fingerprint: fingerprint([type, schema, solution, ordered]) };
+    }
+    case 'scenario': {
+      const checks = f.list<Obj>('checks', true).map((check, i) => {
+        const c = fields(check ?? {}, `${where} › checks[${i}]`, report, ['name', 'run']);
+        return { name: c.str('name'), run: trimCode(c.str('run')) };
+      });
+      if (!checks.length) report.error(where, '"checks" braucht mindestens eine Prüfung');
+      const setup = trimCode(f.str('setup'));
+      return { ...base, type, setup, checks, solution: trimCode(f.str('solution')), fingerprint: fingerprint([type, setup, checks]) };
     }
   }
   return null;
