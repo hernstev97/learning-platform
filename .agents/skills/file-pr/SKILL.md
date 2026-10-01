@@ -23,4 +23,6 @@ BAD
 GOOD
 > ✅ My "new worktree" default was ignored when starting new threads on existing worktrees. Super unintuitive. Now your preferences always apply.
 
+If the change is visible to users, attach screenshots after the explanation, plus a short video when behavior over time matters. Use the `pr-media` skill for this (if present).
+
 Open a real PR rather than a draft so review bots run. If the user also asked to babysit it, continue with the `babysit-pr` skill.
