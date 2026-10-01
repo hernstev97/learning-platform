@@ -41,6 +41,22 @@ async function solve(page: Page, exercise: Exercise) {
       await page.locator('#check').click();
       for (const fix of exercise.fixes) await page.locator(`#fix-${fix.line}`).fill(fix.answers[0]);
       break;
+    case 'scenario':
+      await page.locator('#vm-boot').click();
+      // Prüfen becomes available once the scenario is set up and the terminal takes input.
+      await expect(page.locator('#check')).toBeEnabled({ timeout: 120_000 });
+      // One paste: bash reads the whole solution before running it, so sudo cannot discard lines typed ahead.
+      await page.locator('#vm-screen .xterm-helper-textarea').evaluate((textarea, text) => {
+        const data = new DataTransfer();
+        data.setData('text/plain', text);
+        textarea.dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true }));
+      }, exercise.solution);
+      await page.keyboard.press('Enter');
+      await expect(async () => {
+        await page.locator('#check').click();
+        await expect(page.locator('#feedback')).toContainText('Richtig.', { timeout: 20_000 });
+      }).toPass({ timeout: 120_000 });
+      break;
     case 'order':
       await expect(page.locator('.order-item')).toHaveCount(exercise.lines.length);
       for (let target = 0; target < exercise.lines.length; target++) {

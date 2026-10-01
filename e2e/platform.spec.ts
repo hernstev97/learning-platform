@@ -253,7 +253,7 @@ test('practice, bug and explain exercises', async ({ page }) => {
   for (const box of await page.locator('[data-point]').all()) await box.check();
   await expect(page.locator('#feedback')).toContainText('Richtig.');
   await page.goto('/beispiel');
-  await expect(page.locator('.module-row .label').last()).toHaveText('3/12');
+  await expect(page.locator('.module-row .label').last()).toHaveText('3/13');
 });
 
 test('SQL runs in the browser: table preview, result table, feedback and runnable lesson blocks', async ({ page }) => {
@@ -288,6 +288,47 @@ test('SQL runs in the browser: table preview, result table, feedback and runnabl
   await block.getByRole('button', { name: 'Ausführen' }).click();
   await expect(block.locator('.run-output table')).toContainText('160.5', { timeout: 60_000 });
   await expect(page.locator('.codeblock[data-lang="excel"] .syntax-fn')).toHaveText('SUMMEWENNS');
+});
+
+test('a scenario runs a real Linux in the browser, loaded only on start and only from this site', async ({ page }) => {
+  test.setTimeout(180_000);
+  const errors = errorsOf(page);
+  const requests: URL[] = [];
+  page.on('request', (request) => requests.push(new URL(request.url())));
+  await page.goto(`${base}/13`);
+  await expect(page.locator('#vm-boot')).toBeVisible();
+  await expect(page.locator('#check')).toBeDisabled();
+  expect(requests.filter((url) => url.pathname.startsWith('/vm/'))).toEqual([]);
+
+  const started = requests.length;
+  await page.locator('#vm-boot').click();
+  const terminal = page.locator('#vm-screen .xterm-rows');
+  await expect(terminal).toContainText('ops@web01:~$', { timeout: 120_000 });
+  await page.locator('#check').click();
+  await expect(page.locator('#feedback')).toContainText('0 von 1 Prüfungen bestanden', { timeout: 30_000 });
+  await expect(page.locator('.test.fail')).toHaveCount(1);
+
+  await page.locator('#vm-screen').click();
+  await page.keyboard.type('echo hallo > ~/hallo.txt');
+  await page.keyboard.press('Enter');
+  await expect(page.locator('#vm-steps')).toHaveText('1 Befehl');
+  await page.locator('#check').click();
+  await expect(page.locator('#feedback')).toContainText('Richtig.', { timeout: 30_000 });
+
+  page.once('dialog', (dialog) => dialog.accept());
+  await page.locator('#vm-reset').click();
+  await expect(page.locator('#vm-steps')).toHaveText('');
+  await expect(terminal).toContainText('ops@web01:~$', { timeout: 30_000 });
+  await page.locator('#vm-screen').click();
+  await page.keyboard.type('cat ~/hallo.txt');
+  await page.keyboard.press('Enter');
+  await expect(terminal).toContainText(/No.such.file.or.directory/, { timeout: 30_000 });
+
+  // No network in the VM: everything after the start comes from this site.
+  const origin = new URL(page.url()).origin;
+  expect(requests.slice(started).filter((url) => url.origin !== origin).map(String)).toEqual([]);
+  expect(requests.some((url) => url.pathname.endsWith('/state.bin.zst'))).toBe(true);
+  expect(errors).toEqual([]);
 });
 
 test('cards, projects, reference pages and data export', async ({ page }) => {
@@ -423,7 +464,7 @@ test('unsaved work can be exported and merged when browser storage is blocked', 
   backup.areas.beispiel.read = { 'alle-typen': '2026-09-28' };
   await page.locator('#import-file').setInputFiles({ name: 'backup.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(backup)) });
   await expect(page.locator('#data-message')).toContainText('übernommen');
-  await expect(page.locator('.data-table tr', { hasText: 'Beispielbereich' })).toContainText('1 / 12');
+  await expect(page.locator('.data-table tr', { hasText: 'Beispielbereich' })).toContainText('1 / 13');
 });
 
 test('malformed addresses render the not-found page without an unhandled exception', async ({ page }) => {

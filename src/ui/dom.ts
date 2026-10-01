@@ -22,11 +22,11 @@ export function html(strings: TemplateStringsArray, ...values: Value[]): Raw {
 export const LEVELS = ['', 'Einstieg', 'Fortgeschritten', 'Profi'] as const;
 export const TYPE_LABELS: Record<string, string> = {
   gap: 'Lückencode', choice: 'Auswahl', order: 'Reihenfolge', output: 'Ausgabe vorhersagen', command: 'Terminal',
-  code: 'Programmieren', practice: 'Praxisaufgabe', bug: 'Fehler finden', explain: 'Erklären', sql: 'SQL-Abfrage',
+  code: 'Programmieren', practice: 'Praxisaufgabe', bug: 'Fehler finden', explain: 'Erklären', sql: 'SQL-Abfrage', scenario: 'Linux-Szenario',
 };
 export const TYPE_VERBS: Record<string, string> = {
   gap: 'Schreiben', choice: 'Verstehen', order: 'Verstehen', output: 'Vorhersagen', command: 'Schreiben',
-  code: 'Schreiben', practice: 'Anwenden', bug: 'Fehler finden', explain: 'Erklären', sql: 'Schreiben',
+  code: 'Schreiben', practice: 'Anwenden', bug: 'Fehler finden', explain: 'Erklären', sql: 'Schreiben', scenario: 'Diagnostizieren',
 };
 export const minutes = (value: number) => value >= 90 ? `${Math.round(value / 60 * 2) / 2} h`.replace('.', ',') : `${value} min`;
 export const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;

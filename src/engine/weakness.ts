@@ -7,7 +7,7 @@ import { DRILL_MAX, legacyDrill, refreshInterval } from './drill.ts';
 import { addDays, daysBetween, isDone, localDay, type AreaProgress, type CardState, type DrillState } from './storage.ts';
 
 /** Rough minutes per review item, for the time estimate of a round. */
-export const MINUTES: Record<ExerciseType | 'card', number> = { gap: 2, choice: 1, order: 2, output: 2, command: 1, code: 6, practice: 8, bug: 3, explain: 5, sql: 4, card: 1 };
+export const MINUTES: Record<ExerciseType | 'card', number> = { gap: 2, choice: 1, order: 2, output: 2, command: 1, code: 6, practice: 8, bug: 3, explain: 5, sql: 4, scenario: 12, card: 1 };
 /** Quick recall checks; refreshers prefer them over long self-checked tasks. */
 const QUICK = new Set<ExerciseType>(['gap', 'choice', 'order', 'output', 'command', 'bug', 'code', 'sql']);
 /** A module counts as learned, and can go stale, once this share of its exercises is solved. */

@@ -3,11 +3,12 @@
 // /sw.js with the build's file list, so it must not reference anything outside its own body.
 // Personal progress travels over the Convex WebSocket and Clerk runs on its own origin; neither passes through here.
 
-export type WorkerConfig = { version: string; files: string[]; pyodide: string };
+export type WorkerConfig = { version: string; files: string[]; pyodide: string; vm: string };
 
-export function serviceWorker(worker: ServiceWorkerGlobalScope, { version, files, pyodide }: WorkerConfig): void {
+export function serviceWorker(worker: ServiceWorkerGlobalScope, { version, files, pyodide, vm }: WorkerConfig): void {
   const SHELL = `learn-shell-${version}`;
   const PYODIDE = `learn-pyodide-${pyodide}`;
+  const VM = `learn-vm-${vm}`;
   // After this long a slow network loses against the cached shell.
   const NAVIGATION_TIMEOUT = 4000;
   const precached = new Set(files);
@@ -32,7 +33,7 @@ export function serviceWorker(worker: ServiceWorkerGlobalScope, { version, files
       // Cache names are listed in creation order. The previous shell stays: pages opened before this
       // update may still lazy-load its chunks, which the server no longer has.
       const shells = names.filter((name) => name.startsWith('learn-shell-') && name !== SHELL);
-      const runtimes = names.filter((name) => name.startsWith('learn-pyodide-') && name !== PYODIDE);
+      const runtimes = names.filter((name) => (name.startsWith('learn-pyodide-') && name !== PYODIDE) || (name.startsWith('learn-vm-') && name !== VM));
       await Promise.all([...shells.slice(0, -1), ...runtimes].map((name) => caches.delete(name)));
       await worker.clients.claim();
     })());
@@ -43,7 +44,8 @@ export function serviceWorker(worker: ServiceWorkerGlobalScope, { version, files
     const url = new URL(request.url);
     if (request.method !== 'GET' || url.origin !== worker.location.origin) return;
     if (request.mode === 'navigate') event.respondWith(page(request));
-    else if (url.pathname.startsWith('/pyodide/')) event.respondWith(python(event));
+    else if (url.pathname.startsWith('/pyodide/')) event.respondWith(runtime(PYODIDE, event));
+    else if (url.pathname.startsWith('/vm/')) event.respondWith(runtime(VM, event));
     else if (precached.has(url.pathname) || url.pathname.startsWith('/assets/')) event.respondWith(file(request));
   });
 
@@ -65,9 +67,10 @@ export function serviceWorker(worker: ServiceWorkerGlobalScope, { version, files
     return await caches.match(request, { ignoreSearch: true, ignoreVary: true }) ?? fetch(request);
   }
 
-  // Pyodide (about 12 MB) is cached on first use only; files keep their names across versions, hence the versioned cache.
-  async function python(event: FetchEvent): Promise<Response> {
-    const cache = await caches.open(PYODIDE);
+  // Pyodide (about 12 MB) and the Linux VM (snapshot plus the files the VM has read) are cached on first use only.
+  // Files keep their names across versions, hence the versioned caches.
+  async function runtime(name: string, event: FetchEvent): Promise<Response> {
+    const cache = await caches.open(name);
     const hit = await cache.match(event.request, { ignoreVary: true });
     if (hit) return hit;
     const response = await fetch(event.request);

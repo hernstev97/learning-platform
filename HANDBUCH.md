@@ -199,7 +199,7 @@ Gemeinsame Felder aller Übungen:
 | Feld | Pflicht | Inhalt |
 | --- | --- | --- |
 | `id` | ja | kebab-case, eindeutig im Modul. Nie ändern, sobald veröffentlicht (Fortschritt hängt daran). |
-| `type` | ja | `gap`, `choice`, `order`, `output`, `command`, `code`, `practice`, `bug`, `explain`, `sql` |
+| `type` | ja | `gap`, `choice`, `order`, `output`, `command`, `code`, `practice`, `bug`, `explain`, `sql`, `scenario` |
 | `title` | ja | Kurz, neugierig machend, keine Lösung verraten |
 | `prompt` | ja | Markdown. Die Aufgabe, eindeutig formuliert. |
 | `explanation` | ja | Markdown. Erscheint nach dem Lösen: *warum* das richtig ist, was dahintersteckt, typische Verwechslungen. 2–6 Sätze. |
@@ -220,7 +220,7 @@ Die Übungen eines Moduls stehen in dieser Reihenfolge. Jede Stufe setzt die vor
 | 3. Schreiben | Syntax und Idiome aktiv produzieren | `gap`, `command`, `code`, `sql` | 3–5 |
 | 4. Fehler finden | Bugs erkennen, erklären, beheben | `bug` (oder `code` mit fehlerhaftem Startcode) | 1–2 |
 | 5. Erklären | Bestehende Implementierungen in eigenen Worten erklären | `explain` | 1–2 |
-| 6. Anwenden | Eine kleine, realistische Aufgabe lösen | `code`, `practice` | 1–2 |
+| 6. Anwenden | Eine kleine, realistische Aufgabe lösen | `code`, `practice`, `scenario` | 1–2 |
 
 `pnpm content:check` warnt, wenn einem Modul `output`, `bug` oder `explain` fehlt oder mehr als ein Drittel Multiple Choice ist.
 
@@ -238,6 +238,7 @@ Die Übungen eines Moduls stehen in dieser Reihenfolge. Jede Stufe setzt die vor
 | `bug` | Fehler finden und beheben | Off-by-one, falsche Bedingung, Race Condition, Sicherheitslücke, falscher Befehl |
 | `explain` | Bestehende Implementierung erklären | Code lesen und in eigenen Worten wiedergeben – wie im Code-Review oder Interview |
 | `practice` | Größere Aufgaben mit Musterlösung | Rust/Kotlin-Programme, Konfigurationen, Skripte |
+| `scenario` | Einen Fehler in einem echten Linux finden und beheben | Diagnose im Linux-Pfad: Dienste, Logs, Rechte, Konfiguration. Bewertet wird der reparierte Zustand. |
 
 Python- und Automation-Module haben mindestens drei `code`-Übungen, davon gern eine mit fehlerhaftem Startcode („Repariere …“).
 
@@ -433,6 +434,53 @@ Laufzeitumgebung (Browser und `pnpm verify` identisch, siehe `src/python/harness
 - `pnpm verify` führt die Musterlösung mit derselben SQLite-Version aus: Sie muss Zeilen liefern, und der `starter` darf das erwartete Ergebnis noch nicht liefern.
 - SQL-Module mischen `sql` mit `output` (`lang: sql`, siehe oben), `gap`, `bug` und `explain`; `sql` ersetzt dort die `code`-Übungen.
 
+### `scenario` – Linux-Szenario (echte VM im Browser)
+
+```yaml
+- id: dienst-nach-boot
+  type: scenario
+  title: Läuft von Hand, aber nicht nach dem Neustart
+  prompt: |                    # Symptom und Ziel, so wie es im Betrieb ankommt
+    `web01` wurde heute früh neu gestartet. Seitdem antwortet `http://localhost:8000/health` nicht. …
+  setup: |                     # Pflicht: bash als root, baut den Fehler in den frischen Snapshot ein
+    set -e
+    mkdir -p /opt/healthapp/www
+    …
+    systemctl daemon-reload
+  checks:                      # Pflicht: je ein bash-Skript als root, Exit-Code 0 = bestanden
+    - name: healthapp startet beim Boot
+      run: systemctl is-enabled healthapp
+    - name: Der Health-Endpunkt antwortet
+      run: curl -fsS --max-time 5 http://localhost:8000/health
+  solution: |                  # Pflicht: Musterlösung, so wie der Lernende sie tippt (als ops, mit sudo)
+    sudo systemctl enable --now healthapp
+    …
+  hints: […]
+  explanation: …
+```
+
+Die Übung startet ein echtes Debian 12 (i386, systemd 252) in [v86](https://github.com/copy/v86), einem x86-Emulator in WebAssembly. Der Lernende arbeitet frei im Terminal und meldet mit „Prüfen“, dass er fertig ist. Bewertet wird der reparierte Zustand, nicht der Weg dorthin.
+
+- **Ablauf:** „Linux starten“ lädt einmalig den Snapshot (rund 17 MB) und stellt ihn wieder her. Danach stellt der Steuerkanal die Uhr auf jetzt und führt `setup` aus, erst dann erscheint der Prompt. „Neu starten“ stellt den Snapshot wieder her und führt `setup` erneut aus. Die Kopfzeile zählt die Befehle; die Zahl fließt nicht in die Bewertung ein.
+- **Umgebung:** Hostname `web01`, angemeldet als `ops` mit `sudo` ohne Passwort, Mitglied von `adm` und `systemd-journal` (Journal ohne sudo), Zeitzone Europe/Berlin. Vorhanden sind systemd mit journald und dbus, `curl`, `busybox` (zum Beispiel `busybox httpd` als kleiner Webserver), `less`, `nano`, `vim.tiny`, `procps`, `psmisc`, `lsof` und `file`. Kein Netzwerk außer `lo`, kein Python, keine man-Pages. Die Paketliste steht in `tooling/vm/Dockerfile`.
+- **`setup`** läuft als root im frischen Snapshot. Beginne mit `set -e`, damit ein Fehler im Aufbau auffällt, statt ein halb kaputtes Szenario zu liefern. Neue oder geänderte Units brauchen `systemctl daemon-reload`. Halte `setup` kurz: Der Lernende wartet darauf, und unter Emulation dauert schon `daemon-reload` einige Sekunden.
+- **`checks`** laufen als root nacheinander, alle, auch nach einem Fehlschlag. Die Ausgabe einer gescheiterten Prüfung sieht der Lernende, die Befehle erst in der Lösung. Prüfe das Ergebnis, nicht einen bestimmten Lösungsweg: `curl` auf den Endpunkt statt `grep` in der Unit-Datei. Für „übersteht den Boot“ reichen `systemctl is-enabled` und `systemctl restart`, denn ein von Hand gestarteter Prozess besteht das nicht.
+- **`solution`** erscheint unter „Lösung zeigen“. `pnpm vm:verify` führt sie als `ops` in einer Login-Shell aus, also genau so, wie sie dasteht.
+- **Prüfung:** `pnpm vm:verify [bereich]` stellt für jedes Szenario den Snapshot unter Node wieder her. Nach `setup` muss mindestens eine Prüfung scheitern, nach `setup` und `solution` müssen alle bestehen. `pnpm verify` prüft Szenarien nicht.
+- **Firmennetz:** Die VM hat kein Netzwerk (kein Relay, keine Netzwerktreiber im Image). Alle Dateien kommen von der eigenen Domain, nichts lädt vor „Linux starten“, und nichts landet im Precache. Lädt der Snapshot nicht, etwa weil ein Proxy große Downloads sperrt, meldet die Übung das, und der Rest der Seite läuft weiter. In einem Hintergrund-Tab pausiert die VM.
+- **Offline:** Der Service Worker legt den Snapshot und jede Datei, die die VM liest, beim ersten Gebrauch ab. Offline funktioniert, was die VM schon einmal gelesen hat.
+
+#### Das Image
+
+```sh
+pnpm vm:build      # Docker baut Debian, v86 bootet es unter Node und speichert den Zustand (2–3 Minuten)
+pnpm vm:verify     # alle Szenarien gegen das Image prüfen
+```
+
+`pnpm vm:build` braucht Docker mit buildx, `python3` (3.14 oder das Modul `zstandard`) und `zstd`. Das Ergebnis liegt in `vendor/vm/debian-12/` und wird committet wie `vendor/pyodide`. Es besteht aus `state.bin.zst` (Snapshot samt Dateitabelle), `files/` (eine zstd-Datei je Datei im System, benannt nach ihrem Hash), dem BIOS und `manifest.json`. Das Vite-Plugin `vm()` kopiert es zusammen mit v86 nach `public/vm/`.
+
+Szenarien brauchen keinen Neubau, solange ihnen das Image reicht. Neu bauen musst du nach Änderungen an `tooling/vm/` (Pakete, Steuerkanal, Benutzer) und nach einem v86-Update, denn der Snapshot passt nur zu der v86-Version, mit der er entstand. Speicher, Kernel-Parameter und serielle Schnittstellen stehen in `src/vm/config.ts` und gelten für Build und Browser gleichermaßen.
+
 ### `bug` – Fehler finden und beheben
 
 ```yaml
@@ -592,6 +640,7 @@ Normales Markdown mit `##`-Abschnitten. Der **Spickzettel** ist dicht: Tabellen,
 pnpm content:check [bereich]   # Struktur, Pflichtfelder, IDs, Lücken, Richtwerte (Warnungen)
 pnpm verify [bereich]          # führt Python aus, kompiliert Rust, vergleicht Ausgaben
                                # beide mit --allow-missing: fehlende Moduldateien nur als Warnung
+pnpm vm:verify [bereich]       # Linux-Szenarien in der echten VM (siehe scenario)
 pnpm test                      # Unit-Tests inkl. Bear-Rekonstruktion und Prüflogik
 pnpm test:e2e                  # Browser-Tests (Playwright)
 pnpm build                     # TypeScript + Produktionsbuild
@@ -605,6 +654,7 @@ Checkliste vor dem Commit:
 
 - [ ] `content:check` ohne Fehler, Warnungen bewusst akzeptiert
 - [ ] `verify` ohne Fehler
+- [ ] Bei Linux-Szenarien: `vm:verify` ohne Fehler
 - [ ] Jede Übung ist eindeutig lösbar; alternative richtige Antworten sind in `accept`/`answers`/`alternatives`
 - [ ] Jede Erklärung liefert das *Warum*
 - [ ] Links zeigen auf offizielle Dokumentation und funktionieren

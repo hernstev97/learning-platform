@@ -10,7 +10,7 @@ describe('content', () => {
     const loaded = loadContent(undefined, join(import.meta.dirname, 'fixtures'));
     expect(formatIssues(loaded.errors)).toBe('');
     const types = new Set(loaded.areas.beispiel.modules['alle-typen'].exercises.map((e) => e.type));
-    expect([...types].sort()).toEqual(['bug', 'choice', 'code', 'command', 'explain', 'gap', 'order', 'output', 'practice', 'sql']);
+    expect([...types].sort()).toEqual(['bug', 'choice', 'code', 'command', 'explain', 'gap', 'order', 'output', 'practice', 'scenario', 'sql']);
     expect(loaded.catalog.areas[0].projects.filter((p) => p.capstone)).toHaveLength(1);
   });
   it('published content is valid', () => {
@@ -36,6 +36,25 @@ describe('content', () => {
       const messages = loadContent(undefined, root).errors.map((issue) => issue.message).join('\n');
       expect(messages).toContain('"schema" lässt sich nicht ausführen: duplicate column name: region');
       expect(messages).toContain('"ordered" muss true oder false sein');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it('normalises scenario exercises and requires setup, checks and a solution', () => {
+    const loaded = loadContent(undefined, join(import.meta.dirname, 'fixtures'));
+    const scenario = loaded.areas.beispiel.modules['alle-typen'].exercises.find((e) => e.type === 'scenario')!;
+    expect(scenario.type === 'scenario' && { setup: scenario.setup, checks: scenario.checks, solution: scenario.solution }).toEqual({
+      setup: 'rm -f /home/ops/hallo.txt',
+      checks: [{ name: 'hallo.txt enthält genau „hallo“', run: 'grep -qx hallo /home/ops/hallo.txt' }],
+      solution: 'echo hallo > ~/hallo.txt',
+    });
+    const root = mkdtempSync(join(tmpdir(), 'learning-scenario-'));
+    try {
+      cpSync(join(import.meta.dirname, 'fixtures/beispiel'), join(root, 'beispiel'), { recursive: true });
+      const file = join(root, 'beispiel/modules/alle-typen.yaml');
+      writeFileSync(file, readFileSync(file, 'utf8').replace('    setup: rm -f /home/ops/hallo.txt\n', '').replace('        run: grep -qx hallo /home/ops/hallo.txt', '        command: grep -qx hallo /home/ops/hallo.txt'));
+      const messages = loadContent(undefined, root).errors.map((issue) => issue.message);
+      expect(messages).toContain('"setup" fehlt');
+      expect(messages).toContain('unbekanntes Feld "command" (erlaubt: name, run)');
+      expect(messages).toContain('"run" fehlt');
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
   it('reports list items that YAML read as objects instead of text', () => {
