@@ -18,8 +18,9 @@ export async function prepareScenario(agent: AgentChannel, setup: string, now = 
 /** Runs every check, also after a failed one, so the learner sees the whole picture. */
 export async function runChecks(agent: AgentChannel, checks: ScenarioCheck[]): Promise<CheckResult[]> {
   // lp-agent only runs in normal operation. During a reboot or in rescue or emergency mode every check would wait
-  // for its full timeout; one short question first tells the learner what is going on.
-  await agent.run('true', 8000).catch(() => {
+  // for its full timeout; one short question first tells the learner what is going on. 20 s leave room for a VM that
+  // a scenario keeps busy on purpose.
+  await agent.run('true', 20_000).catch(() => {
     throw new Error('Die VM antwortet nicht. Startet das System gerade neu, oder steckt es im Rescue- oder Emergency-Modus? Warte auf den Prompt oder bringe das System in den normalen Betrieb, dann prüfe erneut.');
   });
   const results: CheckResult[] = [];
