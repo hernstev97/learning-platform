@@ -1,0 +1,836 @@
+id: boot-recovery
+title: Boot & Recovery
+level: 3
+minutes: 170
+summary: Wenn ein Server nach dem Neustart nicht zurückkommt – du erkennst an der Konsole, welche Etappe scheitert, und holst das System über GRUB, Rescue- und Emergency-Modus, ein neues initramfs oder chroot zurück.
+goals:
+  - Du ordnest eine Fehlermeldung beim Start der richtigen Etappe zu (Bootloader, Kernel, initramfs, systemd).
+  - Du änderst die Kernelzeile einmalig im GRUB-Menü und dauerhaft über `/etc/default/grub` und `update-grub` und kennst die Gegenstücke bei systemd-boot und Limine.
+  - Du unterscheidest `rescue.target`, `emergency.target` und `init=/bin/bash` und bringst ein System aus der Notfall-Shell zurück in den Normalbetrieb.
+  - Du findest fstab-Fehler vor dem Neustart und machst optionale Mounts mit `nofail` startsicher.
+  - Du baust das initramfs mit `update-initramfs`, `mkinitcpio` oder `dracut` neu und prüfst seinen Inhalt.
+  - Du reparierst ein System per chroot aus einem Live-System.
+resources:
+  - title: systemd.special(7) · rescue.target und emergency.target
+    url: https://www.freedesktop.org/software/systemd/man/latest/systemd.special.html#rescue.target
+  - title: kernel-command-line(7)
+    url: https://www.freedesktop.org/software/systemd/man/latest/kernel-command-line.html
+  - title: GNU GRUB Manual · Simple configuration
+    url: https://www.gnu.org/software/grub/manual/grub/html_node/Simple-configuration.html
+  - title: initramfs-tools(7)
+    url: https://manpages.debian.org/bookworm/initramfs-tools-core/initramfs-tools.7.en.html
+  - title: ArchWiki · chroot
+    url: https://wiki.archlinux.org/title/Chroot
+lab: |
+  set -e
+  # Ein Image mit Produktbildern als Datenplatte für die fstab-Beispiele
+  mkdir -p /root/bilder /var/lib/images /srv/produktbilder
+  printf '<svg xmlns="http://www.w3.org/2000/svg"/>\n' > /root/bilder/logo.svg
+  mkfs.ext4 -q -F -L produktbilder -d /root/bilder /var/lib/images/produktbilder.img 4M >/dev/null
+  rm -rf /root/bilder
+lesson: |
+  Freitagabend, Kernel-Update, `sudo reboot` – und `web01` kommt nicht zurück. SSH antwortet nicht, es bleibt die Konsole des Hypervisors. Dort steht vielleicht `grub rescue>`, vielleicht `(initramfs)`, vielleicht „You are in emergency mode“. Jede dieser Meldungen gehört zu einer anderen Etappe des Bootvorgangs, und für jede gibt es einen anderen Weg zurück.
+
+  Die Etappen selbst kennst du aus dem Abschnitt „Vom Einschalten bis PID 1“ im Modul zu systemd, fstab und `nofail` aus dem Speicher-Modul. Hier geht es um die Eingriffe: Kernelzeile ändern, Notfall-Shells nutzen, das initramfs neu bauen, von außen reparieren. Die Lern-VM startet wie ein Server über GRUB von einer echten Platte. Die Beispiele mit „Im Terminal“ kannst du direkt ausprobieren, und `sudo reboot` startet die VM wirklich neu, mit GRUB-Menü im Terminal. Geht dabei etwas kaputt, stellt „Zurücksetzen“ den Anfangszustand wieder her.
+
+  ## Wo der Boot stehen bleibt
+
+  Die erste Frage bei einem Rechner, der nicht hochkommt: Welche Etappe hat zuletzt etwas ausgegeben? Daraus folgt, wo du eingreifst ([bootup(7)](https://www.freedesktop.org/software/systemd/man/latest/bootup.html)).
+
+  | Die Konsole zeigt | Etappe | Häufige Ursache | Weg zurück |
+  | --- | --- | --- | --- |
+  | `grub rescue>` oder `error: file '/vmlinuz-…' not found` | Bootloader | `/boot` beschädigt, GRUB passt nicht mehr zur Platte | Live-System, chroot, `grub-install`, `update-grub` |
+  | `Kernel panic - not syncing: VFS: Unable to mount root fs` oder `No working init found` | Kernel | initramfs fehlt oder ist kaputt | älteren Kernel im GRUB-Menü wählen, initramfs neu bauen |
+  | `ALERT! … does not exist. Dropping to a shell!` mit Prompt `(initramfs)` | initramfs | Treiber fehlt im initramfs, `root=` falsch | anderer Kernel oder Fallback-Image, initramfs mit Treiber neu bauen |
+  | `You are in emergency mode` | systemd | eine fstab-Zeile scheitert | Notfall-Shell, fstab reparieren |
+  | Login erscheint, ein Dienst fehlt | systemd | Unit-Fehler | `systemctl`, `journalctl` |
+
+  Den Ist-Zustand liest du so ab:
+
+  ```console vm
+  $ cat /proc/cmdline
+  BOOT_IMAGE=/vmlinuz-6.1.0-53-686 root=host9p ro console=ttyS0 mitigations=off init_on_free=on quiet loglevel=3
+  $ ls /boot
+  System.map-6.1.0-53-686
+  config-6.1.0-53-686
+  grub
+  initrd.img-6.1.0-53-686
+  lost+found
+  vmlinuz-6.1.0-53-686
+  $ journalctl --list-boots --no-pager
+  IDX BOOT ID                          FIRST ENTRY                  LAST ENTRY
+   -1 2f2dcc15f9964bac9b408e05c5a9afae Thu 2026-10-01 11:49:17 CEST Thu 2026-10-01 11:49:42 CEST
+    0 7e290a9120804839a118202aaed3f761 Thu 2026-10-01 11:50:05 CEST …
+  ```
+
+  `/proc/cmdline` ist die Kernelzeile, mit der dieser Boot tatsächlich gestartet wurde, nicht die aus einer Konfigurationsdatei. Zu jedem Kernel `vmlinuz-<version>` gehört ein `initrd.img-<version>`. Nach einem gescheiterten Start, den du auf einem Umweg doch noch hochbekommen hast, zeigt `journalctl -b -1` das Journal des vorigen Boots, wenn es persistent gespeichert wird (in der VM ist das so). Ein Boot, der schon im initramfs stirbt, hinterlässt dagegen kein Journal: journald läuft erst auf dem echten Root-Dateisystem. Dort hilft nur, was auf der Konsole stand.
+
+  ## GRUB: Konfiguration, Menü und Kernelzeile
+
+  GRUB liest beim Start `/boot/grub/grub.cfg`. Diese Datei änderst du nie von Hand. `update-grub` (auf Debian ein Kurzaufruf für `grub-mkconfig -o /boot/grub/grub.cfg`) erzeugt sie neu aus `/etc/default/grub`, danach aus allen Dateien `/etc/default/grub.d/*.cfg`, die Variablen überschreiben oder ergänzen, und den Skripten in `/etc/grub.d/`, die die Menüeinträge bauen: `10_linux` sucht die Kernel in `/boot`, `40_custom` nimmt eigene Einträge auf ([GRUB-Handbuch · Simple configuration](https://www.gnu.org/software/grub/manual/grub/html_node/Simple-configuration.html)).
+
+  ```console vm
+  $ grep -v '^#' /etc/default/grub | grep .
+  GRUB_DEFAULT=0
+  GRUB_TIMEOUT=5
+  GRUB_DISTRIBUTOR=`lsb_release -i -s 2> /dev/null || echo Debian`
+  GRUB_CMDLINE_LINUX_DEFAULT="quiet loglevel=3"
+  GRUB_CMDLINE_LINUX="console=ttyS0 mitigations=off init_on_free=on"
+  GRUB_TERMINAL=serial
+  GRUB_SERIAL_COMMAND="serial --unit=0 --speed=115200"
+  $ sudo update-grub
+  Generating grub configuration file ...
+  Found linux image: /boot/vmlinuz-6.1.0-53-686
+  Found initrd image: /boot/initrd.img-6.1.0-53-686
+  done
+  $ grep -E "^\s*(menuentry|submenu) " /boot/grub/grub.cfg | cut -d"'" -f2
+  Debian GNU/Linux
+  Advanced options for Debian GNU/Linux
+  Debian GNU/Linux, with Linux 6.1.0-53-686
+  Debian GNU/Linux, with Linux 6.1.0-53-686 (recovery mode)
+  ```
+
+  Für die Kernelzeile gibt es zwei Variablen. `GRUB_CMDLINE_LINUX` landet in jedem Eintrag, auch im Recovery-Eintrag. `GRUB_CMDLINE_LINUX_DEFAULT` landet nur in den normalen Einträgen; der Recovery-Eintrag bekommt stattdessen `single` direkt hinter `ro`. Was das System zum Starten braucht (Konsole, Root-Optionen, LUKS-Parameter), gehört deshalb in `GRUB_CMDLINE_LINUX`. `quiet`, Grafik-Optionen und Experimente gehören in `GRUB_CMDLINE_LINUX_DEFAULT`. Dann bleibt der Recovery-Eintrag ein sauberer Ausweg, wenn ein Experiment schiefgeht.
+
+  `grub-install` ist ein anderes Werkzeug: Es schreibt den Startcode von GRUB in den MBR oder auf die EFI-Systempartition. Du brauchst es nach einem Plattentausch oder wenn GRUB selbst nicht mehr startet, nicht für eine geänderte Kernelzeile.
+
+  ### Die Kernelzeile einmalig ändern
+
+  So probierst du es in der VM aus:
+
+  1. `sudo reboot` eingeben. Das GRUB-Menü steht fünf Sekunden im Terminal, ein Druck auf ↓ hält den Countdown an.
+  2. `e` öffnet den markierten Eintrag im Editor.
+  3. Mit ↓ zur Zeile, die mit `linux` beginnt (sie steht zwei Zeilen über `initrd`), mit Strg+E ans Zeilenende.
+  4. ` systemd.unit=rescue.target` anhängen, mit Leerzeichen davor, und mit Strg+X booten.
+
+  Die Änderung gilt nur für diesen Start, `grub.cfg` bleibt, wie sie war. Was der Parameter bewirkt, zeigt der nächste Abschnitt. Für einen Server ohne Konsole gibt es `grub-reboot`: Es trägt einen Menüeintrag nur für den nächsten Start in `/boot/grub/grubenv` ein, danach gilt wieder der Standard.
+
+  ```console vm
+  $ sudo grub-reboot "Advanced options for Debian GNU/Linux>Debian GNU/Linux, with Linux $(uname -r) (recovery mode)"
+  $ sudo grub-editenv list
+  next_entry=Advanced options for Debian GNU/Linux>Debian GNU/Linux, with Linux 6.1.0-53-686 (recovery mode)
+  ```
+
+  Untermenü und Eintrag trennt ein `>`. Der nächste `sudo reboot` startet jetzt genau einmal den Recovery-Eintrag; `sudo grub-editenv - unset next_entry` nimmt das zurück. Das Handbuch beschreibt `grub-reboot` zusammen mit `GRUB_DEFAULT=saved`, die `grub.cfg` von Debian wertet `next_entry` aber auch mit `GRUB_DEFAULT=0` aus, wie hier in der VM.
+
+  ### systemd-boot, Limine und Fedora
+
+  Nicht jede Distribution nutzt das klassische GRUB-Schema, und die Kernelzeile steht dann woanders:
+
+  | Bootloader | Kernelzeile steht in | Anwenden |
+  | --- | --- | --- |
+  | GRUB (Debian, Ubuntu) | `/etc/default/grub` | `sudo update-grub` |
+  | GRUB mit BLS-Einträgen (Fedora) | `/boot/loader/entries/*.conf` | `sudo grubby --update-kernel=ALL --args="…"` |
+  | systemd-boot | Zeile `options` in `/boot/loader/entries/*.conf` | Datei speichern; `bootctl list` zeigt das Ergebnis |
+  | Limine | Zeile `cmdline:` in `limine.conf`; auf CachyOS `KERNEL_CMDLINE` in `/etc/default/limine` | auf CachyOS `sudo limine-mkinitcpio` |
+
+  ```ini title=/boot/loader/entries/arch.conf
+  title   Arch Linux
+  linux   /vmlinuz-linux
+  initrd  /initramfs-linux.img
+  options root=UUID=8d2f6c1a-5b3e-4f7a-9c0d-1e2b3a4c5d6e rw quiet
+  ```
+
+  ```text title=limine.conf
+  timeout: 5
+
+  /Arch Linux
+      protocol: linux
+      path: boot():/vmlinuz-linux
+      cmdline: root=UUID=8d2f6c1a-5b3e-4f7a-9c0d-1e2b3a4c5d6e rw quiet
+      module_path: boot():/initramfs-linux.img
+  ```
+
+  Beide Bootloader sehen nicht dein Dateisystem, sondern nur ihre Partition. Pfade beginnen an der Wurzel der EFI-Systempartition (bei Limine `boot():`, die Partition mit der `limine.conf`). Ist die ESP unter `/boot` eingehängt, heißt der Kernel also `/vmlinuz-linux`, nicht `/boot/vmlinuz-linux` ([systemd-boot(7)](https://www.freedesktop.org/software/systemd/man/latest/systemd-boot.html), [bootctl(1)](https://www.freedesktop.org/software/systemd/man/latest/bootctl.html), [ArchWiki · Limine](https://wiki.archlinux.org/title/Limine)). Auf CachyOS mit Limine schreibt `limine-entry-tool` aus dem Paket `limine-mkinitcpio-hook` die Einträge selbst. Die Kernelzeile änderst du dort in `/etc/default/limine`, nicht direkt in `limine.conf`.
+
+  ## Rescue-Modus, Emergency-Modus und init=/bin/bash
+
+  systemd liest Parameter von der Kernelzeile. `systemd.unit=` ersetzt für diesen einen Start das Ziel aus `default.target`. `single` (auch `s`, `S` oder `1`) ist der alte Name für `rescue.target`, `emergency` steht für `emergency.target` ([kernel-command-line(7)](https://www.freedesktop.org/software/systemd/man/latest/kernel-command-line.html#systemd.unit=), [systemd.special(7)](https://www.freedesktop.org/software/systemd/man/latest/systemd.special.html#emergency.target)).
+
+  | | `rescue.target` | `emergency.target` | `init=/bin/bash` |
+  | --- | --- | --- | --- |
+  | Kernelparameter | `systemd.unit=rescue.target` oder `single` | `systemd.unit=emergency.target` oder `emergency` | `init=/bin/bash` |
+  | PID 1 | systemd | systemd | bash |
+  | Eingehängt | alles aus der fstab | nur `/` | nur `/`, meist nur lesbar |
+  | Dienste | nur Basisdienste wie journald und udev, kein Netz, kein sshd | fast keine | keine |
+  | Anmeldung | root-Passwort | root-Passwort | keine |
+  | Weiter mit | `systemctl default` oder `exit` | `systemctl default` oder `exit` | `exec /sbin/init` |
+
+  Rescue und Emergency starten `sulogin`, das das root-Passwort verlangt ([sulogin(8)](https://man7.org/linux/man-pages/man8/sulogin.8.html)). In der VM hat root keines, deshalb steht dort „Press Enter for maintenance“, und Enter genügt. Ist root gesperrt, wie auf einer Ubuntu-Standardinstallation, verweigert `sulogin` die Shell:
+
+  ```text
+  Cannot open access to console, the root account is locked.
+  See sulogin(8) man page for more details.
+
+  Press Enter to continue.
+  ```
+
+  Enter setzt dann nur den normalen Start fort. Der letzte Ausweg ist `init=/bin/bash`: Der Kernel startet eine Shell statt systemd als PID 1, ohne Anmeldung ([Kernel-Parameter · init=](https://docs.kernel.org/admin-guide/kernel-parameters.html)). Das ist auch der Weg, ein vergessenes root-Passwort zu setzen. Wer an der Konsole sitzt, ist damit root, außer ein GRUB-Passwort oder eine verschlüsselte Platte steht davor.
+
+  ```bash
+  # Prompt: root@(none):/#  – kein Hostname, weil systemd ihn noch nicht gesetzt hat
+  mount -o remount,rw /    # / ist laut Kernelzeile (ro) nur lesbar eingehängt
+  passwd root
+  exec /sbin/init          # systemd übernimmt als PID 1 und startet normal weiter
+  ```
+
+  In der Lern-VM ist `/` dabei schon beschreibbar; auf echter Hardware brauchst du das `remount`.
+
+  Was systemd ohne Kernelparameter startet, bestimmt der Symlink `default.target`. Und den Emergency-Modus löst nicht nur ein Kernelparameter aus:
+
+  ```console vm
+  $ systemctl get-default
+  graphical.target
+  $ systemctl show -p OnFailure -p OnFailureJobMode local-fs.target
+  OnFailure=emergency.target
+  OnFailureJobMode=replace-irreversibly
+  ```
+
+  Scheitert `local-fs.target`, schaltet systemd über `OnFailure=` in den Emergency-Modus und beendet dabei alles andere. `sudo systemctl set-default multi-user.target` ändert das Standardziel dauerhaft. Eine Kernelzeile mit `systemd.unit=` gewinnt trotzdem; `systemctl get-default` zeigt weiter den Symlink und meldet auf stderr nur einen Hinweis.
+
+  > [!INTERVIEW] „Was ist der Unterschied zwischen Rescue- und Emergency-Modus?“
+  > Beide sind systemd-Targets mit einer root-Shell auf der Konsole und ohne Dienste. `rescue.target` zieht `sysinit.target` nach: Alle Dateisysteme aus der fstab sind eingehängt, Swap und udev laufen. `emergency.target` startet fast nichts, nur `/` ist eingehängt, oft nur lesbar. Deshalb landet ein System nach einem fstab-Fehler im Emergency-Modus: Rescue würde an denselben Mounts scheitern. Beide fragen nach dem root-Passwort; kennt das niemand, bleibt `init=/bin/bash`, bei dem der Kernel eine Shell statt systemd startet.
+
+  ## fstab-Fehler und local-fs.target
+
+  Beim Start und bei jedem `systemctl daemon-reload` übersetzt `systemd-fstab-generator` jede Zeile der fstab in eine Mount-Unit unter `/run/systemd/generator/` ([systemd-fstab-generator(8)](https://www.freedesktop.org/software/systemd/man/latest/systemd-fstab-generator.html)). Der Name folgt dem Einhängepunkt: `/boot` wird `boot.mount`, `/srv/produktbilder` wird `srv-produktbilder.mount`.
+
+  ```console vm
+  $ systemctl cat boot.mount
+  # /run/systemd/generator/boot.mount
+  # Automatically generated by systemd-fstab-generator
+
+  [Unit]
+  Documentation=man:fstab(5) man:systemd-fstab-generator(8)
+  SourcePath=/etc/fstab
+  Before=local-fs.target
+  Requires=systemd-fsck@dev-disk-by\x2dlabel-boot.service
+  After=systemd-fsck@dev-disk-by\x2dlabel-boot.service
+  After=blockdev@dev-disk-by\x2dlabel-boot.target
+
+  [Mount]
+  What=/dev/disk/by-label/boot
+  Where=/boot
+  Type=ext4
+  $ systemctl show -p Requires --value local-fs.target
+  -.mount boot.mount
+  ```
+
+  Ohne `nofail` hängt der Generator den Mount an `local-fs.target` als `Requires=` und ordnet ihn davor ein. Scheitert er, scheitert `local-fs.target`, und `OnFailure=` schickt das System in den Emergency-Modus. Mit `nofail` bekommt `local-fs.target` nur ein `Wants=` ohne Reihenfolge: Der Boot wartet nicht und geht weiter, wenn der Mount scheitert. Quellen wie `UUID=…` oder `LABEL=…` sind Geräte; auf sie wartet systemd standardmäßig 90 Sekunden, `x-systemd.device-timeout=10s` verkürzt das ([systemd.mount(5)](https://www.freedesktop.org/software/systemd/man/latest/systemd.mount.html#x-systemd.device-timeout=)).
+
+  Das Lab hat ein Image mit Produktbildern unter `/var/lib/images/` abgelegt. So hängst du es dauerhaft ein und testest, ohne neu zu starten:
+
+  ```console vm
+  $ echo '/var/lib/images/produktbilder.img  /srv/produktbilder  ext4  loop,ro,nofail  0  0' | sudo tee -a /etc/fstab
+  /var/lib/images/produktbilder.img  /srv/produktbilder  ext4  loop,ro,nofail  0  0
+  $ sudo findmnt --verify
+
+  0 parse errors, 0 errors, 3 warnings
+  /
+     [W] recommended root FS passno is 1 (current is 0)
+  /srv/produktbilder
+     [W] non-bind mount source /var/lib/images/produktbilder.img is a directory or regular file
+     [W] your fstab has been modified, but systemd still uses the old version;
+         use 'systemctl daemon-reload' to reload
+  $ sudo systemctl daemon-reload
+  $ sudo systemctl start srv-produktbilder.mount
+  $ findmnt /srv/produktbilder
+  TARGET             SOURCE     FSTYPE OPTIONS
+  /srv/produktbilder /dev/loop0 ext4   ro,relatime
+  ```
+
+  `findmnt --verify` vergleicht die fstab mit dem System: Gibt es Quelle und Ziel, passt der Typ zum Dateisystem auf der Platte, kennt der Kernel ihn? Einen Tippfehler in den Optionen findet es nicht. Den findet erst ein echter Mount, deshalb der zweite Schritt mit der Mount-Unit, genau wie beim Boot. Willst du sehen, was ein Fehler beim Start anrichtet, mach aus `nofail` ein `nofial` (`sudo sed -i 's/nofail/nofial/' /etc/fstab`) und starte neu. Nach rund 40 Sekunden steht im Terminal:
+
+  ```text
+  [FAILED] Failed to mount srv-produktbilder.mount - /srv/produktbilder.
+  [DEPEND] Dependency failed for local-fs.target - Local File Systems.
+  You are in emergency mode. After logging in, type "journalctl -xb" to view
+  system logs, "systemctl reboot" to reboot, "systemctl default" or "exit"
+  to boot into default mode.
+  Press Enter for maintenance
+  (or press Control-D to continue):
+  ```
+
+  Der Tippfehler hat `nofail` abgeschaltet, und `mount` reicht das unbekannte Wort an den Kernel weiter, der den Mount ablehnt. Nach Enter bist du root: `systemctl --failed` nennt die Unit, `journalctl -b -p err` die Kernelmeldung `ext4: Unknown parameter 'nofial'`. Repariere die Zeile (`nano /etc/fstab`), dann `systemctl daemon-reload` und `systemctl default`. Fehlt dagegen ein Gerät, siehst du erst nach den 90 Sekunden `Timed out waiting for device`.
+
+  > [!WARNING] Nicht mit local-fs.target testen
+  > `sudo systemctl start local-fs.target` sieht nach einem guten Test für die ganze fstab aus. Scheitert dabei ein Pflicht-Mount, greift `OnFailure=` auch im laufenden Betrieb: systemd wechselt in den Emergency-Modus und beendet sshd samt deiner Sitzung. Teste mit `findmnt --verify`, dann `daemon-reload` und `systemctl start` auf die einzelne Mount-Unit oder `mount -a`.
+
+  ## initramfs neu bauen
+
+  Das initramfs ist eine Momentaufnahme: Treiber, Konfiguration und Werkzeuge zum Zeitpunkt des Bauens. Neu bauen musst du es, wenn sich etwas ändert, das vor dem Einhängen von `/` gebraucht wird: ein neuer Plattencontroller, LUKS, LVM oder RAID unter dem Root-Dateisystem, eine geänderte Modulliste. Bei einem Kernel-Update erledigt das der Paketmanager. In der VM kommt `/` per 9p aus dem Emulator, deshalb stehen die Module dafür in der Liste von initramfs-tools:
+
+  ```console vm
+  $ lsinitramfs /boot/initrd.img-$(uname -r) | wc -l
+  464
+  $ lsinitramfs /boot/initrd.img-$(uname -r) | grep -E 'fs/9p|virtio_pci\.ko'
+  usr/lib/modules/6.1.0-53-686/kernel/drivers/virtio/virtio_pci.ko
+  usr/lib/modules/6.1.0-53-686/kernel/fs/9p
+  usr/lib/modules/6.1.0-53-686/kernel/fs/9p/9p.ko
+  $ grep -v '^#' /etc/initramfs-tools/modules
+  9p
+  9pnet
+  9pnet_virtio
+  virtio
+  virtio_ring
+  virtio_pci
+  ```
+
+  Module in `/etc/initramfs-tools/modules` kopiert `mkinitramfs` ins Image, und das initramfs lädt sie beim Start ([initramfs-tools(7)](https://manpages.debian.org/bookworm/initramfs-tools-core/initramfs-tools.7.en.html)). Verwechsle die Datei nicht mit `/etc/modules`: Die liest `systemd-modules-load` erst, wenn das echte Root-Dateisystem schon hängt. Für den Treiber der Systemplatte ist das zu spät. Nach jeder Änderung baust du das initramfs neu, unter Emulation dauert das knapp eine Minute:
+
+  ```console vm
+  $ sudo update-initramfs -u
+  update-initramfs: Generating /boot/initrd.img-6.1.0-53-686
+  W: Couldn't identify type of root file system for fsck hook
+  ```
+
+  `-u` aktualisiert das Image des neuesten Kernels, `-u -k all` die aller installierten Kernel ([update-initramfs(8)](https://manpages.debian.org/bookworm/initramfs-tools/update-initramfs.8.en.html)). Die Warnung kommt vom 9p-Wurzeldateisystem der VM. Ob ein Modul drin ist, prüfst du danach mit `lsinitramfs`: Einen Tippfehler in der Modulliste übergeht `update-initramfs` ohne Meldung.
+
+  | | Debian, Ubuntu | Arch, CachyOS | Fedora |
+  | --- | --- | --- | --- |
+  | Werkzeug | initramfs-tools | mkinitcpio | dracut |
+  | Treiber ergänzen | `/etc/initramfs-tools/modules` | `MODULES=()` in `/etc/mkinitcpio.conf` | `add_drivers+=" … "` in `/etc/dracut.conf.d/*.conf` |
+  | Neu bauen | `update-initramfs -u` | `mkinitcpio -P` | `dracut -f` |
+  | Inhalt zeigen | `lsinitramfs` | `lsinitcpio` | `lsinitrd` |
+
+  `mkinitcpio -P` baut alle Presets aus `/etc/mkinitcpio.d/`. Viele Arch-Installationen haben dort neben `default` ein Preset `fallback`: Es lässt den Hook `autodetect` weg, der das Image auf die Treiber der aktuellen Hardware zuschneidet. Das Fallback-Image ist größer, bootet aber auch nach einem Hardwarewechsel ([mkinitcpio(8)](https://man.archlinux.org/man/mkinitcpio.8), [dracut(8)](https://man.archlinux.org/man/dracut.8)). Auf CachyOS mit Limine baut `sudo limine-mkinitcpio` die Images und die Boot-Einträge in einem Schritt.
+
+  > [!PRAXIS] Kernel-Updates ohne Nachtschicht
+  > Vor dem Neustart prüfst du, dass ein zweiter, funktionierender Kernel installiert ist (auf Arch etwa `linux-lts` neben `linux`) und dass du an die Konsole kommst: IPMI, iDRAC, die Webkonsole des Hypervisors. Geänderte fstab-Zeilen testest du vorher mit `findmnt --verify` und einem Mount über systemd. Neu gestartet wird im Wartungsfenster, solange noch jemand wach ist, nicht automatisch um drei Uhr nachts. Und nach dem Start schaust du in `journalctl -b -p err`, bevor du die Konsole schließt.
+
+  ## Reparatur per chroot aus einem Live-System
+
+  Startet kein Kernel mehr oder ist GRUB selbst kaputt, reparierst du von außen. Du bootest ein Live-System (Debian Live, die Arch-ISO, den Rettungsmodus eines Installers), hängst das installierte System ein und wechselst mit `chroot` hinein. Danach arbeiten Paketmanager, `update-initramfs` und `update-grub` auf dem installierten System statt auf dem Live-System ([ArchWiki · chroot](https://wiki.archlinux.org/title/Chroot)).
+
+  ```bash
+  lsblk -f                                    # Root, /boot und ESP finden; LUKS erst mit cryptsetup open, LVM mit vgchange -ay
+  mount /dev/nvme0n1p2 /mnt
+  mount /dev/nvme0n1p1 /mnt/boot/efi          # Einhängepunkt laut /mnt/etc/fstab
+  for d in dev proc sys run; do mount --rbind /$d /mnt/$d; done
+  chroot /mnt /bin/bash
+  # im chroot: dpkg --configure -a, update-initramfs -u -k all, update-grub, bei Bedarf grub-install
+  exit
+  umount -R /mnt
+  ```
+
+  Die vier Bind-Mounts geben den Werkzeugen im chroot, was sonst der laufende Kernel liefert: Gerätedateien (`/dev`), Prozess- und Mount-Informationen (`/proc`), Geräte und EFI-Variablen (`/sys`), Laufzeitdaten von udev und LVM (`/run`). `--rbind` nimmt Untermounts wie `/dev/pts` und `/sys/firmware/efi/efivars` mit. Ohne sie findet `grub-probe` keine Geräte, und `grub-install` kann keinen EFI-Eintrag schreiben. Auf der Arch-ISO erledigt `arch-chroot /mnt` diese Mounts selbst.
+
+  ## Häufige Fehler
+
+  - **`/etc/default/grub` geändert, `update-grub` vergessen.** Der nächste Start nutzt die alte `grub.cfg`. Umgekehrt überschreibt das nächste Kernel-Update jede Handänderung an `grub.cfg`.
+  - **Experimente in `GRUB_CMDLINE_LINUX`.** Dann trifft ein kaputter Parameter auch den Recovery-Eintrag. Einmalige Tests gehören in den GRUB-Editor (`e`), dauerhafte Kosmetik in `GRUB_CMDLINE_LINUX_DEFAULT`.
+  - **Vergessene Drop-ins.** `update-grub` liest auch `/etc/default/grub.d/*.cfg`. Wer nur `/etc/default/grub` durchsucht, findet einen Parameter aus einem Drop-in nicht; `grep -rn` über `/etc/default/` findet ihn.
+  - **Treiber in `/etc/modules` statt im initramfs.** `lsmod` zeigt das Modul im laufenden System, beim nächsten Start auf neuer Hardware fehlt es trotzdem. Was beim Start im Image steckt, zeigt `lsinitramfs`.
+  - **Optionale Platten ohne `nofail`**, oder mit Tippfehler darin. Eine USB-Backupplatte, die nicht steckt, hält den Start sonst 90 Sekunden auf und endet im Emergency-Modus. Nach `mkfs` hat ein Dateisystem außerdem eine neue UUID; die alte in der fstab zeigt ins Leere.
+  - **`systemctl isolate rescue.target` über SSH.** Der Wechsel stoppt sshd, und du sperrst dich aus. Rescue-Modus nur an der Konsole.
+  - **chroot ohne Bind-Mounts.** Die Befehle laufen, aber `update-grub` und `grub-install` scheitern an fehlenden Geräten, oder sie schreiben in das Live-System.
+
+  ## Zusammenfassung
+
+  - Die letzte Meldung auf der Konsole verrät die Etappe: `grub rescue>` ist der Bootloader, `(initramfs)` das initramfs, „emergency mode“ systemd mit einem fstab-Problem.
+  - `/proc/cmdline` zeigt die Kernelzeile dieses Boots. Dauerhaft änderst du sie in `/etc/default/grub` plus `update-grub`, einmalig mit `e` im GRUB-Menü.
+  - `GRUB_CMDLINE_LINUX` gilt für alle Einträge, `GRUB_CMDLINE_LINUX_DEFAULT` nicht für den Recovery-Eintrag.
+  - `systemd.unit=` auf der Kernelzeile schlägt `default.target`. `rescue.target` hängt die fstab ein, `emergency.target` nur `/`; beide wollen das root-Passwort, `init=/bin/bash` nicht.
+  - Ohne `nofail` verlangt `local-fs.target` den Mount, und sein Scheitern führt über `OnFailure=` in den Emergency-Modus. Prüfen: `findmnt --verify`, `daemon-reload`, Mount-Unit starten.
+  - Treiber für die Systemplatte gehören ins initramfs: `/etc/initramfs-tools/modules` plus `update-initramfs -u`, `mkinitcpio -P` oder `dracut -f`, kontrolliert mit `lsinitramfs`.
+  - Zweiter Kernel oder Fallback-Image sind der eingebaute Ausweg; das Live-System mit chroot und Bind-Mounts ist der letzte.
+exercises:
+  - id: root-passwort-vergessen
+    type: choice
+    title: Kein Passwort, kein sudo
+    prompt: |
+      Auf einem Debian-Server kennt niemand mehr das root-Passwort, und der einzige Admin-Benutzer ist versehentlich aus der Gruppe `sudo` geflogen. Du sitzt an der Konsole und hast mit `e` den Standardeintrag im GRUB-Menü geöffnet. Was hängst du an die `linux`-Zeile, um eine Root-Shell zu bekommen?
+    options:
+      - text: "`init=/bin/bash`"
+        correct: true
+        why: Der Kernel startet bash statt systemd als PID 1. Es läuft kein Dienst und niemand fragt nach einem Passwort.
+      - text: "`systemd.unit=rescue.target`"
+        correct: false
+        why: Der Rescue-Modus startet `sulogin`, das genau das unbekannte root-Passwort verlangt.
+      - text: "`systemd.unit=emergency.target`"
+        correct: false
+        why: Auch der Emergency-Modus öffnet die Shell erst nach dem root-Passwort über `sulogin`.
+      - text: "`single`"
+        correct: false
+        why: systemd übersetzt `single` in `rescue.target`. Es folgt dieselbe Passwortabfrage.
+    explanation: |
+      Rescue und Emergency sind systemd-Targets, und beide schützen die Shell mit `sulogin`. `init=/bin/bash` umgeht systemd ganz: Der Kernel führt die Shell als erstes Programm aus. Dann `mount -o remount,rw /`, `passwd root` und `exec /sbin/init`, um normal weiterzustarten. Deshalb gilt: Wer an die Konsole kommt, kommt an root, außer ein GRUB-Passwort oder eine verschlüsselte Platte steht davor.
+    resources:
+      - title: sulogin(8)
+        url: https://man7.org/linux/man-pages/man8/sulogin.8.html
+      - title: Kernel-Parameter · init=
+        url: https://docs.kernel.org/admin-guide/kernel-parameters.html
+  - id: wo-bleibt-der-boot-stehen
+    type: choice
+    title: Stillstand bei (initramfs)
+    prompt: |
+      Nach Arbeiten am Server bleibt der Start so stehen. Welche Ursachen passen zu diesem Bild?
+    lang: text
+    code: |
+      Loading Linux 6.1.0-28-amd64 ...
+      Loading initial ramdisk ...
+      Gave up waiting for root device.  Common problems:
+       - Boot args (cat /proc/cmdline)
+         - Check rootdelay= (did the system wait long enough?)
+         - Check root= (did the system wait for the right device?)
+       - Missing modules (cat /proc/modules; ls /dev)
+      ALERT!  UUID=6f1b2c3d-8e4f-4a5b-9c6d-7e8f9a0b1c2d does not exist.  Dropping to a shell!
+      (initramfs)
+    options:
+      - text: Dem initramfs fehlt der Treiber für den Controller der Systemplatte.
+        correct: true
+        why: Ohne Treiber erscheint das Blockgerät nie, und das initramfs wartet vergeblich auf die UUID.
+      - text: Die UUID in `root=` gibt es nicht mehr, etwa weil die Partition neu formatiert wurde.
+        correct: true
+        why: Das initramfs sucht genau die UUID von der Kernelzeile. Nach einem `mkfs` hat das Dateisystem eine neue.
+      - text: Eine fstab-Zeile für `/srv/daten` ist fehlerhaft.
+        correct: false
+        why: Die fstab wertet systemd erst nach dem Wechsel auf das echte Root-Dateisystem aus. Das Bild wäre dann der Emergency-Modus.
+      - text: GRUB findet den Kernel nicht.
+        correct: false
+        why: "Dann bliebe GRUB mit `error: file '/vmlinuz-…' not found` stehen. Hier liefen Kernel und initramfs schon."
+    explanation: |
+      Der Prompt `(initramfs)` ist eine busybox-Shell im initramfs. Kernel und initramfs sind also geladen, aber das initramfs findet das Root-Dateisystem nicht. Ursachen sind ein fehlender Treiber (neuer Controller, virtio statt IDE) oder ein falsches `root=`. In der Shell zeigen `cat /proc/cmdline` und `ls /dev/disk/by-uuid`, welche von beiden zutrifft. Abhilfe schaffen ein älterer Kernel, ein Fallback-Image oder ein neu gebautes initramfs.
+    resources:
+      - title: initramfs-tools(7)
+        url: https://manpages.debian.org/bookworm/initramfs-tools-core/initramfs-tools.7.en.html
+  - id: chroot-reparatur
+    type: order
+    title: Reparatur vom USB-Stick
+    prompt: |
+      Ein Debian-Laptop (UEFI) bootet nach einem abgebrochenen Kernel-Update nicht mehr, kein Kernel im GRUB-Menü kommt durch. Du hast ein Live-System gestartet und bist root. Das Root-Dateisystem liegt auf `/dev/nvme0n1p2`, die EFI-Systempartition auf `/dev/nvme0n1p1` und wird unter `/boot/efi` eingehängt. Bring die Schritte in die richtige Reihenfolge.
+    lang: bash
+    lines: |
+      lsblk -f
+      mount /dev/nvme0n1p2 /mnt
+      mount /dev/nvme0n1p1 /mnt/boot/efi
+      for d in dev proc sys run; do mount --rbind /$d /mnt/$d; done
+      chroot /mnt /bin/bash
+      dpkg --configure -a
+      update-initramfs -u -k all
+      update-grub
+      exit
+      umount -R /mnt
+    alternatives:
+      - [1, 2, 4, 3, 5, 6, 7, 8, 9, 10]
+    explanation: |
+      Erst identifizierst du die Partitionen, dann hängst du das Root-Dateisystem ein, denn `/mnt/boot/efi` und die Ziele der Bind-Mounts liegen darin. Ob ESP oder Bind-Mounts zuerst kommen, ist egal. `chroot` braucht beides. Im chroot schließt `dpkg --configure -a` das abgebrochene Update ab. `update-initramfs` baut die Images, und `update-grub` danach nimmt sie ins Menü auf. Zum Schluss verlässt du den chroot und hängst mit `umount -R` alles in umgekehrter Reihenfolge aus.
+    resources:
+      - title: ArchWiki · chroot
+        url: https://wiki.archlinux.org/title/Chroot
+  - id: get-default-trotz-kernelzeile
+    type: output
+    title: Was meint get-default?
+    prompt: |
+      Das System ist gerade gestartet. Was gibt der letzte Befehl aus?
+    lang: console
+    code: |
+      $ cat /proc/cmdline
+      BOOT_IMAGE=/vmlinuz-6.1.0-53-686 root=host9p ro console=ttyS0 quiet systemd.unit=rescue.target
+      $ readlink /etc/systemd/system/default.target
+      /lib/systemd/system/multi-user.target
+      $ systemctl get-default 2>/dev/null
+    expected: multi-user.target
+    explanation: |
+      `systemctl get-default` liest nur den Symlink `default.target`, und der zeigt auf `multi-user.target`. Gestartet ist das System trotzdem in `rescue.target`, denn `systemd.unit=` auf der Kernelzeile ersetzt `default.target` für diesen Boot. systemd 252 schreibt dazu auf stderr `Note: found "systemd.unit" on the kernel commandline, which overrides the default unit.`, hier mit `2>/dev/null` verworfen. Was wirklich aktiv ist, zeigt `systemctl list-units --type=target`.
+    resources:
+      - title: systemctl(1) · get-default
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemctl.html#get-default
+  - id: recovery-kernelzeile
+    type: output
+    title: Der Recovery-Eintrag nach dem Drop-in
+    prompt: |
+      Auf `web01` gelten diese Einstellungen. Nach `sudo update-grub` startest du über „Advanced options“ den Eintrag „(recovery mode)“ mit dem Kernel `/vmlinuz-6.1.0-53-686`. Das Wurzeldateisystem ist `host9p`. Debian setzt bei Recovery-Einträgen `single` direkt hinter `ro`. Was zeigt danach `cat /proc/cmdline`?
+    lang: bash
+    code: |
+      # /etc/default/grub
+      GRUB_CMDLINE_LINUX_DEFAULT="quiet loglevel=3"
+      GRUB_CMDLINE_LINUX="console=ttyS0"
+
+      # /etc/default/grub.d/90-fehlersuche.cfg
+      GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT systemd.unit=rescue.target"
+
+      # So baut /etc/grub.d/10_linux den normalen Eintrag:
+      #   linux /vmlinuz-<version> root=<gerät> ro ${GRUB_CMDLINE_LINUX} ${GRUB_CMDLINE_LINUX_DEFAULT}
+      # GRUB stellt beim Start BOOT_IMAGE=<kernel> davor.
+    expected: BOOT_IMAGE=/vmlinuz-6.1.0-53-686 root=host9p ro single console=ttyS0
+    explanation: |
+      Der Recovery-Eintrag bekommt nur `GRUB_CMDLINE_LINUX`, nicht `GRUB_CMDLINE_LINUX_DEFAULT`. Damit fehlen `quiet loglevel=3` und auch der Parameter aus dem Drop-in, obwohl der die Variable erweitert. Genau deshalb ist der Recovery-Eintrag der Ausweg, wenn in `GRUB_CMDLINE_LINUX_DEFAULT` etwas Kaputtes steht. `single` startet `rescue.target`, ohne `quiet` siehst du dabei jede Statusmeldung von systemd.
+    resources:
+      - title: GNU GRUB Manual · Simple configuration
+        url: https://www.gnu.org/software/grub/manual/grub/html_node/Simple-configuration.html
+  - id: standardziel-setzen
+    type: command
+    title: Kein Desktop auf dem Server
+    prompt: |
+      `default.target` zeigt auf `graphical.target`, die Vorgabe des Pakets. `web01` hat keine grafische Oberfläche. Stelle das Standardziel dauerhaft auf den Mehrbenutzerbetrieb ohne grafisches Ziel.
+    answers:
+      - sudo systemctl set-default multi-user.target
+      - systemctl set-default multi-user.target
+    output: |
+      Created symlink /etc/systemd/system/default.target → /lib/systemd/system/multi-user.target.
+    explanation: |
+      `set-default` legt den Symlink `/etc/systemd/system/default.target` an. Er verdeckt die Vorgabe unter `/lib/systemd/system/`. `graphical.target` hätte `multi-user.target` ohnehin mitgestartet und zusätzlich einen Display-Manager gewollt; auf einem Server ist `multi-user.target` das ehrliche Ziel. Ein `systemd.unit=` auf der Kernelzeile gewinnt trotzdem gegen diesen Symlink.
+    resources:
+      - title: systemctl(1) · set-default
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemctl.html#set-default%20TARGET
+  - id: initramfs-je-distribution
+    type: gap
+    title: Drei Distributionen, ein initramfs
+    prompt: |
+      Du hast auf drei Rechnern einen Treiber für die Systemplatte in die Konfiguration eingetragen. Ergänze jeweils den Befehl, der die initramfs-Images aller installierten Kernel neu baut.
+    lang: bash
+    code: |
+      # Debian/Ubuntu (initramfs-tools): Images aller installierten Kernel aktualisieren
+      sudo ⟦update-initramfs -u -k all⟧
+      # Arch/CachyOS (mkinitcpio): alle Presets aus /etc/mkinitcpio.d/ bauen
+      sudo ⟦mkinitcpio -P⟧
+      # Fedora (dracut): Images aller Kernel neu erzeugen und vorhandene überschreiben
+      sudo ⟦dracut --regenerate-all --force⟧
+    gaps:
+      - label: initramfs-tools
+        hint: "`update-initramfs` mit der Aktion „aktualisieren“ und der Kernelversion `all`."
+        accept: ["update-initramfs -k all -u"]
+      - label: mkinitcpio
+        hint: Die Option für „alle Presets“ ist ein großes P.
+        accept: ["mkinitcpio --allpresets"]
+      - label: dracut
+        hint: "`dracut` mit `--regenerate-all`; ohne `-f` überschreibt es kein vorhandenes Image."
+        accept: ["dracut -f --regenerate-all", "dracut --force --regenerate-all", "dracut --regenerate-all -f"]
+    explanation: |
+      Alle drei bauen dasselbe: ein Archiv mit Treibern und Skripten, das der Bootloader neben den Kernel lädt. `update-initramfs -u` allein aktualisiert nur das neueste Image, `-k all` alle. `mkinitcpio -P` baut jedes Preset, also meist das Standard- und das Fallback-Image. `dracut` baut ohne Optionen nur das Image des laufenden Kernels und verweigert das Überschreiben ohne `-f`. Auf CachyOS mit Limine nimmst du `limine-mkinitcpio`, weil `mkinitcpio -P` dort die Boot-Einträge nicht aktualisiert.
+    resources:
+      - title: update-initramfs(8)
+        url: https://manpages.debian.org/bookworm/initramfs-tools/update-initramfs.8.en.html
+      - title: mkinitcpio(8)
+        url: https://man.archlinux.org/man/mkinitcpio.8
+      - title: dracut(8)
+        url: https://man.archlinux.org/man/dracut.8
+  - id: fstab-optional
+    type: gap
+    title: Die Backup-Platte darf fehlen
+    prompt: |
+      Die USB-Backupplatte steckt meist nicht. Fehlt sie, soll der Start nicht in den Emergency-Modus gehen und höchstens 10 Sekunden auf sie warten. Steckt sie, soll sie eingehängt und vorher geprüft werden. Ergänze die Zeile.
+    lang: text
+    code: |
+      # /etc/fstab
+      UUID=3f1c9a2e-7b4d-4c2a-9e51-2d8f0c6a1b7e  /mnt/backup  ext4  defaults,⟦nofail⟧,⟦x-systemd.device-timeout=10s⟧  0  ⟦2⟧
+    gaps:
+      - label: Darf fehlen
+        hint: Die Option heißt wörtlich „scheitert nicht“.
+      - label: Wartezeit auf das Gerät
+        hint: Eine systemd-Option für fstab, die mit `x-systemd.` beginnt und die Wartezeit auf das Gerät begrenzt.
+        accept: ["x-systemd.device-timeout=10"]
+      - label: Prüfreihenfolge
+        hint: "`1` ist dem Wurzeldateisystem vorbehalten, `0` heißt „nie prüfen“."
+    explanation: |
+      Mit `nofail` hängt systemd-fstab-generator den Mount nur per `Wants=` an `local-fs.target`, ohne Reihenfolge: Der Start wartet nicht und scheitert nicht daran. Auf das Gerät selbst wartet systemd aber weiter, standardmäßig 90 Sekunden, und das kürzt `x-systemd.device-timeout=` (ohne Einheit sind es Sekunden). Die `2` lässt vor dem Einhängen `systemd-fsck@` laufen. Für Quellen, die keine Geräte sind, etwa ein Image mit `loop`, ignoriert der Generator den Timeout.
+    resources:
+      - title: systemd.mount(5) · fstab-Optionen
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemd.mount.html#x-systemd.device-timeout=
+      - title: fstab(5)
+        url: https://man7.org/linux/man-pages/man5/fstab.5.html
+  - id: chroot-ohne-bind-mounts
+    type: bug
+    title: Im chroot fehlen die Geräte
+    prompt: |
+      Mit diesem Skript reparierst du aus einem Live-System heraus einen Debian-Server (BIOS, Root auf `/dev/sda2`, `/boot` auf `/dev/sda1`). Im chroot findet `update-grub` die Geräte nicht, `grub-install` scheitert, und `ls /proc /sys` zeigt im chroot zwei leere Verzeichnisse. Finde die fehlerhafte Zeile und ersetze sie durch eine `for`-Schleife über alle nötigen Verzeichnisse.
+    lang: bash
+    code: |
+      #!/bin/bash
+      set -euo pipefail
+      mount /dev/sda2 /mnt
+      mount /dev/sda1 /mnt/boot
+      mount --bind /dev /mnt/dev
+      chroot /mnt update-initramfs -u -k all
+      chroot /mnt update-grub
+      chroot /mnt grub-install /dev/sda
+      umount -R /mnt
+    lines: [5]
+    fix:
+      - line: 5
+        answers:
+          - for d in dev proc sys run; do mount --rbind /$d /mnt/$d; done
+          - for d in dev proc sys run; do mount --bind /$d /mnt/$d; done
+          - for d in dev proc sys; do mount --rbind /$d /mnt/$d; done
+          - for d in dev proc sys; do mount --bind /$d /mnt/$d; done
+    explanation: |
+      `chroot` wechselt nur das Wurzelverzeichnis. `/proc` und `/sys` des installierten Systems sind leere Verzeichnisse, die der laufende Kernel erst füllt, wenn sie eingehängt sind. `grub-probe` liest dort Mounts und Geräteinformationen, `update-initramfs` die Kernelmodule und Geräte. Die Bind-Mounts reichen `/dev`, `/proc`, `/sys` und `/run` des Live-Systems in den chroot durch. `--rbind` nimmt auch Untermounts wie `/dev/pts` mit, auf UEFI wichtig für `/sys/firmware/efi/efivars`.
+    resources:
+      - title: ArchWiki · chroot
+        url: https://wiki.archlinux.org/title/Chroot
+  - id: limine-fallback
+    type: bug
+    title: Der Fallback fällt mit
+    prompt: |
+      Die SSD eines Arch-Laptops steckt jetzt in einem neuen Rechner. Der Eintrag „Arch Linux“ bleibt im initramfs stehen, weil der Treiber für den neuen Controller fehlt. Der Eintrag „Arch Linux (Fallback)“ scheitert genauso. Auf der EFI-Systempartition liegen `vmlinuz-linux`, `initramfs-linux.img` und `initramfs-linux-fallback.img`, die Einträge pflegt der Besitzer von Hand. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: text
+    code: |
+      timeout: 5
+
+      /Arch Linux
+          protocol: linux
+          path: boot():/vmlinuz-linux
+          cmdline: root=UUID=8d2f6c1a-5b3e-4f7a-9c0d-1e2b3a4c5d6e rw quiet
+          module_path: boot():/initramfs-linux.img
+
+      /Arch Linux (Fallback)
+          protocol: linux
+          path: boot():/vmlinuz-linux
+          cmdline: root=UUID=8d2f6c1a-5b3e-4f7a-9c0d-1e2b3a4c5d6e rw
+          module_path: boot():/initramfs-linux.img
+    lines: [13]
+    fix:
+      - line: 13
+        answers: ["module_path: boot():/initramfs-linux-fallback.img"]
+    explanation: |
+      Das Standard-Image baut mkinitcpio mit dem Hook `autodetect`, der nur Treiber für die aktuelle Hardware aufnimmt. Das Fallback-Image entsteht ohne `autodetect` und enthält alle Treiber. Genau deshalb bootet es auf einem anderen Rechner. Der Fallback-Eintrag lädt hier aber das Standard-Image und scheitert an derselben Stelle. Ist das System wieder oben, baut `mkinitcpio -P` (auf CachyOS `limine-mkinitcpio`) ein Standard-Image für die neue Hardware.
+    resources:
+      - title: ArchWiki · Limine
+        url: https://wiki.archlinux.org/title/Limine
+      - title: mkinitcpio(8)
+        url: https://man.archlinux.org/man/mkinitcpio.8
+  - id: journal-gescheiterter-boot
+    type: explain
+    title: Anderthalb Minuten bis zur Notfall-Shell
+    prompt: |
+      Ein Server stand nach dem Neustart im Emergency-Modus. Ein Kollege hat ihn mit `systemctl default` weiterstarten lassen und dir diesen Auszug aus `journalctl -b` geschickt. Erkläre, was passiert ist, und wie du es dauerhaft behebst.
+    lang: text
+    code: |
+      09:14:05 web01 systemd[1]: Expecting device dev-disk-by\x2dlabel-backup.device - /dev/disk/by-label/backup...
+      09:15:35 web01 systemd[1]: dev-disk-by\x2dlabel-backup.device: Job dev-disk-by\x2dlabel-backup.device/start timed out.
+      09:15:35 web01 systemd[1]: Timed out waiting for device dev-disk-by\x2dlabel-backup.device - /dev/disk/by-label/backup.
+      09:15:35 web01 systemd[1]: Dependency failed for mnt-backup.mount - /mnt/backup.
+      09:15:35 web01 systemd[1]: Dependency failed for local-fs.target - Local File Systems.
+      09:15:35 web01 systemd[1]: local-fs.target: Job local-fs.target/start failed with result 'dependency'.
+      09:15:35 web01 systemd[1]: Dependency failed for systemd-fsck@dev-disk-by\x2dlabel-backup.service - File System Check on /dev/disk/by-label/backup.
+      09:15:35 web01 systemd[1]: local-fs.target: Triggering OnFailure= dependencies.
+      09:15:36 web01 systemd[1]: Started emergency.service - Emergency Shell.
+      09:15:36 web01 systemd[1]: Reached target emergency.target - Emergency Mode.
+    points:
+      - Ein Dateisystem mit dem Label `backup` ist innerhalb des Standard-Timeouts von 90 Sekunden nicht als Gerät erschienen.
+      - fsck und Mount scheitern deshalb als Abhängigkeit (`dependency`), nicht wegen eines Fehlers im Dateisystem.
+      - Weil die fstab-Zeile kein `nofail` hat, verlangt `local-fs.target` den Mount und scheitert mit ihm; `OnFailure=` startet `emergency.target`.
+      - "Abhilfe: Label und Gerät prüfen (`lsblk -f`), bei einer optionalen Platte `nofail` und einen kürzeren `x-systemd.device-timeout=` setzen, dann `daemon-reload`."
+    explanation: |
+      Um 09:14:05 beginnt systemd, auf `/dev/disk/by-label/backup` zu warten, genau 90 Sekunden später gibt es auf. Das Gerät kam nie, weil die Platte nicht steckt oder ihr Label nach einem `mkfs` anders heißt. Alles, was davon abhängt, scheitert mit `dependency`: die Dateisystemprüfung, der Mount und, weil die Zeile ohne `nofail` ein Pflicht-Mount ist, auch `local-fs.target`. Dessen `OnFailure=emergency.target` erklärt die Notfall-Shell. Ich würde mit `lsblk -f` nachsehen, ob es ein Dateisystem mit diesem Label gibt. Ist die Platte optional, kommen `nofail,x-systemd.device-timeout=10s` in die Zeile, danach `findmnt --verify` und `systemctl daemon-reload`.
+    resources:
+      - title: systemd-fstab-generator(8)
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemd-fstab-generator.html
+      - title: systemd.special(7) · local-fs.target
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemd.special.html#local-fs.target
+  - id: fstab-wartungsfenster
+    type: scenario
+    title: Heute Nacht wird neu gestartet
+    prompt: |
+      Heute um 23:00 startet `web01` im Wartungsfenster neu. Mira hat gestern zwei Images in `/etc/fstab` eingetragen, getestet hat sie nichts:
+
+      - `/var/lib/images/produktbilder.img` enthält die Produktbilder des Shops. nginx liefert sie aus `/srv/produktbilder` aus, nur lesend. Ohne sie ist der Shop kaputt.
+      - `/var/lib/images/export.img` ist für CSV-Exporte unter `/srv/export` gedacht. Das Image liefert die Buchhaltung erst nächste Woche. Fehlt es, darf das den Start nicht aufhalten; sobald es da ist, soll es beim Start eingehängt werden.
+
+      Sorge dafür, dass `web01` heute Nacht ohne Eingriff hochkommt und beide Einhängepunkte so funktionieren. Du darfst mit `sudo reboot` ausprobieren, was heute Nacht passieren würde. Landest du in einer Notfall-Shell: Enter drücken, reparieren, mit `systemctl default` weiterstarten.
+    setup: |
+      set -e
+      mkdir -p /root/bilder/2026 /var/lib/images /srv/produktbilder /srv/export
+      printf '<svg xmlns="http://www.w3.org/2000/svg"/>\n' > /root/bilder/logo.svg
+      printf 'artikel;bild\nP-1001;kaffeemuehle.jpg\nP-1002;milchkaennchen.jpg\n' > /root/bilder/2026/katalog.csv
+      mkfs.ext4 -q -F -L produktbilder -d /root/bilder /var/lib/images/produktbilder.img 8M >/dev/null
+      rm -rf /root/bilder
+      cat >> /etc/fstab <<'EOF'
+      # Produktbilder (nur lesen) und Exportplatte – OPS-2291, Mira
+      /var/lib/images/produktbilder.img  /srv/produktbilder  ext3  loop,ro      0  0
+      /var/lib/images/export.img         /srv/export         ext4  loop,nofial  0  0
+      EOF
+    checks:
+      - name: findmnt --verify meldet keine Fehler in der fstab
+        run: findmnt --verify
+      - name: Die Produktbilder hängen beim Start nur lesend unter /srv/produktbilder
+        run: |
+          systemctl daemon-reload
+          if ! systemctl list-dependencies --plain --no-pager local-fs.target | grep -q 'srv-produktbilder\.mount'; then
+            echo "/srv/produktbilder gehört nicht zu den Mounts, die beim Start eingehängt werden."
+            exit 1
+          fi
+          umount -l /srv/produktbilder 2>/dev/null
+          systemctl start srv-produktbilder.mount || exit 1
+          findmnt -no OPTIONS /srv/produktbilder | grep -qw ro || { echo "/srv/produktbilder ist beschreibbar eingehängt."; exit 1; }
+          test -s /srv/produktbilder/2026/katalog.csv || { echo "Unter /srv/produktbilder fehlen die Produktbilder."; exit 1; }
+      - name: Fehlt das Export-Image, startet der Rest trotzdem
+        run: |
+          if systemctl show -p Requires --value local-fs.target | grep -qw 'srv-export.mount'; then
+            echo "local-fs.target verlangt srv-export.mount. Fehlt das Image, endet der Start im Emergency-Modus."
+            exit 1
+          fi
+          for unit in $(systemctl show -p Requires --value local-fs.target); do
+            case $unit in
+              *.mount) systemctl start -- "$unit" || { echo "$unit ist für den Start nötig, lässt sich aber nicht einhängen."; exit 1; } ;;
+            esac
+          done
+      - name: Liegt das Export-Image bereit, wird es beim Start eingehängt
+        run: |
+          if ! systemctl list-dependencies --plain --no-pager local-fs.target | grep -Eq 'srv-export\.(mount|automount)'; then
+            echo "/srv/export wird beim Start nicht eingehängt."
+            exit 1
+          fi
+          neu=
+          if [ ! -e /var/lib/images/export.img ]; then
+            mkfs.ext4 -q /var/lib/images/export.img 4M >/dev/null && neu=1
+          fi
+          systemctl start srv-export.mount && mountpoint -q /srv/export
+          rc=$?
+          umount /srv/export 2>/dev/null
+          [ -n "$neu" ] && rm -f /var/lib/images/export.img
+          exit $rc
+    solution: |
+      # Was würde der Start heute Nacht einhängen? findmnt prüft die fstab gegen Platte und Kernel:
+      sudo findmnt --verify
+      #   /srv/produktbilder  [E] ext3 does not match with on-disk ext4
+      # Die Mount-Units entstehen aus der fstab erst mit daemon-reload. Einhängen wie beim Start:
+      sudo systemctl daemon-reload
+      sudo systemctl start srv-produktbilder.mount || journalctl -k -n 3 --no-pager
+      #   EXT4-fs (loop0): couldn't mount as ext3 due to feature incompatibilities
+      # Was verlangt local-fs.target zwingend? srv-export.mount sollte dort nicht stehen:
+      systemctl show -p Requires local-fs.target
+      grep export /etc/fstab
+      #   loop,nofial – ein Tippfehler, also kein nofail. Und mount reicht das unbekannte Wort an den Kernel weiter.
+      sudo sed -i -e '/produktbilder.img/s/ext3/ext4/' -e 's/nofial/nofail/' /etc/fstab
+      sudo findmnt --verify
+      sudo systemctl daemon-reload
+      sudo systemctl start srv-produktbilder.mount
+      systemctl show -p Requires local-fs.target
+      ls /srv/produktbilder
+    hints:
+      - "Prüfe die fstab, bevor du neu startest: `sudo findmnt --verify`. Optionen prüft es nicht – starte die Mounts deshalb auch so wie der Start: `sudo systemctl daemon-reload`, dann `sudo systemctl start srv-produktbilder.mount`."
+      - "Warum scheitert der Mount? `journalctl -k -n 5` zeigt die Meldung des Kernels, `sudo blkid /var/lib/images/produktbilder.img` den echten Typ des Dateisystems."
+      - "Ob ein Mount den Start aufhalten kann, zeigt `systemctl show -p Requires local-fs.target`. Steht `srv-export.mount` dort, wirkt `nofail` nicht – lies die Optionen Buchstabe für Buchstabe."
+    explanation: |
+      Zwei Zeilen, zwei Fehler. Die Produktbilder sind ein ext4-Image, in der fstab steht `ext3`; der ext4-Treiber lehnt das ab, weil das Dateisystem Funktionen nutzt, die es in ext3 nicht gibt. `findmnt --verify` meldet das schon vor dem Neustart. In der Export-Zeile steht `nofial`. systemd erkennt darin kein `nofail` und macht den Mount zur Pflicht. `mount` reicht das unbekannte Wort an den Kernel weiter, der den Mount ablehnt, selbst wenn das Image da wäre. Beide Pflicht-Mounts scheitern beim Start, damit scheitert `local-fs.target`, und `OnFailure=` startet den Emergency-Modus.
+
+      Die Verallgemeinerung: Eine fstab-Änderung ist erst getestet, wenn systemd sie eingehängt hat (`daemon-reload` und die Mount-Unit starten). `findmnt --verify` findet falsche Typen und Pfade, aber keine Tippfehler in Optionen. Ob ein Mount den Start blockieren kann, verrät `systemctl show -p Requires local-fs.target`. Mit `nofail` und fehlendem Image steht `srv-export.mount` übrigens nach jedem Start als `failed` da, und das System meldet `degraded` – der Start läuft aber durch.
+    resources:
+      - title: systemd-fstab-generator(8)
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemd-fstab-generator.html
+      - title: findmnt(8)
+        url: https://man7.org/linux/man-pages/man8/findmnt.8.html
+  - id: rescue-nach-jedem-neustart
+    type: scenario
+    title: Nach jedem Neustart wartet web01 auf Enter
+    prompt: |
+      Seit letzter Woche bleibt `web01` nach jedem Neustart an einer Wartungsabfrage auf der Konsole stehen. Erst wer Enter drückt und `systemctl default` tippt, bekommt einen normalen Server. Jens hat damals ein Bootproblem untersucht und weiß nur noch, dass er „an GRUB und an systemd etwas umgestellt“ hat. Er ist im Urlaub.
+
+      Sorge dafür, dass `web01` wieder ohne Eingriff in den Normalbetrieb startet, auch nach dem nächsten Kernel-Update, das `update-grub` erneut ausführt. Probier es mit `sudo reboot` aus.
+    setup: |
+      set -e
+      cat > /etc/default/grub.d/90-fehlersuche.cfg <<'EOF'
+      # Fehlersuche Bootproblem OPS-2240 (Jens)
+      GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT systemd.unit=rescue.target"
+      EOF
+      update-grub 2>/dev/null
+      systemctl set-default rescue.target 2>/dev/null
+    checks:
+      - name: Der Standardeintrag in grub.cfg startet ohne Rescue-Parameter
+        run: |
+          zeile=$(grep -m1 -E '^\s*linux\s' /boot/grub/grub.cfg)
+          if echo "$zeile" | grep -qE 'systemd\.unit=|\s(single|emergency|s|S|1)(\s|$)'; then
+            echo "Kernelzeile in grub.cfg: $zeile"
+            exit 1
+          fi
+          echo "$zeile" | grep -q 'console=ttyS0' || { echo "console=ttyS0 fehlt – ohne sie bleibt das Terminal nach dem Neustart leer."; exit 1; }
+      - name: Auch ein neues update-grub erzeugt die normale Kernelzeile
+        run: |
+          grub-mkconfig -o /tmp/grub-pruefung.cfg >/dev/null 2>&1 || { echo "grub-mkconfig scheitert."; exit 1; }
+          zeile=$(grep -m1 -E '^\s*linux\s' /tmp/grub-pruefung.cfg)
+          rm -f /tmp/grub-pruefung.cfg
+          if echo "$zeile" | grep -qE 'systemd\.unit=|\s(single|emergency|s|S|1)(\s|$)'; then
+            echo "update-grub würde erzeugen: $zeile"
+            exit 1
+          fi
+      - name: systemd startet ohne Kernelparameter in den Normalbetrieb
+        run: |
+          ziel=$(systemctl get-default 2>/dev/null)
+          case $ziel in
+            multi-user.target|graphical.target) exit 0 ;;
+            *) echo "default.target zeigt auf $ziel."; exit 1 ;;
+          esac
+    solution: |
+      # Nach einem Neustart (an der Abfrage Enter, dann systemctl default) verrät die Kernelzeile den ersten Teil:
+      cat /proc/cmdline
+      #   … quiet loglevel=3 systemd.unit=rescue.target
+      # In /etc/default/grub steht das nicht. update-grub liest aber auch /etc/default/grub.d/*.cfg:
+      grep -rn 'systemd.unit' /etc/default/
+      sudo rm /etc/default/grub.d/90-fehlersuche.cfg
+      sudo update-grub
+      grep -m1 -E '^\s*linux' /boot/grub/grub.cfg
+      # Der zweite Teil steckt in systemd: default.target zeigt auf rescue.target.
+      systemctl get-default
+      sudo systemctl set-default multi-user.target
+    hints:
+      - "Starte neu und sieh nach, womit der Kernel gestartet wurde: `cat /proc/cmdline`. Was verlangt `systemd.unit=`?"
+      - "`update-grub` liest nicht nur `/etc/default/grub`. `grep -rn systemd.unit /etc/default/` findet alle Stellen. Nach der Änderung `sudo update-grub` nicht vergessen."
+      - "Startet `web01` mit sauberer Kernelzeile immer noch in die Wartungsabfrage, frag systemd nach seinem Standardziel: `systemctl get-default`."
+    explanation: |
+      Jens hat `rescue.target` an zwei Stellen erzwungen. Ein Drop-in in `/etc/default/grub.d/` hängt `systemd.unit=rescue.target` an `GRUB_CMDLINE_LINUX_DEFAULT`, und `update-grub` hat es in jeden normalen Eintrag geschrieben. Außerdem zeigt `default.target` auf `rescue.target`. Wer nur eine Stelle repariert, landet beim nächsten Start wieder an der Abfrage, weil die andere weiter wirkt. Die Kernelzeile schlägt dabei `default.target`: `systemctl get-default` kann `multi-user.target` melden, während das System in `rescue.target` steht.
+
+      Merke dir die Reihenfolge der Fehlersuche: erst `/proc/cmdline` (was hat der Bootloader übergeben?), dann `systemctl get-default` (was will systemd ohne Parameter?). Dauerhafte Änderungen an der Kernelzeile suchst du in `/etc/default/grub` und allen Drop-ins, nie nur in `grub.cfg`, denn die schreibt das nächste Kernel-Update neu.
+    resources:
+      - title: kernel-command-line(7) · systemd.unit=
+        url: https://www.freedesktop.org/software/systemd/man/latest/kernel-command-line.html#systemd.unit=
+      - title: GNU GRUB Manual · Simple configuration
+        url: https://www.gnu.org/software/grub/manual/grub/html_node/Simple-configuration.html
+  - id: initramfs-umzug
+    type: scenario
+    title: Der Treiber ist geladen, der Probeboot scheitert trotzdem
+    prompt: |
+      `web01` zieht am Montag auf einen neuen Hypervisor um, dort hängt die Systemplatte als virtio-blk-Gerät an. Der Probeboot letzte Woche endete so:
+
+      ```text
+      Gave up waiting for root device.  Common problems:
+       - Boot args (cat /proc/cmdline)
+         - Check rootdelay= (did the system wait long enough?)
+         - Check root= (did the system wait for the right device?)
+       - Missing modules (cat /proc/modules; ls /dev)
+      ALERT!  UUID=4f9a1c2e-6b7d-4e8f-a0b1-c2d3e4f5a6b7 does not exist.  Dropping to a shell!
+      (initramfs)
+      ```
+
+      Mira hat danach `virtio_blk` eingetragen und das Modul geladen, `lsmod` zeigt es. Der zweite Probeboot endete genauso.
+
+      Sorge dafür, dass das initramfs des laufenden Kernels `virtio_blk` enthält und dass auch jedes künftige initramfs, etwa nach einem Kernel-Update, es bekommt. Starte zum Schluss neu, um zu sehen, dass `web01` weiter bootet. Das Neubauen des initramfs dauert in der VM knapp eine Minute.
+    setup: |
+      set -e
+      printf '%s\n' '' '# Umzug auf den neuen Hypervisor, OPS-2307 (Mira)' 'virtio_blk' >> /etc/modules
+      modprobe virtio_blk
+    checks:
+      - name: Das initramfs des laufenden Kernels enthält virtio_blk
+        run: |
+          lsinitramfs "/boot/initrd.img-$(uname -r)" | grep -q '/virtio_blk\.ko' || { echo "virtio_blk.ko fehlt in /boot/initrd.img-$(uname -r)."; exit 1; }
+      - name: Jedes künftige initramfs bekommt virtio_blk ebenfalls
+        run: |
+          grep -Ehqs '^\s*virtio[_-]blk(\s|$)' /etc/initramfs-tools/modules /usr/share/initramfs-tools/modules.d/* && exit 0
+          grep -Eqs 'manual_add_modules.*virtio[_-]blk' /etc/initramfs-tools/hooks/* && exit 0
+          grep -Eqs '^\s*MODULES=most' /etc/initramfs-tools/initramfs.conf /etc/initramfs-tools/conf.d/* && exit 0
+          echo "Die Konfiguration von initramfs-tools nimmt virtio_blk nicht von selbst auf."
+          exit 1
+    solution: |
+      # Geladen ist das Modul im laufenden System. Das sagt nichts über das initramfs:
+      lsmod | grep virtio_blk
+      lsinitramfs /boot/initrd.img-$(uname -r) | grep virtio_blk || echo "virtio_blk fehlt im initramfs"
+      # /etc/modules liest systemd-modules-load erst nach dem Wechsel auf das echte Root-Dateisystem.
+      # initramfs-tools hat eine eigene Liste:
+      grep -v '^#' /etc/initramfs-tools/modules
+      echo virtio_blk | sudo tee -a /etc/initramfs-tools/modules
+      sudo update-initramfs -u
+      lsinitramfs /boot/initrd.img-$(uname -r) | grep virtio_blk
+    hints:
+      - "`lsmod` zeigt das laufende System. Was beim Start im initramfs steckt, zeigt `lsinitramfs /boot/initrd.img-$(uname -r)`."
+      - "`/etc/modules` wird erst gelesen, wenn das Root-Dateisystem schon hängt. initramfs-tools hat eine eigene Modulliste unter `/etc/initramfs-tools/`."
+      - "Nach der Änderung an der Liste muss das Image neu gebaut werden: `sudo update-initramfs -u`, dann mit `lsinitramfs … | grep virtio_blk` kontrollieren."
+    explanation: |
+      Im initramfs sucht das Startskript das Root-Dateisystem. Ohne `virtio_blk` erscheint die Platte auf dem neuen Hypervisor nie als Blockgerät, und das Skript gibt mit `ALERT! … does not exist` auf. Mira hat das Modul in `/etc/modules` eingetragen. Diese Liste lädt `systemd-modules-load` aber erst nach `switch_root`, also nach genau der Stelle, an der der Start scheitert. `modprobe` und `lsmod` beweisen nur, dass das Modul im laufenden Kernel funktioniert.
+
+      Ins initramfs kommt ein Modul über `/etc/initramfs-tools/modules` und ein `update-initramfs -u`. Weil `update-initramfs` bei jedem Kernel-Update dieselbe Liste liest, gilt das auch für künftige Kernel. Kontrolliere das Ergebnis mit `lsinitramfs`. Andere Distributionen folgen demselben Muster: `MODULES=()` in `/etc/mkinitcpio.conf` und `mkinitcpio -P`, `add_drivers+=` in `/etc/dracut.conf.d/` und `dracut -f`.
+    resources:
+      - title: initramfs-tools(7)
+        url: https://manpages.debian.org/bookworm/initramfs-tools-core/initramfs-tools.7.en.html
+      - title: update-initramfs(8)
+        url: https://manpages.debian.org/bookworm/initramfs-tools/update-initramfs.8.en.html

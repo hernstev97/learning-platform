@@ -1,12 +1,13 @@
 id: rechte-benutzer
 title: Rechte & Benutzer
 level: 2
-minutes: 150
+minutes: 240
 summary: Du verstehst Zugriffsentscheidungen als Zusammenspiel aus Identität, Dateirechten und Verzeichnisrechten und vergibst gezielt die nötigen Rechte.
 goals:
   - Du unterscheidest Benutzer, Gruppen sowie reale und effektive Zugriffsrechte.
   - Du liest und änderst Dateimodi symbolisch und oktal.
-  - Du erklärst Verzeichnisrechte, umask, Sonderbits und einfache ACLs.
+  - Du erklärst Verzeichnisrechte, umask, setgid und Sticky-Bit und liest ACLs samt Maske.
+  - Du vergibst Root-Rechte über sudoers und Capabilities so eng wie möglich.
   - Du analysierst Permission denied ohne pauschale Freigaben.
 resources:
   - title: Linux · path_resolution(7)
@@ -19,70 +20,139 @@ resources:
     url: https://man7.org/linux/man-pages/man5/acl.5.html
   - title: sudoers(5)
     url: https://www.sudo.ws/docs/man/sudoers.man/
+  - title: capabilities(7)
+    url: https://man7.org/linux/man-pages/man7/capabilities.7.html
+lab: |
+  set -e
+  # Das Wurzeldateisystem der VM kommt mit Modus 777 aus dem Emulator; auf echten Systemen hat / den Modus 755.
+  chmod 755 /
+  # Ein Dienstkonto, zwei Kollegen und ein CI-Benutzer. alice gehört zum Team developers, bob zum Support.
+  useradd --system --no-create-home --home-dir /srv/app --shell /usr/sbin/nologin app
+  for u in alice bob deploy; do useradd -m -s /bin/bash "$u"; done
+  groupadd developers
+  usermod -aG developers alice
+  # Beispieldateien im Home-Verzeichnis von ops
+  cd /home/ops
+  printf 'listen = 127.0.0.1:8080\nlog_level = info\n' > app.conf
+  printf 'ghp_0000000000000000000000000000beispiel\n' > token.txt
+  printf '#!/bin/sh\necho "Release wird ausgerollt"\n' > deploy.sh
+  mkdir -p releases
+  chown ops:developers app.conf releases
+  chown ops:ops token.txt deploy.sh
+  chmod 640 app.conf; chmod 750 releases; chmod 644 token.txt deploy.sh
+  touch -d '2026-09-28 10:00' app.conf token.txt deploy.sh releases
+  # Konfiguration des Dienstes app: nur root und die Gruppe app kommen hinein
+  install -d -o root -g app -m 750 /srv/app /srv/app/config
+  printf 'DB_PASSWORD=nur-ein-beispiel\n' > /srv/app/config/app.env
+  chown root:app /srv/app/config/app.env
+  chmod 640 /srv/app/config/app.env
+  # Teamordner auf tmpfs, denn das Wurzeldateisystem der VM (9p) kann keine ACLs
+  mkdir -p /srv/team
+  mount -t tmpfs -o size=4m tmpfs /srv/team
+  chgrp developers /srv/team
+  chmod 2770 /srv/team
+  setfacl -m u:ops:rwx,u:bob:--x /srv/team
+  touch -d '2026-09-28 10:00' /srv/team
+  # Für Capabilities: eine Kopie von busybox auf tmpfs (Datei-Capabilities brauchen erweiterte Attribute)
+  install -d -m 755 /srv/www
+  echo 'Hallo von web01' > /srv/www/index.html
+  mkdir -p /opt/web
+  mount -t tmpfs -o size=4m tmpfs /opt/web
+  cp /usr/bin/busybox /opt/web/busybox
+  setcap cap_net_bind_service=+ep /opt/web/busybox
+  # sudo-Regel für die CI
+  echo 'deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart shop.service' > /etc/sudoers.d/deploy
+  chmod 440 /etc/sudoers.d/deploy
 lesson: |
   Deine App läuft im Terminal, aber als Dienst meldet sie `Permission denied`. Der schnelle Versuch `chmod -R 777` macht die Meldung vielleicht unsichtbar, erlaubt aber jedem lokalen Benutzer Änderungen an Code und Konfiguration. Die bessere Frage lautet: Welcher Prozess braucht welche Operation auf welchem Pfad? Aus dieser Frage ergibt sich eine kleine, nachvollziehbare Freigabe.
 
-  Das klassische Linux-Rechtemodell ordnet Dateien einem Besitzer und einer Gruppe zu. Prozesse besitzen eine Benutzeridentität und Gruppenmitgliedschaften. Der Kernel vergleicht diese Informationen bei jedem Zugriff. Wir üben zuerst mit Dateien in einem eigenen Übungsordner. Benutzerverwaltung und Änderungen an Systemdiensten gehören in eine separate VM, weil sie den laufenden Rechner beeinflussen.
+  Das klassische Linux-Rechtemodell ordnet Dateien einem Besitzer und einer Gruppe zu. Prozesse besitzen eine Benutzeridentität und Gruppenmitgliedschaften. Der Kernel vergleicht diese Informationen bei jedem Zugriff. Benutzerverwaltung, sudo-Regeln und Rechte von Diensten übst du in einer eigenen VM, nicht auf deinem Arbeitsrechner, weil sie den laufenden Rechner verändern.
+
+  Das Terminal dieser Lektion ist so eine VM. Die Beispiele mit „Im Terminal“ kannst du dort direkt ausprobieren. Neben dir (`ops`) gibt es das Dienstkonto `app`, die Kollegin `alice` aus dem Team `developers`, `bob` aus dem Support und den CI-Benutzer `deploy`.
 
   ## Identität, Konten und Gruppen
 
-  Namen wie `steven` oder `www-data` sind für Menschen. Der Kernel verwendet numerische **UIDs** und **GIDs**. `id` zeigt Benutzerkennung, primäre Gruppe und zusätzliche Gruppen. `whoami` zeigt den Namen zur effektiven Benutzerkennung. Ein Dienst kann daher unter einer anderen Identität laufen als die Shell, die ihn installiert hat ([credentials(7)](https://man7.org/linux/man-pages/man7/credentials.7.html)).
+  Namen wie `ops` oder `www-data` sind für Menschen. Der Kernel verwendet numerische **UIDs** und **GIDs**. `id` zeigt Benutzerkennung, primäre Gruppe und zusätzliche Gruppen. `whoami` zeigt den Namen zur effektiven Benutzerkennung. Ein Dienst kann daher unter einer anderen Identität laufen als die Shell, die ihn installiert hat ([credentials(7)](https://man7.org/linux/man-pages/man7/credentials.7.html)).
 
-  ```bash
-  id
-  id steven
-  whoami
-  groups
-  getent passwd steven
-  getent group developers
+  ```console vm
+  $ id
+  uid=1000(ops) gid=1000(ops) groups=1000(ops),4(adm),27(sudo),999(systemd-journal)
+  $ id app
+  uid=996(app) gid=996(app) groups=996(app)
+  $ getent passwd ops app
+  ops:x:1000:1000::/home/ops:/bin/bash
+  app:x:996:996::/srv/app:/usr/sbin/nologin
+  $ getent group developers
+  developers:x:1004:alice
   ```
 
-  `/etc/passwd` enthält lokale Konten mit UID, GID, Home und Login-Shell, aber auf heutigen üblichen Systemen keine Passwort-Hashes. Diese liegen geschützt in `/etc/shadow`. `/etc/group` beschreibt lokale Gruppen. `getent` fragt die konfigurierten Namensdienste ab und kann deshalb auch Konten finden, die nicht direkt in diesen Dateien stehen ([passwd(5)](https://man7.org/linux/man-pages/man5/passwd.5.html), [shadow(5)](https://man7.org/linux/man-pages/man5/shadow.5.html)). Lies Passwort-Hashes für diese Übungen nicht aus und kopiere sie nicht in Fehlerberichte.
+  `/etc/passwd` enthält lokale Konten mit UID, GID, Home und Login-Shell, aber auf heutigen üblichen Systemen keine Passwort-Hashes. Diese liegen geschützt in `/etc/shadow`. `/etc/group` beschreibt lokale Gruppen. `getent` fragt die konfigurierten Namensdienste ab und kann deshalb auch Konten finden, die nicht direkt in diesen Dateien stehen ([passwd(5)](https://man7.org/linux/man-pages/man5/passwd.5.html), [shadow(5)](https://man7.org/linux/man-pages/man5/shadow.5.html)). Lies Passwort-Hashes nicht aus und kopiere sie nicht in Fehlerberichte.
 
-  Ein Dienstkonto soll meist keine interaktive Anmeldung erlauben. In einer Debian- oder Arch-VM lässt sich dafür mit passenden Distributionswerkzeugen ein Systemkonto mit eigener Gruppe, festem Datenverzeichnis und einer `nologin`-Shell anlegen. Die konkreten Optionen und Standardpfade prüfst du über `useradd --help`; `adduser` ist auf Debian eine zusätzliche Oberfläche und nicht auf jeder Distribution gleich vorhanden.
+  Das Dienstkonto `app` hat eine UID unter 1000 und die Shell `nologin`: Niemand meldet sich damit an, es existiert nur, damit ein Dienst nicht als root läuft. Angelegt wurde es mit `useradd --system --shell /usr/sbin/nologin app`. `adduser` ist auf Debian eine zusätzliche Oberfläche und nicht auf jeder Distribution gleich vorhanden; die Optionen prüfst du mit `useradd --help`.
 
-  ```bash
-  # Nur als Administrationsbeispiel für eine eigene Test-VM:
-  sudo groupadd developers
-  sudo usermod -aG developers steven
+  ```console vm
+  $ sudo usermod -aG www-data ops
+  $ id -nG
+  ops adm sudo systemd-journal
+  $ id -nG ops
+  ops adm sudo www-data systemd-journal
   ```
 
-  Bei `usermod -aG` bedeutet `-a` hinzufügen. Ohne `-a` ersetzt `-G` die Liste zusätzlicher Gruppen. Neue Mitgliedschaften erscheinen in laufenden Prozessen nicht automatisch: Eine neue Anmeldung übernimmt sie. Prüfe mit `id` in der neuen Sitzung, statt durch immer weitere Rechteänderungen ein altes Sitzungsproblem zu verdecken ([usermod(8)](https://man7.org/linux/man-pages/man8/usermod.8.html)).
+  Bei `usermod -aG` bedeutet `-a` hinzufügen. Ohne `-a` ersetzt `-G` die Liste zusätzlicher Gruppen. `id -nG ops` liest die Kontendatenbank und zeigt die neue Gruppe sofort. `id -nG` ohne Namen zeigt die Gruppen der laufenden Shell, und die hat ihre Gruppen bei der Anmeldung bekommen. Erst eine neue Anmeldung übernimmt die Mitgliedschaft. Prüfe mit `id` in der neuen Sitzung, statt durch immer weitere Rechteänderungen ein altes Sitzungsproblem zu verdecken ([usermod(8)](https://man7.org/linux/man-pages/man8/usermod.8.html)).
 
   ## rwx lesen: Dateien und Verzeichnisse
 
   `ls -l` zeigt Typ, drei Rechtegruppen, Linkzahl, Besitzer und Gruppe. Bei `-rw-r-----` bezeichnet `-` eine reguläre Datei. Der Besitzer darf lesen und schreiben, die Gruppe lesen, andere nichts. `u`, `g`, `o` stehen für user, group und others. Der Kernel nimmt die passende Klasse; er addiert nicht automatisch sämtliche Klassen, in die ein Benutzer irgendwie fällt ([Coreutils · Mode Structure](https://www.gnu.org/software/coreutils/manual/html_node/Mode-Structure.html)).
 
-  ```text
-  -rw-r----- 1 steven developers 120 Sep 28 10:00 app.conf
-  drwxr-x--- 2 steven developers  80 Sep 28 10:00 releases
+  ```console vm
+  $ ls -l app.conf
+  -rw-r----- 1 ops developers 41 Sep 28 10:00 app.conf
+  $ ls -ld releases
+  drwxr-x--- 2 ops developers 0 Sep 28 10:00 releases
   ```
 
   Bei Dateien bedeutet `r` Inhalt lesen, `w` Inhalt verändern und `x` ausführen. Das Ausführen eines Skripts kann weitere Bedingungen haben: Der Interpreter braucht Zugang zum Skript, ein Mount kann `noexec` tragen, und der Shebang muss einen erreichbaren Interpreter benennen. Ein einzelnes x-Bit erklärt daher nicht jede Ausführungsstörung.
 
   Bei Verzeichnissen sind die Operationen anders: `r` erlaubt, die Namen aufzulisten. `x` erlaubt Durchsuchen beziehungsweise Traversieren und den Zugriff auf bekannte Einträge. `w` zusammen mit `x` erlaubt, Einträge anzulegen, umzubenennen oder zu entfernen. Die Schreibrechte einer Datei schützen also nicht automatisch davor, dass ihr Name aus einem beschreibbaren Elternverzeichnis gelöscht wird. Für einen Pfad brauchst du Suchrechte auf allen durchlaufenen Verzeichnissen ([path_resolution(7)](https://man7.org/linux/man-pages/man7/path_resolution.7.html)).
 
-  ```bash
-  ls -ld . ./releases
-  namei -l ./releases/app.conf
-  stat -c '%a %U %G %n' ./releases/app.conf
+  ```console vm
+  $ cat /srv/app/config/app.env
+  cat: /srv/app/config/app.env: Permission denied
+  $ namei -l /srv/app/config/app.env
+  f: /srv/app/config/app.env
+  drwxr-xr-x root root /
+  drwxr-xr-x root root srv
+  drwxr-x--- root app  app
+                       config - Permission denied
+  $ sudo -u app namei -l /srv/app/config/app.env
+  f: /srv/app/config/app.env
+  drwxr-xr-x root root /
+  drwxr-xr-x root root srv
+  drwxr-x--- root app  app
+  drwxr-x--- root app  config
+  -rw-r----- root app  app.env
+  $ sudo -u app test -r /srv/app/config/app.env && echo "app darf lesen"
+  app darf lesen
   ```
 
-  `namei -l` zerlegt den Pfad in Komponenten. Ein Dienst kann `app.conf` lesen dürfen und trotzdem an einem übergeordneten Home-Verzeichnis mit Modus 700 scheitern. Kopiere sensible Konfiguration dann nicht reflexhaft in eine öffentliche Ablage; wähle einen vorgesehenen Dienstpfad und die passende Gruppe.
+  [`namei -l`](https://man7.org/linux/man-pages/man1/namei.1.html) zerlegt den Pfad in Komponenten. Als `ops` endet der Weg schon bei `/srv/app`: Modus 750, Gruppe `app`, und `ops` ist weder Besitzer noch Mitglied. Mit `sudo -u app` prüfst du denselben Pfad mit der Identität des Dienstes. `test -r` beantwortet „darf ich lesen?“, ohne den geheimen Inhalt ins Terminal zu schreiben. Ein Dienst kann eine Datei lesen dürfen und trotzdem an einem Elternverzeichnis mit Modus 700 scheitern. Kopiere sensible Konfiguration dann nicht reflexhaft in eine öffentliche Ablage; wähle einen vorgesehenen Dienstpfad und die passende Gruppe.
 
   > [!MERKE]
-  > Zum Lesen einer Datei brauchst du Zugriff auf den gesamten Weg dorthin. Zum Löschen ihres Namens sind vor allem die Rechte am Elternverzeichnis entscheidend.
+  > Zum Lesen einer Datei brauchst du Zugriff auf den gesamten Weg dorthin. Zum Löschen ihres Namens zählen vor allem die Rechte am Elternverzeichnis.
 
   ## Rechte gezielt setzen und Erzeugung verstehen
 
-  Symbolische Modi beschreiben eine Änderung. `chmod u+x script.sh` ergänzt das Ausführungsrecht des Besitzers. `chmod go-rwx secret.txt` entfernt alle Rechte von Gruppe und anderen. Ein Gleichheitszeichen setzt die angegebene Klasse auf genau den genannten Satz. Numerische Modi beschreiben die drei Klassen mit `r=4`, `w=2`, `x=1` ([Coreutils · chmod](https://www.gnu.org/software/coreutils/manual/html_node/chmod-invocation.html)).
+  Symbolische Modi beschreiben eine Änderung. `chmod u+x deploy.sh` ergänzt das Ausführungsrecht des Besitzers. `chmod go-rwx secret.txt` entfernt alle Rechte von Gruppe und anderen. Ein Gleichheitszeichen setzt die angegebene Klasse auf genau den genannten Satz, etwa `chmod u=rw,g=r,o= app.conf`. Numerische Modi beschreiben die drei Klassen mit `r=4`, `w=2`, `x=1` ([Coreutils · chmod](https://www.gnu.org/software/coreutils/manual/html_node/chmod-invocation.html)).
 
-  ```bash
-  chmod u=rw,g=r,o= app.conf
-  chmod 640 app.conf
-  chmod 750 releases
-  chmod 600 token.txt
-  chgrp developers app.conf
+  ```console vm
+  $ ls -l token.txt deploy.sh
+  -rw-r--r-- 1 ops ops 41 Sep 28 10:00 deploy.sh
+  -rw-r--r-- 1 ops ops 41 Sep 28 10:00 token.txt
+  $ chmod 600 token.txt
+  $ chmod u+x deploy.sh
+  $ stat -c '%a %A %n' token.txt deploy.sh
+  600 -rw------- token.txt
+  744 -rwxr--r-- deploy.sh
   ```
 
   640 bedeutet `rw- r-- ---`, 750 bedeutet `rwx r-x ---`. Ein häufiger Review-Fehler ist dieselbe rekursive Zahl für Dateien und Verzeichnisse: 644 macht Verzeichnisse unzugänglich, 755 macht normale Datendateien ausführbar. Für gemischte Bäume kann `X` helfen: `chmod -R u+rwX,g+rX,o-rwx projekt` ergänzt x nur für Verzeichnisse beziehungsweise bereits irgendwo ausführbare Dateien. Prüfe trotzdem Eigentümer und Zielmenge vor rekursiven Änderungen.
@@ -91,65 +161,202 @@ lesson: |
 
   Die **umask** entfernt beim Erzeugen Rechte aus dem angeforderten Modus. Übliche Programme erzeugen reguläre Dateien mit höchstens 666, Verzeichnisse mit höchstens 777. Bei `umask 027` ergibt das oft 640 und 750. Das ist ein bitweises Entfernen, kein allgemeines arithmetisches Subtrahieren. Bestehende Dateien bleiben unverändert ([umask(2)](https://man7.org/linux/man-pages/man2/umask.2.html)).
 
-  ```bash
-  (
-    umask 027
-    touch bericht.txt
-    mkdir berichte
-    stat -c '%a %n' bericht.txt berichte
-  )
+  ```console vm
+  $ umask
+  0022
+  $ (umask 027; touch bericht.txt; mkdir -p berichte; stat -c '%a %n' bericht.txt berichte)
+  640 bericht.txt
+  750 berichte
+  $ umask
+  0022
   ```
 
-  Die runden Klammern begrenzen die Änderung auf eine Subshell. Ein Programm kann ausdrücklich restriktivere Modi anfordern. Außerdem können Default-ACLs im Elternverzeichnis die Erzeugung beeinflussen. Merke dir deshalb den üblichen Rechenweg und prüfe anschließend den tatsächlichen Modus.
+  Die runden Klammern begrenzen die Änderung auf eine Subshell; danach gilt wieder 022. Ein Programm kann ausdrücklich restriktivere Modi anfordern. Außerdem ersetzt eine Default-ACL im Elternverzeichnis die umask, wie der nächste Abschnitt zeigt. Merke dir deshalb den üblichen Rechenweg und prüfe anschließend den tatsächlichen Modus.
 
   ## Sonderbits und ACLs mit begrenztem Zweck
 
-  **Setuid** auf einer ausführbaren Datei lässt deren Prozess mit der effektiven UID des Besitzers laufen. Das erklärt Programme wie `passwd`, die kontrolliert geschützte Kontodaten ändern müssen. Das ist keine Einladung, eigene Shell-Skripte so zu privilegieren; Linux behandelt setuid-Skripte nicht wie setuid-Binärprogramme. Ein Fehler in privilegiertem Code kann zur Rechteausweitung werden ([execve(2)](https://man7.org/linux/man-pages/man2/execve.2.html)).
+  **Setuid** auf einer ausführbaren Datei lässt deren Prozess mit der effektiven UID des Besitzers laufen. Das erklärt Programme wie `passwd` und `sudo`, die kontrolliert geschützte Daten ändern müssen; `ls -l /usr/bin/passwd` zeigt dafür ein `s` an der Stelle des Besitzer-x: `-rwsr-xr-x`. Das ist keine Einladung, eigene Shell-Skripte so zu privilegieren; Linux behandelt setuid-Skripte nicht wie setuid-Binärprogramme. Ein Fehler in privilegiertem Code kann zur Rechteausweitung werden ([execve(2)](https://man7.org/linux/man-pages/man2/execve.2.html)).
 
-  **Setgid** auf einem Verzeichnis lässt neue Einträge normalerweise dessen Gruppe übernehmen. Für einen Teamordner ist 2770 deshalb ein übliches Muster; die Schreibrechte neuer Dateien hängen weiterhin von Modus, umask und gegebenenfalls Default-ACL ab. Das **Sticky-Bit** auf einem gemeinsam beschreibbaren Verzeichnis beschränkt das Löschen und Umbenennen fremder Einträge. `/tmp` hat typischerweise Modus 1777. Es verhindert nicht, dass eine ohnehin lesbare Datei gelesen wird ([inode(7)](https://man7.org/linux/man-pages/man7/inode.7.html)).
+  **Setgid** auf einem Verzeichnis lässt neue Einträge dessen Gruppe übernehmen statt der primären Gruppe ihres Erzeugers. Neue Unterverzeichnisse erben das Bit gleich mit. Für einen Teamordner ist 2770 deshalb ein übliches Muster ([inode(7)](https://man7.org/linux/man-pages/man7/inode.7.html)). Im Terminal liegt so ein Ordner unter `/srv/team`, auf einem tmpfs, denn das Wurzeldateisystem der VM kann keine ACLs:
 
-  ```bash
-  chmod 2770 team
-  ls -ld team
-  getfacl team
-  setfacl -m u:reviewer:r-- bericht.txt
+  ```console vm
+  $ ls -ld /srv/team
+  drwxrws---+ 2 root developers 40 Sep 28 10:00 /srv/team
+  $ touch /srv/team/plan.txt
+  $ stat -c '%A %U %G %n' /srv/team/plan.txt
+  -rw-r--r-- ops developers /srv/team/plan.txt
   ```
 
-  Eine **ACL** ergänzt gezielte Benutzer- und Gruppenrechte. `getfacl` zeigt sie, `setfacl` verändert sie. Die ACL-Maske begrenzt effektive Rechte benannter Benutzer und der Gruppenklasse; ein großzügiger Eintrag kann durch diese Maske eingeschränkt bleiben. Prüfe bei einem `+` hinter dem Modus in `ls -l` daher die ACL. Verwende ACLs, wenn eine einzelne zusätzliche Freigabe sinnvoller als eine neue gemeinsame Gruppe ist, und dokumentiere diese Ausnahme ([acl(5)](https://man7.org/linux/man-pages/man5/acl.5.html)).
+  Das `s` in `rws` ist das setgid-Bit: `plan.txt` gehört der Gruppe `developers`, nicht `ops`. Die Rechte der Datei bestimmt setgid aber nicht. `touch` hat 666 angefordert, die umask 022 hat der Gruppe das Schreibrecht genommen, und alice kann die Datei nicht ändern.
+
+  Das `+` hinter dem Modus zeigt eine **ACL**. Sie ergänzt gezielte Benutzer- und Gruppenrechte. `getfacl` zeigt sie, `setfacl` verändert sie ([acl(5)](https://man7.org/linux/man-pages/man5/acl.5.html)):
+
+  ```console vm
+  $ getfacl /srv/team
+  getfacl: Removing leading '/' from absolute path names
+  # file: srv/team
+  # owner: root
+  # group: developers
+  # flags: -s-
+  user::rwx
+  user:ops:rwx
+  user:bob:--x
+  group::rwx
+  mask::rwx
+  other::---
+
+  ```
+
+  `ops` ist nicht in `developers` und kommt trotzdem hinein, über den Eintrag `user:ops:rwx`. `bob` darf das Verzeichnis nur durchqueren, aber nicht auflisten. Eine **Default-ACL** an einem Verzeichnis gilt für alles, was darin neu entsteht, und ersetzt dabei die umask:
+
+  ```console vm
+  $ sudo setfacl -d -m g::rwx,o::--- /srv/team
+  $ touch /srv/team/notizen.txt
+  $ stat -c '%A %U %G %n' /srv/team/notizen.txt
+  -rw-rw---- ops developers /srv/team/notizen.txt
+  $ sudo -u alice sh -c 'echo "Release-Freeze ab Donnerstag" > /srv/team/notizen.txt'
+  $ cat /srv/team/notizen.txt
+  Release-Freeze ab Donnerstag
+  ```
+
+  Die **Maske** begrenzt die effektiven Rechte aller benannten Benutzer und Gruppen und der besitzenden Gruppe, nicht aber die des Besitzers und von `other`. Bei einer Datei mit ACL zeigt `ls -l` in den Gruppenbits die Maske, und `chmod` auf die Gruppenbits ändert die Maske, nicht den Eintrag `group::`. Ein harmlos wirkendes `chmod 640` stuft so jede ACL-Freigabe auf Lesen herunter:
+
+  ```console vm
+  $ setfacl -m u:bob:rw /srv/team/notizen.txt
+  $ chmod 640 /srv/team/notizen.txt
+  $ getfacl -p /srv/team/notizen.txt
+  # file: /srv/team/notizen.txt
+  # owner: ops
+  # group: developers
+  user::rw-
+  user:bob:rw-            #effective:r--
+  group::rw-              #effective:r--
+  mask::r--
+  other::---
+
+  $ sudo -u bob cat /srv/team/notizen.txt
+  Release-Freeze ab Donnerstag
+  $ chmod 660 /srv/team/notizen.txt
+  ```
+
+  Verwende ACLs, wenn eine einzelne zusätzliche Freigabe sinnvoller als eine neue gemeinsame Gruppe ist, und dokumentiere diese Ausnahme. Sie brauchen ein Dateisystem, das sie speichert: ext4, XFS, Btrfs und tmpfs können das, manche Netz- und Spezialdateisysteme nicht.
+
+  Das **Sticky-Bit** auf einem gemeinsam beschreibbaren Verzeichnis beschränkt das Löschen und Umbenennen fremder Einträge auf deren Besitzer, den Besitzer des Verzeichnisses und root. `/tmp` hat Modus 1777. Lesen verhindert das Bit nicht:
+
+  ```console vm fails
+  $ stat -c '%A %a %U %n' /tmp
+  drwxrwxrwt 1777 root /tmp
+  $ sudo -u bob sh -c 'umask 000; echo "Notiz von bob" > /tmp/bob-notiz.txt'
+  $ stat -c '%A %U %n' /tmp/bob-notiz.txt
+  -rw-rw-rw- bob /tmp/bob-notiz.txt
+  $ cat /tmp/bob-notiz.txt
+  Notiz von bob
+  $ echo "Antwort von ops" >> /tmp/bob-notiz.txt
+  -bash: /tmp/bob-notiz.txt: Permission denied
+  $ rm -f /tmp/bob-notiz.txt
+  rm: cannot remove '/tmp/bob-notiz.txt': Operation not permitted
+  ```
+
+  > [!DEEP] Warum `>>` trotz Modus 666 scheitert
+  > Das Löschen verhindert das Sticky-Bit. Das Anhängen verhindert eine zweite Regel: Debian setzt `fs.protected_regular = 2` (`/usr/lib/sysctl.d/99-protect-links.conf`). Dann darf niemand eine fremde Datei in einem Sticky-Verzeichnis, das alle oder die Gruppe beschreiben dürfen, mit `O_CREAT` öffnen. `>>` öffnet mit `O_CREAT`, `cat` nicht. Die Regel schützt vor Angriffen, bei denen jemand eine Datei unter einem erwarteten Namen in `/tmp` vorbereitet ([Kernel · protected_regular](https://docs.kernel.org/admin-guide/sysctl/fs.html#protected-regular)).
+
+  ## Capabilities statt root
+
+  Root ist unter Linux kein einzelnes Recht, sondern ein Bündel von **Capabilities**. `CAP_NET_BIND_SERVICE` erlaubt zum Beispiel, Ports unter 1024 zu öffnen, `CAP_NET_RAW` rohe Sockets. Ein Prozess, der nur Port 80 braucht, muss deshalb nicht als root laufen ([capabilities(7)](https://man7.org/linux/man-pages/man7/capabilities.7.html)). Eine Capability kann an einer Programmdatei hängen. Das zeigt `getcap`, das wie `setcap` in `/usr/sbin` liegt und deshalb nicht im `PATH` von `ops` steht:
+
+  ```console vm
+  $ sudo -u app busybox httpd -p 127.0.0.1:80 -h /srv/www
+  httpd: bind: Permission denied
+  $ /usr/sbin/getcap /opt/web/busybox
+  /opt/web/busybox cap_net_bind_service=ep
+  $ sudo -u app /opt/web/busybox httpd -p 127.0.0.1:80 -h /srv/www
+  $ curl -s http://127.0.0.1/
+  Hallo von web01
+  $ sudo pkill -u app busybox
+  ```
+
+  `=ep` heißt: Die Capability ist beim Start erlaubt (permitted) und sofort wirksam (effective). Die Datei-Capability gilt aber für jeden, der diese Kopie von busybox startet, mit jedem ihrer Applets. Für einen Dienst ist systemd die engere Wahl: `AmbientCapabilities=` gibt genau diesem Prozess die Capability mit, auch nachdem systemd zum Benutzer `app` gewechselt hat. `CapabilityBoundingSet=` begrenzt zusätzlich, was der Prozess und seine Kinder überhaupt je bekommen können ([systemd.exec · Capabilities](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#AmbientCapabilities=)). `systemd-run` probiert das ohne Unit-Datei aus:
+
+  ```console vm
+  $ sudo systemd-run --unit=web80 -p User=app \
+      -p AmbientCapabilities=CAP_NET_BIND_SERVICE \
+      /usr/bin/busybox httpd -f -p 127.0.0.1:80 -h /srv/www
+  Running as unit: web80.service
+  $ sleep 1; curl -s http://127.0.0.1/
+  Hallo von web01
+  $ grep -E 'CapEff|CapAmb' /proc/$(pgrep -u app busybox)/status
+  CapEff: 0000000000000400
+  CapAmb: 0000000000000400
+  $ /usr/sbin/capsh --decode=0000000000000400
+  0x0000000000000400=cap_net_bind_service
+  $ sudo systemctl stop web80
+  ```
+
+  Bit 10 (`0x400`) ist `CAP_NET_BIND_SERVICE`, mehr hat der Prozess nicht. Das Wurzeldateisystem dieser VM speichert keine erweiterten Attribute, deshalb liegt die Kopie mit Datei-Capability auf einem tmpfs. Auf einem normalen Debian zeigt `getcap /usr/bin/ping` dagegen `cap_net_raw=ep`.
 
   ## sudo und nachvollziehbare Administration
 
   `sudo` führt einen erlaubten Befehl unter einer anderen Identität aus, standardmäßig root. `su` wechselt die Benutzeridentität beziehungsweise startet eine andere Shell; `su -` erzeugt dabei eine Login-Umgebung. Für Administration bevorzugst du kurze, konkrete privilegierte Aktionen statt einer dauerhaft offenen Root-Shell. So erkennst du leichter, welcher Schritt die erhöhten Rechte benötigt.
 
-  ```bash
-  sudo -l
-  sudo -u app id
-  sudo visudo
-  sudo visudo -c
+  ```console vm
+  $ sudo -l
+  Matching Defaults entries for ops on web01:
+      env_reset, mail_badpass, secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin, use_pty
+
+  User ops may run the following commands on web01:
+      (ALL : ALL) ALL
+      (ALL) NOPASSWD: ALL
+  $ sudo -l -U deploy
+  Matching Defaults entries for deploy on web01:
+      env_reset, mail_badpass, secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin, use_pty
+
+  User deploy may run the following commands on web01:
+      (root) NOPASSWD: /usr/bin/systemctl restart shop.service
+  $ sudo visudo -c
+  /etc/sudoers: parsed OK
+  /etc/sudoers.d/README: parsed OK
+  /etc/sudoers.d/deploy: parsed OK
+  /etc/sudoers.d/ops: parsed OK
   ```
 
-  Die Regeln stehen in sudoers und oft in eingebundenen Dateien unter `/etc/sudoers.d`. Bearbeite sie mit `visudo`, das vor dem Speichern Syntax prüft. Ein vermeintlich enger Eintrag für einen Editor, Interpreter oder einen Befehl mit frei wählbarer Konfigurationsdatei kann trotzdem vollständige Root-Möglichkeiten geben. Lies die [sudoers-Dokumentation](https://www.sudo.ws/docs/man/sudoers.man/), bevor du Befehlsfreigaben konstruierst.
+  `ops` darf alles: einmal über die Gruppe `sudo` mit Passwort (`%sudo ALL=(ALL:ALL) ALL` in `/etc/sudoers`), einmal über `/etc/sudoers.d/ops` ohne. `deploy` darf genau einen Befehl mit genau diesen Argumenten. Eigene Regeln gehören als Drop-in nach `/etc/sudoers.d/`. Die Zeile `@includedir /etc/sudoers.d` am Ende von `/etc/sudoers` liest dort jede Datei, deren Name keinen Punkt enthält und nicht auf `~` endet. Eine Datei `deploy.conf` ignoriert sudo also kommentarlos.
+
+  Bearbeite sudoers nur mit `visudo`, das vor dem Speichern die Syntax prüft. Einen Entwurf prüfst du mit `visudo -cf`, bevor er wirkt:
+
+  ```console vm fails
+  $ echo 'deploy ALL=(root) NOPASSWD: systemctl restart shop.service' > deploy.entwurf
+  $ sudo visudo -cf deploy.entwurf
+  deploy.entwurf:1:29: expected a fully-qualified path name
+  deploy ALL=(root) NOPASSWD: systemctl restart shop.service
+                              ^~~~~~~~~
+  ```
+
+  Befehle brauchen in sudoers den vollen Pfad. Ein geprüfter Entwurf kommt mit `sudo install -m 0440 -o root -g root deploy.entwurf /etc/sudoers.d/deploy` an seinen Platz. Ein vermeintlich enger Eintrag für einen Editor, Pager, Interpreter oder einen Befehl mit frei wählbarer Konfigurationsdatei kann trotzdem vollständige Root-Möglichkeiten geben; für das Bearbeiten einzelner Dateien gibt es `sudoedit`. Lies die [sudoers-Dokumentation](https://www.sudo.ws/docs/man/sudoers.man/), bevor du Befehlsfreigaben konstruierst.
+
+  > [!WARNING]
+  > Ein Syntaxfehler in sudoers kann dich aussperren. Das sudo von Debian 12 (1.9.13) verwirft nur den kaputten Rest der Zeile und meldet den Fehler bei jedem Aufruf; ältere Versionen verweigern jeden Befehl, auch deinen. Prüfe Entwürfe deshalb mit `visudo -cf` und halte bei Änderungen an sudoers eine zweite Root-Sitzung offen.
 
   > [!PRAXIS]
   > Dokumentiere bei einer Freigabe den Dienstbenutzer, den Pfad und die benötigte Operation. Ein Reviewer sollte erkennen, weshalb „Gruppe darf lesen“ genügt und weshalb andere Benutzer nichts benötigen.
 
   ## Häufige Fehler und eine Diagnosefolge
 
-  Beginne bei `Permission denied` mit dem tatsächlichen Dienstkonto und `namei -l`. Prüfe dann Modus, Besitzer, Gruppe und ACL. Wenn diese passen, untersuche Mount-Optionen sowie AppArmor, SELinux oder systemd-Sandboxing. Mehr Unix-Rechte heben eine zusätzliche Sicherheitsrichtlinie nicht automatisch auf. Eine Fehlermeldung benennt das Symptom; sie entscheidet noch nicht, welche Ebene die Operation blockiert.
+  Beginne bei `Permission denied` mit der genauen Meldung, bei Diensten aus `journalctl -u DIENST`: Welche Datei, welche Operation? Prüfe dann mit `namei -l` den ganzen Pfad und mit `sudo -u DIENSTKONTO test -r PFAD` (oder `-w`, `-x`) die konkrete Operation. Dann folgen Modus, Besitzer, Gruppe und ACL. Wenn diese passen, untersuche Mount-Optionen sowie AppArmor, SELinux oder systemd-Sandboxing. Mehr Unix-Rechte heben eine zusätzliche Sicherheitsrichtlinie nicht automatisch auf. Eine Fehlermeldung benennt das Symptom; sie entscheidet noch nicht, welche Ebene die Operation blockiert.
 
-  Verwende keinen Root-Test als alleinigen Funktionsnachweis. Ein Programm kann unter root funktionieren und unter seinem Dienstkonto weiterhin scheitern. Teste die konkrete Lese- oder Schreiboperation mit der vorgesehenen Identität in einer kontrollierten Umgebung. Vermeide rekursive Besitzerwechsel über unbekannte Bäume: Darin können Paketdateien, Symlinks und gemeinsam genutzte Daten liegen.
+  Verwende keinen Root-Test als alleinigen Funktionsnachweis. Ein Programm kann unter root funktionieren und unter seinem Dienstkonto weiterhin scheitern. Teste die konkrete Lese- oder Schreiboperation mit der vorgesehenen Identität in einer kontrollierten Umgebung. Vermeide rekursive Besitzerwechsel über unbekannte Bäume: Darin können Paketdateien, Symlinks und gemeinsam genutzte Daten liegen. Und erwarte nicht, dass eine neue Gruppenmitgliedschaft in einer laufenden Sitzung oder einem laufenden Dienst wirkt: Der Dienst muss neu starten, die Sitzung sich neu anmelden.
 
   > [!INTERVIEW]
-  > „Warum kann ich eine schreibgeschützte Datei löschen?“ – Löschen verändert den Verzeichniseintrag. Die entscheidenden Rechte liegen am Elternverzeichnis; Sticky-Bit, weitere Richtlinien und besondere Attribute können zusätzlich begrenzen.
+  > „Warum kann ich eine schreibgeschützte Datei löschen?“ – Löschen verändert den Verzeichniseintrag. Deshalb zählen die Rechte am Elternverzeichnis; Sticky-Bit, weitere Richtlinien und besondere Attribute können zusätzlich begrenzen.
 
   ## Zusammenfassung
 
   - Der Kernel entscheidet anhand von Identität und konkreter Operation.
   - rwx bedeutet auf Verzeichnissen etwas anderes als auf Dateien.
   - Symbolische Modi ändern gezielt; oktale Modi beschreiben einen Satz.
-  - Die umask entfernt Rechte bei der Erzeugung.
-  - Setgid, Sticky-Bit und ACLs lösen unterschiedliche Spezialfälle.
-  - sudoers gehört in visudo und braucht eine überprüfbare Begrenzung.
+  - Die umask entfernt Rechte bei der Erzeugung; eine Default-ACL ersetzt sie.
+  - Setgid vererbt die Gruppe, das Sticky-Bit schützt fremde Einträge, die ACL-Maske begrenzt alle Einträge der Gruppenklasse.
+  - Capabilities geben einem Prozess einzelne Root-Rechte, am engsten über `AmbientCapabilities=` in der Unit.
+  - sudoers gehört in `visudo`, Drop-ins heißen ohne Punkt, Befehle stehen mit vollem Pfad und genauen Argumenten.
   - Prüfe mit der Identität des betroffenen Dienstes.
 exercises:
   - id: verzeichnis-x
@@ -170,6 +377,68 @@ exercises:
     resources:
       - title: path_resolution(7)
         url: https://man7.org/linux/man-pages/man7/path_resolution.7.html
+  - id: sticky-tmp
+    type: choice
+    title: Eine fremde Datei in /tmp
+    prompt: |
+      `/tmp` hat den Modus 1777. bob legt darin `/tmp/bericht.txt` mit Modus 666 an. Was kann `ops` auf Debian 12 tun? ops ist nicht root und nicht in bobs Gruppe.
+    options:
+      - text: Den Inhalt lesen, etwa mit `cat` oder `cp /tmp/bericht.txt ~/`
+        correct: true
+        why: Die Datei ist für alle lesbar, und `/tmp` erlaubt allen das Durchsuchen. Das Sticky-Bit schränkt das Lesen nicht ein.
+      - text: Die Datei löschen oder umbenennen
+        correct: false
+        why: Das Sticky-Bit erlaubt Löschen und Umbenennen nur dem Besitzer der Datei, dem Besitzer des Verzeichnisses und root. `rm` meldet `Operation not permitted`.
+      - text: Mit `echo neu >> /tmp/bericht.txt` etwas anhängen
+        correct: false
+        why: Trotz Modus 666 kommt `Permission denied`. Debian setzt `fs.protected_regular = 2`, und der Kernel verweigert dann das Öffnen fremder Dateien mit `O_CREAT` in Sticky-Verzeichnissen, die alle beschreiben dürfen. `>>` öffnet mit `O_CREAT`.
+      - text: Eine eigene Datei `/tmp/ops-notiz.txt` anlegen
+        correct: true
+        why: Alle dürfen in `/tmp` schreiben, also neue Einträge anlegen. Das Sticky-Bit betrifft nur fremde Einträge.
+    explanation: |
+      Das Sticky-Bit (`t` an der Stelle des x für andere) schützt Namen, nicht Inhalte: Wer in einem gemeinsam beschreibbaren Verzeichnis eine Datei anlegt, kann sicher sein, dass niemand anders sie löscht oder umbenennt. Lesen und, je nach Modus, Schreiben regeln weiter die Rechte der Datei. Debian ergänzt mit `fs.protected_regular` eine Schutzregel gegen vorbereitete Dateien in `/tmp`, die auch das Öffnen mit `O_CREAT` betrifft.
+    resources:
+      - title: inode(7) – The file type and mode
+        url: https://man7.org/linux/man-pages/man7/inode.7.html
+      - title: Kernel · protected_regular
+        url: https://docs.kernel.org/admin-guide/sysctl/fs.html#protected-regular
+  - id: acl-lesen
+    type: choice
+    title: Was die Maske erlaubt
+    prompt: |
+      `getfacl` zeigt diese ACL einer Datei auf ext4. bob ist weder Besitzer noch Mitglied von `developers` oder `support`. Welche Aussagen stimmen?
+    lang: text
+    code: |
+      # file: srv/team/budget.ods
+      # owner: alice
+      # group: developers
+      user::rw-
+      user:bob:rwx            #effective:r--
+      group::rw-              #effective:r--
+      group:support:r--
+      mask::r--
+      other::---
+    options:
+      - text: bob kann die Datei lesen, aber nicht ändern.
+        correct: true
+        why: Der Eintrag für bob gehört zur Gruppenklasse und wird durch die Maske `r--` begrenzt. `#effective` zeigt das Ergebnis.
+      - text: Mitglieder von `developers` können die Datei ändern.
+        correct: false
+        why: Auch der Eintrag der besitzenden Gruppe wird durch die Maske begrenzt. Effektiv bleibt `r--`.
+      - text: alice kann die Datei ändern.
+        correct: true
+        why: Der Eintrag `user::` des Besitzers gehört nicht zur Gruppenklasse, die Maske gilt für ihn nicht.
+      - text: "`ls -l` zeigt in den Gruppenbits `rw-`."
+        correct: false
+        why: Bei einer Datei mit erweiterter ACL zeigt `ls -l` dort die Maske, also `-rw-r-----+`.
+      - text: Nach `chmod g+w budget.ods` kann bob schreiben.
+        correct: true
+        why: Bei einer erweiterten ACL ändert `chmod` an den Gruppenbits die Maske. Sie wird `rw-`, und bobs Eintrag wirkt dann als `rw-`.
+    explanation: |
+      Die Maske ist die Obergrenze für alle Einträge der Gruppenklasse: benannte Benutzer, die besitzende Gruppe und benannte Gruppen. Für den Besitzer und für `other` gilt sie nicht. `ls -l` und `chmod` arbeiten bei einer erweiterten ACL in den Gruppenbits mit der Maske, nicht mit `group::`. Deshalb stuft ein `chmod 640` alle ACL-Freigaben auf Lesen herunter, und ein `chmod g+w` kann mehr freigeben, als der Name vermuten lässt.
+    resources:
+      - title: acl(5)
+        url: https://man7.org/linux/man-pages/man5/acl.5.html
   - id: modus-ausgabe
     type: output
     title: Ein Modus in Zahlen
@@ -198,6 +467,26 @@ exercises:
     resources:
       - title: umask(2)
         url: https://man7.org/linux/man-pages/man2/umask.2.html
+  - id: setgid-gruppe
+    type: output
+    title: Wem gehört die neue Datei?
+    prompt: |
+      ops ist Mitglied von `developers`, seine primäre Gruppe ist `ops`, die umask ist 022. Was gibt `stat` aus?
+    lang: bash
+    code: |
+      mkdir team
+      chgrp developers team
+      chmod 2770 team
+      touch team/plan.txt
+      stat -c '%A %G' team team/plan.txt
+    expected: |
+      drwxrws--- developers
+      -rw-r--r-- developers
+    explanation: |
+      Das setgid-Bit (die `2` vorne, in `ls` das `s` an der Stelle des Gruppen-x) lässt neue Einträge die Gruppe des Verzeichnisses erben statt der primären Gruppe ihres Erzeugers. Die Rechte der neuen Datei bestimmt es nicht: `touch` fordert 666 an, die umask 022 entfernt das Schreibrecht der Gruppe, übrig bleibt 644. Damit Teammitglieder die Datei ändern können, brauchst du zusätzlich eine passende umask oder eine Default-ACL.
+    resources:
+      - title: inode(7) – The file type and mode
+        url: https://man7.org/linux/man-pages/man7/inode.7.html
   - id: secret-modus
     type: command
     title: Privates Token
@@ -243,6 +532,26 @@ exercises:
       - line: 1
         answers: ["chmod 750 releases"]
     explanation: Gruppenrecht 4 erlaubt das Lesen der Namensliste, aber nicht das Durchsuchen. 5 kombiniert r und x, ohne Schreibrechte zu vergeben.
+  - id: sudoers-editor
+    type: bug
+    title: Die Freigabe ist größer als gedacht
+    prompt: |
+      Das Shop-Team (Gruppe `shop`) soll den Dienst neu starten und neu laden und `/etc/shop/app.conf` als root bearbeiten dürfen, sonst nichts. `sudo visudo -cf shop` meldet `parsed OK`. Im Review öffnet ein Kollege mit `sudo vim /etc/shop/app.conf` die Datei, tippt `:!bash` und hat eine Root-Shell. Finde die Zeile und korrigiere sie so, dass das Team die Datei weiterhin bearbeiten kann.
+    lang: text
+    code: |
+      # /etc/sudoers.d/shop – Rechte für das Shop-Team
+      Cmnd_Alias SHOP_SVC = /usr/bin/systemctl restart shop.service, /usr/bin/systemctl reload shop.service
+      %shop ALL=(root) NOPASSWD: SHOP_SVC
+      %shop ALL=(root) /usr/bin/vim /etc/shop/app.conf
+    lines: [4]
+    fix:
+      - line: 4
+        answers: ["%shop ALL=(root) sudoedit /etc/shop/app.conf", "%shop ALL=(root) NOPASSWD: sudoedit /etc/shop/app.conf", "%shop ALL=sudoedit /etc/shop/app.conf", "%shop ALL=(ALL) sudoedit /etc/shop/app.conf"]
+    explanation: |
+      Ein Editor ist ein Programm, das andere Programme starten kann. Mit `sudo vim` läuft er als root, und `:!bash` startet eine Shell mit denselben Rechten. `sudoedit` (gleichbedeutend mit `sudo -e`) kopiert die Datei in eine temporäre Datei, öffnet sie mit dem Editor des Benutzers unter dessen eigener Identität und schreibt sie danach als root zurück. Dieselbe Falle steckt in jeder Freigabe für Pager, Interpreter oder Programme mit frei wählbarer Konfigurationsdatei.
+    resources:
+      - title: sudoers(5)
+        url: https://www.sudo.ws/docs/man/sudoers.man/
   - id: umask-erklaeren
     type: explain
     title: Die Grenze einer Voreinstellung
@@ -261,6 +570,32 @@ exercises:
     resources:
       - title: umask(2)
         url: https://man7.org/linux/man-pages/man2/umask.2.html
+  - id: dienst-port-80
+    type: explain
+    title: Port 80 ohne root
+    prompt: |
+      Erkläre, was diese Zeilen einer systemd-Unit bewirken, warum der Dienst damit auf Port 80 lauschen kann und warum das enger ist als `setcap cap_net_bind_service=+ep /usr/bin/busybox`.
+    lang: ini
+    code: |
+      [Service]
+      User=web
+      ExecStart=/usr/bin/busybox httpd -f -p 80 -h /srv/www
+      AmbientCapabilities=CAP_NET_BIND_SERVICE
+      CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+      NoNewPrivileges=yes
+    points:
+      - Der Prozess läuft als Benutzer `web`; Ports unter 1024 brauchen `CAP_NET_BIND_SERVICE`, die nur root von Haus aus hat.
+      - "`AmbientCapabilities=` gibt dem Prozess genau diese Capability mit, auch nach dem Wechsel zu `web` und über `execve` hinweg."
+      - "`CapabilityBoundingSet=` begrenzt, welche Capabilities der Prozess und seine Kinder überhaupt jemals bekommen können."
+      - "`NoNewPrivileges=yes` verhindert, dass setuid-Programme oder Datei-Capabilities später mehr Rechte bringen."
+      - "`setcap` auf `/usr/bin/busybox` würde für jeden Aufrufer und jedes Applet gelten, nicht nur für diesen Dienst."
+    explanation: |
+      Ein Webserver auf Port 80 braucht von allen Root-Rechten nur eines: `CAP_NET_BIND_SERVICE`. systemd startet den Dienst als `web` und reicht über `AmbientCapabilities=` genau diese Capability durch; `CapabilityBoundingSet=` schneidet alle anderen weg, und `NoNewPrivileges=yes` schließt den Weg über setuid-Programme. Ein Fehler im Webserver gibt einem Angreifer damit die Rechte von `web` und das Recht, niedrige Ports zu öffnen, mehr nicht. `setcap` am Programm wirkt dagegen für jeden lokalen Benutzer, der es startet, und `getcap` muss man kennen, um die Freigabe überhaupt zu sehen.
+    resources:
+      - title: systemd.exec · AmbientCapabilities=
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#AmbientCapabilities=
+      - title: capabilities(7)
+        url: https://man7.org/linux/man-pages/man7/capabilities.7.html
   - id: dienst-freigabe
     type: practice
     title: Eine Konfiguration für einen Dienst freigeben
@@ -279,3 +614,285 @@ exercises:
       - Lesen wird unter der Dienstidentität erfolgreich und Schreiben erfolglos geprüft.
       - Die Prüfung gibt keinen geheimen Dateiinhalt aus.
     explanation: Die Freigabe richtet sich nach der benötigten Operation und bleibt lesend. `test` prüft den Zugriff ohne sensible Konfiguration in Terminal oder Logs zu kopieren.
+  - id: dienst-permission-denied
+    type: scenario
+    title: Nach dem Deployment bleibt die Shop-API stumm
+    prompt: |
+      Seit dem letzten Deployment läuft `shopapi.service` auf `web01` nicht mehr, `curl http://127.0.0.1:8080/health` bekommt keine Verbindung. Laut Changelog hat sich am Code nichts geändert. Geändert hat sich nur das Deployment-Skript, das ein Kollege „gehärtet“ hat.
+
+      Bring die Shop-API wieder zum Laufen, sodass sie auch den nächsten Neustart übersteht. Randbedingungen:
+
+      - Der Dienst läuft weiter als Systembenutzer `shopapi`, nicht als root.
+      - `/etc/shopapi/shopapi.env` enthält das Datenbankpasswort. Außer root und `shopapi` darf niemand die Datei lesen.
+    setup: |
+      set -e
+      chmod 755 /
+      useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin shopapi
+      # Das „gehärtete“ Deployment lief als root mit umask 077.
+      umask 077
+      mkdir -p /opt/shopapi/bin /etc/shopapi /var/lib/shopapi
+      cat > /opt/shopapi/bin/shopapi <<'EOF'
+      #!/bin/sh
+      # Shop-API (Demo): liest die Konfiguration, legt den Health-Status an und startet den HTTP-Server.
+      set -eu
+      . /etc/shopapi/shopapi.env
+      mkdir -p /var/lib/shopapi/www
+      echo ok > /var/lib/shopapi/www/health
+      exec busybox httpd -f -p "127.0.0.1:$PORT" -h /var/lib/shopapi/www
+      EOF
+      chmod 755 /opt/shopapi/bin/shopapi
+      printf 'PORT=8080\nDB_PASSWORD=Vb7-kR2q-91xT\n' > /etc/shopapi/shopapi.env
+      umask 022
+      cat > /etc/systemd/system/shopapi.service <<'EOF'
+      [Unit]
+      Description=Shop-API
+      After=network.target
+
+      [Service]
+      User=shopapi
+      Group=shopapi
+      ExecStart=/opt/shopapi/bin/shopapi
+
+      [Install]
+      WantedBy=multi-user.target
+      EOF
+      # enable lädt die Unit-Dateien neu (wie daemon-reload) und startet den Dienst.
+      systemctl enable --now shopapi.service 2>/dev/null
+    checks:
+      - name: shopapi startet beim Boot und läuft nach einem Neustart des Dienstes
+        run: systemctl is-enabled shopapi && systemctl restart shopapi && sleep 2 && systemctl is-active shopapi
+      - name: Der Health-Endpunkt antwortet
+        run: curl -fsS --max-time 5 http://127.0.0.1:8080/health
+      - name: Der Dienst läuft als shopapi, nicht als root
+        run: |
+          pgrep -u shopapi -x busybox > /dev/null && exit 0
+          echo "Kein HTTP-Server des Benutzers shopapi gefunden. Laufende busybox-Prozesse:"
+          ps -o user=,args= -C busybox
+          exit 1
+      - name: shopapi.env ist für andere Benutzer nicht lesbar
+        run: |
+          test -s /etc/shopapi/shopapi.env || { echo "/etc/shopapi/shopapi.env fehlt oder ist leer."; exit 1; }
+          runuser -u nobody -- cat /etc/shopapi/shopapi.env > /dev/null 2>&1 || exit 0
+          echo "Der Benutzer nobody kann /etc/shopapi/shopapi.env lesen:"
+          namei -l /etc/shopapi/shopapi.env
+          exit 1
+    solution: |
+      # status=203/EXEC: systemd konnte das Programm gar nicht erst starten.
+      systemctl status shopapi --no-pager
+      # Den Grund meldet der kurzlebige Kindprozess „(shopapi)“. journalctl -u ordnet ihn nicht immer zu,
+      # deshalb die letzten Zeilen des ganzen Journals:
+      journalctl -n 8 --no-pager
+      # (shopapi)[…]: shopapi.service: Failed to execute /opt/shopapi/bin/shopapi: Permission denied
+      namei -l /opt/shopapi/bin/shopapi
+      # /opt/shopapi und bin haben Modus 700, nur root kommt hinein. Programmcode darf jeder lesen.
+      sudo chmod 755 /opt/shopapi /opt/shopapi/bin
+      sudo systemctl restart shopapi; sleep 2
+      journalctl -u shopapi -n 3 --no-pager
+      # /opt/shopapi/bin/shopapi: 4: .: cannot open /etc/shopapi/shopapi.env: Permission denied
+      sudo namei -l /etc/shopapi/shopapi.env
+      # Die Konfiguration bekommt die Gruppe shopapi: Der Dienst darf lesen, andere nicht.
+      sudo chgrp shopapi /etc/shopapi /etc/shopapi/shopapi.env
+      sudo chmod 750 /etc/shopapi
+      sudo chmod 640 /etc/shopapi/shopapi.env
+      sudo -u shopapi test -r /etc/shopapi/shopapi.env && echo "shopapi darf lesen"
+      sudo systemctl restart shopapi; sleep 2
+      journalctl -u shopapi -n 3 --no-pager
+      # mkdir: cannot create directory ‘/var/lib/shopapi’: Permission denied
+      sudo chown shopapi:shopapi /var/lib/shopapi
+      sudo systemctl restart shopapi; sleep 2
+      curl -fsS http://127.0.0.1:8080/health
+    hints:
+      - "`systemctl status shopapi` und `journalctl -u shopapi` zeigen, woran der Start scheitert. Steht dort nur `status=203/EXEC`, lies die letzten Zeilen des ganzen Journals mit `journalctl -n 20`. Welche Datei, welche Operation?"
+      - "`namei -l PFAD` zeigt Besitzer und Modus jeder Komponente, `sudo -u shopapi test -r PFAD` prüft mit der Identität des Dienstes. Nach jeder Reparatur zeigt der nächste Start den nächsten Fehler."
+      - "Das Deployment lief mit `umask 077`: Alles, was es angelegt hat, gehört root und hat Modus 700 oder 600. Code darf jeder lesen, die Konfiguration nur die Gruppe `shopapi`, und das Datenverzeichnis muss dem Dienst gehören."
+    explanation: |
+      Das „gehärtete“ Deployment lief als root mit `umask 077` und hat alles mit Modus 700 oder 600 angelegt. Der Dienst läuft aber als `shopapi` und scheitert dreimal hintereinander: Erst kommt systemd nicht durch `/opt/shopapi` (Status `203/EXEC`), dann darf `shopapi` die Konfiguration nicht lesen, dann nicht in sein Datenverzeichnis schreiben. Jede Ebene braucht eine andere Freigabe. Code darf jeder lesen (755). Geheimnisse liest nur die Dienstgruppe (750 für das Verzeichnis, 640 für die Datei, Besitzer bleibt root, damit der Dienst sie nicht ändern kann). Daten gehören dem Dienst selbst; `StateDirectory=shopapi` in der Unit würde systemd das Verzeichnis gleich mit dem richtigen Besitzer anlegen lassen.
+
+      Die Meldung zum ersten Fehler stammt vom Kindprozess `(shopapi)`, den systemd für den Start abspaltet und der sofort stirbt. journald ordnet Meldungen über die cgroup des Absenders einer Unit zu; ist der Absender schon beendet, fehlt die Zuordnung, und `journalctl -u` zeigt nur `status=203/EXEC`. `journalctl -n 20` ohne Filter zeigt dann den Grund.
+
+      Die Diagnosefolge ist immer dieselbe: Meldung im Journal lesen, mit `namei -l` den ganzen Pfad prüfen, mit `sudo -u DIENST` die konkrete Operation testen, dann die kleinste passende Änderung. `chmod -R 777` hätte alle drei Fehler versteckt und das Datenbankpasswort für jeden lesbar gemacht.
+    resources:
+      - title: namei(1)
+        url: https://man7.org/linux/man-pages/man1/namei.1.html
+      - title: path_resolution(7)
+        url: https://man7.org/linux/man-pages/man7/path_resolution.7.html
+  - id: team-verzeichnis
+    type: scenario
+    title: Das Team kommt sich in die Quere
+    prompt: |
+      Das Team Abrechnung, Gruppe `abrechnung` mit `alice` und `bob`, teilt sich `/srv/abrechnung`. Es gibt drei Beschwerden: Bob kann Alices Rechnungen nicht bearbeiten und umgekehrt. Neue Dateien gehören mal der Gruppe `alice`, mal `bob`. Und Carol aus dem Vertrieb kann alles lesen.
+
+      Richte das Verzeichnis so ein:
+
+      - Alles unter `/srv/abrechnung` gehört der Gruppe `abrechnung`. Alice und Bob können alle vorhandenen Dateien ändern und in allen Verzeichnissen neue anlegen.
+      - Was ein Mitglied neu anlegt, Datei oder Verzeichnis, gehört automatisch der Gruppe `abrechnung` und ist für das andere Mitglied schreibbar. Beide behalten ihre umask 022; Mitgliedschaften und umask änderst du nicht.
+      - Andere Benutzer wie `carol` können in `/srv/abrechnung` nichts auflisten und nichts lesen.
+    setup: |
+      set -e
+      groupadd abrechnung
+      useradd -m -s /bin/bash -G abrechnung alice
+      useradd -m -s /bin/bash -G abrechnung bob
+      useradd -m -s /bin/bash carol
+      # Ein eigenes ext4 für die Abteilung, eingehängt über /etc/fstab
+      truncate -s 16M /var/lib/abrechnung.img
+      mkfs.ext4 -q -L abrechnung /var/lib/abrechnung.img
+      mkdir -p /srv/abrechnung
+      echo '/var/lib/abrechnung.img /srv/abrechnung ext4 loop 0 0' >> /etc/fstab
+      mount /srv/abrechnung
+      cd /srv/abrechnung
+      chgrp abrechnung .
+      chmod 775 .
+      install -d -o alice -g alice -m 755 rechnungen vorlagen
+      printf 'rechnung,kunde,betrag\nR-2026-0912,Bäckerei Kurz,129.90\nR-2026-0913,Café Lindner,48.50\n' > rechnungen/2026-09.csv
+      printf 'Sehr geehrte Damen und Herren,\n' > vorlagen/mahnung.txt
+      printf 'Mahnlauf am 5. Oktober\n' > notizen.txt
+      chown alice:alice rechnungen/2026-09.csv vorlagen/mahnung.txt
+      chown bob:bob notizen.txt
+      chmod 644 rechnungen/2026-09.csv vorlagen/mahnung.txt notizen.txt
+    checks:
+      - name: alice und bob können den Bestand gegenseitig ändern und überall Dateien anlegen
+        run: |
+          ok=1
+          for t in "bob rechnungen/2026-09.csv" "bob vorlagen/mahnung.txt" "alice notizen.txt"; do
+            set -- $t
+            runuser -u "$1" -- test -w "/srv/abrechnung/$2" || { echo "$1 kann /srv/abrechnung/$2 nicht ändern."; ok=0; }
+          done
+          for t in "bob rechnungen" "bob vorlagen" "alice ."; do
+            set -- $t
+            if runuser -u "$1" -- touch "/srv/abrechnung/$2/.pruefung" 2>/dev/null; then rm -f "/srv/abrechnung/$2/.pruefung"
+            else echo "$1 kann in /srv/abrechnung/$2 keine Datei anlegen."; ok=0; fi
+          done
+          [ "$ok" = 1 ]
+      - name: Neue Einträge von alice gehören abrechnung, bob kann sie ändern (umask 022)
+        run: |
+          p=/srv/abrechnung/.pruefung-neu
+          rm -rf "$p"
+          runuser -u alice -- sh -c "umask 022 && mkdir $p && echo alice > $p/neu.txt" 2>/dev/null || { echo "alice kann in /srv/abrechnung kein Verzeichnis mit Datei anlegen."; rm -rf "$p"; exit 1; }
+          ok=1
+          g=$(stat -c %G "$p"); [ "$g" = abrechnung ] || { echo "Ein neues Verzeichnis von alice gehört der Gruppe $g."; ok=0; }
+          g=$(stat -c %G "$p/neu.txt"); [ "$g" = abrechnung ] || { echo "Eine neue Datei von alice gehört der Gruppe $g."; ok=0; }
+          runuser -u bob -- sh -c "umask 022 && echo bob >> $p/neu.txt" 2>/dev/null || { echo "bob kann eine neue Datei von alice nicht ändern ($(stat -c %A "$p/neu.txt"))."; ok=0; }
+          runuser -u bob -- sh -c "umask 022 && touch $p/von-bob.txt" 2>/dev/null || { echo "bob kann in einem neuen Verzeichnis von alice nichts anlegen."; ok=0; }
+          rm -rf "$p"
+          [ "$ok" = 1 ]
+      - name: carol kann in /srv/abrechnung nichts auflisten und nichts lesen
+        run: |
+          ok=1
+          runuser -u carol -- ls /srv/abrechnung > /dev/null 2>&1 && { echo "carol kann /srv/abrechnung auflisten."; ok=0; }
+          for f in notizen.txt rechnungen/2026-09.csv vorlagen/mahnung.txt; do
+            runuser -u carol -- cat "/srv/abrechnung/$f" > /dev/null 2>&1 && { echo "carol kann $f lesen."; ok=0; }
+          done
+          [ "$ok" = 1 ]
+    solution: |
+      # Bestandsaufnahme: falsche Gruppen, kein Gruppen-Schreibrecht, kein setgid, andere dürfen lesen.
+      ls -la /srv/abrechnung /srv/abrechnung/rechnungen
+      # ext4 auf einem Loop-Device: Dieses Dateisystem kann ACLs.
+      findmnt /srv/abrechnung
+      # Bestand: Gruppe abrechnung, die Gruppe darf alles, andere nichts. X setzt x nur bei Verzeichnissen.
+      sudo chgrp -R abrechnung /srv/abrechnung
+      sudo chmod -R g+rwX,o-rwx /srv/abrechnung
+      # setgid an allen Verzeichnissen: Neue Einträge erben die Gruppe abrechnung.
+      sudo find /srv/abrechnung -type d -exec chmod g+s {} +
+      # Default-ACL an allen Verzeichnissen: Neue Einträge bekommen Gruppenschreibrecht, die umask gilt dort nicht.
+      sudo setfacl -R -d -m g::rwx,o::--- /srv/abrechnung
+      getfacl -p /srv/abrechnung
+      # Gegenprobe mit den Identitäten der Beteiligten
+      sudo -u alice sh -c 'umask 022; touch /srv/abrechnung/test-alice.txt'
+      stat -c '%A %U %G %n' /srv/abrechnung/test-alice.txt
+      sudo -u bob sh -c 'echo ok >> /srv/abrechnung/test-alice.txt' && echo "bob darf schreiben"
+      sudo -u carol ls /srv/abrechnung || echo "carol bleibt draußen"
+      sudo rm /srv/abrechnung/test-alice.txt
+    hints:
+      - "Sieh dir Besitzer, Gruppe und Modus an: `ls -la /srv/abrechnung` und die Unterverzeichnisse. Welche Angabe erklärt welche Beschwerde?"
+      - "Das setgid-Bit an einem Verzeichnis lässt neue Einträge dessen Gruppe erben. Die Rechte neuer Dateien bestimmt aber weiter die umask, und 022 nimmt der Gruppe das Schreibrecht."
+      - "`findmnt /srv/abrechnung` zeigt ein ext4, das ACLs kann. Eine Default-ACL wie `setfacl -d -m g::rwx,o::--- VERZEICHNIS` gilt für neue Einträge statt der umask, und zwar an jedem Verzeichnis, das sie trägt."
+    explanation: |
+      Drei Mechanismen lösen drei Teilprobleme. `chgrp -R` und `chmod -R g+rwX,o-rwx` reparieren den Bestand; das große `X` setzt das Suchrecht nur bei Verzeichnissen und bereits ausführbaren Dateien. Das setgid-Bit an jedem Verzeichnis sorgt dafür, dass neue Einträge die Gruppe `abrechnung` erben statt der primären Gruppe ihres Erzeugers, und neue Unterverzeichnisse erben das Bit gleich mit. Die Default-ACL ersetzt beim Anlegen die umask: Neue Dateien bekommen `group::rw-`, neue Verzeichnisse `group::rwx` und selbst wieder die Default-ACL.
+
+      Ohne ACL bliebe nur, die umask von alice und bob auf 002 zu setzen. Das gilt aber für alle ihre Dateien, auch außerhalb des Teamordners. ACLs brauchen ein Dateisystem, das sie speichert: ext4, XFS und Btrfs können das, das Wurzeldateisystem dieser VM (9p) nicht.
+    resources:
+      - title: acl(5) – Object creation and default ACLs
+        url: https://man7.org/linux/man-pages/man5/acl.5.html
+      - title: setfacl(1)
+        url: https://man7.org/linux/man-pages/man1/setfacl.1.html
+  - id: deploy-sudo
+    type: scenario
+    title: Die CI darf den Shop nicht neu starten
+    prompt: |
+      Die CI-Pipeline rollt als Benutzer `deploy` aus und ruft danach `sudo -n systemctl restart shop.service` auf. Das scheitert mit `sudo: a password is required`, das Protokoll liegt in `/home/deploy/ci/letzter-lauf.log`. Ein Kollege hat dafür schon eine Regel nach `/etc/sudoers.d/` gelegt, „aber sudo ignoriert sie“.
+
+      Sorge dafür, dass `deploy` genau diesen Befehl ohne Passwort als root ausführen darf und sonst nichts: kein anderes `systemctl`-Kommando, keine Shell, kein anderes Programm. Danach darf `sudo visudo -c` keinen Fehler melden, und dein eigenes `sudo` muss weiter funktionieren. Prüfe jeden Entwurf mit `sudo visudo -cf DATEI`, bevor er nach `/etc/sudoers.d/` kommt.
+    setup: |
+      set -e
+      useradd -m -s /bin/bash deploy
+      install -d -m 755 /srv/shop
+      echo ok > /srv/shop/health
+      cat > /etc/systemd/system/shop.service <<'EOF'
+      [Unit]
+      Description=Shop (Demo)
+
+      [Service]
+      ExecStart=/usr/bin/busybox httpd -f -p 127.0.0.1:8081 -h /srv/shop
+
+      [Install]
+      WantedBy=multi-user.target
+      EOF
+      systemctl daemon-reload
+      systemctl start shop.service
+      cat > /etc/sudoers.d/deploy.conf <<'EOF'
+      # CI-Deployment: deploy startet den Shop nach dem Ausrollen neu
+      deploy ALL=(root) NOPASSWD: /usr/bin/systemctl
+      EOF
+      chmod 440 /etc/sudoers.d/deploy.conf
+      install -d -o deploy -g deploy /home/deploy/ci
+      cat > /home/deploy/ci/letzter-lauf.log <<'EOF'
+      [deploy] Release 2026-09-30.2 nach /srv/shop kopiert
+      [deploy] sudo -n systemctl restart shop.service
+      sudo: a password is required
+      [deploy] FEHLER: Neustart fehlgeschlagen, das neue Release ist nicht aktiv
+      EOF
+      chown deploy:deploy /home/deploy/ci/letzter-lauf.log
+    checks:
+      - name: deploy startet shop.service ohne Passwort neu
+        run: runuser -u deploy -- sudo -n systemctl restart shop.service
+      - name: deploy darf sonst nichts als root
+        run: |
+          bad=0
+          for c in '/usr/bin/systemctl stop ssh.service' '/usr/bin/systemctl restart ssh.service' '/usr/bin/systemctl edit shop.service' '/usr/bin/systemctl restart shop.service ssh.service' '/usr/bin/systemctl daemon-reload' '/bin/bash' '/usr/bin/id'; do
+            if sudo -l -U deploy $c > /dev/null 2>&1; then echo "deploy darf: sudo $c"; bad=1; fi
+          done
+          exit $bad
+      - name: sudoers ist fehlerfrei, und ops hat weiter sudo
+        run: |
+          out=$(visudo -c 2>&1) || { printf '%s\n' "$out" | grep -v 'parsed OK'; exit 1; }
+          runuser -u ops -- sudo -n true
+    solution: |
+      cat /home/deploy/ci/letzter-lauf.log
+      sudo -l -U deploy
+      # User deploy is not allowed to run sudo on web01. Die Regel wird nicht geladen:
+      ls -l /etc/sudoers.d/
+      sudo grep -n "contain" /etc/sudoers.d/README
+      # Dateien mit Punkt im Namen liest sudo nicht. Die Regel wäre ohnehin zu breit:
+      # /usr/bin/systemctl ohne Argumente erlaubt jedes systemctl-Kommando, auch stop ssh oder edit.
+      printf '%s\n' '# CI-Deployment: deploy darf nur den Shop neu starten' \
+        'deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart shop.service' > ~/deploy.sudoers
+      sudo visudo -cf ~/deploy.sudoers
+      sudo install -m 0440 -o root -g root ~/deploy.sudoers /etc/sudoers.d/deploy
+      sudo rm /etc/sudoers.d/deploy.conf
+      sudo visudo -c
+      sudo -l -U deploy
+      sudo -u deploy sudo -n systemctl restart shop.service && echo "Neustart klappt"
+      sudo -u deploy sudo -n systemctl stop ssh.service || echo "Alles andere bleibt verboten"
+    hints:
+      - "Was darf `deploy` laut sudo? `sudo -l -U deploy` zeigt die Regeln, die sudo tatsächlich geladen hat."
+      - "Vergleiche den Dateinamen in `/etc/sudoers.d/` mit dem, was `/etc/sudoers.d/README` über die Namen sagt. Und lies die Regel selbst: Was erlaubt `/usr/bin/systemctl` ohne Argumente?"
+      - "Schreibe die Regel mit vollem Pfad und genau den Argumenten der CI in eine Datei in deinem Home, prüfe sie mit `sudo visudo -cf` und lege sie mit `sudo install -m 0440 -o root -g root` als `/etc/sudoers.d/deploy` ab."
+    explanation: |
+      `@includedir /etc/sudoers.d` liest nur Dateien, deren Name keinen Punkt enthält und nicht auf `~` endet. So bleiben Sicherungskopien von Editoren und Paketverwaltung außen vor, und `deploy.conf` wurde nie geladen. Die Regel selbst war zu breit: Ein Befehl ohne Argumente erlaubt jeden Aufruf des Programms, also auch `systemctl stop ssh` oder `systemctl edit`, das einen Editor als root startet. Stehen Argumente in der Regel, muss der Aufruf genau passen. Ein Platzhalter wie `restart shop*` wäre wieder zu breit, denn `*` deckt in sudoers auch Leerzeichen und weitere Argumente ab.
+
+      `visudo -cf` prüft einen Entwurf, bevor er wirkt. Das sudo von Debian 12 verwirft bei einem Syntaxfehler den Rest der Zeile und meldet den Fehler bei jedem Aufruf; ältere Versionen verweigern dann jeden Befehl. Ein geprüfter Entwurf mit Besitzer root und Modus 0440 ist deshalb der einzige Weg nach `/etc/sudoers.d/`.
+    resources:
+      - title: sudoers(5)
+        url: https://www.sudo.ws/docs/man/sudoers.man/
+      - title: visudo(8)
+        url: https://www.sudo.ws/docs/man/visudo.man/

@@ -6,7 +6,8 @@ import { join, relative } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { parse as parseYaml } from 'yaml';
 import { createMarkdown, codeBlock, slug } from './markdown.ts';
-import { escape } from '../src/engine/highlight.ts';
+import { escape, languageOf } from '../src/engine/highlight.ts';
+import { vmCommands } from '../src/vm/commands.ts';
 import { shuffledOrder, tokens } from '../src/engine/answers.ts';
 import type {
   Area, AreaSummary, Card, Catalog, Exercise, GlossaryEntry, Level, Module, ModuleSummary, Project, Resource, SqlTable, SqlValue, TopicSummary, TrackSummary,
@@ -327,7 +328,7 @@ function loadModule(areaId: string, moduleId: string, report: Reporter, raw: Raw
   const data = readYaml(report.file, report);
   if (!data) return null;
   const where = `Modul ${moduleId}`;
-  const f = fields(data, where, report, ['id', 'title', 'level', 'minutes', 'summary', 'goals', 'resources', 'lesson', 'exercises']);
+  const f = fields(data, where, report, ['id', 'title', 'level', 'minutes', 'summary', 'goals', 'resources', 'lesson', 'lab', 'exercises']);
   if (data.id !== moduleId) report.error(where, `id "${data.id}" muss dem Dateinamen "${moduleId}" entsprechen`);
   const lessonSource = f.str('lesson');
   const { html: lesson, toc } = md.document(lessonSource);
@@ -335,6 +336,10 @@ function loadModule(areaId: string, moduleId: string, report: Reporter, raw: Raw
   if (words < 1000) report.warn(where, `Lektion ist mit ${words} Wörtern kurz (Richtwert: 1500–3000)`);
   const links = (lessonSource.match(/\]\(https:\/\//g) ?? []).length;
   if (links < 4) report.warn(where, `Lektion verlinkt nur ${links}× auf externe Dokumentation (Richtwert: 6+)`);
+  const lab = data.lab === undefined ? null : trimCode(f.str('lab'));
+  const vm = lessonBlocks(lessonSource).some((block) => block.vm);
+  for (const block of lessonBlocks(lessonSource)) if (block.flags.includes('vm') && !block.vm) report.error(where, `Codeblock ${block.n} ist als "vm" markiert, aber kein bash- oder console-Block`);
+  for (const block of lessonBlocks(lessonSource)) if (block.vm && !vmCommands(block.code, languageOf(block.lang)).trim()) report.error(where, `Codeblock ${block.n} ist als "vm" markiert, enthält aber keinen Befehl (console: Zeilen mit "$ ")`);
   const exercises: Exercise[] = [];
   const seen = new Set<string>();
   f.list<Obj>('exercises', true).forEach((item, i) => {
@@ -358,8 +363,19 @@ function loadModule(areaId: string, moduleId: string, report: Reporter, raw: Raw
   if (noResources > exercises.length / 2) report.warn(where, `${noResources} Übungen ohne Doku-Link (resources)`);
   return {
     id: moduleId, title: f.str('title'), summary: f.str('summary'), level: level(data.level, where, report), minutes: f.num('minutes', 60, 5, 600),
-    goals: f.texts('goals').map((goal) => inline(goal)), lesson, toc, resources: resources(data.resources, where, report), exercises, bear: false,
+    goals: f.texts('goals').map((goal) => inline(goal)), lesson, toc, resources: resources(data.resources, where, report), exercises, lab, vm, bear: false,
   };
+}
+
+// As in CommonMark: backticks or tildes, at least three, closed by a fence of the same character that is at least as
+// long. A four-backtick block can thus show a three-backtick one.
+const FENCE = /^((`|~)\2{2,})(\S+)([^\n]*)\n([\s\S]*?)^\1\2*[ \t]*$/gm;
+/** Fenced code blocks of a lesson in Markdown; `vm` marks shell and console blocks for the lesson's terminal. */
+export function lessonBlocks(lesson: string): { n: number; lang: string; flags: string[]; code: string; vm: boolean }[] {
+  return [...lesson.matchAll(FENCE)].map(([, , , lang, flagText, code], i) => {
+    const flags = flagText.trim().split(/\s+/);
+    return { n: i + 1, lang, flags, code, vm: flags.includes('vm') && ['shell', 'console'].includes(languageOf(lang)) };
+  });
 }
 
 /** The imported Bear course (see content/kotlin/bear/README.md) becomes ten regular modules. */
@@ -387,7 +403,7 @@ function loadBear(areaDir: string, path: string, report: Reporter): { modules: M
       + topics.map((topic: Obj) => `<h2 id="${topic.id}"><a class="anchor" href="#${topic.id}" aria-hidden="true" tabindex="-1">#</a>${escape(topic.title)}</h2>${paragraphs(topic.body)}`).join('');
     return {
       id, title: chapter.title, summary: chapter.description, level: index < 4 ? 1 : index < 8 ? 2 : 3, minutes: 60,
-      goals: [], lesson, toc: topics.map((topic: Obj) => ({ id: topic.id, title: topic.title })), resources: [], bear: true,
+      goals: [], lesson, toc: topics.map((topic: Obj) => ({ id: topic.id, title: topic.title })), resources: [], lab: null, vm: false, bear: true,
       exercises: tasks.map((task: Obj): Exercise => ({
         id: `${id}/${task.id}`, module: id, type: 'gap', lang: 'kotlin', title: task.title, prompt: paragraphs(task.prompt),
         explanation: paragraphs(task.explanation), wiki: { title: task.wiki.title, body: paragraphs(task.wiki.body) }, hints: [],

@@ -118,6 +118,8 @@ goals:                        # 3–6 überprüfbare Lernziele, beginnen mit „
 resources:                    # 2–5 offizielle Quellen, nur https
   - title: The Rust Book · Kapitel 4
     url: https://doc.rust-lang.org/book/ch04-00-understanding-ownership.html
+lab: |                        # optional, nur Linux: bereitet das Terminal der Lektion vor (Abschnitt 6, Codeblöcke)
+  …
 lesson: |
   ## Erste Überschrift
   …Markdown…
@@ -184,11 +186,32 @@ Codeblöcke immer mit Sprache angeben. Unterstützt werden `kotlin`, `rust`, `py
 | ` ```rust ` mit `fn main` | Bekommt einen Link zum Rust Playground. `pnpm verify` kompiliert ihn. |
 | ` ```rust nocheck ` | Absichtlich nicht kompilierender Code (etwa um einen Borrow-Checker-Fehler zu zeigen). Kein Playground-Link, keine Prüfung. |
 | ` ```console ` | Terminal-Sitzung: Zeilen mit `$ ` oder `# ` am Anfang sind Befehle, der Rest ist Ausgabe. |
+| ` ```console vm `, ` ```bash vm ` | Läuft unverändert im Linux der Lektion (siehe unten). Der Block bekommt „Im Terminal“: Ein Klick öffnet unten im Fenster ein echtes Debian und tippt die Befehle ein. Bei `console` sind nur die `$ `-Zeilen Befehle. `pnpm vm:verify` führt jeden Block aus; ` vm fails ` erwartet einen Exit-Code ungleich 0. |
 | ` ```yaml title=docker-compose.yml ` | Eigene Beschriftung statt Sprachname (Unterstriche werden zu Leerzeichen). |
 
 SQL läuft im Browser mit **SQLite 3.39** (die Version in Pyodide), nicht mit der neueren SQLite auf dem Rechner. Fensterfunktionen, `RIGHT`/`FULL JOIN`, `IS DISTINCT FROM`, JSON-Funktionen und Mathefunktionen (`sqrt`, `ln`, `floor`) gibt es; `string_agg`, `concat`, `median` und `percentile` nicht. `pnpm verify` prüft SQL deshalb mit genau dieser Version.
 
 Python-Blöcke mit `run` laufen mit denselben Einschränkungen wie `code`-Übungen (siehe dort): frisches Verzeichnis, kein Netzwerk, keine Threads oder Prozesse, kein `input()`, kein `asyncio.run()` – `await` auf oberster Ebene funktioniert aber. Blöcke, die Threads oder Netzwerk zeigen, deshalb **ohne** `run` schreiben. Rust-Blöcke, die Crates wie `serde` oder `tokio` benutzen, werden nicht kompiliert; sie bekommen trotzdem einen Playground-Link, weil der Playground die beliebtesten Crates mitbringt.
+
+#### Linux im Browser: `vm`-Blöcke und `lab`
+
+Lektionen mit mindestens einem `vm`-Block oder einem `lab` bekommen ein Linux-Terminal: dieselbe VM wie bei den `scenario`-Übungen (Debian 12, Benutzer `ops`, siehe dort). Es öffnet sich erst auf Klick, über „Im Terminal“ an einem Block oder „Linux-Terminal öffnen“ im Kopf der Lektion, und endet mit der Lektion.
+
+````yaml
+lab: |                         # optional, vor lesson: bash als root, bereitet die VM für die Beispiele vor
+  set -e
+  install -d -o ops -g ops /home/ops/logs
+  printf '%s\n' '10.0.0.7 GET /health 200' … > /home/ops/logs/access.log
+lesson: |
+  ```console vm
+  $ grep -c ' 500 ' ~/logs/access.log
+  3
+  ```
+````
+
+- Markiere nur Befehle, die in der VM wirklich laufen und nicht auf Eingaben warten: kein `less`, `top`, `vim`, `ssh` mit Passwortabfrage, kein `exit` (es schließt die Shell des Lernenden). Die gezeigte Ausgabe soll die sein, die Debian 12 in der VM ausgibt (gekürzt mit `…` ist in Ordnung). `pnpm vm:run` zeigt sie dir.
+- `lab` läuft nach jedem Start und nach „Zurücksetzen“, danach meldet sich `ops` neu an, und erst dann erscheint der Prompt. Lege dort die Dateien, Benutzer und Units an, mit denen die Beispiele arbeiten. Halte es kurz.
+- `pnpm vm:verify` führt nach `lab` alle `vm`-Blöcke der Lektion der Reihe nach als `ops` in einer Login-Shell aus, ohne Terminal. Dateien bleiben von Block zu Block erhalten, Shell-Variablen und das aktuelle Verzeichnis nicht. Jeder Block muss mit 0 enden (bei `console` zählt der letzte Befehl), Blöcke mit `fails` mit einem anderen Wert.
 
 Tabellen (GFM) sind erlaubt und im Spickzettel ausdrücklich erwünscht.
 
@@ -461,25 +484,34 @@ Laufzeitumgebung (Browser und `pnpm verify` identisch, siehe `src/python/harness
 
 Die Übung startet ein echtes Debian 12 (i386, systemd 252) in [v86](https://github.com/copy/v86), einem x86-Emulator in WebAssembly. Der Lernende arbeitet frei im Terminal und meldet mit „Prüfen“, dass er fertig ist. Bewertet wird der reparierte Zustand, nicht der Weg dorthin.
 
-- **Ablauf:** „Linux starten“ lädt einmalig den Snapshot (rund 17 MB) und stellt ihn wieder her. Danach stellt der Steuerkanal die Uhr auf jetzt und führt `setup` aus, erst dann erscheint der Prompt. „Neu starten“ stellt den Snapshot wieder her und führt `setup` erneut aus. Die Kopfzeile zählt die Befehle; die Zahl fließt nicht in die Bewertung ein.
-- **Umgebung:** Hostname `web01`, angemeldet als `ops` mit `sudo` ohne Passwort, Mitglied von `adm` und `systemd-journal` (Journal ohne sudo), Zeitzone Europe/Berlin. Vorhanden sind systemd mit journald und dbus, `curl`, `busybox` (zum Beispiel `busybox httpd` als kleiner Webserver), `less`, `nano`, `vim.tiny`, `procps`, `psmisc`, `lsof` und `file`. Kein Netzwerk außer `lo`, kein Python, keine man-Pages. Die Paketliste steht in `tooling/vm/Dockerfile`.
-- **`setup`** läuft als root im frischen Snapshot. Beginne mit `set -e`, damit ein Fehler im Aufbau auffällt, statt ein halb kaputtes Szenario zu liefern. Neue oder geänderte Units brauchen `systemctl daemon-reload`. Halte `setup` kurz: Der Lernende wartet darauf, und unter Emulation dauert schon `daemon-reload` einige Sekunden.
-- **`checks`** laufen als root nacheinander, alle, auch nach einem Fehlschlag. Die Ausgabe einer gescheiterten Prüfung sieht der Lernende, die Befehle erst in der Lösung. Prüfe das Ergebnis, nicht einen bestimmten Lösungsweg: `curl` auf den Endpunkt statt `grep` in der Unit-Datei. Für „übersteht den Boot“ reichen `systemctl is-enabled` und `systemctl restart`, denn ein von Hand gestarteter Prozess besteht das nicht.
-- **`solution`** erscheint unter „Lösung zeigen“. `pnpm vm:verify` führt sie als `ops` in einer Login-Shell aus, also genau so, wie sie dasteht.
-- **Prüfung:** `pnpm vm:verify [bereich]` stellt für jedes Szenario den Snapshot unter Node wieder her. Nach `setup` muss mindestens eine Prüfung scheitern, nach `setup` und `solution` müssen alle bestehen. `pnpm verify` prüft Szenarien nicht.
+- **Ablauf:** „Linux starten“ lädt einmalig den Snapshot (rund 32 MB) und stellt ihn wieder her. Danach stellt der Steuerkanal die Uhr auf jetzt und führt `setup` aus. Anschließend meldet sich `ops` auf dem Terminal neu an, damit die Shell Gruppen, Startdateien und `/etc/environment` aus `setup` kennt; erst dann erscheint der Prompt. „Zurücksetzen“ stellt den Snapshot wieder her und führt `setup` erneut aus. Die Kopfzeile zählt die Befehle; die Zahl fließt nicht in die Bewertung ein.
+- **Umgebung:** Hostname `web01`, angemeldet als `ops` mit `sudo` ohne Passwort, Mitglied von `adm` und `systemd-journal` (Journal ohne sudo), Zeitzone Europe/Berlin, Ausgaben auf Englisch. root hat kein Passwort. Ein emulierter Prozessor, rund 220 MB RAM, kein Swap. Unter Emulation ist alles 10- bis 50-mal langsamer als auf echter Hardware.
+- **Dienste:** systemd 252 mit journald (persistent, `journalctl -b -1` nach einem Neustart), udev, logind, dbus, polkit, `ssh` (sshd auf Port 22) und `cron`. `nginx` ist installiert, aber nicht aktiviert. `lp-agent` (Steuerkanal auf ttyS1) und das Autologin auf ttyS0 gehören der Plattform: Szenarien ändern sie nicht.
+- **Werkzeuge:** coreutils, util-linux (`lsblk`, `findmnt`, `losetup`, `fdisk`), e2fsprogs, `lvm2`, `cryptsetup`, `acl`, `setcap`/`capsh`, `curl`, `dig`/`host`, `dnsmasq` (ohne Dienst-Unit), `ip`, `ss`, `ping`, `nc`, `tcpdump`, OpenSSH, `rsync`, `busybox` (zum Beispiel `busybox httpd`), procps, `sysstat` (`iostat`, `pidstat`, `mpstat`), `htop`, psmisc, `lsof`, `strace`, `file`, `tree`, `less`, `nano`, `vim.tiny`, `man` mit Handbuchseiten, `desktop-file-validate`, `pkexec`, `lspci`, initramfs-tools, GRUB 2.06, dpkg und apt (nur lokale `.deb`-Dateien). Nicht vorhanden: Python, ein Compiler, Docker, git, systemd-resolved, NetworkManager, nftables. Die Paketliste steht in `tooling/vm/Dockerfile`.
+- **Netzwerk:** nur `lo`. Das ganze Netz 127.0.0.0/8 zeigt darauf, damit lassen sich „fremde“ Server nachstellen, etwa ein DNS-Server mit `dnsmasq --listen-address=127.0.10.53 --bind-interfaces`.
+- **Platten und Dateisysteme:** Das Wurzeldateisystem kommt per 9p aus dem Emulator (`host9p`). Es kennt keine erweiterten Attribute: ACLs, Datei-Capabilities und `chattr` gehen dort nicht. Lege dafür in `setup` ein ext4 auf einem Loop-Device oder ein tmpfs an und hänge es ein. `/boot` liegt auf `/dev/sda1` (ext4, Label `boot`) der 64-MB-Platte `/dev/sda`, GRUB steht im MBR. Loop-Devices, Device Mapper, LVM und LUKS funktionieren.
+- **Neustart:** `sudo reboot` startet die VM wirklich neu, über GRUB (Menü im Terminal, 5 Sekunden, `e` bearbeitet einen Eintrag, `Strg`+`X` bootet). Nach rund 40 Sekunden ist der Prompt zurück. Alles auf der Platte und im Wurzeldateisystem bleibt erhalten, Mounts, Loop-Devices und Prozesse aus `setup` nicht; `setup` läuft danach nicht erneut. Im Rescue- oder Emergency-Modus genügt Enter an der Passwortabfrage. Dort und während des Starts antwortet der Steuerkanal nicht; „Prüfen“ sagt das dem Lernenden.
+- **`setup`** läuft als root im frischen Snapshot. Beginne mit `set -e`, damit ein Fehler im Aufbau auffällt, statt ein halb kaputtes Szenario zu liefern. Neue oder geänderte Units brauchen `systemctl daemon-reload`. Halte `setup` kurz: Der Lernende wartet darauf, und unter Emulation dauert schon `daemon-reload` rund vier Sekunden, `update-grub` drei, `update-initramfs -u` über 40.
+- **`checks`** laufen als root nacheinander, alle, auch nach einem Fehlschlag. Die Ausgabe einer gescheiterten Prüfung sieht der Lernende, die Befehle erst in der Lösung. Prüfe das Ergebnis, nicht einen bestimmten Lösungsweg: `curl` auf den Endpunkt statt `grep` in der Unit-Datei. Eine Prüfung kann nicht neu starten. Für „übersteht den Boot“ reichen `systemctl is-enabled` und `systemctl restart`, denn ein von Hand gestarteter Prozess besteht das nicht; für Mounts `findmnt --verify`, `systemctl daemon-reload` und der Start der einzelnen Mount-Unit (`systemctl start -- "$(systemd-escape -p --suffix=mount /srv/data)"`). Nie `local-fs.target` starten: Scheitert dabei ein Pflicht-Mount, schaltet `OnFailure=` die VM in den Emergency-Modus, und der Steuerkanal endet.
+- **`solution`** erscheint unter „Lösung zeigen“. `pnpm vm:verify` führt sie als `ops` in einer Login-Shell ohne Terminal aus, also genau so, wie sie dasteht. Editoren und Rückfragen gehen dort nicht: Schreibe Dateien mit `tee`, `sed -i` oder `printf`. `systemctl` und `journalctl` öffnen im Terminal einen Pager, sobald die Ausgabe nicht auf den Bildschirm passt; in Lösungen deshalb `--no-pager`.
+- **Fallen:** `bash -i` ohne Terminal (etwa in `checks`) bricht mit „Hangup“ ab, prüfe Startdateien mit `runuser -l` oder `su - … -c`. `ssh localhost` kostet unter Emulation rund fünf Sekunden. Nach `systemctl reload ssh` ist Port 22 kurz zu, warte mit `nc -z`.
+- **Prüfung:** `pnpm vm:verify [bereich | bereich/modul]` stellt für jedes Szenario den Snapshot unter Node wieder her. Nach `setup` muss mindestens eine Prüfung scheitern, nach `setup` und `solution` müssen alle bestehen. Mehrere VMs laufen parallel (`--jobs N`). `pnpm verify` prüft Szenarien nicht.
+- **Ausprobieren:** `pnpm vm:run skript.sh` führt Skripte in einer frischen VM aus und zeigt Exit-Code, Dauer und Ausgabe; `-e 'befehle'` statt einer Datei, `--as ops` führt die folgenden Skripte als Lernender aus (`--as root` schaltet zurück), `--reboot` zwischen zwei Skripten startet neu, `--tty` zeigt die Konsole mit GRUB und Bootmeldungen.
 - **Firmennetz:** Die VM hat kein Netzwerk (kein Relay, keine Netzwerktreiber im Image). Alle Dateien kommen von der eigenen Domain, nichts lädt vor „Linux starten“, und nichts landet im Precache. Lädt der Snapshot nicht, etwa weil ein Proxy große Downloads sperrt, meldet die Übung das, und der Rest der Seite läuft weiter. In einem Hintergrund-Tab pausiert die VM.
 - **Offline:** Der Service Worker legt den Snapshot und jede Datei, die die VM liest, beim ersten Gebrauch ab. Offline funktioniert, was die VM schon einmal gelesen hat.
 
 #### Das Image
 
 ```sh
-pnpm vm:build      # Docker baut Debian, v86 bootet es unter Node und speichert den Zustand (2–3 Minuten)
-pnpm vm:verify     # alle Szenarien gegen das Image prüfen
+pnpm vm:build      # Docker baut Debian und die Bootplatte, v86 bootet zweimal unter Node und speichert den Zustand (6–8 Minuten)
+pnpm vm:verify     # alle Szenarien und vm-Blöcke gegen das Image prüfen
 ```
 
-`pnpm vm:build` braucht Docker mit buildx, `python3` (3.14 oder das Modul `zstandard`) und `zstd`. Das Ergebnis liegt in `vendor/vm/debian-12/` und wird committet wie `vendor/pyodide`. Es besteht aus `state.bin.zst` (Snapshot samt Dateitabelle), `files/` (eine zstd-Datei je Datei im System, benannt nach ihrem Hash), dem BIOS und `manifest.json`. Das Vite-Plugin `vm()` kopiert es zusammen mit v86 nach `public/vm/`.
+`pnpm vm:build` braucht Docker mit buildx, `python3` (3.14 oder das Modul `zstandard`) und `zstd`. Das Dockerfile hat zwei Ergebnisse: das Wurzeldateisystem und eine 64-MB-Bootplatte mit GRUB im MBR und `/boot` auf der ersten Partition. Die VM bootet von der Platte, GRUB lädt Kernel und initramfs, und das initramfs hängt das Wurzeldateisystem per 9p ein. Beim ersten Start ersetzt `update-grub` die von Hand geschriebene `grub.cfg` (`tooling/vm/disk/grub.cfg`), ein zweiter Start beweist, dass die erzeugte bootet. Weil 9p auf keinem Blockgerät liegt, beantwortet ein kleiner Wrapper um `grub-probe` die Frage nach dem Gerät von `/` mit `host9p`. Die Kernelzeile steht in `tooling/vm/rootfs/etc/default/grub`.
 
-Szenarien brauchen keinen Neubau, solange ihnen das Image reicht. Neu bauen musst du nach Änderungen an `tooling/vm/` (Pakete, Steuerkanal, Benutzer) und nach einem v86-Update, denn der Snapshot passt nur zu der v86-Version, mit der er entstand. Speicher, Kernel-Parameter und serielle Schnittstellen stehen in `src/vm/config.ts` und gelten für Build und Browser gleichermaßen.
+Das Ergebnis liegt in `vendor/vm/debian-12/` und wird committet wie `vendor/pyodide`. Es besteht aus `state.bin.zst` (Snapshot samt Dateitabelle und Inhalt der Bootplatte), `files/` (eine zstd-Datei je Datei im Wurzeldateisystem, benannt nach ihrem Hash), dem BIOS und `manifest.json`. Das Vite-Plugin `vm()` kopiert es zusammen mit v86 nach `public/vm/`.
+
+Szenarien brauchen keinen Neubau, solange ihnen das Image reicht. Neu bauen musst du nach Änderungen an `tooling/vm/` (Pakete, Steuerkanal, Benutzer, GRUB) und nach einem v86-Update, denn der Snapshot passt nur zu der v86-Version, mit der er entstand. v86 läuft mit einem kleinen Patch (`patches/v86.patch`, über `pnpm patch` eingebunden): Symlinks, die erst in der VM entstehen, bekommen auf 9p die Rechte `lrwxrwxrwx` und die richtige Größe. Ohne ihn verliert `cpio` sie, und `update-initramfs` baut ein initramfs, das nicht bootet. Prüfe nach einem v86-Update, ob der Patch noch nötig ist und noch passt. Speicher, Plattengröße und serielle Schnittstellen stehen in `src/vm/config.ts` und gelten für Build und Browser gleichermaßen.
 
 ### `bug` – Fehler finden und beheben
 
@@ -640,7 +672,8 @@ Normales Markdown mit `##`-Abschnitten. Der **Spickzettel** ist dicht: Tabellen,
 pnpm content:check [bereich]   # Struktur, Pflichtfelder, IDs, Lücken, Richtwerte (Warnungen)
 pnpm verify [bereich]          # führt Python aus, kompiliert Rust, vergleicht Ausgaben
                                # beide mit --allow-missing: fehlende Moduldateien nur als Warnung
-pnpm vm:verify [bereich]       # Linux-Szenarien in der echten VM (siehe scenario)
+pnpm vm:verify [bereich]       # Linux-Szenarien und vm-Blöcke in der echten VM (siehe scenario)
+pnpm vm:run skript.sh          # ein Skript in einer frischen VM ausführen (zum Ausprobieren)
 pnpm test                      # Unit-Tests inkl. Bear-Rekonstruktion und Prüflogik
 pnpm test:e2e                  # Browser-Tests (Playwright)
 pnpm build                     # TypeScript + Produktionsbuild
@@ -654,7 +687,7 @@ Checkliste vor dem Commit:
 
 - [ ] `content:check` ohne Fehler, Warnungen bewusst akzeptiert
 - [ ] `verify` ohne Fehler
-- [ ] Bei Linux-Szenarien: `vm:verify` ohne Fehler
+- [ ] Bei Linux-Szenarien und `vm`-Blöcken: `vm:verify` ohne Fehler
 - [ ] Jede Übung ist eindeutig lösbar; alternative richtige Antworten sind in `accept`/`answers`/`alternatives`
 - [ ] Jede Erklärung liefert das *Warum*
 - [ ] Links zeigen auf offizielle Dokumentation und funktionieren

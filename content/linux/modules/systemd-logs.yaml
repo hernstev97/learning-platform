@@ -1,7 +1,7 @@
 id: systemd-logs
 title: systemd, Dienste & Logs
 level: 2
-minutes: 160
+minutes: 210
 summary: Vom Bootvorgang bis zum eigenen Dienst – wie du mit systemd Programme zuverlässig betreibst, mit Timern planst und mit journalctl die Ursache eines Fehlers findest.
 goals:
   - Du beschreibst den Bootvorgang von der Firmware bis zu systemd als PID 1.
@@ -9,6 +9,7 @@ goals:
   - Du schreibst eine Service-Unit mit `Type=`, `ExecStart=`, `Restart=`, `User=`, Umgebung und Abhängigkeiten und passt fremde Units per Drop-in an.
   - Du ersetzt Cronjobs durch Timer mit `OnCalendar=` und `Persistent=` und prüfst Zeitangaben mit `systemd-analyze calendar`.
   - Du findest mit `journalctl` gezielt die Meldungen eines Dienstes, eines Boots oder einer Priorität.
+  - Du führst einen gescheiterten Dienst oder einen Timer, der nie läuft, mit `systemctl status`, `systemctl show` und dem Journal auf die Ursache zurück, etwa `203/EXEC` oder ein Startlimit.
 resources:
   - title: systemd.service(5)
     url: https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html
@@ -16,12 +17,101 @@ resources:
     url: https://www.freedesktop.org/software/systemd/man/latest/systemctl.html
   - title: journalctl(1)
     url: https://www.freedesktop.org/software/systemd/man/latest/journalctl.html
+  - title: systemd.exec(5) · Process Exit Codes
+    url: https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#Process%20Exit%20Codes
   - title: ArchWiki · systemd
     url: https://wiki.archlinux.org/title/Systemd
+lab: |
+  set -e
+  # shop: eine Demo-API nach dem Muster der Unit in der Lektion, mit Logzeilen wie eine echte Anwendung
+  useradd --system --home-dir /srv/shop --shell /usr/sbin/nologin shop
+  useradd --system --home-dir /var/lib/postgresql --shell /bin/bash postgres
+  install -d -o shop -g shop /srv/shop/www /srv/shop/bin
+  install -d /etc/shop
+  install -d -o postgres -g postgres /var/backups/shop
+  echo ok > /srv/shop/www/health
+  printf 'SHOP_PORT=8000\nPAYMENT_TOKEN=geheim\n' > /etc/shop/shop.env
+  chmod 600 /etc/shop/shop.env
+  cat > /srv/shop/bin/shop-api <<'EOF'
+  #!/bin/bash
+  # Demo-API: liefert /health aus und schreibt Logzeilen wie eine echte Anwendung
+  echo "Shop API 2.4.0 startet auf 127.0.0.1:$SHOP_PORT"
+  echo "WARN Cache ist kalt, die ersten Anfragen dauern länger"
+  busybox httpd -f -p "127.0.0.1:$SHOP_PORT" -h /srv/shop/www &
+  echo "ERROR Zahlungsdienst nicht erreichbar: connect timeout nach 5000 ms"
+  while sleep 30; do
+    echo "GET /api/products 200 $((RANDOM % 80 + 20)) ms"
+  done
+  EOF
+  chmod 755 /srv/shop/bin/shop-api
+  cat > /etc/systemd/system/shop.service <<'EOF'
+  [Unit]
+  Description=Shop API (Demo)
+  After=network-online.target
+  Wants=network-online.target
+
+  [Service]
+  Type=exec
+  User=shop
+  Group=shop
+  WorkingDirectory=/srv/shop
+  EnvironmentFile=/etc/shop/shop.env
+  ExecStart=/srv/shop/bin/shop-api
+  Restart=on-failure
+  RestartSec=5
+
+  [Install]
+  WantedBy=multi-user.target
+  EOF
+  # db-backup: Timer und Oneshot-Service wie in der Lektion, mit einem Demo-Skript statt pg_dump
+  cat > /usr/local/bin/db-backup.sh <<'EOF'
+  #!/bin/bash
+  # Demo statt pg_dump: schreibt eine kleine Sicherungsdatei
+  set -eu
+  ziel=/var/backups/shop/shop-$(date +%F).sql
+  echo "-- Sicherung der Datenbank shop, $(date '+%F %T')" > "$ziel"
+  echo "Backup geschrieben: $ziel ($(stat -c %s "$ziel") Bytes)"
+  EOF
+  chmod 755 /usr/local/bin/db-backup.sh
+  cat > /etc/systemd/system/db-backup.service <<'EOF'
+  [Unit]
+  Description=PostgreSQL-Backup der Shop-Datenbank
+
+  [Service]
+  Type=oneshot
+  User=postgres
+  ExecStart=/usr/local/bin/db-backup.sh
+  EOF
+  cat > /etc/systemd/system/db-backup.timer <<'EOF'
+  [Unit]
+  Description=Tägliches Datenbank-Backup um 03:00
+
+  [Timer]
+  OnCalendar=*-*-* 03:00:00
+  Persistent=true
+  RandomizedDelaySec=10min
+
+  [Install]
+  WantedBy=timers.target
+  EOF
+  # invoice-sync: ein Dienst, dessen Programm bei einem Update verschwunden ist
+  cat > /etc/systemd/system/invoice-sync.service <<'EOF'
+  [Unit]
+  Description=Rechnungsabgleich mit der Buchhaltung
+
+  [Service]
+  Type=exec
+  ExecStart=/opt/invoice-sync/bin/invoice-sync --once
+  EOF
+  systemctl daemon-reload
+  systemctl enable --quiet --now shop db-backup.timer
+  systemctl start invoice-sync || true
 lesson: |
   Deine kleine Shop-API läuft auf einem VPS. Gestartet hast du sie mit `nohup gunicorn … &`. Nach einem nächtlichen Kernel-Update startet der Server neu, und die API ist weg. Eine Woche später stürzt sie wegen eines Speicherlecks ab, und niemand merkt es bis zum Morgen. Die Logs liegen in einer `nohup.out`, die inzwischen 4 GB groß ist.
 
   Für genau diese Probleme gibt es **systemd**: Es startet Dienste beim Booten in der richtigen Reihenfolge, startet sie nach Abstürzen neu, sammelt ihre Ausgaben im Journal und stoppt sie geordnet. Auf Debian, Ubuntu, Fedora, Arch und CachyOS ist es gleichermaßen der Standard. Wer im Betrieb oder als Backend-Entwickler arbeitet, braucht die Werkzeuge aus diesem Modul jede Woche.
+
+  Die Beispiele mit „Im Terminal“ laufen in einem Debian 12 mit systemd 252. Dort warten schon drei Demo-Units auf dich: die Shop-API `shop.service`, der Backup-Timer `db-backup.timer` und `invoice-sync.service`, das beim Start scheitert.
 
   ## Vom Einschalten bis PID 1
 
@@ -33,15 +123,28 @@ lesson: |
   4. **initramfs.** Ein Mini-System mit genau den Treibern und Werkzeugen, die nötig sind, um das echte Root-Dateisystem zu finden: Module für NVMe, LUKS-Entschlüsselung, btrfs-Subvolumes. Danach wechselt es per `switch_root` auf das echte Root-Dateisystem.
   5. **systemd als PID 1.** Es liest seine Unit-Dateien, bestimmt das Ziel `default.target` (auf Desktops `graphical.target`, auf Servern `multi-user.target`) und startet alles, was dafür nötig ist – so parallel wie die Abhängigkeiten erlauben.
 
-  ```console
+  ```console vm
   $ systemd-analyze
-  Startup finished in 9.129s (firmware) + 6.028s (loader) + 937ms (kernel) + 2.532s (initrd) + 19.136s (userspace) = 37.764s
-  graphical.target reached after 19.136s in userspace.
+  Startup finished in 9.287s (kernel) + 16.614s (userspace) = 25.901s
+  graphical.target reached after 16.346s in userspace.
   $ systemd-analyze blame | head -3
-  $ systemd-analyze critical-chain
+  3.049s e2scrub_reap.service
+  3.030s systemd-udev-trigger.service
+  2.690s systemd-journald.service
+  $ systemd-analyze critical-chain ssh.service
+  The time when unit became active or started is printed after the "@" character.
+  The time the unit took to start is printed after the "+" character.
+
+  ssh.service +2.656s
+  └─basic.target @13.085s
+    └─sockets.target @13.079s
+      └─dbus.socket @13.077s
+        └─sysinit.target @13.053s
+          └─systemd-update-utmp.service @12.870s +178ms
+  …
   ```
 
-  [`systemd-analyze`](https://www.freedesktop.org/software/systemd/man/latest/systemd-analyze.html) zeigt dieselben Etappen mit Zeiten. `blame` listet die langsamsten Units, `critical-chain` die Kette, die den Boot tatsächlich aufgehalten hat. Das Denkmodell für die Fehlersuche: Bleibt der Rechner vor dem Kernel hängen, liegt es an Firmware oder Bootloader; landet er in einer Notfall-Shell der initramfs, findet er sein Root-Dateisystem nicht; bootet er, aber ein Dienst fehlt, ist es ein Fall für `systemctl` und `journalctl`.
+  [`systemd-analyze`](https://www.freedesktop.org/software/systemd/man/latest/systemd-analyze.html) zeigt dieselben Etappen mit Zeiten. `blame` listet die langsamsten Units, `critical-chain` die Kette, die den Boot (oder hier den Start von `ssh.service`) tatsächlich aufgehalten hat: `@` ist der Zeitpunkt nach Beginn des Userspace, `+` die Startdauer der Unit. Auf einem UEFI-Laptop mit systemd-boot beginnt die erste Zeile mit zwei weiteren Etappen, etwa `9.129s (firmware) + 6.028s (loader) + 937ms (kernel) + 2.532s (initrd) + 19.136s (userspace)`. Die VM der Lektion startet per BIOS und GRUB; ohne UEFI-Variablen erfährt systemd nichts über Firmware und Bootloader. Und weil Debians initramfs-tools die initramfs ohne systemd betreibt, zählt deren Zeit hier zum Kernel. Das Denkmodell für die Fehlersuche: Bleibt der Rechner vor dem Kernel hängen, liegt es an Firmware oder Bootloader; landet er in einer Notfall-Shell der initramfs, findet er sein Root-Dateisystem nicht; bootet er, aber ein Dienst fehlt, ist es ein Fall für `systemctl` und `journalctl`.
 
   ## Units und systemctl
 
@@ -75,6 +178,26 @@ lesson: |
 
   Die wichtigste Unterscheidung: **`start` wirkt jetzt, `enable` wirkt beim nächsten Boot.** `enable` liest den Abschnitt `[Install]` der Unit und legt einen symbolischen Link an, etwa `/etc/systemd/system/multi-user.target.wants/nginx.service`. Damit „will“ `multi-user.target` den Dienst, und er startet bei jedem Boot mit. Laufen muss er deshalb noch lange nicht – `enable --now` erledigt beides. Units ohne `[Install]`-Abschnitt sind `static`: Sie werden nur als Abhängigkeit anderer Units gestartet.
 
+  In der VM ist nginx installiert, aber weder aktiviert noch gestartet. So siehst du beide Achsen getrennt:
+
+  ```console vm
+  $ systemctl is-enabled nginx; systemctl is-active nginx
+  disabled
+  inactive
+  $ sudo systemctl start nginx
+  $ systemctl is-enabled nginx; systemctl is-active nginx
+  disabled
+  active
+  $ sudo systemctl enable nginx
+  Synchronizing state of nginx.service with SysV service script with /lib/systemd/systemd-sysv-install.
+  Executing: /lib/systemd/systemd-sysv-install enable nginx
+  Created symlink /etc/systemd/system/multi-user.target.wants/nginx.service → /lib/systemd/system/nginx.service.
+  $ curl -sI http://localhost | head -1
+  HTTP/1.1 200 OK
+  ```
+
+  Die Zeilen über SysV erscheinen auf Debian, weil nginx zusätzlich ein altes Init-Skript unter `/etc/init.d` mitbringt; `enable` hält beide Welten synchron. Entscheidend ist die letzte Zeile von `enable`: der Symlink in `multi-user.target.wants`.
+
   Die zweite Unterscheidung: `reload` bittet den **Dienst**, seine Konfiguration neu zu lesen (bei nginx per `SIGHUP`, wie im Modul zu Prozessen), und funktioniert nur, wenn die Unit `ExecReload=` definiert. `daemon-reload` dagegen lässt **systemd selbst** alle Unit-Dateien neu einlesen. Das brauchst du jedes Mal, nachdem du eine Unit-Datei von Hand geändert hast; sonst arbeitet systemd mit der alten Fassung weiter und meldet in `systemctl status` einen Hinweis, dass sich die Datei auf der Platte geändert hat.
 
   **Fremde Units anpassen.** Willst du an `nginx.service` etwas ändern, kopierst du nicht die ganze Datei, sondern legst einen **Drop-in** an:
@@ -84,6 +207,26 @@ lesson: |
   ```
 
   Das öffnet einen Editor für `/etc/systemd/system/nginx.service.d/override.conf`, führt danach automatisch `daemon-reload` aus und behält alle Einstellungen des Pakets bei, die du nicht überschreibst. Kommt mit dem nächsten Update eine verbesserte Paket-Unit, profitierst du davon. `systemctl edit --full` erzeugt dagegen eine vollständige Kopie unter `/etc`, die künftige Paketänderungen verdeckt ([systemctl · edit](https://www.freedesktop.org/software/systemd/man/latest/systemctl.html#edit%20UNIT%E2%80%A6)).
+
+  In Skripten und Automatisierung legst du den Drop-in ohne Editor an: Verzeichnis `<unit>.d`, eine Datei mit der Endung `.conf`, danach selbst `daemon-reload`. Ab systemd 256 kann `systemctl edit --stdin` das in einem Schritt; Debian 12 hat systemd 252. Für die Demo-Unit `shop.service` verkürzt der Drop-in die Wartezeit vor einem automatischen Neustart:
+
+  ```console vm
+  $ sudo mkdir -p /etc/systemd/system/shop.service.d
+  $ printf '[Service]\nRestartSec=2\n' | sudo tee /etc/systemd/system/shop.service.d/restart.conf
+  [Service]
+  RestartSec=2
+  $ sudo systemctl daemon-reload
+  $ systemctl show -p RestartUSec shop
+  RestartUSec=2s
+  $ systemctl status shop | head -5
+  ● shop.service - Shop API (Demo)
+       Loaded: loaded (/etc/systemd/system/shop.service; enabled; preset: enabled)
+      Drop-In: /etc/systemd/system/shop.service.d
+               └─restart.conf
+       Active: active (running) since Thu 2026-10-01 12:27:20 CEST; 53s ago
+  ```
+
+  [`systemctl show`](https://www.freedesktop.org/software/systemd/man/latest/systemctl.html#show%20PATTERN%E2%80%A6%7CJOB%E2%80%A6) liefert den Wert, den systemd tatsächlich verwendet, nachdem alle Dateien und Drop-ins zusammengeführt sind. Mit `--value` bekommst du nur den Wert, ohne `Name=`: genau richtig für Skripte. `systemctl cat shop` zeigt Originaldatei und Drop-in untereinander.
 
   ## Eine eigene Service-Unit schreiben
 
@@ -132,6 +275,60 @@ lesson: |
 
   **`[Install]`** wird nur von `enable` gelesen: `WantedBy=multi-user.target` heißt „starte mich, wenn das System normal hochfährt“.
 
+  ### Eine laufende Unit lesen
+
+  `shop.service` in der VM folgt diesem Muster, nur startet `ExecStart=` ein kleines Bash-Skript statt Gunicorn. `systemctl status` liest du von oben nach unten: Woher kommt die Unit, und ist sie aktiviert (`Loaded`)? Gibt es Drop-ins? Läuft sie, und seit wann (`Active`)? Welche Prozesse gehören dazu (`CGroup`)? Darunter stehen die letzten Zeilen aus dem Journal.
+
+  ```console vm
+  $ systemctl status shop
+  ● shop.service - Shop API (Demo)
+       Loaded: loaded (/etc/systemd/system/shop.service; enabled; preset: enabled)
+      Drop-In: /etc/systemd/system/shop.service.d
+               └─restart.conf
+       Active: active (running) since Thu 2026-10-01 12:27:20 CEST; 53s ago
+     Main PID: 388 (shop-api)
+        Tasks: 3 (limit: 549)
+       Memory: 952.0K
+          CPU: 110ms
+       CGroup: /system.slice/shop.service
+               ├─388 /bin/bash /srv/shop/bin/shop-api
+               ├─390 busybox httpd -f -p 127.0.0.1:8000 -h /srv/shop/www
+               └─402 sleep 30
+
+  Oct 01 12:27:20 web01 systemd[1]: Starting shop.service - Shop API (Demo)...
+  Oct 01 12:27:20 web01 systemd[1]: Started shop.service - Shop API (Demo).
+  Oct 01 12:27:20 web01 shop-api[388]: Shop API 2.4.0 startet auf 127.0.0.1:8000
+  Oct 01 12:27:20 web01 shop-api[388]: WARN Cache ist kalt, die ersten Anfragen dauern länger
+  Oct 01 12:27:20 web01 shop-api[388]: ERROR Zahlungsdienst nicht erreichbar: connect timeout nach 5000 ms
+  $ systemctl show -p MainPID -p NRestarts -p User -p WorkingDirectory shop
+  MainPID=388
+  NRestarts=0
+  WorkingDirectory=/srv/shop
+  User=shop
+  ```
+
+  `Restart=on-failure` kannst du gefahrlos ausprobieren. [`systemctl kill`](https://www.freedesktop.org/software/systemd/man/latest/systemctl.html#kill%20PATTERN%E2%80%A6) schickt allen Prozessen der Unit ein Signal; `SIGKILL` wirkt für systemd wie ein Absturz, etwa durch den OOM-Killer. Nach `RestartSec=` (dank Drop-in zwei Sekunden) ist der Dienst wieder da, und `NRestarts` zählt mit:
+
+  ```console vm
+  $ sudo systemctl kill --signal=KILL shop
+  $ sleep 4; systemctl show -p NRestarts -p ActiveState shop
+  NRestarts=1
+  ActiveState=active
+  $ journalctl -u shop -n 12 -o cat
+  shop.service: Sent signal SIGKILL to main process 388 (shop-api) on client request.
+  …
+  shop.service: Main process exited, code=killed, status=9/KILL
+  shop.service: Failed with result 'signal'.
+  shop.service: Scheduled restart job, restart counter is at 1.
+  Stopped shop.service - Shop API (Demo).
+  Starting shop.service - Shop API (Demo)...
+  Started shop.service - Shop API (Demo).
+  Shop API 2.4.0 startet auf 127.0.0.1:8000
+  …
+  ```
+
+  Ein `sudo systemctl stop shop` hätte dagegen keinen Neustart ausgelöst: Ein Stopp auf Anweisung ist kein Fehler.
+
   > [!TIP] Units prüfen, bevor du sie aktivierst
   > `systemd-analyze verify /etc/systemd/system/shop.service` meldet Tippfehler in Direktiven und fehlende Programme. Danach: `sudo systemctl daemon-reload`, `sudo systemctl enable --now shop`, `systemctl status shop`.
 
@@ -167,18 +364,44 @@ lesson: |
 
   Aktiviert wird der **Timer**, nicht der Service: `sudo systemctl enable --now db-backup.timer`. `OnCalendar=` hat ein eigenes Format `Wochentag Jahr-Monat-Tag Stunde:Minute:Sekunde`, nicht die fünf Felder von cron ([systemd.time(7) · Calendar Events](https://www.freedesktop.org/software/systemd/man/latest/systemd.time.html#Calendar%20Events)). Ob du es richtig geschrieben hast, prüfst du, bevor du dich darauf verlässt:
 
-  ```console
+  ```console vm fails
   $ systemd-analyze calendar "Mon..Fri 9:00"
     Original form: Mon..Fri 9:00
   Normalized form: Mon..Fri *-*-* 09:00:00
-      Next elapse: Tue 2026-09-29 09:00:00 CEST
-         From now: 14h left
-  $ systemctl list-timers
-  NEXT                         LEFT LAST                         PASSED UNIT             ACTIVATES
-  Tue 2026-09-29 03:04:12 CEST   8h Mon 2026-09-28 03:02:51 CEST    15h db-backup.timer  db-backup.service
+      Next elapse: Fri 2026-10-02 09:00:00 CEST
+         (in UTC): Fri 2026-10-02 07:00:00 UTC
+         From now: 20h left
+  $ systemd-analyze calendar "Mo..Fr 9:00"
+  Failed to parse calendar specification 'Mo..Fr 9:00': Invalid argument
   ```
 
-  Warum Timer statt cron? `Persistent=true` holt einen verpassten Lauf nach, wenn der Rechner zur geplanten Zeit aus war – für Laptops und Desktops entscheidend. Jeder Lauf landet mit Exit-Status im Journal (`journalctl -u db-backup`), statt in einer Mail an root, die niemand liest. Ein laufendes Backup startet nicht doppelt, und der Service lässt sich zum Testen jederzeit per `systemctl start db-backup.service` von Hand auslösen. `RandomizedDelaySec=` verteilt Last, wenn viele Server zur selben Minute starten würden.
+  systemd versteht nur englische Wochentage. `Mon-Fri` akzeptiert es ebenfalls und schreibt es als `Mon..Fri`. In der VM sind die Units aus den beiden Kästen oben schon angelegt, und der Timer ist aktiv. `systemctl list-timers` zeigt alle aktiven Timer mit nächstem (`NEXT`) und letztem (`LAST`) Lauf; die übrigen gehören zu Debian-Paketen:
+
+  ```console vm
+  $ systemctl list-timers
+  NEXT                         LEFT          LAST                         PASSED       UNIT                         ACTIVATES
+  Thu 2026-10-01 12:30:00 CEST 1min 39s left Thu 2026-10-01 12:27:09 CEST 1min 10s ago sysstat-collect.timer        sysstat-collect.service
+  Thu 2026-10-01 12:41:37 CEST 13min left    -                            -            systemd-tmpfiles-clean.timer systemd-tmpfiles-clean.service
+  Fri 2026-10-02 00:00:00 CEST 11h left      -                            -            dpkg-db-backup.timer         dpkg-db-backup.service
+  Fri 2026-10-02 00:07:00 CEST 11h left      -                            -            sysstat-summary.timer        sysstat-summary.service
+  Fri 2026-10-02 03:06:42 CEST 14h left      -                            -            db-backup.timer              db-backup.service
+
+  5 timers listed.
+  Pass --all to see loaded but inactive timers, too.
+  $ sudo systemctl start db-backup.service
+  $ journalctl -u db-backup -o cat
+  Starting db-backup.service - PostgreSQL-Backup der Shop-Datenbank...
+  Backup geschrieben: /var/backups/shop/shop-2026-10-01.sql (53 Bytes)
+  db-backup.service: Deactivated successfully.
+  Finished db-backup.service - PostgreSQL-Backup der Shop-Datenbank.
+  ```
+
+  `NEXT` für `db-backup.timer` liegt nicht genau auf 03:00, weil `RandomizedDelaySec=10min` den Start zufällig verschiebt. Der Service lässt sich jederzeit von Hand starten; `systemctl start` kehrt bei `Type=oneshot` erst zurück, wenn das Skript fertig ist, und meldet dessen Fehler.
+
+  Warum Timer statt cron? `Persistent=true` holt einen verpassten Lauf nach, wenn der Rechner zur geplanten Zeit aus war; auf Laptops und Desktops kommt das täglich vor. Jeder Lauf landet mit Exit-Status im Journal (`journalctl -u db-backup`), statt in einer Mail an root, die niemand liest. Ein laufendes Backup startet nicht doppelt, und der Service lässt sich zum Testen jederzeit per `systemctl start db-backup.service` von Hand auslösen. `RandomizedDelaySec=` verteilt Last, wenn viele Server zur selben Minute starten würden.
+
+  > [!TIP] Wenn ein Timer nie läuft
+  > `systemctl list-timers --all` zeigt auch inaktive Timer; steht dort `-` statt eines Termins, ist der Timer nicht gestartet oder kaputt. `systemctl status name.timer` verrät, welches von beidem: `Loaded: bad-setting` heißt, systemd hat die Datei verworfen, der Grund steht direkt darunter im Journal (`Failed to parse calendar specification …`). `Trigger:` nennt den nächsten Termin, `Triggers:` die Unit, die der Timer startet; das ist ohne `Unit=` ([systemd.timer · Unit=](https://www.freedesktop.org/software/systemd/man/latest/systemd.timer.html#Unit=)) der Service mit demselben Namen. Gibt es den nicht, verweigert der Timer den Start mit `Refusing to start, unit … to trigger not loaded`. Für Skripte liefert `systemctl show -p NextElapseUSecRealtime name.timer` den nächsten Termin.
 
   ### User-Units und Lingering
 
@@ -203,10 +426,116 @@ lesson: |
 
   Die Filter lassen sich kombinieren: `journalctl -u shop -b -p warning --since "10:00"` zeigt Warnungen und Schlimmeres der Shop-API seit zehn Uhr im aktuellen Boot. Die Prioritäten folgen syslog: `emerg` (0), `alert`, `crit`, `err`, `warning`, `notice`, `info`, `debug` (7) ([journalctl · -p](https://www.freedesktop.org/software/systemd/man/latest/journalctl.html#-p)). Achtung: Zeilen, die ein Dienst auf stdout oder stderr schreibt, bekommen standardmäßig die Priorität `info` – ein `-p err` blendet also auch Fehlermeldungen deiner App aus, wenn sie nur als Text `ERROR` enthalten. Dann hilft die Textsuche `journalctl -u shop -g ERROR`.
 
+  Die Demo-API schreibt genau solche Zeilen. Nach dem Absturz-Test oben sieht das so aus:
+
+  ```console vm
+  $ journalctl -u shop -p warning -o cat
+  shop.service: Main process exited, code=killed, status=9/KILL
+  shop.service: Failed with result 'signal'.
+  $ journalctl -u shop -g ERROR -o cat
+  ERROR Zahlungsdienst nicht erreichbar: connect timeout nach 5000 ms
+  ERROR Zahlungsdienst nicht erreichbar: connect timeout nach 5000 ms
+  $ journalctl -u invoice-sync -p warning -o cat
+  invoice-sync.service: Failed at step EXEC spawning /opt/invoice-sync/bin/invoice-sync: No such file or directory
+  invoice-sync.service: Failed with result 'exit-code'.
+  Failed to start invoice-sync.service - Rechnungsabgleich mit der Buchhaltung.
+  ```
+
+  `-p warning` findet nur die Meldungen, die systemd selbst mit Priorität geschrieben hat; die beiden `ERROR`-Zeilen der App (eine je Start) findet erst `-g`. Damit eigene Skripte mit echter Priorität loggen, gibt es [`systemd-cat`](https://www.freedesktop.org/software/systemd/man/latest/systemd-cat.html) und [`logger`](https://man7.org/linux/man-pages/man1/logger.1.html). Ein Dienst kann die Priorität auch selbst setzen, indem er eine Zeile mit `<3>` (für `err`) beginnt ([systemd.exec · SyslogLevelPrefix=](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#SyslogLevelPrefix=)).
+
+  ```console vm
+  $ echo "Nur noch 4 % frei auf /srv" | systemd-cat -t backup -p warning
+  $ logger -t backup -p user.err "Sicherung abgebrochen: Ziel nicht erreichbar"
+  $ journalctl -t backup -p warning -o short-precise
+  Oct 01 12:28:23.007569 web01 backup[510]: Nur noch 4 % frei auf /srv
+  Oct 01 12:28:23.129611 web01 backup[511]: Sicherung abgebrochen: Ziel nicht erreichbar
+  ```
+
+  `-t` filtert nach dem Kennzeichen (`SYSLOG_IDENTIFIER`), `-o short-precise` zeigt Zeitstempel mit Mikrosekunden. Das hilft, wenn du Meldungen aus mehreren Diensten in die richtige Reihenfolge bringen musst.
+
   Zwei Details aus dem Betrieb: `-b -1` funktioniert nur, wenn das Journal **persistent** ist. Mit der Standardeinstellung `Storage=auto` ist das der Fall, sobald das Verzeichnis `/var/log/journal` existiert; sonst liegt das Journal nur im RAM unter `/run/log/journal` und ist nach dem Neustart weg ([journald.conf(5)](https://www.freedesktop.org/software/systemd/man/latest/journald.conf.html)). Und die Größe begrenzt journald selbst (standardmäßig auf einen Anteil des Dateisystems); einmalig aufräumen kannst du mit `sudo journalctl --vacuum-time=2weeks` oder `--vacuum-size=500M`.
+
+  Die VM hat ein persistentes Journal. Es enthält schon zwei Boots: den ersten Start beim Bau des Images und den Start, aus dem das Terminal stammt.
+
+  ```console vm
+  $ journalctl --list-boots
+  IDX BOOT ID                          FIRST ENTRY                  LAST ENTRY
+   -1 2f2dcc15f9964bac9b408e05c5a9afae Thu 2026-10-01 11:49:17 CEST Thu 2026-10-01 11:49:42 CEST
+    0 7e290a9120804839a118202aaed3f761 Thu 2026-10-01 11:50:05 CEST Thu 2026-10-01 12:28:23 CEST
+  $ journalctl -b -1 -n 3
+  Oct 01 11:49:42 web01 systemd-shutdown[1]: Sending SIGTERM to remaining processes...
+  Oct 01 11:49:42 web01 systemd-journald[166]: Received SIGTERM from PID 1 (systemd-shutdow).
+  Oct 01 11:49:42 web01 systemd-journald[166]: Journal stopped
+  $ journalctl --disk-usage
+  Archived and active journals take up 8.0M in the file system.
+  ```
+
+  Die letzten Zeilen eines Boots zeigen, wie er endete: Ein geordnetes Herunterfahren endet wie hier mit `Journal stopped`. Fehlt so ein Ende, ist der Rechner abgestürzt oder hart ausgeschaltet worden.
 
   > [!PRAXIS] Der Weg vom Alarm zur Ursache
   > Ein Dienst ist ausgefallen. Die Reihenfolge, die sich im Betrieb bewährt: `systemctl list-units --failed` (was ist kaputt?), `systemctl status shop` (Exit-Code, letzte Zeilen), `journalctl -u shop -b -e` (springt ans Ende der Meldungen seit dem Boot), bei Bedarf `journalctl -b -p err` für das ganze System. Der Exit-Status in `status` verrät oft schon die Richtung: `status=203/EXEC` heißt, das Programm aus `ExecStart=` ließ sich nicht starten; `status=217/USER`, dass der Benutzer aus `User=` nicht existiert ([systemd.exec · Process Exit Codes](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#Process%20Exit%20Codes)).
+
+  ## Wenn ein Dienst nicht startet: 203/EXEC und Startlimits
+
+  In der VM ist `invoice-sync.service` beim Start gescheitert. Der Weg aus dem Kasten oben, angewandt:
+
+  ```console vm
+  $ systemctl status invoice-sync
+  × invoice-sync.service - Rechnungsabgleich mit der Buchhaltung
+       Loaded: loaded (/etc/systemd/system/invoice-sync.service; static)
+       Active: failed (Result: exit-code) since Thu 2026-10-01 12:27:20 CEST; 1min 4s ago
+     Main PID: 392 (code=exited, status=203/EXEC)
+          CPU: 6ms
+
+  Oct 01 12:27:20 web01 systemd[1]: Starting invoice-sync.service - Rechnungsabgleich mit der Buchhaltung...
+  Oct 01 12:27:20 web01 (ice-sync)[392]: invoice-sync.service: Failed at step EXEC spawning /opt/invoice-sync/bin/invoice-sync: No such file or directory
+  Oct 01 12:27:20 web01 systemd[1]: invoice-sync.service: Main process exited, code=exited, status=203/EXEC
+  Oct 01 12:27:20 web01 systemd[1]: invoice-sync.service: Failed with result 'exit-code'.
+  Oct 01 12:27:20 web01 systemd[1]: Failed to start invoice-sync.service - Rechnungsabgleich mit der Buchhaltung.
+  $ systemctl list-units --failed
+    UNIT                 LOAD   ACTIVE SUB    DESCRIPTION
+  ● invoice-sync.service loaded failed failed Rechnungsabgleich mit der Buchhaltung
+  …
+  1 loaded units listed.
+  ```
+
+  `203/EXEC` bedeutet: systemd hat den Prozess angelegt, aber `execve` auf das Programm aus `ExecStart=` ist gescheitert. Von der Anwendung lief keine einzige Zeile. Die Zeile davor im Journal nennt den Fehlercode des Kernels, und der grenzt die Ursache ein (Meldungen von systemd 252):
+
+  | Journal | Ursache | Prüfen mit |
+  | --- | --- | --- |
+  | `Failed at step EXEC spawning …: No such file or directory`, und `ls` findet die Datei nicht | falscher Pfad, Paket oder venv fehlt | `ls -l`, `systemctl cat` |
+  | `Failed to locate executable …: Permission denied` | Ausführungsrecht fehlt, oder das Dateisystem ist mit `noexec` eingehängt | `ls -l`, `findmnt -T <pfad>` |
+  | `Failed to execute …: No such file or directory`, obwohl die Datei existiert | Der Interpreter aus der `#!`-Zeile fehlt, oft wegen Windows-Zeilenenden: Der Kernel sucht `/bin/sh\r` | `head -n1 <datei> \| od -c`, `file` |
+  | `Neither a valid executable name nor an absolute path` schon beim `daemon-reload` | relativer Pfad wie `./run.sh`; die Unit steht auf `bad-setting` | `systemctl status` |
+
+  Der dritte Fall ist der tückischste, weil die Meldung „Datei nicht gefunden“ sagt, während `ls` sie anzeigt. In der Shell sieht er so aus:
+
+  ```console vm fails
+  $ printf '#!/bin/sh\r\necho hallo\r\n' > crlf.sh; chmod +x crlf.sh
+  $ file crlf.sh
+  crlf.sh: POSIX shell script, ASCII text executable, with CRLF line terminators
+  $ head -n1 crlf.sh | od -c
+  0000000   #   !   /   b   i   n   /   s   h  \r  \n
+  0000013
+  $ ./crlf.sh
+  -bash: ./crlf.sh: cannot execute: required file not found
+  ```
+
+  `sed -i 's/\r$//' crlf.sh` entfernt die Wagenrückläufe am Zeilenende (oder `dos2unix`, wo es installiert ist).
+
+  **Startlimit.** Hat eine Unit `Restart=on-failure` und scheitert jeder Start sofort, startet systemd sie im Abstand von `RestartSec=` neu, bis das Startlimit greift: standardmäßig fünf Starts in zehn Sekunden ([systemd.unit · StartLimitIntervalSec=](https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html#StartLimitIntervalSec=interval)). Danach steht im Journal `Start request repeated too quickly`, und auch ein `systemctl start` von Hand wird abgewiesen, bis das Intervall abgelaufen ist. Nach der Reparatur setzt [`systemctl reset-failed`](https://www.freedesktop.org/software/systemd/man/latest/systemctl.html#reset-failed%20%5BPATTERN%E2%80%A6%5D) den Zähler und den Zustand `failed` zurück:
+
+  ```console vm
+  $ systemctl show -p Result -p ExecMainStatus invoice-sync
+  Result=exit-code
+  ExecMainStatus=203
+  $ sudo systemctl reset-failed invoice-sync
+  $ systemctl list-units --failed
+    UNIT LOAD ACTIVE SUB DESCRIPTION
+  0 loaded units listed.
+  ```
+
+  `reset-failed` repariert nichts. Es räumt nur die Liste auf; scheitert der nächste Start, steht die Unit wieder dort.
 
   ## Häufige Fehler
 
@@ -216,18 +545,20 @@ lesson: |
   - **Dienst schickt sich selbst in den Hintergrund** (etwa `--daemon`) bei `Type=simple` oder `exec`. systemd hält den Dienst für beendet und räumt die übrigen Prozesse ab. Den Vordergrund-Modus des Programms nutzen.
   - **`enable` ohne `--now`** und wundern, dass nichts läuft – oder `start` ohne `enable` und wundern, dass nach dem Reboot nichts läuft.
   - **`After=network.target`** für einen Dienst, der beim Start eine entfernte Datenbank erreichen muss. Richtig: `Wants=` und `After=network-online.target`.
-  - **Cron-Syntax in `OnCalendar=`.** `0 3 * * *` ist ungültig; `systemd-analyze calendar` deckt das vor dem Einsatz auf.
+  - **Cron-Syntax oder deutsche Wochentage in `OnCalendar=`.** `0 3 * * *` und `Mo..Fr 06:30` sind ungültig, systemd verwirft den Timer (`bad-setting`). `systemd-analyze calendar` deckt das vor dem Einsatz auf.
   - **Den Service statt den Timer aktivieren.** `enable db-backup.service` hat ohne `[Install]`-Abschnitt keine Wirkung; aktiviert wird `db-backup.timer`.
+  - **Timer und Service heißen verschieden.** `backup.timer` startet ohne `Unit=` nur `backup.service`. Heißt die Service-Datei anders, verweigert der Timer den Start (`Refusing to start, unit … to trigger not loaded`).
+  - **Startskript mit Windows-Zeilenenden oder ohne Ausführungsrecht.** Beides endet in `status=203/EXEC`. `file` und `ls -l` zeigen es sofort.
 
   ## Zusammenfassung
 
   - Boot: Firmware → Bootloader → Kernel → initramfs (findet das Root-Dateisystem) → systemd als PID 1 → `default.target`.
   - Units sind INI-Dateien; eigene gehören nach `/etc/systemd/system`, Anpassungen fremder Units als Drop-in per `systemctl edit`.
   - `start`/`stop` wirken jetzt, `enable`/`disable` beim Boot, `--now` verbindet beides. `reload` betrifft den Dienst, `daemon-reload` systemd selbst.
-  - Eine gute Service-Unit hat `Type=exec` (oder `oneshot` für Jobs), einen eigenen `User=`, `WorkingDirectory=`, `EnvironmentFile=` für Secrets, `Restart=on-failure` und passende `Wants=`/`After=`.
-  - `ExecStart=` ist keine Shell: keine Umleitungen, Pipes oder `&&`.
-  - Timer ersetzen cron: `OnCalendar=`, `Persistent=true`, Timer aktivieren, Zeitangaben mit `systemd-analyze calendar` prüfen, Überblick mit `list-timers`.
-  - `journalctl -u`, `-b`, `-b -1`, `-p err`, `--since`, `-f`, `-o cat/json` beantworten fast jede Frage nach dem Warum.
+  - Eine gute Service-Unit hat `Type=exec` (oder `oneshot` für Jobs), einen eigenen `User=`, `WorkingDirectory=`, `EnvironmentFile=` für Secrets, `Restart=on-failure` und passende `Wants=`/`After=`. `ExecStart=` ist keine Shell: keine Umleitungen, Pipes oder `&&`.
+  - Timer ersetzen cron: `OnCalendar=`, `Persistent=true`, Timer aktivieren, Zeitangaben mit `systemd-analyze calendar` prüfen, Überblick mit `list-timers --all`; `Triggers:` in `systemctl status` zeigt, welchen Service ein Timer startet.
+  - `journalctl -u`, `-b`, `-b -1`, `-p err`, `-g`, `--since`, `-f`, `-o cat/json` beantworten fast jede Frage nach dem Warum. Was eine App auf stdout schreibt, hat Priorität `info`.
+  - `status=203/EXEC` heißt: Das Programm aus `ExecStart=` ließ sich nicht starten. Die Journalzeile davor nennt den Grund; `systemctl reset-failed` setzt nach der Reparatur Startlimit und `failed` zurück, `systemctl show -p …` liefert einzelne Eigenschaften für Skripte.
   - User-Units liegen unter `~/.config/systemd/user`; mit Lingering laufen sie auch ohne Login.
 exercises:
   - id: reload-restart-daemon-reload
@@ -307,6 +638,38 @@ exercises:
         url: https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html#Wants=
       - title: systemd.io · Running Services After the Network Is Up
         url: https://systemd.io/NETWORK_ONLINE/
+
+  - id: exec-datei-ist-da
+    type: choice
+    title: Die Datei ist doch da
+    prompt: |
+      `backup.service` scheitert mit `status=203/EXEC`. Im Journal steht:
+
+      ```text
+      backup.service: Failed to execute /usr/local/bin/backup.sh: No such file or directory
+      ```
+
+      `ls -l /usr/local/bin/backup.sh` zeigt aber `-rwxr-xr-x 1 root root 412 Sep 28 09:12 /usr/local/bin/backup.sh`. Welche Ursachen passen zu diesem Bild?
+    options:
+      - text: Die Datei hat Windows-Zeilenenden. Der Kernel sucht deshalb den Interpreter `/bin/bash\r`, den es nicht gibt.
+        correct: true
+        why: Der Kernel liest die `#!`-Zeile bis zum Zeilenumbruch. Das `\r` davor gehört dann zum Pfad des Interpreters, und den gibt es nicht. Das meldet `execve` als `ENOENT`.
+      - text: Die `#!`-Zeile nennt einen Interpreter, der auf diesem Server fehlt, etwa `#!/usr/bin/python3` ohne installiertes Python.
+        correct: true
+        why: Fehlt der Interpreter, meldet `execve` ebenfalls „No such file or directory“, obwohl das Skript selbst existiert.
+      - text: Dem Skript fehlt das Ausführungsrecht.
+        correct: false
+        why: Dann lautete der Fehler `Permission denied`. Außerdem zeigt `ls -l` hier `rwx`.
+      - text: Ein Befehl im Skript, etwa `rsync`, ist nicht installiert.
+        correct: false
+        why: Dann wäre das Skript gestartet und mit eigenem Exit-Code gescheitert, meist 127 („command not found“). `203/EXEC` heißt, dass schon der Start scheiterte.
+    explanation: |
+      systemd meldet `203/EXEC`, wenn `execve` für das Programm aus `ExecStart=` scheitert. Bei einem Skript lädt der Kernel dabei den Interpreter aus der `#!`-Zeile. Fehlt der, kommt `ENOENT` zurück, und die Meldung nennt den Pfad des Skripts, nicht den des Interpreters. Die häufigste Ursache sind Windows-Zeilenenden: Aus `#!/bin/bash` wird `#!/bin/bash\r`. `file` meldet dann `with CRLF line terminators`, `head -n1 … | od -c` zeigt das `\r`.
+    resources:
+      - title: execve(2) – ERRORS
+        url: https://man7.org/linux/man-pages/man2/execve.2.html#ERRORS
+      - title: systemd.exec(5) – Process Exit Codes
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#Process%20Exit%20Codes
 
   - id: enabled-aber-inaktiv
     type: output
@@ -563,7 +926,7 @@ exercises:
           Process: 48231 ExecStart=/srv/shop/.venv/bin/gunicorn --workers 4 --bind 127.0.0.1:8000 shop.wsgi:application (code=exited, status=203/EXEC)
          Main PID: 48231 (code=exited, status=203/EXEC)
 
-      Sep 28 09:14:03 web01 (gunicorn)[48231]: shop.service: Unable to locate executable '/srv/shop/.venv/bin/gunicorn': No such file or directory
+      Sep 28 09:14:03 web01 (gunicorn)[48231]: shop.service: Failed to locate executable /srv/shop/.venv/bin/gunicorn: No such file or directory
       Sep 28 09:14:03 web01 (gunicorn)[48231]: shop.service: Failed at step EXEC spawning /srv/shop/.venv/bin/gunicorn: No such file or directory
       Sep 28 09:14:03 web01 systemd[1]: shop.service: Start request repeated too quickly.
       Sep 28 09:14:03 web01 systemd[1]: shop.service: Failed with result 'exit-code'.
@@ -649,3 +1012,179 @@ exercises:
         url: https://wiki.archlinux.org/title/Systemd/Timers
       - title: systemd.timer(5) – Persistent=
         url: https://www.freedesktop.org/software/systemd/man/latest/systemd.timer.html#Persistent=
+
+  - id: preisdienst-faellt-aus
+    type: scenario
+    title: Bei mir lief das Skript
+    prompt: |
+      Ein Kollege hat heute Morgen den neuen Preisdienst von seinem Laptop aus über eine Dateifreigabe nach `web01` kopiert und `pricing-api.service` aktiviert. Seitdem meldet das Monitoring, dass `http://localhost:8081/health` nicht antwortet. „Bei mir lief das Skript“, schreibt er im Chat.
+
+      Bring `pricing-api` zum Laufen: Der Health-Endpunkt soll antworten, und der Dienst soll auch einen Neustart überstehen. Die Unit selbst ist in Ordnung. Du bist als `ops` angemeldet und hast `sudo`.
+    setup: |
+      set -e
+      useradd --system --no-create-home --shell /usr/sbin/nologin pricing
+      install -d /opt/pricing-api/bin /opt/pricing-api/public
+      echo ok > /opt/pricing-api/public/health
+      echo '{"artikel": 1842, "stand": "06:00"}' > /opt/pricing-api/public/prices.json
+      # Über die Dateifreigabe kopiert: Windows-Zeilenenden, kein Ausführungsrecht
+      printf '#!/bin/sh\r\n# Startskript des Preisdienstes\r\nexec busybox httpd -f -p 8081 -h /opt/pricing-api/public\r\n' > /opt/pricing-api/bin/start.sh
+      chmod 644 /opt/pricing-api/bin/start.sh
+      cat > /etc/systemd/system/pricing-api.service <<'EOF'
+      [Unit]
+      Description=Preisdienst
+
+      [Service]
+      User=pricing
+      ExecStart=/opt/pricing-api/bin/start.sh
+      Restart=on-failure
+      RestartSec=1
+
+      [Install]
+      WantedBy=multi-user.target
+      EOF
+      systemctl daemon-reload
+      systemctl enable --quiet --now pricing-api
+      # Warten, bis systemd nach fünf Fehlstarts aufgibt (Startlimit)
+      for i in $(seq 40); do [ "$(systemctl show -p ActiveState --value pricing-api)" = failed ] && break; sleep 0.5; done
+    checks:
+      - name: pricing-api läuft
+        run: systemctl is-active pricing-api
+      - name: Der Health-Endpunkt antwortet
+        run: curl -fsS --max-time 5 http://localhost:8081/health
+      - name: pricing-api übersteht einen Neustart des Dienstes
+        run: systemctl restart pricing-api && sleep 2 && systemctl is-active pricing-api
+    solution: |
+      # failed mit status=203/EXEC: Das Programm aus ExecStart= ließ sich nicht starten.
+      systemctl status pricing-api --no-pager
+      journalctl -u pricing-api -n 20 --no-pager
+      # „Failed to locate executable …: Permission denied“
+      ls -l /opt/pricing-api/bin/start.sh
+      sudo chmod 755 /opt/pricing-api/bin/start.sh
+      # Nach zu vielen Fehlstarts weist systemd jeden Start ab, bis der Zähler zurückgesetzt ist.
+      sudo systemctl reset-failed pricing-api
+      sudo systemctl start pricing-api
+      sleep 3
+      # Wieder 203/EXEC, jetzt „No such file or directory“ – obwohl die Datei existiert.
+      journalctl -u pricing-api -n 5 --no-pager -o cat
+      file /opt/pricing-api/bin/start.sh
+      head -n1 /opt/pricing-api/bin/start.sh | od -c
+      # Windows-Zeilenenden: Der Kernel sucht den Interpreter „/bin/sh\r“. Alle Zeilen reparieren:
+      sudo sed -i 's/\r$//' /opt/pricing-api/bin/start.sh
+      file /opt/pricing-api/bin/start.sh
+      sudo systemctl reset-failed pricing-api
+      sudo systemctl restart pricing-api
+      sleep 1
+      curl -fsS http://localhost:8081/health
+    hints:
+      - "`systemctl status pricing-api` zeigt den Exit-Status, `journalctl -u pricing-api` die Zeile davor mit dem Grund."
+      - "`203/EXEC` heißt, `execve` auf die Datei aus `ExecStart=` ist gescheitert. Sieh dir die Datei mit `ls -l` an und starte sie testweise von Hand."
+      - "„No such file or directory“, obwohl die Datei da ist? Sieh dir die erste Zeile genau an: `file /opt/pricing-api/bin/start.sh` oder `head -n1 … | od -c`. Bei „Start request repeated too quickly“ hilft `systemctl reset-failed pricing-api`."
+    explanation: |
+      Zwei Fehler liegen hintereinander, beide vom Kopieren. Zuerst fehlt das Ausführungsrecht: `Failed to locate executable …: Permission denied`, und `ls -l` zeigt `-rw-r--r--`. Nach `chmod 755` bleibt es bei `203/EXEC`, jetzt mit `No such file or directory`. Gemeint ist nicht das Skript, sondern sein Interpreter: Die Datei hat Windows-Zeilenenden, für den Kernel lautet die erste Zeile `#!/bin/sh\r`, und ein Programm `/bin/sh\r` gibt es nicht. In der Shell heißt dieselbe Ursache `cannot execute: required file not found`. `sed -i 's/\r$//'` repariert alle Zeilen. Nur die erste zu reparieren reicht nicht: Das `\r` am Ende des Pfads hinter `-h` ließe `httpd` scheitern.
+
+      Dazu kommt `Restart=on-failure`. Jeder Fehlstart löst einen neuen Versuch aus, bis nach fünf Starts in zehn Sekunden das Startlimit greift (`Start request repeated too quickly`). Wer innerhalb dieses Fensters repariert, setzt den Zähler mit `systemctl reset-failed` zurück. Allgemein gilt: Bei `203/EXEC` hat die Anwendung nie angefangen. Die Ursache liegt bei Datei, Rechten, Interpreter oder Pfad, nicht im Code.
+    resources:
+      - title: systemd.exec(5) – Process Exit Codes
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#Process%20Exit%20Codes
+      - title: execve(2) – ERRORS
+        url: https://man7.org/linux/man-pages/man2/execve.2.html#ERRORS
+      - title: systemctl(1) – reset-failed
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemctl.html#reset-failed%20%5BPATTERN%E2%80%A6%5D
+
+  - id: morgenbericht-fehlt
+    type: scenario
+    title: Der Morgenbericht kam nie an
+    prompt: |
+      Seit Montag soll `web01` jeden Werktag um 06:30 einen Morgenbericht für das Team erzeugen: Plattenplatz, fehlgeschlagene Units, Last. Ein Kollege hat dafür `morning-report.timer` eingerichtet und mit `systemctl enable` aktiviert. Bisher kam kein einziger Bericht, und in `/var/lib/morning-report/` liegt nichts.
+
+      Sorge dafür, dass der Timer werktags um 06:30 den Bericht erzeugt, auch nach einem Neustart des Servers. Du bist als `ops` angemeldet und hast `sudo`.
+    setup: |
+      set -e
+      cat > /usr/local/bin/morning-report <<'EOF'
+      #!/bin/bash
+      # Morgenbericht: Plattenplatz, fehlgeschlagene Units und Last für das Team
+      set -eu
+      ziel=/var/lib/morning-report/report-$(date +%F).txt
+      {
+        echo "Morgenbericht für $(hostname), $(date '+%F %R')"
+        df -h / /boot
+        systemctl list-units --failed --no-legend
+        cat /proc/loadavg
+      } > "$ziel"
+      echo "Bericht geschrieben: $ziel"
+      EOF
+      chmod 755 /usr/local/bin/morning-report
+      cat > /etc/systemd/system/morning_report.service <<'EOF'
+      [Unit]
+      Description=Morgenbericht erzeugen
+
+      [Service]
+      Type=oneshot
+      StateDirectory=morning-report
+      ExecStart=/usr/local/bin/morning-report
+      EOF
+      cat > /etc/systemd/system/morning-report.timer <<'EOF'
+      [Unit]
+      Description=Morgenbericht werktags um 06:30
+
+      [Timer]
+      OnCalendar=Mo..Fr 06:30
+      Persistent=true
+
+      [Install]
+      WantedBy=timers.target
+      EOF
+      systemctl daemon-reload
+      systemctl enable --quiet morning-report.timer
+    checks:
+      - name: morning-report.timer ist aktiviert und läuft
+        run: systemctl is-enabled morning-report.timer && systemctl is-active morning-report.timer
+      - name: Der nächste Termin liegt werktags um 06:30
+        run: |
+          cal=$(systemctl show -p TimersCalendar --value morning-report.timer)
+          case "$cal" in
+            *'OnCalendar=Mon..Fri *-*-* 06:30:00 '*) ;;
+            *) echo "Zeitangabe des Timers: ${cal:-keine}"; exit 1 ;;
+          esac
+          test -n "$(systemctl show -p NextElapseUSecRealtime --value morning-report.timer)"
+      - name: Der Timer startet einen Service, der den Bericht erzeugt
+        run: |
+          svc=$(systemctl show -p Triggers --value morning-report.timer)
+          systemctl start "$svc" || exit 1
+          test -s "/var/lib/morning-report/report-$(date +%F).txt" || { echo "Kein Bericht von heute in /var/lib/morning-report."; exit 1; }
+    solution: |
+      # list-timers zeigt nur aktive Timer, --all auch die übrigen: kein Termin für morning-report.timer.
+      systemctl list-timers --all --no-pager
+      # Loaded: bad-setting – „Failed to parse calendar specification … Mo..Fr 06:30“
+      systemctl status morning-report.timer --no-pager
+      # systemd kennt nur englische Wochentage.
+      systemd-analyze calendar "Mo..Fr 06:30" || true
+      systemd-analyze calendar "Mon..Fri 06:30"
+      sudo sed -i 's/^OnCalendar=Mo\.\.Fr 06:30$/OnCalendar=Mon..Fri 06:30/' /etc/systemd/system/morning-report.timer
+      sudo systemctl daemon-reload
+      # Der Start scheitert trotzdem: „Refusing to start, unit morning-report.service to trigger not loaded“
+      sudo systemctl start morning-report.timer || journalctl -u morning-report.timer -n 3 --no-pager
+      # Der Timer startet ohne Unit= den gleichnamigen Service. Die Datei heißt aber anders:
+      ls /etc/systemd/system/ | grep -i morning
+      sudo mv /etc/systemd/system/morning_report.service /etc/systemd/system/morning-report.service
+      sudo systemctl daemon-reload
+      sudo systemctl start morning-report.timer
+      systemctl list-timers morning-report.timer --no-pager
+      # Einmal von Hand auslösen, statt bis morgen 06:30 zu warten
+      sudo systemctl start morning-report.service
+      journalctl -u morning-report.service -n 3 --no-pager -o cat
+    hints:
+      - "`systemctl list-timers --all` zeigt auch Timer ohne Termin. Was steht in `systemctl status morning-report.timer` hinter `Loaded:` und im Journal darunter?"
+      - "Prüfe die Zeitangabe mit `systemd-analyze calendar \"…\"`. In welcher Sprache erwartet systemd Wochentage?"
+      - "Startet der Timer auch nach der Korrektur nicht? Lies `Triggers:` in `systemctl status morning-report.timer` und vergleiche mit den Dateien in `/etc/systemd/system/`."
+    explanation: |
+      Der Timer war aktiviert, aber nie aktiv. `Mo..Fr` ist Deutsch; systemd kennt nur englische Wochentage, verwirft die Zeile beim Laden (`Failed to parse calendar specification`) und lehnt dann einen Timer ohne Zeitangabe ab (`Timer unit lacks value setting`, `Loaded: bad-setting`). `enable` legt trotzdem den Symlink an, deshalb sah die Einrichtung richtig aus. Nach der Korrektur auf `Mon..Fri 06:30` scheitert der Start am zweiten Fehler: Ohne `Unit=` startet `morning-report.timer` die Unit `morning-report.service`, die Datei heißt aber `morning_report.service`. Umbenennen oder `Unit=morning_report.service` im Timer lösen das. Danach braucht es `daemon-reload` und einen Start des Timers, denn `enable` allein hätte ihn erst beim nächsten Boot gestartet.
+
+      Prüfe neue Timer deshalb dreifach: `systemd-analyze calendar` für die Zeitangabe, `systemctl list-timers` für den nächsten Termin und `systemctl start <service>` für die Arbeit selbst.
+    resources:
+      - title: systemd.time(7) – Calendar Events
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemd.time.html#Calendar%20Events
+      - title: systemd.timer(5) – Unit=
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemd.timer.html#Unit=
+      - title: systemctl(1) – list-timers
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemctl.html#list-timers%20PATTERN%E2%80%A6

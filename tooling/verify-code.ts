@@ -19,7 +19,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { availableParallelism, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
-import { ROOT, loadContent } from './content.ts';
+import { ROOT, lessonBlocks, loadContent } from './content.ts';
 import { assemble, fixedCode, gapSolution, normalizeOutput } from '../src/engine/answers.ts';
 import { compareSql } from '../src/engine/sql.ts';
 import type { BugExercise, GapExercise, OrderExercise, OutputExercise, SqlExercise } from '../src/content/types.ts';
@@ -234,17 +234,12 @@ for (const { area, module, file, exercise: authored, normalized } of loaded.raw)
 }
 
 // Lesson code blocks.
-const FENCE = /^```(\S+)([^\n]*)\n([\s\S]*?)^```\s*$/gm;
 for (const areaId of Object.keys(loaded.areas)) {
   for (const module of Object.values(loaded.areas[areaId].modules)) {
     if (module.bear || !selected(areaId, module.id)) continue;
     const file = join(root, areaId, 'modules', `${module.id}.yaml`);
     const lesson = String(parseYaml(readFileSync(file, 'utf8')).lesson ?? '');
-    let n = 0;
-    for (const match of lesson.matchAll(FENCE)) {
-      n++;
-      const [, lang, flagText, code] = match;
-      const flags = flagText.trim().split(/\s+/);
+    for (const { n, lang, flags, code } of lessonBlocks(lesson)) {
       const label = `${areaId}/modules/${module.id}.yaml › Lektion, Codeblock ${n} (${lang})`;
       if (lang === 'python' && flags.includes('run')) {
         jobs.push({ label, run: async () => {

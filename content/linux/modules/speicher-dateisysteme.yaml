@@ -1,41 +1,107 @@
 id: speicher-dateisysteme
 title: Speicher, Dateisysteme & Backups
 level: 2
-minutes: 170
-summary: Du unterscheidest Datenträger, Dateisysteme und Mounts, erklärst Speicherverbrauch und planst Backups mit einem nachgewiesenen Restore.
+minutes: 260
+summary: Du unterscheidest Datenträger, Dateisysteme und Mounts, vergrößerst LVM-Volumes im Betrieb, öffnest LUKS-Volumes, reparierst ext4 nach Fehlern, liest SMART-Werte und planst Backups mit einem nachgewiesenen Restore.
 goals:
   - Du liest Geräte-, Dateisystem- und Mountinformationen ohne Datenträger zu verändern.
   - Du erklärst fstab, UUIDs und die Unterschiede zwischen df, du und Inodes.
-  - Du unterscheidest Btrfs-Snapshots, LVM, Swap und unabhängige Backups.
-  - Du erstellst einen sicheren Speicher- und Wiederherstellungsplan für eine Test-VM.
+  - Du vergrößerst ein Logical Volume samt Dateisystem im laufenden Betrieb und nimmst eine neue Platte in eine Volume Group auf.
+  - Du öffnest LUKS-Volumes mit Keyfile und richtest sie über crypttab und fstab dauerhaft ein.
+  - Du prüfst und reparierst ext4 mit e2fsck und beurteilst den Zustand einer Platte mit dmesg und SMART.
+  - Du unterscheidest Snapshots, Swap und unabhängige Backups und weist einen Restore nach.
 resources:
   - title: lsblk(8)
     url: https://man7.org/linux/man-pages/man8/lsblk.8.html
-  - title: mount(8)
-    url: https://man7.org/linux/man-pages/man8/mount.8.html
   - title: fstab(5)
     url: https://man7.org/linux/man-pages/man5/fstab.5.html
-  - title: Btrfs · Subvolumes
-    url: https://btrfs.readthedocs.io/en/latest/btrfs-subvolume.html
-  - title: Restic · Restore
-    url: https://restic.readthedocs.io/en/stable/050_restore.html
+  - title: lvm(8)
+    url: https://man7.org/linux/man-pages/man8/lvm.8.html
+  - title: cryptsetup(8)
+    url: https://man7.org/linux/man-pages/man8/cryptsetup.8.html
+  - title: e2fsck(8)
+    url: https://man7.org/linux/man-pages/man8/e2fsck.8.html
+lab: |
+  set -e
+  export LVM_SUPPRESS_FD_WARNINGS=1
+  # Zwei kleine Testplatten (Loop-Devices) mit LVM, darauf ext4 unter /srv/app
+  mkdir -p /var/lib/vdisks /srv/app
+  truncate -s 32M /var/lib/vdisks/disk1.img /var/lib/vdisks/disk2.img /var/lib/vdisks/tresor.img
+  losetup /dev/loop0 /var/lib/vdisks/disk1.img
+  losetup /dev/loop1 /var/lib/vdisks/disk2.img
+  pvcreate -q /dev/loop0 /dev/loop1
+  vgcreate -q vgdata /dev/loop0 /dev/loop1
+  lvcreate -q -n app -L 32M vgdata
+  mkfs.ext4 -q -L app /dev/vgdata/app
+  mount /dev/vgdata/app /srv/app
+  mkdir /srv/app/uploads
+  fallocate -l 6M /srv/app/uploads/katalog-2026.pdf
+  chown -R ops:ops /srv/app/uploads
+  # Ein LUKS-Container mit Keyfile (PBKDF2 mit wenigen Iterationen, damit es im Emulator schnell geht)
+  mkdir -p -m 700 /etc/cryptsetup-keys.d
+  head -c 64 /dev/urandom > /etc/cryptsetup-keys.d/tresor.key
+  chmod 400 /etc/cryptsetup-keys.d/tresor.key
+  cryptsetup luksFormat -q --pbkdf pbkdf2 --pbkdf-force-iterations 1000 --key-file /etc/cryptsetup-keys.d/tresor.key /var/lib/vdisks/tresor.img
+  # Ein Gerät, das jeden Lesezugriff mit einem I/O-Fehler beantwortet
+  dmsetup create defekt --table '0 8192 error'
 lesson: |
   Ein Deployment schlägt mit „No space left on device“ fehl. Du löschst eine große Datei, aber `df` zeigt fast denselben Verbrauch. Vielleicht liegt die Datei auf einem anderen Mount, vielleicht hält ein Prozess sie offen, vielleicht fehlen Inodes statt Datenblöcke. Speicherfehler lassen sich nur zuverlässig erklären, wenn du die Ebenen auseinanderhältst.
 
   Wir beginnen mit lesender Bestandsaufnahme. Befehle zum Partitionieren, Formatieren und Mounten gehören ausschließlich auf ausdrücklich dafür vorgesehene Testdatenträger. Ein sichtbarer Gerätename ist keine Garantie, dass das Gerät entbehrlich ist. Der praktische Erfolg dieses Moduls ist ein dokumentierter Aufbau samt Restore-Test, nicht das möglichst schnelle Ausführen eines Formatierungsbefehls.
 
+  Das Debian dieser Lektion ist so ein Testsystem. Die Beispiele mit „Im Terminal“ kannst du dort direkt ausprobieren. Neben der Bootplatte `/dev/sda` hat das Terminal zwei kleine Testplatten mit LVM, einen verschlüsselten Container und ein absichtlich defektes Gerät. Die Testplatten sind Loop-Devices: Imagedateien, die der Kernel wie Blockgeräte behandelt.
+
   ## Vom Blockgerät bis zum Pfad
 
   Eine SSD ist ein **Blockgerät**. Eine Partition beschreibt einen Bereich davon. Auf einer Partition kann ein Dateisystem liegen, das Blöcke in Dateien und Verzeichnisse organisiert. Ein **Mount** hängt dieses Dateisystem an einen Verzeichnispfad. Zusätzliche Schichten wie Verschlüsselung und LVM können zwischen Gerät und Dateisystem liegen. Ein Linux-Pfad nennt deshalb nicht direkt die Hardware ([mount(8)](https://man7.org/linux/man-pages/man8/mount.8.html)).
 
-  ```bash
-  lsblk -o NAME,TYPE,SIZE,FSTYPE,UUID,MOUNTPOINTS
-  findmnt /
-  findmnt -T /var/log
-  lsblk -f
+  ```console vm
+  $ lsblk -f
+  NAME         FSTYPE      FSVER    LABEL UUID                                   FSAVAIL FSUSE% MOUNTPOINTS
+  loop0        LVM2_member LVM2 001       rgo6kp-rNgH-1D0Q-WJze-3Q0K-rIo8-JlP90j
+  `-vgdata-app ext4        1.0      app   7187b60f-ecaf-43a3-8114-0822a09b44b8       17M    24% /srv/app
+  loop1        LVM2_member LVM2 001       VmBDcn-BSHB-jSYW-HHho-Xoqd-XlHs-QIR5rW
+  `-vgdata-app ext4        1.0      app   7187b60f-ecaf-43a3-8114-0822a09b44b8       17M    24% /srv/app
+  sda
+  `-sda1       ext4        1.0      boot  6c7e4a52-1f0b-4d3e-9a52-0b0071e00b00     33.4M    30% /boot
+  defekt
   ```
 
-  `lsblk` zeigt Beziehungen zwischen Blockgeräten. `findmnt -T` beantwortet, welches Dateisystem einen konkreten Pfad trägt. Das ist vor einer Verbrauchsanalyse wichtiger als die Vermutung, alles unter `/var` müsse auf derselben Partition liegen. `blkid` identifiziert Dateisystemsignaturen und UUIDs; je nach Zugriffsrechten kann die vollständige Erkennung Privilegien benötigen ([lsblk(8)](https://man7.org/linux/man-pages/man8/lsblk.8.html), [findmnt(8)](https://man7.org/linux/man-pages/man8/findmnt.8.html)).
+  `lsblk` zeigt Beziehungen zwischen Blockgeräten. `loop0` und `loop1` tragen die Signatur `LVM2_member`, darüber liegt das Logical Volume `vgdata-app` mit ext4, eingehängt unter `/srv/app`. Es erscheint unter beiden Platten, weil es Platz auf beiden belegt; der Abschnitt über LVM erklärt das. `sda1` ist die Bootpartition, `defekt` ein Gerät ohne Dateisystem für den Abschnitt über Lesefehler.
+
+  ```console vm
+  $ findmnt -T /srv/app/uploads
+  TARGET   SOURCE                 FSTYPE OPTIONS
+  /srv/app /dev/mapper/vgdata-app ext4   rw,relatime
+  $ findmnt /
+  TARGET SOURCE FSTYPE OPTIONS
+  /      host9p 9p     rw,relatime,dirsync,loose,access=client,trans=virtio
+  ```
+
+  `findmnt -T` beantwortet, welches Dateisystem einen konkreten Pfad trägt. Das ist vor einer Verbrauchsanalyse wichtiger als die Vermutung, alles unter `/srv` müsse auf derselben Partition liegen. In der VM kommt `/` per 9p aus dem Emulator und liegt auf keinem Blockgerät, deshalb fehlt es in `lsblk`. Auf einem echten Server stünde dort eine Partition oder ein Logical Volume ([lsblk(8)](https://man7.org/linux/man-pages/man8/lsblk.8.html), [findmnt(8)](https://man7.org/linux/man-pages/man8/findmnt.8.html)).
+
+  `blkid` liest Signaturen, Labels und UUIDs direkt vom Gerät und braucht dafür root-Rechte. `fdisk -l` zeigt eine Partitionstabelle, ohne sie zu ändern ([blkid(8)](https://man7.org/linux/man-pages/man8/blkid.8.html), [fdisk(8)](https://man7.org/linux/man-pages/man8/fdisk.8.html)):
+
+  ```console vm
+  $ sudo blkid
+  /dev/loop1: UUID="VmBDcn-BSHB-jSYW-HHho-Xoqd-XlHs-QIR5rW" TYPE="LVM2_member"
+  /dev/mapper/vgdata-app: LABEL="app" UUID="7187b60f-ecaf-43a3-8114-0822a09b44b8" BLOCK_SIZE="1024" TYPE="ext4"
+  /dev/loop0: UUID="rgo6kp-rNgH-1D0Q-WJze-3Q0K-rIo8-JlP90j" TYPE="LVM2_member"
+  /dev/sda1: LABEL="boot" UUID="6c7e4a52-1f0b-4d3e-9a52-0b0071e00b00" BLOCK_SIZE="1024" TYPE="ext4" PARTUUID="0f0a7e91-01"
+  $ sudo fdisk -l /dev/sda
+  Disk /dev/sda: 64 MiB, 67108864 bytes, 131072 sectors
+  Disk model: v86 ATA HD
+  Units: sectors of 1 * 512 = 512 bytes
+  Sector size (logical/physical): 512 bytes / 512 bytes
+  I/O size (minimum/optimal): 512 bytes / 512 bytes
+  Disklabel type: dos
+  Disk identifier: 0x0f0a7e91
+
+  Device     Boot Start    End Sectors Size Id Type
+  /dev/sda1  *     2048 131071  129024  63M 83 Linux
+  ```
+
+  Auf einem Laptop mit NVMe-SSD sieht `lsblk` typischerweise so aus:
 
   ```text
   NAME         TYPE  SIZE FSTYPE MOUNTPOINTS
@@ -46,18 +112,22 @@ lesson: |
 
   Bei SATA- und USB-Geräten heißen Pfade oft `/dev/sda` und `/dev/sda1`, bei NVMe `/dev/nvme0n1` und `/dev/nvme0n1p1`. Die Nummerierung kann sich ändern. Verwende für dauerhafte Zuordnung eine geprüfte UUID statt eines zufälligen Buchstabens. Auch eine UUID ist kein Geheimnis und kein Ersatz für die Prüfung von Größe, Typ, Seriennummer und Inhalt vor einer Änderung.
 
-  Eine GPT-Partitionstabelle beschreibt Partitionen, keine Dateien. `fdisk` oder `parted` ändern diese Tabelle. `mkfs.ext4` beziehungsweise `mkfs.btrfs` erzeugen ein Dateisystem und können vorhandene Daten zerstören. Ein Dateisystemtyp wird nicht dadurch geändert, dass du eine andere Zeichenfolge in `fstab` schreibst. Die Schichten müssen tatsächlich zusammenpassen.
+  Eine Partitionstabelle beschreibt Partitionen, keine Dateien. Heute ist das meist GPT; die Bootplatte der VM nutzt das ältere MBR-Format, das `fdisk` als `dos` anzeigt. `fdisk` oder `parted` ändern diese Tabelle. `mkfs.ext4` beziehungsweise `mkfs.btrfs` erzeugen ein Dateisystem und können vorhandene Daten zerstören. Ein Dateisystemtyp wird nicht dadurch geändert, dass du eine andere Zeichenfolge in `fstab` schreibst. Die Schichten müssen tatsächlich zusammenpassen.
 
   ## Dateisystemwahl und Mount-Vertrag
 
-  **ext4** ist für viele gewöhnliche Linux-Datenvolumes eine übersichtliche Wahl. **XFS** ist ein etabliertes Dateisystem für große und parallele Arbeitslasten; seine Größenänderung ist kein beliebiges Vergrößern und Verkleinern. **Btrfs** bietet unter anderem Copy-on-Write, Prüfsummen und Subvolumes. **vfat** wird häufig für EFI-Systempartitionen verwendet und hat kein natives Unix-Besitzer- und Rechtemodell wie ext4. Die Wahl folgt Anforderungen und Betriebserfahrung, nicht einer pauschalen Rangliste ([Kernel · ext4](https://docs.kernel.org/filesystems/ext4/index.html), [Kernel · XFS](https://docs.kernel.org/filesystems/xfs/index.html)).
+  **ext4** ist für viele gewöhnliche Linux-Datenvolumes eine übersichtliche Wahl. **XFS** ist ein etabliertes Dateisystem für große und parallele Arbeitslasten; es lässt sich vergrößern, aber nicht verkleinern. **Btrfs** bietet unter anderem Copy-on-Write, Prüfsummen und Subvolumes. **vfat** wird häufig für EFI-Systempartitionen verwendet und hat kein natives Unix-Besitzer- und Rechtemodell wie ext4. Die Wahl folgt Anforderungen und Betriebserfahrung, nicht einer pauschalen Rangliste ([Kernel · ext4](https://docs.kernel.org/filesystems/ext4/index.html), [Kernel · XFS](https://docs.kernel.org/filesystems/xfs/index.html)).
 
-  Ein Mount verdeckt vorübergehend vorhandene Einträge unter dem Mountpunkt. Diese Dateien werden nicht automatisch in das neue Dateisystem verschoben. Wenn ein Backupmedium nicht eingehängt ist, kann ein Skript versehentlich auf die Systemplatte in das leere Mountverzeichnis schreiben. Prüfe daher den erwarteten Mount ausdrücklich, bevor große Kopien starten.
+  Ein Mount verdeckt vorübergehend vorhandene Einträge unter dem Mountpunkt. Diese Dateien werden nicht automatisch in das neue Dateisystem verschoben. Wenn ein Backupmedium nicht eingehängt ist, kann ein Skript versehentlich auf die Systemplatte in das leere Mountverzeichnis schreiben. Prüfe daher den erwarteten Mount ausdrücklich, bevor große Kopien starten. `mountpoint` endet nur bei einem echten Mountpunkt mit Exit-Code 0 und eignet sich deshalb für Skripte:
 
-  ```bash
-  findmnt --mountpoint /mnt/backup
-  mountpoint -q /mnt/backup
-  df -h /mnt/backup
+  ```console vm
+  $ findmnt --mountpoint /srv/app
+  TARGET   SOURCE                 FSTYPE OPTIONS
+  /srv/app /dev/mapper/vgdata-app ext4   rw,relatime
+  $ mountpoint /srv
+  /srv is not a mountpoint
+  $ mountpoint /srv/app
+  /srv/app is a mountpoint
   ```
 
   Die Datei `/etc/fstab` beschreibt dauerhafte Mounts mit sechs Feldern: Quelle, Ziel, Typ, Optionen, dump-Feld und Prüfreihenfolge. Ein Schema für ein separates, optionales ext4-Datenvolume könnte so aussehen; die Beispiel-UUID musst du durch die tatsächlich ermittelte ersetzen ([fstab(5)](https://man7.org/linux/man-pages/man5/fstab.5.html)).
@@ -74,29 +144,41 @@ lesson: |
 
   `df` fragt die Belegung eines Dateisystems ab. `du` läuft durch erreichbare Verzeichniseinträge und summiert zugeordnete Dateiblöcke. Damit beantworten sie verschiedene Fragen. `du -x` bleibt auf einem Dateisystem und verhindert, dass ein darunter gemountetes großes Datenvolume die Analyse der Systemplatte verfälscht ([Coreutils · df](https://www.gnu.org/software/coreutils/manual/html_node/df-invocation.html), [Coreutils · du](https://www.gnu.org/software/coreutils/manual/html_node/du-invocation.html)).
 
-  ```bash
-  df -h /var
-  df -i /var
-  du -xhd1 /var 2> du-fehler.log
-  du -sh ./berichte
+  ```console vm
+  $ df -hT /srv/app
+  Filesystem             Type  Size  Used Avail Use% Mounted on
+  /dev/mapper/vgdata-app ext4   26M  6.1M   17M  27% /srv/app
+  $ df -i /srv/app
+  Filesystem             Inodes IUsed IFree IUse% Mounted on
+  /dev/mapper/vgdata-app   8192    13  8179    1% /srv/app
+  $ du -sh /srv/app/uploads
+  6.1M /srv/app/uploads
   ```
+
+  Das LV ist 32 MiB groß, `df` nennt 26M. Den Rest belegen Journal, Inode-Tabellen und andere Verwaltungsdaten. `Avail` ist noch einmal kleiner als `Size` minus `Used`, weil ext4 standardmäßig 5 % für root reserviert. Auf einem Server beginnst du eine Suche mit `du -xhd1 /var 2> du-fehler.log`: eine Ebene tief, nur dieses Dateisystem, Fehlermeldungen getrennt.
 
   Ein laufender Prozess kann eine gelöschte Datei weiter geöffnet halten. Ihr Name ist weg und `du` findet sie nicht mehr, aber die Blöcke bleiben bis zum letzten Schließen belegt. `lsof +L1` kann solche Dateien zeigen. Die richtige Maßnahme hängt vom Prozess ab: unterstützte Logrotation oder ein geordneter Neustart sind nachvollziehbarer als wahlloses Beenden. Metadaten, reservierter Platz, Snapshots, Hardlinks und unterschiedliche Zugriffsrechte erklären weitere Abweichungen.
 
-  Eine **Sparse-Datei** besitzt eine logische Länge, ohne für jeden Nullbereich physische Blöcke zu belegen. `ls -l` zeigt die logische Größe; `du` normalerweise den tatsächlich zugeordneten Platz. `du --apparent-size` wechselt auf die scheinbare Größe. Ein Dateiformat für VM-Abbilder kann deshalb groß aussehen und zunächst wenig Platz verbrauchen. Kopierwerkzeuge und Optionen entscheiden, ob Löcher erhalten bleiben.
+  Eine **Sparse-Datei** besitzt eine logische Länge, ohne für jeden Nullbereich physische Blöcke zu belegen. `ls -l` zeigt die logische Größe, `du` normalerweise den tatsächlich zugeordneten Platz. `du --apparent-size` wechselt auf die scheinbare Größe. Auf dem ext4 unter `/srv/app` lässt sich das zeigen:
 
-  ```bash
-  printf 'abc\n' > klein.txt
-  stat -c 'Bytes: %s' klein.txt
-  du --apparent-size --block-size=1 klein.txt
+  ```console vm
+  $ truncate -s 100M /srv/app/uploads/vm-abbild.img
+  $ ls -lh /srv/app/uploads/vm-abbild.img
+  -rw-r--r-- 1 ops ops 100M Oct  1 12:19 /srv/app/uploads/vm-abbild.img
+  $ du -h /srv/app/uploads/vm-abbild.img
+  0 /srv/app/uploads/vm-abbild.img
+  $ du -h --apparent-size /srv/app/uploads/vm-abbild.img
+  100M /srv/app/uploads/vm-abbild.img
   ```
+
+  Eine 100-MiB-Datei auf einem 26-MiB-Dateisystem: Sie besteht nur aus einem Loch. Abbilder virtueller Maschinen sehen deshalb oft groß aus und belegen zunächst wenig Platz. Kopierwerkzeuge und Optionen entscheiden, ob Löcher erhalten bleiben.
 
   Inodes speichern Metadaten und Verweise auf Dateidaten. Bei Dateisystemen mit begrenztem Inode-Vorrat können sehr viele kleine Dateien das Anlegen neuer Dateien verhindern, obwohl noch Datenblöcke frei sind. `df -i` prüft diese Ressource. Btrfs hat kein gleichartiges festes Inode-Kontingent; interpretiere die Ausgabe passend zum Dateisystem. Ein großes `du` kann selbst I/O verursachen, deshalb beginne gezielt beim betroffenen Mount statt immer bei `/`.
 
   > [!PRAXIS]
   > Ein Speicherbericht nennt Mount, Zeitpunkt, belegte Blöcke, Inode-Situation und die größten bekannten Verbraucher. „Platte voll“ ohne diese Angaben ist eine Beobachtung, noch keine Ursache.
 
-  ## Btrfs, Snapshots und weitere Speicherschichten
+  ## Btrfs-Snapshots und Swap
 
   Ein Btrfs-Subvolume besitzt eine eigene Verzeichnishierarchie innerhalb desselben Dateisystems. Ein Snapshot beginnt mit dem Stand eines Subvolumes und teilt zunächst dessen Datenblöcke über Copy-on-Write. Änderungen lösen die nötigen neuen Blöcke aus. Verschachtelte Subvolumes werden nicht rekursiv mitsnapshottet; ein Snapshot von `/` ist deshalb nicht automatisch ein Snapshot aller darin sichtbaren Daten ([Btrfs · Subvolumes](https://btrfs.readthedocs.io/en/latest/btrfs-subvolume.html)).
 
@@ -109,11 +191,322 @@ lesson: |
 
   Diese lesenden Befehle setzen ein passendes Btrfs-System und gegebenenfalls zusätzliche Rechte voraus. Snapper verwaltet Snapshots nach Konfigurationen. Prüfe zuerst, welche Konfigurationen und Subvolumes tatsächlich existieren. Ein Distributionsname garantiert kein bestimmtes Layout. Ein Root-Rollback kann Systemdateien zurücksetzen, während separate Home- oder Daten-Subvolumes unberührt bleiben; genau deshalb muss der Umfang dokumentiert sein ([Snapper-Dokumentation](https://snapper.io/documentation.html)).
 
-  Snapshots auf demselben Datenträger helfen bei versehentlichen Änderungen. Sie schützen nicht vor Verlust dieses Datenträgers. Außerdem behalten sie alte Datenblöcke und können weiteren Platz binden. Löschen einer großen Datei gibt daher nicht zwingend sofort ihren gesamten Platz frei. Für Btrfs-Auslastung ist die eigene Dateisystemstatistik aussagekräftiger als eine vorschnelle Addition sichtbarer Dateigrößen.
-
-  **LVM** bietet eine andere Schicht: Physical Volumes werden zu einer Volume Group zusammengefasst, daraus entstehen Logical Volumes als Blockgeräte. Darauf können Dateisysteme liegen. Vergrößern des Logical Volume und Vergrößern des Dateisystems sind getrennte Operationen. Ein LVM-Snapshot ist deshalb nicht dasselbe Objekt wie ein Btrfs-Subvolume-Snapshot ([LVM2-Dokumentation](https://sourceware.org/lvm2/)).
+  Snapshots auf demselben Datenträger helfen bei versehentlichen Änderungen. Sie schützen nicht vor Verlust dieses Datenträgers. Außerdem behalten sie alte Datenblöcke und können weiteren Platz binden. Löschen einer großen Datei gibt daher nicht zwingend sofort ihren gesamten Platz frei. Für Btrfs-Auslastung ist die eigene Dateisystemstatistik aussagekräftiger als eine vorschnelle Addition sichtbarer Dateigrößen. LVM-Snapshots arbeiten eine Ebene tiefer, am Blockgerät; der nächste Abschnitt zeigt sie.
 
   **Swap** gibt dem Kernel die Möglichkeit, geeignete Speicherseiten aus dem RAM auszulagern. `swapon --show` zeigt aktive Swap-Bereiche. **zram** stellt komprimierte Blockgeräte im RAM bereit und wird häufig für Swap verwendet; es verbraucht weiterhin RAM und CPU. Mehr Swap löst ein ungebremstes Speicherleck nicht. Prüfe Druck und Arbeitslast, bevor du Größenwerte änderst ([Kernel · zram](https://docs.kernel.org/admin-guide/blockdev/zram.html)).
+
+  ## LVM: Volumes im laufenden Betrieb vergrößern
+
+  Mit Partitionen legst du Größen einmal fest. Wird eine Partition zu klein, musst du verschieben, kopieren oder neu anlegen. **LVM** (Logical Volume Manager) schiebt eine Schicht dazwischen. Platten oder Partitionen werden zu **Physical Volumes** (PV). Mehrere PVs bilden eine **Volume Group** (VG), einen gemeinsamen Vorrat aus gleich großen Stücken, den Extents (Standard: 4 MiB). Aus diesem Vorrat schneidest du **Logical Volumes** (LV), die sich wie Partitionen verhalten, aber wachsen und über mehrere Platten reichen können ([lvm(8)](https://man7.org/linux/man-pages/man8/lvm.8.html), [LVM2-Dokumentation](https://sourceware.org/lvm2/)).
+
+  ```console vm
+  $ sudo pvs
+    PV         VG     Fmt  Attr PSize  PFree
+    /dev/loop0 vgdata lvm2 a--  28.00m     0
+    /dev/loop1 vgdata lvm2 a--  28.00m 24.00m
+  $ sudo vgs
+    VG     #PV #LV #SN Attr   VSize  VFree
+    vgdata   2   1   0 wz--n- 56.00m 24.00m
+  $ sudo lvs
+    LV   VG     Attr       LSize  Pool Origin Data%  Meta%  Move Log Cpy%Sync Convert
+    app  vgdata -wi-ao---- 32.00m
+  ```
+
+  Jede 32-MiB-Platte bringt 7 Extents mit, also 28 MiB; den Rest belegen LVM-Metadaten und Ausrichtung. Das LV `app` braucht 8 Extents: 7 auf `loop0` und eines auf `loop1`. Deshalb stand es in `lsblk` unter beiden Platten. `VFree` zeigt, was die VG noch verteilen kann. In der `Attr`-Spalte von `lvs` bedeutet `a` aktiv und `o` geöffnet, hier: eingehängt. Das Gerät heißt wahlweise `/dev/vgdata/app` oder `/dev/mapper/vgdata-app`.
+
+  ### Erst das Volume, dann das Dateisystem
+
+  `lvextend` vergrößert nur das Blockgerät. Das Dateisystem darauf hat seine Größe beim Anlegen festgelegt und merkt davon nichts. `lvextend -r` (`--resizefs`) vergrößert beides in einem Schritt: Nach dem LV startet es für ext4 `resize2fs` und für XFS `xfs_growfs`, in Debian 12 über das Hilfsskript `fsadm`. Beide Dateisysteme wachsen online, also eingehängt und im Betrieb ([lvextend(8)](https://man7.org/linux/man-pages/man8/lvextend.8.html), [resize2fs(8)](https://man7.org/linux/man-pages/man8/resize2fs.8.html)).
+
+  ```console vm
+  $ sudo lvextend -r -L +8M vgdata/app
+    Size of logical volume vgdata/app changed from 32.00 MiB (8 extents) to 40.00 MiB (10 extents).
+    Logical volume vgdata/app successfully resized.
+  resize2fs 1.47.0 (5-Feb-2023)
+  Filesystem at /dev/mapper/vgdata-app is mounted on /srv/app; on-line resizing required
+  old_desc_blocks = 1, new_desc_blocks = 1
+  The filesystem on /dev/mapper/vgdata-app is now 40960 (1k) blocks long.
+
+  $ df -h /srv/app
+  Filesystem              Size  Used Avail Use% Mounted on
+  /dev/mapper/vgdata-app   33M  6.1M   25M  20% /srv/app
+  ```
+
+  `-L +8M` heißt „um 8 MiB größer“, `-L 8M` hieße „auf 8 MiB“. `-l +100%FREE` gibt dem LV alle freien Extents der VG. Ohne `-r` passiert der klassische Fehler: Das LV wächst, `df` zeigt die alte Größe.
+
+  ```console vm
+  $ sudo lvextend -L +4M vgdata/app
+    Size of logical volume vgdata/app changed from 40.00 MiB (10 extents) to 44.00 MiB (11 extents).
+    Logical volume vgdata/app successfully resized.
+  $ df -h /srv/app
+  Filesystem              Size  Used Avail Use% Mounted on
+  /dev/mapper/vgdata-app   33M  6.1M   25M  20% /srv/app
+  $ sudo resize2fs /dev/vgdata/app
+  resize2fs 1.47.0 (5-Feb-2023)
+  Filesystem at /dev/vgdata/app is mounted on /srv/app; on-line resizing required
+  old_desc_blocks = 1, new_desc_blocks = 1
+  The filesystem on /dev/vgdata/app is now 45056 (1k) blocks long.
+
+  $ df -h /srv/app
+  Filesystem              Size  Used Avail Use% Mounted on
+  /dev/mapper/vgdata-app   36M  6.1M   28M  19% /srv/app
+  ```
+
+  Bei XFS heißt der zweite Schritt `xfs_growfs /srv/app`; er nimmt den Mountpunkt statt des Geräts. Hat die VG keinen freien Platz mehr, kommt eine neue Platte dazu. Für eine neue Platte `/dev/sdc` auf einem Server sind das drei Befehle:
+
+  ```bash
+  sudo pvcreate /dev/sdc
+  sudo vgextend vgdata /dev/sdc
+  sudo lvextend -r -l +100%FREE vgdata/app
+  ```
+
+  `pvcreate` überschreibt den Anfang des Geräts. Prüfe vorher mit `lsblk -f` und `blkid`, dass `/dev/sdc` wirklich die neue, leere Platte ist. Danach liegt das LV auf mehreren Platten: Fällt eine aus, ist das ganze Dateisystem betroffen. LVM verteilt Platz, Redundanz kommt von RAID.
+
+  > [!WARNING] Verkleinern ist ein anderer Vorgang
+  > ext4 lässt sich nur ausgehängt verkleinern, XFS gar nicht. Die Reihenfolge kehrt sich um: erst das Dateisystem, dann das LV. Wer ein LV ohne `-r` unter die Größe seines Dateisystems verkleinert, schneidet ihm das Ende ab. Vor jedem Verkleinern steht ein geprüftes Backup.
+
+  ### Snapshots auf Blockebene
+
+  Ein LVM-Snapshot hält den Stand eines LV fest. Bevor sich ein Block am Original ändert, kopiert LVM den alten Inhalt in den Snapshot (Copy-on-Write). Dafür braucht der Snapshot eigenen Platz in der VG:
+
+  ```console vm
+  $ sudo lvcreate -s -n app-snap -L 8M vgdata/app
+    Logical volume "app-snap" created.
+  $ sudo lvs
+    LV       VG     Attr       LSize  Pool Origin Data%  Meta%  Move Log Cpy%Sync Convert
+    app      vgdata owi-aos--- 44.00m
+    app-snap vgdata swi-a-s---  8.00m      app    6.45
+  $ sudo lvremove -y vgdata/app-snap
+    Logical volume "app-snap" successfully removed.
+  ```
+
+  `Data%` zeigt, wie viel vom Snapshot-Platz belegt ist. Bei 100 % wird der Snapshot ungültig. Typischer Einsatz: Snapshot anlegen, davon in Ruhe ein konsistentes Backup lesen, Snapshot löschen. Er liegt auf denselben Platten wie das Original und ist deshalb selbst kein Backup.
+
+  > [!INTERVIEW]
+  > „Ein Volume ist voll, die Volume Group hat noch Platz. Was tust du?“ – `lvextend -r` mit `-L +…` oder `-l +100%FREE`, danach `df -h` als Nachweis. Ohne `-r` wächst nur das Blockgerät; dann folgt `resize2fs` für ext4 oder `xfs_growfs` für XFS. Hat die VG keinen Platz, kommen vorher `pvcreate` und `vgextend` mit einer neuen Platte.
+
+  ## LUKS: verschlüsselte Blockgeräte
+
+  Eine gestohlene Laptop-SSD oder eine ausgemusterte Serverplatte gibt ihre Daten nicht preis, wenn sie verschlüsselt sind. Unter Linux übernimmt das **dm-crypt** im Kernel; es verschlüsselt ein beliebiges Blockgerät. **LUKS** (Linux Unified Key Setup) ist das Format des Headers am Anfang des Geräts. Er enthält den Schlüssel, mit dem die Daten verschlüsselt sind (Volume Key), mehrfach verschlüsselt: einmal pro **Keyslot**. Jede Passphrase und jedes Keyfile öffnet einen eigenen Keyslot. Deshalb kannst du eine Passphrase wechseln oder ein Keyfile ergänzen, ohne die Daten neu zu verschlüsseln. LUKS2 bietet bis zu 32 Keyslots ([cryptsetup(8)](https://man7.org/linux/man-pages/man8/cryptsetup.8.html), [Kernel · dm-crypt](https://docs.kernel.org/admin-guide/device-mapper/dm-crypt.html)).
+
+  ```console vm
+  $ sudo cryptsetup luksDump /var/lib/vdisks/tresor.img | head -n 30
+  LUKS header information
+  Version:        2
+  Epoch:          3
+  Metadata area:  16384 [bytes]
+  Keyslots area:  16744448 [bytes]
+  UUID:           2224f401-7d55-42fe-8703-a66f989c764d
+  …
+  Data segments:
+    0: crypt
+        offset: 16777216 [bytes]
+        length: (whole device)
+        cipher: aes-xts-plain64
+        sector: 4096 [bytes]
+
+  Keyslots:
+    0: luks2
+        Key:        512 bits
+        Priority:   normal
+        Cipher:     aes-xts-plain64
+        Cipher key: 512 bits
+        PBKDF:      pbkdf2
+        Hash:       sha256
+        Iterations: 1000
+  …
+  ```
+
+  > [!NOTE] Warum nur 1000 Iterationen?
+  > Das Lab hat den Container mit `--pbkdf pbkdf2 --pbkdf-force-iterations 1000` angelegt, damit er im Emulator in Sekunden entsteht. Ohne diese Optionen wählt `cryptsetup luksFormat` für LUKS2 Argon2id und misst die Parameter so ein, dass das Ableiten des Schlüssels spürbar Rechenzeit und Speicher kostet. Genau das bremst das Raten von Passphrasen. Auf echten Systemen bleibt es beim Standard.
+
+  `luksFormat` legt den Header an und zerstört dabei, was vorher auf dem Gerät stand. `cryptsetup open` entschlüsselt mit Passphrase oder Keyfile und erzeugt ein neues Blockgerät unter `/dev/mapper/`. Erst darauf liegt das Dateisystem:
+
+  ```console vm
+  $ sudo cryptsetup open --key-file /etc/cryptsetup-keys.d/tresor.key /var/lib/vdisks/tresor.img tresor
+  $ lsblk -o NAME,TYPE,SIZE,FSTYPE,MOUNTPOINTS /dev/loop2
+  NAME     TYPE  SIZE FSTYPE      MOUNTPOINTS
+  loop2    loop   32M crypto_LUKS
+  `-tresor crypt  16M
+  $ sudo cryptsetup status tresor
+  /dev/mapper/tresor is active.
+    type:    LUKS2
+    cipher:  aes-xts-plain64
+    keysize: 512 bits
+    key location: keyring
+    device:  /dev/loop2
+    loop:    /var/lib/vdisks/tresor.img
+    sector size:  4096
+    offset:  32768 sectors
+    size:    32768 sectors
+    mode:    read/write
+  ```
+
+  Für die Imagedatei hat `cryptsetup` selbst ein Loop-Device angelegt (`loop2`). Von 32 MiB bleiben 16 MiB für Daten, weil der LUKS2-Header standardmäßig 16 MiB belegt. Beim ersten Öffnen braucht das neue Gerät ein Dateisystem:
+
+  ```console vm
+  $ sudo mkfs.ext4 -q -L tresor /dev/mapper/tresor
+  $ sudo mkdir -p /srv/tresor
+  $ sudo mount /dev/mapper/tresor /srv/tresor
+  $ df -h /srv/tresor
+  Filesystem          Size  Used Avail Use% Mounted on
+  /dev/mapper/tresor   11M   24K  9.9M   1% /srv/tresor
+  $ sudo umount /srv/tresor
+  $ sudo cryptsetup close tresor
+  ```
+
+  Nach `close` ist der Schlüssel aus dem Kernel entfernt und `/dev/mapper/tresor` verschwunden. Keyslots verwaltest du mit `luksAddKey` (fragt eine vorhandene Passphrase ab und legt eine neue an), `luksRemoveKey` und `luksKillSlot`. Der Header ist die empfindlichste Stelle: Ist er beschädigt, sind die Daten verloren, auch mit der richtigen Passphrase. `sudo cryptsetup luksHeaderBackup /dev/sdb --header-backup-file sdb-luks-header.img` sichert ihn. Die Datei gehört an einen geschützten Ort außerhalb dieser Platte.
+
+  ### Beim Booten öffnen: crypttab
+
+  Dauerhaft öffnet systemd verschlüsselte Volumes über `/etc/crypttab`. Jede Zeile hat vier Felder: Name des Mappings, Gerät, Keyfile und Optionen. Beim Booten macht `systemd-cryptsetup-generator` daraus die Unit `systemd-cryptsetup@<name>.service`, danach hängt die fstab `/dev/mapper/<name>` ein ([crypttab(5)](https://www.freedesktop.org/software/systemd/man/latest/crypttab.html)):
+
+  ```text
+  # /etc/crypttab
+  kunden  UUID=3c1f6a2e-8d47-4b1e-9f0a-2b7c5d9e4a11  /etc/cryptsetup-keys.d/kunden.key  luks
+
+  # /etc/fstab
+  /dev/mapper/kunden  /srv/kunden  ext4  defaults,nofail  0  2
+  ```
+
+  Das Gerät steht als UUID des LUKS-Headers darin; `blkid` zeigt sie mit `TYPE="crypto_LUKS"`. Ein Keyfile gehört root und ist für niemanden sonst lesbar (`chmod 400`), sonst warnt systemd-cryptsetup im Journal. Und es enthält genau die Bytes des Schlüssels: cryptsetup liest ein Keyfile vollständig, auch einen abschließenden Zeilenumbruch. Eine Passphrase am Prompt oder ohne `--key-file` über stdin endet dagegen am ersten Zeilenumbruch. Für Keyfiles nimmst du deshalb besser Zufallsbytes (`head -c 64 /dev/urandom`) und meldest sie mit `luksAddKey` in einem eigenen Keyslot an. Ein verschlüsseltes Wurzeldateisystem öffnet schon das initramfs; auf Debian liest `cryptsetup-initramfs` dafür dieselbe crypttab.
+
+  ## Dateisysteme prüfen und reparieren: fsck
+
+  Nach einem Stromausfall, einem Kernelabsturz oder defekter Hardware können die Verwaltungsstrukturen eines Dateisystems sich widersprechen: Ein Verzeichniseintrag zeigt auf einen freien Inode, ein Block gilt als frei, obwohl eine Datei ihn nutzt. Das Journal von ext4 und XFS fängt die meisten Abstürze ab, aber nicht jeden Schaden. `fsck` ist ein Frontend und startet das passende Prüfprogramm, für ext4 `e2fsck` ([e2fsck(8)](https://man7.org/linux/man-pages/man8/e2fsck.8.html)). Für XFS tut `fsck.xfs` beim normalen Boot nichts; reparieren muss dort `xfs_repair`.
+
+  Repariert wird nur ein **ausgehängtes** Dateisystem. Auf einem eingehängten ändert der Kernel laufend Strukturen, die `e2fsck` gleichzeitig umschreiben würde. Das Ergebnis wäre schlimmer als der Ausgangsschaden.
+
+  ```console vm
+  $ sudo umount /srv/app
+  $ sudo e2fsck -f -n /dev/vgdata/app
+  e2fsck 1.47.0 (5-Feb-2023)
+  Pass 1: Checking inodes, blocks, and sizes
+  Pass 2: Checking directory structure
+  Pass 3: Checking directory connectivity
+  Pass 4: Checking reference counts
+  Pass 5: Checking group summary information
+  app: 14/12288 files (0.0% non-contiguous), 14368/45056 blocks
+  $ sudo mount /dev/vgdata/app /srv/app
+  ```
+
+  | Option | Wirkung |
+  | --- | --- |
+  | `-n` | nur lesen und jede Frage mit „nein“ beantworten: zum Ansehen |
+  | `-f` | auch prüfen, wenn das Dateisystem als sauber markiert ist |
+  | `-p` | „preen“: harmlose Fehler ohne Rückfrage beheben, bei allem anderen abbrechen |
+  | `-y` | jede Reparatur mit „ja“ beantworten |
+
+  Der Exit-Code fasst das Ergebnis zusammen: 0 keine Fehler, 1 Fehler behoben, 2 behoben und Neustart nötig, 4 Fehler bleiben, 8 Bedienfehler ([e2fsck(8) · Exit Code](https://man7.org/linux/man-pages/man8/e2fsck.8.html#EXIT_CODE)). Dateien, deren Verzeichniseintrag verloren ging, hängt `e2fsck` unter `lost+found` ein. Sie heißen dann nach ihrer Inode-Nummer, etwa `#17`; den alten Namen musst du am Inhalt erkennen.
+
+  `tune2fs -l` liest den Superblock: Zustand, Zahl der Mounts seit der letzten Prüfung und deren Zeitpunkt ([tune2fs(8)](https://man7.org/linux/man-pages/man8/tune2fs.8.html)).
+
+  ```console vm
+  $ sudo tune2fs -l /dev/sda1 | grep -E '^(Filesystem state|Mount count|Maximum mount count|Last checked|Check interval)'
+  Filesystem state:         clean
+  Mount count:              2
+  Maximum mount count:      -1
+  Last checked:             Thu Oct  1 11:46:37 2026
+  Check interval:           0 (<none>)
+  ```
+
+  `Maximum mount count: -1` und `Check interval: 0` bedeuten: keine erzwungene Prüfung nach Anzahl der Mounts oder nach Zeit. Das ist seit e2fsprogs 1.42 der Standard für neue Dateisysteme; `tune2fs -c` und `tune2fs -i` schalten es wieder ein. Steht der Zustand auf `clean with errors`, hat der Kernel einen Fehler bemerkt, und eine Prüfung ist fällig.
+
+  ### fsck beim Booten
+
+  Die sechste Spalte der fstab legt fest, ob ein Dateisystem beim Start geprüft wird: `0` nie, `1` für das Wurzeldateisystem, `2` für alle anderen. systemd startet dafür vor dem Einhängen `systemd-fsck-root.service` und je Gerät eine Instanz von `systemd-fsck@.service`. Sie rufen `fsck` im Preen-Modus auf. Findet er etwas, das er nicht ohne Rückfrage beheben darf, bricht er ab:
+
+  ```text
+  systemd-fsck[352]: archiv: UNEXPECTED INCONSISTENCY; RUN fsck MANUALLY.
+  systemd-fsck[352]:         (i.e., without -a or -p options)
+  ```
+
+  Dann scheitert die fsck-Unit und mit ihr der Mount. Fehlt in der fstab `nofail`, landet das System im Emergency-Modus. `journalctl -b -u 'systemd-fsck@*'` zeigt die Meldungen aller Prüfungen dieses Boots. Die Kernelparameter `fsck.mode=force` und `fsck.repair=yes` erzwingen eine Prüfung beziehungsweise Reparaturen ohne Rückfrage ([systemd-fsck@.service](https://www.freedesktop.org/software/systemd/man/latest/systemd-fsck@.service.html)).
+
+  > [!WARNING] Erst sichern, dann reparieren
+  > `e2fsck -y` trifft jede Entscheidung für dich, auch „Eintrag löschen“. Auf einer Platte, die gerade ausfällt, kann jeder Reparaturlauf mehr zerstören, als er rettet. Meldet der Kernel Lesefehler der Hardware, kopierst du zuerst die Daten oder ein Abbild der Platte, etwa mit GNU `ddrescue`, und reparierst danach die Kopie.
+
+  ## Plattengesundheit: Kernelmeldungen und SMART
+
+  Bevor ein Dateisystem Fehler meldet, sieht der Kernel meist schon die Ursache: Lesefehler, Timeouts, zurückgesetzte Verbindungen. Diese Meldungen landen im Kernel-Ringpuffer. `dmesg` liest ihn, auf Debian nur mit root-Rechten, weil `kernel.dmesg_restrict` gesetzt ist. `-T` rechnet die Sekunden seit dem Boot in Uhrzeiten um, `--level=err,warn` lässt nur Fehler und Warnungen durch ([dmesg(1)](https://man7.org/linux/man-pages/man1/dmesg.1.html)).
+
+  Das Gerät `/dev/mapper/defekt` aus dem Lab nutzt das Device-Mapper-Ziel `error`: Es beantwortet jeden Zugriff mit einem I/O-Fehler, so wie eine Platte, die einen Sektor nicht mehr lesen kann.
+
+  ```console vm
+  $ sudo dd if=/dev/mapper/defekt of=/dev/null bs=4k count=1
+  dd: error reading '/dev/mapper/defekt': Input/output error
+  0+0 records in
+  0+0 records out
+  0 bytes copied, 0.00164572 s, 0.0 kB/s
+  $ sudo dmesg -T --level=err,warn | tail -n 3
+  [Thu Oct  1 12:19:03 2026] Buffer I/O error on dev dm-1, logical block 1008, async page read
+  [Thu Oct  1 12:19:04 2026] Buffer I/O error on dev dm-1, logical block 1008, async page read
+  [Thu Oct  1 12:19:24 2026] Buffer I/O error on dev dm-1, logical block 0, async page read
+  ```
+
+  Die ersten beiden Zeilen stammen von udev, das das neue Gerät beim Anlegen nach Signaturen abgesucht hat. `dm-1` ist der Kernelname von `defekt`; `ls -l /dev/mapper` zeigt die Zuordnung. Ohne `tail` siehst du davor auch Warnungen aus dem Boot, die nichts mit Platten zu tun haben. Auch das gehört zum Lesen von `dmesg`: Rauschen von echten Fehlern trennen. Der Kernel schreibt dieselben Meldungen ins Journal. Dort liest `ops` sie ohne `sudo`, mit `-b -1` auch die des vorigen Boots:
+
+  ```console vm
+  $ journalctl -k -p err -b --no-pager | tail -n 3
+  Oct 01 12:19:03 web01 kernel: Buffer I/O error on dev dm-1, logical block 1008, async page read
+  Oct 01 12:19:05 web01 kernel: Buffer I/O error on dev dm-1, logical block 1008, async page read
+  Oct 01 12:19:25 web01 kernel: Buffer I/O error on dev dm-1, logical block 0, async page read
+  ```
+
+  Auf echter Hardware sieht ein Lesefehler einer SATA-Platte etwa so aus:
+
+  ```text
+  ata3.00: failed command: READ FPDMA QUEUED
+  ata3.00: status: { DRDY ERR }
+  ata3.00: error: { UNC }
+  sd 2:0:0:0: [sdb] tag#7 Sense Key : Medium Error [current]
+  sd 2:0:0:0: [sdb] tag#7 Add. Sense: Unrecovered read error - auto reallocate failed
+  critical medium error, dev sdb, sector 81920 op 0x0:(READ) flags 0x0 phys_seg 1 prio class 2
+  EXT4-fs error (device sdb1): __ext4_find_entry:1683: inode #393217: comm rsync: reading directory lblock 0
+  ```
+
+  Von oben nach unten: Die Platte meldet einen Sektor, den sie nicht lesen kann (`UNC`, uncorrectable). Die SCSI-Schicht übersetzt das in einen Medienfehler, der Block-Layer nennt Gerät und Sektor, und ext4 kann deshalb ein Verzeichnis nicht lesen. Die Ursache ist Hardware, `e2fsck` behebt sie nicht. Meldungen wie `SATA link down` oder `ICRC`-Fehler deuten eher auf Kabel oder Controller.
+
+  ### SMART: was die Platte über sich selbst weiß
+
+  Festplatten und SSDs führen Statistiken über ihren Zustand, genannt SMART (Self-Monitoring, Analysis and Reporting Technology). `smartctl` aus dem Paket `smartmontools` liest sie. In der Lern-VM gibt es weder das Paket noch eine Platte mit SMART, deshalb hier die Ausgabe einer alternden Serverplatte ([smartctl(8)](https://manpages.debian.org/bookworm/smartmontools/smartctl.8.en.html)):
+
+  ```console
+  $ sudo smartctl -H -A /dev/sdb
+  smartctl 7.3 2022-02-28 r5338 [x86_64-linux-6.1.0-26-amd64] (local build)
+  …
+  SMART overall-health self-assessment test result: PASSED
+
+  ID# ATTRIBUTE_NAME          FLAG     VALUE WORST THRESH TYPE      UPDATED  WHEN_FAILED RAW_VALUE
+    5 Reallocated_Sector_Ct   0x0033   097   097   010    Pre-fail  Always       -       152
+    9 Power_On_Hours          0x0032   061   061   000    Old_age   Always       -       34512
+  187 Reported_Uncorrect      0x0032   093   093   000    Old_age   Always       -       7
+  194 Temperature_Celsius     0x0022   035   049   000    Old_age   Always       -       35
+  197 Current_Pending_Sector  0x0012   100   100   000    Old_age   Always       -       24
+  198 Offline_Uncorrectable   0x0010   100   100   000    Old_age   Offline      -       24
+  199 UDMA_CRC_Error_Count    0x003e   200   200   000    Old_age   Always       -       0
+  ```
+
+  `VALUE` ist ein vom Hersteller normierter Wert, höher ist besser. Fällt er auf `THRESH` oder darunter, meldet `-H` `FAILED`. `PASSED` heißt also nur: Noch kein Attribut hat seine Schwelle erreicht. Aussagekräftiger ist `RAW_VALUE` bei vier Attributen. **5** zählt Sektoren, die die Platte schon durch Reservesektoren ersetzt hat. **187** zählt Lesefehler, die sie nicht korrigieren konnte. **197** zählt Sektoren, die sich gerade nicht lesen lassen und auf Ersatz warten, **198** Sektoren, die beim Offline-Test unlesbar waren. Steigen diese Werte, verliert die Platte Daten, auch wenn `-H` noch `PASSED` sagt. **199** zählt Übertragungsfehler auf dem Kabel und spricht eher für Kabel oder Anschluss.
+
+  NVMe-SSDs kennen diese Attribute nicht. `sudo smartctl -a /dev/nvme0` zeigt stattdessen ein festes Gesundheitsprotokoll:
+
+  ```text
+  SMART/Health Information (NVMe Log 0x02)
+  Critical Warning:                   0x00
+  Temperature:                        41 Celsius
+  Available Spare:                    100%
+  Available Spare Threshold:          10%
+  Percentage Used:                    7%
+  …
+  Media and Data Integrity Errors:    0
+  Error Information Log Entries:      0
+  ```
+
+  `Critical Warning` ungleich `0x00` ist ein Alarm. `Available Spare` nähert sich mit der Zeit `Available Spare Threshold`. `Percentage Used` schätzt den Verschleiß gegenüber der vom Hersteller angegebenen Lebensdauer und kann über 100 % steigen. `Media and Data Integrity Errors` größer 0 heißt: Die SSD hat Daten geliefert, die sie nicht korrigieren konnte. `smartctl -t short` beziehungsweise `-t long` startet einen Selbsttest, `smartctl -l selftest` zeigt die Ergebnisse ([smartmontools · FAQ](https://www.smartmontools.org/wiki/FAQ)).
+
+  > [!PRAXIS]
+  > Auf Servern überwacht der Dienst `smartd` aus demselben Paket die Werte und meldet Änderungen per Mail oder ins Journal. Steigen 5, 197 oder 198, tauschst du die Platte geplant, solange noch alles lesbar ist. In einem RAID ersetzt du sie, bevor eine zweite ausfällt.
 
   ## Backups sind Wiederherstellungsabläufe
 
@@ -135,14 +528,15 @@ lesson: |
 
   ## Häufige Fehler und Zusammenfassung
 
-  Verwechsele nie Gerätepfade und Mountpunkte. Ein belegtes `/srv` kann auf der Root-Partition liegen, obwohl ein Datenvolume geplant war. `nofail` ist kein Gesundheitscheck. Snapshots ersetzen keine unabhängige Kopie. Und eine grüne nächtliche Backupmeldung ersetzt keinen Restore-Test. Halte jeden Eingriff klein, sichere die Konfiguration und prüfe das Ergebnis mit einem zweiten, passenden Signal.
+  Verwechsele nie Gerätepfade und Mountpunkte. Ein belegtes `/srv` kann auf der Root-Partition liegen, obwohl ein Datenvolume geplant war. `lvextend` ohne `-r` vergrößert nur das Blockgerät, `df` bleibt beim alten Wert. `e2fsck` gehört auf ein ausgehängtes Dateisystem, und auf einer Platte mit Lesefehlern kommt die Sicherung vor der Reparatur. Ein Keyfile, das mit `echo` entstand, enthält einen Zeilenumbruch und passt nicht zur getippten Passphrase. `PASSED` von `smartctl -H` ist kein Gesundheitszeugnis. `nofail` ist kein Gesundheitscheck. Snapshots ersetzen keine unabhängige Kopie, und eine grüne nächtliche Backupmeldung ersetzt keinen Restore-Test.
 
-  - Identifiziere Gerät, Dateisystem und Mount vor jeder Änderung.
-  - UUIDs helfen bei dauerhafter Zuordnung.
-  - `df`, `du` und `df -i` beantworten unterschiedliche Fragen.
-  - Ein gelöschter Name bedeutet nicht sofort freigegebene Blöcke.
-  - Snapshots, Swap und LVM lösen verschiedene Probleme.
-  - Definiere Backupumfang, Aufbewahrung und Wiederherstellungsnachweis.
+  - Identifiziere Gerät, Dateisystem und Mount vor jeder Änderung: `lsblk -f`, `findmnt -T`, `blkid`.
+  - `df`, `du` und `df -i` beantworten unterschiedliche Fragen; ein gelöschter Name gibt nicht sofort Blöcke frei.
+  - LVM: PVs bilden eine VG, daraus entstehen LVs. `lvextend -r` vergrößert LV und Dateisystem zusammen.
+  - LUKS trennt Datenschlüssel und Passphrasen über Keyslots; crypttab und fstab öffnen und hängen beim Booten ein.
+  - `e2fsck -f -n` sieht nach, `e2fsck -f -y` repariert, beides nur ausgehängt. Verlorene Dateien landen in `lost+found`.
+  - `dmesg -T --level=err,warn` und `journalctl -k` zeigen Hardwarefehler, `smartctl` den Zustand der Platte.
+  - Snapshots, Swap und LVM lösen verschiedene Probleme; ein Backup beweist sich erst beim Restore.
 exercises:
   - id: schichten
     type: order
@@ -174,6 +568,37 @@ exercises:
     resources:
       - title: Btrfs · Subvolumes
         url: https://btrfs.readthedocs.io/en/latest/btrfs-subvolume.html
+  - id: lesefehler-zuerst
+    type: choice
+    title: Lesefehler im Kernel-Log
+    prompt: |
+      Auf einem Fileserver bricht seit gestern das nächtliche Backup ab. `sudo dmesg -T --level=err,warn` zeigt Dutzende solcher Blöcke. Was ist der richtige erste Schritt?
+    lang: text
+    code: |
+      [Wed Sep 30 03:12:44 2026] ata3.00: failed command: READ FPDMA QUEUED
+      [Wed Sep 30 03:12:44 2026] ata3.00: status: { DRDY ERR }
+      [Wed Sep 30 03:12:44 2026] ata3.00: error: { UNC }
+      [Wed Sep 30 03:12:44 2026] sd 2:0:0:0: [sdb] tag#7 Sense Key : Medium Error [current]
+      [Wed Sep 30 03:12:44 2026] sd 2:0:0:0: [sdb] tag#7 Add. Sense: Unrecovered read error - auto reallocate failed
+      [Wed Sep 30 03:12:44 2026] critical medium error, dev sdb, sector 81920 op 0x0:(READ) flags 0x0 phys_seg 1 prio class 2
+      [Wed Sep 30 03:12:45 2026] EXT4-fs error (device sdb1): __ext4_find_entry:1683: inode #393217: comm rsync: reading directory lblock 0
+    options:
+      - text: Die noch lesbaren Daten auf ein anderes Medium sichern, dann mit `smartctl` den Zustand von `sdb` prüfen und den Tausch planen.
+        correct: true
+        why: Die Platte kann Sektoren nicht mehr lesen. Jede weitere Last kann mehr Sektoren kosten, deshalb kommt die Sicherung zuerst.
+      - text: Sofort `sudo e2fsck -f -y /dev/sdb1` laufen lassen, damit das Dateisystem wieder konsistent ist.
+        correct: false
+        why: e2fsck repariert Strukturen des Dateisystems, keine defekten Sektoren. Auf einer ausfallenden Platte kann ein Reparaturlauf Einträge verwerfen, die sich noch retten ließen.
+      - text: Den Server neu starten, danach sind die Meldungen verschwunden.
+        correct: false
+        why: Ein Neustart leert nur den Ringpuffer. Die defekten Sektoren bleiben, und beim Booten liest die fsck-Prüfung womöglich gleich wieder darauf.
+      - text: Das SATA-Kabel tauschen, denn `ata3.00` meldet einen Fehler der Verbindung.
+        correct: false
+        why: "`UNC` und „Unrecovered read error“ heißen: Die Platte selbst kann den Sektor nicht lesen. Kabelprobleme zeigen sich als `ICRC`-Fehler, `SATA link down` und im SMART-Attribut 199."
+    explanation: Die Kette reicht von der Platte (`UNC`, uncorrectable) über den Medienfehler im Block-Layer bis zum ext4-Fehler. Die Ursache ist Hardware, und sie wird mit jedem Zugriff schlimmer. Deshalb zuerst sichern, was noch lesbar ist, notfalls als Abbild mit `ddrescue`, und erst danach auf einer Kopie oder neuen Platte reparieren.
+    resources:
+      - title: dmesg(1)
+        url: https://man7.org/linux/man-pages/man1/dmesg.1.html
   - id: dateilaenge
     type: output
     title: Logische Bytes zählen
@@ -239,6 +664,27 @@ exercises:
         answers: ["du -xhd1 /var", "du -h -x -d 1 /var", "du -h --one-file-system --max-depth=1 /var"]
     explanation: |
       `-x` begrenzt den Verzeichnislauf auf ein Dateisystem. Das macht die Summe besser mit der Belegung dieses Mounts vergleichbar.
+  - id: crypttab-name
+    type: bug
+    title: Das Volume ist offen, der Ordner leer
+    prompt: |
+      Nach dem Neustart bleibt `/srv/kunden` leer, obwohl `systemd-cryptsetup@kunden.service` aktiv ist. Etwa 90 Sekunden nach dem Start meldet das Journal `Timed out waiting for device dev-mapper-kundendaten.device - /dev/mapper/kundendaten.` Dienste und Monitoring erwarten den Mapping-Namen `kunden`. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: text
+    code: |
+      # /etc/crypttab
+      kunden  UUID=3c1f6a2e-8d47-4b1e-9f0a-2b7c5d9e4a11  /etc/cryptsetup-keys.d/kunden.key  luks
+
+      # /etc/fstab
+      /dev/mapper/kundendaten  /srv/kunden  ext4  defaults,nofail  0  2
+    lines: [5]
+    fix:
+      - line: 5
+        answers: ["/dev/mapper/kunden  /srv/kunden  ext4  defaults,nofail  0  2"]
+    explanation: |
+      Das erste Feld der crypttab ist der Name des Mappings: systemd-cryptsetup öffnet das Volume als `/dev/mapper/kunden`. Die fstab wartet aber auf `/dev/mapper/kundendaten`, ein Gerät, das nie erscheint. Nach dem Standard-Timeout von 90 Sekunden gibt systemd auf; `nofail` verhindert nur, dass der Boot daran hängen bleibt. Quelle in der fstab und Name in der crypttab müssen übereinstimmen.
+    resources:
+      - title: crypttab(5)
+        url: https://www.freedesktop.org/software/systemd/man/latest/crypttab.html
   - id: geloescht-offen
     type: explain
     title: Warum bleibt df voll?
@@ -257,6 +703,268 @@ exercises:
     resources:
       - title: unlink(2)
         url: https://man7.org/linux/man-pages/man2/unlink.2.html
+  - id: smart-lesen
+    type: explain
+    title: PASSED, aber …
+    prompt: Ein Kollege meint, die Platte sei in Ordnung, schließlich stehe da `PASSED`. Erkläre ihm, was diese Ausgabe wirklich sagt und was als Nächstes passieren sollte.
+    lang: text
+    code: |
+      $ sudo smartctl -H -A /dev/sdb
+      SMART overall-health self-assessment test result: PASSED
+
+      ID# ATTRIBUTE_NAME          FLAG     VALUE WORST THRESH TYPE      UPDATED  WHEN_FAILED RAW_VALUE
+        5 Reallocated_Sector_Ct   0x0033   097   097   010    Pre-fail  Always       -       152
+        9 Power_On_Hours          0x0032   061   061   000    Old_age   Always       -       34512
+      187 Reported_Uncorrect      0x0032   093   093   000    Old_age   Always       -       7
+      194 Temperature_Celsius     0x0022   035   049   000    Old_age   Always       -       35
+      197 Current_Pending_Sector  0x0012   100   100   000    Old_age   Always       -       24
+      198 Offline_Uncorrectable   0x0010   100   100   000    Old_age   Offline      -       24
+      199 UDMA_CRC_Error_Count    0x003e   200   200   000    Old_age   Always       -       0
+    points:
+      - "`PASSED` heißt nur, dass kein normierter Wert (`VALUE`) auf seine Schwelle (`THRESH`) gefallen ist."
+      - Die Rohwerte von 5, 187, 197 und 198 sind größer als 0, die Platte ersetzt Sektoren und kann weitere nicht lesen.
+      - Attribut 199 ist 0, ein Kabel- oder Anschlussproblem ist deshalb unwahrscheinlich.
+      - Nächster Schritt ist sichern und die Platte geplant tauschen, ohne auf `FAILED` zu warten.
+    explanation: |
+      Die Gesamtbewertung vergleicht nur die normierten Werte mit den Schwellen des Herstellers, und die liegen weit unten. Die Rohwerte erzählen etwas anderes: 152 Sektoren hat die Platte schon durch Reserve ersetzt (5), 24 kann sie gerade nicht lesen (197, 198), und 7 Mal hat sie unkorrigierbare Daten gemeldet (187). Diese vier Attribute sagen Ausfälle besser voraus als die Gesamtbewertung. Da 199 bei 0 steht, liegt es nicht am Kabel. Also: aktuelle Sicherung prüfen, Platte tauschen oder im RAID ersetzen, und `smartd` so einrichten, dass steigende Rohwerte gemeldet werden.
+    resources:
+      - title: smartctl(8)
+        url: https://manpages.debian.org/bookworm/smartmontools/smartctl.8.en.html
+      - title: smartmontools · FAQ
+        url: https://www.smartmontools.org/wiki/FAQ
+  - id: volume-voll
+    type: scenario
+    title: 95 Prozent und eine neue Platte
+    prompt: |
+      Das Monitoring von `web01` meldet: `/srv/data` ist zu 95 % belegt, die Uploads der Baustellen-App laufen in wenigen Stunden voll. Das Rechenzentrum hat dafür eine zweite 48-MiB-Platte angeschlossen (in dieser VM ein Loop-Device).
+
+      Gib `/srv/data` den ganzen Platz der neuen Platte, ohne die vorhandenen Daten anzufassen. Das Dateisystem soll dabei eingehängt bleiben. Du bist als `ops` angemeldet und hast `sudo`.
+    setup: |
+      set -e
+      export LVM_SUPPRESS_FD_WARNINGS=1
+      mkdir -p /var/lib/vdisks /srv/data /root/.lab
+      truncate -s 48M /var/lib/vdisks/disk1.img /var/lib/vdisks/disk2.img
+      losetup /dev/loop0 /var/lib/vdisks/disk1.img
+      pvcreate -q /dev/loop0
+      vgcreate -q vgdata /dev/loop0
+      lvcreate -q -l 100%FREE -n data vgdata
+      mkfs.ext4 -q -L data /dev/vgdata/data
+      mount /dev/vgdata/data /srv/data
+      mkdir -p /srv/data/uploads/2026-08 /srv/data/uploads/2026-09 /srv/data/export
+      for m in 08 09; do
+        for n in 1 2 3; do fallocate -l 5M /srv/data/uploads/2026-$m/aufmass-$n.pdf; done
+      done
+      fallocate -l 1500K /srv/data/uploads/2026-09/baustelle-nord.jpg
+      for i in $(seq 1 200); do printf 'A-%05d;2026-09-%02d;%d\n' $i $((i % 30 + 1)) $((i * 37 % 1000)); done > /srv/data/export/auftraege.csv
+      printf 'Freigaben Q3: Nord ok, Süd offen\n' > /srv/data/export/freigaben.txt
+      chown -R 1000:1000 /srv/data/uploads /srv/data/export
+      cd /srv/data
+      find . -path ./lost+found -prune -o -type f -printf '%s %p\n' | sort > /root/.lab/data.list
+      sha256sum export/* > /root/.lab/data.sha256
+      # Die neue, leere Platte
+      losetup /dev/loop1 /var/lib/vdisks/disk2.img
+    checks:
+      - name: /srv/data ist weiter das Logical Volume vgdata/data
+        run: |
+          src=$(findmnt -no SOURCE /srv/data)
+          echo "Eingehängt ist: ${src:-nichts}"
+          [ "$src" = /dev/mapper/vgdata-data ]
+      - name: vgdata/data nutzt beide Platten (mindestens 88 MiB)
+        run: |
+          mb=$(LVM_SUPPRESS_FD_WARNINGS=1 lvs --noheadings --nosuffix --units m -o lv_size vgdata/data | tr -d ' ')
+          echo "vgdata/data ist ${mb:-?} MiB groß"
+          [ "${mb%.*}" -ge 88 ]
+      - name: Das Dateisystem füllt das ganze Logical Volume
+        run: |
+          bs=$(dumpe2fs -h /dev/vgdata/data 2>/dev/null | awk -F: '/^Block size/ {print $2 + 0}')
+          bc=$(dumpe2fs -h /dev/vgdata/data 2>/dev/null | awk -F: '/^Block count/ {print $2 + 0}')
+          fs=$((bs * bc / 1048576))
+          lv=$(($(blockdev --getsize64 /dev/vgdata/data) / 1048576))
+          echo "Dateisystem: $fs MiB, Logical Volume: $lv MiB"
+          [ "$fs" -ge "$lv" ]
+      - name: Alle Dateien unter /srv/data sind unverändert
+        run: |
+          cd /srv/data
+          sha256sum --quiet -c /root/.lab/data.sha256 &&
+            find . -path ./lost+found -prune -o -type f -printf '%s %p\n' | sort | diff /root/.lab/data.list -
+    solution: |
+      # Was ist voll, und worauf liegt es?
+      df -hT /srv/data
+      lsblk
+      # Die Volume Group hat keinen Platz mehr (VFree 0), loop1 ist die neue Platte ohne Inhalt
+      sudo pvs
+      sudo vgs
+      sudo lvs
+      sudo blkid /dev/loop1 || echo "keine Signatur auf /dev/loop1"
+      # Neue Platte als PV vorbereiten, in die VG aufnehmen, LV und ext4 in einem Schritt vergrößern
+      sudo pvcreate /dev/loop1
+      sudo vgextend vgdata /dev/loop1
+      sudo lvextend -r -l +100%FREE vgdata/data
+      df -h /srv/data
+    hints:
+      - "Worauf liegt `/srv/data`? `df -hT /srv/data` und `lsblk` zeigen das Gerät. Welche Platte hat noch keine Kinder und kein Dateisystem?"
+      - "`sudo pvs`, `sudo vgs` und `sudo lvs`: Wie viel kann die Volume Group noch verteilen (`VFree`)? Eine neue Platte wird erst ein Physical Volume und dann Teil der VG."
+      - "`pvcreate`, `vgextend`, dann `lvextend -l +100%FREE`. Und das Dateisystem? Entweder `-r` oder danach `resize2fs`."
+    explanation: |
+      Die Volume Group `vgdata` hatte kein freies Extent mehr (`VFree 0`), also führt der Weg über die neue Platte. `pvcreate` schreibt die LVM-Signatur, `vgextend` nimmt das PV in die VG auf, `lvextend -l +100%FREE` gibt dem LV alle freien Extents, und `-r` vergrößert ext4 anschließend online mit `resize2fs`. Ohne `-r` wäre das LV 88 MiB groß, `df` zeigte aber weiter 37M, weil das Dateisystem seine Größe beim Anlegen festgelegt hat.
+
+      Keiner dieser Befehle verschiebt oder überschreibt belegte Extents, deshalb bleiben die Daten unberührt. Das LV liegt jetzt auf zwei Platten: Fällt eine aus, ist das ganze Dateisystem betroffen. Redundanz kommt von RAID, nicht von LVM.
+    resources:
+      - title: lvextend(8)
+        url: https://man7.org/linux/man-pages/man8/lvextend.8.html
+      - title: resize2fs(8)
+        url: https://man7.org/linux/man-pages/man8/resize2fs.8.html
+  - id: kundendaten-verschlossen
+    type: scenario
+    title: Die Kundendaten bleiben verschlossen
+    prompt: |
+      Nach dem Neustart von `web01` ist `/srv/kunden` leer. Die Kundendaten liegen auf einem LUKS-verschlüsselten Volume, das systemd beim Booten über `/etc/crypttab` mit dem Keyfile `/etc/cryptsetup-keys.d/kunden.key` öffnen soll. Ein Kollege hat das Keyfile gestern neu angelegt. Die Passphrase aus dem Passwortsafe lautet `Herbst-Kunden-2026`.
+
+      Finde heraus, warum das Volume verschlossen bleibt. Sorge dafür, dass das Keyfile an seinem Platz das Volume öffnet und nur für root lesbar ist. Hänge `/srv/kunden` danach über `/dev/mapper/kunden` wieder ein, so wie es crypttab und fstab vorsehen. Das Volume liegt in dieser VM auf einem Loop-Device.
+    setup: |
+      set -e
+      mkdir -p /var/lib/vdisks /srv/kunden /root/.lab/seed/vertraege
+      cd /root/.lab/seed
+      printf 'kunde_nr;name;ort\nK-001;Bäckerei Lindner;Kassel\nK-002;Autohaus Brandt;Fulda\nK-003;Praxis Dr. Öztürk;Marburg\n' > kundenliste.csv
+      printf 'Rahmenvertrag K-002, Laufzeit bis 2027-06-30\n' > vertraege/K-002.txt
+      sha256sum kundenliste.csv vertraege/K-002.txt > /root/.lab/kunden.sha256
+      cd /
+      truncate -s 32M /var/lib/vdisks/kunden.img
+      printf '%s' 'Herbst-Kunden-2026' > /root/.lab/pw
+      cryptsetup luksFormat -q --pbkdf pbkdf2 --pbkdf-force-iterations 1000 --key-file /root/.lab/pw /var/lib/vdisks/kunden.img
+      cryptsetup open --key-file /root/.lab/pw /var/lib/vdisks/kunden.img aufbau
+      mkfs.ext4 -q -L kunden -d /root/.lab/seed /dev/mapper/aufbau
+      cryptsetup close aufbau
+      rm -rf /root/.lab/pw /root/.lab/seed
+      losetup /dev/loop0 /var/lib/vdisks/kunden.img
+      # Das Keyfile, so wie der Kollege es angelegt hat
+      mkdir -p /etc/cryptsetup-keys.d
+      echo 'Herbst-Kunden-2026' > /etc/cryptsetup-keys.d/kunden.key
+      chmod 644 /etc/cryptsetup-keys.d/kunden.key
+      echo "kunden  UUID=$(cryptsetup luksUUID /dev/loop0)  /etc/cryptsetup-keys.d/kunden.key  luks,headless=true" >> /etc/crypttab
+      echo '/dev/mapper/kunden  /srv/kunden  ext4  defaults,nofail  0  2' >> /etc/fstab
+      systemctl daemon-reload
+      # Wie beim Booten: systemd versucht, das Volume zu öffnen
+      systemctl start systemd-cryptsetup@kunden.service 2>/dev/null || true
+    checks:
+      - name: Das Keyfile öffnet das Volume
+        run: cryptsetup open --test-passphrase --key-file /etc/cryptsetup-keys.d/kunden.key /var/lib/vdisks/kunden.img
+      - name: Nur root kann das Keyfile lesen
+        run: |
+          set -- $(stat -c '%U %a' /etc/cryptsetup-keys.d/kunden.key)
+          echo "Besitzer $1, Rechte $2"
+          [ "$1" = root ] && [ $((0$2 & 077)) -eq 0 ]
+      - name: /srv/kunden ist über /dev/mapper/kunden eingehängt
+        run: |
+          src=$(findmnt -no SOURCE /srv/kunden)
+          echo "Eingehängt ist: ${src:-nichts}"
+          [ "$src" = /dev/mapper/kunden ]
+      - name: Die Kundendaten sind lesbar und unverändert
+        run: cd /srv/kunden && sha256sum -c /root/.lab/kunden.sha256
+    solution: |
+      # Das Volume ist zu: crypto_LUKS ohne Mapping darüber
+      lsblk -f
+      systemctl --failed --no-pager
+      journalctl -b -u systemd-cryptsetup@kunden --no-pager
+      # „Key data incorrect?“ Die Passphrase aus dem Safe passt (printf schreibt sie ohne Zeilenumbruch) ...
+      printf '%s' 'Herbst-Kunden-2026' | sudo cryptsetup open --test-passphrase --key-file - /dev/loop0 && echo "Passphrase passt"
+      # ... das Keyfile nicht. Am Ende steht ein \n, das echo angehängt hat.
+      sudo od -c /etc/cryptsetup-keys.d/kunden.key
+      printf '%s' 'Herbst-Kunden-2026' | sudo tee /etc/cryptsetup-keys.d/kunden.key > /dev/null
+      sudo chmod 600 /etc/cryptsetup-keys.d/kunden.key
+      # Denselben Weg nehmen wie der Boot: erst die crypttab-Unit, dann die fstab
+      sudo systemctl start systemd-cryptsetup@kunden.service
+      sudo mount /srv/kunden
+      ls /srv/kunden
+    hints:
+      - "`systemctl --failed` zeigt, welche Unit beim Start gescheitert ist, `journalctl -b -u <unit>` die Begründung."
+      - "Passt die Passphrase selbst? `sudo cryptsetup open --test-passphrase /dev/loop0` fragt sie ab, ohne etwas zu öffnen. Versuch dasselbe mit `--key-file`."
+      - "Wie viele Zeichen hat die Passphrase, wie viele Bytes das Keyfile? `sudo od -c /etc/cryptsetup-keys.d/kunden.key` zeigt jedes Byte, auch unsichtbare."
+    explanation: |
+      Der Kollege hat das Keyfile mit `echo` geschrieben, und `echo` hängt einen Zeilenumbruch an. cryptsetup liest ein Keyfile vollständig, also lautete der Schlüssel `Herbst-Kunden-2026\n` und passte zu keinem Keyslot. Eine Passphrase am Prompt endet dagegen am Zeilenumbruch, deshalb funktionierte sie von Hand. `printf '%s'` schreibt sie ohne Umbruch. Das Journal von `systemd-cryptsetup@kunden.service` nannte beide Probleme: „Key data incorrect?“ und die Rechte 0644.
+
+      Sauberer als eine Passphrase im Keyfile ist ein Keyfile aus Zufallsbytes (`head -c 64 /dev/urandom`) in einem eigenen Keyslot, angemeldet mit `cryptsetup luksAddKey`. Dann bleibt die Passphrase im Safe und lässt sich unabhängig vom Keyfile wechseln.
+    resources:
+      - title: crypttab(5)
+        url: https://www.freedesktop.org/software/systemd/man/latest/crypttab.html
+      - title: cryptsetup(8) (Debian 12, Passphrase processing)
+        url: https://manpages.debian.org/bookworm/cryptsetup-bin/cryptsetup.8.en.html
+  - id: archiv-nach-stromausfall
+    type: scenario
+    title: Nach dem Stromausfall fehlt das Archiv
+    prompt: |
+      Heute Nacht ist im Rechenzentrum der Strom ausgefallen, `web01` ist danach neu gestartet. Seitdem ist `/srv/archiv` leer, und die Buchhaltung kommt nicht an ihre Belege. Laut Inventarliste lagen in `/srv/archiv/2026/q3/` zwei Dateien: `rechnungen-q3.csv` und `gutschriften-q3.csv`.
+
+      Finde heraus, was beim Start schiefging, repariere das Dateisystem und hänge `/srv/archiv` wieder beschreibbar ein. Am Ende liegen beide Q3-Dateien wieder unter ihrem Namen an ihrem Platz. Das Archiv liegt in dieser VM auf einem Loop-Device, auf einem echten Server wäre es eine Partition.
+    setup: |
+      set -e
+      mkdir -p /var/lib/vdisks /srv/archiv /root/.lab/seed/2026/q2 /root/.lab/seed/2026/q3
+      cd /root/.lab/seed/2026
+      echo 'rechnung_nr;kunde;datum;betrag_eur' | tee q2/rechnungen-q2.csv > q3/rechnungen-q3.csv
+      echo 'gutschrift_nr;rechnung_nr;datum;betrag_eur' > q3/gutschriften-q3.csv
+      for i in $(seq 1 40); do
+        printf 'R-2026-%04d;K-%03d;2026-%02d-%02d;%d.%02d\n' $((1000 + i)) $((i * 7 % 97)) $((4 + i % 3)) $((i % 28 + 1)) $((i * 37 % 900 + 50)) $((i * 13 % 100)) >> q2/rechnungen-q2.csv
+        printf 'R-2026-%04d;K-%03d;2026-%02d-%02d;%d.%02d\n' $((2000 + i)) $((i * 11 % 97)) $((7 + i % 3)) $((i % 28 + 1)) $((i * 41 % 900 + 50)) $((i * 17 % 100)) >> q3/rechnungen-q3.csv
+      done
+      for i in 1 2 3 4 5; do
+        printf 'G-2026-%03d;R-2026-%04d;2026-09-%02d;-%d.00\n' $i $((2000 + i * 6)) $((i * 5)) $((i * 20)) >> q3/gutschriften-q3.csv
+      done
+      cd /root/.lab/seed
+      sha256sum 2026/q3/* > /root/.lab/q3.sha256
+      truncate -s 16M /var/lib/vdisks/archiv.img
+      mkfs.ext4 -q -L archiv -d /root/.lab/seed /var/lib/vdisks/archiv.img
+      cd /
+      rm -rf /root/.lab/seed
+      # Der Stromausfall: Der Inode des Verzeichnisses 2026/q3 und ein Gruppendeskriptor sind beschädigt
+      debugfs -w -R 'clri /2026/q3' /var/lib/vdisks/archiv.img 2>/dev/null
+      debugfs -w -R 'set_bg 1 checksum 0' /var/lib/vdisks/archiv.img 2>/dev/null
+      losetup /dev/loop0 /var/lib/vdisks/archiv.img
+      echo 'LABEL=archiv  /srv/archiv  ext4  defaults,nofail  0  2' >> /etc/fstab
+      systemctl daemon-reload
+      # Wie beim Booten: systemd-fsck prüft vor dem Einhängen
+      systemctl start srv-archiv.mount 2>/dev/null || true
+    checks:
+      - name: /srv/archiv ist beschreibbar eingehängt
+        run: findmnt -n -O rw /srv/archiv || { echo "/srv/archiv ist nicht beschreibbar eingehängt"; exit 1; }
+      - name: Der Superblock meldet ein sauberes Dateisystem
+        run: |
+          state=$(dumpe2fs -h /dev/disk/by-label/archiv 2>/dev/null | sed -n 's/^Filesystem state: *//p')
+          echo "Filesystem state: ${state:-unbekannt}"
+          [ "$state" = clean ]
+      - name: Rechnungen und Gutschriften für Q3 liegen wieder unter /srv/archiv/2026/q3
+        run: cd /srv/archiv && sha256sum -c /root/.lab/q3.sha256
+    solution: |
+      # /srv/archiv ist leer, weil nichts eingehängt ist. Die Prüfung vor dem Einhängen ist gescheitert:
+      findmnt /srv/archiv || echo "nicht eingehängt"
+      systemctl --failed --no-pager
+      journalctl -b -u 'systemd-fsck@*' --no-pager | tail -n 8
+      # „UNEXPECTED INCONSISTENCY; RUN fsck MANUALLY“: von Hand prüfen, ausgehängt, vollständig (-f), alle Reparaturen (-y)
+      lsblk -f
+      sudo e2fsck -f -y /dev/disk/by-label/archiv
+      # Exit-Code 1: Fehler behoben. Ein zweiter Lauf zur Kontrolle, nur lesend:
+      sudo e2fsck -f -n /dev/disk/by-label/archiv
+      sudo mount /srv/archiv
+      # 2026/q3 gibt es nicht mehr; e2fsck hat die Dateien ohne Namen nach lost+found gehängt (nur root darf hinein)
+      ls /srv/archiv/2026
+      sudo ls -l /srv/archiv/lost+found
+      sudo sh -c 'head -n 2 /srv/archiv/lost+found/*'
+      sudo mkdir /srv/archiv/2026/q3
+      sudo mv "$(sudo grep -rl '^rechnung_nr;' /srv/archiv/lost+found)" /srv/archiv/2026/q3/rechnungen-q3.csv
+      sudo mv "$(sudo grep -rl '^gutschrift_nr;' /srv/archiv/lost+found)" /srv/archiv/2026/q3/gutschriften-q3.csv
+      ls -l /srv/archiv/2026/q3
+    hints:
+      - "`systemctl --failed` und `journalctl -b -u 'systemd-fsck@*'`: Was hat die Prüfung vor dem Einhängen gemeldet?"
+      - "„RUN fsck MANUALLY“ heißt: `e2fsck` von Hand, auf dem **ausgehängten** Gerät, mit `-f`. Das Gerät zeigt `lsblk -f`, oder du nimmst `/dev/disk/by-label/archiv`."
+      - "Dateien ohne Verzeichniseintrag hängt `e2fsck` unter `lost+found` ein, benannt nach ihrer Inode-Nummer. Welche ist welche? Die erste Zeile verrät es."
+    explanation: |
+      Der Stromausfall hat zwei Dinge beschädigt: die Prüfsumme eines Gruppendeskriptors und den Inode des Verzeichnisses `2026/q3`. Beim Start lief `systemd-fsck@` im Preen-Modus. Er reparierte die Prüfsumme und entfernte den kaputten Verzeichniseintrag, stieß dann aber auf Dateien ohne Verzeichnis. Die darf er nicht ohne Rückfrage verschieben, also brach er mit „UNEXPECTED INCONSISTENCY; RUN fsck MANUALLY“ ab, und der Mount fiel aus. `nofail` hielt den Boot am Laufen. `e2fsck -f -y` auf dem ausgehängten Gerät hängte die verwaisten Inodes unter `lost+found` ein: Name und Verzeichnis waren verloren, der Inhalt nicht.
+
+      Wer vor der Reparatur einhängt, sieht einen Teil der Daten und übersieht leicht, dass Dateien fehlen. Statt `mount` startet `sudo systemctl start srv-archiv.mount` denselben Weg wie der Boot, mit erneuter Prüfung davor.
+    resources:
+      - title: e2fsck(8) · Exit Code
+        url: https://man7.org/linux/man-pages/man8/e2fsck.8.html#EXIT_CODE
+      - title: systemd-fsck@.service
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemd-fsck@.service.html
   - id: restore-probe
     type: practice
     title: Wiederherstellung nachweisen

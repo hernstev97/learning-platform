@@ -25,7 +25,7 @@ pnpm dev            # http://127.0.0.1:5180
 | `pnpm test` | Unit-Tests (Prüflogik, Speicher, Bear-Rekonstruktion, Inhalte) |
 | `pnpm lint`, `pnpm typecheck` | ESLint und strikte TypeScript-Prüfung einschließlich Backend |
 | `pnpm test:convex:e2e` | Echte lokale Convex-Verbindung und mehrere Browsersitzungen; Setup in docs/CONVEX.md |
-| `pnpm test:e2e` | Browser-Tests aller Lernbereiche, elf Übungsarten, Python- und SQL-Laufzeit, Linux-VM, Lernstand und Bear-Track |
+| `pnpm test:e2e` | Browser-Tests aller Lernbereiche, elf Übungsarten, Python- und SQL-Laufzeit, Linux-VM in Übung und Lektion, Lernstand und Bear-Track |
 | `pnpm test:pwa:e2e` | Produktionsbuild mit Service Worker: Installierbarkeit und Offline-Lesen |
 | `pnpm build` | TypeScript prüfen und statisch nach `dist/` bauen |
 | `pnpm bear:build`, `pnpm bear:check` | Bear-Track aus dem gepinnten Snapshot erzeugen bzw. prüfen |
@@ -42,7 +42,7 @@ tooling/content.ts         Lädt, validiert und normalisiert alle Inhalte (Build
 tooling/markdown.ts        Markdown → HTML zur Build-Zeit (Callouts, Codeblöcke, Inhaltsverzeichnis)
 tooling/search-index.ts    Suchindex zur Build-Zeit (Klartext je Modul, Abschnitt, Begriff, Projekt und Karte)
 tooling/vite-plugins.ts    Inhalte als virtuelle Module (ein Chunk pro Bereich), Pyodide und Linux-VM selbst gehostet
-tooling/vm/                Debian-Image für Linux-Szenarien bauen (pnpm vm:build) und Szenarien darin prüfen (pnpm vm:verify)
+tooling/vm/                Debian-Image samt GRUB-Bootplatte bauen (pnpm vm:build), Szenarien und vm-Blöcke darin prüfen (pnpm vm:verify), Skripte ausprobieren (pnpm vm:run)
 tooling/verify-code.ts     Führt Musterlösungen und Beispiele aus
 tooling/fixtures/          Beispielbereich mit jeder Übungsart (Tests, Vorlage)
 src/engine/                Prüflogik (tokenbasiert je Sprache), Highlighter, Lernstand, Suche (Treffer und Ranking), Wiederholungsregeln und Schwachstellenanalyse
@@ -55,7 +55,7 @@ src/exercises/             Die elf Übungsarten
 src/ui/search.ts           Suchdialog mit Tastaturbedienung
 src/pages/                 Startseite, Bereich, Lektion, Übung, Karten, Wiederholen, Projekte, Nachschlageseiten, Daten
 src/python/                Pyodide-Worker und Harness für Python und SQLite (dieselbe Harness nutzt pnpm verify)
-src/vm/                    Linux-VM im Browser (v86): Laden, Snapshot, Steuerkanal, Prüfungen
+src/vm/                    Linux-VM im Browser (v86): Laden, Snapshot, Steuerkanal, Prüfungen, Terminal in Übungen und Lektionen
 vendor/pyodide/            Zusätzliche Pyodide-Pakete (tzdata, beautifulsoup4, PyYAML, pandas mit numpy)
 vendor/vm/                 Gebautes Debian-Image samt Snapshot für die Linux-VM
 ```
@@ -78,7 +78,7 @@ Das Design (hell oder dunkel) folgt der Systemeinstellung, bis es über den Scha
 
 - **Lückencode, Terminal, Fehlerkorrektur:** tokenweiser Vergleich mit den akzeptierten Antworten, je nach Sprache (Python: `'a'` = `"a"`; Shell: `-la` = `-al` = `-l -a`, harmlose Anführungszeichen egal). Es wird kein Compiler ausgeführt; gleichwertige Umformulierungen müssen als Alternative hinterlegt sein.
 - **Python-Code:** läuft wirklich – in Pyodide (Python 3.14, pandas 3.0) in einem Web Worker mit Zeitlimit, gegen die Tests der Übung. Kein Netzwerk, keine Threads, kein `subprocess`.
-- **Linux-Szenarien:** ein echtes Debian 12 mit systemd läuft in v86 (x86-Emulator in WebAssembly), ohne Netzwerk. Geprüft wird der Zustand der VM mit Shell-Befehlen, nicht der Weg dorthin.
+- **Linux-Szenarien:** ein echtes Debian 12 mit systemd läuft in v86 (x86-Emulator in WebAssembly), ohne Netzwerk. Es bootet über GRUB von einer emulierten Platte, `sudo reboot` startet also wirklich neu. Geprüft wird der Zustand der VM mit Shell-Befehlen, nicht der Weg dorthin. Dieselbe VM steht in Linux-Lektionen als Terminal bereit: Beispiele mit „Im Terminal“ laufen dort, `pnpm vm:verify` führt sie vorher aus.
 - **SQL-Abfragen:** laufen wirklich – SQLite 3.39 in Pyodide, gegen eine frische Datenbank je Lauf. Verglichen wird das Ergebnis mit dem der Musterlösung (Spalten, Werte, bei Bedarf Reihenfolge), nicht der Text der Abfrage.
 - **Excel-Formeln und Power Query:** tokenweiser Vergleich wie bei Lückencode; deutsche und englische Funktionsnamen und `;`/`,` gelten als gleich. Excel selbst läuft nicht.
 - **Ausgabe vorhersagen:** zeilenweiser Vergleich; die erwarteten Ausgaben stammen aus echten Läufen (`pnpm verify`).

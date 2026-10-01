@@ -1,29 +1,69 @@
 id: netzwerk-ssh
 title: Netzwerk & SSH
 level: 2
-minutes: 180
-summary: Wie Pakete ihren Weg finden, wie du Verbindungsprobleme Schicht für Schicht eingrenzt und wie du mit SSH, curl und rsync sicher und bequem mit Servern arbeitest.
+minutes: 270
+summary: Wie Pakete ihren Weg finden, wie Namen zu Adressen werden, wie du Verbindungsprobleme Schicht für Schicht eingrenzt und wie du mit SSH, curl und rsync sicher und bequem mit Servern arbeitest.
 goals:
-  - Du erklärst IP-Adresse, Subnetz (CIDR), Gateway, DNS, Ports sowie den Unterschied zwischen TCP und UDP und liest `ip addr`, `ip route` und `ss -tulpn`.
-  - Du grenzt ein Verbindungsproblem systematisch ein – Name, Route, Port, Dienst – mit `resolvectl`, `dig`, `ping`, `tracepath` und `curl`.
-  - Du richtest SSH mit ed25519-Schlüsseln, `~/.ssh/config` und ssh-agent ein und reagierst richtig auf Host-Key-Warnungen.
+  - Du erklärst IP-Adresse, Subnetz (CIDR), Gateway, Ports, TCP und UDP sowie das Prinzip einer Host-Firewall und liest `ip addr`, `ip route` und `ss -tulpn`.
+  - Du richtest eine Schnittstelle dauerhaft mit `nmcli` oder systemd-networkd ein und erkennst, welches Werkzeug ein System verwaltet.
+  - Du verfolgst einen Namen über `/etc/nsswitch.conf`, `/etc/hosts` und `/etc/resolv.conf`, kennst die wichtigen Record-Typen und unterscheidest NXDOMAIN, SERVFAIL und „Temporary failure in name resolution“ mit `getent`, `dig` und `resolvectl`.
+  - Du schneidest mit `tcpdump` gezielt Verkehr mit und liest DNS-Anfragen und TCP-Handshakes.
+  - Du richtest SSH mit ed25519-Schlüsseln, `~/.ssh/config` und ssh-agent ein und findest heraus, warum ein Server einen Schlüssel ablehnt.
   - Du nutzt Port-Forwarding (`-L`, `-R`) und Jump Hosts (`-J`) und überträgst Dateien mit `rsync`, ohne dich von Schrägstrichen und `--delete` überraschen zu lassen.
-  - Du kennst das Konzept einer Host-Firewall (nftables, ufw, firewalld).
 resources:
   - title: ss(8)
     url: https://man7.org/linux/man-pages/man8/ss.8.html
+  - title: resolv.conf(5)
+    url: https://man7.org/linux/man-pages/man5/resolv.conf.5.html
+  - title: tcpdump(1)
+    url: https://www.tcpdump.org/manpages/tcpdump.1.html
   - title: ssh(1) – OpenSSH
     url: https://man.openbsd.org/ssh.1
-  - title: ssh_config(5) – OpenSSH
-    url: https://man.openbsd.org/ssh_config.5
   - title: rsync(1)
     url: https://download.samba.org/pub/rsync/rsync.1
-  - title: curl – Handbuchseite
-    url: https://curl.se/docs/manpage.html
+lab: |
+  set -e
+  # Firmen-DNS ns1.corp.internal auf 127.0.10.53, zuständig für corp.internal.
+  cat > /etc/corp-dns.conf <<'EOF'
+  domain-needed
+  local-ttl=300
+  local=/corp.internal/
+  host-record=ns1.corp.internal,127.0.10.53
+  host-record=db.corp.internal,127.0.20.5
+  host-record=api.corp.internal,127.0.20.6
+  cname=www.corp.internal,api.corp.internal
+  host-record=mail.corp.internal,127.0.20.25
+  mx-host=corp.internal,mail.corp.internal,10
+  txt-record=corp.internal,"v=spf1 mx -all"
+  server=/partner.example/127.0.40.53
+  EOF
+  systemd-run --unit=corp-dns --quiet dnsmasq -k --listen-address=127.0.10.53 --bind-interfaces --no-resolv --no-hosts --conf-file=/etc/corp-dns.conf
+  # Der DNS-Server des Partners ist kaputt: Er beantwortet jede Anfrage mit SERVFAIL.
+  cat > /usr/local/sbin/servfail-dns <<'EOF'
+  #!/usr/bin/perl
+  use strict; use warnings; use IO::Socket::INET;
+  my $s = IO::Socket::INET->new(LocalAddr => $ARGV[0], LocalPort => 53, Proto => 'udp') or die "bind: $!";
+  while (1) {
+    my $peer = $s->recv(my $q, 512) // next;
+    next if length($q) < 17;
+    my $i = 12;
+    $i += 1 + ord(substr($q, $i, 1)) while $i < length($q) && ord(substr($q, $i, 1));
+    $i += 5;
+    $s->send(substr($q, 0, 2) . pack('n5', 0x8182, 1, 0, 0, 0) . substr($q, 12, $i - 12), 0, $peer);
+  }
+  EOF
+  chmod 755 /usr/local/sbin/servfail-dns
+  systemd-run --unit=partner-dns --quiet /usr/local/sbin/servfail-dns 127.0.40.53
+  printf 'search corp.internal\nnameserver 127.0.10.53\n' > /etc/resolv.conf
+  echo '127.0.0.1 api.shop.test' >> /etc/hosts
+  # Eine kleine API auf api.corp.internal:8080.
+  mkdir -p /srv/api
+  echo ok > /srv/api/health
+  systemd-run --unit=api --quiet busybox httpd -f -p 127.0.20.6:8080 -h /srv/api
 lesson: |
   Dein Frontend meldet „Network Error“ beim Aufruf der API auf dem Staging-Server. Ist der Name falsch aufgelöst? Fehlt eine Route? Blockiert eine Firewall den Port? Läuft der Dienst gar nicht – oder lauscht er nur auf `127.0.0.1`? Wer diese Fragen der Reihe nach mit je einem Befehl beantworten kann, findet die Ursache in Minuten statt in Stunden. Und für fast alles, was danach kommt – Logs lesen, deployen, eine Datenbank untersuchen –, verbindest du dich per SSH mit dem Server.
 
-  Dieses Modul baut zuerst das Denkmodell auf und führt dann durch die Werkzeuge in genau der Reihenfolge, in der du sie bei der Fehlersuche brauchst.
+  Dieses Modul baut zuerst das Denkmodell auf und führt dann durch die Werkzeuge in genau der Reihenfolge, in der du sie bei der Fehlersuche brauchst. Die Beispiele mit „Im Terminal“ kannst du in einem Debian 12 ausprobieren, in dem schon ein kleiner Firmen-DNS für `corp.internal` und eine Test-API laufen.
 
   ## Das Modell: Adresse, Netz, Gateway, Name, Port
 
@@ -61,6 +101,19 @@ lesson: |
 
   `ip -br addr` (brief) zeigt pro Schnittstelle Zustand und Adressen; `ip link` nur die Schnittstellen selbst. `fe80::…` ist eine link-lokale IPv6-Adresse, die nur im lokalen Segment gilt. In der Routing-Tabelle gewinnt immer die **spezifischste** passende Route (längstes Präfix): Für `172.17.0.5` passt `172.17.0.0/16` (Docker-Bridge), für alles ohne speziellere Route gilt `default`. `ip route get` beantwortet die Frage „Welchen Weg nimmt ein Paket zu dieser Adresse?“ direkt ([ip-route(8)](https://man7.org/linux/man-pages/man8/ip-route.8.html)).
 
+  Die Übungs-VM zeigt das Modell von einer ungewohnten Seite. Sie hat keine Netzwerkkarte, nur Loopback:
+
+  ```console vm
+  $ ip -br addr
+  lo               UNKNOWN        127.0.0.1/8 ::1/128
+  $ ip route
+  $ ip route get 127.0.20.6
+  local 127.0.20.6 dev lo src 127.0.0.1 uid 1000
+      cache <local>
+  ```
+
+  Die Haupttabelle ist leer: keine Default-Route, kein Gateway, das Internet ist nicht erreichbar. Trotzdem kommt die VM an `127.0.20.6`, denn der Kernel trägt das ganze Netz `127.0.0.0/8` in die Tabelle `local` ein (`ip route show table local`). Jede Adresse daraus landet auf `lo`. Deshalb kann in der VM jede `127.x`-Adresse einen „fremden“ Server spielen, hier den DNS-Server `127.0.10.53` und eine API auf `127.0.20.6`.
+
   Welche Ports offen sind und welcher Prozess dahintersteckt, zeigt [`ss`](https://man7.org/linux/man-pages/man8/ss.8.html):
 
   ```console
@@ -72,30 +125,223 @@ lesson: |
   tcp   LISTEN 0      2048       127.0.0.1:8000       0.0.0.0:*     users:(("gunicorn",pid=2231,fd=5))
   ```
 
-  Die Optionen lesen sich als Satz: **t**cp, **u**dp, **l**istening, **p**rocesses, **n**umeric (Ports als Zahl statt Namen). Ohne `sudo` siehst du die Prozesse fremder Benutzer nicht. `netstat` aus net-tools kann Ähnliches, ist aber veraltet; `ss` fragt den Kernel direkt und ist auf jedem aktuellen System vorhanden. Suchst du nur einen Port: `ss -ltnp 'sport = :5173'`.
+  Die Optionen lesen sich als Satz: **t**cp, **u**dp, **l**istening, **p**rocesses, **n**umeric (Ports als Zahl statt Namen). Ohne `sudo` siehst du die Prozesse fremder Benutzer nicht. `netstat` aus net-tools kann Ähnliches, ist aber veraltet; `ss` fragt den Kernel direkt und ist auf jedem aktuellen System vorhanden. Suchst du nur einen Port: `ss -ltnp 'sport = :5173'`. In der VM lauschen der Firmen-DNS, die Test-API und sshd:
 
-  ## Erreichbarkeit und Namen
-
-  [`ping`](https://man7.org/linux/man-pages/man8/ping.8.html) schickt ICMP-Echo-Anfragen und misst die Antwortzeit; `ping -c 3 1.1.1.1` hört nach drei Paketen auf. Kommt keine Antwort, ist das noch kein Beweis: Viele Server und Cloud-Firewalls blockieren ICMP. [`tracepath`](https://man7.org/linux/man-pages/man8/tracepath.8.html) (oder `traceroute`, `mtr`) zeigt die Router auf dem Weg und damit, **wo** Pakete hängen bleiben.
-
-  **DNS.** Wenn ein Programm einen Namen auflöst, fragt es nicht direkt einen DNS-Server, sondern die C-Bibliothek. Die richtet sich nach `/etc/nsswitch.conf` ([nsswitch.conf(5)](https://man7.org/linux/man-pages/man5/nsswitch.conf.5.html)): Dort steht, welche Quellen in welcher Reihenfolge gefragt werden – typischerweise die Datei [`/etc/hosts`](https://man7.org/linux/man-pages/man5/hosts.5.html) und DNS. Auf CachyOS, Arch, Fedora und Ubuntu übernimmt [systemd-resolved](https://www.freedesktop.org/software/systemd/man/latest/systemd-resolved.service.html) die DNS-Auflösung: `/etc/resolv.conf` zeigt dann auf den lokalen Stub `127.0.0.53`, und die echten DNS-Server stehen in `resolvectl status`.
-
-  ```console
-  $ resolvectl query api.shop.example
-  api.shop.example: 203.0.113.10                   -- link: enp4s0
-  $ dig +short api.shop.example
-  203.0.113.10
-  $ dig @1.1.1.1 +short api.shop.example
-  203.0.113.10
-  $ getent hosts api.shop.test
-  127.0.0.1       api.shop.test
+  ```console vm
+  $ sudo ss -ltnp
+  State  Recv-Q Send-Q Local Address:Port Peer Address:PortProcess
+  LISTEN 0      0        127.0.10.53:53        0.0.0.0:*    users:(("dnsmasq",pid=323,fd=5))
+  LISTEN 0      0         127.0.20.6:8080      0.0.0.0:*    users:(("busybox",pid=330,fd=3))
+  LISTEN 0      0            0.0.0.0:22        0.0.0.0:*    users:(("sshd",pid=238,fd=3))
+  LISTEN 0      0                  *:22              *:*    users:(("sshd",pid=238,fd=4))
   ```
 
-  Die Werkzeuge beantworten unterschiedliche Fragen. `dig` spricht DNS direkt und ignoriert `/etc/hosts`; mit `@server` fragst du gezielt einen bestimmten DNS-Server – ideal, um zu prüfen, ob ein neuer Eintrag schon weltweit sichtbar ist. `getent hosts` und [`resolvectl query`](https://www.freedesktop.org/software/systemd/man/latest/resolvectl.html) gehen denselben Weg wie deine Programme, inklusive `/etc/hosts`. Liefert `dig` die richtige Adresse, dein Browser aber eine andere, steckt oft ein alter Eintrag in `/etc/hosts` oder ein Cache dahinter (`resolvectl flush-caches`).
+  ## Netzwerk dauerhaft konfigurieren: NetworkManager, systemd-networkd, ifupdown
+
+  `ip addr add` und `ip route add` ändern nur den laufenden Kernel, nach dem nächsten Boot ist alles weg. Dauerhaft richtet ein Netzwerkdienst die Schnittstellen ein, und für jede Schnittstelle sollte genau einer zuständig sein:
+
+  | Werkzeug | Typisch auf | Konfiguration | Bedienung |
+  | --- | --- | --- | --- |
+  | NetworkManager | Desktops (CachyOS, Fedora, Ubuntu Desktop), Fedora- und RHEL-Server | Profile in `/etc/NetworkManager/system-connections/` | `nmcli`, `nmtui`, Applet im Desktop |
+  | systemd-networkd | Server und Container, Ubuntu Server (über netplan) | `.network`-Dateien in `/etc/systemd/network/` | `networkctl` |
+  | ifupdown | Debian-Server aus dem Installer | `/etc/network/interfaces` | `ifup`, `ifdown` |
+
+  **NetworkManager** verwaltet Verbindungsprofile. Ein Profil gehört zu einem Gerät oder einem WLAN und enthält Adressen, Gateway und DNS-Server. `nmcli connection modify` ändert das gespeicherte Profil, wirksam wird es mit `nmcli connection up` ([nmcli(1)](https://networkmanager.dev/docs/api/latest/nmcli.html)):
+
+  ```console
+  $ nmcli device status
+  DEVICE  TYPE      STATE         CONNECTION
+  enp4s0  ethernet  connected     Wired connection 1
+  wlan0   wifi      disconnected  --
+  $ sudo nmcli connection modify "Wired connection 1" \
+        ipv4.method manual ipv4.addresses 192.168.178.50/24 \
+        ipv4.gateway 192.168.178.1 ipv4.dns 192.168.178.1
+  $ sudo nmcli connection up "Wired connection 1"
+  ```
+
+  Mit `ipv4.method auto` kehrst du zu DHCP zurück. NetworkManager schreibt auch `/etc/resolv.conf` oder gibt die DNS-Server an systemd-resolved weiter. Von Hand geänderte DNS-Einträge in dieser Datei sind deshalb beim nächsten Verbindungswechsel weg; sie gehören ins Profil.
+
+  **systemd-networkd** liest `.network`-Dateien. `[Match]` wählt die Schnittstelle, `[Network]` beschreibt, was sie bekommt ([systemd.network(5)](https://www.freedesktop.org/software/systemd/man/latest/systemd.network.html)):
+
+  ```ini title=/etc/systemd/network/10-lan.network
+  [Match]
+  Name=enp1s0
+
+  [Network]
+  DHCP=yes
+  ```
+
+  Für eine feste Adresse stehen dort stattdessen `Address=192.168.10.20/24` und `Gateway=192.168.10.1`. `sudo networkctl reload` liest geänderte Dateien ein, `networkctl status enp1s0` zeigt Adressen, Routen und DNS-Server. DNS-Server aus `DNS=` reicht networkd an systemd-resolved weiter; `/etc/resolv.conf` schreibt es nicht selbst.
+
+  **ifupdown** ist Debians klassischer Weg: ein Block `iface enp1s0 inet static` mit `address 192.168.10.20/24` und `gateway 192.168.10.1` in `/etc/network/interfaces`, aktiviert mit `sudo ifup enp1s0` ([interfaces(5)](https://manpages.debian.org/bookworm/ifupdown/interfaces.5.en.html)).
+
+  Welcher Dienst zuständig ist, verraten `nmcli general status`, `networkctl` und ein Blick in `/etc/network/interfaces`. In der Übungs-VM ist es keiner:
+
+  ```console vm
+  $ networkctl
+  WARNING: systemd-networkd is not running, output will be incomplete.
+
+  IDX LINK TYPE     OPERATIONAL SETUP
+    1 lo   loopback -           unmanaged
+
+  1 links listed.
+  ```
+
+  > [!WARNING] Zwei Verwalter für eine Schnittstelle
+  > Kümmern sich NetworkManager und systemd-networkd (oder ifupdown) um dasselbe Gerät, überschreiben sie sich gegenseitig Adressen und Routen. Das Symptom: Die Adresse wechselt, oder die Default-Route verschwindet nach ein paar Minuten wieder. Entscheide dich pro Schnittstelle für einen Dienst und schalte die anderen dafür ab.
+
+  ## Erreichbarkeit und Firewall
+
+  [`ping`](https://man7.org/linux/man-pages/man8/ping.8.html) schickt ICMP-Echo-Anfragen und misst die Antwortzeit; `ping -c 3 1.1.1.1` hört nach drei Paketen auf. Kommt keine Antwort, ist das noch kein Beweis: Viele Server und Cloud-Firewalls blockieren ICMP. [`tracepath`](https://man7.org/linux/man-pages/man8/tracepath.8.html) (oder `traceroute`, `mtr`) zeigt die Router auf dem Weg und damit, **wo** Pakete hängen bleiben.
 
   ### Firewall: das Konzept
 
   Auch wenn ein Dienst auf `0.0.0.0` lauscht, kann ihn eine Firewall abschirmen. Im Linux-Kernel filtert **nftables** Pakete (Nachfolger von iptables); `ufw` (Ubuntu) und `firewalld` (Fedora, RHEL) sind bequemere Oberflächen dafür ([ArchWiki · nftables](https://wiki.archlinux.org/title/Nftables)). Das Grundprinzip auf Servern: eingehend alles verbieten, was nicht ausdrücklich erlaubt ist. Mit ufw erlaubst du zuerst SSH und schaltest dann ein – in dieser Reihenfolge, sonst sperrst du dich aus: `sudo ufw allow OpenSSH`, `sudo ufw enable`, `sudo ufw status verbose`. Regeln, Härtung und Stolperfallen wie Docker, das veröffentlichte Ports an ufw vorbei freigibt, behandelt das Modul zu Sicherheit.
+
+  ## DNS: Records, Resolver und der Weg eines Namens
+
+  DNS ist eine verteilte Datenbank aus **Records**. Jeder Record hat einen Namen, einen Typ, einen Wert und eine **TTL** (Time to Live): So viele Sekunden dürfen Resolver und Programme die Antwort zwischenspeichern ([RFC 1035](https://www.rfc-editor.org/rfc/rfc1035.html)).
+
+  | Typ | Inhalt | Beispiel |
+  | --- | --- | --- |
+  | `A` | IPv4-Adresse | `api.shop.example. 300 IN A 203.0.113.10` |
+  | `AAAA` | IPv6-Adresse | `api.shop.example. 300 IN AAAA 2001:db8::10` |
+  | `CNAME` | Alias, verweist auf einen anderen Namen | `www.shop.example. 300 IN CNAME shop.example.` |
+  | `MX` | Mailserver der Domain, mit Priorität | `shop.example. 3600 IN MX 10 mail.shop.example.` |
+  | `TXT` | Text, etwa SPF, DKIM oder Domain-Nachweise | `shop.example. 3600 IN TXT "v=spf1 mx -all"` |
+  | `NS` | Nameserver, die für die Zone zuständig sind | `shop.example. 86400 IN NS ns1.dns-anbieter.example.` |
+  | `SOA` | Stammdaten der Zone: primärer Server, Seriennummer, Zeiten | `shop.example. 3600 IN SOA ns1.dns-anbieter.example. hostmaster.shop.example. 2026100101 …` |
+  | `PTR` | Rückwärtsauflösung: Adresse → Name | `10.113.0.203.in-addr.arpa. 3600 IN PTR api.shop.example.` |
+  | `SRV` | Dienst mit Port und Zielrechner, etwa LDAP oder SIP | `_ldap._tcp.corp.example. 3600 IN SRV 0 100 389 dc1.corp.example.` |
+
+  Zwei Regeln sparen Ärger. Ein CNAME darf nicht neben anderen Records desselben Namens stehen, deshalb kann die Domain selbst (`shop.example`, die ja `NS` und `SOA` hat) kein CNAME sein ([RFC 1034, Abschnitt 3.6.2](https://www.rfc-editor.org/rfc/rfc1034.html#section-3.6.2)). Und die TTL bestimmt, wie lange alte Antworten nach einer Änderung weiterleben: Wer einen Umzug plant, senkt sie einige Tage vorher auf wenige Minuten.
+
+  **Der Weg eines Namens.** Programme fragen nicht selbst einen DNS-Server, sondern rufen `getaddrinfo()` in der C-Bibliothek auf. Die arbeitet die Zeile `hosts:` in [`/etc/nsswitch.conf`](https://man7.org/linux/man-pages/man5/nsswitch.conf.5.html) ab:
+
+  ```console vm
+  $ grep '^hosts:' /etc/nsswitch.conf
+  hosts:          files dns
+  $ cat /etc/resolv.conf
+  search corp.internal
+  nameserver 127.0.10.53
+  ```
+
+  `files` ist [`/etc/hosts`](https://man7.org/linux/man-pages/man5/hosts.5.html), `dns` der Resolver der glibc. Der erste Treffer gewinnt: Steht ein Name in `/etc/hosts`, fragt niemand mehr einen DNS-Server. Der Resolver liest [`/etc/resolv.conf`](https://man7.org/linux/man-pages/man5/resolv.conf.5.html): `nameserver` nennt bis zu drei Server, die er der Reihe nach fragt, `search` hängt Domains an kurze Namen an. Deshalb findet `db` hier `db.corp.internal`.
+
+  Auf vielen Systemen sitzt [systemd-resolved](https://www.freedesktop.org/software/systemd/man/latest/systemd-resolved.service.html) dazwischen, auf Fedora und Ubuntu zum Beispiel ab Werk. Dann ist `/etc/resolv.conf` ein Link auf eine Datei mit `nameserver 127.0.0.53`. Unter dieser Adresse lauscht der lokale Stub von resolved: Er speichert Antworten zwischen und reicht Anfragen an die DNS-Server der jeweiligen Schnittstelle weiter. Welche das sind, zeigt `resolvectl status`. `resolvectl query name` löst auf wie ein Programm, `resolvectl flush-caches` leert den Zwischenspeicher ([resolvectl(1)](https://www.freedesktop.org/software/systemd/man/latest/resolvectl.html)). Ob dein System resolved nutzt, verrät `ls -l /etc/resolv.conf`. Debian 12 installiert es nicht ab Werk, die Übungs-VM auch nicht.
+
+  **getent oder dig?** Die beiden Werkzeuge beantworten verschiedene Fragen:
+
+  ```console vm
+  $ getent hosts db
+  127.0.20.5      db.corp.internal
+  $ getent hosts api.shop.test
+  127.0.0.1       api.shop.test
+  $ dig +short api.shop.test
+  $ getent -s dns hosts api.shop.test
+  $ dig +noall +answer www.corp.internal
+  www.corp.internal.	300	IN	CNAME	api.corp.internal.
+  api.corp.internal.	300	IN	A	127.0.20.6
+  ```
+
+  [`getent hosts`](https://man7.org/linux/man-pages/man1/getent.1.html) geht denselben Weg wie jedes Programm, inklusive `/etc/hosts` und Suchdomain; mit `-s files` oder `-s dns` fragt es nur eine Quelle. [`dig`](https://manpages.debian.org/bookworm/bind9-dnsutils/dig.1.en.html) spricht DNS direkt mit dem ersten Server aus `resolv.conf`, ignoriert `/etc/hosts` und hängt ohne `+search` keine Suchdomain an. `api.shop.test` steht nur in `/etc/hosts`, deshalb findet `dig` nichts. `dig @server name` fragt einen bestimmten Server, `+short` zeigt nur die Werte, `+noall +answer` die Records samt TTL. Weitere Typen fragst du mit dem Typ als Argument ab:
+
+  ```console vm
+  $ dig +short MX corp.internal
+  10 mail.corp.internal.
+  $ dig +short -x 127.0.20.5
+  db.corp.internal.
+  ```
+
+  **Fehlerbilder.** Scheitert die Auflösung, sagt der Status in der Antwort von `dig`, auf welcher Seite das Problem liegt. Programme melden über die glibc nur drei verschiedene Texte:
+
+  | `dig` zeigt | Bedeutung | Meldung von Programmen |
+  | --- | --- | --- |
+  | `status: NXDOMAIN` | Der zuständige Server sagt verbindlich: Diesen Namen gibt es nicht. Tippfehler, falsche Suchdomain, fehlender Eintrag. | `Name or service not known` |
+  | `status: NOERROR`, `ANSWER: 0` | Den Namen gibt es, aber nicht mit diesem Typ (NODATA), etwa keinen `A`-Record. | `No address associated with hostname` |
+  | `status: SERVFAIL` | Der Resolver konnte keine Antwort beschaffen: zuständiger Server tot, Delegation kaputt, DNSSEC-Fehler. Über den Namen selbst sagt das nichts. | `Temporary failure in name resolution` |
+  | `status: REFUSED` | Der Server beantwortet die Anfrage nicht, etwa weil er für die Zone nicht zuständig ist und keine Rekursion anbietet. | `Temporary failure in name resolution` |
+  | `no servers could be reached` | Kein Server aus `resolv.conf` hat geantwortet. | `Temporary failure in name resolution` |
+
+  ```console vm
+  $ dig nix.corp.internal | grep status:
+  ;; ->>HEADER<<- opcode: QUERY, status: NXDOMAIN, id: 56028
+  $ dig shop.partner.example | grep status:
+  ;; ->>HEADER<<- opcode: QUERY, status: SERVFAIL, id: 17187
+  ```
+
+  ```console vm fails
+  $ dig @127.0.9.53 db.corp.internal
+  ;; communications error to 127.0.9.53#53: connection refused
+  ;; communications error to 127.0.9.53#53: connection refused
+  ;; communications error to 127.0.9.53#53: connection refused
+
+  ; <<>> DiG 9.18.49-1~deb12u2-Debian <<>> @127.0.9.53 db.corp.internal
+  ; (1 server found)
+  ;; global options: +cmd
+  ;; no servers could be reached
+  ```
+
+  ```console vm fails
+  $ ssh nix.corp.internal
+  ssh: Could not resolve hostname nix.corp.internal: Name or service not known
+  $ ssh shop.partner.example
+  ssh: Could not resolve hostname shop.partner.example: Temporary failure in name resolution
+  ```
+
+  „Temporary failure“ heißt also nicht „Name falsch“, sondern „keine verwertbare Antwort bekommen“. `getent` endet in allen Fällen nur mit Exit-Code 2, curl schreibt immer `Could not resolve host`. Für die Diagnose zählt deshalb der Status aus `dig`. Auf Systemen mit systemd-resolved unterscheidet auch `resolvectl query` die Fälle: Bei NXDOMAIN endet die Meldung auf `not found`, bei SERVFAIL heißt es `server or network returned error`, gefolgt vom Status.
+
+  > [!PRAXIS] Namensprobleme in vier Befehlen
+  > `getent hosts name` (was bekommen Programme?), `cat /etc/resolv.conf` bzw. `resolvectl status` (wen fragt das System?), `dig name` (was sagt dieser Server?), `dig @anderer-server name` (was sagt ein anderer?). Liefert getent etwas anderes als dig, steht der Name in `/etc/hosts` oder ein Cache hängt. Antwortet `dig @richtiger-server` und `dig` allein nicht, ist der eingetragene Nameserver das Problem.
+
+  ## Pakete mitlesen: tcpdump
+
+  Wenn Logs nicht weiterhelfen, zeigt [`tcpdump`](https://www.tcpdump.org/manpages/tcpdump.1.html), was wirklich über die Leitung geht: welche Anfragen ein Programm stellt, an welche Adresse und ob eine Antwort kommt. Es braucht root-Rechte und einen Filter, sonst gehen die interessanten Pakete in der Masse unter. Die Filtersprache steht in [pcap-filter(7)](https://www.tcpdump.org/manpages/pcap-filter.7.html): `host 10.0.0.5`, `port 53`, `tcp`, `udp`, verknüpft mit `and`, `or` und `not`.
+
+  ```bash vm
+  # Im Hintergrund mitschneiden, dann eine Anfrage stellen
+  sudo timeout 10 tcpdump -i lo -n -c 2 udp port 53 &
+  sleep 2
+  dig +short db.corp.internal
+  wait
+  ```
+
+  ```text
+  listening on lo, link-type EN10MB (Ethernet), snapshot length 262144 bytes
+  127.0.20.5
+  12:29:24.464743 IP 127.0.0.1.44164 > 127.0.10.53.53: 40522+ [1au] A? db.corp.internal. (57)
+  12:29:24.465466 IP 127.0.10.53.53 > 127.0.0.1.44164: 40522* 1/0/1 A 127.0.20.5 (61)
+  2 packets captured
+  ```
+
+  `-i lo` wählt die Schnittstelle (`-i any` nimmt alle). `-n` zeigt Adressen und Ports als Zahlen: Ohne die Option fragt tcpdump für jede Adresse selbst per DNS nach einem Namen, das bremst und erzeugt genau den Verkehr, den du vielleicht gerade suchst. Viele Anleitungen schreiben `-nn`; ältere Versionen brauchten das zweite `n` für Portnummern, in aktuellen schadet es nicht. `-c 2` hört nach zwei Paketen auf, `timeout 10` spätestens nach zehn Sekunden. Die Zeilen liest du so: `127.0.0.1.44164` (Adresse.Port) fragt `127.0.10.53` auf Port 53 nach dem `A`-Record; `40522` ist die Anfrage-ID, `+` heißt „Rekursion erwünscht“. Die Antwort mit derselben ID ist autoritativ (`*`) und enthält einen Answer-Record (`1/0/1` zählt Answer, Authority und Additional).
+
+  Mit `-w datei` schreibt tcpdump die Pakete in eine Datei, statt sie anzuzeigen, `-r datei` liest sie später, auch in Wireshark. So siehst du, was hinter einem harmlosen `getent hosts db` steckt:
+
+  ```bash vm
+  sudo timeout 10 tcpdump -i lo -n -c 6 -w /tmp/dns.pcap udp port 53 &
+  sleep 2
+  getent hosts db
+  wait
+  tcpdump -n -r /tmp/dns.pcap
+  ```
+
+  ```text
+  reading from file /tmp/dns.pcap, link-type EN10MB (Ethernet), snapshot length 262144
+  12:29:32.806188 IP 127.0.0.1.44231 > 127.0.10.53.53: 16635+ AAAA? db.corp.internal. (34)
+  12:29:32.807001 IP 127.0.10.53.53 > 127.0.0.1.44231: 16635 0/0/0 (34)
+  12:29:32.808289 IP 127.0.0.1.58154 > 127.0.10.53.53: 64145+ AAAA? db. (20)
+  12:29:32.808990 IP 127.0.10.53.53 > 127.0.0.1.58154: 64145 NXDomain 0/0/0 (20)
+  12:29:32.815963 IP 127.0.0.1.37046 > 127.0.10.53.53: 19204+ A? db.corp.internal. (34)
+  12:29:32.816627 IP 127.0.10.53.53 > 127.0.0.1.37046: 19204* 1/0/0 A 127.0.20.5 (50)
+  ```
+
+  Drei Anfragen für einen Namen: `getent hosts` sucht zuerst eine IPv6-Adresse (`AAAA`), erst mit angehängter Suchdomain, dann ohne, und fragt danach nach IPv4. Solche Abläufe machen langsame Namensauflösung erklärbar: Antwortet ein Server nicht, wartet jede dieser Anfragen bis zum Timeout, ab Werk fünf Sekunden.
+
+  Für Klartextprotokolle wie HTTP zeigt `-A` den Inhalt der Pakete, zum Beispiel `sudo tcpdump -i lo -n -A 'tcp port 8080'`. Bei HTTPS bleiben die Daten verschlüsselt, aber Adressen, Ports und der TCP-Handshake (`Flags [S]`, `[S.]`, `[.]`) sind sichtbar. Das reicht, um zu sehen, ob eine Verbindung überhaupt zustande kommt und wer sie abbricht (`Flags [R]`).
+
+  > [!WARNING] Mitschnitte sind vertraulich
+  > Eine `.pcap`-Datei enthält alles, was unverschlüsselt über die Leitung ging: Cookies, Tokens, Passwörter aus Klartextprotokollen. Filtere eng, schneide kurz mit und lösche die Datei, sobald du sie nicht mehr brauchst.
 
   ## HTTP von der Kommandozeile: curl und wget
 
@@ -116,7 +362,29 @@ lesson: |
   - `-v` zeigt, an welcher Stelle eine Verbindung scheitert: Kommt keine Adresse zustande (DNS), kein `Connected to` (Route, Firewall, Port), bricht TLS ab (Zertifikat) oder antwortet der Server mit einem Fehlerstatus?
   - `-X` setzt die Methode, `-H` einen Header, `-d` den Body. `-d` allein macht bereits einen POST mit `Content-Type: application/x-www-form-urlencoded` – für JSON musst du den Header setzen oder `--json '{…}'` nutzen, das beides erledigt ([curl · --json](https://curl.se/docs/manpage.html#--json)).
   - `-o datei` speichert die Antwort, `-O` unter dem Namen aus der URL.
-  - **`--fail`** ist für Skripte entscheidend: Ohne die Option endet curl auch bei `404` oder `500` mit Exit-Status 0, weil die HTTP-Übertragung ja geklappt hat. Mit `--fail` liefert es bei Status ab 400 den Exit-Code 22 ([curl · --fail](https://curl.se/docs/manpage.html#--fail)). `-sS` unterdrückt den Fortschrittsbalken, zeigt Fehler aber trotzdem.
+  - **`--fail`** brauchst du in Skripten: Ohne die Option endet curl auch bei `404` oder `500` mit Exit-Status 0, weil die HTTP-Übertragung ja geklappt hat. Mit `--fail` liefert es bei Status ab 400 den Exit-Code 22 ([curl · --fail](https://curl.se/docs/manpage.html#--fail)). `-sS` unterdrückt den Fortschrittsbalken, zeigt Fehler aber trotzdem.
+
+  In der Übungs-VM antwortet die Test-API. `-s` blendet den Fortschrittsbalken aus, `-v` zeigt trotzdem jede Phase:
+
+  ```console vm
+  $ curl -sv http://api.corp.internal:8080/health
+  *   Trying 127.0.20.6:8080...
+  * Connected to api.corp.internal (127.0.20.6) port 8080 (#0)
+  > GET /health HTTP/1.1
+  > Host: api.corp.internal:8080
+  > User-Agent: curl/7.88.1
+  > Accept: */*
+  >
+  < HTTP/1.1 200 OK
+  < Content-Length: 3
+  …
+  ok
+  ```
+
+  ```console vm fails
+  $ curl -sS --fail http://api.corp.internal:8080/fehlt
+  curl: (22) The requested URL returned error: 404
+  ```
 
   `wget` ist auf das Herunterladen spezialisiert: `wget https://example.org/datei.iso` speichert unter dem Namen aus der URL, `wget -c` setzt einen abgebrochenen Download fort ([wget(1)](https://man.archlinux.org/man/wget.1)). Für APIs ist curl das Werkzeug der Wahl.
 
@@ -137,7 +405,17 @@ lesson: |
 
   Es entstehen zwei Dateien: `id_ed25519` (privat, verlässt nie deinen Rechner, Rechte `600`) und `id_ed25519.pub` (öffentlich, darf überall hin). [`ssh-copy-id`](https://man.archlinux.org/man/ssh-copy-id.1) hängt den öffentlichen Schlüssel auf dem Server an `~/.ssh/authorized_keys` an. Eine Passphrase schützt den privaten Schlüssel, falls dein Laptop gestohlen wird; damit du sie nicht bei jeder Verbindung tippen musst, merkt sich der **ssh-agent** den entschlüsselten Schlüssel für die Sitzung: `ssh-add ~/.ssh/id_ed25519`, Kontrolle mit `ssh-add -l`. Auf den meisten Desktops läuft bereits ein Agent.
 
-  **Host-Keys und known_hosts.** Beim ersten Kontakt fragt ssh, ob du dem Fingerabdruck des Servers vertraust, und speichert ihn in `~/.ssh/known_hosts`. Ändert er sich später, bricht ssh mit `WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!` ab. Das ist entweder harmlos (Server neu installiert, IP an eine neue VM vergeben) oder ein Angriff (Man-in-the-Middle). Deshalb löschst du den alten Eintrag mit `ssh-keygen -R host` erst, **nachdem** du den neuen Fingerabdruck über einen unabhängigen Weg geprüft hast – etwa in der Web-Konsole des Hosters mit `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`.
+  Im Übungs-Terminal läuft sshd auf Port 22, du kannst den ganzen Weg also auf einem Rechner gehen. Für die Übung ohne Passphrase (`-N ''`), auf deinem Laptop mit:
+
+  ```console vm
+  $ ssh-keygen -q -t ed25519 -N '' -C ops@web01 -f ~/.ssh/id_ed25519
+  $ cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
+  $ ssh -o StrictHostKeyChecking=accept-new ops@localhost hostname
+  Warning: Permanently added 'localhost' (ED25519) to the list of known hosts.
+  web01
+  ```
+
+  **Host-Keys und known_hosts.** Beim ersten Kontakt fragt ssh, ob du dem Fingerabdruck des Servers vertraust, und speichert ihn in `~/.ssh/known_hosts`; `StrictHostKeyChecking=accept-new` übernimmt ihn ohne Rückfrage, lehnt geänderte Keys aber weiter ab. Ändert sich der Host-Key später, bricht ssh mit `WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!` ab. Das ist entweder harmlos (Server neu installiert, IP an eine neue VM vergeben) oder ein Angriff (Man-in-the-Middle). Deshalb löschst du den alten Eintrag mit `ssh-keygen -R host` erst, **nachdem** du den neuen Fingerabdruck über einen unabhängigen Weg geprüft hast – etwa in der Web-Konsole des Hosters mit `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`.
 
   **~/.ssh/config.** Statt dir Adressen, Benutzer und Schlüssel zu merken, gibst du jedem Server einen Kurznamen ([ssh_config(5)](https://man.openbsd.org/ssh_config.5)):
 
@@ -178,6 +456,23 @@ lesson: |
   > [!INTERVIEW] „Wie greifst du auf eine Datenbank zu, die nicht öffentlich erreichbar ist?“
   > Über einen SSH-Tunnel: `ssh -N -L 5433:localhost:5432 bastion` bzw. mit `-J`, wenn die Datenbank hinter einem Bastion-Host liegt. Die Datenbank bleibt auf `127.0.0.1` oder im privaten Netz, es wird kein Port nach außen geöffnet, und die Verbindung ist verschlüsselt und an meinen SSH-Schlüssel gebunden. Lokal verbinde ich mich dann mit `localhost:5433`.
 
+  ### Wenn der Server den Schlüssel ablehnt
+
+  `Permission denied (publickey)` ist absichtlich wortkarg: Wer sich unbefugt anmelden will, soll nicht erfahren, woran es lag. Die Gründe findest du auf zwei Seiten. Der Client zeigt mit `ssh -v`, welche Schlüssel er anbietet und wie der Server reagiert:
+
+  ```console vm
+  $ ssh -v -o BatchMode=yes ops@localhost true 2>&1 | grep -E 'Offering|Server accepts|Authenticated'
+  debug1: Offering public key: /home/ops/.ssh/id_ed25519 ED25519 SHA256:IgFyGaVqsoCilOZZRjNmpZms+7kPQc5h9tBr80okwis
+  debug1: Server accepts key: /home/ops/.ssh/id_ed25519 ED25519 SHA256:IgFyGaVqsoCilOZZRjNmpZms+7kPQc5h9tBr80okwis
+  Authenticated to localhost ([::1]:22) using "publickey".
+  ```
+
+  Fehlt `Server accepts key`, hat der Server abgelehnt. Den Grund schreibt sshd ins Journal: `journalctl -u ssh` auf Debian und Ubuntu, `journalctl -u sshd` auf Fedora und Arch. Die häufigsten Ursachen:
+
+  - **Rechte (StrictModes).** sshd prüft, ob außer dem Benutzer und root jemand `authorized_keys`, `~/.ssh` oder das Home-Verzeichnis ändern kann. Wer dort schreiben darf, könnte eigene Schlüssel eintragen. Das Journal meldet dann `Authentication refused: bad ownership or modes for file /home/deploy/.ssh/authorized_keys` (oder `for directory …`), immer für die erste Stelle des Pfads, die nicht passt. Abhilfe: `chmod 600 ~/.ssh/authorized_keys`, `chmod 700 ~/.ssh`, kein Schreibrecht für Gruppe und andere auf dem Home-Verzeichnis ([sshd_config(5) · StrictModes](https://man.openbsd.org/sshd_config.5#StrictModes)). Debian erlaubt Gruppenschreibrecht nur, solange die Gruppe allein dem Benutzer gehört.
+  - **Falsche Datei oder kaputter Inhalt.** sshd liest nur die Dateien aus `AuthorizedKeysFile`, ab Werk `.ssh/authorized_keys`. Ein Schlüssel als eigene `.pub`-Datei daneben, mit Zeilenumbruch mitten im Schlüssel oder beim falschen Benutzer zählt nicht, und das Journal schweigt dazu. Vergleiche die Fingerabdrücke: `ssh-keygen -lf ~/.ssh/id_ed25519.pub` auf dem Client, `ssh-keygen -lf ~/.ssh/authorized_keys` auf dem Server.
+  - **Konfiguration.** `AllowUsers`, `DenyUsers` oder `PermitRootLogin` schließen den Benutzer aus. Das Journal sagt es, etwa `User deploy from 192.0.2.10 not allowed because not listed in AllowUsers`.
+
   ## Dateien übertragen: scp und rsync
 
   `scp quelle ziel` kopiert einzelne Dateien über SSH: `scp dump.sql staging:/tmp/`. Seit OpenSSH 9.0 nutzt `scp` intern das SFTP-Protokoll ([Release Notes 9.0](https://www.openssh.com/txt/release-9.0)). Für Verzeichnisse, Deployments und Backups ist [`rsync`](https://download.samba.org/pub/rsync/rsync.1) besser: Es überträgt nur Unterschiede, kann abgebrochene Übertragungen fortsetzen und zeigt vorher, was es tun würde.
@@ -194,16 +489,20 @@ lesson: |
   **`--delete`** löscht am Ziel alles, was in der Quelle fehlt – genau das Richtige, um ein Verzeichnis zu spiegeln, und genau das Falsche, wenn Quelle oder Ziel vertauscht sind oder der Schrägstrich fehlt. Ein vertauschtes `rsync -a --delete leer/ ~/` leert dein Home-Verzeichnis. Deshalb: erst `--dry-run`, Ausgabe lesen, dann ohne.
 
   > [!PRAXIS] Die Reihenfolge bei „die API ist nicht erreichbar“
-  > Auf dem eigenen Rechner: `resolvectl query api.staging.example` (Name?), `ip route get <ip>` (Weg?), `curl -v https://api.staging.example/health` (Verbindung, TLS, Status?). Auf dem Server per `ssh staging`: `systemctl status shop` (läuft der Dienst?), `sudo ss -tlnp` (lauscht er, und auf welcher Adresse?), `sudo ufw status` (lässt die Firewall den Port durch?), `curl -v http://127.0.0.1:8000/health` (antwortet er lokal?). Die erste Frage mit einer unerwarteten Antwort ist deine Spur.
+  > Auf dem eigenen Rechner: `resolvectl query api.staging.example` oder `getent hosts api.staging.example` (Name?), `ip route get <ip>` (Weg?), `curl -v https://api.staging.example/health` (Verbindung, TLS, Status?). Auf dem Server per `ssh staging`: `systemctl status shop` (läuft der Dienst?), `sudo ss -tlnp` (lauscht er, und auf welcher Adresse?), `sudo ufw status` (lässt die Firewall den Port durch?), `curl -v http://127.0.0.1:8000/health` (antwortet er lokal?). Die erste Frage mit einer unerwarteten Antwort ist deine Spur.
 
   ## Häufige Fehler
 
   - **Dienst lauscht nur auf `127.0.0.1`.** Von außen: `Connection refused`. `ss -tlnp` zeigt es sofort. Oft ist das gewollt (hinter nginx) – dann ist der Test von außen falsch, nicht der Dienst.
+  - **`ip addr add` für eine Konfiguration halten.** Nach dem nächsten Boot ist die Adresse weg. Dauerhaft gehört sie in das Profil von NetworkManager, eine `.network`-Datei oder `/etc/network/interfaces`.
+  - **`/etc/resolv.conf` von Hand ändern, obwohl NetworkManager oder resolved sie verwalten.** Die Änderung verschwindet beim nächsten Verbindungswechsel. DNS-Server gehören ins Verbindungsprofil bzw. in die `.network`-Datei.
   - **`ping` geht nicht, also ist der Server weg.** ICMP wird oft gefiltert. Teste den eigentlichen Port mit `curl` oder `nc -zv host 443`.
-  - **`dig` und Browser liefern verschiedene Adressen.** `/etc/hosts` oder ein Cache ist im Spiel; `getent hosts` zeigt, was Programme wirklich bekommen.
+  - **`dig` und Programme liefern verschiedene Adressen.** Ein alter Eintrag in `/etc/hosts` oder ein Cache ist im Spiel; `getent hosts` zeigt, was Programme wirklich bekommen, `getent -s files hosts name` den Eintrag aus der Datei.
+  - **„Temporary failure in name resolution“ für einen Tippfehler halten.** Bei einem Tippfehler käme `Name or service not known`. „Temporary failure“ heißt: Kein Server hat brauchbar geantwortet. `dig` zeigt, welcher Server gefragt wurde und was er gesagt hat.
+  - **tcpdump ohne `-n` und ohne Filter.** Die Ausgabe hängt an Namensauflösungen, der Mitschnitt enthält die eigenen DNS-Anfragen von tcpdump und tausende fremde Pakete.
   - **Skripte ohne `curl --fail`.** Ein `500` gilt als Erfolg, die Pipeline bleibt grün.
   - **Host-Key-Warnung wegklicken** mit `ssh-keygen -R` oder `StrictHostKeyChecking no`, ohne den Fingerabdruck zu prüfen.
-  - **Privaten Schlüssel kopieren oder mit falschen Rechten ablegen.** ssh verweigert Schlüssel, die andere lesen können (`UNPROTECTED PRIVATE KEY FILE`). `chmod 600 ~/.ssh/id_ed25519`, `chmod 700 ~/.ssh`.
+  - **Privaten Schlüssel kopieren oder mit falschen Rechten ablegen.** ssh verweigert Schlüssel, die andere lesen können (`UNPROTECTED PRIVATE KEY FILE`). `chmod 600 ~/.ssh/id_ed25519`, `chmod 700 ~/.ssh`. Auf dem Server lehnt sshd `authorized_keys` ab, wenn Gruppe oder andere die Datei oder ein Verzeichnis darüber ändern dürfen.
   - **`-L` und `-R` verwechselt.** Der Tunnel steht, aber auf der falschen Seite, und `psql` meldet `Connection refused`.
   - **Schrägstrich bei rsync vergessen** oder `--delete` ohne `--dry-run`.
   - **`ufw enable` vor `ufw allow OpenSSH`** auf einem entfernten Server.
@@ -213,9 +512,13 @@ lesson: |
   - Eine Verbindung braucht Adresse und Subnetz (CIDR), eine Route (direkt oder über das Gateway), einen aufgelösten Namen, einen offenen Port und einen Dienst, der auf der richtigen Adresse lauscht.
   - TCP: Verbindung, Reihenfolge, Zuverlässigkeit. UDP: einzelne Datagramme ohne Garantie. `127.0.0.1` = nur lokal, `0.0.0.0`/`[::]` = alle Schnittstellen.
   - `ip -br addr`, `ip route`, `ip route get` für die eigene Maschine; `ss -tulpn` für offene Ports samt Prozess.
-  - `dig` fragt DNS direkt, `getent hosts`/`resolvectl query` gehen den Weg der Programme inklusive `/etc/hosts`.
+  - Dauerhaft konfiguriert genau ein Dienst pro Schnittstelle: NetworkManager (`nmcli connection modify` und `up`), systemd-networkd (`.network`-Dateien, `networkctl`) oder ifupdown.
+  - Records: `A`/`AAAA` für Adressen, `CNAME` als Alias, `MX`, `TXT`, `NS`, `SOA`, `PTR`, `SRV`; die TTL bestimmt, wie lange alte Antworten leben.
+  - Programme lösen über `nsswitch.conf` auf: `/etc/hosts` zuerst, dann die Server aus `resolv.conf` bzw. den Stub `127.0.0.53` von systemd-resolved. `getent hosts` zeigt diesen Weg, `dig` fragt nur DNS.
+  - NXDOMAIN: Name gibt es nicht („Name or service not known“). SERVFAIL, REFUSED oder kein Server erreichbar: „Temporary failure in name resolution“.
+  - `tcpdump -i lo -n -c 10 udp port 53` zeigt Anfragen und Antworten; `-w`/`-r` für Dateien, `-A` für Klartextinhalte.
   - `curl -I`, `-L`, `-v`, `-X`, `-H`, `-d`, `-o` und in Skripten immer `--fail`.
-  - SSH: ed25519-Schlüssel, `ssh-copy-id`, `~/.ssh/config` mit spezifischen Einträgen vor `Host *`, Agent für die Passphrase, Host-Key-Warnungen erst prüfen, dann handeln.
+  - SSH: ed25519-Schlüssel, `ssh-copy-id`, `~/.ssh/config` mit spezifischen Einträgen vor `Host *`, Agent für die Passphrase, Host-Key-Warnungen erst prüfen, dann handeln. Lehnt der Server ab: `ssh -v` auf dem Client, `journalctl -u ssh` auf dem Server.
   - `-L` öffnet den Port lokal, `-R` auf dem Server; `-J`/`ProxyJump` für Jump Hosts statt `-A`.
   - rsync: `-avz`, Schrägstrich an der Quelle = Inhalt statt Verzeichnis, `--delete` nur nach `--dry-run`.
 exercises:
@@ -263,6 +566,45 @@ exercises:
       - title: curl – Handbuchseite
         url: https://curl.se/docs/manpage.html
 
+  - id: dns-fehlerbilder
+    type: choice
+    title: Drei Arten, keinen Namen zu bekommen
+    prompt: |
+      Eine Kollegin hat auf `web01` diese Befehle ausgeführt. Welche Aussagen stimmen?
+    lang: console
+    code: |
+      $ dig rechnung.corp.internal | grep status:
+      ;; ->>HEADER<<- opcode: QUERY, status: NXDOMAIN, id: 32614
+      $ dig shop.partner.example | grep status:
+      ;; ->>HEADER<<- opcode: QUERY, status: SERVFAIL, id: 9599
+      $ ssh shop.partner.example
+      ssh: Could not resolve hostname shop.partner.example: Temporary failure in name resolution
+      $ getent hosts rechnung.corp.internal; echo $?
+      2
+    options:
+      - text: "`rechnung.corp.internal` gibt es laut dem zuständigen Server nicht. Ein Tippfehler oder ein fehlender Eintrag in der Zone ist wahrscheinlicher als ein Netzwerkproblem."
+        correct: true
+        why: NXDOMAIN ist eine verbindliche Antwort. Der Server war erreichbar und sagt, dass der Name nicht existiert.
+      - text: "SERVFAIL heißt, dass es `shop.partner.example` nicht gibt."
+        correct: false
+        why: SERVFAIL heißt, dass der Resolver keine Antwort beschaffen konnte, etwa weil der zuständige Server nicht antwortet oder DNSSEC scheitert. Ob es den Namen gibt, bleibt offen.
+      - text: "Die Meldung von ssh passt zum SERVFAIL: Die glibc hat keine verwertbare Antwort bekommen und meldet einen vorübergehenden Fehler."
+        correct: true
+        why: Bei SERVFAIL, REFUSED oder einem Server, der gar nicht antwortet, liefert `getaddrinfo()` den Fehler `EAI_AGAIN`, Text „Temporary failure in name resolution“.
+      - text: "Der Exit-Code 2 von `getent` zeigt, dass der DNS-Server nicht erreichbar war."
+        correct: false
+        why: "`getent` endet bei jeder erfolglosen Suche mit 2, egal ob NXDOMAIN oder toter Server. Den Grund zeigt erst `dig`."
+      - text: "`ssh rechnung.corp.internal` würde mit „Name or service not known“ abbrechen, nicht mit „Temporary failure“."
+        correct: true
+        why: Für NXDOMAIN liefert die glibc `EAI_NONAME`. Die Antwort ist endgültig, ein zweiter Versuch ändert nichts.
+    explanation: |
+      Der Status in der dig-Antwort trennt zwei Welten. NXDOMAIN (und NODATA) sind Antworten: Der Server weiß Bescheid, der Name oder der Typ fehlt, die Ursache liegt in der Zone oder beim Namen, den du fragst. SERVFAIL, REFUSED und „no servers could be reached“ heißen dagegen, dass keine verwertbare Antwort zustande kam; dann suchst du beim Resolver, beim eingetragenen Nameserver oder beim zuständigen Server. Programme zeigen davon nur „Name or service not known“ oder „Temporary failure in name resolution“, `getent` sogar nur einen Exit-Code.
+    resources:
+      - title: RFC 1035 – RCODE
+        url: https://www.rfc-editor.org/rfc/rfc1035.html#section-4.1.1
+      - title: getaddrinfo(3)
+        url: https://man7.org/linux/man-pages/man3/getaddrinfo.3.html
+
   - id: routing-vorhersagen
     type: output
     title: Welche Schnittstelle?
@@ -291,6 +633,50 @@ exercises:
     resources:
       - title: ip-route(8)
         url: https://man7.org/linux/man-pages/man8/ip-route.8.html
+
+  - id: getent-gegen-dig
+    type: output
+    title: Wer fragt wen?
+    prompt: |
+      Auf einem Server gilt die Konfiguration unten. Bei welcher IPv4-Adresse landet jeder der sechs Befehle? Schreibe pro Befehl eine Zeile mit der Adresse, in der gegebenen Reihenfolge, oder `keine`, wenn der Befehl keine Adresse bekommt.
+    lang: console
+    code: |
+      $ grep '^hosts:' /etc/nsswitch.conf
+      hosts:          files dns
+      $ cat /etc/hosts
+      127.0.0.1       localhost
+      127.0.0.1       api.shop.test
+      10.0.5.20       db.corp.internal
+      $ cat /etc/resolv.conf
+      search corp.internal
+      nameserver 10.0.0.53
+
+      # Der DNS-Server 10.0.0.53 kennt diese Records:
+      #   db.corp.internal.    300  IN  A      10.0.7.20
+      #   api.corp.internal.   300  IN  A      10.0.7.30
+      #   www.corp.internal.   300  IN  CNAME  api.corp.internal.
+
+      # Befehle:
+      # 1. getent hosts db.corp.internal
+      # 2. dig +short db.corp.internal
+      # 3. curl http://db.corp.internal/
+      # 4. curl http://www.corp.internal/
+      # 5. dig +short api.shop.test
+      # 6. getent hosts api
+    expected: |
+      10.0.5.20
+      10.0.7.20
+      10.0.5.20
+      10.0.7.30
+      keine
+      10.0.7.30
+    explanation: |
+      `getent` und `curl` gehen über `nsswitch.conf`: zuerst `files`, also `/etc/hosts`. Dort steht `db.corp.internal` mit der alten Adresse `10.0.5.20`, deshalb fragen beide gar nicht erst den DNS-Server (1 und 3). `dig` liest `/etc/hosts` nie und bekommt vom Server `10.0.7.20` (2) – genau dieses Auseinanderlaufen ist das typische Zeichen für einen vergessenen Eintrag in `/etc/hosts`. `www.corp.internal` steht nicht in der Datei; DNS liefert den CNAME auf `api.corp.internal` und dessen A-Record, curl verbindet sich mit `10.0.7.30` (4). `api.shop.test` gibt es nur in `/etc/hosts`, also findet `dig` nichts (5). `getent hosts api` findet `api` nicht in der Datei, der Resolver hängt die Suchdomain an und fragt nach `api.corp.internal` (6).
+    resources:
+      - title: nsswitch.conf(5)
+        url: https://man7.org/linux/man-pages/man5/nsswitch.conf.5.html
+      - title: resolv.conf(5) – search
+        url: https://man7.org/linux/man-pages/man5/resolv.conf.5.html
 
   - id: rsync-schraegstrich
     type: output
@@ -332,6 +718,69 @@ exercises:
     resources:
       - title: ss(8)
         url: https://man7.org/linux/man-pages/man8/ss.8.html
+
+  - id: networkd-statisch
+    type: gap
+    title: Eine feste Adresse für db01
+    prompt: |
+      `db01` läuft mit Debian 12 und systemd-networkd. Die Schnittstelle `enp1s0` soll fest die Adresse `192.168.10.20/24` bekommen, das Gateway `192.168.10.1`, den DNS-Server `192.168.10.53` und die Suchdomain `corp.internal`. Ergänze `/etc/systemd/network/10-lan.network`.
+    lang: ini
+    code: |
+      [⟦Match⟧]
+      Name=enp1s0
+
+      [Network]
+      ⟦Address⟧=192.168.10.20/24
+      ⟦Gateway⟧=192.168.10.1
+      DNS=192.168.10.53
+      ⟦Domains⟧=corp.internal
+    gaps:
+      - label: Abschnitt, der die Schnittstelle auswählt
+        hint: Der Abschnitt entscheidet, ob die Datei zu einer Schnittstelle passt.
+      - label: Adresse mit Präfixlänge
+        hint: Das Schlüsselwort heißt wie das, was es setzt, auf Englisch.
+      - label: Default-Route
+        hint: Der Router, über den alles außerhalb des Subnetzes geht.
+      - label: Suchdomain
+        hint: Das Gegenstück zu `search` in `resolv.conf`, im Plural.
+    explanation: |
+      `[Match]` legt fest, für welche Schnittstellen die Datei gilt, hier über den Namen. `[Network]` beschreibt, was sie bekommt: `Address=` mit Präfixlänge, `Gateway=` erzeugt die Default-Route. `DNS=` und `Domains=` gibt networkd an systemd-resolved weiter; ohne resolved landen sie in keiner `resolv.conf`. Wirksam wird die Datei mit `sudo networkctl reload`, prüfen kannst du sie mit `networkctl status enp1s0`. Auf einem Desktop mit NetworkManager steht dasselbe in einem Profil: `nmcli connection modify "Wired connection 1" ipv4.method manual ipv4.addresses 192.168.10.20/24 ipv4.gateway 192.168.10.1 ipv4.dns 192.168.10.53 ipv4.dns-search corp.internal`, danach `nmcli connection up "Wired connection 1"`.
+    resources:
+      - title: systemd.network(5) – [Network]
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemd.network.html
+      - title: nmcli(1)
+        url: https://networkmanager.dev/docs/api/latest/nmcli.html
+
+  - id: tcpdump-dns
+    type: command
+    title: Welche Namen fragt der Server an?
+    prompt: Schneide auf der Loopback-Schnittstelle `lo` nur UDP-Verkehr auf Port 53 mit. Adressen und Ports sollen als Zahlen erscheinen, und nach 10 Paketen soll tcpdump von selbst aufhören.
+    context: Du bist als Benutzer mit sudo-Rechten angemeldet. Ein lokaler Resolver lauscht auf einer `127.x`-Adresse.
+    answers:
+      - sudo tcpdump -i lo -n -c 10 udp port 53
+      - sudo tcpdump -i lo -nn -c 10 udp port 53
+      - sudo tcpdump -n -i lo -c 10 udp port 53
+      - sudo tcpdump -nn -i lo -c 10 udp port 53
+      - sudo tcpdump -i lo -c 10 -n udp port 53
+      - sudo tcpdump -i lo -c 10 -nn udp port 53
+      - sudo tcpdump -n -c 10 -i lo udp port 53
+      - sudo tcpdump -nn -c 10 -i lo udp port 53
+      - sudo tcpdump -i lo -n -c 10 'udp port 53'
+      - sudo tcpdump -i lo -nn -c 10 'udp port 53'
+      - sudo tcpdump -i lo -n -c 10 udp and port 53
+      - sudo tcpdump -i lo -nn -c 10 udp and port 53
+    output: |
+      tcpdump: verbose output suppressed, use -v[v]... for full protocol decode
+      listening on lo, link-type EN10MB (Ethernet), snapshot length 262144 bytes
+      12:29:24.464743 IP 127.0.0.1.44164 > 127.0.10.53.53: 40522+ [1au] A? db.corp.internal. (57)
+      12:29:24.465466 IP 127.0.10.53.53 > 127.0.0.1.44164: 40522* 1/0/1 A 127.0.20.5 (61)
+    explanation: |
+      `-i lo` wählt die Schnittstelle, `-n` lässt Adressen und Ports als Zahlen stehen (ohne die Option würde tcpdump selbst Namen auflösen und eigene DNS-Anfragen erzeugen), `-c 10` beendet nach zehn Paketen. Der Filter `udp port 53` am Ende ist ein pcap-Ausdruck; `udp and port 53` bedeutet dasselbe. In der Ausgabe steht pro Zeile Absender und Ziel als `Adresse.Port`, dahinter die Anfrage-ID, der Typ (`A?`) und der Name. Die Antwort trägt dieselbe ID, `*` kennzeichnet eine autoritative Antwort. DNS kann auch über TCP laufen, etwa bei großen Antworten; dann brauchst du `port 53` ohne `udp`.
+    resources:
+      - title: tcpdump(1)
+        url: https://www.tcpdump.org/manpages/tcpdump.1.html
+      - title: pcap-filter(7)
+        url: https://www.tcpdump.org/manpages/pcap-filter.7.html
 
   - id: curl-header-redirect
     type: command
@@ -552,12 +1001,207 @@ exercises:
       - "Abhilfe: `listen_addresses = 'localhost'` in der PostgreSQL-Konfiguration (Zugriff für Admins per SSH-Tunnel) und/oder eine Firewall, die nur 22, 80 und 443 eingehend erlaubt; danach mit `ss` und von außen prüfen."
       - "`-t` zeigt nur TCP; offene UDP-Ports sieht man erst mit `ss -ulnp`."
     explanation: |
-      Entscheidend ist die Spalte „Local Address“. Alles auf `0.0.0.0` oder `[::]` nimmt Verbindungen auf jeder Schnittstelle an: sshd auf 22 und nginx auf 80 und 443 – das ist der beabsichtigte Eingang. Gunicorn lauscht nur auf `127.0.0.1:8000`, also kann nur nginx auf demselben Rechner ihn erreichen, genau richtig für einen Reverse Proxy. Der DNS-Stub auf `127.0.0.53` ist ebenfalls lokal. Das Problem ist PostgreSQL auf `0.0.0.0:5432`: Ohne Firewall kann jeder im Internet es erreichen und Passwörter durchprobieren. Ich würde `listen_addresses` auf `localhost` setzen, Admin-Zugriffe per `ssh -L` tunneln und zusätzlich eine Firewall einrichten, die eingehend nur 22, 80 und 443 durchlässt. Weil ich nur TCP angesehen habe, prüfe ich UDP noch mit `ss -ulnp`.
+      Die Antwort steht in der Spalte „Local Address“. Alles auf `0.0.0.0` oder `[::]` nimmt Verbindungen auf jeder Schnittstelle an: sshd auf 22 und nginx auf 80 und 443 – das ist der beabsichtigte Eingang. Gunicorn lauscht nur auf `127.0.0.1:8000`, also kann nur nginx auf demselben Rechner ihn erreichen, genau richtig für einen Reverse Proxy. Der DNS-Stub auf `127.0.0.53` ist ebenfalls lokal. Das Problem ist PostgreSQL auf `0.0.0.0:5432`: Ohne Firewall kann jeder im Internet es erreichen und Passwörter durchprobieren. Ich würde `listen_addresses` auf `localhost` setzen, Admin-Zugriffe per `ssh -L` tunneln und zusätzlich eine Firewall einrichten, die eingehend nur 22, 80 und 443 durchlässt. Weil ich nur TCP angesehen habe, prüfe ich UDP noch mit `ss -ulnp`.
     resources:
       - title: ss(8)
         url: https://man7.org/linux/man-pages/man8/ss.8.html
       - title: PostgreSQL · listen_addresses
         url: https://www.postgresql.org/docs/current/runtime-config-connection.html
+
+  - id: dns-umzug
+    type: scenario
+    title: Seit dem DNS-Umzug findet die App ihre Datenbank nicht
+    prompt: |
+      Das Netzwerk-Team hat gestern den Firmen-DNS umgezogen. Seitdem meldet der Dienst `bestell-sync` auf `web01`, die Datenbank-API unter `http://db.corp.internal:8080/health` sei nicht erreichbar. Im Ticket schreibt das Netzwerk-Team:
+
+      > Der neue Server `ns1.corp.internal` (127.0.10.53) liefert für `db.corp.internal` die richtige Adresse, das haben wir geprüft. Der alte DNS-Server 127.0.9.53 ist seit heute früh abgeschaltet.
+
+      Finde heraus, warum `web01` die Datenbank nicht erreicht, und repariere die Namensauflösung. Die Adresse der Datenbank gehört nicht fest in `/etc/hosts`, denn sie zieht nächste Woche noch einmal um. Die Units `sim-ns1` und `sim-db01` spielen in dieser VM den DNS-Server und den Datenbank-Server; an ihnen änderst du nichts.
+    setup: |
+      set -e
+      # Simulation der übrigen Infrastruktur: ns1 (Firmen-DNS) und db01 (Datenbank-API).
+      cat > /etc/corp-dns.conf <<'EOF'
+      domain-needed
+      local-ttl=300
+      local=/corp.internal/
+      host-record=ns1.corp.internal,127.0.10.53
+      host-record=db.corp.internal,127.0.20.5
+      host-record=api.corp.internal,127.0.20.6
+      EOF
+      cat > /etc/systemd/system/sim-ns1.service <<'EOF'
+      [Unit]
+      Description=Simulation: DNS-Server ns1.corp.internal (127.0.10.53)
+
+      [Service]
+      ExecStart=/usr/sbin/dnsmasq -k --listen-address=127.0.10.53 --bind-interfaces --no-resolv --no-hosts --conf-file=/etc/corp-dns.conf
+
+      [Install]
+      WantedBy=multi-user.target
+      EOF
+      mkdir -p /srv/db01
+      echo ok > /srv/db01/health
+      cat > /etc/systemd/system/sim-db01.service <<'EOF'
+      [Unit]
+      Description=Simulation: Datenbank-API auf db01 (127.0.20.5:8080)
+
+      [Service]
+      ExecStart=/usr/bin/busybox httpd -f -p 127.0.20.5:8080 -h /srv/db01
+
+      [Install]
+      WantedBy=multi-user.target
+      EOF
+      # Die App gleicht alle 20 Sekunden Bestellungen mit der Datenbank-API ab.
+      cat > /usr/local/bin/bestell-sync <<'EOF'
+      #!/bin/sh
+      while true; do
+        curl -fsS --max-time 5 -o /dev/null http://db.corp.internal:8080/health && echo "Abgleich ok"
+        sleep 20
+      done
+      EOF
+      chmod 755 /usr/local/bin/bestell-sync
+      cat > /etc/systemd/system/bestell-sync.service <<'EOF'
+      [Unit]
+      Description=Bestellabgleich mit der Datenbank-API
+
+      [Service]
+      DynamicUser=yes
+      ExecStart=/usr/local/bin/bestell-sync
+
+      [Install]
+      WantedBy=multi-user.target
+      EOF
+      # Der Fehler: ein vergessener Testeintrag und der alte DNS-Server.
+      printf '127.0.30.5\tdb.corp.internal\t# Migrationstest Juni\n' >> /etc/hosts
+      printf '# Stand: altes Rechenzentrum\nsearch corp.internal\nnameserver 127.0.9.53\n' > /etc/resolv.conf
+      systemctl daemon-reload
+      systemctl enable --now sim-ns1 sim-db01 bestell-sync 2>/dev/null
+    checks:
+      - name: "`db.corp.internal` liefert auf web01 dieselbe Adresse wie ns1"
+        run: |
+          if grep -Eq '^[[:space:]]*nameserver[[:space:]]+127\.0\.9\.53([[:space:]]|$)' /etc/resolv.conf; then
+            echo "/etc/resolv.conf nennt noch den abgeschalteten Server 127.0.9.53."
+            exit 1
+          fi
+          soll=$(dig +short @127.0.10.53 db.corp.internal A)
+          ist=$(getent hosts db.corp.internal | awk '{ print $1; exit }')
+          echo "getent hosts: ${ist:-keine Antwort}, ns1: $soll"
+          [ -n "$ist" ] && [ "$ist" = "$soll" ]
+      - name: Die Adresse kommt aus dem DNS, nicht aus /etc/hosts
+        run: "! getent -s files hosts db.corp.internal"
+      - name: bestell-sync läuft und erreicht die Datenbank-API
+        run: systemctl is-active bestell-sync && curl -fsS --max-time 5 http://db.corp.internal:8080/health
+    solution: |
+      # Was meldet die App?
+      journalctl -u bestell-sync -n 5 --no-pager
+      # curl: (7) Failed to connect to db.corp.internal port 8080 …: Couldn't connect to server
+      # Welche Adresse benutzt curl, und welche liefert ns1?
+      curl -sv --max-time 5 http://db.corp.internal:8080/health 2>&1 | grep Trying
+      dig +short @127.0.10.53 db.corp.internal
+      # curl versucht 127.0.30.5, ns1 sagt 127.0.20.5. Woher kommt die alte Adresse?
+      getent hosts db.corp.internal
+      grep '^hosts:' /etc/nsswitch.conf
+      grep -n corp.internal /etc/hosts
+      # files steht vor dns: Der Testeintrag in /etc/hosts gewinnt. Er muss weg.
+      sudo sed -i '/db\.corp\.internal/d' /etc/hosts
+      # Jetzt scheitert die Auflösung ganz:
+      getent hosts db.corp.internal || echo "keine Antwort"
+      dig db.corp.internal
+      # ;; communications error to 127.0.9.53#53: connection refused – der Resolver fragt den abgeschalteten Server.
+      cat /etc/resolv.conf
+      printf 'search corp.internal\nnameserver 127.0.10.53\n' | sudo tee /etc/resolv.conf
+      getent hosts db.corp.internal
+      curl -fsS http://db.corp.internal:8080/health
+    hints:
+      - "Welche Adresse benutzt die App? `curl -v http://db.corp.internal:8080/health` zeigt sie in der Zeile `Trying …`. Vergleiche mit der Antwort von ns1: `dig @127.0.10.53 db.corp.internal`."
+      - "`getent hosts` geht denselben Weg wie die App, `dig` fragt nur DNS. Liefern sie Verschiedenes, schau in `/etc/nsswitch.conf`, in welcher Reihenfolge die Quellen gefragt werden, und dann in die erste davon."
+      - "Scheitert die Auflösung danach ganz, zeigt `dig db.corp.internal` (ohne `@`), welchen Server der Resolver fragt. Er steht in `/etc/resolv.conf`; schreibe die Datei mit `printf … | sudo tee /etc/resolv.conf` neu."
+    explanation: |
+      Hier lagen zwei Fehler übereinander. Ein vergessener Testeintrag in `/etc/hosts` lenkte `db.corp.internal` auf `127.0.30.5`. Weil in `/etc/nsswitch.conf` `hosts: files dns` steht, fragt die glibc zuerst die Datei und hört beim ersten Treffer auf. Deshalb sah die App kein DNS-Problem, sondern „Couldn't connect to server“, während `dig`, das `/etc/hosts` nicht liest, die richtige Adresse lieferte. Darunter zeigte `/etc/resolv.conf` noch auf den abgeschalteten Server. Ohne Antwort meldet die glibc „Temporary failure in name resolution“, curl „Could not resolve host“, und `dig` nennt den Server, den es vergeblich gefragt hat.
+
+      Die Verallgemeinerung: Vergleiche bei Namensproblemen `getent hosts` (Sicht der Programme), `dig` (Sicht des eingetragenen Servers) und `dig @server` (Sicht eines bestimmten Servers). Auf Systemen mit systemd-resolved übernimmt `resolvectl query` die Rolle von `getent`, und die Server stehen in `resolvectl status` statt in `resolv.conf`; dort trägst du sie im Verbindungsprofil ein, nicht in der Datei.
+    resources:
+      - title: nsswitch.conf(5)
+        url: https://man7.org/linux/man-pages/man5/nsswitch.conf.5.html
+      - title: resolv.conf(5)
+        url: https://man7.org/linux/man-pages/man5/resolv.conf.5.html
+      - title: hosts(5)
+        url: https://man7.org/linux/man-pages/man5/hosts.5.html
+
+  - id: deploy-schluessel
+    type: scenario
+    title: Seit gestern nur noch „Permission denied (publickey)“
+    prompt: |
+      Die Deploy-Pipeline meldet sich als `deploy` auf `web01` an. Seit gestern bricht sie ab:
+
+      ```text
+      deploy@localhost: Permission denied (publickey,password).
+      ```
+
+      Gestern hat ein Kollege zwei Dinge erledigt: Er hat den neuen Schlüssel der Pipeline auf den Server kopiert. Und er hat `anna` in die Gruppe `deploy` aufgenommen und `sudo chmod -R g+w /home/deploy` ausgeführt, damit sie Releases nach `/home/deploy/releases` legen kann.
+
+      Die Pipeline läuft hier als `ops` mit dem Schlüssel `~/.ssh/deploy_ed25519`. Nachstellen kannst du den Fehler mit `ssh -i ~/.ssh/deploy_ed25519 deploy@localhost true`. Repariere den Zugang, ohne die Rechteprüfung von sshd abzuschalten. Der Build-Server `ci@build01` meldet sich ebenfalls als `deploy` an und muss das weiter können, und `anna` muss weiter in `releases/` schreiben können.
+    setup: |
+      set -e
+      useradd -m -s /bin/bash deploy
+      useradd -m -s /bin/bash anna
+      # Schlüssel der Pipeline; sie kennt den Host-Key von web01 schon.
+      install -d -m 700 -o ops -g ops /home/ops/.ssh
+      runuser -u ops -- ssh-keygen -q -t ed25519 -N '' -C deploy-pipeline -f /home/ops/.ssh/deploy_ed25519
+      echo "localhost $(cut -d' ' -f1,2 /etc/ssh/ssh_host_ed25519_key.pub)" >> /home/ops/.ssh/known_hosts
+      chown ops:ops /home/ops/.ssh/known_hosts
+      # Der Build-Server meldet sich schon lange als deploy an.
+      install -d -m 700 /root/.ssh
+      ssh-keygen -q -t ed25519 -N '' -C ci@build01 -f /root/.ssh/ci_build01
+      install -d -m 700 -o deploy -g deploy /home/deploy/.ssh
+      install -d -m 755 -o deploy -g deploy /home/deploy/releases
+      install -m 600 -o deploy -g deploy /root/.ssh/ci_build01.pub /home/deploy/.ssh/authorized_keys
+      # Gestern: neuer Pipeline-Schlüssel per scp abgelegt, anna ins Team aufgenommen.
+      install -m 644 -o deploy -g deploy /home/ops/.ssh/deploy_ed25519.pub /home/deploy/.ssh/deploy_ed25519.pub
+      usermod -aG deploy anna
+      chmod -R g+w /home/deploy
+    checks:
+      - name: ops kommt mit dem Pipeline-Schlüssel als deploy herein
+        run: runuser -u ops -- ssh -o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=accept-new -i /home/ops/.ssh/deploy_ed25519 deploy@localhost true
+      - name: Der Build-Server (ci@build01) kommt weiter als deploy herein
+        run: ssh -o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -i /root/.ssh/ci_build01 deploy@localhost true
+      - name: anna kann weiter in /home/deploy/releases schreiben
+        run: runuser -u anna -- touch /home/deploy/releases/.pruefung && rm -f /home/deploy/releases/.pruefung
+      - name: sshd prüft weiter Besitzer und Rechte (StrictModes)
+        run: sshd -T | grep -x 'strictmodes yes'
+    solution: |
+      # Der Client erfährt nur, dass kein Schlüssel akzeptiert wurde:
+      ssh -o BatchMode=yes -i ~/.ssh/deploy_ed25519 deploy@localhost true
+      # Den Grund schreibt sshd ins Journal:
+      journalctl -u ssh -n 5 --no-pager
+      # Authentication refused: bad ownership or modes for file /home/deploy/.ssh/authorized_keys
+      sudo ls -la /home/deploy /home/deploy/.ssh
+      getent group deploy
+      # Gruppenschreibrecht auf dem ganzen Pfad, und die Gruppe deploy hat jetzt ein zweites Mitglied.
+      sudo chmod 600 /home/deploy/.ssh/authorized_keys
+      sudo chmod 700 /home/deploy/.ssh
+      sudo chmod 755 /home/deploy
+      # releases/ bleibt gruppenbeschreibbar, dort legt anna die Releases ab.
+      ssh -o BatchMode=yes -i ~/.ssh/deploy_ed25519 deploy@localhost true
+      journalctl -u ssh -n 3 --no-pager
+      # Keine Rechte-Meldung mehr und trotzdem abgewiesen. Steht der Schlüssel in authorized_keys?
+      ssh-keygen -lf ~/.ssh/deploy_ed25519.pub
+      sudo ssh-keygen -lf /home/deploy/.ssh/authorized_keys
+      # Dort steht nur ci@build01. Der neue Schlüssel liegt als eigene Datei daneben, sshd liest sie nie.
+      cat ~/.ssh/deploy_ed25519.pub | sudo tee -a /home/deploy/.ssh/authorized_keys
+      ssh -o BatchMode=yes -i ~/.ssh/deploy_ed25519 deploy@localhost true && echo "Anmeldung klappt"
+    hints:
+      - "Warum sshd ablehnt, erfährt der Client absichtlich nicht. Der Server schreibt es ins Journal: `journalctl -u ssh -n 20`."
+      - "sshd prüft, ob außer dem Besitzer jemand `authorized_keys`, `~/.ssh` oder das Home-Verzeichnis ändern kann. Die Meldung nennt jeweils die erste Stelle, die nicht passt; versuche es nach jeder Korrektur erneut. `releases/` liegt nicht auf diesem Weg."
+      - "Keine Rechte-Meldung mehr, aber weiter abgewiesen? Vergleiche `ssh-keygen -lf ~/.ssh/deploy_ed25519.pub` mit `sudo ssh-keygen -lf /home/deploy/.ssh/authorized_keys` und schau, welche Dateien sonst in `/home/deploy/.ssh` liegen."
+    explanation: |
+      Auch hier lagen zwei Fehler übereinander. `chmod -R g+w` hat `authorized_keys`, `~/.ssh` und `/home/deploy` für die Gruppe beschreibbar gemacht. Mit `StrictModes yes`, dem Standard, verweigert sshd dann den Schlüssel: Wer die Datei ändern kann, könnte eigene Schlüssel eintragen. Debian duldet Gruppenschreibrecht nur, solange die Gruppe allein dem Benutzer gehört; seit `anna` Mitglied von `deploy` ist, gilt das nicht mehr. Das Journal nennt zuerst die Datei, dann die Verzeichnisse darüber. `releases/` darf gruppenbeschreibbar bleiben, denn sshd prüft nur den Weg zu `authorized_keys`.
+
+      Der zweite Fehler: Der neue Schlüssel lag als `deploy_ed25519.pub` in `~/.ssh`. sshd liest aber nur die Dateien aus `AuthorizedKeysFile` (`.ssh/authorized_keys`, unter Debian auch `.ssh/authorized_keys2`). Ein fehlender Schlüssel erzeugt bei `LogLevel INFO` keine eigene Meldung, nur `Connection closed by authenticating user`. Fingerabdrücke mit `ssh-keygen -lf` zu vergleichen klärt das in Sekunden; `ssh-copy-id` hätte den Schlüssel gleich an die richtige Stelle gehängt.
+    resources:
+      - title: sshd_config(5) – StrictModes
+        url: https://man.openbsd.org/sshd_config.5#StrictModes
+      - title: sshd(8) – AUTHORIZED_KEYS FILE FORMAT
+        url: https://man.openbsd.org/sshd.8#AUTHORIZED_KEYS_FILE_FORMAT
 
   - id: ssh-einrichten
     type: practice

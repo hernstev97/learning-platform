@@ -1,7 +1,7 @@
 id: dateisystem
 title: Dateisystem & Navigation
 level: 1
-minutes: 160
+minutes: 200
 summary: Wie Linux alle Dateien in einem einzigen Baum organisiert, wie du dich darin bewegst, Dateien sicher anlegst, kopierst und löschst – und wie du mit `find` genau die Dateien erwischst, die du meinst.
 goals:
   - Du erklärst, was „alles ist eine Datei“ bedeutet, und ordnest die wichtigsten Verzeichnisse des FHS ihrem Zweck zu.
@@ -19,14 +19,53 @@ resources:
     url: https://www.gnu.org/software/findutils/manual/html_mono/find.html
   - title: Bash Reference Manual · Filename Expansion
     url: https://www.gnu.org/software/bash/manual/html_node/Filename-Expansion.html
+lab: |
+  set -e
+  # ~/projekt ist ein tmpfs: Symlinks, Verzeichnisgrößen und df zeigen dort dasselbe wie auf einer echten Platte.
+  p=/home/ops/projekt
+  install -d -o ops -g ops "$p"
+  mount -t tmpfs -o size=32m,mode=755,uid=1000,gid=1000 projekt "$p"
+  cd "$p"
+  mkdir -p shop/src shop/tests shop/docs logs
+  printf 'port: 8080\n' > shop/config.yaml
+  printf 'DB_PASSWORT=geheim\n' > shop/.env
+  printf '<h1>Shop</h1>\n' > shop/src/index.html
+  printf '#!/bin/sh\ncurl -fsS http://localhost:8080/health\n' > shop/tests/smoke.sh
+  printf '# Shop\n\nStart: ./tests/smoke.sh\n' > shop/docs/README.md
+  head -c 3M /dev/zero > shop/backup.tar
+  # Logs mit echtem Alter: Name, Alter in Tagen, Zeilen (Vielfache von 20). gzip behält die Zeitstempel.
+  cd logs
+  log() {
+    local i; for ((i = 0; i < $3; i += 20)); do printf 'GET /api/produkte 200 12ms\n%.0s' {1..20}; done > "$1"
+    touch -d "@$((EPOCHSECONDS - $2 * 86400))" "$1"
+  }
+  log api.log.5 43 900; log api.log.4 36 900; log api.log.3 15 800; log api.log.2 8 700
+  log db.log.3 40 400; log db.log.2 8 300
+  gzip -n api.log.[2-5] db.log.[23]
+  log api.log.1 1 600; log db.log.1 1 200; log api.log 0 120; log db.log 0 40
+  echo 'worker gestartet' > worker.log; touch -d '2 hours ago' worker.log
+  printf '# Notizen\n- Logrotation prüfen\n' > notizen.md; touch -d '3 days ago' notizen.md
+  chown -R ops:ops "$p"
 lesson: |
   Montagmorgen, der Monitoring-Alarm meldet: „Dateisystem `/` zu 97 % voll“. Du loggst dich ein und musst drei Fragen schnell beantworten: Wo liegen auf diesem Server die großen Dateien? Welche davon darf ich löschen? Und wie lösche ich *genau diese* – und nicht versehentlich mehr? Die Werkzeuge dafür sind einfach: `cd`, `ls`, `du`, `find`, `rm`. Gefährlich wird es, wenn du nicht weißt, was die Shell aus deinem Befehl macht, bevor er ausgeführt wird.
 
   Dieses Modul baut dafür ein klares Bild auf: ein Verzeichnisbaum, in dem jedes Verzeichnis einen Zweck hat, Pfade als Wegbeschreibungen, Namen als Verweise auf Inodes, und eine Shell, die Muster wie `*.log` selbst in Dateinamen übersetzt.
 
+  Die Beispiele mit „Im Terminal“ laufen in einem echten Debian 12 im Browser, angemeldet als `ops`. Dort liegt ein Beispielprojekt unter `~/projekt`: ein kleiner Shop und ein Log-Verzeichnis mit Dateien, die Tage bis Wochen alt sind.
+
   ## Alles ist eine Datei – in einem einzigen Baum
 
-  Unter Linux gibt es keine Laufwerksbuchstaben. Es gibt genau **einen** Verzeichnisbaum, der bei `/` (Root) beginnt. Weitere Dateisysteme – eine zweite SSD, ein USB-Stick, ein Netzlaufwerk – werden an einem Verzeichnis in diesen Baum **eingehängt** (gemountet). Auf CachyOS mit btrfs sind zum Beispiel `/` und `/home` verschiedene Subvolumes, die du trotzdem als einen Baum siehst.
+  Unter Linux gibt es keine Laufwerksbuchstaben. Es gibt genau **einen** Verzeichnisbaum, der bei `/` (Root) beginnt. Weitere Dateisysteme – eine zweite SSD, ein USB-Stick, ein Netzlaufwerk – werden an einem Verzeichnis in diesen Baum **eingehängt** (gemountet). Auf CachyOS mit btrfs sind zum Beispiel `/` und `/home` verschiedene Subvolumes, die du trotzdem als einen Baum siehst. Im Terminal dieser Lektion hängen drei Dateisysteme in einem Baum:
+
+  ```console vm
+  $ df -h / /boot ~/projekt
+  Filesystem      Size  Used Avail Use% Mounted on
+  host9p          256G  303M  256G   1% /
+  /dev/sda1        54M   16M   34M  33% /boot
+  projekt          32M  3.1M   29M  10% /home/ops/projekt
+  ```
+
+  `/` kommt über das Protokoll 9p aus dem Emulator, `/boot` ist die erste Partition der virtuellen Platte `/dev/sda`, und `~/projekt` ist ein [tmpfs](https://man7.org/linux/man-pages/man5/tmpfs.5.html) im Arbeitsspeicher, den das Terminal für diese Lektion eingehängt hat. Für `cd` und `ls` ist das alles ein Baum; welches Dateisystem hinter einem Pfad steckt, zeigen `df` und [`findmnt`](https://man7.org/linux/man-pages/man8/findmnt.8.html).
 
   Der Grundsatz „alles ist eine Datei“ heißt: Fast alles, womit ein Programm arbeitet, erreicht es über einen Pfad und dieselben System Calls (`open`, `read`, `write`). Das erste Zeichen in `ls -l` verrät den Typ:
 
@@ -35,20 +74,20 @@ lesson: |
   | `-` | reguläre Datei | `/etc/hostname` |
   | `d` | Verzeichnis | `/var/log` |
   | `l` | symbolischer Link | `/bin -> usr/bin` |
-  | `c` / `b` | Zeichen- / Blockgerät | `/dev/null`, `/dev/nvme0n1` |
+  | `c` / `b` | Zeichen- / Blockgerät | `/dev/null`, `/dev/sda`, `/dev/nvme0n1` |
   | `s` / `p` | Socket / Named Pipe | `/run/systemd/journal/socket` |
 
-  ```console
-  $ ls -l /dev/null /dev/nvme0n1
-  crw-rw-rw- 1 root root   1, 3 Sep 28 06:02 /dev/null
-  brw-rw---- 1 root disk 259, 0 Sep 28 06:02 /dev/nvme0n1
+  ```console vm
+  $ ls -l /dev/null /dev/sda
+  crw-rw-rw- 1 root root 1, 3 Oct  1 11:50 /dev/null
+  brw-rw---- 1 root disk 8, 0 Oct  1 11:50 /dev/sda
   $ cat /proc/loadavg
-  6.57 9.32 9.42 2/4558 1691273
+  0.42 0.31 0.12 1/76 367
   $ file /usr/bin/ls
-  /usr/bin/ls: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, …
+  /usr/bin/ls: ELF 32-bit LSB pie executable, Intel 80386, version 1 (SYSV), dynamically linked, …
   ```
 
-  `/proc/loadavg` liegt auf keiner Platte: Der Kernel erzeugt den Inhalt beim Lesen. Genauso funktionieren [`/proc`](https://man7.org/linux/man-pages/man5/proc.5.html) (Prozesse und Kernel-Zustand) und [`/sys`](https://docs.kernel.org/filesystems/sysfs.html) (Geräte und Treiber). [`file`](https://man7.org/linux/man-pages/man1/file.1.html) schaut in den Inhalt statt auf die Endung – unter Linux ist `.txt` nur ein Teil des Namens.
+  Bei Gerätedateien steht statt der Größe ein Zahlenpaar: Über diese Major- und Minor-Nummer findet der Kernel den Treiber. `/proc/loadavg` liegt auf keiner Platte: Der Kernel erzeugt den Inhalt beim Lesen. Genauso funktionieren [`/proc`](https://man7.org/linux/man-pages/man5/proc.5.html) (Prozesse und Kernel-Zustand) und [`/sys`](https://docs.kernel.org/filesystems/sysfs.html) (Geräte und Treiber). [`file`](https://man7.org/linux/man-pages/man1/file.1.html) schaut in den Inhalt statt auf die Endung – unter Linux ist `.txt` nur ein Teil des Namens.
 
   ## Der Verzeichnisbaum: jedes Verzeichnis hat einen Zweck
 
@@ -57,7 +96,7 @@ lesson: |
   | Pfad | Inhalt | Denk an … |
   | --- | --- | --- |
   | `/etc` | systemweite Konfiguration, Textdateien | `/etc/nginx/nginx.conf`, `/etc/ssh/sshd_config` |
-  | `/home` | Heimatverzeichnisse der Benutzer | `/home/steven`; root wohnt in `/root` |
+  | `/home` | Heimatverzeichnisse der Benutzer | `/home/ops`; root wohnt in `/root` |
   | `/usr` | installierte Programme und Bibliotheken, im Betrieb nur lesend | `/usr/bin`, `/usr/lib`, `/usr/share/doc` |
   | `/usr/local` | von Hand installierte Software, am Paketmanager vorbei | `/usr/local/bin` |
   | `/opt` | in sich geschlossene Zusatzpakete | `/opt/google/chrome` |
@@ -66,10 +105,22 @@ lesson: |
   | `/run` | Laufzeitdaten seit dem letzten Boot | PID-Dateien, Sockets |
   | `/dev` | Gerätedateien | `/dev/null`, `/dev/sda` |
   | `/proc`, `/sys` | virtuelle Schnittstellen zum Kernel | `/proc/cpuinfo` |
-  | `/boot` | Kernel und Bootloader-Dateien | `vmlinuz-linux-cachyos` |
+  | `/boot` | Kernel und Bootloader-Dateien | `vmlinuz-6.1.0-53-686`, `grub/` |
   | `/srv` | Daten, die der Server ausliefert | `/srv/www` |
 
-  Das Denkmodell dahinter: **`/usr` ist statisch, `/var` wächst, `/etc` konfiguriert.** Wenn eine Platte vollläuft, ist fast immer `/var` schuld (Logs, Datenbanken, Container-Images), selten `/usr`. Auf aktuellen Distributionen sind `/bin`, `/sbin` und `/lib` übrigens nur noch Symlinks nach `/usr` („merged /usr“). Auf Arch und damit CachyOS ist `/tmp` ein `tmpfs` im Arbeitsspeicher.
+  Das Denkmodell dahinter: **`/usr` ist statisch, `/var` wächst, `/etc` konfiguriert.** Wenn eine Platte vollläuft, ist fast immer `/var` schuld (Logs, Datenbanken, Container-Images), selten `/usr`. Auf aktuellen Distributionen sind `/bin`, `/sbin` und `/lib` übrigens nur noch Symlinks nach `/usr` („merged /usr“):
+
+  ```console vm
+  $ ls /
+  bin   dev  home        initrd.img.old  media  opt   root  sbin  sys  usr  vmlinuz
+  boot  etc  initrd.img  lib             mnt    proc  run   srv   tmp  var  vmlinuz.old
+  $ ls -ld /bin /sbin /lib
+  lrwxrwxrwx 1 root root 0 Sep 18 02:00 /bin -> usr/bin
+  lrwxrwxrwx 1 root root 0 Sep 18 02:00 /lib -> usr/lib
+  lrwxrwxrwx 1 root root 0 Sep 18 02:00 /sbin -> usr/sbin
+  ```
+
+  `vmlinuz` und `initrd.img` sind Debians Links auf den aktuellen Kernel in `/boot`. Auf Arch und damit CachyOS ist `/tmp` ein `tmpfs` im Arbeitsspeicher. Debian 12 legt `/tmp` noch auf die Platte und leert es beim Booten (`D /tmp` in `/usr/lib/tmpfiles.d/tmp.conf`); [seit Debian 13](https://www.debian.org/releases/trixie/release-notes/issues.en.html#the-temporary-files-directory-tmp-is-now-stored-in-a-tmpfs) ist es auch dort ein tmpfs.
 
   > [!INTERVIEW] „Wo schaust du auf einem Server zuerst nach?“
   > Konfiguration in `/etc/<dienst>`, Logs in `/var/log` oder im Journal, Anwendungsdaten in `/var/lib/<dienst>`, selbst deployte Anwendungen meist unter `/opt` oder `/srv`. Wer das ohne Nachdenken sagen kann, zeigt, dass er sich auf fremden Systemen orientieren kann.
@@ -82,19 +133,41 @@ lesson: |
   - `~` ersetzt die Shell durch dein Heimatverzeichnis, `~anna` durch das von `anna`. Das macht die Shell ([Tilde Expansion](https://www.gnu.org/software/bash/manual/html_node/Tilde-Expansion.html)), nicht `cd`.
   - `cd -` springt ins vorige Verzeichnis zurück und gibt es aus. `cd` ohne Argument bringt dich nach Hause.
 
-  ```console
+  ```console vm
+  $ cd ~/projekt/shop/src
   $ pwd
-  /home/steven/projekte/shop
-  $ cd ../../Downloads
+  /home/ops/projekt/shop/src
+  $ cd ../../logs
   $ pwd
-  /home/steven/Downloads
+  /home/ops/projekt/logs
   $ cd -
-  /home/steven/projekte/shop
+  /home/ops/projekt/shop/src
   ```
 
-  Für den Überblick brauchst du [`ls`](https://www.gnu.org/software/coreutils/manual/html_node/ls-invocation.html) mit wenigen Optionen: `-l` ausführlich, `-a` auch versteckte Dateien, `-h` Größen lesbar (K, M, G), `-t` nach Änderungszeit sortiert (neueste zuerst), `-r` umgekehrt, `-d` ein Verzeichnis selbst statt seines Inhalts. `ls -lht` zeigt dir also sofort, welche Logdatei zuletzt geschrieben wurde.
+  Für den Überblick brauchst du [`ls`](https://www.gnu.org/software/coreutils/manual/html_node/ls-invocation.html) mit wenigen Optionen: `-l` ausführlich, `-a` auch versteckte Dateien, `-h` Größen lesbar (K, M, G), `-t` nach Änderungszeit sortiert (neueste zuerst), `-r` umgekehrt, `-d` ein Verzeichnis selbst statt seines Inhalts. `ls -lht` zeigt dir also sofort, welche Logdatei zuletzt geschrieben wurde:
 
-  **Versteckte Dateien** sind unter Linux nur eine Konvention: Namen, die mit `.` beginnen, blendet `ls` ohne `-a` aus. So liegen Konfigurationen wie `.bashrc`, `.gitignore` oder `.env` unauffällig im Verzeichnis. `ls -A` zeigt sie ohne die Einträge `.` und `..`.
+  ```console vm
+  $ ls -lht ~/projekt/logs
+  total 64K
+  -rw-r--r-- 1 ops ops 3.2K Oct  1 12:19 api.log
+  -rw-r--r-- 1 ops ops 1.1K Oct  1 12:19 db.log
+  -rw-r--r-- 1 ops ops   17 Oct  1 10:19 worker.log
+  -rw-r--r-- 1 ops ops  16K Sep 30 12:19 api.log.1
+  -rw-r--r-- 1 ops ops 5.3K Sep 30 12:19 db.log.1
+  -rw-r--r-- 1 ops ops   32 Sep 28 12:19 notizen.md
+  -rw-r--r-- 1 ops ops   90 Sep 23 12:19 db.log.2.gz
+  …
+  -rw-r--r-- 1 ops ops  130 Aug 19 12:19 api.log.5.gz
+  ```
+
+  **Versteckte Dateien** sind unter Linux nur eine Konvention: Namen, die mit `.` beginnen, blendet `ls` ohne `-a` aus. So liegen Konfigurationen wie `.bashrc`, `.gitignore` oder `.env` unauffällig im Verzeichnis. `ls -A` zeigt sie ohne die Einträge `.` und `..`:
+
+  ```console vm
+  $ ls ~/projekt/shop
+  backup.tar  config.yaml  docs  src  tests
+  $ ls -A ~/projekt/shop
+  .env  backup.tar  config.yaml  docs  src  tests
+  ```
 
   > [!NOTE] ls sieht bei dir anders aus
   > In fish auf CachyOS ist `ls` ein Alias für `eza` mit Icons und Farben (siehe Modul „Linux & die Shell“). Die Ausgaben in diesem Kurs stammen vom GNU-`ls`, das du mit `command ls -l` bekommst und das auf jedem Server läuft.
@@ -115,67 +188,111 @@ lesson: |
   - **Existiert das Ziel, landet die Quelle darin.** `cp -r src backup` erzeugt `backup` als Kopie von `src` – aber nur, wenn `backup` noch nicht existiert. Beim zweiten Aufruf entsteht `backup/src`. Dasselbe gilt für `mv`.
   - **`mv` innerhalb eines Dateisystems ist sofort fertig**, auch bei 50 GB: Es ändert nur Verzeichniseinträge. Über Dateisystemgrenzen hinweg kopiert es und löscht danach.
 
+  Die ersten beiden kannst du im Beispielprojekt nachstellen:
+
+  ```console vm
+  $ cd ~/projekt
+  $ cp -r logs logs-kopie-r
+  $ cp -a logs logs-kopie-a
+  $ ls -l logs/api.log.5.gz logs-kopie-r/api.log.5.gz logs-kopie-a/api.log.5.gz
+  -rw-r--r-- 1 ops ops 130 Aug 19 12:19 logs-kopie-a/api.log.5.gz
+  -rw-r--r-- 1 ops ops 130 Oct  1 12:19 logs-kopie-r/api.log.5.gz
+  -rw-r--r-- 1 ops ops 130 Aug 19 12:19 logs/api.log.5.gz
+  $ cp -r shop/docs docs-backup
+  $ cp -r shop/docs docs-backup
+  $ ls docs-backup
+  README.md  docs
+  ```
+
+  Die Kopie mit `-r` trägt die Uhrzeit des Kopierens; ein späteres `find -mtime +30` hält sie für neu. Und der zweite `cp -r` hat keine Fehlermeldung ausgegeben, sondern `docs` *in* das vorhandene `docs-backup` kopiert.
+
   `rm` kennt keinen Papierkorb. Und weil die Shell Variablen *vor* dem Aufruf einsetzt, ist diese Zeile in einem Skript eine Zeitbombe:
 
   ```bash
   rm -rf $BUILD_DIR/*
   ```
 
-  Ist `BUILD_DIR` leer, weil jemand das Skript ohne Argument aufruft, führt die Shell `rm -rf /*` aus. Genau das ist 2015 im Linux-Startskript von Steam passiert und hat bei Nutzern das komplette Heimatverzeichnis gelöscht ([Issue #3671](https://github.com/ValveSoftware/steam-for-linux/issues/3671)). Enthält der Pfad ein Leerzeichen, trifft `rm` außerdem die falschen Verzeichnisse. Die sichere Form:
+  Ist `BUILD_DIR` leer, weil jemand das Skript ohne Argument aufruft, führt die Shell `rm -rf /*` aus. Genau das ist 2015 im Linux-Startskript von Steam passiert und hat bei Nutzern das komplette Heimatverzeichnis gelöscht ([Issue #3671](https://github.com/ValveSoftware/steam-for-linux/issues/3671)). Enthält der Pfad ein Leerzeichen, trifft `rm` außerdem die falschen Verzeichnisse. Was die Shell aus der Zeile macht, siehst du gefahrlos, wenn du `echo` davorsetzt:
+
+  ```console vm
+  $ BUILD_DIR=
+  $ echo rm -rf $BUILD_DIR/*
+  rm -rf /bin /boot /dev /etc /home /initrd.img /initrd.img.old /lib /media /mnt /opt /proc /root /run /sbin /srv /sys /tmp /usr /var /vmlinuz /vmlinuz.old
+  ```
+
+  Die sichere Form:
 
   ```bash
   rm -rf -- "${BUILD_DIR:?BUILD_DIR ist leer}"/*
+  ```
+
+  ```console vm fails
+  $ BUILD_DIR=
+  $ echo rm -rf -- "${BUILD_DIR:?BUILD_DIR ist leer}"/*
+  -bash: BUILD_DIR: BUILD_DIR ist leer
   ```
 
   `"…"` verhindert das Zerlegen an Leerzeichen, [`${VAR:?}`](https://www.gnu.org/software/bash/manual/html_node/Shell-Parameter-Expansion.html) bricht mit Fehlermeldung ab, wenn die Variable leer oder nicht gesetzt ist, und `--` beendet die Optionen. GNU `rm` verweigert zwar `rm -rf /` (`--preserve-root` ist Standard), aber `/*` sind aus seiner Sicht lauter einzelne Verzeichnisse – der Schutz greift dort nicht.
 
   ## Globbing und Brace Expansion: die Shell übersetzt
 
-  ```console
+  ```console vm
+  $ cd ~/projekt/logs
   $ ls
-  api.log  db.log  db.log.1  k.txt  m.txt  notizen.md
+  api.log    api.log.2.gz  api.log.4.gz  db.log    db.log.2.gz  notizen.md
+  api.log.1  api.log.3.gz  api.log.5.gz  db.log.1  db.log.3.gz  worker.log
   $ echo *.log
-  api.log db.log
-  $ echo ?.txt
-  k.txt m.txt
+  api.log db.log worker.log
+  $ echo *.log.?
+  api.log.1 db.log.1
+  $ echo api.log.[2-4].gz
+  api.log.2.gz api.log.3.gz api.log.4.gz
   $ echo *.csv
   *.csv
   ```
 
-  **Globbing** ([Filename Expansion](https://www.gnu.org/software/bash/manual/html_node/Filename-Expansion.html)) ersetzt Muster durch passende Dateinamen: `*` steht für beliebig viele Zeichen, `?` für genau eines, `[abc]` oder `[0-9]` für eines aus einer Menge. Entscheidend ist, *wer* das tut: **die Shell, bevor der Befehl startet.** `rm *.log` bekommt nie das Muster zu sehen, sondern die fertige Liste `api.log db.log`. Daraus folgen drei Regeln:
+  **Globbing** ([Filename Expansion](https://www.gnu.org/software/bash/manual/html_node/Filename-Expansion.html)) ersetzt Muster durch passende Dateinamen: `*` steht für beliebig viele Zeichen, `?` für genau eines, `[abc]` oder `[0-9]` für eines aus einer Menge. Die Frage ist, *wer* das tut: **die Shell, bevor der Befehl startet.** `rm *.log` bekommt nie das Muster zu sehen, sondern die fertige Liste `api.log db.log worker.log`. Daraus folgen drei Regeln:
 
   - `*` trifft keine versteckten Dateien. `rm -r *` lässt `.env` und `.git` stehen.
   - Passt nichts, reicht bash das Muster **unverändert** weiter (siehe `*.csv` oben). fish bricht in diesem Fall den Befehl mit einer Fehlermeldung ab ([fish-Doku zu Wildcards](https://fishshell.com/docs/current/fish_for_bash_users.html#wildcards-globs)); `[abc]` kennt fish nicht.
-  - Soll ein **Programm** das Muster auswerten – etwa `find` –, musst du es quoten: `find . -name '*.log'`. Ohne Quotes würde die Shell `*.log` schon im aktuellen Verzeichnis auflösen, und `find` bekäme `-name api.log db.log`.
+  - Soll ein **Programm** das Muster auswerten – etwa `find` –, musst du es quoten: `find . -name '*.log'`. Ohne Quotes würde die Shell `*.log` schon im aktuellen Verzeichnis auflösen, und `find` bekäme `-name api.log db.log worker.log`.
 
   **Brace Expansion** ([Brace Expansion](https://www.gnu.org/software/bash/manual/html_node/Brace-Expansion.html)) sieht ähnlich aus, ist aber etwas anderes: Sie erzeugt Wörter, *ohne* nach existierenden Dateien zu schauen.
 
-  ```console
-  $ mkdir -p shop/{src,tests,docs}
-  $ cp nginx.conf{,.bak}
+  ```console vm
+  $ cd ~/projekt
+  $ mkdir -p neu/{src,tests,docs}
+  $ cp shop/config.yaml{,.bak}
+  $ ls neu shop
+  neu:
+  docs  src  tests
+
+  shop:
+  backup.tar  config.yaml  config.yaml.bak  docs  src  tests
   $ echo bericht-{01..03}.pdf
   bericht-01.pdf bericht-02.pdf bericht-03.pdf
   ```
 
-  `nginx.conf{,.bak}` wird zu `nginx.conf nginx.conf.bak` – die schnellste Art, vor einer Änderung ein Backup zu machen. fish kennt `{a,b}`, aber keine Bereiche wie `{01..03}`; dort nimmst du `seq`.
+  `shop/config.yaml{,.bak}` wird zu `shop/config.yaml shop/config.yaml.bak` – die schnellste Art, vor einer Änderung ein Backup zu machen. fish kennt `{a,b}`, aber keine Bereiche wie `{01..03}`; dort nimmst du `seq`.
 
   ## Inodes, Hardlinks und symbolische Links
 
   Ein Dateiname ist nicht die Datei. Die eigentliche Datei ist ein **Inode**: ein Eintrag mit Typ, Rechten, Besitzer, Größe, Zeitstempeln und den Verweisen auf die Datenblöcke ([inode(7)](https://man7.org/linux/man-pages/man7/inode.7.html)). Ein **Verzeichnis** ist nur eine Tabelle „Name → Inode-Nummer“. `ls -i` zeigt die Nummer, `stat` alle Metadaten:
 
-  ```console
+  ```console vm
+  $ cd ~/projekt/shop
   $ ln config.yaml config-hart.yaml
   $ ln -s config.yaml config-link.yaml
-  $ ls -li
-  335419 -rw-r--r-- 2 steven steven 11 Sep 28 18:50 config-hart.yaml
-  335420 lrwxrwxrwx 1 steven steven 11 Sep 28 18:50 config-link.yaml -> config.yaml
-  335419 -rw-r--r-- 2 steven steven 11 Sep 28 18:50 config.yaml
+  $ ls -li config.yaml config-hart.yaml config-link.yaml
+   7 -rw-r--r-- 2 ops ops 11 Oct  1 12:19 config-hart.yaml
+  66 lrwxrwxrwx 1 ops ops 11 Oct  1 12:19 config-link.yaml -> config.yaml
+   7 -rw-r--r-- 2 ops ops 11 Oct  1 12:19 config.yaml
   $ stat -c '%i %h %n' config.yaml
-  335419 2 config.yaml
+  7 2 config.yaml
   ```
 
   - Ein **Hardlink** (`ln ziel name`) ist ein zweiter Name für **denselben** Inode. Beide Namen sind gleichberechtigt; die Zahl `2` in der zweiten Spalte ist der Link-Zähler. Hardlinks gehen nur innerhalb eines Dateisystems und nicht auf Verzeichnisse.
-  - Ein **symbolischer Link** (`ln -s ziel name`) ist eine eigene kleine Datei mit eigenem Inode, deren Inhalt ein Pfad ist. Er darf auf Verzeichnisse und über Dateisystemgrenzen zeigen – und er kann ins Leere zeigen, wenn das Ziel verschwindet. Ein relativer Zielpfad wird vom Ort des **Links** aus aufgelöst, nicht von deinem aktuellen Verzeichnis.
+  - Ein **symbolischer Link** (`ln -s ziel name`) ist eine eigene kleine Datei mit eigenem Inode, deren Inhalt ein Pfad ist; seine Größe `11` ist die Länge von `config.yaml`. Er darf auf Verzeichnisse und über Dateisystemgrenzen zeigen – und er kann ins Leere zeigen, wenn das Ziel verschwindet. Ein relativer Zielpfad wird vom Ort des **Links** aus aufgelöst, nicht von deinem aktuellen Verzeichnis.
 
   Die Reihenfolge bei [`ln`](https://www.gnu.org/software/coreutils/manual/html_node/ln-invocation.html) merkst du dir wie bei `cp`: erst das Bestehende, dann das Neue.
 
@@ -184,19 +301,22 @@ lesson: |
   > [!PRAXIS] Gelöscht, aber die Platte bleibt voll
   > Klassiker im Betrieb: Du löschst eine 20 GB große Logdatei, doch `df` zeigt keinen freien Platz mehr. Der Dienst hat die Datei noch geöffnet und schreibt weiter hinein – nur hat sie keinen Namen mehr. Erst ein Neustart oder Reload des Dienstes gibt den Platz frei. Besser ist es, die Datei zu leeren statt zu löschen (`truncate -s 0 app.log`) oder gleich `logrotate` zu nutzen. Das Modul zur Fehlersuche zeigt, wie du solche Dateien mit `lsof` findest.
 
-  Symlinks siehst du überall: `/bin -> usr/bin`, Konfigurationen in `/etc/nginx/sites-enabled/`, die auf `sites-available/` zeigen, oder ein Deploy-Verzeichnis `current`, das auf die aktuelle Version in `releases/` zeigt. Umschalten heißt dann nur: Link neu setzen.
+  Symlinks siehst du überall: `/bin -> usr/bin`, Konfigurationen in `/etc/nginx/sites-enabled/`, die auf `sites-available/` zeigen, oder ein Deploy-Verzeichnis `current`, das auf die aktuelle Version in `releases/` zeigt. Umschalten heißt dann nur: Link neu setzen, mit `ln -sfn releases/v43 current`. Das `-n` ist Pflicht: Ohne es folgt `ln` dem vorhandenen Link `current` in sein Zielverzeichnis und legt den neuen Link *dort* an. GNU `ln` (coreutils 9.1 auf Debian 12) legt den neuen Link unter einem Zufallsnamen an und benennt ihn mit [rename(2)](https://man7.org/linux/man-pages/man2/rename.2.html) über den alten; `strace` zeigt das. Ein Prozess, der `current` gerade öffnet, sieht deshalb immer entweder das alte oder das neue Ziel, nie eine Lücke.
 
   ## Dateien finden mit find
 
   [`find`](https://man7.org/linux/man-pages/man1/find.1.html) durchläuft einen Verzeichnisbaum und prüft jede Datei gegen eine Reihe von **Tests**. Alle Tests müssen zutreffen (logisches UND), dann folgt eine **Aktion** – ohne Angabe ist es `-print`.
 
-  ```console
-  $ find /var/log -type f -name '*.gz' -mtime +30
-  /var/log/nginx/access.log.12.gz
-  /var/log/nginx/error.log.9.gz
-  $ find ~/Downloads -type f -size +500M -exec ls -lh {} +
-  -rw-r--r-- 1 steven steven 5.8G Sep 12 21:04 /home/steven/Downloads/ubuntu-24.04.iso
+  ```console vm
+  $ find ~/projekt/logs -type f -name '*.gz' -mtime +30
+  /home/ops/projekt/logs/db.log.3.gz
+  /home/ops/projekt/logs/api.log.5.gz
+  /home/ops/projekt/logs/api.log.4.gz
+  $ find ~/projekt -type f -size +1M -exec ls -lh {} +
+  -rw-r--r-- 1 ops ops 3.0M Oct  1 12:19 /home/ops/projekt/shop/backup.tar
   ```
+
+  Auf einem Server sieht dasselbe mit `/var/log` und Gigabytes genauso aus. Die Reihenfolge der Treffer ist die, in der `find` sie im Verzeichnis antrifft, nicht alphabetisch.
 
   | Test | Bedeutung |
   | --- | --- |
@@ -211,19 +331,43 @@ lesson: |
 
   Für Aktionen gibt es zwei Formen von `-exec`. Mit `\;` startet `find` den Befehl **für jede Datei einzeln** – bei 10 000 Dateien 10 000 Prozesse. Mit `+` sammelt es viele Dateinamen und startet den Befehl so selten wie möglich ([Multiple Files](https://www.gnu.org/software/findutils/manual/html_node/find_html/Multiple-Files.html)). `{}` ist der Platzhalter für die Dateinamen.
 
-  `-delete` löscht jeden Treffer. Weil `find` den Ausdruck von links nach rechts auswertet, ist die **Position** entscheidend: `find . -delete -name '*.log'` löscht erst alles und prüft danach den Namen. Die sichere Gewohnheit: Befehl erst ohne `-delete` laufen lassen, Liste prüfen, dann `-delete` **ans Ende** hängen.
+  `-delete` löscht jeden Treffer. Weil `find` den Ausdruck von links nach rechts auswertet, zählt die **Position**: `find . -delete -name '*.log'` löscht erst alles und prüft danach den Namen. Die sichere Gewohnheit: Befehl erst ohne `-delete` laufen lassen, Liste prüfen, dann `-delete` **ans Ende** hängen. Die Liste oben war geprüft, also:
 
-  Für den Überblick über Größen helfen [`du`](https://www.gnu.org/software/coreutils/manual/html_node/du-invocation.html) und `tree`:
-
-  ```console
-  $ du -sh /var/log
-  2.1G	/var/log
-  $ du -h --max-depth=1 /var | sort -h | tail -3
-  1.2G	/var/cache
-  2.1G	/var/log
-  4.6G	/var
-  $ tree -L 1 ~/projekte/shop
+  ```console vm
+  $ find ~/projekt/logs -type f -name '*.gz' -mtime +30 -delete
+  $ ls ~/projekt/logs
+  api.log    api.log.2.gz  db.log    db.log.2.gz  worker.log
+  api.log.1  api.log.3.gz  db.log.1  notizen.md
   ```
+
+  Für den Überblick über Größen helfen [`du`](https://www.gnu.org/software/coreutils/manual/html_node/du-invocation.html) und [`tree`](https://manpages.debian.org/bookworm/tree/tree.1.en.html):
+
+  ```console vm
+  $ sudo du -h --max-depth=1 /var | sort -h | tail -4
+  2.6M    /var/cache
+  6.0M    /var/lib
+  8.6M    /var/log
+  18M     /var
+  $ du -sh ~/projekt
+  3.3M    /home/ops/projekt
+  $ tree ~/projekt/shop
+  /home/ops/projekt/shop
+  ├── backup.tar
+  ├── config-hart.yaml
+  ├── config-link.yaml -> config.yaml
+  ├── config.yaml
+  ├── config.yaml.bak
+  ├── docs
+  │   └── README.md
+  ├── src
+  │   └── index.html
+  └── tests
+      └── smoke.sh
+
+  4 directories, 8 files
+  ```
+
+  Auf einem Server, der seit Monaten läuft, stehen bei `/var/log` schnell Gigabytes; diese VM ist frisch gestartet. `du` braucht hier `sudo`, weil `ops` nicht in jedes Verzeichnis unter `/var` hineinschauen darf; ohne zählt es diese einfach nicht mit.
 
   ## Häufige Fehler
 
@@ -232,6 +376,8 @@ lesson: |
   - **`find -name *.log` ohne Quotes:** Findet nur Dateien, die so heißen wie die Logdatei im aktuellen Verzeichnis, oder bricht mit `paths must precede expression` ab.
   - **`cp -r` für Backups:** Zeitstempel und Rechte gehen verloren. Nimm `cp -a`.
   - **Symlink mit falschem relativen Ziel:** `ln -s config.yaml /etc/app/config.yaml` zeigt auf `/etc/app/config.yaml` selbst. Nimm einen absoluten Pfad als Ziel oder denke vom Ort des Links aus.
+  - **`ln -sf` auf einen Link zu einem Verzeichnis:** `ln -sf releases/v43 current` meldet keinen Fehler, legt den neuen Link aber *in* das Verzeichnis, auf das `current` zeigt. `current` bleibt, wie er war. Mit `-n` (oder `-T`) ersetzt `ln` den Link selbst.
+  - **`find … -delete` ohne Probelauf oder ohne `-maxdepth`:** `find` steigt in jedes Unterverzeichnis ab. Was dort liegt und zufällig auf das Muster passt, ist ebenfalls weg.
   - **`rm -rf` mit Variablen:** immer `"${VAR:?}"` und erst mit `ls` oder `echo` testen, was getroffen würde.
 
   > [!WARNING] Erst anschauen, dann löschen
@@ -244,7 +390,7 @@ lesson: |
   - Absolute Pfade beginnen mit `/`; `.`, `..`, `~` und `cd -` sparen Tipparbeit.
   - `cp -a` für Backups, `mkdir -p` für Verzeichnisbäume, `rm` hat keinen Papierkorb. Variablen in `rm` immer als `"${VAR:?}"`.
   - Glob-Muster (`*`, `?`, `[…]`) und Brace Expansion (`{a,b}`) löst die Shell vor dem Befehl auf. Muster für `find` quotest du.
-  - Ein Name zeigt auf einen Inode. Hardlinks sind weitere Namen, Symlinks eigene Dateien mit einem Pfad als Inhalt. Speicher wird erst frei, wenn kein Name und kein offener Prozess mehr darauf zeigt.
+  - Ein Name zeigt auf einen Inode. Hardlinks sind weitere Namen, Symlinks eigene Dateien mit einem Pfad als Inhalt. Speicher wird erst frei, wenn kein Name und kein offener Prozess mehr darauf zeigt. Einen Link auf ein Verzeichnis ersetzt du mit `ln -sfn`.
   - `find` kombiniert Tests mit UND; `-exec … {} +` bündelt Aufrufe, `-delete` gehört ans Ende und erst nach einem Probelauf.
 exercises:
   - id: fhs-zuordnen
@@ -537,6 +683,187 @@ exercises:
     resources:
       - title: find(1)
         url: https://man7.org/linux/man-pages/man1/find.1.html
+
+  - id: backup-platte-voll
+    type: scenario
+    title: Das Backup heute Nacht passt nicht mehr
+    prompt: |
+      Das Monitoring meldet: „`/srv/backup` auf `web01` fast voll“. Heute Nacht um 02:15 schreibt der Backup-Job das nächste Archiv der Shop-Datenbank, rund 8 MB. Passt es nicht, bricht der Job ab, und es gibt für diesen Tag kein Backup.
+
+      Räume `/srv/backup` nach der Aufbewahrungsregel des Teams auf; sie steht in `/srv/backup/LIESMICH.txt`. Tagesarchive, die älter als 14 Tage sind, dürfen weg. Alles andere bleibt: die jüngeren Tagesarchive, die Monatsarchive und die übrigen Dateien. Du bist als `ops` angemeldet und hast `sudo`.
+    setup: |
+      set -e
+      truncate -s 32M /var/lib/backup-platte.img
+      mkfs.ext4 -q -m 0 -L backup /var/lib/backup-platte.img
+      mkdir -p /srv/backup
+      mount -o loop /var/lib/backup-platte.img /srv/backup
+      cd /srv/backup
+      # Tagesarchive der letzten 30 Tage, jeweils um 02:15 geschrieben
+      base=$(date -d 'today 02:15' +%s)
+      [ "$base" -le "$(date +%s)" ] || base=$((base - 86400))
+      : > /root/.backup-neu; : > /root/.backup-alt
+      for i in $(seq 0 29); do
+        t=$((base - i * 86400))
+        printf -v f 'shop-db-%(%F)T.sql.gz' "$t"
+        fallocate -l 720K "$f"
+        touch -d "@$t" "$f"
+        if [ "$i" -le 12 ]; then echo "$f" >> /root/.backup-neu; elif [ "$i" -ge 16 ]; then echo "$f" >> /root/.backup-alt; fi
+      done
+      mkdir monatlich
+      for n in 1 2; do
+        m=$(date -d "$(date +%Y-%m-15) -$n month" +%Y-%m)
+        fallocate -l 600K "monatlich/shop-db-$m.sql.gz"
+        touch -d "$m-01 02:15" "monatlich/shop-db-$m.sql.gz"
+        echo "monatlich/shop-db-$m.sql.gz" >> /root/.backup-rest
+      done
+      cat > LIESMICH.txt <<'EOF'
+      Backups der Shop-Datenbank auf web01
+      Tagesarchive:  /srv/backup/shop-db-JJJJ-MM-TT.sql.gz, schreibt der Backup-Job täglich um 02:15
+                     Aufbewahrung 14 Tage
+      Monatsarchive: /srv/backup/monatlich/, Aufbewahrung 12 Monate, nicht von Hand löschen
+      Wiederherstellen: siehe restore.sh
+      EOF
+      printf '#!/bin/sh\n# Spielt ein Archiv in die Shop-Datenbank zurück: restore.sh DATEI\nset -eu\necho "Wiederherstellen aus $1"\n' > restore.sh
+      chmod 755 restore.sh
+      touch -d '200 days ago' LIESMICH.txt
+      touch -d '150 days ago' restore.sh
+      printf '%s\n' LIESMICH.txt restore.sh >> /root/.backup-rest
+    checks:
+      - name: Auf /srv/backup sind mindestens 8 MB frei
+        run: |
+          mountpoint -q /srv/backup || { echo "/srv/backup ist nicht mehr eingehängt"; exit 1; }
+          frei=$(df -BM --output=avail /srv/backup | tail -1 | tr -dc 0-9)
+          echo "frei: $frei MB"
+          [ "$frei" -ge 8 ]
+      - name: Die Tagesarchive der letzten 13 Tage sind alle noch da
+        run: |
+          fehlt=0
+          while read -r f; do [ -f "/srv/backup/$f" ] || { echo "fehlt: $f"; fehlt=1; }; done < /root/.backup-neu
+          exit $fehlt
+      - name: Monatsarchive, LIESMICH.txt und restore.sh sind unangetastet
+        run: |
+          fehlt=0
+          while read -r f; do [ -f "/srv/backup/$f" ] || { echo "fehlt: $f"; fehlt=1; }; done < /root/.backup-rest
+          exit $fehlt
+      - name: Kein Tagesarchiv, das älter als 15 Tage ist, liegt noch auf der Platte
+        run: |
+          n=0
+          while read -r f; do [ -e "/srv/backup/$f" ] && n=$((n + 1)); done < /root/.backup-alt
+          echo "noch da: $n alte Tagesarchive"
+          [ "$n" -eq 0 ]
+    solution: |
+      df -h /srv/backup
+      cat /srv/backup/LIESMICH.txt
+      # Die ältesten Dateien zuletzt; dazu das Unterverzeichnis mit den Monatsarchiven
+      ls -lt /srv/backup | tail -n 5
+      ls -l /srv/backup/monatlich
+      # Probelauf: nur Tagesarchive direkt in /srv/backup (-maxdepth 1 lässt monatlich/ aus),
+      # nur reguläre Dateien mit dem Namensmuster, älter als 14 volle Tage
+      find /srv/backup -maxdepth 1 -type f -name 'shop-db-*.sql.gz' -mtime +14 | sort
+      find /srv/backup -maxdepth 1 -type f -name 'shop-db-*.sql.gz' -mtime +14 | wc -l
+      # Liste stimmt: dieselbe Zeile mit -delete am Ende, als root, denn die Archive gehören root
+      sudo find /srv/backup -maxdepth 1 -type f -name 'shop-db-*.sql.gz' -mtime +14 -delete
+      df -h /srv/backup
+    hints:
+      - "Verschaff dir erst einen Überblick: `df -h /srv/backup`, `cat /srv/backup/LIESMICH.txt` und `ls -lt /srv/backup`. Gibt es Unterverzeichnisse?"
+      - "`find` mit `-name 'shop-db-*.sql.gz'` und `-mtime +14` findet die alten Tagesarchive – aber auch in Unterverzeichnissen. Lass den Befehl zuerst ohne Aktion laufen und lies die Liste."
+      - "`-maxdepth 1` hält `find` aus `monatlich/` heraus. Erst wenn die Liste stimmt, hängst du `-delete` ans Ende; die Dateien gehören root, also mit `sudo`."
+    explanation: |
+      Die Regel steckt in drei Tests: `-name 'shop-db-*.sql.gz'` lässt `LIESMICH.txt` und `restore.sh` stehen, obwohl sie Monate alt sind. `-mtime +14` trifft nur Dateien, die mehr als 14 volle Tage alt sind. Und `-maxdepth 1` schützt die Monatsarchive, deren Namen ebenfalls auf das Muster passen, weil `find` sonst in `monatlich/` absteigt. Der Probelauf ohne `-delete` zeigt genau die Liste, die danach gelöscht wird; `-delete` gehört ans Ende, weil `find` den Ausdruck von links nach rechts auswertet.
+
+      `df` misst das Dateisystem, nicht das Verzeichnis: Nach dem Löschen ist der Platz sofort frei, weil kein Prozess die Archive offen hält. Im Betrieb übernimmt so eine Regel ein Timer oder die Backup-Software selbst; von Hand gilt immer: erst anschauen, dann löschen.
+    resources:
+      - title: find(1)
+        url: https://man7.org/linux/man-pages/man1/find.1.html
+      - title: df(1)
+        url: https://man7.org/linux/man-pages/man1/df.1.html
+
+  - id: release-umschalten
+    type: scenario
+    title: Umgeschaltet, aber die Seite bleibt alt
+    prompt: |
+      Gestern sollte Release `2026-10-01` des Shops auf `web01` live gehen. nginx liefert `/srv/shop/current/public` aus, und `current` ist ein Symlink auf das aktive Release in `/srv/shop/releases/`. Ben hat wie immer umgeschaltet:
+
+      ```text
+      $ cd /srv/shop && ln -sf releases/2026-10-01 current
+      ```
+
+      Keine Fehlermeldung – aber `curl http://localhost/version.txt` liefert weiterhin `2026-09-24`.
+
+      Schalte auf `2026-10-01` um. `current` bleibt ein Symlink, und die älteren Releases bleiben für ein Rollback genau so liegen, wie sie ausgeliefert wurden. `/srv/shop` gehört dir (`ops`).
+    setup: |
+      set -e
+      mkdir -p /srv/shop
+      mount -t tmpfs -o size=8m,mode=755,uid=1000,gid=1000 shop /srv/shop
+      cd /srv/shop
+      for r in 2026-09-17 2026-09-24 2026-10-01; do
+        mkdir -p "releases/$r/public"
+        echo "$r" > "releases/$r/public/version.txt"
+        printf '<!doctype html>\n<title>Shop</title>\n<h1>Shop</h1>\n<p>Release %s</p>\n' "$r" > "releases/$r/public/index.html"
+        touch -d "$r 10:00" "releases/$r/public/version.txt" "releases/$r/public/index.html" "releases/$r/public" "releases/$r"
+      done
+      ln -s releases/2026-09-24 current
+      # Bens Versuch von gestern
+      ln -sf releases/2026-10-01 current
+      chown -R ops:ops /srv/shop
+      cat > /etc/nginx/sites-available/shop <<'EOF'
+      server {
+          listen 80 default_server;
+          root /srv/shop/current/public;
+          index index.html;
+      }
+      EOF
+      rm -f /etc/nginx/sites-enabled/default
+      ln -s /etc/nginx/sites-available/shop /etc/nginx/sites-enabled/shop
+      systemctl start nginx
+    checks:
+      - name: http://localhost/version.txt liefert 2026-10-01
+        run: |
+          v=$(curl -fsS --max-time 5 http://localhost/version.txt 2>&1)
+          echo "ausgeliefert: $v"
+          [ "$v" = 2026-10-01 ]
+      - name: /srv/shop/current ist ein Symlink auf releases/2026-10-01
+        run: |
+          [ -L /srv/shop/current ] || { echo "current ist kein Symlink"; exit 1; }
+          z=$(readlink -f /srv/shop/current)
+          echo "current zeigt auf $z"
+          [ "$z" = /srv/shop/releases/2026-10-01 ]
+      - name: Die älteren Releases sind vollständig und unverändert, ein Rollback ist möglich
+        run: |
+          for r in 2026-09-17 2026-09-24; do
+            d=/srv/shop/releases/$r
+            inhalt=$(ls -A "$d" 2>/dev/null | tr '\n' ' ')
+            [ "$inhalt" = "public " ] || { echo "releases/$r enthält: $inhalt"; exit 1; }
+            [ "$(cat "$d/public/version.txt")" = "$r" ] || { echo "releases/$r/public/version.txt ist verändert"; exit 1; }
+          done
+          [ -f /srv/shop/releases/2026-10-01/public/version.txt ]
+    solution: |
+      curl -s http://localhost/version.txt
+      # Wohin zeigt current?
+      ls -l /srv/shop
+      readlink /srv/shop/current
+      # current zeigt auf ein Verzeichnis. ln -sf ist dem Link gefolgt und hat den neuen Link
+      # im alten Release angelegt – relativ und deshalb ins Leere:
+      ls -l /srv/shop/releases/2026-09-24
+      rm /srv/shop/releases/2026-09-24/2026-10-01
+      # -n behandelt den vorhandenen Link current als Datei und ersetzt ihn
+      cd /srv/shop
+      ln -sfn releases/2026-10-01 current
+      ls -l current
+      curl -s http://localhost/version.txt
+    hints:
+      - "Wohin zeigt `current` gerade? `ls -l /srv/shop` und `readlink /srv/shop/current` verraten es."
+      - "Ist das letzte Argument von `ln` ein Verzeichnis – oder ein Link auf eins –, legt `ln` den neuen Link *darin* an. Schau in `/srv/shop/releases/2026-09-24` nach, was Bens Befehl dort hinterlassen hat."
+      - "Räume Bens Link im alten Release weg und setze `current` neu: `ln -sfn` (oder `ln -sfT`) behandelt den vorhandenen Link selbst als das, was ersetzt wird."
+    explanation: |
+      `ln -sf ZIEL current` prüft zuerst, ob `current` ein Verzeichnis ist – und folgt dabei dem Symlink. Weil `current` auf `releases/2026-09-24` zeigte, hat `ln` dort einen neuen Link `2026-10-01` angelegt und `current` nicht angefasst. Dieser Link zeigt zudem ins Leere, weil sein relatives Ziel vom Ort des Links aus gelesen wird. `-n` (`--no-dereference`) behandelt einen Link auf ein Verzeichnis wie eine normale Datei, `-f` ersetzt ihn. GNU `ln` legt den neuen Link dabei unter einem Zufallsnamen an und benennt ihn per `rename(2)` um, deshalb gibt es keinen Moment ohne `current`.
+
+      nginx löst den Pfad bei jeder Anfrage neu auf; nach dem Umschalten kommt sofort das neue Release, ohne Neustart. Ein Rollback ist derselbe Befehl mit dem alten Release – vorausgesetzt, es liegt unverändert da.
+    resources:
+      - title: GNU Coreutils · ln invocation
+        url: https://www.gnu.org/software/coreutils/manual/html_node/ln-invocation.html
+      - title: symlink(7)
+        url: https://man7.org/linux/man-pages/man7/symlink.7.html
 
   - id: platz-schaffen
     type: practice

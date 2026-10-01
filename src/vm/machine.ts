@@ -3,7 +3,7 @@
 // from other sites.
 import type { V86 } from 'v86';
 import { AgentChannel } from './channel.ts';
-import { VM_IMAGE, vmOptions } from './config.ts';
+import { VM_DISK_SIZE, VM_IMAGE, vmOptions } from './config.ts';
 
 const BASE = `/vm/${VM_IMAGE}`;
 const START_LIMIT = 90_000;
@@ -21,7 +21,7 @@ export type Machine = {
   destroy(): void;
 };
 
-/** Kept for the session: another scenario or "Neu starten" restores without downloading again. */
+/** Kept for the session: another scenario, the lesson terminal or "Zurücksetzen" restores without downloading again. */
 let snapshot: Promise<ArrayBuffer> | null = null;
 
 async function download(url: string, progress: (loaded: number, total: number) => void): Promise<ArrayBuffer> {
@@ -50,7 +50,8 @@ export async function startMachine(output: (bytes: Uint8Array) => void, progress
     snapshot,
   ]);
   const emulator: V86 = new Emulator({
-    ...vmOptions({ wasm: '/vm/v86.wasm', bios: `${BASE}/seabios.bin`, vgaBios: `${BASE}/vgabios.bin`, files: `${BASE}/files/` }),
+    // The disk's contents come with the snapshot.
+    ...vmOptions({ wasm: '/vm/v86.wasm', bios: `${BASE}/seabios.bin`, vgaBios: `${BASE}/vgabios.bin`, files: `${BASE}/files/` }, new ArrayBuffer(VM_DISK_SIZE)),
     initial_state: { buffer: state.slice(0) },
     autostart: true,
   });

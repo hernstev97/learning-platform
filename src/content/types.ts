@@ -71,6 +71,13 @@ export type Module = {
   toc: TocEntry[];
   resources: Resource[];
   exercises: Exercise[];
+  /**
+   * Bash script (as root) that prepares the Linux VM for the lesson's terminal, e.g. sample files the examples use.
+   * Null without one; the terminal then shows the plain VM. Only lessons with `vm` blocks or a lab get a terminal.
+   */
+  lab: string | null;
+  /** Lesson code blocks marked `vm`: commands that run in the lesson's terminal. */
+  vm: boolean;
   /** Set for modules generated from the Bear snapshot. */
   bear: boolean;
 };

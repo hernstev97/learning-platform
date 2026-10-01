@@ -1,0 +1,958 @@
+id: desktop-wayland
+title: Desktop & Wayland
+level: 2
+minutes: 150
+summary: Was zwischen Kernel und Fenster passiert – Wayland und Compositor, Sitzungen, D-Bus und polkit, udev und Grafiktreiber, PipeWire, XDG-Verzeichnisse, Starter und Portale – und wie du Fehler darin eingrenzt.
+goals:
+  - Du erklärst, wie sich Wayland und X11 beim Zeichnen, bei Eingaben und bei Bildschirmaufnahmen unterscheiden, und welche Rolle Compositor, XWayland und Display Manager spielen.
+  - Du fragst Dienste mit `busctl` über D-Bus ab und schreibst polkit-Regeln, die genau eine Aktion freigeben.
+  - Du prüfst mit `lspci -k` und `udevadm`, ob ein Gerät seinen Treiber hat, und schreibst udev-Regeln für feste Namen und Rechte.
+  - Du ordnest den Grafikstapel ein (DRM, Mesa, NVIDIA mit Open Kernel Modules oder nouveau/NVK) und den Audiostapel (PipeWire, WirePlumber).
+  - Du legst `.desktop`-Dateien und Autostart-Einträge nach den XDG-Regeln an und findest heraus, warum einer nicht startet.
+resources:
+  - title: Wayland · Architektur
+    url: https://wayland.freedesktop.org/architecture.html
+  - title: polkit(8)
+    url: https://polkit.pages.freedesktop.org/polkit/polkit.8.html
+  - title: udev(7)
+    url: https://www.freedesktop.org/software/systemd/man/latest/udev.html
+  - title: XDG Base Directory Specification
+    url: https://specifications.freedesktop.org/basedir/latest/
+  - title: ArchWiki · Wayland
+    url: https://wiki.archlinux.org/title/Wayland
+lab: |
+  set -e
+  groupadd -r usv
+  install -d /etc/xdg/autostart
+  printf '%s\n' '#!/bin/sh' 'echo "Backup-Hinweis: Das letzte Backup ist älter als sieben Tage."' > /usr/local/bin/backup-hinweis
+  chmod 755 /usr/local/bin/backup-hinweis
+  cat > /etc/xdg/autostart/backup-hinweis.desktop <<'EOF'
+  [Desktop Entry]
+  Type=Application
+  Name=Backup-Hinweis
+  Comment=Erinnert nach dem Login an das wöchentliche Backup
+  Exec=/usr/local/bin/backup-hinweis
+  EOF
+lesson: |
+  Auf deinem CachyOS-Laptop drückst du eine Taste, und im Editor erscheint ein Buchstabe. Du steckst ein USB-Headset ein, und der Ton wechselt dorthin. Du teilst im Browser deinen Bildschirm, und Plasma fragt, welches Fenster. Dazwischen arbeiten Kernel, udev, logind, ein Compositor, PipeWire, D-Bus, polkit und Portale. Bleibt nach einem NVIDIA-Update der Bildschirm schwarz oder überträgt die Videokonferenz nur ein schwarzes Bild, musst du wissen, welche Schicht zuständig ist.
+
+  Vieles davon begegnet dir auch auf Servern: `hostnamectl` spricht per D-Bus mit einem Dienst, `systemctl` fragt polkit, ob du ohne sudo darfst, und udev gibt Geräten ihre Namen und Rechte. Das Debian im Terminal hat keine Grafik, aber D-Bus, polkit, udev, logind und systemd laufen dort echt. Die Beispiele mit „Im Terminal“ kannst du direkt ausprobieren.
+
+  ## Wayland und X11: wer zeichnet, wer verteilt Eingaben
+
+  Unter **X11** besitzt ein zentraler Prozess, der X-Server, Bildschirm, Tastatur und Maus. Programme schicken ihm Zeichenaufträge oder fertige Bilder. Der Fenstermanager ist nur ein weiterer Client, der Compositor für Schatten und Transparenz noch einer. Das Protokoll von 1987 vertraut allen Clients: Jedes Programm kann den ganzen Bildschirm auslesen und die Tastendrücke anderer Fenster mitlesen.
+
+  **Wayland** ist kein Programm, sondern ein Protokoll zwischen einem **Compositor** und seinen Clients ([Wayland · Architektur](https://wayland.freedesktop.org/architecture.html)). Er übernimmt die Rollen von X-Server, Fenstermanager und Compositor zugleich: KWin bei Plasma, Mutter bei GNOME, dazu eigenständige wie Hyprland, Sway oder niri. Die Arbeit teilt sich so auf:
+
+  - Jeder Client zeichnet seinen Fensterinhalt selbst, mit der CPU in gemeinsamen Speicher oder mit OpenGL/Vulkan in GPU-Speicher, und übergibt den fertigen Puffer an seine Oberfläche (`wl_surface`).
+  - Der Compositor setzt aus allen Puffern ein Bild zusammen und gibt es über den Grafiktreiber des Kernels (KMS) an den Monitor.
+  - Eingaben liest der Compositor selbst aus `/dev/input/event*` (über libinput) und schickt sie nur an das Fenster mit dem Fokus.
+
+  | Frage | X11 | Wayland |
+  | --- | --- | --- |
+  | Wer setzt das Bild zusammen? | X-Server, optional ein eigener Compositor | der Compositor |
+  | Wer verteilt Tastatur und Maus? | X-Server, jeder Client kann mitlesen | Compositor, nur an das fokussierte Fenster |
+  | Bildschirmfoto, Bildschirmfreigabe | jeder Client liest den Bildschirm | über den Compositor bzw. ein Portal, mit Rückfrage |
+  | Alte X11-Programme | laufen direkt | laufen über XWayland |
+
+  Daraus folgen die Eigenheiten, über die man bei Wayland stolpert: Ein Programm kann sich nicht selbst an eine Bildschirmposition setzen, keine globalen Tastenkürzel abgreifen und den Bildschirm nicht ungefragt aufnehmen. Bildschirmfotos und Bildschirmfreigabe laufen über Portale (siehe unten). Alte X11-Programme laufen über **XWayland**, einen X-Server, der selbst ein Wayland-Client ist und den der Compositor bei Bedarf startet ([ArchWiki · Xwayland](https://wiki.archlinux.org/title/Wayland#Xwayland)). X11-Programme sehen sich dort untereinander weiterhin, die Wayland-Fenster aber nicht.
+
+  Wayland ist der Standard. Plasma startet seit Version 6.0 (2024) in Wayland, Plasma 6.7 ist die letzte Version mit X11-Sitzung, ab 6.8 (geplant für Oktober 2026) gibt es nur noch Wayland ([KDE · Going all-in on a Wayland future](https://blogs.kde.org/2025/11/26/going-all-in-on-a-wayland-future/)). GNOME hat die X11-Sitzung mit Version 50 entfernt. Welche Art Sitzung du hast, verrät eine Variable:
+
+  ```console vm
+  $ echo $XDG_SESSION_TYPE
+  tty
+  ```
+
+  Im Terminal steht `tty`, denn das Debian hat keine Grafik. Auf deinem Plasma-Desktop steht dort `wayland`, in einer X11-Sitzung `x11`.
+
+  > [!INTERVIEW] „Was ist der Unterschied zwischen X11 und Wayland?“
+  > Unter X11 verwaltet ein zentraler X-Server Bildschirm und Eingaben; Fenstermanager und Compositor sind eigene Clients, und jeder Client kann den Bildschirm lesen und Tastatureingaben mitschneiden. Wayland ist ein Protokoll, bei dem der Compositor diese Rollen vereint: Clients rendern selbst in Puffer, der Compositor setzt sie zusammen und gibt Eingaben nur an das fokussierte Fenster. Das schützt Programme voreinander, und der Umweg entfällt, bei dem X-Server und Compositor das Bild zwischen sich hin- und herreichen. Bildschirmaufnahme und globale Kürzel laufen deshalb über Portale, alte Programme über XWayland.
+
+  ## Vom Display Manager zur Sitzung: logind
+
+  Auf einem Desktop ist `graphical.target` das Standardziel. Es zieht `display-manager.service` nach, einen Alias auf den installierten **Display Manager**: SDDM bei Plasma (auch auf CachyOS), GDM bei GNOME, schlankere wie greetd oder ly. Er zeigt den Anmeldebildschirm, prüft dein Passwort über PAM und startet die gewählte Sitzung. Welche Sitzungen es gibt, steht in `.desktop`-Dateien unter `/usr/share/wayland-sessions/` und `/usr/share/xsessions/`; Plasma bringt `plasma.desktop` mit.
+
+  Beim Anmelden registriert das PAM-Modul `pam_systemd` eine **Sitzung** bei `systemd-logind` ([pam_systemd(8)](https://www.freedesktop.org/software/systemd/man/latest/pam_systemd.html)). Damit passiert dreierlei:
+
+  - logind vergibt eine Sitzungs-ID und merkt sich Typ (`wayland`, `x11`, `tty`), Klasse, Sitz (`seat0`: Bildschirm, Tastatur und Maus am Rechner) und ob die Sitzung gerade aktiv ist.
+  - systemd startet für deine UID den User-Manager `user@1000.service` (`systemd --user`) und legt `XDG_RUNTIME_DIR=/run/user/1000` an, ein tmpfs nur für dich. Dort liegen später die Sockets von Wayland, D-Bus und PipeWire.
+  - Die aktive Sitzung am Sitz bekommt Zugriff auf die Geräte: udev markiert Grafikkarten, Eingabegeräte und Soundkarten mit dem Tag `uaccess`, und logind gibt dem Benutzer der aktiven Sitzung Rechte darauf. Der Compositor öffnet `/dev/dri/card0` und `/dev/input/event*` über logind und braucht dafür kein root.
+
+  ```console vm
+  $ loginctl list-sessions
+  SESSION  UID USER SEAT TTY
+        1 1000 ops       ttyS0
+
+  1 sessions listed.
+  $ loginctl show-session "$XDG_SESSION_ID" -p Type -p Class -p Service
+  Service=login
+  Type=tty
+  Class=user
+  ```
+
+  Im Terminal bist du über die serielle Konsole angemeldet: kein Sitz, Typ `tty`, angemeldet über `login`. In deiner Plasma-Sitzung zeigt derselbe Befehl `Service=sddm` und `Type=wayland`, mit `-p Seat` auch `seat0`.
+
+  ## D-Bus und polkit: Dienste fragen um Erlaubnis
+
+  **D-Bus** ist der Nachrichtenbus, über den Programme Methoden anderer Programme aufrufen ([D-Bus-Spezifikation](https://dbus.freedesktop.org/doc/dbus-specification.html)). Es gibt einen **Systembus** für Systemdienste (systemd, logind, hostnamed, NetworkManager, udisks2) und je Benutzer einen **Session-Bus** für dessen Programme (Benachrichtigungen, Portale, Plasma selbst). Debian nutzt dafür `dbus-daemon`, Arch und CachyOS seit 2024 die Neuimplementierung dbus-broker ([Arch-News](https://archlinux.org/news/making-dbus-broker-our-default-d-bus-daemon/)).
+
+  Jeder Dienst hat einen Namen wie `org.freedesktop.hostname1`, darunter Objekte wie `/org/freedesktop/hostname1` mit Interfaces, und die bieten Methoden, Eigenschaften und Signale. Viele Dienste sind aktivierbar: Sie laufen erst, wenn jemand sie aufruft. `busctl` aus systemd zeigt das ([busctl(1)](https://www.freedesktop.org/software/systemd/man/latest/busctl.html)):
+
+  ```console vm
+  $ busctl list --no-pager | grep -v '^:'
+  NAME                       PID PROCESS        USER CONNECTION    UNIT                   SESSION DESCRIPTION
+  org.freedesktop.DBus         1 systemd        root -             init.scope             -       -
+  org.freedesktop.PolicyKit1   - -              -    (activatable) -                      -       -
+  org.freedesktop.hostname1    - -              -    (activatable) -                      -       -
+  …
+  org.freedesktop.login1     229 systemd-logind root :1.1          systemd-logind.service -       -
+  …
+  ```
+
+  `hostnamectl` ist nur ein D-Bus-Client für `hostname1`. Dieselben Daten holst du dir direkt:
+
+  ```console vm
+  $ busctl introspect org.freedesktop.hostname1 /org/freedesktop/hostname1 org.freedesktop.hostname1 | head -n 4
+  NAME                       TYPE      SIGNATURE RESULT/VALUE                                           FLAGS
+  .Describe                  method    -         s                                                      -
+  .GetHardwareSerial         method    -         s                                                      -
+  .GetProductUUID            method    b         ay                                                     -
+  $ busctl get-property org.freedesktop.hostname1 /org/freedesktop/hostname1 org.freedesktop.hostname1 Hostname
+  s "web01"
+  $ busctl call org.freedesktop.hostname1 /org/freedesktop/hostname1 org.freedesktop.DBus.Properties Get ss org.freedesktop.hostname1 Chassis
+  v s "vm"
+  ```
+
+  Vor jedem Wert steht seine Typsignatur: `s` ist ein String, `v` ein Variant, `ss` heißt „zwei Strings“. Auf einem Desktop zeigt `busctl --user list` den Session-Bus. Dieser Server hat keinen, denn auf Debian liefert ihn erst das Paket `dbus-user-session`, das Desktop-Installationen mitbringen:
+
+  ```console vm fails
+  $ busctl --user list
+  Failed to connect to bus: No such file or directory
+  ```
+
+  **polkit** entscheidet, ob ein unprivilegierter Prozess eine privilegierte Aktion auslösen darf ([polkit(8)](https://polkit.pages.freedesktop.org/polkit/polkit.8.html)). Der Ablauf ist immer gleich: Ein Client (Plasma-Systemeinstellungen, `hostnamectl`, `systemctl`) ruft per D-Bus einen Dienst auf, der als root läuft. Der Dienst fragt polkitd: „Darf dieser Aufrufer die Aktion `org.freedesktop.hostname1.set-machine-info`?“ polkitd antwortet mit Ja, Nein oder „nach Authentisierung“. Im letzten Fall fragt ein **Authentisierungsagent** nach dem Passwort, auf Plasma ein Dialog, im Terminal `pkttyagent`. Ohne Agent, etwa in einem Skript, scheitert der Aufruf:
+
+  ```console vm fails
+  $ hostnamectl --no-ask-password set-deployment staging
+  Could not set deployment: Interactive authentication required.
+  ```
+
+  ```console vm
+  $ pkaction --verbose --action-id org.freedesktop.hostname1.set-machine-info
+  org.freedesktop.hostname1.set-machine-info:
+    description:       Set machine information
+    message:           Authentication is required to set local machine information.
+  …
+    implicit any:      auth_admin_keep
+    implicit inactive: auth_admin_keep
+    implicit active:   auth_admin_keep
+  ```
+
+  Die Aktionen und ihre Voreinstellungen liefern die Pakete als XML unter `/usr/share/polkit-1/actions/`. Die drei `implicit`-Zeilen gelten für beliebige Sitzungen (`any`, etwa SSH), für inaktive und für aktive Sitzungen am Rechner. `auth_admin_keep` heißt: Ein Administrator muss sich ausweisen, danach gilt die Erlaubnis einige Minuten. Wer Administrator ist, legt eine Regel fest, auf Debian die Gruppe `sudo`, auf Arch `wheel`.
+
+  Eigene Entscheidungen triffst du mit Regeln in JavaScript unter `/etc/polkit-1/rules.d/`. polkitd liest sie zusammen mit denen aus `/usr/share/polkit-1/rules.d/` in Namensreihenfolge, und die erste Regel, die ein Ergebnis zurückgibt, entscheidet ([polkit(8) · Authorization Rules](https://polkit.pages.freedesktop.org/polkit/polkit.8.html#polkit-rules)). Gibt keine etwas zurück, gilt die Voreinstellung der Aktion. Diese Regel erlaubt der Gruppe `adm`, Standort und Einsatzzweck des Servers zu setzen:
+
+  ```bash vm
+  sudo tee /etc/polkit-1/rules.d/50-adm-machine-info.rules > /dev/null <<'EOF'
+  // Mitglieder von adm dürfen Standort und Einsatzzweck des Servers setzen.
+  polkit.addRule(function(action, subject) {
+      if (action.id == "org.freedesktop.hostname1.set-machine-info" &&
+          subject.isInGroup("adm")) {
+          return polkit.Result.YES;
+      }
+  });
+  EOF
+  ```
+
+  ```console vm
+  $ hostnamectl --no-ask-password set-deployment staging
+  $ hostnamectl | grep -E 'hostname|Deployment'
+   Static hostname: web01
+        Deployment: staging
+  ```
+
+  polkitd bemerkt neue und geänderte Regeln selbst, ein Neustart ist nicht nötig. Bei der Aktion `org.freedesktop.systemd1.manage-units` übergibt systemd zusätzlich die Details `unit` (der volle Name, etwa `nginx.service`) und `verb` (`start`, `stop`, `restart` …), die eine Regel mit `action.lookup("unit")` abfragt.
+
+  > [!WARNING] polkit schweigt bei Fehlern
+  > Ein Syntaxfehler lässt polkitd die ganze Regeldatei verwerfen. Der Aufrufer sieht nur „Interactive authentication required“, den Grund findest du im Journal: `journalctl -u polkit` zeigt „Error compiling script …“. Ausgaben von `polkit.log()` landen dort nur, wenn polkitd ohne `--no-debug` läuft, und Debian startet es mit dieser Option.
+
+  ## udev und Treiber: vom Gerät zur Gerätedatei
+
+  Findet der Kernel ein Gerät, beim Boot über PCI oder später beim Einstecken über USB, legt er einen Eintrag in `/sys` an und schickt ein **uevent**. `systemd-udevd` arbeitet dann seine Regeln ab ([udev(7)](https://www.freedesktop.org/software/systemd/man/latest/udev.html)): Es lädt den passenden Treiber, setzt Besitzer und Rechte der Gerätedatei in `/dev`, legt Symlinks wie `/dev/disk/by-uuid/…` an und vergibt Tags wie `uaccess` oder `systemd`. Was udev über ein Gerät weiß, zeigt `udevadm info`:
+
+  ```console vm
+  $ udevadm info /dev/ttyS3
+  P: /devices/platform/serial8250/tty/ttyS3
+  M: ttyS3
+  …
+  E: DEVNAME=/dev/ttyS3
+  E: MAJOR=4
+  E: MINOR=67
+  E: SUBSYSTEM=tty
+  …
+  E: TAGS=:systemd:
+  ```
+
+  Regeln liegen unter `/usr/lib/udev/rules.d/` (Pakete) und `/etc/udev/rules.d/` (du). udev liest beide Verzeichnisse zusammen in Namensreihenfolge, eine Datei in `/etc` ersetzt eine gleichnamige aus `/usr/lib`. Eine Regel ist eine Zeile aus Vergleichen (`==`) und Zuweisungen (`=`, `+=` zum Anhängen, `:=` für endgültig). Spätere Zuweisungen überschreiben frühere, deshalb tragen eigene Regeln meist eine hohe Nummer. Angenommen, an `/dev/ttyS3` hängt eine USV, deren Überwachung als Gruppe `usv` läuft:
+
+  ```bash vm
+  sudo tee /etc/udev/rules.d/70-usv.rules > /dev/null <<'EOF'
+  # USV an COM4 (/dev/ttyS3): fester Name /dev/usv, lesbar für die Gruppe usv
+  SUBSYSTEM=="tty", KERNEL=="ttyS3", SYMLINK+="usv", GROUP="usv", MODE="0660"
+  EOF
+  sudo udevadm control --reload
+  sudo udevadm trigger --settle /dev/ttyS3
+  ```
+
+  ```console vm
+  $ ls -lL /dev/usv
+  crw-rw---- 1 root usv 4, 67 Oct  1 09:14 /dev/usv
+  $ sudo udevadm test /sys/class/tty/ttyS3 2>&1 | grep -E 'GROUP|MODE|LINK'
+  ttyS3: /usr/lib/udev/rules.d/50-udev-default.rules:40 GROUP 20
+  ttyS3: /etc/udev/rules.d/70-usv.rules:2 GROUP 996
+  ttyS3: /etc/udev/rules.d/70-usv.rules:2 MODE 0660
+  ttyS3: /etc/udev/rules.d/70-usv.rules:2 LINK 'usv'
+  DEVLINKS=/dev/usv
+  ```
+
+  `udevadm control --reload` lädt die Regeln neu, `udevadm trigger` spielt die Ereignisse vorhandener Geräte noch einmal ab, und `udevadm test` zeigt, welche Regelzeile was gesetzt hat: erst die Gruppe `dialout` (GID 20) aus der Standardregel, dann `usv` aus deiner. `trigger` schickt ohne Option die Aktion `change`, Boot und Einstecken melden `add`. Regeln, die nur für eine Aktion gelten, testest du deshalb mit `--action=add` ([udevadm(8)](https://www.freedesktop.org/software/systemd/man/latest/udevadm.html)). Live zusehen kannst du mit `udevadm monitor --udev --property`, während du ein Gerät einsteckst.
+
+  ### Gerät da, Treiber fehlt
+
+  Treiber sind meist Kernelmodule. Jedes Gerät meldet eine `modalias` aus Hersteller-, Geräte- und Klassen-ID, und udev lädt per `modprobe` das Modul, das diesen Alias kennt. `lspci -k` zeigt pro PCI-Gerät, welcher Treiber gebunden ist (`Kernel driver in use`) und welche Module passen würden (`Kernel modules`):
+
+  ```console vm
+  $ lspci -k
+  …
+  00:05.0 Ethernet controller: Realtek Semiconductor Co., Ltd. RTL-8029(AS)
+          Subsystem: Red Hat, Inc. QEMU Virtual Machine
+  00:06.0 Unclassified device [0002]: Red Hat, Inc. Virtio 1.0 filesystem (rev 01)
+          Subsystem: Red Hat, Inc. Virtio 1.0 filesystem
+          Kernel driver in use: virtio-pci
+          Kernel modules: virtio_pci
+  00:12.0 VGA compatible controller: Device 1234:1111
+          Subsystem: Red Hat, Inc. Device 1100
+  …
+  ```
+
+  Die virtio-Karte, über die das Wurzeldateisystem kommt, hat ihren Treiber. Netzwerkkarte und Grafikkarte sind da, aber das Image enthält absichtlich keine Treiber für sie: kein gebundener Treiber, kein passendes Modul. Ohne Grafiktreiber gibt es auch keine DRM-Geräte:
+
+  ```console vm fails
+  $ ls /dev/dri
+  ls: cannot access '/dev/dri': No such file or directory
+  ```
+
+  Auf einem Desktop stellt der **DRM-Treiber** des Kernels (Direct Rendering Manager) die Grafikkarte bereit ([Kernel · DRM](https://docs.kernel.org/gpu/introduction.html)): `/dev/dri/card0` für Kernel Mode Setting (Auflösung, Monitore, Bildwechsel), das der Compositor nutzt, und `/dev/dri/renderD128` zum Rendern für jedes Programm. Darüber liegt der Userspace-Treiber, der OpenGL und Vulkan umsetzt:
+
+  | GPU | Kerneltreiber | OpenGL / Vulkan |
+  | --- | --- | --- |
+  | AMD | `amdgpu` | Mesa: radeonsi / RADV |
+  | Intel | `i915`, neuere Generationen `xe` | Mesa: iris / ANV |
+  | NVIDIA, proprietär | `nvidia` aus den Open Kernel Modules (`nvidia-open`) | NVIDIAs eigene Bibliotheken (`nvidia-utils`) |
+  | NVIDIA, frei | `nouveau` | Mesa: NVK (Vulkan), Zink (OpenGL über Vulkan) |
+
+  NVIDIA empfiehlt seit der Treiberserie 560 die **Open Kernel Modules**. Offen ist dabei nur der Kernelteil, OpenGL, Vulkan und CUDA bleiben proprietär. CachyOS installiert sie mit seinem Hardware-Werkzeug `chwd` seit 2024 für Karten ab Turing, Arch hat mit Treiber 590 das Paket `nvidia` durch `nvidia-open` ersetzt. Die Serie 590 unterstützt Pascal (GTX 10xx) und ältere Karten nicht mehr, für sie bleibt `nvidia-580xx-dkms` aus dem AUR ([ArchWiki · NVIDIA](https://wiki.archlinux.org/title/NVIDIA#Installation)). Für Wayland muss das Modul `nvidia_drm` mit `modeset=1` laufen; die Arch-Pakete setzen das seit Treiber 560 selbst ([ArchWiki · DRM kernel mode setting](https://wiki.archlinux.org/title/NVIDIA#DRM_kernel_mode_setting)). Die freie Alternative ist `nouveau` mit Mesas Vulkan-Treiber NVK, laut Mesa ein konformer Vulkan-1.4-Treiber. Seit Mesa 25.1 laufen auf Turing und neueren Karten auch OpenGL-Programme darüber, mit Zink als Übersetzer von OpenGL nach Vulkan ([Mesa · NVK](https://docs.mesa3d.org/drivers/nvk.html)). Was tatsächlich rendert, zeigt dir der Desktop:
+
+  ```console
+  $ lspci -k -d ::03xx
+  01:00.0 VGA compatible controller: NVIDIA Corporation AD104 [GeForce RTX 4070] (rev a1)
+          Subsystem: …
+          Kernel driver in use: nvidia
+          Kernel modules: nouveau, nvidia_drm, nvidia
+  $ cat /sys/module/nvidia_drm/parameters/modeset
+  Y
+  $ glxinfo -B | grep 'OpenGL renderer'
+  OpenGL renderer string: NVIDIA GeForce RTX 4070/PCIe/SSE2
+  ```
+
+  > [!PRAXIS] Schwarzer Bildschirm nach dem Treiber-Update
+  > Auf Rolling-Release-Systemen wie CachyOS kommt ein NVIDIA-Update oft zusammen mit einem neuen Kernel. Bleibt danach der Bildschirm schwarz, wechselst du mit Strg+Alt+F3 auf eine Textkonsole und prüfst Schicht für Schicht: `lspci -k -d ::03xx` (ist `nvidia` gebunden?), `journalctl -b -k | grep -i nvidia` (Modul geladen, Versionskonflikt?), `cat /sys/module/nvidia_drm/parameters/modeset` und `journalctl -b -u sddm`. Meldet `nvidia-smi` „Driver/library version mismatch“, läuft noch das alte Kernelmodul mit den neuen Bibliotheken; ein Neustart behebt das.
+
+  ## PipeWire: Ton, Kamera und Bildschirmfreigabe
+
+  **PipeWire** ist ein Server für Audio- und Videoströme ([PipeWire · Überblick](https://docs.pipewire.org/page_overview.html)). Er hat PulseAudio und JACK auf den großen Desktop-Distributionen abgelöst, auch auf Debian 12 mit GNOME, auf Arch und CachyOS. Alte Programme merken davon nichts: `pipewire-pulse` spricht das PulseAudio-Protokoll, `pipewire-jack` ersetzt die JACK-Bibliothek, ALSA-Programme gehen über ein Plugin. PipeWire selbst entscheidet nichts. Welcher Strom auf welchem Gerät landet, welches Gerät Standard ist und welche App die Kamera bekommt, regelt der Session-Manager **WirePlumber** ([ArchWiki · PipeWire](https://wiki.archlinux.org/title/PipeWire)). Alle drei laufen als User-Units in deinem `systemd --user` und starten per Socket-Aktivierung:
+
+  ```console
+  $ systemctl --user status pipewire pipewire-pulse wireplumber | grep -E '●|Active:'
+  ● pipewire.service - PipeWire Multimedia Service
+       Active: active (running) since Thu 2026-10-01 08:12:03 CEST; 1h 4min ago
+  ● pipewire-pulse.service - PipeWire PulseAudio
+       Active: active (running) since Thu 2026-10-01 08:12:03 CEST; 1h 4min ago
+  ● wireplumber.service - Multimedia Service Session Manager
+       Active: active (running) since Thu 2026-10-01 08:12:03 CEST; 1h 4min ago
+  $ wpctl status
+  …
+  Audio
+   ├─ Devices:
+   │      48. Family 17h/19h HD Audio Controller  [alsa]
+   │      49. AD104 High Definition Audio Controller [alsa]
+   │
+   ├─ Sinks:
+   │  *   57. Family 17h/19h HD Audio Controller Analog Stereo [vol: 0.40]
+   │      58. AD104 High Definition Audio Controller Digital Stereo (HDMI) [vol: 1.00]
+  …
+  $ wpctl set-default 58
+  $ wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%+
+  $ pactl info | grep 'Server Name'
+  Server Name: PulseAudio (on PipeWire 1.6.9)
+  ```
+
+  Das `*` markiert das Standardgerät, die Zahlen sind IDs im Graphen von PipeWire. Eigene Einstellungen legst du als Schnipsel in `~/.config/pipewire/pipewire.conf.d/` oder `~/.config/wireplumber/wireplumber.conf.d/` ab. WirePlumber hat mit Version 0.5 von Lua- auf `.conf`-Dateien umgestellt, ältere Anleitungen passen deshalb nicht mehr. Weil PipeWire auch Video transportiert, läuft unter Wayland die Bildschirmfreigabe darüber: Der Compositor schreibt das Bild in einen PipeWire-Strom, und die App liest ihn. Ob sie das darf, entscheidet ein Portal.
+
+  ## XDG: Verzeichnisse, Starter, Autostart und Portale
+
+  Die XDG-Spezifikationen von freedesktop.org legen fest, wo Programme ihre Dateien ablegen, wie Starter aussehen und wie Programme den Desktop um etwas bitten.
+
+  ### Basisverzeichnisse
+
+  Die [XDG Base Directory Specification](https://specifications.freedesktop.org/basedir/latest/) nennt für jede Art von Datei eine Variable. Ist sie nicht gesetzt, gilt der Standardwert:
+
+  | Variable | Standard | Inhalt |
+  | --- | --- | --- |
+  | `XDG_CONFIG_HOME` | `~/.config` | Konfiguration |
+  | `XDG_DATA_HOME` | `~/.local/share` | Daten, Starter, Icons |
+  | `XDG_STATE_HOME` | `~/.local/state` | Zustand wie Verlauf und Logs |
+  | `XDG_CACHE_HOME` | `~/.cache` | Cache, darf jederzeit weg |
+  | `XDG_RUNTIME_DIR` | von logind gesetzt: `/run/user/UID` | Sockets, nur während der Sitzung |
+  | `XDG_CONFIG_DIRS` | `/etc/xdg` | systemweite Konfiguration |
+  | `XDG_DATA_DIRS` | `/usr/local/share:/usr/share` | systemweite Daten |
+
+  Programme suchen erst beim Benutzer, dann in den Systemverzeichnissen der Reihe nach:
+
+  ```console vm
+  $ echo "${XDG_CONFIG_HOME:-$HOME/.config}"
+  /home/ops/.config
+  $ echo "${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+  /usr/local/share:/usr/share
+  $ systemd-path user-configuration user-shared user-state-cache user-runtime
+  /home/ops/.config
+  /home/ops/.local/share
+  /home/ops/.cache
+  /run/user/1000
+  ```
+
+  ### Starter: `.desktop`-Dateien
+
+  Menüeinträge sind `.desktop`-Dateien nach der [Desktop Entry Specification](https://specifications.freedesktop.org/desktop-entry/latest/). Pakete legen sie unter `/usr/share/applications/` ab, deine eigenen gehören nach `~/.local/share/applications/`. Eine Datei mit demselben Namen ersetzt dort die des Pakets. Ein Starter für ein eigenes Skript:
+
+  ```ini title=~/.local/share/applications/backup-jetzt.desktop
+  [Desktop Entry]
+  Type=Application
+  Name=Backup jetzt
+  Comment=Sichert ~/Projekte auf das NAS
+  Exec=/home/steven/bin/backup-jetzt --verbose
+  Icon=drive-harddisk
+  Terminal=true
+  Categories=Utility;
+  ```
+
+  `Exec` läuft nicht durch eine Shell ([Spezifikation · Exec](https://specifications.freedesktop.org/desktop-entry/latest/exec-variables.html)). Tilde, `$HOME`, Pipes und ein vorangestelltes `VAR=wert` funktionieren nicht. Das Programm steht mit absolutem Pfad oder als Name aus dem `PATH` da, Umgebungsvariablen setzt `env VAR=wert programm`. Platzhalter wie `%f` (eine Datei) oder `%U` (mehrere URLs) füllt der Starter aus. `NoDisplay=true` blendet einen Eintrag im Menü aus, er bleibt aber für Dateizuordnungen nutzbar; `Hidden=true` bedeutet „gelöscht“. Boolesche Werte heißen `true` und `false`:
+
+  ```console vm fails
+  $ printf '[Desktop Entry]\nType=Application\nName=Backup jetzt\nExec=/usr/local/bin/backup-jetzt\nTerminal=yes\n' > ~/backup-jetzt.desktop
+  $ desktop-file-validate ~/backup-jetzt.desktop
+  /home/ops/backup-jetzt.desktop: error: value "yes" for boolean key "Terminal" in group "Desktop Entry" contains invalid characters, boolean values must be "false" or "true"
+  ```
+
+  ### Autostart
+
+  Programme, die nach dem Login starten sollen, liegen als `.desktop`-Datei in `~/.config/autostart/` oder systemweit in `/etc/xdg/autostart/` ([Autostart-Spezifikation](https://specifications.freedesktop.org/autostart/latest/)). Auch hier ersetzt eine Datei gleichen Namens beim Benutzer die des Systems, und mit `Hidden=true` startet das Programm nicht. Plasma (seit 5.25) und GNOME überlassen den Start systemd: Der [systemd-xdg-autostart-generator](https://www.freedesktop.org/software/systemd/man/latest/systemd-xdg-autostart-generator.html) macht beim Login aus jedem Eintrag eine User-Unit, und die Sitzung startet `xdg-desktop-autostart.target`. `OnlyShowIn=` und `NotShowIn=` übersetzt er in eine `ExecCondition=`, Einträge mit `Hidden=true` oder ohne das Programm aus `TryExec=` lässt er weg. Das funktioniert auch im Terminal, `systemctl --user daemon-reload` lässt den Generator laufen:
+
+  ```console vm
+  $ cat /etc/xdg/autostart/backup-hinweis.desktop
+  [Desktop Entry]
+  Type=Application
+  Name=Backup-Hinweis
+  Comment=Erinnert nach dem Login an das wöchentliche Backup
+  Exec=/usr/local/bin/backup-hinweis
+  $ systemctl --user daemon-reload
+  $ systemctl --user list-dependencies xdg-desktop-autostart.target
+  xdg-desktop-autostart.target
+  ○ └─app-backup\x2dhinweis@autostart.service
+  ```
+
+  Abschalten, ohne die Datei des Systems anzufassen:
+
+  ```console vm
+  $ mkdir -p ~/.config/autostart
+  $ cp /etc/xdg/autostart/backup-hinweis.desktop ~/.config/autostart/
+  $ echo 'Hidden=true' >> ~/.config/autostart/backup-hinweis.desktop
+  $ systemctl --user daemon-reload
+  $ systemctl --user list-dependencies xdg-desktop-autostart.target
+  xdg-desktop-autostart.target
+  ```
+
+  > [!MERKE]
+  > Programme suchen XDG-Dateien immer in derselben Reihenfolge: erst beim Benutzer (`~/.config`, `~/.local/share`), dann im System (`/etc/xdg`, `/usr/share`). Eine Datei gleichen Namens beim Benutzer ersetzt die des Systems vollständig.
+
+  ### Portale
+
+  Ein **Portal** ist eine D-Bus-Schnittstelle auf dem Session-Bus (`org.freedesktop.portal.Desktop`), über die Programme den Desktop um etwas bitten: eine Datei auswählen (`FileChooser`), einen Link öffnen (`OpenURI`), ein Bildschirmfoto machen (`Screenshot`), den Bildschirm teilen (`ScreenCast`), ein globales Tastenkürzel anmelden (`GlobalShortcuts`). Der Dienst `xdg-desktop-portal` nimmt die Anfrage an und reicht sie an das Backend des Desktops weiter, etwa `xdg-desktop-portal-kde`, `-gnome`, `-gtk`, `-wlr` oder `-hyprland` ([XDG Desktop Portal](https://flatpak.github.io/xdg-desktop-portal/docs/)). Das Backend zeigt den Dialog, und du entscheidest. Welches Backend wofür zuständig ist, steht in `portals.conf` passend zu `XDG_CURRENT_DESKTOP`, auf Plasma also in `/usr/share/xdg-desktop-portal/kde-portals.conf`. Flatpak-Apps erreichen den Desktop nur über Portale. Unter Wayland nutzen auch normal installierte Browser, OBS oder Zoom das ScreenCast-Portal, weil es keinen anderen Weg zum Bildschirminhalt gibt.
+
+  ## Häufige Fehler
+
+  - **Bildschirmfreigabe zeigt Schwarz oder keinen Dialog.** Das Portal-Backend für deinen Desktop fehlt, oder `xdg-desktop-portal` läuft nicht: `systemctl --user status xdg-desktop-portal`. Unter Hyprland oder Sway muss die Sitzung `WAYLAND_DISPLAY` und `XDG_CURRENT_DESKTOP` an systemd und D-Bus weitergeben (`dbus-update-activation-environment --systemd …`), sonst startet das Portal ohne Wayland oder mit dem falschen Backend. Alte X11-Programme unter XWayland sehen nur andere X11-Fenster.
+  - **Die polkit-Regel wirkt nicht.** Ein Syntaxfehler (steht im Journal), ein Unit-Name ohne Endung oder Bedingungen wie `subject.active` und `subject.local`: Ein Cronjob oder eine SSH-Sitzung ist nie lokal aktiv.
+  - **Die udev-Regel greift nach dem Neustart nicht.** Eine spätere Regel überschreibt deine Zuweisung, weil deine Datei eine kleinere Nummer hat; `udevadm test` zeigt die Reihenfolge. Oder die Regel vergleicht Attribute aus zwei verschiedenen Elterngeräten: `ATTRS{…}` passt in einer Regel nur auf ein Elterngerät zugleich.
+  - **Der Starter erscheint nicht.** Die Datei endet nicht auf `.desktop`, `Type=` ist falsch geschrieben, `NoDisplay=true` steht drin, oder `Exec` enthält Shell-Syntax. `desktop-file-validate` findet die meisten dieser Fälle.
+  - **Kein Ton.** Zeigt `wpctl status` nur „Dummy Output“, sieht WirePlumber kein Gerät: Treiber prüfen (`lspci -k`) und `journalctl --user -u wireplumber` lesen. Hängt alles, hilft `systemctl --user restart pipewire pipewire-pulse wireplumber` – ohne sudo, denn es sind deine Units.
+  - **NVIDIA und Wayland.** Schwarzer Bildschirm: `modeset` ist aus, oder der Treiber passt nicht zur Karte (Pascal mit Treiber 590). Flackern in Wayland- und XWayland-Programmen: Treiber vor 555 oder ein Compositor ohne Explicit Sync.
+
+  ## Zusammenfassung
+
+  - Unter Wayland ist der Compositor zugleich Display-Server und Fenstermanager. Clients rendern selbst, Eingaben gehen nur ans fokussierte Fenster, X11-Programme laufen über XWayland.
+  - Der Display Manager meldet dich über PAM an. logind führt die Sitzung (`loginctl`), gibt der aktiven Sitzung die Geräte und startet `systemd --user`.
+  - D-Bus verbindet Programme über den Systembus und je Benutzer einen Session-Bus. `busctl` listet, inspiziert und ruft auf.
+  - polkit entscheidet für privilegierte Dienste. Regeln liegen in `/etc/polkit-1/rules.d/`, Fehler darin stehen nur im Journal.
+  - udev vergibt Namen und Rechte und lädt Treiber. Eigene Regeln bekommen eine hohe Nummer, `udevadm test` zeigt die Reihenfolge, `lspci -k` den gebundenen Treiber.
+  - Der Kernel stellt die Grafikkarte über einen DRM-Treiber bereit, OpenGL und Vulkan kommen aus Mesa oder von NVIDIA. NVIDIA unter Wayland braucht `nvidia_drm.modeset=1`.
+  - PipeWire transportiert Ton und Video, WirePlumber entscheidet, wohin. Beide laufen als User-Units.
+  - XDG heißt: Benutzer vor System, gleicher Name ersetzt. Starter und Autostart sind `.desktop`-Dateien, Portale vermitteln zwischen App und Desktop.
+exercises:
+  - id: wayland-rollen
+    type: choice
+    title: Wer macht was in der Plasma-Sitzung?
+    prompt: Du arbeitest in einer Plasma-Sitzung unter Wayland. Welche Aussagen stimmen?
+    options:
+      - text: KWin entscheidet, welches Fenster einen Tastendruck bekommt, und schickt ihn nur dorthin.
+        correct: true
+        why: Unter Wayland liest der Compositor die Eingabegeräte über libinput und schickt Ereignisse an das Fenster mit dem Fokus.
+      - text: Firefox zeichnet seinen Fensterinhalt selbst in einen Puffer und übergibt ihn KWin.
+        correct: true
+        why: Clients rendern selbst, per CPU oder GPU, und reichen fertige Puffer ein. Der Compositor setzt sie zum Bild zusammen.
+      - text: Ein Wayland-Programm kann den Inhalt anderer Fenster lesen, solange es unter demselben Benutzer läuft.
+        correct: false
+        why: Wayland gibt Clients keinen Zugriff auf fremde Oberflächen. Bildschirmaufnahmen laufen über den Compositor oder das ScreenCast-Portal, mit Rückfrage.
+      - text: Ein reines X11-Programm startet nicht, weil es unter Wayland keinen X-Server gibt.
+        correct: false
+        why: XWayland ist ein X-Server, der selbst ein Wayland-Client ist. KWin startet ihn bei Bedarf; wegfallen wird nur die X11-Sitzung.
+      - text: Der Fenstermanager ist ein eigener Prozess, der sich mit dem Compositor abstimmt.
+        correct: false
+        why: Das ist das Modell von X11. Unter Wayland vereint ein Programm Display-Server, Fenstermanager und Compositor, hier KWin.
+    explanation: |
+      Unter Wayland zeichnen die Clients, der Compositor setzt zusammen und verteilt die Eingaben. Weil nur der Compositor das ganze Bild kennt, kann ein Programm andere Fenster weder lesen noch fernsteuern. Funktionen, die das brauchen, wie Bildschirmfreigabe oder globale Kürzel, laufen über Portale. X11-Programme laufen weiter, aber in XWayland, und sehen dort nur einander.
+    resources:
+      - title: Wayland · Architektur
+        url: https://wayland.freedesktop.org/architecture.html
+  - id: nvidia-stapel
+    type: choice
+    title: Welcher Teil des NVIDIA-Treibers ist offen?
+    prompt: |
+      Auf deinem CachyOS-Rechner steckt eine GeForce RTX 4070 (Ada). `lspci -k` zeigt `Kernel driver in use: nvidia`, installiert ist `nvidia-open`. Welche Aussagen stimmen?
+    options:
+      - text: Das Kernelmodul ist quelloffen, OpenGL und Vulkan kommen weiter aus NVIDIAs proprietären Bibliotheken.
+        correct: true
+        why: Die Open Kernel Modules betreffen nur den Kernelteil. Die Userspace-Treiber in `nvidia-utils` bleiben Binärdateien von NVIDIA.
+      - text: Für eine Wayland-Sitzung muss `nvidia_drm` mit `modeset=1` laufen; prüfen lässt sich das unter `/sys/module/nvidia_drm/parameters/modeset`.
+        correct: true
+        why: Ohne DRM-KMS kann der Compositor die Monitore nicht ansteuern. Die Arch-Pakete stellen `modeset=1` seit Treiber 560 selbst ein.
+      - text: Mesa liefert hier OpenGL, NVIDIA nur den Kerneltreiber.
+        correct: false
+        why: Mit dem proprietären Userspace kommt OpenGL von NVIDIA. Mesa ist zuständig, wenn `nouveau` läuft, dann mit NVK und Zink.
+      - text: Eine GTX 1060 (Pascal) im Zweitrechner läuft mit demselben aktuellen `nvidia-open`.
+        correct: false
+        why: Die Open Kernel Modules unterstützen erst Turing und neuer, und die Serie 590 unterstützt Pascal überhaupt nicht mehr. Auf Arch bleibt `nvidia-580xx-dkms` oder nouveau.
+      - text: Mit `nouveau` und Mesas NVK läuft dieselbe Karte ganz ohne proprietäre Treiber, OpenGL kommt dann über Zink.
+        correct: true
+        why: NVK ist ein konformer Vulkan-Treiber in Mesa. Seit Mesa 25.1 nutzen Turing und neuere Karten NVK mit Zink auch für OpenGL.
+    explanation: |
+      Der Grafikstapel hat zwei Hälften: den DRM-Treiber im Kernel (`nvidia` oder `nouveau`) und den Userspace-Treiber für OpenGL und Vulkan (NVIDIAs Bibliotheken oder Mesa). „Open Kernel Modules“ öffnet nur die erste Hälfte. Wayland braucht von der Kernelhälfte KMS, deshalb `modeset=1`. Welche Generation welchen Treiber bekommt, steht in der Tabelle im ArchWiki.
+    resources:
+      - title: ArchWiki · NVIDIA · Installation
+        url: https://wiki.archlinux.org/title/NVIDIA#Installation
+      - title: Mesa · NVK
+        url: https://docs.mesa3d.org/drivers/nvk.html
+  - id: tastendruck-bis-pixel
+    type: order
+    title: Vom Tastendruck bis zum Pixel
+    prompt: Du tippst in Kate unter Plasma (Wayland) ein „a“. Bring die Schritte in die richtige Reihenfolge.
+    lang: text
+    lines: |
+      Der Kernel meldet den Tastendruck als Ereignis auf /dev/input/event3
+      KWin liest das Ereignis über libinput und bestimmt das Fenster mit Tastaturfokus
+      KWin schickt Kate ein wl_keyboard.key-Ereignis mit dem Keycode
+      Kate übersetzt den Keycode mit xkbcommon in „a“ und zeichnet den neuen Inhalt in einen Puffer
+      Kate hängt den Puffer an ihre Oberfläche und meldet sie neu (wl_surface.attach, damage, commit)
+      KWin setzt aus allen Oberflächen den nächsten Frame zusammen
+      KWin übergibt den Frame per KMS an den Grafiktreiber, der ihn beim nächsten Bildwechsel anzeigt
+    explanation: |
+      Eingaben und Ausgabe laufen beide durch den Compositor. Er bekommt das Ereignis vom Kernel, entscheidet über den Fokus und gibt nur den Keycode weiter; welches Zeichen daraus wird, bestimmt der Client mit der Tastaturbelegung (xkbcommon). Gezeichnet wird im Client, angezeigt über den Compositor und KMS. Unter X11 hätte der X-Server die Eingabe verteilt und jeder Client hätte sie mitlesen können.
+    resources:
+      - title: Wayland · Architektur
+        url: https://wayland.freedesktop.org/architecture.html
+  - id: canreboot-vorhersagen
+    type: output
+    title: Darf ich neu starten?
+    prompt: |
+      Du bist der einzige angemeldete Benutzer und Mitglied von `wheel`. Du fragst logind zweimal, ob du neu starten darfst: erst in deiner Plasma-Sitzung am Laptop, dann aus einer SSH-Sitzung von einem anderen Rechner. Was antwortet logind jeweils? Die Voreinstellung der Aktion steht oben.
+    lang: console
+    code: |
+      $ pkaction --verbose --action-id org.freedesktop.login1.reboot | grep implicit
+        implicit any:      auth_admin_keep
+        implicit inactive: auth_admin_keep
+        implicit active:   yes
+
+      # 1. in der Plasma-Sitzung am Laptop
+      $ busctl call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager CanReboot
+      # 2. per SSH
+      $ busctl call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager CanReboot
+    expected: |
+      s "yes"
+      s "challenge"
+    explanation: |
+      `CanReboot` fragt polkit, ohne zu authentisieren. Die Plasma-Sitzung ist lokal (an `seat0`) und aktiv, also gilt `implicit active: yes`. Eine SSH-Sitzung hat keinen Sitz, für polkit ist sie nicht lokal, also gilt `implicit any: auth_admin_keep`, und logind antwortet `challenge`: erlaubt nach Authentisierung. Deshalb fragt `systemctl reboot` per SSH nach einem Passwort, im Plasma-Menü nicht. Sind weitere Benutzer angemeldet, prüft logind zusätzlich die Aktion `reboot-multiple-sessions`.
+    resources:
+      - title: polkit(8) · Declaring Actions
+        url: https://polkit.pages.freedesktop.org/polkit/polkit.8.html#polkit-declaring-actions
+  - id: udev-vorrang
+    type: output
+    title: Welche Regel gewinnt?
+    prompt: |
+      Du steckst einen USB-Seriell-Adapter ein, er erscheint als `/dev/ttyUSB0`. Diese drei Regeln passen auf ihn. Was geben die beiden Befehle danach aus?
+    lang: text
+    code: |
+      # /usr/lib/udev/rules.d/50-udev-default.rules (Auszug, gilt für ACTION=="add")
+      KERNEL=="tty[A-Z]*[0-9]|ttymxc[0-9]*|pppox[0-9]*|ircomm[0-9]*|noz[0-9]*|rfcomm[0-9]*", GROUP="dialout"
+
+      # /etc/udev/rules.d/10-gps.rules
+      SUBSYSTEM=="tty", ATTRS{idVendor}=="067b", ATTRS{idProduct}=="23a3", SYMLINK+="gps0", GROUP:="gps", MODE="0660"
+
+      # /etc/udev/rules.d/99-serial.rules
+      SUBSYSTEM=="tty", KERNEL=="ttyUSB[0-9]*", MODE="0664"
+
+      $ stat -c '%G %a' /dev/ttyUSB0
+      $ readlink /dev/gps0
+    expected: |
+      gps 664
+      ttyUSB0
+    explanation: |
+      udev arbeitet die Dateien beider Verzeichnisse gemeinsam in Namensreihenfolge ab: 10, 50, 99. `GROUP:=` in `10-gps.rules` setzt die Gruppe endgültig, die spätere Zuweisung `dialout` wird ignoriert. `MODE` wurde dagegen mit `=` gesetzt, also überschreibt `99-serial.rules` den Wert mit `0664`. Symlinks legt udev relativ an, deshalb zeigt `readlink` nur `ttyUSB0`.
+    resources:
+      - title: udev(7)
+        url: https://www.freedesktop.org/software/systemd/man/latest/udev.html
+  - id: sitzungstyp-pruefen
+    type: command
+    title: Wayland oder X11?
+    prompt: Frag logind, welchen Typ deine aktuelle Sitzung hat. Zeige nur diese eine Eigenschaft.
+    context: Die ID deiner Sitzung steht in `$XDG_SESSION_ID`.
+    answers:
+      - loginctl show-session $XDG_SESSION_ID -p Type
+      - loginctl show-session "$XDG_SESSION_ID" -p Type
+      - loginctl show-session $XDG_SESSION_ID --property=Type
+      - loginctl show-session "$XDG_SESSION_ID" --property=Type
+      - loginctl show-session $XDG_SESSION_ID -p Type --value
+      - loginctl show-session "$XDG_SESSION_ID" -p Type --value
+      - loginctl show-session -p Type $XDG_SESSION_ID
+      - loginctl show-session -p Type "$XDG_SESSION_ID"
+      - loginctl show-session self -p Type
+    output: |
+      Type=wayland
+    explanation: |
+      `loginctl show-session` zeigt die Eigenschaften einer Sitzung, `-p` filtert auf eine. Die Variable `XDG_SESSION_TYPE` enthält meist dasselbe, aber sie lässt sich in jeder Shell überschreiben; logind kennt den Wert, mit dem die Sitzung angemeldet wurde. Mögliche Werte sind `wayland`, `x11`, `tty` und `unspecified`.
+    resources:
+      - title: loginctl(1)
+        url: https://www.freedesktop.org/software/systemd/man/latest/loginctl.html
+  - id: dbus-eigenschaft
+    type: command
+    title: Den Hostnamen über D-Bus lesen
+    prompt: Lies mit `busctl` die Eigenschaft `Hostname` des Dienstes `org.freedesktop.hostname1`. Objekt und Interface heißen wie der Dienst (`/org/freedesktop/hostname1`, `org.freedesktop.hostname1`).
+    answers:
+      - busctl get-property org.freedesktop.hostname1 /org/freedesktop/hostname1 org.freedesktop.hostname1 Hostname
+      - busctl --system get-property org.freedesktop.hostname1 /org/freedesktop/hostname1 org.freedesktop.hostname1 Hostname
+      - busctl call org.freedesktop.hostname1 /org/freedesktop/hostname1 org.freedesktop.DBus.Properties Get ss org.freedesktop.hostname1 Hostname
+    output: |
+      s "web01"
+    explanation: |
+      `get-property` braucht Dienst, Objektpfad, Interface und Eigenschaft. Davor steht die Typsignatur, `s` für String. Dasselbe geht allgemeiner über die Methode `Get` des Standard-Interfaces `org.freedesktop.DBus.Properties`, die jedes Objekt hat. `hostnamectl` macht intern genau diese Aufrufe.
+    resources:
+      - title: busctl(1)
+        url: https://www.freedesktop.org/software/systemd/man/latest/busctl.html
+  - id: pipewire-neu-starten
+    type: command
+    title: Der Ton ist weg
+    prompt: |
+      Nach dem Aufwachen aus dem Standby ist der Ton weg, `wpctl status` zeigt nur noch „Dummy Output“. Starte PipeWire, den PulseAudio-Ersatz `pipewire-pulse` und WirePlumber neu, mit einem Befehl.
+    answers:
+      - systemctl --user restart pipewire pipewire-pulse wireplumber
+      - systemctl --user restart pipewire wireplumber pipewire-pulse
+      - systemctl --user restart pipewire-pulse pipewire wireplumber
+      - systemctl --user restart pipewire-pulse wireplumber pipewire
+      - systemctl --user restart wireplumber pipewire pipewire-pulse
+      - systemctl --user restart wireplumber pipewire-pulse pipewire
+      - systemctl --user restart pipewire.service pipewire-pulse.service wireplumber.service
+      - systemctl restart --user pipewire pipewire-pulse wireplumber
+    explanation: |
+      PipeWire, `pipewire-pulse` und WirePlumber sind User-Units in deinem `systemd --user`, nicht Systemdienste. Ohne `--user` sucht `systemctl` sie im System und findet nichts, und mit sudo träfest du den falschen Manager. Neustarten hilft, wenn WirePlumber nach dem Aufwachen die Geräte nicht neu eingelesen hat; bleibt danach „Dummy Output“, fehlt eher der Treiber (`lspci -k`, Journal).
+    resources:
+      - title: ArchWiki · PipeWire
+        url: https://wiki.archlinux.org/title/PipeWire
+  - id: starter-reparieren
+    type: bug
+    title: Der Starter fürs AppImage bleibt unsichtbar
+    prompt: |
+      Für ein AppImage hast du `~/.local/share/applications/notizen.desktop` angelegt. Das AppImage liegt unter `/home/steven/Apps/Notizen.AppImage` und ist ausführbar. Der Starter erscheint nicht im Startmenü, und `desktop-file-validate` meldet einen Fehler. Finde die beiden fehlerhaften Zeilen und korrigiere sie.
+    lang: ini
+    code: |
+      [Desktop Entry]
+      Type=Application
+      Name=Notizen
+      Comment=Markdown-Notizen mit Team-Sync
+      Exec=~/Apps/Notizen.AppImage %u
+      Icon=notizen
+      Terminal=false
+      Categories=Office;
+      NoDisplay=true
+    lines: [5, 9]
+    fix:
+      - line: 5
+        answers:
+          - Exec=/home/steven/Apps/Notizen.AppImage %u
+          - Exec=/home/steven/Apps/Notizen.AppImage %U
+          - Exec=/home/steven/Apps/Notizen.AppImage
+          - Exec="/home/steven/Apps/Notizen.AppImage" %u
+      - line: 9
+        answers:
+          - NoDisplay=false
+    explanation: |
+      `Exec` läuft nicht durch eine Shell, die Tilde wird nicht zum Home-Verzeichnis. Die Spezifikation zählt `~` zu den reservierten Zeichen, deshalb meldet `desktop-file-validate` „contains a reserved character '~' outside of a quote“. `NoDisplay=true` ist gültig, blendet den Eintrag aber im Menü aus; dafür ist es gedacht, etwa für Helfer, die nur Dateitypen öffnen. Die Zeile ganz zu löschen ist gleichwertig mit `NoDisplay=false`.
+    resources:
+      - title: Desktop Entry Specification · Exec
+        url: https://specifications.freedesktop.org/desktop-entry/latest/exec-variables.html
+      - title: Desktop Entry Specification · Schlüssel
+        url: https://specifications.freedesktop.org/desktop-entry/latest/recognized-keys.html
+  - id: treiber-fehlt-erklaeren
+    type: explain
+    title: Warum könnte hier kein Compositor starten?
+    prompt: |
+      Das ist die Grafikkarte der VM aus dem Terminal. Erkläre, was die Ausgaben zeigen und warum auf diesem System kein Wayland-Compositor starten könnte. Was müsste sich ändern?
+    lang: console
+    code: |
+      $ lspci -nnk -s 00:12.0
+      00:12.0 VGA compatible controller [0300]: Device [1234:1111]
+              Subsystem: Red Hat, Inc. Device [1af4:1100]
+      $ cat /sys/bus/pci/devices/0000:00:12.0/modalias
+      pci:v00001234d00001111sv00001AF4sd00001100bc03sc00i00
+      $ sudo modprobe --resolve-alias pci:v00001234d00001111sv00001AF4sd00001100bc03sc00i00
+      modprobe: FATAL: Module pci:v00001234d00001111sv00001AF4sd00001100bc03sc00i00 not found in directory /lib/modules/6.1.0-53-686
+      $ ls /dev/dri
+      ls: cannot access '/dev/dri': No such file or directory
+    points:
+      - Der Kernel hat die Karte per PCI gefunden (Klasse 0300, ID 1234:1111), aber kein Treiber ist gebunden; die Zeile „Kernel driver in use“ fehlt.
+      - Die modalias beschreibt das Gerät. Kein installiertes Modul kennt diesen Alias, deshalb konnte udev keinen Treiber laden.
+      - Ohne DRM-Treiber gibt es weder `/dev/dri/card0` für KMS noch einen Render-Knoten, also nichts, worüber ein Compositor Monitore ansteuern oder rendern könnte.
+      - Abhilfe ist ein Kernel bzw. Paket mit dem passenden DRM-Treiber (für diese emulierte Karte `bochs`); udev lädt ihn dann beim Boot selbst.
+    explanation: |
+      `lspci` listet, was auf dem PCI-Bus steckt, unabhängig von Treibern. Ob ein Treiber gebunden ist, zeigt erst `-k`. udev lädt Treiber über die modalias: `modprobe` sucht ein Modul, dessen Alias darauf passt. Hier gibt es keins, weil das Image ohne Grafiktreiber gebaut ist. Ohne DRM-Treiber entsteht kein `/dev/dri`, und ein Wayland-Compositor braucht genau diese Geräte für Ausgabe (KMS) und Rendern. Die Textkonsole läuft trotzdem, weil sie den VGA-Textmodus nutzt. Auf echter Hardware ist das Muster dasselbe, etwa eine brandneue GPU mit einem zu alten Kernel.
+    resources:
+      - title: Kernel · DRM Introduction
+        url: https://docs.kernel.org/gpu/introduction.html
+  - id: bildschirmfreigabe-erklaeren
+    type: explain
+    title: Warum fragt Plasma beim Teilen des Bildschirms?
+    prompt: |
+      So läuft eine Bildschirmfreigabe in Firefox unter Plasma (Wayland) ab, vereinfacht als Folge von D-Bus-Aufrufen. Erkläre, welche Komponente was tut, warum der Umweg nötig ist und warum ein altes X11-Konferenzprogramm unter Wayland oft nur Schwarz überträgt.
+    lang: text
+    code: |
+      Firefox → org.freedesktop.portal.ScreenCast.CreateSession()
+      Firefox → SelectSources(types: Monitor | Window)
+      Firefox → Start()
+                xdg-desktop-portal-kde zeigt: „Firefox möchte deinen Bildschirm teilen“
+                Du wählst das Fenster „Präsentation.odp“.
+      Antwort ← streams: [(63, {source_type: Window, size: (1920, 1080)})]
+      Firefox → OpenPipeWireRemote() → Dateideskriptor
+      Firefox liest die Frames vom PipeWire-Knoten 63
+    points:
+      - Unter Wayland kennt nur der Compositor das ganze Bild; ein Client kann fremde Fenster nicht lesen.
+      - "`xdg-desktop-portal` nimmt die Anfrage auf dem Session-Bus an und reicht sie an das Backend des Desktops weiter, hier `xdg-desktop-portal-kde`, das mit KWin spricht."
+      - Du entscheidest im Dialog, was geteilt wird, und Firefox bekommt nur diese eine Quelle.
+      - Das Bild kommt als PipeWire-Strom; Firefox bekommt einen Zugang zu genau diesem Knoten.
+      - Ein X11-Programm, das selbst den Bildschirm abgreift, sieht unter XWayland nur andere X11-Fenster; die Wayland-Fenster bleiben schwarz.
+    explanation: |
+      Firefox fragt nicht den Compositor direkt, sondern das ScreenCast-Portal auf dem Session-Bus. `xdg-desktop-portal` wählt per `portals.conf` das Backend zum Desktop, das Backend zeigt den Dialog und lässt KWin das gewählte Fenster in einen PipeWire-Strom schreiben. Die Antwort enthält die Knotennummer, `OpenPipeWireRemote` liefert einen Zugang, der nur diesen Strom sieht. So kann kein Programm heimlich mitfilmen. Fehlt das passende Backend oder läuft das Portal ohne `WAYLAND_DISPLAY`, kommt kein Dialog. Alte X11-Programme, die den Bildschirm über X11 lesen, sehen in XWayland nur X11-Fenster.
+    resources:
+      - title: XDG Desktop Portal · ScreenCast
+        url: https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.ScreenCast.html
+  - id: deploy-darf-neu-starten
+    type: scenario
+    title: Der Deploy-Job darf nicht, was er soll
+    prompt: |
+      Der Deploy-Job auf `web01` läuft als Benutzer `deploy`. Nach jedem Release startet er die Shop-App mit `systemctl restart app.service` neu, ohne sudo. Damit das geht, hat eine Kollegin gestern die polkit-Regel `/etc/polkit-1/rules.d/60-deploy.rules` angelegt. Der Job von heute Nacht ist trotzdem gescheitert:
+
+      ```text
+      Failed to restart app.service: Interactive authentication required.
+      ```
+
+      Repariere die Regel. `deploy` soll `app.service` neu starten dürfen, aber weder stoppen noch andere Dienste anfassen. `deploy` bekommt kein sudo. So testest du wie der Job, ohne Passwortabfrage: `sudo -u deploy systemctl --no-ask-password restart app.service`.
+    setup: |
+      set -e
+      useradd -m -s /bin/bash deploy
+      mkdir -p /opt/app/www
+      echo ok > /opt/app/www/health
+      cat > /etc/systemd/system/app.service <<'EOF'
+      [Unit]
+      Description=Shop-App (Health-Endpunkt auf Port 8080)
+
+      [Service]
+      ExecStart=/bin/busybox httpd -f -p 8080 -h /opt/app/www
+
+      [Install]
+      WantedBy=multi-user.target
+      EOF
+      systemctl daemon-reload
+      systemctl enable --now app.service
+      cat > /etc/polkit-1/rules.d/60-deploy.rules <<'EOF'
+      // OPS-412: Der Deploy-Job (Benutzer deploy) startet die Shop-App nach jedem Release neu.
+      polkit.addRule(function(action, subject) {
+          if (action.id == "org.freedesktop.systemd1.manage-units" &&
+              action.lookup("unit") == "app" &&
+              subject.user == "deploy") {
+              return polkit.Result.YES;
+          }
+      };
+      EOF
+      # Der Lauf von heute Nacht
+      runuser -u deploy -- systemctl --no-ask-password restart app.service 2>/dev/null || true
+    checks:
+      - name: deploy startet app.service ohne sudo neu
+        run: runuser -u deploy -- systemctl --no-ask-password restart app.service && systemctl is-active app.service
+      - name: deploy kann app.service nicht stoppen
+        run: |
+          if runuser -u deploy -- systemctl --no-ask-password stop app.service 2>/dev/null; then
+            systemctl start app.service
+            echo "deploy durfte app.service stoppen"
+            exit 1
+          fi
+      - name: deploy kann keine anderen Dienste neu starten
+        run: |
+          if runuser -u deploy -- systemctl --no-ask-password restart cron.service 2>/dev/null; then
+            echo "deploy durfte cron.service neu starten"
+            exit 1
+          fi
+    solution: |
+      # So scheitert der Job:
+      sudo -u deploy systemctl --no-ask-password restart app.service
+      # Hat polkitd die Regel überhaupt geladen? Das Journal sagt Nein:
+      journalctl -u polkit -b --no-pager | grep -i error
+      # Error compiling script /etc/polkit-1/rules.d/60-deploy.rules: SyntaxError: parse error (line 8)
+      sudo cat /etc/polkit-1/rules.d/60-deploy.rules
+      # Zeile 8 schließt addRule( nicht. Außerdem übergibt systemd den vollen Unit-Namen app.service,
+      # und ohne Blick auf verb dürfte deploy die App auch stoppen.
+      sudo tee /etc/polkit-1/rules.d/60-deploy.rules > /dev/null <<'EOF'
+      // OPS-412: Der Deploy-Job (Benutzer deploy) darf die Shop-App neu starten, sonst nichts.
+      polkit.addRule(function(action, subject) {
+          if (action.id == "org.freedesktop.systemd1.manage-units" &&
+              action.lookup("unit") == "app.service" &&
+              action.lookup("verb") == "restart" &&
+              subject.user == "deploy") {
+              return polkit.Result.YES;
+          }
+      });
+      EOF
+      # polkitd lädt geänderte Regeln selbst neu:
+      journalctl -u polkit -n 3 --no-pager
+      sudo -u deploy systemctl --no-ask-password restart app.service && echo "Neustart erlaubt"
+      sudo -u deploy systemctl --no-ask-password stop app.service || echo "Stoppen verweigert"
+    hints:
+      - "Hat polkitd die Regel überhaupt geladen? Nach jeder Änderung schreibt es ins Journal: `journalctl -u polkit`."
+      - "Welche Details gibt systemd an polkit weiter? `action.lookup(\"unit\")` liefert den Namen genau so, wie systemd ihn kennt, also mit Endung."
+      - "Für „nur neu starten“ prüfst du zusätzlich `action.lookup(\"verb\") == \"restart\"`. Teste danach beides: Neustart muss gehen, `stop` muss scheitern."
+    explanation: |
+      Drei Fehler lagen übereinander. Die Regel hatte einen Syntaxfehler (`};` statt `});`). polkitd verwirft dann die ganze Datei und meldet das nur im Journal, nicht dem Aufrufer. Nach der Korrektur hätte sie trotzdem nie gegriffen: systemd fragt polkit mit `unit=app.service`, nicht mit `app`. Und ohne Prüfung von `verb` hätte `deploy` die App auch stoppen oder starten dürfen.
+
+      So funktioniert das allgemein: Ein unprivilegierter Prozess ruft per D-Bus einen privilegierten Dienst auf (hier systemd), und der Dienst fragt polkitd. polkitd führt die JavaScript-Regeln in Namensreihenfolge aus, die erste Regel mit Ergebnis gewinnt, sonst gilt der Standard der Aktion (`auth_admin`). Ohne Terminal kann niemand ein Passwort eingeben, daher „Interactive authentication required“. Neue und geänderte Regeln lädt polkitd selbst, ein Neustart ist nicht nötig.
+    resources:
+      - title: polkit(8) · Authorization Rules
+        url: https://polkit.pages.freedesktop.org/polkit/polkit.8.html#polkit-rules
+      - title: ArchWiki · Polkit · systemd-Units für Benutzer freigeben
+        url: https://wiki.archlinux.org/title/Polkit#Allow_management_of_individual_systemd_units_by_regular_users
+  - id: gps-nach-neustart
+    type: scenario
+    title: Nach dem Neustart gehört der GPS-Empfänger wieder dialout
+    prompt: |
+      An der seriellen Schnittstelle `/dev/ttyS2` von `web01` hängt der GPS-Empfänger einer Messstation. Der Dienst `gps-logger` läuft als Benutzer `gpslog` (Mitglied der Gruppe `gps`) und liest die Positionen über `/dev/gps0`. Ein Kollege hat gestern die udev-Regel dafür geschrieben, sie mit `sudo udevadm trigger` getestet und gemeldet: „Läuft.“ Nach dem Neustart heute früh steht `gps-logger` auf `failed`.
+
+      Sorge dafür, dass `/dev/gps0` nach jedem Boot der Gruppe `gps` gehört (Modus `660`) und `gps-logger` läuft. `gpslog` kommt nicht in die Gruppe `dialout`: Die gäbe Zugriff auf alle seriellen Schnittstellen.
+    setup: |
+      set -e
+      groupadd -r gps
+      useradd -r -M -s /usr/sbin/nologin -G gps gpslog
+      cat > /usr/local/bin/gps-logger <<'EOF'
+      #!/bin/sh
+      # Liest NMEA-Sätze vom GPS-Empfänger und schreibt sie ins Journal.
+      exec 3< /dev/gps0
+      echo "gps-logger: lese von /dev/gps0"
+      while :; do
+          if read -r satz <&3; then echo "$satz"; else sleep 5; fi
+      done
+      EOF
+      chmod 755 /usr/local/bin/gps-logger
+      cat > /etc/systemd/system/gps-logger.service <<'EOF'
+      [Unit]
+      Description=GPS-Logger der Messstation
+      Wants=dev-gps0.device
+      After=dev-gps0.device
+
+      [Service]
+      User=gpslog
+      ExecStart=/usr/local/bin/gps-logger
+
+      [Install]
+      WantedBy=multi-user.target
+      EOF
+      cat > /etc/udev/rules.d/10-gps.rules <<'EOF'
+      # GPS-Empfänger der Messstation an COM3 (/dev/ttyS2), Ticket OPS-388
+      SUBSYSTEM=="tty", KERNEL=="ttyS2", SYMLINK+="gps0", GROUP="gps", MODE="0660"
+      EOF
+      udevadm control --reload
+      # Zustand wie nach dem Boot: Beim Start meldet udev jedes Gerät mit der Aktion "add".
+      udevadm trigger --action=add --settle /dev/ttyS2
+      systemctl daemon-reload
+      systemctl enable gps-logger.service
+      systemctl start gps-logger.service
+    checks:
+      - name: Nach einem Boot gehört /dev/gps0 der Gruppe gps (Modus 660)
+        run: |
+          udevadm trigger --action=add --settle /dev/ttyS2
+          ls -lL /dev/gps0
+          test "$(stat -L -c '%G %a' /dev/gps0)" = "gps 660"
+      - name: gpslog ist nicht in dialout
+        run: |
+          if id -nG gpslog | grep -qw dialout; then
+            echo "gpslog ist Mitglied von dialout"
+            exit 1
+          fi
+      - name: gps-logger läuft, auch nach einem Neustart des Dienstes
+        run: systemctl restart gps-logger && sleep 3 && systemctl is-active gps-logger
+    solution: |
+      systemctl status gps-logger --no-pager
+      journalctl -u gps-logger -b --no-pager | tail -n 3
+      # /usr/local/bin/gps-logger: 3: cannot open /dev/gps0: Permission denied
+      ls -lL /dev/gps0
+      # Gruppe dialout statt gps. Was machen die Regeln beim Boot (Aktion add) mit ttyS2?
+      cat /etc/udev/rules.d/10-gps.rules
+      sudo udevadm test --action=add /sys/class/tty/ttyS2 2>&1 | grep -E 'GROUP|MODE|LINK'
+      # 10-gps.rules setzt die Gruppe gps, danach setzt 50-udev-default.rules sie auf dialout (GID 20).
+      # udevadm trigger schickt ohne --action die Aktion "change", und dabei setzt 50-udev-default.rules keine Gruppe:
+      # Deshalb sah der Test des Kollegen gut aus. Lösung: die eigene Regel nach der Standardregel einsortieren.
+      sudo mv /etc/udev/rules.d/10-gps.rules /etc/udev/rules.d/70-gps.rules
+      sudo udevadm control --reload
+      sudo udevadm trigger --action=add --settle /dev/ttyS2
+      ls -lL /dev/gps0
+      sudo systemctl restart gps-logger
+      systemctl is-active gps-logger
+    hints:
+      - "Warum ist `gps-logger` gescheitert? `journalctl -u gps-logger -b` und `ls -lL /dev/gps0` zeigen es."
+      - "Die Regel sieht richtig aus. Welche Regeln laufen nach ihr? `sudo udevadm test --action=add /sys/class/tty/ttyS2` zeigt jede Zuweisung mit Datei und Zeile."
+      - "Beim Boot meldet udev jedes Gerät mit `add`, `udevadm trigger` ohne Option schickt `change`. Für `add` setzt `50-udev-default.rules` die Gruppe `dialout` – nach `10-gps.rules`. Benenne die Datei um (`70-gps.rules`) oder setze die Gruppe mit `:=` endgültig."
+    explanation: |
+      udev arbeitet alle Regeldateien aus `/usr/lib/udev/rules.d` und `/etc/udev/rules.d` gemeinsam in Namensreihenfolge ab. Spätere Zuweisungen überschreiben frühere: `10-gps.rules` setzte `GROUP="gps"`, `50-udev-default.rules` danach `GROUP="dialout"` für alle `ttyS*`. Dieser Teil der Standardregeln gilt aber nur für die Aktion `add`. `udevadm trigger` ohne `--action` schickt `change`, deshalb sah der Test gut aus, und erst der Boot (`systemd-udev-trigger.service` mit `--action=add`) zeigte den Fehler.
+
+      Eigene Regeln bekommen deshalb eine Nummer hinter den Standardregeln (`70-` oder `99-`), oder sie setzen Werte mit `:=` endgültig. Teste Regeln mit `udevadm test --action=add` oder `udevadm trigger --action=add`, so wie der Boot sie anwendet.
+    resources:
+      - title: udev(7) · Regeln und Operatoren
+        url: https://www.freedesktop.org/software/systemd/man/latest/udev.html
+      - title: udevadm(8) · trigger und test
+        url: https://www.freedesktop.org/software/systemd/man/latest/udevadm.html
+  - id: autostart-unter-plasma
+    type: scenario
+    title: Unter GNOME lief der Sync, unter Plasma nicht
+    prompt: |
+      Du bist auf deinem Rechner von GNOME auf KDE Plasma umgestiegen, das Home-Verzeichnis ist geblieben. Seitdem startet der Notizen-Sync nach dem Login nicht mehr. Die IT verteilt ihn als Paket `notes-sync` mit einem Autostart-Eintrag für alle Benutzer.
+
+      Plasma startet Autostart-Einträge über systemd: Beim Login erzeugt `systemd-xdg-autostart-generator` aus jedem Eintrag eine User-Unit, und `xdg-desktop-autostart.target` startet sie. Das Terminal spielt deine Plasma-Sitzung nach: Der User-Manager von `ops` hat `XDG_CURRENT_DESKTOP=KDE`, und `systemctl --user daemon-reload` lässt den Generator laufen wie ein neuer Login.
+
+      Sorge dafür, dass der Sync in deiner Plasma-Sitzung startet. Die Dateien des Pakets bleiben unverändert: Sie gelten für alle Benutzer des Rechners.
+    setup: |
+      set -e
+      p=/tmp/notes-sync
+      mkdir -p $p/DEBIAN $p/usr/bin $p/etc/xdg/autostart
+      printf '%s\n' 'Package: notes-sync' 'Version: 1.4.2' 'Architecture: all' 'Maintainer: IT-Service <it@example.com>' 'Description: Gleicht ~/Notizen mit dem Team-Server ab' > $p/DEBIAN/control
+      echo /etc/xdg/autostart/notes-sync.desktop > $p/DEBIAN/conffiles
+      cat > $p/usr/bin/notes-sync <<'EOF'
+      #!/bin/sh
+      # Notizen-Sync: protokolliert den Start und hält die Verbindung zum Team-Server.
+      state="${XDG_STATE_HOME:-$HOME/.local/state}/notes-sync"
+      mkdir -p "$state"
+      date '+%F %T gestartet' >> "$state/sync.log"
+      exec sleep infinity
+      EOF
+      chmod 755 $p/usr/bin/notes-sync
+      cat > $p/etc/xdg/autostart/notes-sync.desktop <<'EOF'
+      [Desktop Entry]
+      Type=Application
+      Name=Notizen-Sync
+      Comment=Gleicht ~/Notizen mit dem Team-Server ab
+      Exec=/usr/bin/notes-sync --background
+      Icon=folder-sync
+      OnlyShowIn=GNOME;
+      EOF
+      dpkg-deb -b $p /tmp/notes-sync.deb > /dev/null
+      dpkg -i /tmp/notes-sync.deb > /dev/null
+      rm -rf $p /tmp/notes-sync.deb
+      install -d -o ops -g ops /home/ops/.config /home/ops/.config/autostart
+      cat > /home/ops/.config/autostart/notes-sync.desktop <<'EOF'
+      [Desktop Entry]
+      Type=Application
+      Name=Notizen-Sync
+      Exec=/usr/bin/notes-sync --background
+      OnlyShowIn=GNOME;
+      Hidden=true
+      EOF
+      chown ops:ops /home/ops/.config/autostart/notes-sync.desktop
+      runuser -u ops -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user set-environment XDG_CURRENT_DESKTOP=KDE
+      runuser -u ops -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user daemon-reload
+    checks:
+      - name: Der Sync startet beim Login in Plasma
+        run: |
+          u() { runuser -u ops -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user "$@"; }
+          u set-environment XDG_CURRENT_DESKTOP=KDE
+          u daemon-reload
+          units=$(u list-dependencies --plain xdg-desktop-autostart.target | awk 'NR > 1 { print $NF }')
+          rm -f /home/ops/.local/state/notes-sync/sync.log
+          for unit in $units; do u restart "$unit"; done
+          sleep 2
+          if ! grep -qs gestartet /home/ops/.local/state/notes-sync/sync.log; then
+            echo "xdg-desktop-autostart.target startet: ${units:-keine Unit}"
+            echo "notes-sync lief nicht"
+            exit 1
+          fi
+      - name: Die Dateien des Pakets notes-sync sind unverändert
+        run: |
+          changed=$(dpkg --verify notes-sync)
+          if [ -n "$changed" ]; then echo "$changed"; exit 1; fi
+      - name: Alle Einträge in ~/.config/autostart sind gültig
+        run: |
+          for f in /home/ops/.config/autostart/*.desktop; do
+            [ -e "$f" ] || continue
+            desktop-file-validate "$f" || exit 1
+          done
+    solution: |
+      # Welche Autostart-Einträge gibt es? Der Ordner des Benutzers kommt vor dem des Systems.
+      ls ~/.config/autostart /etc/xdg/autostart
+      cat ~/.config/autostart/notes-sync.desktop
+      # Hidden=true: Diese Datei gleichen Namens verdeckt den Eintrag des Pakets, als wäre er gelöscht.
+      systemctl --user list-dependencies xdg-desktop-autostart.target
+      cat /etc/xdg/autostart/notes-sync.desktop
+      # Auch das Paket startet ihn nur unter GNOME (OnlyShowIn=GNOME;). Plasma meldet sich als KDE:
+      systemctl --user show-environment | grep XDG_CURRENT_DESKTOP
+      # Eigene Kopie: der Eintrag des Pakets ohne OnlyShowIn, ohne Hidden
+      grep -v '^OnlyShowIn=' /etc/xdg/autostart/notes-sync.desktop > ~/.config/autostart/notes-sync.desktop
+      desktop-file-validate ~/.config/autostart/notes-sync.desktop
+      systemctl --user daemon-reload
+      systemctl --user list-dependencies xdg-desktop-autostart.target
+      systemctl --user start 'app-notes\x2dsync@autostart.service'
+      systemctl --user status 'app-notes\x2dsync@autostart.service' --no-pager
+    hints:
+      - "Autostart-Einträge liegen in `~/.config/autostart` und `/etc/xdg/autostart`. Gibt es eine Datei mit demselben Namen in beiden?"
+      - "`systemctl --user list-dependencies xdg-desktop-autostart.target` zeigt, welche Units der Generator erzeugt hat. Fehlt eine, hat er den Eintrag weggelassen (`Hidden=true`). Ist sie da, startet aber nicht, nennt `systemctl --user status` den Grund, etwa eine gescheiterte Bedingung aus `OnlyShowIn=`."
+      - "Eine Datei gleichen Namens in `~/.config/autostart` ersetzt die des Systems vollständig. Lege dort eine Kopie des Paket-Eintrags ohne `Hidden=true` an, die auch unter KDE gilt, und lass den Generator mit `systemctl --user daemon-reload` neu laufen."
+    explanation: |
+      Zwei Dinge hielten den Sync auf. Die Datei `~/.config/autostart/notes-sync.desktop` mit `Hidden=true` stammte aus der Zeit, als du ihn abgeschaltet hattest. Laut Autostart-Spezifikation ersetzt eine Datei gleichen Namens im Benutzerordner die des Systems, und `Hidden=true` bedeutet „gelöscht“. Darunter lag der zweite Fehler: Der Eintrag des Pakets gilt mit `OnlyShowIn=GNOME;` nur für GNOME. Der Generator übersetzt das in eine `ExecCondition=`, die unter `XDG_CURRENT_DESKTOP=KDE` scheitert, und systemd überspringt die Unit („Skipped due to 'exec-condition'“).
+
+      Die Lösung ist eine eigene, gültige Kopie im Benutzerordner. Dasselbe Prinzip gilt für Starter unter `~/.local/share/applications` und für fast alle XDG-Dateien: Benutzer vor System, gleicher Name ersetzt. Das Paket bleibt unangetastet, `dpkg --verify` meldet nichts.
+    resources:
+      - title: Desktop Application Autostart Specification
+        url: https://specifications.freedesktop.org/autostart-spec/latest/
+      - title: systemd-xdg-autostart-generator(8)
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemd-xdg-autostart-generator.html
