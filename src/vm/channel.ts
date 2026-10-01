@@ -24,6 +24,7 @@ export class AgentChannel {
   private queue: Pending[] = [];
   private current: (Pending & { timer: ReturnType<typeof setTimeout> }) | null = null;
   private readyListeners: (() => void)[] = [];
+  private bootListeners: (() => void)[] = [];
   private readonly send: (bytes: Uint8Array) => void;
 
   /** `send` writes raw bytes to ttyS1 (v86: `serial_send_bytes(1, bytes)`). */
@@ -40,7 +41,7 @@ export class AgentChannel {
     const line = this.line.replace(/\r$/, '');
     this.line = '';
     if (line === '@@ready') {
-      for (const listener of this.readyListeners.splice(0)) listener();
+      for (const listener of [...this.readyListeners.splice(0), ...this.bootListeners]) listener();
       return;
     }
     const match = /^@@(\d+) (\d+) ?([A-Za-z0-9+/=]*)$/.exec(line);
@@ -55,6 +56,11 @@ export class AgentChannel {
   /** Resolves when the agent announces itself (only after a boot, not after restoring a snapshot). */
   ready(): Promise<void> {
     return new Promise((resolve) => this.readyListeners.push(resolve));
+  }
+
+  /** Calls `listener` every time the agent announces itself, i.e. after every reboot inside the VM. */
+  onReady(listener: () => void): void {
+    this.bootListeners.push(listener);
   }
 
   /** Runs a bash script as root inside the VM. Requests are sent one at a time. */

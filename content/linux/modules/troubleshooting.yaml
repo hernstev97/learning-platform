@@ -1,11 +1,12 @@
 id: troubleshooting
 title: Systematische Fehlersuche
 level: 3
-minutes: 190
+minutes: 300
 summary: Du führst Symptome auf überprüfbare Ursachen zurück, trennst Messung von Vermutung und belegst eine Reparatur mit dem betroffenen Lern- oder Betriebsablauf.
 goals:
   - Du formulierst ein enges Symptom und testbare Hypothesen.
   - Du unterscheidest CPU-Auslastung, Last, I/O-Wartezeit und Speicherdruck.
+  - Du liest vmstat, iostat, pidstat und PSI und findest mit strace und perf heraus, worauf ein Prozess wartet oder womit er rechnet.
   - Du untersuchst Dienste, Speicher, Netzwerk und Rechte schrittweise.
   - Du dokumentierst Eingriffe, Verifikation und ein kurzes sachliches Postmortem.
 resources:
@@ -19,10 +20,40 @@ resources:
     url: https://docs.kernel.org/accounting/psi.html
   - title: strace
     url: https://strace.io/
+lab: |
+  set -e
+  # Lastgeneratoren und ein still scheiterndes Programm für die Beispiele
+  cat > /usr/local/bin/rechenlast <<'EOF'
+  #!/bin/sh
+  # rechenlast [SEKUNDEN] – hält die CPU beschäftigt (Standard: 10 s)
+  exec timeout "${1:-10}" sh -c 'while :; do :; done'
+  EOF
+  cat > /usr/local/bin/schreiblast <<'EOF'
+  #!/bin/sh
+  # schreiblast [SEKUNDEN] – schreibt am Seitencache vorbei nach /srv/daten (Standard: 10 s)
+  exec timeout "${1:-10}" sh -c 'while :; do dd if=/dev/zero of=/srv/daten/probe bs=64k count=64 oflag=direct status=none; done'
+  EOF
+  cat > /usr/local/bin/monatsbericht <<'EOF'
+  #!/bin/sh
+  # monatsbericht – fasst die Umsätze des Monats zusammen
+  satz=$(cat /etc/monatsbericht/steuer.conf 2>/dev/null) || exit 1
+  echo "Monatsbericht erstellt (Steuersatz $satz %)"
+  EOF
+  chmod 755 /usr/local/bin/rechenlast /usr/local/bin/schreiblast /usr/local/bin/monatsbericht
+  mkdir -p /etc/monatsbericht.d
+  echo 19 > /etc/monatsbericht.d/steuer.conf
+  # Ein kleines ext4 auf einem Loop-Device als Datenplatte
+  truncate -s 48M /var/tmp/daten.img
+  mkfs.ext4 -q /var/tmp/daten.img
+  mkdir -p /srv/daten
+  mount -o loop /var/tmp/daten.img /srv/daten
+  chown ops:ops /srv/daten
 lesson: |
   Die Meldung „Der Server ist langsam“ ist ein Anfang, aber noch keine Diagnose. Langsam beim Login, beim Laden einer Seite oder beim Schreiben einer Datei? Seit wann? Für alle Benutzer oder nur einen? Ein guter nächster Schritt reduziert Unsicherheit, ohne die Beweislage durch hektische Neustarts und mehrere gleichzeitige Änderungen zu zerstören.
 
   Dieses Modul verbindet die bisherigen Werkzeuge. Wir behandeln eine eigene Testumgebung und dokumentierte Beispielausgaben. In einem echten System prüfst du vor Eingriffen Zuständigkeit, gespeicherte Arbeit und betroffene Nutzer. Die technische Methode bleibt gleich: Symptom eingrenzen, eine Hypothese formulieren, passend messen, eine begrenzte Änderung vornehmen und den ursprünglichen Ablauf erneut prüfen.
+
+  Die Beispiele mit „Im Terminal“ kannst du direkt im Debian dieser Lektion ausprobieren. Dort liegen drei kleine Hilfsprogramme bereit: `rechenlast` beschäftigt die CPU für einige Sekunden, `schreiblast` schreibt so lange auf ein kleines ext4 unter `/srv/daten`, und `monatsbericht` enthält einen Fehler, den du mit strace findest.
 
   ## Vom Symptom zur widerlegbaren Hypothese
 
@@ -68,7 +99,7 @@ lesson: |
   namei -l /srv/app/config.ini
   ```
 
-  Werkzeugspezifische Konfigurationstests prüfen vor einem Reload. Sie benötigen unter Umständen die Rechte, mit denen auch die echte Konfiguration gelesen wird. Ein `nginx -t` als unprivilegierter Benutzer kann an einer geschützten Datei scheitern, obwohl die privilegierte Dienstprüfung erfolgreich wäre. Entscheidend ist der passende Kontext, nicht das reflexhafte Anhängen von sudo an jeden Diagnosebefehl ([nginx · Command-line parameters](https://nginx.org/en/docs/switches.html)).
+  Werkzeugspezifische Konfigurationstests prüfen vor einem Reload. Sie benötigen unter Umständen die Rechte, mit denen auch die echte Konfiguration gelesen wird. Ein `nginx -t` als unprivilegierter Benutzer kann an einer geschützten Datei scheitern, obwohl die privilegierte Dienstprüfung erfolgreich wäre. Es kommt auf den passenden Kontext an, nicht auf ein reflexhaftes sudo vor jedem Diagnosebefehl ([nginx · Command-line parameters](https://nginx.org/en/docs/switches.html)).
 
   Nach einer Reparatur prüfst du Status, Listener und den tatsächlichen HTTP-Pfad. Ein laufender Prozess kann weiterhin falsche Inhalte oder Fehlerantworten liefern. Bewahre die relevante Vorher-Meldung und den Nachher-Nachweis im Fehlerbericht auf.
 
@@ -85,6 +116,22 @@ lesson: |
   journalctl --disk-usage
   ```
 
+  In der Lektions-VM ist `/srv/daten` ein eigenes kleines Dateisystem auf einem Loop-Device:
+
+  ```console vm
+  $ findmnt -T /srv/daten
+  TARGET     SOURCE     FSTYPE OPTIONS
+  /srv/daten /dev/loop0 ext4   rw,relatime
+  $ df -h /srv/daten
+  Filesystem      Size  Used Avail Use% Mounted on
+  /dev/loop0       40M   14K   37M   1% /srv/daten
+  $ df -i /srv/daten
+  Filesystem     Inodes IUsed IFree IUse% Mounted on
+  /dev/loop0      12288    11 12277    1% /srv/daten
+  ```
+
+  `findmnt -T` sucht den Mount, auf dem ein Pfad liegt; `df` mit einem Pfad zeigt nur dieses Dateisystem. 12 288 Inodes bei 40 MiB: Wer dort viele Kleinstdateien anlegt, bekommt „No space left on device“, obwohl `df -h` noch freien Platz meldet.
+
   `du` kann ohne ausreichende Leserechte unvollständig sein und erzeugt selbst I/O. `ncdu` bietet eine interaktive Ansicht, verändert aber beim Lesen ebenso nicht die grundlegende Messmethode. `lsof +L1` zeigt offene Dateien mit weniger als einem Link; große gelöschte Logs können deshalb weiterhin Platz belegen. Geordnete Logrotation oder ein abgestimmter Neustart des zuständigen Dienstes schließt solche Dateien besser als zufälliges Löschen weiterer Daten ([unlink(2)](https://man7.org/linux/man-pages/man2/unlink.2.html)).
 
   Das Journal kann mit Aufbewahrungsregeln begrenzt werden. `journalctl --vacuum-time=7d` entfernt geeignete archivierte Journaldateien und ist eine echte Löschoperation. Es löscht nicht zwingend die aktive Journaldatei und ersetzt keine Prüfung des gewünschten Aufbewahrungszeitraums. Sichere benötigte Incident-Belege zuerst und plane künftig passende Limits ([journald.conf](https://www.freedesktop.org/software/systemd/man/latest/journald.conf.html)).
@@ -95,6 +142,23 @@ lesson: |
 
   Linux Load Average zählt grob lauffähige und bestimmte ununterbrechbar wartende Aufgaben über verschiedene Zeitfenster. Sie ist keine CPU-Prozentzahl. Last 8 bedeutet auf einem System mit vielen Kernen etwas anderes als auf einem kleinen System, und wartende I/O-Aufgaben können die Last bei geringer CPU-Auslastung erhöhen ([proc_loadavg(5)](https://man7.org/linux/man-pages/man5/proc_loadavg.5.html)).
 
+  ```console vm
+  $ uptime
+   12:19:52 up 0 min,  1 user,  load average: 1.42, 0.36, 0.12
+  $ nproc
+  1
+  ```
+
+  Die drei Zahlen mitteln über 1, 5 und 15 Minuten. Mit einer CPU heißt 1,42: Im Schnitt der letzten Minute wollte knapp anderthalbmal so viel Arbeit laufen, wie die CPU schafft, hier beim Start der VM. Ob Rechenarbeit oder I/O dahintersteckt, sagt die Zahl nicht. Das klären die Werkzeuge dieses Abschnitts. Nach der USE-Methode geordnet:
+
+  | Ressource | Auslastung (U) | Sättigung (S) | Fehler (E) |
+  | --- | --- | --- | --- |
+  | CPU | `vmstat`: `us` + `sy`; `pidstat -u`: `%CPU` | `vmstat`: `r` über der Zahl der CPUs; `pidstat -u`: `%wait`; PSI `cpu` | Machine-Check-Meldungen in `journalctl -k` |
+  | Speicher | `free`: `available`; `pidstat -r`: `RSS` | `vmstat`: `si`/`so`; `pidstat -r`: `majflt/s`; PSI `memory` | OOM-Kills in `journalctl -k` |
+  | Platte | `iostat -x`: `%util` (mit Vorsicht) | `iostat -x`: `aqu-sz`, `r_await`/`w_await`; `vmstat`: `b`; PSI `io` | I/O-Fehler in `journalctl -k` |
+
+  Für die erste Minute an einem langsamen Server reichen diese Befehle. Alle außer `top` schreiben Zeilen im Intervall, die du in den Fehlerbericht kopieren kannst. `iostat` und `pidstat` gehören zum Paket sysstat und sind nicht überall vorinstalliert ([sysstat-Dokumentation](https://sysstat.github.io/)).
+
   ```bash
   uptime
   top
@@ -103,17 +167,123 @@ lesson: |
   pidstat -u -d -r 1 5
   ```
 
-  `vmstat` verbindet Warteschlangen, Speicher, Swap, I/O und CPU-Zeiten. Die erste Zeile fasst normalerweise die Zeit seit dem Boot zusammen; die folgenden Zeilen zeigen die angegebenen Intervalle. Verwechsele diesen Langzeitdurchschnitt nicht mit der akuten Störung. `iostat` und `pidstat` gehören gewöhnlich zum Paket sysstat und sind nicht überall vorinstalliert ([vmstat(8)](https://man7.org/linux/man-pages/man8/vmstat.8.html), [sysstat-Dokumentation](https://sysstat.github.io/)).
+  ### vmstat: Warteschlangen, Speicher und CPU im Sekundentakt
 
-  Betrachte mehrere Signale: CPU-Arbeit, Laufwarteschlange, I/O-Latenz, Durchsatz und betroffene Prozesse. `iowait` ist kein präziser Prozentsatz „des langsamen Datenträgers“. Ebenso ist ein hoher `%util`-Wert je nach Gerät und Parallelität kein vollständiger Sättigungsbeweis. Eine kurze Messreihe unter Last und der Bezug zur Antwortzeit sind hilfreicher als ein einzelner Grenzwert aus einem fremden System.
+  `vmstat 1 4` schreibt vier Zeilen im Abstand von einer Sekunde. In der ersten Zeile sind Raten und CPU-Anteile Mittelwerte seit dem Boot; erst die folgenden Zeilen zeigen das Intervall. Verwechsele diesen Langzeitdurchschnitt nicht mit der akuten Störung. `r`, `b` und die Speicherspalten sind immer Momentaufnahmen ([vmstat(8)](https://man7.org/linux/man-pages/man8/vmstat.8.html#FIELD_DESCRIPTION_FOR_VM_MODE)).
 
-  Der Kernel stellt mit **PSI** Pressure Stall Information bereit. Die Dateien unter `/proc/pressure` beschreiben, wie viel Zeit Aufgaben wegen Ressourcenmangels warten. Das ergänzt reine Auslastungswerte. Die Werte hängen von Zeitraum und Ressource ab; notiere die konkrete Datei und das Fenster ([Kernel · PSI](https://docs.kernel.org/accounting/psi.html)).
+  | Spalte | Bedeutung | Worauf du achtest |
+  | --- | --- | --- |
+  | `r` | lauffähige Aufgaben, laufend oder auf eine CPU wartend | dauerhaft mehr als CPUs: CPU gesättigt |
+  | `b` | Aufgaben, die blockiert auf I/O warten (Zustand `D`) | dauerhaft über 0: Platte oder Netzwerkspeicher prüfen |
+  | `si`, `so` | aus dem Swap ein- und in ihn ausgelagert, KiB/s | dauerhaft über 0: Speicherdruck; ohne Swap immer 0 |
+  | `bi`, `bo` | von Blockgeräten gelesen und auf sie geschrieben, KiB/s | Durchsatz; mit `iostat` dem Gerät zuordnen |
+  | `us`, `sy` | CPU-Zeit in Programmen und im Kernel | zusammen nahe 100: CPU voll |
+  | `id`, `wa` | Leerlauf; Leerlauf, während I/O aussteht | hohes `wa`: Die CPU hätte Zeit, Aufgaben warten auf I/O |
+  | `st` | gestohlene Zeit: Die VM wollte rechnen, der Hypervisor gab die CPU einem anderen Gast | dauerhaft mehr als wenige Prozent: Host überbucht |
 
-  ```bash
-  cat /proc/pressure/cpu
-  cat /proc/pressure/memory
-  cat /proc/pressure/io
+  ```console vm
+  $ rechenlast 4 &
+  $ vmstat 1 4
+  procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+   r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+   2  0      0 180268    392  39308    0    0    62    14 1078 1254 35 49 16  0  0
+   2  0      0 180268    392  39308    0    0     0     0  250   40 100  0  0  0  0
+   2  0      0 180268    392  39308    0    0     0   517  647  687 99  1  0  0  0
+   2  0      0 180268    392  39308    0    0     0     0  252   12 100  0  0  0  0
   ```
+
+  `r` steht bei 2, die VM hat eine CPU: `rechenlast` und `vmstat` selbst wollen rechnen, eine Aufgabe wartet immer. `us` liegt bei 100, `id` bei 0. Die 49 % `sy` der ersten Zeile stammen noch vom Boot der VM.
+
+  ```console vm
+  $ schreiblast 4 &
+  $ vmstat 1 4
+  procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+   r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+   1  0      0 179788    396  40340    0    0    53    37  982 1105 44 42 13  0  0
+   1  0      0 179788    396  40340    0    0     2 12288 6463 7508  1  8  1 90  0
+   1  1      0 179788    396  40340    0    0     0 11840 6223 7950  0 13  1 86  0
+   1  1      0 179788    396  40340    0    0     0  9792 5235 7906  1 16  2 81  0
+  ```
+
+  Jetzt ist das Bild umgekehrt. `us` und `sy` liegen zusammen unter 20, `wa` über 80. `schreiblast` schreibt mit `dd oflag=direct` am Seitencache vorbei, jeder Block wartet auf das Gerät. In `b` taucht der wartende Prozess auf, `bo` zeigt rund 12 MiB/s. Mehr CPU würde hier nichts beschleunigen. Lies `wa` trotzdem nur als Hinweis: Es ist Leerlaufzeit, während I/O aussteht. Hat die CPU nebenher zu rechnen, sinkt `wa`, obwohl das Gerät genauso langsam bleibt.
+
+  ### iostat -x: Latenz und Warteschlange je Gerät
+
+  `iostat -x` zeigt für jedes Blockgerät, wie viele Anfragen es bedient und wie lange sie dauern. `-d` lässt den CPU-Teil weg, `-y` den ersten Bericht seit dem Boot, `-z` Geräte ohne Aktivität ([iostat(1)](https://man7.org/linux/man-pages/man1/iostat.1.html#REPORTS)).
+
+  | Spalte | Bedeutung |
+  | --- | --- |
+  | `r/s`, `w/s` | abgeschlossene Lese- und Schreibanfragen pro Sekunde |
+  | `rkB/s`, `wkB/s` | gelesene und geschriebene KiB pro Sekunde |
+  | `r_await`, `w_await` | mittlere Dauer einer Anfrage in ms, die Zeit in der Warteschlange eingeschlossen |
+  | `aqu-sz` | mittlere Zahl gleichzeitig ausstehender Anfragen |
+  | `%util` | Anteil der Zeit, in der mindestens eine Anfrage unterwegs war |
+
+  ```console vm
+  $ schreiblast 4 &
+  $ iostat -dxy loop0 1 1
+  Linux 6.1.0-53-686 (web01)   10/01/26   _i686_  (1 CPU)
+
+  Device            r/s     rkB/s   rrqm/s  %rrqm r_await rareq-sz     w/s     wkB/s   wrqm/s  %wrqm w_await wareq-sz     d/s     dkB/s   drqm/s  %drqm d_await dareq-sz     f/s f_await  aqu-sz  %util
+  loop0            4.00      4.00     0.00   0.00    1.00     1.00  129.00   8256.00     0.00   0.00    6.09    64.00    0.00      0.00     0.00   0.00    0.00     0.00    0.00    0.00    0.79   0.00
+  ```
+
+  `loop0` ist das Gerät hinter `/srv/daten`. Es bedient 129 Schreibanfragen pro Sekunde zu je 64 KiB (`wareq-sz`), jede dauert im Schnitt 6 ms. `aqu-sz` folgt daraus: 129 × 0,006 s ≈ 0,8 Anfragen sind im Mittel gleichzeitig unterwegs. Mit dieser Beziehung (Anfragen pro Sekunde × Dauer = Warteschlange) prüfst du fremde Ausgaben auf Plausibilität. `%util` bleibt in dieser VM immer bei 0,00, auch unter Last; das ist ein Artefakt der Emulation.
+
+  Auf echter Hardware steht dort ein Wert, und er führt leicht in die Irre. `%util` misst nur, ob irgendeine Anfrage lief. Eine Festplatte bedient Anfragen nacheinander; bei 100 % ist sie voll. SSDs, NVMe-SSDs und RAID-Verbünde bearbeiten Dutzende Anfragen parallel. Dort heißt 100 % nur „ständig etwas zu tun“, nicht „am Limit“, wie auch die Handbuchseite schreibt. Sättigung erkennst du an steigendem `r_await` oder `w_await` und wachsendem `aqu-sz` bei gleichem Durchsatz. Eine kurze Messreihe unter Last und der Bezug zur Antwortzeit helfen mehr als ein einzelner Grenzwert aus einem fremden System.
+
+  ### pidstat: welcher Prozess die Last erzeugt
+
+  `vmstat` und `iostat` beschreiben die Maschine, `pidstat` die Prozesse: `-u` die CPU, `-d` die Platten-I/O, `-r` den Speicher. Es listet nur Prozesse, die im Intervall aktiv waren. I/O-Werte fremder Prozesse siehst du nur mit sudo ([pidstat(1)](https://man7.org/linux/man-pages/man1/pidstat.1.html)).
+
+  ```console vm
+  $ rechenlast 4 &
+  $ pidstat -u 1 2
+  Linux 6.1.0-53-686 (web01)   10/01/26   _i686_  (1 CPU)
+
+  12:11:43      UID       PID    %usr %system  %guest   %wait    %CPU   CPU  Command
+  12:11:44        0        15    0.00    0.75    0.00    0.00    0.75     0  rcu_preempt
+  12:11:44     1000       395    3.76    3.76    0.00    8.27    7.52     0  pidstat
+  12:11:44     1000       396   92.48    0.00    0.00   18.80   92.48     0  sh
+  …
+  Average:      UID       PID    %usr %system  %guest   %wait    %CPU   CPU  Command
+  Average:        0        15    0.00    0.43    0.00    0.00    0.43     -  rcu_preempt
+  Average:     1000       395    4.72    6.01    0.00   14.16   10.73     -  pidstat
+  Average:     1000       396   92.70    0.00    0.00   20.17   92.70     -  sh
+  ```
+
+  `sh` ist die Schleife in `rechenlast`: 93 % CPU, fast alles im Benutzermodus (`%usr`). `%wait` ist die Zeit, in der der Prozess rechnen wollte, aber auf die CPU warten musste, also Sättigung aus Sicht eines einzelnen Prozesses. Viel `%system` statt `%usr` hieße: Der Prozess verbringt seine Zeit in Systemaufrufen. Das ist ein Fall für strace.
+
+  ```console vm
+  $ schreiblast 4 &
+  $ pidstat -d 1 2
+  Linux 6.1.0-53-686 (web01)   10/01/26   _i686_  (1 CPU)
+
+  12:19:56      UID       PID   kB_rd/s   kB_wr/s kB_ccwr/s iodelay  Command
+  12:19:58     1000       355      0.00   8416.44      0.00       0  sh
+  12:19:58     1000       359      0.00   1315.07      0.00       0  dd
+  …
+  ```
+
+  Jeder `dd`-Lauf lebt nur Sekundenbruchteile. Endet ein Kindprozess, rechnet der Kernel seine I/O dem Elternprozess zu, deshalb steht der größte Teil bei `sh`. Bei Diensten, die für jede Aufgabe kurz einen Helfer starten, findest du den Verursacher entsprechend beim Elternprozess. `iodelay` bleibt 0, solange der Kernel keine Verzögerungen pro Aufgabe erfasst; seit Kernel 5.14 ist das standardmäßig aus (`sysctl kernel.task_delayacct`).
+
+  ### PSI: wie lange Aufgaben warten
+
+  Auslastung sagt, wie beschäftigt eine Ressource ist. PSI (Pressure Stall Information) sagt, wie viel Zeit dadurch verloren geht: wie lange Aufgaben warteten, weil CPU, Speicher oder I/O fehlten ([Kernel · PSI](https://docs.kernel.org/accounting/psi.html#pressure-interface)).
+
+  ```console vm
+  $ grep . /proc/pressure/*
+  /proc/pressure/cpu:some avg10=33.13 avg60=25.10 avg300=7.89 total=27078499
+  /proc/pressure/cpu:full avg10=0.00 avg60=0.00 avg300=0.00 total=0
+  /proc/pressure/io:some avg10=49.96 avg60=17.50 avg300=4.19 total=14119421
+  /proc/pressure/io:full avg10=4.66 avg60=1.77 avg300=0.42 total=1518673
+  /proc/pressure/memory:some avg10=0.00 avg60=0.00 avg300=0.00 total=0
+  /proc/pressure/memory:full avg10=0.00 avg60=0.00 avg300=0.00 total=0
+  ```
+
+  Die Zeile `some` gibt den Anteil der Zeit an, in der mindestens eine Aufgabe auf die Ressource wartete; andere konnten weiterarbeiten. `full` ist der Anteil, in dem alle nicht untätigen Aufgaben gleichzeitig warteten. In dieser Zeit kam nichts voran. `avg10`, `avg60` und `avg300` sind gleitende Mittel in Prozent über 10, 60 und 300 Sekunden, `total` ist die gesamte Wartezeit in Mikrosekunden. Die Differenz zweier `total`-Werte zeigt auch kurze Spitzen, die in den Mitteln verschwinden.
+
+  Kurz nach `schreiblast` steht `io some` bei 50: In der Hälfte der letzten zehn Sekunden wartete mindestens eine Aufgabe auf I/O. `cpu full` ist auf Systemebene immer 0. Der Kernel definiert den Wert dort nicht und gibt die Zeile seit Kernel 5.13 nur aus Kompatibilitätsgründen aus. Notiere bei jedem PSI-Wert Datei, Zeile und Fenster, sonst lässt er sich später nicht vergleichen.
 
   > [!PRAXIS]
   > Ein plausibler Engpassbericht verbindet „Antwortzeit steigt“ mit „diese Ressource staut sich“ und „dieser Prozess erzeugt die Last“. Eine einzelne hohe Zahl ist zunächst nur ein Messwert.
@@ -121,6 +291,15 @@ lesson: |
   ## Speicherdruck, offene Dateien und Systemaufrufe
 
   `free -h` zeigt unter anderem `available`: eine Schätzung, wie viel RAM ohne Swapping für neue Anwendungen verfügbar ist. Wenig völlig freier RAM ist unter Linux wegen Dateicaches allein kein Fehler. Speicherdruck erkennst du besser an available, Swapaktivität, PSI und dem betroffenen Prozessverlauf.
+
+  ```console vm
+  $ free -h
+                 total        used        free      shared  buff/cache   available
+  Mem:           237Mi        31Mi       133Mi       236Ki        81Mi       206Mi
+  Swap:             0B          0B          0B
+  ```
+
+  Ohne Swap, wie in dieser VM und auf vielen Cloud-Servern, bleiben `si` und `so` in `vmstat` immer 0. Speicherdruck sieht dann anders aus. Anonymen Speicher wie Heap und Stack kann der Kernel nirgends auslagern. Er verdrängt stattdessen Dateiseiten aus dem Cache, auch den Programmcode laufender Prozesse, und muss sie kurz darauf wieder von der Platte lesen. In `vmstat` steigt `bi` bei kleinem `cache`, und PSI zeigt Druck bei `memory` und `io` zugleich. Reicht auch das nicht, beendet der OOM-Killer einen Prozess.
 
   ```bash
   free -h
@@ -131,16 +310,144 @@ lesson: |
 
   Ein vom OOM-Killer beendeter Prozess muss nicht bedeuten, dass der gesamte Host keinen RAM mehr hatte. Eine cgroup kann ein eigenes Limit erreichen. Prüfe Kernelmeldungen, Unitgrenzen und Zeitverlauf. Ein größeres Limit kann eine akute Begrenzung verschieben, beweist aber nicht, dass ein Speicherleck repariert ist ([Kernel · cgroup v2 Memory](https://docs.kernel.org/admin-guide/cgroup-v2.html#memory)).
 
-  `lsof -p PID` zeigt offene Dateien, Sockets und andere Ressourcen. `strace` beobachtet Systemaufrufe eines Prozesses und hilft bei Fragen wie „welcher Pfad fehlt?“ oder „worauf wartet er?“. Es kann Leistung beeinflussen und sensible Daten sichtbar machen. Filtere eng, zeichne kurz auf und verwende es nur für Prozesse, die du untersuchen darfst ([strace-Dokumentation](https://strace.io/)).
+  ### Druck in einer einzelnen Unit: PSI je cgroup
+
+  systemd legt jeden Dienst in eine eigene cgroup unter `/sys/fs/cgroup/system.slice/<unit>/`. Jede cgroup hat eigene Dateien `cpu.pressure`, `memory.pressure` und `io.pressure` im Format von `/proc/pressure` ([Kernel · PSI](https://docs.kernel.org/accounting/psi.html#cgroup2-interface)). Damit siehst du, welcher Dienst leidet, auch wenn der Host insgesamt ruhig wirkt. Das Beispiel startet perl als kurzlebigen Dienst mit `MemoryHigh=16M`; perl legt rund 30 MB an.
+
+  ```console vm
+  $ sudo systemd-run --unit=druck -p MemoryHigh=16M perl -e '@a = ("x" x 15_000_000); sleep 20'
+  Running as unit: druck.service
+  $ sleep 3
+  $ cat /sys/fs/cgroup/system.slice/druck.service/memory.pressure
+  some avg10=1.44 avg60=0.26 avg300=0.05 total=170767
+  full avg10=1.44 avg60=0.26 avg300=0.05 total=170767
+  $ systemctl status druck --no-pager | grep Memory
+       Memory: 29.3M (high: 16.0M available: 0B)
+  ```
+
+  `MemoryHigh=` ist eine weiche Grenze. Liegt eine Gruppe darüber, bremst der Kernel ihre Prozesse und versucht, Speicher zurückzuholen ([systemd.resource-control](https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html#MemoryHigh=bytes)). Ohne Swap lässt sich perls Zeichenkette nirgends auslagern, also wartet perl. Die Gruppe enthält nur diese eine Aufgabe, deshalb sind `some` und `full` gleich. Die Werte bleiben klein, weil perl nur beim Anlegen gebremst wird; ein Dienst, der dauerhaft über seiner Grenze arbeitet, zeigt hohe Werte. `MemoryMax=` wäre die harte Grenze, an der der OOM-Killer einen Prozess der Gruppe beendet.
+
+  ### strace: was ein Programm wirklich tut
+
+  `lsof -p PID` zeigt offene Dateien, Sockets und andere Ressourcen eines Prozesses. `strace` geht weiter: Es hängt sich per `ptrace` an einen Prozess und protokolliert jeden Systemaufruf mit Argumenten und Rückgabewert. Jede Datei, jede Verbindung und jedes Warten auf ein Gerät läuft über einen solchen Aufruf. Das hilft genau dann, wenn ein Programm schweigt ([strace(1)](https://man7.org/linux/man-pages/man1/strace.1.html)).
 
   ```bash
   lsof -p 1234
   strace -f -e trace=openat,connect -p 1234
   ```
 
-  `ENOENT` bedeutet meist, dass ein benötigter Pfad nicht gefunden wurde; `EACCES` weist auf eine verweigerte Operation hin. Die erste fehlgeschlagene Suche ist nicht automatisch der Fehler: Programme probieren oft mehrere zulässige Pfade. Lies den Ablauf und die Reaktion der Anwendung. Nach Ctrl+C bei einer angehängten strace-Sitzung prüfst du, dass die Beobachtung beendet ist und der Zielprozess wie erwartet weiterläuft.
+  | Option | Wirkung |
+  | --- | --- |
+  | `-f` | folgt Kindprozessen und Threads; ohne `-f` fehlt alles, was ein Skript an Hilfsprogramme abgibt |
+  | `-e trace=file,network` | nur Aufrufe mit Dateinamen (`openat`, `statx`, `execve` …) und Socket-Aufrufe; einzelne Aufrufe gehen auch: `-e trace=openat,connect` |
+  | `-Z` | nur fehlgeschlagene Aufrufe |
+  | `-T` | Dauer jedes Aufrufs in spitzen Klammern |
+  | `-c` | statt Einzelzeilen am Ende eine Tabelle mit Aufrufen, Fehlern und Zeit je Systemaufruf |
+  | `-w` | mit `-c`: Wanduhrzeit statt Kernel-CPU-Zeit, damit Warten sichtbar wird |
+  | `-p PID` | an einen laufenden Prozess anhängen; Strg+C löst ihn wieder |
+  | `-o datei` | Protokoll in eine Datei statt nach stderr |
 
-  Bei Zugriffsproblemen ergänzt `namei -l` die Pfadprüfung. Wenn Unix-Rechte passen, untersuche ACLs, Mount-Optionen, AppArmor beziehungsweise SELinux und systemd-Sandboxing. „Mit root klappt es“ identifiziert noch nicht, welche dieser Ebenen für den vorgesehenen Dienstbenutzer angepasst werden muss.
+  In der Lektions-VM endet `monatsbericht` ohne jede Meldung:
+
+  ```console vm
+  $ monatsbericht; echo "Exit-Code: $?"
+  Exit-Code: 1
+  ```
+
+  ```console vm fails
+  $ strace -f -e trace=openat monatsbericht
+  openat(AT_FDCWD, "/etc/ld.so.cache", O_RDONLY|O_LARGEFILE|O_CLOEXEC) = 4
+  openat(AT_FDCWD, "/lib/i386-linux-gnu/libc.so.6", O_RDONLY|O_LARGEFILE|O_CLOEXEC) = 4
+  openat(AT_FDCWD, "/usr/local/bin/monatsbericht", O_RDONLY|O_LARGEFILE) = 4
+  strace: Process 438 attached
+  [pid   438] openat(AT_FDCWD, "/dev/null", O_WRONLY|O_CREAT|O_TRUNC|O_LARGEFILE, 0666) = 4
+  [pid   438] openat(AT_FDCWD, "/etc/ld.so.cache", O_RDONLY|O_LARGEFILE|O_CLOEXEC) = 4
+  [pid   438] openat(AT_FDCWD, "/lib/i386-linux-gnu/libc.so.6", O_RDONLY|O_LARGEFILE|O_CLOEXEC) = 4
+  [pid   438] openat(AT_FDCWD, "/etc/monatsbericht/steuer.conf", O_RDONLY|O_LARGEFILE) = -1 ENOENT (No such file or directory)
+  [pid   438] +++ exited with 1 +++
+  --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=438, si_uid=1000, si_status=1, si_utime=0, si_stime=1 /* 0.01 s */} ---
+  +++ exited with 1 +++
+  ```
+
+  Lies von unten nach oben. Der Hauptprozess endet mit 1, kurz nachdem sein Kind `438` mit 1 endete. Das Kind ist die Befehlsersetzung `$(…)`, die `cat` ausführt, und `cat` scheitert an `/etc/monatsbericht/steuer.conf` mit `ENOENT`. Ohne `-f` fehlten genau diese Zeilen. Vorhanden ist nur `/etc/monatsbericht.d/steuer.conf`. Die ersten Aufrufe öffnen Linker-Cache und C-Bibliothek, das macht jedes dynamisch gelinkte Programm. strace selbst endet mit dem Exit-Code des beobachteten Programms, hier also mit 1.
+
+  `-c` fasst zusammen, statt jeden Aufruf zu zeigen:
+
+  ```console vm
+  $ strace -c ls -l /usr/bin > /dev/null
+  % time     seconds  usecs/call     calls    errors syscall
+  ------ ----------- ----------- --------- --------- ----------------
+   68.23    0.174000         313       555           statx
+   15.91    0.040578          87       465       465 getxattr
+    5.08    0.012946         187        69           readlink
+    3.72    0.009475         728        13           openat
+  …
+    0.54    0.001380         345         4         4 connect
+  …
+  ------ ----------- ----------- --------- --------- ----------------
+  100.00    0.255022         211      1205       476 total
+  ```
+
+  `ls -l` ruft für jeden Eintrag `statx` auf, für symbolische Links zusätzlich `readlink`. Alle 465 `getxattr` scheitern: ls fragt nach erweiterten Attributen, um ACLs und Sicherheitslabel zu markieren, und das Wurzeldateisystem dieser VM kennt keine. Die vier gescheiterten `connect` stammen aus der glibc, die für die Benutzernamen einen nscd-Cache sucht, den es hier nicht gibt. 476 Fehler, und das Programm arbeitet korrekt: Die Fehlerspalte ist ein Hinweis, kein Befund.
+
+  Ohne weitere Option misst die Spalte `seconds` die CPU-Zeit im Kernel. Ein Prozess, der in `fsync` auf die Platte wartet, verbraucht dabei kaum CPU und fällt in der Tabelle nicht auf. Mit `-w` zählt strace die Wanduhrzeit zwischen Beginn und Ende jedes Aufrufs; dann wird Warten sichtbar.
+
+  ```console vm fails
+  $ strace -T -e trace=connect,getsockopt curl -sS http://127.0.0.1:8080/health
+  connect(4, {sa_family=AF_UNIX, sun_path="/var/run/nscd/socket"}, 110) = -1 ENOENT (No such file or directory) <0.001038>
+  connect(4, {sa_family=AF_UNIX, sun_path="/var/run/nscd/socket"}, 110) = -1 ENOENT (No such file or directory) <0.000443>
+  connect(6, {sa_family=AF_INET, sin_port=htons(8080), sin_addr=inet_addr("127.0.0.1")}, 16) = -1 EINPROGRESS (Operation now in progress) <0.014003>
+  getsockopt(6, SOL_SOCKET, SO_ERROR, [ECONNREFUSED], [4]) = 0 <0.000180>
+  curl: (7) Failed to connect to 127.0.0.1 port 8080 after 26 ms: Couldn't connect to server
+  +++ exited with 7 +++
+  ```
+
+  curl verbindet sich nichtblockierend: `connect` kehrt sofort mit `EINPROGRESS` zurück, das Ergebnis holt `getsockopt` ab. `ECONNREFUSED` heißt, auf `127.0.0.1:8080` lauscht niemand. Die Zahlen in spitzen Klammern sind die Dauer jedes Aufrufs in Sekunden. Eine sofortige Ablehnung deutet auf einen fehlenden Listener. Ein `connect` oder `poll`, das Sekunden dauert, deutet auf ein Ziel, das gar nicht antwortet.
+
+  `ENOENT` bedeutet meist, dass ein benötigter Pfad nicht gefunden wurde; `EACCES` weist auf eine verweigerte Operation hin. Die erste fehlgeschlagene Suche ist nicht automatisch der Fehler: Programme probieren oft mehrere zulässige Pfade. Lies den Ablauf und die Reaktion der Anwendung. Nach Strg+C bei einer angehängten strace-Sitzung prüfst du, dass die Beobachtung beendet ist und der Zielprozess wie erwartet weiterläuft.
+
+  Bei Zugriffsproblemen ergänzt `namei -l` die Pfadprüfung. Wenn Unix-Rechte passen, untersuche ACLs, Mount-Optionen, AppArmor beziehungsweise SELinux und systemd-Sandboxing. „Mit root klappt es“ identifiziert noch nicht, welche dieser Ebenen für den vorgesehenen Dienstbenutzer angepasst werden muss. Teste deshalb als der Benutzer, als der der Dienst läuft, etwa mit `sudo -u dienstbenutzer strace -f …`.
+
+  > [!WARNING] strace bremst
+  > strace hält den beobachteten Prozess bei jedem Systemaufruf an, beim Eintritt und beim Verlassen. Ein Dienst mit vielen Aufrufen läuft darunter um ein Vielfaches langsamer, und die Ausgabe kann Passwörter oder Tokens enthalten. Filtere mit `-e`, schreibe mit `-o` in eine Datei, beobachte nur kurz und nur Prozesse, die du untersuchen darfst.
+
+  ## perf: wohin die CPU-Zeit geht
+
+  `pidstat` sagt, welcher Prozess rechnet, aber nicht, woran. strace hilft dabei wenig, denn eine Schleife, die nur rechnet, macht kaum Systemaufrufe. Dafür gibt es `perf`. Es unterbricht die CPU einige tausend Mal pro Sekunde und notiert, welche Funktion gerade läuft, mit `-g` samt Aufrufstapel. Aus vielen solchen Stichproben ergibt sich, wo die Zeit bleibt, und der Prozess läuft dabei fast ungebremst weiter ([perf-record(1)](https://man7.org/linux/man-pages/man1/perf-record.1.html), [perf Wiki · Tutorial](https://perf.wiki.kernel.org/index.php/Tutorial)).
+
+  In der VM dieses Kurses gibt es perf nicht. Auf Debian steckt es im Paket `linux-perf`. Debian setzt außerdem `kernel.perf_event_paranoid` auf 3; dann darf ohne root niemand perf nutzen.
+
+  ```bash
+  sudo perf top -p 4121                     # live: Funktionen mit den meisten Stichproben
+  sudo perf stat -p 4121 -- sleep 10        # Zähler über 10 s: CPU-Zeit, Kontextwechsel, Seitenfehler, Instruktionen
+  sudo perf record -g -p 4121 -- sleep 30   # 30 s Stichproben mit Aufrufstapel nach perf.data
+  sudo perf report --stdio                  # Auswertung als Text
+  ```
+
+  `perf report` zeigt zwei Prozentspalten. `Self` ist der Anteil der Stichproben, in denen die Funktion selbst lief. `Children` zählt zusätzlich alles, was sie aufruft ([perf-report(1)](https://man7.org/linux/man-pages/man1/perf-report.1.html)). Ein gekürzter Ausschnitt von einem x86_64-Server mit Debian 12 und installierten Debug-Symbolen, auf dem ein Rechnungsdienst PDFs erzeugt:
+
+  ```text
+  # Children      Self  Command   Shared Object       Symbol
+      97.80%     0.40%  rechnung  rechnung            [.] handle_request
+      84.12%     1.02%  rechnung  rechnung            [.] build_invoice_pdf
+      80.55%    62.31%  rechnung  libz.so.1.2.13      [.] deflate_slow
+      17.70%    17.52%  rechnung  libz.so.1.2.13      [.] longest_match
+       8.31%     8.12%  rechnung  [kernel.kallsyms]   [k] clear_page_erms
+  ```
+
+  `handle_request` steht oben, weil fast alles unter ihm läuft; selbst kostet es 0,4 %. Die Zeit verbrennt in der Kompression (`deflate_slow`, `longest_match`), aufgerufen aus `build_invoice_pdf`. Die Frage an den Code lautet also: Muss jedes PDF bei jeder Anfrage neu komprimiert werden? `[.]` markiert Code im Benutzermodus, `[k]` Kernelcode.
+
+  Ein Flamegraph zeichnet dieselben Stapel als Grafik. Jede Ebene ist ein Funktionsaufruf, die Breite eines Balkens sein Anteil an den Stichproben. Die x-Achse ist alphabetisch sortiert und keine Zeitachse. Breite Balken ganz oben sind Funktionen, die selbst rechnen ([Brendan Gregg · Flame Graphs](https://www.brendangregg.com/flamegraphs.html)). Die beiden Skripte stammen aus seinem Repository FlameGraph:
+
+  ```bash
+  sudo perf script > stapel.txt
+  ./stackcollapse-perf.pl stapel.txt | ./flamegraph.pl > cpu.svg
+  ```
+
+  Zeigt perf Hex-Adressen oder `[unknown]` statt Funktionsnamen, fehlen Debug-Symbole; Debian liefert sie in `-dbgsym`-Paketen. Enden die Stapel nach ein, zwei Ebenen, fehlen Frame-Pointer. Dann rekonstruiert `perf record --call-graph dwarf` die Stapel aus Kopien des Stacks, und `perf.data` wird deutlich größer.
+
+  > [!INTERVIEW]
+  > „Ein Prozess steht bei 100 % CPU. Wie findest du heraus, warum?“ – Zuerst `pidstat -u 1` für die Aufteilung. Viel `%system` heißt, er steckt in Systemaufrufen; `strace -c -p PID` zeigt, in welchen. Viel `%usr` heißt, er rechnet selbst; `perf top -p PID` oder `perf record -g` zeigt die Funktionen. Mit dem Ergebnis gehe ich in den Code und frage, warum diese Funktion so oft läuft.
 
   ## Netzwerk nach Schichten untersuchen
 
@@ -158,7 +465,7 @@ lesson: |
 
   `getent` folgt der Namensdienstkonfiguration des Systems, `dig` fragt DNS. Unterschiede können durch `/etc/hosts`, Resolverkonfiguration oder Anwendungscaches entstehen. Die Beispieladressen sind Dokumentationswerte; ersetze sie durch die eigene Testumgebung. `curl -v` zeigt Phasen wie Verbindung und TLS. Bereinige Headers und Zugangsdaten, bevor du die Ausgabe teilst ([curl-Handbuch](https://curl.se/docs/manpage.html)).
 
-  „Connection refused“ passt zu einem fehlenden Listener oder einer aktiven Ablehnung. Ein Timeout kann zu Paketverlust, Filterung oder einem nicht antwortenden Dienst passen. HTTP 502 zeigt, dass du bereits einen HTTP-Server erreicht hast; die nächste Frage liegt oft bei dessen Upstream. Eine gültige TLS-Verbindung ist wiederum kein Nachweis, dass Datenbank und fachliche API funktionieren.
+  „Connection refused“ passt zu einem fehlenden Listener, zu einem Listener auf einer anderen Adresse oder zu einer aktiven Ablehnung. `ss -ltnp` zeigt, ob ein Dienst auf `127.0.0.1`, auf `[::1]` oder auf allen Adressen lauscht. Ein Timeout kann zu Paketverlust, Filterung oder einem nicht antwortenden Dienst passen. HTTP 502 zeigt, dass du bereits einen HTTP-Server erreicht hast; die nächste Frage liegt oft bei dessen Upstream. Eine gültige TLS-Verbindung ist wiederum kein Nachweis, dass Datenbank und fachliche API funktionieren.
 
   ## Verifikation und ein kurzes Postmortem
 
@@ -174,10 +481,11 @@ lesson: |
   - Beobachtung, Hypothese und bestätigte Ursache bleiben getrennt.
   - Messe während des Symptoms und notiere die Messgrenzen.
   - Dienststatus, Listener und fachliche Antwort sind eigene Ebenen.
-  - Load Average, CPU-Nutzung und Speicherdruck sind keine Synonyme.
+  - Load Average, CPU-Nutzung und Speicherdruck sind keine Synonyme: `r` und `%wait` zeigen CPU-Sättigung, `b`, `w_await` und `aqu-sz` I/O-Sättigung, PSI die verlorene Zeit.
+  - `%util` nahe 100 beweist bei SSDs und RAID-Verbünden keinen Engpass.
+  - `strace -f -e trace=file` zeigt, woran ein stummes Programm scheitert, `strace -c -w`, worauf es wartet, `perf`, womit es rechnet.
   - Prüfe Datenblöcke, Inodes, offene gelöschte Dateien und Mounts.
-  - Ändere begrenzt und verifiziere den ursprünglichen Ablauf.
-  - Dokumentiere Ursachen und Folgemaßnahmen sachlich.
+  - Ändere begrenzt, verifiziere den ursprünglichen Ablauf und dokumentiere Ursachen und Folgemaßnahmen sachlich.
 exercises:
   - id: diagnosefolge
     type: order
@@ -211,6 +519,83 @@ exercises:
     resources:
       - title: proc_loadavg(5)
         url: https://man7.org/linux/man-pages/man5/proc_loadavg.5.html
+  - id: io-engpass
+    type: choice
+    title: Welches Gerät staut sich?
+    prompt: |
+      Ein Datenbankserver (8 CPUs, kein Swap) antwortet seit 10:40 langsam. Auf `nvme0n1` liegen die Datendateien, auf der Festplatte `sdb` das Transaktionslog. Die Ausgaben stammen von diesem Server während der Störung, nicht aus der VM. Welche Aussagen tragen die Messwerte?
+    lang: text
+    code: |
+      $ vmstat 1 4
+      procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+       r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+       1  0      0 812344  10220 9871520   0    0   612  3340 2210 3120  9  3 87  1  0
+       2  9      0 810112  10220 9876540   0    0 39410 99260 6120 9811  4  3 35 58  0
+       1  8      0 809876  10220 9878020   0    0 39188 101232 5988 9530  3  3 36 58  0
+       1  9      0 809540  10220 9879332   0    0 39402 98876 6044 9702  4  2 35 59  0
+
+      $ iostat -dxy 1 1   (Spalten gekürzt und umsortiert)
+      Device         r/s      w/s     rkB/s     wkB/s  r_await  w_await  aqu-sz   %util
+      nvme0n1    9800.00   120.00  39200.00    960.00     0.10     0.03    0.98   98.40
+      sdb           3.00   410.00     12.00  98400.00     5.20   212.40   87.10  100.00
+    options:
+      - text: "`sdb` ist gesättigt: Schreibanfragen dauern im Mittel über 200 ms, und im Schnitt stehen rund 87 Anfragen gleichzeitig an."
+        correct: true
+        why: Hohe Wartezeit und eine lange Warteschlange bei einem Gerät, das Anfragen nacheinander bedient, sind das Bild der Sättigung.
+      - text: "`nvme0n1` ist mit 98 % `%util` ebenfalls am Limit."
+        correct: false
+        why: "`%util` misst nur den Anteil der Zeit, in der mindestens eine Anfrage unterwegs war. Eine NVMe-SSD bearbeitet viele Anfragen parallel; 0,10 ms Wartezeit und eine Warteschlange unter 1 zeigen keinen Stau."
+      - text: Die acht bis neun blockierten Prozesse in Spalte `b` warten vermutlich auf das Transaktionslog; `pidstat -d 1` zeigt, wer dorthin schreibt.
+        correct: true
+        why: "`b` zählt Prozesse, die auf I/O warten. Zeitgleich staut sich nur `sdb`, und eine Datenbank wartet beim Commit auf ihr Log."
+      - text: Der Server lagert aus, und `wa` entsteht durch Swapping.
+        correct: false
+        why: "`swpd`, `si` und `so` stehen auf 0. Ohne Swap kann Auslagern nicht die Ursache sein."
+      - text: Die CPUs sind der Engpass, denn `wa` verbraucht 58 % der Rechenzeit.
+        correct: false
+        why: "`wa` ist Leerlaufzeit, während I/O aussteht. Gerechnet wird nur 6–7 % (`us` + `sy`), und `r` liegt weit unter 8."
+    explanation: |
+      Sättigung zeigt sich an Wartezeit und Warteschlange, nicht an `%util` allein. Die Warteschlange ergibt sich aus Anfragen pro Sekunde mal Dauer: Bei `sdb` sind das 410 × 0,2124 s ≈ 87, bei `nvme0n1` 9800 × 0,0001 s ≈ 1. `vmstat` passt dazu: Die erste Zeile mittelt seit dem Boot und ist unauffällig, danach warten acht bis neun Prozesse auf I/O, `wa` steigt, und die CPUs sind sonst frei. Die erste Spur ist also das Log-Gerät und wer es beschreibt.
+    resources:
+      - title: iostat(1) · Reports
+        url: https://man7.org/linux/man-pages/man1/iostat.1.html#REPORTS
+      - title: vmstat(8) · Felder
+        url: https://man7.org/linux/man-pages/man8/vmstat.8.html#FIELD_DESCRIPTION_FOR_VM_MODE
+  - id: perf-report
+    type: choice
+    title: Wo verbrennt die CPU-Zeit?
+    prompt: |
+      Ein Bestelldienst steht seit dem letzten Release bei 100 % CPU, fast alles `%usr`. Das ist ein gekürzter Ausschnitt aus `perf report --stdio` nach `perf record -g` über 30 Sekunden, von einem x86_64-Server mit Debian 12 und installierten Debug-Symbolen (nicht aus der VM). Welche Schlussfolgerung tragen die Zahlen?
+    lang: text
+    code: |
+      # Children      Self  Command   Shared Object          Symbol
+          98.64%     0.18%  shop-api  shop-api               [.] handle_request
+          72.90%     0.61%  shop-api  shop-api               [.] validate_order
+          70.85%     0.44%  shop-api  libpcre2-8.so.0.11.2   [.] pcre2_compile_8
+          55.31%    54.97%  shop-api  libpcre2-8.so.0.11.2   [.] compile_branch
+          14.02%    13.88%  shop-api  libpcre2-8.so.0.11.2   [.] parse_regex
+          11.27%     1.05%  shop-api  shop-api               [.] render_json
+           6.40%     6.31%  shop-api  [kernel.kallsyms]      [k] clear_page_erms
+    options:
+      - text: "`validate_order` verbringt fast seine ganze Zeit damit, einen regulären Ausdruck zu kompilieren. Ihn einmal zu kompilieren und wiederzuverwenden spart den größten Anteil."
+        correct: true
+        why: "Von den 72,90 % unter `validate_order` entfallen 70,85 % auf `pcre2_compile_8`. Kompilieren gehört an den Start des Programms, nicht in jede Anfrage."
+      - text: "`handle_request` ist mit 98,64 % die teuerste Funktion, dort muss optimiert werden."
+        correct: false
+        why: "`Children` zählt alle aufgerufenen Funktionen mit. `Self` liegt bei 0,18 %: `handle_request` kostet selbst fast nichts, es ruft nur die teuren Funktionen auf."
+      - text: "`compile_branch` ist schlecht programmiert; PCRE2 sollte durch eine schnellere Bibliothek ersetzt werden."
+        correct: false
+        why: "Der hohe `Self`-Anteil zeigt, dass die Funktion sehr oft läuft. Das Muster spricht für zu viele Aufrufe aus der Anwendung, nicht für eine langsame Bibliothek."
+      - text: Der Kernel ist der Engpass, weil `clear_page_erms` mit `[k]` auftaucht.
+        correct: false
+        why: "6,4 % im Kernel, der Speicherseiten für neuen Speicher nullt, sind ein Nebenschauplatz. Über 70 % stecken im Kompilieren."
+    explanation: |
+      `Self` ist die Zeit in der Funktion selbst, `Children` zusätzlich die Zeit in allem, was sie aufruft. Oben stehen deshalb immer Verteiler wie `handle_request`. Die Spur führt über die Kette mit großem `Children`-Anteil nach unten bis zu den Funktionen mit großem `Self`-Anteil, hier `compile_branch` und `parse_regex` in PCRE2. Ihr Aufrufer aus der Anwendung ist `validate_order`. Dass ein Muster bei jeder Anfrage neu kompiliert wird, bestätigst du im Code oder im Aufrufgraphen, den `perf report` unter jeder Zeile aufklappen kann.
+    resources:
+      - title: perf-report(1)
+        url: https://man7.org/linux/man-pages/man1/perf-report.1.html
+      - title: perf Wiki · Tutorial
+        url: https://perf.wiki.kernel.org/index.php/Tutorial
   - id: fehlerrate
     type: output
     title: Ein kleines Zeitfenster auswerten
@@ -312,6 +697,79 @@ exercises:
       - Auf dem geprüften Backendport ist kein Listener sichtbar.
       - Als Nächstes werden Backend-Unit, Logs und konfigurierte Portzuordnung geprüft.
     explanation: Die Beobachtungen grenzen die Störung auf den Weg vom Proxy zum Backend ein. Sie beweisen noch nicht, warum das Backend fehlt; ein DNS- oder TLS-Neuentwurf wäre durch diese Belege nicht begründet.
+  - id: psi-speicherdruck
+    type: explain
+    title: Schnellere Platten gegen hohes wa?
+    prompt: |
+      Ein API-Server (4 GiB RAM, kein Swap) reagiert seit einer Stunde zäh. Ein Kollege will die Daten auf schnellere SSDs umziehen, weil `wa` über 50 % liegt. Die Ausgaben stammen von diesem Server, nicht aus der VM. Erkläre, welche Ressource der Engpass ist, warum der Umzug wenig bringt und was du als Nächstes prüfst.
+    lang: text
+    code: |
+      $ free -m
+                     total        used        free      shared  buff/cache   available
+      Mem:            3920        3822          61           2         156          98
+      Swap:              0           0           0
+
+      $ vmstat 1 3
+      procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+       r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+       2  0      0  63412    320 159880    0    0   210    88  980 1430  6  3 90  1  0
+       3  6      0  62104    312 158220    0    0 48212   120 4120 6211 12 21 14 53  0
+       2  7      0  60988    308 157004    0    0 51320    96 4302 6540 10 23 12 55  0
+
+      $ grep . /proc/pressure/memory /proc/pressure/io
+      /proc/pressure/memory:some avg10=61.42 avg60=48.90 avg300=22.15 total=318842211
+      /proc/pressure/memory:full avg10=38.70 avg60=29.31 avg300=12.04 total=201224870
+      /proc/pressure/io:some avg10=58.10 avg60=45.22 avg300=20.40 total=301127730
+      /proc/pressure/io:full avg10=36.95 avg60=27.80 avg300=11.62 total=190288145
+    points:
+      - Ohne Swap bleiben `si` und `so` bei 0; sie taugen hier nicht als Signal für Speicherdruck.
+      - Fast kein RAM ist verfügbar, der Cache ist winzig, und `bi` liegt bei rund 50 MiB/s, während kaum geschrieben wird. Der Kernel verdrängt Dateiseiten und liest sie sofort wieder ein.
+      - "`memory full` von fast 39 % heißt: In rund 39 % der letzten zehn Sekunden kam keine Aufgabe voran, weil alle auf Speicher warteten."
+      - Der I/O-Druck ist eine Folge des Speichermangels. Schnellere Platten verkürzen das Nachladen, beheben aber nicht, dass der Arbeitsspeicher nicht reicht.
+      - Als Nächstes suchst du den Verbraucher (`ps --sort=-rss`, `pidstat -r 1`, `memory.current` und `memory.pressure` der Units) und prüfst `journalctl -k` auf OOM-Meldungen.
+    explanation: |
+      Der Engpass ist der Arbeitsspeicher, nicht die Platte. Anonymen Speicher kann der Kernel ohne Swap nirgends auslagern. Er holt sich Platz aus dem Seitencache und wirft dabei auch Programmcode und häufig gelesene Dateien hinaus, die kurz darauf wieder gebraucht werden. Diese Nachladevorgänge sind die Lesezugriffe in `bi`; die Prozesse warten darauf im Zustand `D` (`b`), und die CPU steht in `wa`. PSI passt dazu: Der Druck bei `memory` ist mindestens so hoch wie bei `io`, denn das Warten auf verdrängte und wieder gebrauchte Seiten zählt der Kernel als Speicherdruck. Schreiblast (`bo`) gibt es kaum.
+
+      Hilfreich ist, den Verbraucher zu finden und zu begrenzen oder dem Server mehr RAM zu geben. Schnellere SSDs würden die Wartezeit pro Nachladen senken, das Thrashing selbst aber nicht beenden.
+    resources:
+      - title: Kernel · PSI
+        url: https://docs.kernel.org/accounting/psi.html#pressure-interface
+      - title: Kernel · cgroup v2 Memory
+        url: https://docs.kernel.org/admin-guide/cgroup-v2.html#memory
+  - id: strace-zusammenfassung
+    type: explain
+    title: Wohin verschwinden die 40 Minuten?
+    prompt: |
+      Ein nächtlicher Export braucht seit dem Umzug auf einen neuen Server 40 statt 4 Minuten. Der Prozess hat nur einen Thread, die CPU ist fast untätig. Du hängst dich eine Minute lang an ihn und drückst dann Strg+C. Die Tabelle stammt von diesem Server, nicht aus der VM. Erkläre, wohin die Zeit geht, welche Zeile du zuerst verfolgst und warum die vielen Fehler nicht die erste Spur sind.
+    lang: text
+    code: |
+      $ sudo strace -c -w -f -p 23817
+      strace: Process 23817 attached
+      ^Cstrace: Process 23817 detached
+      % time     seconds  usecs/call     calls    errors syscall
+      ------ ----------- ----------- --------- --------- ----------------
+       88.64   52.180341       45772      1140           fdatasync
+        6.51    3.833102          31    123649           write
+        3.00    1.766224          29     60904     60896 openat
+        1.04    0.611042          39     15620           read
+        0.81    0.479113          26     18240           lseek
+        0.00    0.000212          26         8           close
+      ------ ----------- ----------- --------- --------- ----------------
+      100.00   58.870034         268    219561     60896 total
+    points:
+      - Mit `-w` misst die Tabelle Wanduhrzeit; rund 52 der 60 Sekunden stecken in `fdatasync`.
+      - Jeder `fdatasync` dauert im Schnitt rund 46 ms. Der Export wartet darauf, dass Daten dauerhaft auf dem Gerät liegen, nicht auf die CPU.
+      - Die rund 61 000 fehlgeschlagenen `openat` sind auffällig, kosten zusammen aber unter 2 Sekunden. Sie sind ein Nebenbefund.
+      - Als Nächstes prüfst du das Zielgerät mit `iostat -x` (`w_await`, `f_await`) und, ob der Export nach jeder Handvoll Datensätze synchronisiert, statt größere Blöcke zu schreiben.
+    explanation: |
+      Die Tabelle zeigt, wo der Prozess in Systemaufrufen steckt, nicht, wo er rechnet. Mit `-w` zählt sie die Zeit zwischen Beginn und Ende jedes Aufrufs; ohne `-w` stünde dort nur Kernel-CPU-Zeit, und das Warten in `fdatasync` fiele kaum auf. 1140 Aufrufe in einer Minute sind rund 19 pro Sekunde, jeder dauert etwa 46 ms: Zusammen ergibt das fast die gesamte Minute. Auf dem alten Server war das Gerät schneller beim Synchronisieren, etwa durch einen Controller mit batteriegepuffertem Schreibcache; das bestätigt oder widerlegt erst `iostat -x` auf dem neuen.
+
+      Die Fehler bei `openat` gehören trotzdem ins Protokoll. Fast jeder Versuch scheitert, das Programm sucht also wiederholt eine Datei, die es nicht gibt. Bei 29 µs pro Aufruf ist das aber nicht der Grund für 36 Minuten Verzögerung.
+    resources:
+      - title: strace(1)
+        url: https://man7.org/linux/man-pages/man1/strace.1.html
+      - title: fsync(2)
+        url: https://man7.org/linux/man-pages/man2/fsync.2.html
   - id: dienst-nach-boot
     type: scenario
     title: Läuft von Hand, aber nicht nach dem Neustart
@@ -375,6 +833,331 @@ exercises:
         url: https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#WorkingDirectory=
       - title: systemctl enable
         url: https://www.freedesktop.org/software/systemd/man/latest/systemctl.html#enable%20UNIT%E2%80%A6
+  - id: bad-gateway
+    type: scenario
+    title: 502, obwohl das Backend antwortet
+    prompt: |
+      Seit dem Deployment um 14:20 meldet das Monitoring für `http://localhost/health` auf `web01` nur noch `502 Bad Gateway`. nginx arbeitet dort als Reverse Proxy vor `shop-backend.service`. Im Ticket schreibt die Entwicklerin: „Das Backend läuft, `curl localhost:8080/health` liefert `ok`. Muss an nginx liegen.“
+
+      Finde heraus, warum nginx das Backend nicht erreicht, und repariere es so, dass `/health` über nginx wieder `ok` liefert, auch nach einem Neustart der Dienste. Das Backend soll weiterhin nur lokal erreichbar sein.
+    setup: |
+      set -e
+      mkdir -p /srv/shop/www /etc/shop
+      echo ok > /srv/shop/www/health
+      echo '<h1>Shop</h1>' > /srv/shop/www/index.html
+      cat > /etc/shop/backend.env <<'EOF'
+      # Adresse des Backends. Deployment 14:20: nur noch lokal statt auf allen Adressen.
+      LISTEN=[::1]:8080
+      EOF
+      cat > /etc/systemd/system/shop-backend.service <<'EOF'
+      [Unit]
+      Description=Shop-Backend
+
+      [Service]
+      User=www-data
+      EnvironmentFile=/etc/shop/backend.env
+      ExecStart=/usr/bin/busybox httpd -f -p ${LISTEN} -h /srv/shop/www
+      Restart=on-failure
+
+      [Install]
+      WantedBy=multi-user.target
+      EOF
+      cat > /etc/nginx/sites-available/shop <<'EOF'
+      server {
+          listen 80 default_server;
+          listen [::]:80 default_server;
+          server_name _;
+
+          location / {
+              proxy_pass http://127.0.0.1:8080;
+              proxy_set_header Host $host;
+          }
+      }
+      EOF
+      rm -f /etc/nginx/sites-enabled/default
+      ln -s /etc/nginx/sites-available/shop /etc/nginx/sites-enabled/shop
+      ln -s /lib/systemd/system/nginx.service /etc/systemd/system/multi-user.target.wants/nginx.service
+      ln -s /etc/systemd/system/shop-backend.service /etc/systemd/system/multi-user.target.wants/shop-backend.service
+      systemctl daemon-reload
+      systemctl start shop-backend.service nginx.service
+      curl -s -o /dev/null http://localhost/health || true
+    checks:
+      - name: shop-backend startet beim Boot und läuft nach einem Neustart
+        run: systemctl is-enabled shop-backend && systemctl restart shop-backend && sleep 1 && systemctl is-active shop-backend
+      - name: Die nginx-Konfiguration ist gültig, nginx startet beim Boot
+        run: nginx -t -q && systemctl is-enabled nginx && systemctl is-active nginx
+      - name: Über nginx liefert /health wieder ok
+        run: curl -fsS --max-time 5 http://localhost/health
+      - name: Das Backend lauscht nur auf localhost
+        run: |
+          adressen=$(ss -Hltnp | grep '"busybox"' | awk '{ print $4 }')
+          echo "Das Backend lauscht auf: ${adressen:-nichts}"
+          [ -n "$adressen" ] && ! printf '%s\n' "$adressen" | grep -qvE '^(127\.[0-9.]+|\[::1\]):[0-9]+$'
+    solution: |
+      # Wer antwortet mit 502? Der Server-Header sagt: nginx selbst.
+      curl -si http://localhost/health | head -n 3
+      # nginx schreibt Upstream-Fehler ins Fehlerlog (ops liest als Mitglied von adm mit):
+      tail -n 1 /var/log/nginx/error.log
+      # connect() failed (111: Connection refused) while connecting to upstream, … upstream: "http://127.0.0.1:8080/health"
+      # Das Backend läuft und antwortet auch, aber auf welcher Adresse?
+      systemctl status shop-backend --no-pager | head -n 3
+      curl -sS http://localhost:8080/health
+      sudo ss -ltnp 'sport = :8080'
+      # LISTEN … [::1]:8080 … busybox: nur IPv6-Loopback. nginx verbindet sich mit 127.0.0.1.
+      grep LISTEN /etc/shop/backend.env
+      sudo sed -i 's/^LISTEN=.*/LISTEN=127.0.0.1:8080/' /etc/shop/backend.env
+      sudo systemctl restart shop-backend
+      sudo ss -ltnp 'sport = :8080'
+      curl -fsS http://localhost/health
+    hints:
+      - "Wer schickt die 502? `curl -si http://localhost/health` zeigt Status und `Server:`-Header. Fehler beim Upstream schreibt nginx nach `/var/log/nginx/error.log`."
+      - "Das Fehlerlog nennt die Adresse, mit der nginx sich verbinden will. Vergleiche sie mit der Adresse, auf der das Backend wirklich lauscht: `sudo ss -ltnp`."
+      - "`localhost` heißt `127.0.0.1` und `::1`. curl probiert beide, nginx verbindet sich hier fest mit `127.0.0.1`. Die Adresse des Backends steht in `/etc/shop/backend.env`."
+    explanation: |
+      Die 502 erzeugt nginx selbst: Es hat die Anfrage angenommen, bekommt aber keine Verbindung zum Upstream. Das Fehlerlog nennt Ziel und Grund, `127.0.0.1:8080` und `111: Connection refused`. `ss -ltnp` zeigt, dass busybox seit dem Deployment nur auf `[::1]:8080` lauscht, dem IPv6-Loopback. Ein Socket auf `::1` nimmt keine Verbindungen an `127.0.0.1` an. Die Probe der Entwicklerin klappte trotzdem, weil curl `localhost` zu `::1` und `127.0.0.1` auflöst und beide Adressen probiert. Sie hat also einen anderen Weg getestet als nginx.
+
+      Beide Reparaturen sind richtig: das Backend auf `127.0.0.1:8080` legen oder in nginx `proxy_pass http://[::1]:8080;` eintragen und nginx neu laden. Allgemein gilt: Teste genau den Weg, den der Client nimmt, mit derselben Adresse, demselben Port und demselben Protokoll.
+    resources:
+      - title: nginx · proxy_pass
+        url: https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_pass
+      - title: ss(8)
+        url: https://man7.org/linux/man-pages/man8/ss.8.html
+  - id: zaeher-server
+    type: scenario
+    title: Der Server ist zäh
+    prompt: |
+      Seit gestern Mittag ist `web01` zäh: Befehle im Terminal brauchen spürbar länger, und der Shop (`shop.service`, `http://127.0.0.1:8080/health`) antwortet langsamer als sonst. Im Team erinnert sich jemand, „irgendeinen Job“ eingerichtet zu haben, weiß aber nicht mehr, welchen.
+
+      Finde heraus, was die CPU belegt und wer es startet. Der Job wird gebraucht und soll weiter regelmäßig laufen. Er darf aber dauerhaft höchstens 20 % einer CPU bekommen, auch wenn die Maschine sonst nichts zu tun hat. Der Shop muss dabei weiterlaufen.
+    setup: |
+      set -e
+      # Der Shop
+      mkdir -p /srv/shop/www
+      echo ok > /srv/shop/www/health
+      cat > /etc/systemd/system/shop.service <<'EOF'
+      [Unit]
+      Description=Shop-Frontend
+
+      [Service]
+      User=www-data
+      ExecStart=/usr/bin/busybox httpd -f -p 127.0.0.1:8080 -h /srv/shop/www
+
+      [Install]
+      WantedBy=multi-user.target
+      EOF
+      # Ein harmloser Job zum Vergleich
+      cat > /etc/systemd/system/belegexport.service <<'EOF'
+      [Unit]
+      Description=Belege an die Buchhaltung exportieren
+
+      [Service]
+      Type=oneshot
+      ExecStart=/bin/true
+      EOF
+      cat > /etc/systemd/system/belegexport.timer <<'EOF'
+      [Unit]
+      Description=Belege nachts exportieren
+
+      [Timer]
+      OnCalendar=*-*-* 02:30
+
+      [Install]
+      WantedBy=timers.target
+      EOF
+      # Der Job, der die CPU belegt
+      cat > /usr/local/bin/katalog-vorschau <<'EOF'
+      #!/bin/sh
+      # Baut die Vorschaubilder des Produktkatalogs neu und prüft jede per Prüfsumme.
+      n=0
+      while [ "$n" -lt 100 ]; do
+        head -c 8M /dev/urandom | sha256sum > /dev/null
+        n=$((n + 1))
+      done
+      EOF
+      chmod 755 /usr/local/bin/katalog-vorschau
+      cat > /etc/systemd/system/katalog-vorschau.service <<'EOF'
+      [Unit]
+      Description=Vorschaubilder des Produktkatalogs neu aufbauen
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/bin/katalog-vorschau
+      EOF
+      cat > /etc/systemd/system/katalog-vorschau.timer <<'EOF'
+      [Unit]
+      Description=Vorschaubilder regelmäßig neu aufbauen
+
+      [Timer]
+      OnActiveSec=10s
+      OnUnitInactiveSec=30s
+
+      [Install]
+      WantedBy=timers.target
+      EOF
+      mkdir -p /etc/systemd/system/timers.target.wants
+      ln -s /etc/systemd/system/shop.service /etc/systemd/system/multi-user.target.wants/shop.service
+      ln -s /etc/systemd/system/belegexport.timer /etc/systemd/system/timers.target.wants/belegexport.timer
+      ln -s /etc/systemd/system/katalog-vorschau.timer /etc/systemd/system/timers.target.wants/katalog-vorschau.timer
+      systemctl daemon-reload
+      systemctl start shop.service belegexport.timer katalog-vorschau.timer
+      systemctl start --no-block katalog-vorschau.service
+    checks:
+      - name: Der Shop läuft und antwortet
+        run: systemctl is-active shop && curl -fsS --max-time 5 http://127.0.0.1:8080/health
+      - name: Der Job wird weiter regelmäßig gestartet
+        run: systemctl is-enabled katalog-vorschau.timer && systemctl is-active katalog-vorschau.timer
+      - name: Der Job bekommt höchstens 20 % einer CPU
+        run: |
+          systemctl start --no-block katalog-vorschau.service
+          sleep 2
+          cg=/sys/fs/cgroup/system.slice/katalog-vorschau.service
+          nutzung() { awk '$1 == "usage_usec" { print $2 }' "$cg/cpu.stat" 2>/dev/null; }
+          a=$(nutzung); sleep 4; b=$(nutzung)
+          if [ -z "$a" ] || [ -z "$b" ]; then echo "Der Job lief während der Messung nicht."; exit 1; fi
+          p=$(( (b - a) / 40000 ))
+          echo "Der Job nutzte $p % einer CPU (Messung über 4 Sekunden)."
+          [ "$p" -le 25 ]
+    solution: |
+      # Eine CPU, aber zwei bis drei lauffähige Aufgaben und kein Leerlauf
+      nproc
+      uptime
+      vmstat 1 3
+      # PSI: Aufgaben warten auf die CPU
+      cat /proc/pressure/cpu
+      # Wer rechnet? sha256sum und head wechseln die PID, ihr Elternprozess bleibt.
+      ps -eo pid,ppid,%cpu,cmd --sort=-%cpu | head -n 5
+      eltern=$(ps -o ppid= -C sha256sum | head -n 1)
+      ps -o pid,unit,cmd -p $eltern
+      # Die Unit und der Timer, der sie immer wieder startet
+      systemctl status katalog-vorschau.service --no-pager | head -n 4
+      systemctl list-timers --no-pager
+      # Dauerhaft auf 20 % einer CPU begrenzen; Timer und Shop bleiben unberührt
+      sudo systemctl set-property katalog-vorschau.service CPUQuota=20%
+      cat /sys/fs/cgroup/system.slice/katalog-vorschau.service/cpu.max
+      vmstat 1 3
+    hints:
+      - "Wie viele CPUs hat die Maschine (`nproc`), und wie viele Aufgaben wollen rechnen? Spalte `r` in `vmstat 1 5` und `cat /proc/pressure/cpu` zeigen, ob die CPU der Engpass ist."
+      - "`top` oder `ps -eo pid,ppid,%cpu,cmd --sort=-%cpu` zeigt die Rechner. Kurzlebige Prozesse wechseln die PID; folge dem Elternprozess. `ps -o unit= -p PID` oder `systemctl status PID` nennt die Unit, `systemctl list-timers` den Auslöser."
+      - "`kill` oder Abschalten helfen hier nicht, der Timer startet den Job wieder, und er wird gebraucht. Gesucht ist eine harte Obergrenze für die cgroup des Dienstes: `CPUQuota=`, gesetzt mit `systemctl set-property` oder einem Drop-in."
+    explanation: |
+      Auf einer CPU heißt `r` = 2 bis 3 bei `id` = 0: Mehrere Aufgaben wollen rechnen, eine bekommt die CPU, die anderen warten. PSI bestätigt das mit `cpu some` um 50. Die Rechner `sha256sum` und `head` leben nur Sekunden; stabil ist ihr Elternprozess, das Skript `katalog-vorschau`. Über die cgroup (`ps -o unit`, `systemctl status PID`) findest du die Unit, `systemctl list-timers` zeigt den Timer, der sie 30 Sekunden nach jedem Ende neu startet. Ein `kill` hilft deshalb nur kurz.
+
+      `CPUQuota=20%` setzt in der cgroup `cpu.max` auf 20 ms je 100 ms: Der Job bekommt nie mehr, auch wenn die CPU sonst frei wäre. `Nice=` und `CPUWeight=` verteilen dagegen nur, wenn mehrere Aufgaben konkurrieren; im Leerlauf bekäme der Job weiter 100 %. `systemctl set-property` wendet die Grenze sofort an und speichert sie dauerhaft unter `/etc/systemd/system.control/`; ein Drop-in mit `daemon-reload` wirkt genauso. Danach zeigt `cpu.pressure` in der cgroup des Jobs hohe Werte: Jetzt wartet der Job, nicht mehr der Rest des Systems.
+    resources:
+      - title: systemd.resource-control · CPUQuota=
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html#CPUQuota=
+      - title: systemd.timer
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemd.timer.html
+      - title: Kernel · PSI für cgroups
+        url: https://docs.kernel.org/accounting/psi.html#cgroup2-interface
+  - id: stummer-abgleich
+    type: scenario
+    title: Exit-Code 1 und sonst nichts
+    prompt: |
+      Seit dem Update auf lagersync 2.4 gestern Abend bleibt der Lagerexport `/srv/lager/bestand.csv` auf dem Stand von gestern. Ein Timer startet `lagersync.service` alle fünf Minuten, und der Dienst endet jedes Mal mit Exit-Code 1. Eine Fehlermeldung gibt es nicht, weder im Journal noch im Terminal. Der Hersteller schreibt: „Bei uns läuft 2.4 problemlos. Das Programm liegt unter `/opt/lager`.“
+
+      Finde heraus, woran lagersync scheitert, und repariere es. Der Dienst soll weiter als Benutzer `lager` laufen, und die Zugangsdaten in `/opt/lager/etc/zugang.token` dürfen nur root und `lager` lesen.
+    setup: |
+      set -e
+      useradd --system --home-dir /var/lib/lager --create-home --shell /usr/sbin/nologin lager
+      mkdir -p /opt/lager/bin /opt/lager/etc /srv/lager
+      cat > /opt/lager/bin/lagersync <<'EOF'
+      #!/bin/sh
+      # lagersync 2.4 – Lagerwerk GmbH
+      # Gleicht den Lagerbestand mit dem Shop ab. Sucht Konfiguration und
+      # Zugangsdaten relativ zum Installationsort.
+      basis=$(dirname "$(readlink -f "$0")")/..
+      for datei in "${XDG_CONFIG_HOME:-$HOME/.config}/lagersync/lagersync.conf" "$basis/etc/lagersync.conf"; do
+        if [ -f "$datei" ]; then
+          . "$datei"
+          break
+        fi
+      done
+      [ -n "$ZIEL" ] || exit 1
+      token=$(cat "$basis/etc/zugang.token" 2>/dev/null) || exit 1
+      [ -n "$token" ] || exit 1
+      printf 'artikel;bestand\n4711;12\n4712;0\n4713;38\n' > "$ZIEL.neu" || exit 1
+      mv "$ZIEL.neu" "$ZIEL"
+      EOF
+      chmod 755 /opt/lager/bin/lagersync
+      printf '# Ziel des Exports\nZIEL=/srv/lager/bestand.csv\n' > /opt/lager/etc/lagersync.conf
+      printf 'lw_7f3c9a1e52d04b8e\n' > /opt/lager/etc/zugang.token
+      chmod 600 /opt/lager/etc/zugang.token
+      printf 'artikel;bestand\n4711;14\n4712;3\n4713;40\n' > /srv/lager/bestand.csv
+      chown -R lager:lager /srv/lager
+      touch -d 'yesterday 21:55' /srv/lager/bestand.csv
+      # Das Update hat das Programm kopiert, statt es zu verlinken.
+      cp /opt/lager/bin/lagersync /usr/local/bin/lagersync
+      cat > /etc/systemd/system/lagersync.service <<'EOF'
+      [Unit]
+      Description=Lagerbestand mit dem Shop abgleichen
+
+      [Service]
+      Type=oneshot
+      User=lager
+      ExecStart=/usr/local/bin/lagersync
+      EOF
+      cat > /etc/systemd/system/lagersync.timer <<'EOF'
+      [Unit]
+      Description=Lagerabgleich alle fünf Minuten
+
+      [Timer]
+      OnCalendar=*:0/5
+
+      [Install]
+      WantedBy=timers.target
+      EOF
+      mkdir -p /etc/systemd/system/timers.target.wants
+      ln -s /etc/systemd/system/lagersync.timer /etc/systemd/system/timers.target.wants/lagersync.timer
+      systemctl daemon-reload
+      systemctl start lagersync.timer
+      systemctl start lagersync.service || true
+    checks:
+      - name: lagersync.service läuft fehlerfrei durch
+        run: systemctl start lagersync.service
+      - name: Der Export ist frisch und stammt vom Dienstbenutzer lager
+        run: |
+          f=/srv/lager/bestand.csv
+          ls -l "$f"
+          [ "$(stat -c %U "$f")" = lager ] && [ -n "$(find "$f" -mmin -2)" ] && grep -q '^4711;12$' "$f"
+      - name: Nur root und lager können zugang.token lesen
+        run: |
+          ls -l /opt/lager/etc/zugang.token
+          ! runuser -u ops -- cat /opt/lager/etc/zugang.token >/dev/null 2>&1 &&
+            [ -z "$(find /opt/lager /usr/local -name zugang.token -perm /o=r)" ]
+    solution: |
+      # Der Dienst scheitert ohne Meldung:
+      systemctl status lagersync --no-pager
+      journalctl -u lagersync -n 5 --no-pager
+      # strace zeigt, welche Dateien das Programm sucht; -f folgt auch Kindprozessen.
+      strace -f -e trace=file /usr/local/bin/lagersync 2>&1 | tail -n 3
+      # statx(… "/usr/local/bin/../etc/lagersync.conf" …) = -1 ENOENT: gesucht neben dem Programm, nicht unter /opt/lager
+      ls -l /usr/local/bin/lagersync /opt/lager/bin/lagersync
+      # Eine Kopie statt eines Links. lagersync sucht seine Dateien relativ zum eigenen Pfad.
+      sudo ln -sf /opt/lager/bin/lagersync /usr/local/bin/lagersync
+      # Erneut testen, und zwar als Dienstbenutzer, nicht als root:
+      sudo -u lager strace -f -e trace=file /usr/local/bin/lagersync 2>&1 | tail -n 4
+      # [pid …] openat(AT_FDCWD, "/opt/lager/bin/../etc/zugang.token", …) = -1 EACCES (Permission denied)
+      ls -l /opt/lager/etc/
+      sudo chgrp lager /opt/lager/etc/zugang.token
+      sudo chmod 640 /opt/lager/etc/zugang.token
+      sudo systemctl start lagersync.service
+      ls -l /srv/lager/bestand.csv
+    hints:
+      - "Das Programm schweigt, also frag den Kernel: `strace -f -e trace=file /usr/local/bin/lagersync` zeigt jeden Dateizugriff. Lies von unten: Was geschah kurz vor `+++ exited with 1 +++`?"
+      - "Wo sucht lagersync seine Konfiguration, und wo liegt sie? Vergleiche `ls -l /usr/local/bin/lagersync` mit `/opt/lager/bin/`. Das Programm bestimmt seinen Installationsort aus dem eigenen Pfad."
+      - "Teste als der Benutzer, als der der Dienst läuft: `sudo -u lager strace -f -e trace=file /usr/local/bin/lagersync`. Ein `EACCES` in einer Zeile mit `[pid …]` stammt aus einem Kindprozess."
+    explanation: |
+      Zwei Fehler lagen hintereinander, und keiner erzeugt eine Meldung. Erstens hat das Update das Programm nach `/usr/local/bin` kopiert, statt es zu verlinken. lagersync bestimmt seinen Ort mit `readlink -f "$0"` und sucht die Konfiguration im Verzeichnis `../etc` daneben, also unter `/usr/local/etc`. strace zeigt den aufgelösten Pfad mit `ENOENT`. Das `ENOENT` für `~/.config/lagersync` davor ist kein Fehler, sondern ein optionaler Ort, den das Programm zuerst probiert.
+
+      Zweitens darf `lager` das Token nicht lesen (`0600`, root). Das sieht nur, wer als Dienstbenutzer testet: Mit `sudo strace` läuft alles durch, weil root jede Datei lesen darf. Und nur mit `-f`, denn das Token liest ein `cat` in einem Kindprozess. `chgrp lager` plus `chmod 640` gibt genau dem Dienst Lesezugriff; `chown lager` mit `0600` wäre ebenso richtig.
+
+      Allgemein: Wenn ein Programm still scheitert, zeigt `strace -f -e trace=file`, was es zuletzt versucht hat. Teste mit dem Benutzer, der Umgebung und dem Pfad, mit denen der Dienst wirklich startet.
+    resources:
+      - title: strace(1)
+        url: https://man7.org/linux/man-pages/man1/strace.1.html
+      - title: systemd.exec · User=
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#User=
   - id: incident-runbook
     type: practice
     title: Eine Störung nachvollziehbar abschließen

@@ -118,9 +118,11 @@ export function vm(): Plugin {
   };
 }
 
-/** Changes with v86 and with every image build; names the service worker's VM cache. */
+/** Changes with v86, its local patch (patches/v86.patch) and every image build; names the service worker's VM cache. */
 export function vmVersion(): string {
-  const v86 = JSON.parse(readFileSync(join(ROOT, 'node_modules/v86/package.json'), 'utf8')).version as string;
+  const patch = join(ROOT, 'patches/v86.patch');
+  const v86 = JSON.parse(readFileSync(join(ROOT, 'node_modules/v86/package.json'), 'utf8')).version as string
+    + (existsSync(patch) ? createHash('sha256').update(readFileSync(patch)).digest('hex') : '');
   // Every image is a folder with a manifest; stray files such as .DS_Store are not images.
   const images = readdirSync(join(ROOT, 'vendor/vm'), { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort()
     .map((image) => readFileSync(join(ROOT, 'vendor/vm', image, 'manifest.json'), 'utf8'));

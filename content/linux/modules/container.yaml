@@ -1,10 +1,11 @@
 id: container
 title: Container mit Docker & Podman
 level: 3
-minutes: 190
-summary: Du verpackst einen kleinen Dienst reproduzierbar, trennst Laufzeitdaten vom Image und prüfst Netzwerk, Startbereitschaft und Rechte.
+minutes: 230
+summary: Du verpackst einen kleinen Dienst reproduzierbar, trennst Laufzeitdaten vom Image, prüfst Netzwerk, Startbereitschaft und Rechte und kennst die Kernel-Bausteine darunter.
 goals:
   - Du erklärst Container als isolierte Prozesse mit gemeinsamem Kernel.
+  - Du zeigst Namespaces und cgroups mit `unshare`, `lsns` und `systemd-run` und begrenzt Speicher und CPU eines Dienstes über seine cgroup.
   - Du unterscheidest Images, Container, Volumes und Bind-Mounts.
   - Du schreibst ein Dockerfile und eine Compose-Datei mit überprüfbaren Betriebsanforderungen.
   - Du diagnostizierst Start-, Port- und Berechtigungsfehler und kennst die Grenzen der Isolation.
@@ -22,11 +23,90 @@ resources:
 lesson: |
   Auf deinem Rechner läuft die App, auf dem Server fehlen eine Bibliothek und die richtige Laufzeit. Ein Container-Image beschreibt einen gemeinsamen Auslieferungsstand. Damit verschwinden jedoch nicht alle Betriebsfragen: Daten müssen Neustarts überleben, Ports müssen an der richtigen Stelle lauschen und der Prozess braucht genau die benötigten Rechte.
 
-  Wir bauen einen kleinen statischen Testserver. Er ist bewusst kein Produktions-Webserver, sondern ein überschaubares Beispiel für Verpackung und Betrieb. Für praktische Containerübungen verwendest du eine eigene Entwicklungsumgebung oder VM. Die Plattform bewertet Konfigurationen und deine überprüfbaren Nachweise; sie startet keinen Docker-Daemon im Browser.
+  Wir bauen einen kleinen statischen Testserver. Er ist bewusst kein Produktions-Webserver, sondern ein überschaubares Beispiel für Verpackung und Betrieb. Für Docker und Podman verwendest du eine eigene Entwicklungsumgebung oder VM; im Debian dieser Lektion läuft keine Container-Engine. Die Kernel-Bausteine darunter gibt es dort aber. Die Beispiele mit „Im Terminal“ im ersten Abschnitt bauen die Bestandteile eines Containers von Hand nach und laufen dort unverändert.
 
   ## Container sind Prozesse, keine kleinen vollständigen Rechner
 
   Ein Linux-Container nutzt den Kernel des Hosts. **Namespaces** geben Prozessen getrennte Sichten auf Ressourcen wie Prozessnummern, Mounts und Netzwerk. **cgroups** gruppieren Prozesse und können Ressourcenverbrauch begrenzen beziehungsweise messen. Ein geschichtetes Dateisystem stellt Imageinhalt und eine beschreibbare Containerschicht zusammen. Eine VM hat dagegen einen eigenen Gastkernel und virtualisierte Hardware ([namespaces(7)](https://man7.org/linux/man-pages/man7/namespaces.7.html), [Kernel · cgroup v2](https://docs.kernel.org/admin-guide/cgroup-v2.html)).
+
+  Das lässt sich ohne Docker zeigen. Unter `/proc/<pid>/ns/` hat jeder Prozess für jede Namespace-Art einen Verweis. Zwei Prozesse mit derselben Nummer teilen sich diese Sicht. `lsns` listet die Namespaces mit dem jeweils ältesten Prozess darin ([lsns(8)](https://man7.org/linux/man-pages/man8/lsns.8.html)):
+
+  ```console vm
+  $ readlink /proc/self/ns/pid /proc/self/ns/uts /proc/self/ns/mnt
+  pid:[4026531836]
+  uts:[4026531838]
+  mnt:[4026531841]
+  $ lsns | head -n 4
+          NS TYPE   NPROCS   PID USER COMMAND
+  4026531834 time        5   257 ops  /lib/systemd/systemd --user
+  4026531835 cgroup      5   257 ops  /lib/systemd/systemd --user
+  4026531836 pid         5   257 ops  /lib/systemd/systemd --user
+  ```
+
+  `unshare` startet ein Programm in neuen Namespaces. Mit eigenem PID-Namespace und frisch eingehängtem `/proc` sieht der Prozess nur noch sich selbst und ist dort PID 1, wie der Hauptprozess eines Containers. Ein eigener UTS-Namespace gibt ihm einen eigenen Hostnamen ([unshare(1)](https://man7.org/linux/man-pages/man1/unshare.1.html), [pid_namespaces(7)](https://man7.org/linux/man-pages/man7/pid_namespaces.7.html)):
+
+  ```console vm
+  $ sudo unshare --pid --fork --mount-proc ps -ef
+  UID        PID  PPID  C STIME TTY          TIME CMD
+  root         1     0 74 12:33 ?        00:00:00 ps -ef
+  $ sudo unshare --uts sh -c 'hostname box; hostname'
+  box
+  $ hostname
+  web01
+  ```
+
+  `--fork` ist nötig, weil erst ein Kindprozess im neuen PID-Namespace landet. `--mount-proc` hängt in einem eigenen Mount-Namespace ein neues `/proc` ein; ohne das zeigte `ps` weiter alle Prozesse des Hosts. Der Host behält seinen Hostnamen `web01`. Docker kombiniert für jeden Container diese und weitere Namespaces: Mount, Netzwerk, IPC und optional User.
+
+  Auch cgroups sind sichtbar. Jeder Prozess gehört zu genau einer cgroup in der Hierarchie unter `/sys/fs/cgroup`. systemd legt dort für jeden Dienst, jede Sitzung und jeden Scope eine eigene an:
+
+  ```console vm
+  $ cat /proc/self/cgroup
+  0::/user.slice/user-1000.slice/session-1.scope
+  $ systemctl show -p MemoryCurrent,MemoryMax,CPUQuotaPerSecUSec ssh
+  MemoryCurrent=4231168
+  CPUQuotaPerSecUSec=infinity
+  MemoryMax=infinity
+  ```
+
+  `0::` steht für die einheitliche Hierarchie von cgroup v2. Die Shell im Terminal läuft in der Sitzung von `ops`, sshd in `system.slice/ssh.service`, ohne Grenzen. `systemd-cgls` zeigt den ganzen Baum, `systemd-cgtop` den Verbrauch je cgroup, interaktiv wie `top`. `systemd-run --scope` startet ein Programm in einer neuen cgroup und setzt dort Grenzen ([systemd-run(1)](https://www.freedesktop.org/software/systemd/man/latest/systemd-run.html#--scope), [systemd.resource-control(5)](https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html#MemoryMax=bytes)):
+
+  ```console vm
+  $ sudo systemd-run --scope --unit=demo -p MemoryMax=16M sh -c 'cat /proc/self/cgroup; cat /sys/fs/cgroup/system.slice/demo.scope/memory.max'
+  Running scope as unit: demo.scope
+  0::/system.slice/demo.scope
+  16777216
+  ```
+
+  `MemoryMax=16M` steht als 16777216 Bytes in der Datei `memory.max` der neuen cgroup. Braucht die Gruppe mehr und lässt sich kein Speicher zurückgewinnen, beendet der OOM-Killer einen Prozess darin, und zwar nur darin. `tail /dev/zero` zeigt das: `/dev/zero` liefert endlos Nullbytes ohne Zeilenumbruch, also hält `tail` eine immer längere „letzte Zeile“ im Speicher.
+
+  ```console vm
+  $ sudo systemd-run --scope -p MemoryMax=16M tail /dev/zero
+  Running scope as unit: run-rfb0139acacbe4f10a43d931e098d7a0e.scope
+  Killed
+  $ sudo dmesg | tail -n 1
+  [   43.740969] Memory cgroup out of memory: Killed process 349 (tail) total-vm:18964kB, anon-rss:16128kB, file-rss:1156kB, shmem-rss:0kB, UID:0 pgtables:32kB oom_score_adj:0
+  ```
+
+  Bei 16 MiB war Schluss, der Rest der VM lief weiter. Ohne `MemoryMax` würde `tail` den ganzen Arbeitsspeicher füllen. Genau diese Dateien schreibt auch Docker: `docker run --memory=16m` setzt `memory.max` der Container-cgroup, `--cpus=0.5` setzt `cpu.max` auf `50000 100000`, also 50 ms Rechenzeit je 100 ms ([Docker · Resource constraints](https://docs.docker.com/engine/containers/resource_constraints/), [Kernel · cgroup v2, Memory](https://docs.kernel.org/admin-guide/cgroup-v2.html#memory-interface-files)).
+
+  Der dritte Baustein ist ein eigenes Wurzelverzeichnis. Das älteste Werkzeug dafür ist `chroot`. Ein Verzeichnis mit `busybox` und den Bibliotheken, die es braucht, reicht schon als winziges „Image“ ([chroot(2)](https://man7.org/linux/man-pages/man2/chroot.2.html)):
+
+  ```console vm
+  $ mkdir -p ~/box/bin
+  $ cp /bin/busybox ~/box/bin/
+  $ for lib in $(ldd /bin/busybox | grep -o '/lib[^ ]*'); do cp --parents "$lib" ~/box; done
+  $ find ~/box -type f | sort
+  /home/ops/box/bin/busybox
+  /home/ops/box/lib/i386-linux-gnu/libc.so.6
+  /home/ops/box/lib/i386-linux-gnu/libresolv.so.2
+  /home/ops/box/lib/ld-linux.so.2
+  $ sudo chroot ~/box /bin/busybox cat /etc/hostname
+  cat: can't open '/etc/hostname': No such file or directory
+  $ sudo chroot ~/box /bin/busybox ls /
+  bin  lib
+  ```
+
+  Für den Prozess ist `/home/ops/box` jetzt `/`, die Dateien des Hosts darüber existieren für ihn nicht. Ein Container-Image ist im Kern so ein Verzeichnisbaum, verpackt in Schichten. Die Runtime setzt die Schichten mit overlayfs zusammen, wechselt mit `pivot_root` hinein und kombiniert das mit Namespaces, cgroups, reduzierten Capabilities und einem seccomp-Filter. `chroot` allein ist keine Sicherheitsgrenze: Ein Prozess mit root-Rechten kann daraus ausbrechen.
 
   Die Trennung erleichtert Betrieb und Verpackung, ist aber keine absolute Sicherheitsgrenze. Ein privilegierter Container, weitreichende Host-Mounts oder Zugriff auf den Docker-Socket können große Hostrechte eröffnen. Root im Container und Root auf dem Host sind insbesondere ohne User-Namespace nicht sauber gleichzusetzen mit „harmlos isoliert“. Begrenze Rechte und Datenzugänge entsprechend dem Bedrohungsmodell.
 
@@ -206,6 +286,23 @@ exercises:
     resources:
       - title: namespaces(7)
         url: https://man7.org/linux/man-pages/man7/namespaces.7.html
+  - id: pid-eins
+    type: output
+    title: Wer ist hier PID 1?
+    prompt: Was gibt dieser Befehl im Debian der Lektion aus? `ps -e -o comm=` listet alle sichtbaren Prozesse, nur mit dem Befehlsnamen und ohne Kopfzeile.
+    lang: bash
+    code: |
+      sudo unshare --pid --fork --mount-proc sh -c 'echo $$; ps -e -o comm='
+    expected: |
+      1
+      sh
+      ps
+    verify: false
+    explanation: |
+      `unshare --pid --fork` startet `sh` als ersten Prozess eines neuen PID-Namespace, deshalb gibt `$$` die 1 aus. `--mount-proc` hängt ein neues `/proc` ein, das nur die Prozesse dieses Namespace kennt: die Shell und das gerade laufende `ps` als PID 2. Die übrigen Prozesse der VM laufen weiter, sie sind von innen nur unsichtbar. So sieht der Hauptprozess eines Containers aus: PID 1 in seinem Namespace, eine gewöhnliche PID auf dem Host.
+    resources:
+      - title: pid_namespaces(7)
+        url: https://man7.org/linux/man-pages/man7/pid_namespaces.7.html
   - id: port-argumente
     type: output
     title: Eine Veröffentlichung als Argumentliste
@@ -259,6 +356,27 @@ exercises:
     prompt: Zeige mit Docker die letzten 50 Logzeilen des Containers `learn-web`, ohne dauerhaft zu folgen.
     answers: ["docker logs --tail 50 learn-web", "docker container logs --tail 50 learn-web", "docker logs --tail=50 learn-web"]
     explanation: Eine begrenzte Logmenge liefert Startkontext ohne unüberschaubare Ausgabe. Sie enthält nur die vom Logging-Pfad erfassten Meldungen.
+  - id: speicher-scope
+    type: command
+    title: Ein Import mit Speichergrenze
+    prompt: Starte `./import.sh` aus dem aktuellen Verzeichnis als transiente Scope-Unit von systemd, die höchstens 256 MiB Arbeitsspeicher bekommt. Du brauchst dafür `sudo`.
+    answers:
+      - sudo systemd-run --scope -p MemoryMax=256M ./import.sh
+      - sudo systemd-run -p MemoryMax=256M --scope ./import.sh
+      - sudo systemd-run --scope --property=MemoryMax=256M ./import.sh
+      - sudo systemd-run --property=MemoryMax=256M --scope ./import.sh
+      - sudo systemd-run --scope --property MemoryMax=256M ./import.sh
+      - sudo systemd-run --property MemoryMax=256M --scope ./import.sh
+      - sudo systemd-run --scope -p MemoryMax=256M -- ./import.sh
+    output: |
+      Running scope as unit: run-r3f0c1e9a2b7d4c58a6e1f0b9d2c4a7e1.scope
+    explanation: |
+      `systemd-run --scope` legt eine neue cgroup an, verschiebt sich selbst hinein und startet dann `./import.sh` im Vordergrund, mit deinem Arbeitsverzeichnis und deiner Umgebung. `-p MemoryMax=256M` landet als 268435456 Bytes in `memory.max` dieser cgroup; systemd rechnet mit 1024er-Einheiten. Ohne `--scope` würde systemd eine Dienst-Unit anlegen, die PID 1 im Hintergrund startet. Docker setzt mit `docker run --memory=256m` dieselbe Grenze für die cgroup eines Containers.
+    resources:
+      - title: systemd-run(1) · --scope
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemd-run.html#--scope
+      - title: systemd.resource-control(5) · MemoryMax=
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html#MemoryMax=bytes
   - id: nicht-root
     type: gap
     title: Laufzeitidentität festlegen
@@ -312,6 +430,97 @@ exercises:
     resources:
       - title: Compose · Startup order
         url: https://docs.docker.com/compose/how-tos/startup-order/
+  - id: dienst-begrenzen
+    type: scenario
+    title: Die Grenze, die nicht greift
+    prompt: |
+      Ticket OPS-1432, zweiter Anlauf: Der Berichtsdienst `report-worker` hat vorletzte Nacht den Arbeitsspeicher von `web01` gefüllt, der OOM-Killer hat dabei `sshd` erwischt. Jan hat danach eine Speichergrenze für den Dienst eingetragen. Letzte Nacht stieg der Verbrauch trotzdem wieder ungebremst.
+
+      Sorge dafür, dass `report-worker` höchstens 64 MiB Arbeitsspeicher und höchstens 20 % einer CPU bekommt, also das, was `docker run --memory=64m --cpus=0.2` für einen Container täte. Die Grenzen sollen sofort für den laufenden Dienst gelten und dauerhaft bleiben. Die Unit-Datei unter `/lib/systemd/system/` stammt aus dem Paket und wird beim nächsten Update überschrieben. Der Dienst soll weiterlaufen.
+    setup: |
+      set -e
+      mkdir -p /var/lib/report-worker
+      cat > /usr/bin/report-worker <<'EOF'
+      #!/bin/sh
+      # report-worker 2.4.1: baut nachts die Monatsberichte, tagsüber nur ein Lebenszeichen
+      while :; do
+        date '+%F %T' > /var/lib/report-worker/heartbeat
+        sleep 10
+      done
+      EOF
+      chmod 755 /usr/bin/report-worker
+      cat > /lib/systemd/system/report-worker.service <<'EOF'
+      [Unit]
+      Description=Berichtsgenerator (report-worker)
+      After=network.target
+
+      [Service]
+      ExecStart=/usr/bin/report-worker
+      Restart=on-failure
+
+      [Install]
+      WantedBy=multi-user.target
+      EOF
+      mkdir -p /etc/systemd/system/report-worker.service.d
+      cat > /etc/systemd/system/report-worker.service.d/limits.conf <<'EOF'
+      # OPS-1432: report-worker hat nachts den Speicher gefüllt, Grenze gesetzt (jk)
+      [Unit]
+      MemoryMax=64M
+      EOF
+      ln -s /lib/systemd/system/report-worker.service /etc/systemd/system/multi-user.target.wants/report-worker.service
+      systemctl daemon-reload
+      systemctl start report-worker.service
+    checks:
+      - name: report-worker läuft und startet beim Boot
+        run: systemctl is-enabled report-worker && systemctl is-active report-worker
+      - name: Der laufende Dienst hat höchstens 64 MiB Arbeitsspeicher (memory.max)
+        run: |
+          m=$(cat /sys/fs/cgroup/system.slice/report-worker.service/memory.max 2>/dev/null)
+          echo "memory.max: ${m:-fehlt}"
+          [ -n "$m" ] && [ "$m" != max ] && [ "$m" -le 67108864 ]
+      - name: Der laufende Dienst hat höchstens 20 % einer CPU (cpu.max)
+        run: |
+          c=$(cat /sys/fs/cgroup/system.slice/report-worker.service/cpu.max 2>/dev/null)
+          echo "cpu.max: ${c:-fehlt, keine CPU-Grenze}"
+          q=${c%% *}; p=${c##* }
+          [ -n "$c" ] && [ "$q" != max ] && [ $((q * 100 / p)) -le 20 ]
+      - name: Beide Grenzen gelten auch nach daemon-reload und Neustart des Dienstes
+        run: |
+          systemctl daemon-reload && systemctl restart report-worker && sleep 1
+          cg=/sys/fs/cgroup/system.slice/report-worker.service
+          m=$(cat $cg/memory.max 2>/dev/null)
+          c=$(cat $cg/cpu.max 2>/dev/null)
+          echo "memory.max: ${m:-fehlt}, cpu.max: ${c:-fehlt}"
+          q=${c%% *}; p=${c##* }
+          [ -n "$m" ] && [ "$m" != max ] && [ "$m" -le 67108864 ] && [ -n "$c" ] && [ "$q" != max ] && [ $((q * 100 / p)) -le 20 ]
+    solution: |
+      # Was gilt gerade? MemoryMax=infinity, obwohl es ein Drop-in gibt
+      systemctl status report-worker --no-pager
+      systemctl show -p MemoryMax,CPUQuotaPerSecUSec report-worker
+      systemctl cat report-worker --no-pager
+      # PID 1 hat den Schlüssel beim Laden ignoriert, er steht im falschen Abschnitt:
+      journalctl -b --no-pager | grep 'report-worker.service.d'
+      # Ressourcengrenzen gehören nach [Service]; die CPU-Grenze kommt dazu
+      printf '[Service]\nMemoryMax=64M\nCPUQuota=20%%\n' | sudo tee /etc/systemd/system/report-worker.service.d/limits.conf
+      sudo systemctl daemon-reload
+      # daemon-reload überträgt die Werte sofort in die cgroup des laufenden Dienstes
+      systemctl show -p MemoryMax,CPUQuotaPerSecUSec report-worker
+      cat /sys/fs/cgroup/system.slice/report-worker.service/memory.max /sys/fs/cgroup/system.slice/report-worker.service/cpu.max
+    hints:
+      - "Was gilt gerade? `systemctl show -p MemoryMax,CPUQuotaPerSecUSec report-worker` zeigt die Werte, die systemd tatsächlich verwendet."
+      - "`systemctl cat report-worker` zeigt Unit und Drop-ins zusammen. Was PID 1 beim Laden ignoriert hat, steht im Journal: `journalctl -b | grep report-worker`."
+      - "Ressourcengrenzen regeln, wie der Prozess läuft, und gehören in den Abschnitt `[Service]`. Danach `sudo systemctl daemon-reload` und ein Blick nach `/sys/fs/cgroup/system.slice/report-worker.service/`."
+    explanation: |
+      Jans Drop-in lag am richtigen Ort, aber `MemoryMax=` stand im Abschnitt `[Unit]`. Dort kennt systemd den Schlüssel nicht, ignoriert ihn und meldet das nur beim Laden im Journal: „Unknown key 'MemoryMax' in section [Unit], ignoring.“ `systemctl show` zeigt es sofort mit `MemoryMax=infinity`. Im Abschnitt `[Service]` schreibt systemd `MemoryMax=64M` als 67108864 in `memory.max` der cgroup und `CPUQuota=20%` als `20000 100000` in `cpu.max`, also 20 ms Rechenzeit je 100 ms. Nach `daemon-reload` gelten die Werte sofort, ein Neustart des Dienstes ist nicht nötig.
+
+      `sudo systemctl set-property report-worker MemoryMax=64M CPUQuota=20%` wäre ebenso richtig: Es legt eigene Drop-ins unter `/etc/systemd/system.control/` an und wendet sie gleich an. Docker macht mit `--memory` und `--cpus` dasselbe für die cgroup eines Containers.
+    resources:
+      - title: systemd.resource-control(5) · MemoryMax=
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html#MemoryMax=bytes
+      - title: systemd.resource-control(5) · CPUQuota=
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html#CPUQuota=
+      - title: Kernel · cgroup v2, CPU
+        url: https://docs.kernel.org/admin-guide/cgroup-v2.html#cpu-interface-files
   - id: web-container
     type: practice
     title: Eine kleine Website reproduzierbar ausliefern

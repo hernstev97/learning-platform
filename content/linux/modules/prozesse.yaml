@@ -1,14 +1,14 @@
 id: prozesse
 title: Prozesse & Signale
 level: 2
-minutes: 150
+minutes: 190
 summary: Wie Linux Programme als Prozesse ausführt, wie du sie beobachtest, steuerst und sauber beendest – und warum `kill -9` der letzte Ausweg ist.
 goals:
   - Du erklärst den Unterschied zwischen Programm und Prozess und das Zusammenspiel von `fork`, `exec` und `wait`.
   - Du liest `ps`, den Kopf von `top`, die Load Average und `free` richtig und erkennst, ob CPU, Platte oder Speicher der Engpass ist.
-  - Du beendest Prozesse mit dem passenden Signal und begründest, warum `SIGKILL` der letzte Ausweg ist.
+  - Du beendest Prozesse mit dem passenden Signal, begründest, warum `SIGKILL` der letzte Ausweg ist, und erkennst an `/proc/<pid>/status`, welche Signale ein Prozess ignoriert.
   - Du steuerst Jobs mit `&`, `jobs`, `fg` und `bg` und weißt, warum dauerhafte Dienste in systemd gehören.
-  - Du nutzt Exit-Codes und `/proc/<pid>` für die Fehlersuche und gehst mit Zombies richtig um.
+  - Du findest heraus, welcher Prozess einen Port belegt und wer ihn gestartet hat, nutzt Exit-Codes und `/proc/<pid>` für die Fehlersuche und gehst mit Zombies richtig um.
 resources:
   - title: signal(7) – Überblick über Signale
     url: https://man7.org/linux/man-pages/man7/signal.7.html
@@ -18,10 +18,47 @@ resources:
     url: https://man7.org/linux/man-pages/man5/proc.5.html
   - title: Bash Reference Manual · Job Control
     url: https://www.gnu.org/software/bash/manual/html_node/Job-Control-Basics.html
+  - title: ss(8) – Sockets und ihre Prozesse anzeigen
+    url: https://man7.org/linux/man-pages/man8/ss.8.html
+lab: |
+  set -e
+  # queue-worker: fängt SIGHUP und SIGTERM ab und schreibt jedes Signal nach ~/queue-worker.log
+  cat > /usr/local/bin/queue-worker <<'EOF'
+  #!/bin/bash
+  # Demo-Worker: arbeitet Aufträge ab und meldet jedes Signal in ~/queue-worker.log
+  exec >>/home/ops/queue-worker.log 2>&1
+  trap 'echo "SIGHUP: lese die Konfiguration neu"' HUP
+  trap 'echo "SIGTERM: Auftrag gesichert, beende mich"; exit 0' TERM
+  echo "queue-worker gestartet, PID $$"
+  while :; do sleep 5 & wait $!; done
+  EOF
+  # thumbnailer: zwei Worker-Kinder, zwei fertige Jobs, deren Exit-Status niemand abholt, und ein gelöschtes Log
+  cat > /usr/local/bin/thumbnailer <<'EOF'
+  #!/usr/bin/perl
+  # Demo: Elternprozess mit zwei Workern und zwei Jobs, die er nie mit wait() abholt
+  open(my $log, '>>', '/home/ops/thumbnailer.log') or die $!;
+  $log->autoflush(1);
+  print $log "thumbnailer gestartet, PID $$\n";
+  for (1 .. 2) { if (!fork) { sleep 3600 while 1 } }
+  for (1 .. 2) { fork or exit 0 }
+  sleep 3600 while 1;
+  EOF
+  chmod 755 /usr/local/bin/queue-worker /usr/local/bin/thumbnailer
+  for name in queue-worker thumbnailer; do
+    printf '[Unit]\nDescription=Demo %s\n\n[Service]\nUser=ops\nExecStart=/usr/local/bin/%s\n' "$name" "$name" > "/etc/systemd/system/$name.service"
+  done
+  printf '2026-09-28 10:00:01 INFO  Server gestartet\n2026-09-28 10:00:07 WARN  Cache kalt\n' > /home/ops/app.log
+  chown ops:ops /home/ops/app.log
+  systemctl daemon-reload
+  systemctl start queue-worker thumbnailer
+  until [ -s /home/ops/thumbnailer.log ] && [ "$(pgrep -c thumbnailer)" -ge 5 ]; do sleep 0.2; done
+  rm /home/ops/thumbnailer.log
 lesson: |
   Du startest mit `npm run dev` einen Entwicklungsserver, schließt versehentlich das Terminal-Tab, und beim nächsten Start meldet der Server `EADDRINUSE: address already in use :::5173`. Oder ein Test-Runner hängt, `Strg+C` bewirkt nichts, und im Team-Chat schreibt jemand „mach halt `kill -9`“. In beiden Fällen brauchst du dasselbe Wissen: Was ist ein Prozess, wie findest du ihn, und wie beendest du ihn so, dass nichts kaputtgeht?
 
   Dieses Modul baut das Denkmodell dafür auf. Danach liest du `ps` und `top` wie jemand aus dem Betrieb, unterscheidest `SIGTERM` von `SIGKILL` und kannst begründen, warum ein Dienst nicht mit `nohup … &` auf einem Server laufen sollte.
+
+  Die Beispiele mit „Im Terminal“ kannst du direkt ausprobieren. Im Debian der Lektion laufen dafür zwei Demo-Dienste: `queue-worker` protokolliert jedes Signal, das er bekommt, und `thumbnailer` hat Kindprozesse, um die er sich nicht kümmert.
 
   ## Lebenszyklus: fork, exec, exit, wait
 
@@ -34,20 +71,20 @@ lesson: |
 
   Tippst du `python3 app.py`, forkt die Shell, das Kind lädt per `execve` Python, und die Shell wartet mit [`wait()`](https://man7.org/linux/man-pages/man2/wait.2.html), bis das Kind fertig ist. Daraus folgt eine Regel, die viele Rätsel erklärt: **Ein Kind erbt eine Kopie der Umgebung, kann aber die seines Elternprozesses nie ändern.** Ein Skript, das `cd /srv` oder `export DEBUG=1` ausführt, verändert deshalb nicht deine Shell. Genau darum ist `cd` ein Shell-Builtin und kein eigenes Programm.
 
-  ```console
+  ```console vm
   $ echo $$
-  48211
+  267
   $ bash -c 'echo "Ich bin $$, mein Elternprozess ist $PPID"'
-  Ich bin 48530, mein Elternprozess ist 48211
+  Ich bin 412, mein Elternprozess ist 267
   $ pstree -p -s $$
-  systemd(1)───systemd(1432)───kitty(2210)───fish(2215)───bash(48211)───pstree(48533)
+  systemd(1)---login(237)---bash(267)---pstree(413)
   ```
 
-  `$$` ist die PID der aktuellen Shell, `$PPID` die ihres Elternprozesses. Folgst du der Kette nach oben, landest du immer bei PID 1 – auf fast allen aktuellen Distributionen ist das systemd.
+  `$$` ist die PID der aktuellen Shell, `$PPID` die ihres Elternprozesses. Folgst du der Kette nach oben, landest du immer bei PID 1 – auf fast allen aktuellen Distributionen ist das systemd. Im Terminal der Lektion hat `login` deine Shell gestartet, weil du an der seriellen Konsole angemeldet bist; auf deinem Desktop stehen dort Terminal-Emulator und Benutzer-systemd.
 
   Wenn ein Prozess endet, hinterlässt er einen **Exit-Status** zwischen 0 und 255. `0` bedeutet Erfolg, alles andere einen Fehler; was genau, legt das Programm fest. Die Shell speichert den Status des letzten Befehls in `$?`:
 
-  ```console
+  ```console vm
   $ grep -q "ERROR" app.log
   $ echo $?
   1
@@ -56,7 +93,7 @@ lesson: |
   $ echo $?
   2
   $ gibtsnicht
-  bash: gibtsnicht: command not found
+  -bash: gibtsnicht: command not found
   $ echo $?
   127
   ```
@@ -64,6 +101,23 @@ lesson: |
   `grep` liefert `1`, wenn nichts gefunden wurde, und `2` bei echten Fehlern. `127` heißt „Befehl nicht gefunden“, `126` „gefunden, aber nicht ausführbar“. Stirbt ein Prozess an einem Signal, meldet die Shell `128 + Signalnummer` ([Bash Manual · Exit Status](https://www.gnu.org/software/bash/manual/html_node/Exit-Status.html)). Auf Exit-Codes bauen `&&`, `||`, `if` in Skripten und jede CI-Pipeline auf.
 
   Zwischen dem Ende des Kindes und dem `wait()` des Elternprozesses liegt ein Zwischenzustand: Der Kernel hebt PID und Exit-Status auf, bis jemand sie abholt. So lange ist der Prozess ein **Zombie** (Zustand `Z`, in `ps` als `<defunct>`). Er belegt keinen Speicher und keine CPU mehr, aber einen Eintrag in der Prozesstabelle. Kurzlebige Zombies sind normal. Hunderte Zombies desselben Elternprozesses bedeuten einen Bug: Der Elternprozess ruft nie `wait()` auf. Beenden kannst du einen Zombie nicht – er ist schon tot. Stirbt aber sein Elternprozess, übernimmt PID 1 (oder der nächste sogenannte *Subreaper*, zum Beispiel `systemd --user`) die Kinder und räumt die Zombies ab ([wait(2), Abschnitt NOTES](https://man7.org/linux/man-pages/man2/wait.2.html#NOTES)).
+
+  Der Demo-Dienst `thumbnailer` zeigt beides: zwei Worker, die schlafen, und zwei Jobs, die längst fertig sind, deren Exit-Status aber niemand abgeholt hat. `-C` wählt Prozesse nach Namen aus, `pgrep -o` liefert den ältesten Treffer, hier den Elternprozess:
+
+  ```console vm
+  $ ps -o pid,ppid,stat,cmd -C thumbnailer
+    PID  PPID STAT CMD
+    353     1 Ss   /usr/bin/perl /usr/local/bin/thumbnailer
+    360   353 S    /usr/bin/perl /usr/local/bin/thumbnailer
+    361   353 S    /usr/bin/perl /usr/local/bin/thumbnailer
+    362   353 Z    [thumbnailer] <defunct>
+    363   353 Z    [thumbnailer] <defunct>
+  $ pstree -p $(pgrep -o thumbnailer)
+  thumbnailer(353)-+-thumbnailer(360)
+                   |-thumbnailer(361)
+                   |-thumbnailer(362)
+                   `-thumbnailer(363)
+  ```
 
   Das Gegenstück ist der **Waisenprozess** (orphan): ein Kind, das noch läuft, obwohl sein Elternprozess beendet ist. Das ist kein Fehler. Der Kernel hängt es an PID 1 oder einen Subreaper, und die Arbeit geht weiter.
 
@@ -77,25 +131,28 @@ lesson: |
 
   [`ps`](https://man7.org/linux/man-pages/man1/ps.1.html) macht eine Momentaufnahme. Zwei Schreibweisen haben sich gehalten, beide zeigen alle Prozesse:
 
-  ```console
+  ```console vm
   $ ps aux | head -3
-  USER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
-  root           1  0.0  0.0  22660 16864 ?        Ss   06:02   0:05 /usr/lib/systemd/systemd --switched-root --system
-  root           2  0.0  0.0      0     0 ?        S    06:02   0:00 [kthreadd]
+  USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
+  root         1 22.0  4.3  38640 10576 ?        Ss   12:02   0:09 /sbin/init
+  root         2  0.0  0.0      0     0 ?        S    12:02   0:00 [kthreadd]
   $ ps -ef | head -3
-  UID          PID    PPID  C STIME TTY          TIME CMD
-  root           1       0  0 06:02 ?        00:00:05 /usr/lib/systemd/systemd --switched-root --system
-  root           2       0  0 06:02 ?        00:00:00 [kthreadd]
+  UID        PID  PPID  C STIME TTY          TIME CMD
+  root         1     0 21 12:02 ?        00:00:09 /sbin/init
+  root         2     0  0 12:02 ?        00:00:00 [kthreadd]
   ```
 
-  `ps aux` (BSD-Syntax, ohne Bindestrich) zeigt CPU- und Speicheranteil, `RSS` (tatsächlich belegter Arbeitsspeicher in KiB) und den Zustand `STAT`. `ps -ef` (POSIX-Syntax) zeigt dafür die `PPID`. Einträge in eckigen Klammern sind Kernel-Threads. Bei der Fehlersuche wählst du die Spalten besser selbst: `-e` für alle Prozesse, `-o` für die Spalten, `--sort` für die Reihenfolge (Minus = absteigend).
+  `ps aux` (BSD-Syntax, ohne Bindestrich) zeigt CPU- und Speicheranteil, `RSS` (tatsächlich belegter Arbeitsspeicher in KiB) und den Zustand `STAT`. `ps -ef` (POSIX-Syntax) zeigt dafür die `PPID`. Einträge in eckigen Klammern sind Kernel-Threads. PID 1 heißt auf Debian `/sbin/init`, ein symbolischer Link auf systemd. Bei der Fehlersuche wählst du die Spalten besser selbst: `-e` für alle Prozesse, `-o` für die Spalten, `--sort` für die Reihenfolge (Minus = absteigend).
 
-  ```console
-  $ ps -eo pid,ppid,user,stat,rss,cmd --sort=-rss | head -3
-      PID    PPID USER     STAT   RSS CMD
-     3310    2210 steven   Sl   2140332 /usr/lib/firefox/firefox
-     2231       1 app      Sl    88412 /srv/app/.venv/bin/python /srv/app/.venv/bin/gunicorn app:server
+  ```console vm
+  $ ps -eo pid,ppid,user,stat,rss,cmd --sort=-rss | head -4
+    PID  PPID USER     STAT   RSS CMD
+    168     1 root     Ss   11352 /lib/systemd/systemd-journald
+      1     0 root     Ss   10576 /sbin/init
+    257     1 ops      Ss    8724 /lib/systemd/systemd --user
   ```
+
+  Auf einem Entwicklerrechner steht hier eher der Browser mit 2 GB, auf einem Server die Anwendung. In der kleinen VM mit 237 MiB RAM führt das Journal.
 
   Die wichtigsten Zustände in der Spalte `STAT` ([ps(1), PROCESS STATE CODES](https://man7.org/linux/man-pages/man1/ps.1.html#PROCESS_STATE_CODES)):
 
@@ -109,18 +166,34 @@ lesson: |
 
   Dahinter können Zusatzzeichen stehen: `s` (Sitzungsleiter), `l` (mehrere Threads), `+` (Vordergrund-Prozessgruppe eines Terminals), `N` bzw. `<` (niedrige bzw. hohe Priorität). `Sl` heißt also: schläft, hat mehrere Threads.
 
-  Nach Namen suchst du mit [`pgrep`](https://man7.org/linux/man-pages/man1/pgrep.1.html): `pgrep -a nginx` zeigt PID und Kommandozeile aller Prozesse, deren **Name** passt; mit `-f` durchsucht `pgrep` die **ganze Kommandozeile**. Das ist wichtig, weil der Name eines Node- oder Python-Programms `node` bzw. `python3` lautet, nicht der des Skripts.
+  Nach Namen suchst du mit [`pgrep`](https://man7.org/linux/man-pages/man1/pgrep.1.html): `pgrep -a nginx` zeigt PID und Kommandozeile aller Prozesse, deren **Name** passt; mit `-f` durchsucht `pgrep` die **ganze Kommandozeile**. Das ist wichtig, weil der Name eines Programms, das du als `python3 app.py` oder `node server.js` startest, `python3` bzw. `node` lautet, nicht der des Skripts. Startest du ein Skript dagegen direkt über seine `#!`-Zeile, trägt der Prozess den Namen der Skriptdatei:
 
-  [`top`](https://man7.org/linux/man-pages/man1/top.1.html) aktualisiert sich laufend (`htop` ist komfortabler, muss aber meist nachinstalliert werden). Wichtiger als die Prozessliste ist der Kopf:
-
-  ```console
-  $ top -bn1 | head -5
-  top - 14:43:56 up  8:41,  1 user,  load average: 1.31, 1.68, 1.56
-  Tasks: 646 total,   3 running, 639 sleep,   0 d-sleep,   0 stopped,   4 zombie
-  %Cpu(s):  5.6 us,  2.8 sy,  0.6 ni, 90.0 id,  0.6 wa,  0.2 hi,  0.4 si,  0.0 st
-  MiB Mem :  64044.4 total,   7167.2 free,  11635.1 used,  47381.6 buff/cache
-  MiB Swap:  64044.0 total,  64041.8 free,      2.2 used.  52409.3 avail Mem
+  ```console vm
+  $ pgrep -a queue-worker
+  352 /bin/bash /usr/local/bin/queue-worker
+  $ pgrep -a bash
+  267 -bash
+  $ pgrep -af /usr/local/bin
+  352 /bin/bash /usr/local/bin/queue-worker
+  353 /usr/bin/perl /usr/local/bin/thumbnailer
+  360 /usr/bin/perl /usr/local/bin/thumbnailer
+  361 /usr/bin/perl /usr/local/bin/thumbnailer
   ```
+
+  `queue-worker` ist ein Bash-Skript, trotzdem findet `pgrep -a bash` nur deine Login-Shell (`-bash`). `pgrep -af` dagegen trifft alles, was `/usr/local/bin` irgendwo in der Kommandozeile hat. Die Zombies fehlen in dieser Liste: Sie haben keine Kommandozeile mehr, und für solche Prozesse vergleicht `pgrep -f` nur den Namen.
+
+  [`top`](https://man7.org/linux/man-pages/man1/top.1.html) aktualisiert sich laufend (`htop` ist komfortabler, muss aber meist nachinstalliert werden; in der VM ist es installiert). Wichtiger als die Prozessliste ist der Kopf. `-b` schaltet auf Textausgabe, `-n1` beendet `top` nach einer Runde:
+
+  ```console vm
+  $ top -bn1 | head -5
+  top - 12:03:07 up 0 min,  1 user,  load average: 2.17, 0.56, 0.19
+  Tasks:  79 total,   1 running,  76 sleeping,   0 stopped,   2 zombie
+  %Cpu(s): 33.3 us, 50.0 sy,  0.0 ni, 16.7 id,  0.0 wa,  0.0 hi,  0.0 si,  0.0 st
+  MiB Mem :    237.9 total,    171.0 free,     35.0 used,     40.7 buff/cache
+  MiB Swap:      0.0 total,      0.0 free,      0.0 used.    202.9 avail Mem
+  ```
+
+  Die zwei Zombies in der Zeile `Tasks` sind die von `thumbnailer`.
 
   In der CPU-Zeile bedeuten `us` Zeit in Programmen, `sy` Zeit im Kernel, `ni` Programme mit erhöhtem Nice-Wert, `id` Leerlauf, `wa` Leerlauf *während auf I/O gewartet wird*, `hi`/`si` Interrupts und `st` („steal“) Zeit, die der Hypervisor einer VM entzogen hat ([top(1), SUMMARY Display](https://man7.org/linux/man-pages/man1/top.1.html#2._SUMMARY_Display)).
 
@@ -132,16 +205,29 @@ lesson: |
   - Hoher Load heißt nicht automatisch „CPU am Limit“. Ist `wa` hoch und hängen viele Prozesse in `D`, wartet das System auf Platte oder Netzwerkspeicher. Mehr CPU hilft dann nicht.
   - Die Reihenfolge zeigt den Trend: `6.10, 3.20, 0.90` heißt, die Last ist in den letzten Minuten gestiegen; `0.90, 3.20, 6.10` heißt, sie klingt ab.
 
-  `uptime` zeigt dieselben drei Zahlen. Für den Speicher nimmst du [`free -h`](https://man7.org/linux/man-pages/man1/free.1.html):
+  `uptime` zeigt dieselben drei Zahlen, `/proc/loadavg` liefert sie roh: dahinter die Zahl der gerade lauffähigen und aller Prozesse und Threads sowie die zuletzt vergebene PID ([proc_loadavg(5)](https://man7.org/linux/man-pages/man5/proc_loadavg.5.html)).
 
-  ```console
-  $ free -h
-                 total        used        free      shared  buff/cache   available
-  Mem:            62Gi        11Gi       7.0Gi       1.2Gi        46Gi        51Gi
-  Swap:           62Gi       2.2Mi        62Gi
+  ```console vm
+  $ cat /proc/loadavg
+  2.17 0.56 0.19 1/78 386
+  $ uptime
+   12:03:07 up 0 min,  1 user,  load average: 2.17, 0.56, 0.19
+  $ nproc
+  1
   ```
 
-  Linux nutzt ungenutzten Arbeitsspeicher als Cache für Dateien (`buff/cache`) und gibt ihn sofort ab, wenn Programme Speicher brauchen. Aussagekräftig ist deshalb `available`: die Schätzung, wie viel Speicher neue Programme bekommen können, ohne dass das System swappen muss. Wenig `free` bei viel `available` ist gesund.
+  Die VM hat einen einzigen Kern. Load 2,17 heißt dort: Im Mittel der letzten Minute wollten gut zwei Prozesse rechnen, einer kam dran, der Rest wartete. Die 15-Minuten-Zahl ist so klein, weil die VM erst seit Kurzem läuft und der Mittelwert beim Booten bei 0 beginnt. Deine Werte im Terminal sehen anders aus; die Lesart bleibt.
+
+  Für den Speicher nimmst du [`free -h`](https://man7.org/linux/man-pages/man1/free.1.html):
+
+  ```console vm
+  $ free -h
+                 total        used        free      shared  buff/cache   available
+  Mem:           237Mi        34Mi       170Mi       244Ki        40Mi       202Mi
+  Swap:             0B          0B          0B
+  ```
+
+  Linux nutzt ungenutzten Arbeitsspeicher als Cache für Dateien (`buff/cache`) und gibt ihn sofort ab, wenn Programme Speicher brauchen. Aussagekräftig ist deshalb `available`: die Schätzung, wie viel Speicher neue Programme bekommen können, ohne dass das System swappen muss. In der frisch gestarteten VM ist der Cache noch fast leer. Auf einer Workstation mit 64 GB, die seit Stunden läuft, sieht dieselbe Zeile eher so aus: 7 GiB `free`, 46 GiB `buff/cache`, 51 GiB `available`. Wenig `free` bei viel `available` ist gesund. Die VM hat außerdem keinen Swap (`0B`): Wird der Speicher knapp, greift dort sofort der OOM-Killer.
 
   > [!MERKE]
   > Load Average = Prozesse in `R` plus Prozesse in `D`, gemittelt – immer im Verhältnis zu `nproc` lesen. Beim Speicher zählt `available`, nicht `free`.
@@ -173,9 +259,29 @@ lesson: |
 
   Warum ist `SIGTERM` der Standard und `SIGKILL` der letzte Ausweg? Bei `SIGTERM` darf das Programm aufräumen: laufende Anfragen zu Ende bearbeiten, Puffer auf die Platte schreiben, Datenbanktransaktionen abschließen, Lock- und PID-Dateien löschen, Kindprozesse beenden. `SIGKILL` entfernt den Prozess, ohne dass er noch eine einzige Zeile Code ausführt. Die Folgen sind halb geschriebene Dateien, verwaiste Lock-Dateien, abgebrochene Uploads und Kindprozesse, die herrenlos weiterlaufen.
 
-  Die richtige Reihenfolge lautet deshalb: `SIGTERM` schicken, einige Sekunden warten, erst dann `SIGKILL`. systemd macht beim Stoppen eines Dienstes genau das – erst das Signal aus `KillSignal=` (Standard `SIGTERM`), nach Ablauf von `TimeoutStopSec=` (Standard 90 Sekunden) `SIGKILL` ([systemd.kill(5)](https://www.freedesktop.org/software/systemd/man/latest/systemd.kill.html)).
+  Die richtige Reihenfolge lautet deshalb: `SIGTERM` schicken, einige Sekunden warten, erst dann `SIGKILL`. systemd macht beim Stoppen eines Dienstes genau das – erst das Signal aus `KillSignal=` (Standard `SIGTERM`), nach Ablauf von `TimeoutStopSec=` (Standard 90 Sekunden) `SIGKILL`. Mit der Standardeinstellung `KillMode=control-group` gehen beide Signale an alle Prozesse der Unit, nicht nur an den Hauptprozess ([systemd.kill(5)](https://www.freedesktop.org/software/systemd/man/latest/systemd.kill.html)). Hängt `systemctl stop` anderthalb Minuten und steht danach `State 'stop-sigterm' timed out. Killing.` im Journal, hat der Dienst `SIGTERM` nicht befolgt.
 
   `SIGHUP` hat eine Doppelrolle. Ursprünglich meldete es „die Leitung zum Terminal ist weg“ und beendet deshalb standardmäßig. Viele Daemons ohne Terminal – nginx, sshd, rsyslog – fangen es ab und lesen stattdessen ihre Konfiguration neu ein. Ein Blick in die Doku des Programms klärt, was es mit `SIGHUP` macht.
+
+  ### Abfangen, ignorieren, vererben
+
+  Für jedes Signal legt ein Prozess fest, was passiert: die Standardwirkung, ignorieren oder eine eigene Funktion, den Handler. In Bash setzt du einen Handler mit `trap`. Der Demo-Dienst `queue-worker` fängt `SIGHUP` und `SIGTERM` ab und schreibt jedes Signal in sein Log. Welche Signale ein Prozess abfängt (`SigCgt`, „caught“) und welche er ignoriert (`SigIgn`), steht in `/proc/<pid>/status`:
+
+  ```console vm
+  $ grep -E '^Sig(Ign|Cgt)' /proc/$(pgrep queue-worker)/status
+  SigIgn:  0000000000001004
+  SigCgt:  0000000000014003
+  $ kill -HUP $(pgrep queue-worker)
+  $ kill $(pgrep queue-worker)
+  $ sleep 1; cat ~/queue-worker.log
+  queue-worker gestartet, PID 352
+  SIGHUP: lese die Konfiguration neu
+  SIGTERM: Auftrag gesichert, beende mich
+  ```
+
+  Die Masken sind Hexadezimalzahlen, in denen Bit *n* − 1 für Signal *n* steht ([proc_pid_status(5)](https://man7.org/linux/man-pages/man5/proc_pid_status.5.html)). In `SigCgt` = `0x14003` sind die Bits 0, 1, 14 und 16 gesetzt, also die Signale 1 (`HUP`), 2 (`INT`), 15 (`TERM`) und 17 (`CHLD`); `INT` und `CHLD` fängt Bash von sich aus ab. `SigIgn` = `0x1004` sind die Bits 2 und 12: `SIGQUIT`, das Bash immer ignoriert, und `SIGPIPE`, das systemd für Dienste ignorieren lässt (`IgnoreSIGPIPE=`). Nummer und Name übersetzt `kill -l 15` (Ausgabe `TERM`).
+
+  Für die Fehlersuche zählt, was bei `fork` und `execve` mit diesen Einstellungen passiert ([signal(7)](https://man7.org/linux/man-pages/man7/signal.7.html#DESCRIPTION)): Bei `fork` erbt das Kind alle. Bei `execve` setzt der Kernel **abgefangene** Signale auf die Standardwirkung zurück, denn der Handler gehörte zum alten Programm. **Ignorierte** Signale bleiben ignoriert. Genau so arbeitet `nohup`: Es setzt `SIGHUP` auf „ignorieren“ und ersetzt sich dann per `execve` durch deinen Befehl. Die Kehrseite: Ein Startskript mit `trap '' TERM` vererbt das Ignorieren an alles, was es startet. Ist das gestartete Programm eine Bash, hilft auch deren eigenes `trap … TERM` nicht mehr, denn eine nicht interaktive Bash kann Signale, die schon beim Start ignoriert waren, weder abfangen noch zurücksetzen ([bash(1), SHELL BUILTIN COMMANDS, `trap`](https://man7.org/linux/man-pages/man1/bash.1.html#SHELL_BUILTIN_COMMANDS)). In `/proc/<pid>/status` siehst du das sofort: Das `TERM`-Bit `0x4000` steht in `SigIgn` statt in `SigCgt`.
 
   > [!INTERVIEW] „Was ist der Unterschied zwischen kill und kill -9?“
   > `kill` schickt `SIGTERM`: Der Prozess kann das Signal abfangen, aufräumen und sich selbst beenden. `kill -9` schickt `SIGKILL`: Der Kernel entfernt den Prozess sofort, ohne dass dieser reagieren kann – offene Daten gehen verloren, Lock-Dateien bleiben liegen. Deshalb erst `SIGTERM`, ein paar Sekunden warten, dann `SIGKILL`, so wie systemd es beim Stoppen tut. Ergänzung, die Eindruck macht: Ein Prozess im Zustand `D` und ein Zombie reagieren auch auf `SIGKILL` nicht. Und der Exit-Code 137 (128 + 9) in einem Container-Log verrät, dass der Prozess hart getötet wurde, oft vom OOM-Killer.
@@ -217,45 +323,109 @@ lesson: |
   ```
 
   > [!PRAXIS] Der Port ist noch belegt
-  > `EADDRINUSE` nach einem geschlossenen Tab heißt meist: Der alte Dev-Server lebt noch, zum Beispiel weil er per `disown` oder aus einem IDE-Terminal gestartet wurde. Finde ihn mit `pgrep -af vite` (oder mit `ss -ltnp`, das den Port dem Prozess zuordnet – mehr im Netzwerk-Modul) und beende ihn mit `kill <pid>`. Wenn du das oft tust, gehört der Server in einen `tmux`-Pane oder in ein `docker compose`-Setup mit klarem Lebenszyklus.
+  > `EADDRINUSE` nach einem geschlossenen Tab heißt meist: Der alte Dev-Server lebt noch, zum Beispiel weil er per `disown` oder aus einem IDE-Terminal gestartet wurde. Finde ihn mit `pgrep -af vite` oder über den Port (nächster Abschnitt) und beende ihn mit `kill <pid>`. Wenn du das oft tust, gehört der Server in einen `tmux`-Pane oder in ein `docker compose`-Setup mit klarem Lebenszyklus.
+
+  ## Wer hält den Port, und wer hat ihn gestartet?
+
+  Meldet ein Dienst `Address already in use`, sitzt schon ein anderer Prozess auf dem Port. Drei Werkzeuge ordnen Port und Prozess einander zu: [`ss`](https://man7.org/linux/man-pages/man8/ss.8.html) aus iproute2, [`lsof`](https://man7.org/linux/man-pages/man8/lsof.8.html) und [`fuser`](https://man7.org/linux/man-pages/man1/fuser.1.html) aus psmisc. Am Beispiel von sshd auf Port 22:
+
+  ```console vm
+  $ ss -ltnp 'sport = :22'
+  State  Recv-Q Send-Q Local Address:Port Peer Address:PortProcess
+  LISTEN 0      0            0.0.0.0:22        0.0.0.0:*
+  LISTEN 0      0                  *:22              *:*
+  $ sudo ss -ltnp 'sport = :22'
+  State  Recv-Q Send-Q Local Address:Port Peer Address:PortProcess
+  LISTEN 0      0            0.0.0.0:22        0.0.0.0:*    users:(("sshd",pid=238,fd=3))
+  LISTEN 0      0                  *:22              *:*    users:(("sshd",pid=238,fd=4))
+  $ sudo fuser -v 22/tcp
+                       USER        PID ACCESS COMMAND
+  22/tcp:              root        238 F.... sshd
+  $ ps -o pid,ppid,user,unit,cmd -C sshd
+    PID  PPID USER     UNIT                            CMD
+    238     1 root     ssh.service                     sshd: /usr/sbin/sshd -D [listener] 0 of 10-100 startups
+  ```
+
+  `-l` zeigt lauschende Sockets, `-t` nur TCP, `-n` Zahlen statt Dienstnamen, `-p` den Prozess. Ohne root fehlt die Spalte `Process` bei fremden Prozessen: `ss` müsste dafür in deren `/proc/<pid>/fd` schauen, und das darf nur der Besitzer. Eine leere Spalte heißt also nicht „kein Prozess“, sondern „nicht deiner“. `sudo lsof -i :22` liefert dasselbe in anderer Form.
+
+  Bevor du den Prozess beendest, klärst du, wer ihn gestartet hat. Die Spalte `unit` von `ps` (oder `systemctl status <pid>`) nennt die systemd-Unit: `ssh.service` ist ein Dienst, den du mit `systemctl` steuerst. Steht dort `session-5.scope`, hat jemand den Prozess in einer Anmeldesitzung von Hand gestartet. Und die `PPID` verrät, ob ein Elternprozess ihn nach einem `kill` sofort wieder startet, etwa eine Schleife in einem Skript. Vorsicht mit `fuser -k`: Ohne Signalangabe schickt es `SIGKILL`.
 
   ## Werkzeugkasten: nice, renice und /proc
 
-  **Priorität.** Jeder Prozess hat einen Nice-Wert von -20 (höchste Priorität) bis 19 (niedrigste), Standard 0. Je „netter“ ein Prozess ist, desto weniger CPU-Zeit bekommt er, *wenn* andere Prozesse um die CPU konkurrieren. Normale Benutzer dürfen den Wert nur erhöhen; senken darf nur root ([nice(1)](https://man7.org/linux/man-pages/man1/nice.1.html), [renice(1)](https://man7.org/linux/man-pages/man1/renice.1.html)). Der Nice-Wert wirkt nur auf die CPU-Verteilung, nicht auf Platten-I/O – dafür gibt es `ionice`.
+  **Priorität.** Jeder Prozess hat einen Nice-Wert von -20 (höchste Priorität) bis 19 (niedrigste), Standard 0. Je „netter“ ein Prozess ist, desto weniger CPU-Zeit bekommt er, *wenn* andere Prozesse um die CPU konkurrieren. Normale Benutzer dürfen den Wert nur erhöhen; senken darf nur root ([nice(1)](https://man7.org/linux/man-pages/man1/nice.1.html), [renice(1)](https://man7.org/linux/man-pages/man1/renice.1.html)). Der Nice-Wert wirkt nur auf die CPU-Verteilung, nicht auf Platten-I/O – dafür gibt es `ionice`. Typisch ist `nice -n 19 tar -czf backup.tar.gz ~/projekte` für ein Backup, das die Arbeit am Rechner nicht ausbremsen soll.
 
-  ```console
-  $ nice -n 19 tar -czf backup.tar.gz ~/projekte
-  $ renice -n 10 -p 4242
-  4242 (process ID) old priority 0, new priority 10
+  ```console vm
+  $ nice -n 19 ps -o pid,ni,cmd
+    PID  NI CMD
+    267   0 -bash
+    405  19 ps -o pid,ni,cmd
+  $ renice -n 10 -p $(pgrep -o thumbnailer)
+  353 (process ID) old priority 0, new priority 10
+  $ ps -o pid,ni,stat,cmd -p $(pgrep -o thumbnailer)
+    PID  NI STAT CMD
+    353  10 SNs  /usr/bin/perl /usr/local/bin/thumbnailer
+  ```
+
+  Das `N` in `SNs` markiert den erhöhten Nice-Wert. Zurück auf 0 darf `ops` ihn nicht setzen:
+
+  ```console vm fails
+  $ renice -n 0 -p $(pgrep -o thumbnailer)
+  renice: failed to set priority for 353 (process ID): Permission denied
   ```
 
   **Das /proc-Dateisystem.** Unter `/proc/<pid>/` stellt der Kernel alles über einen Prozess als Dateien bereit ([proc(5)](https://man7.org/linux/man-pages/man5/proc.5.html)). `ps` und `top` lesen genau diese Dateien. Wenn du wissen willst, was ein Prozess gerade tut, schau direkt hinein:
 
-  ```console
-  $ grep -E '^(Name|State|PPid|Threads|VmRSS)' /proc/2231/status
-  Name:   gunicorn
+  ```console vm
+  $ pid=$(pgrep -o thumbnailer)
+  $ grep -E '^(Name|State|PPid|Threads|VmRSS)' /proc/$pid/status
+  Name:   thumbnailer
   State:  S (sleeping)
   PPid:   1
+  VmRSS:      5832 kB
   Threads:        1
-  VmRSS:     88412 kB
-  $ tr '\0' ' ' < /proc/2231/cmdline; echo
-  /srv/app/.venv/bin/python /srv/app/.venv/bin/gunicorn app:server
-  $ ls -l /proc/2231/fd
-  lr-x------ 1 app app 64 Sep 28 10:02 0 -> /dev/null
-  l-wx------ 1 app app 64 Sep 28 10:02 1 -> /var/log/app/gunicorn.log
-  l-wx------ 1 app app 64 Sep 28 10:02 2 -> /var/log/app/gunicorn.log
-  lrwx------ 1 app app 64 Sep 28 10:02 5 -> socket:[48213]
-  $ readlink /proc/2231/cwd
-  /srv/app
+  $ tr '\0' ' ' < /proc/$pid/cmdline; echo
+  /usr/bin/perl /usr/local/bin/thumbnailer
+  $ ls -l /proc/$pid/fd
+  total 0
+  lr-x------ 1 ops ops 64 Oct  1 12:03 0 -> /dev/null
+  lrwx------ 1 ops ops 64 Oct  1 12:03 1 -> socket:[13736]
+  lrwx------ 1 ops ops 64 Oct  1 12:03 2 -> socket:[13736]
+  l-wx------ 1 ops ops 64 Oct  1 12:03 3 -> /home/ops/thumbnailer.log (deleted)
+  $ readlink /proc/$pid/cwd /proc/$pid/exe
+  /
+  /usr/bin/perl
   ```
 
-  - [`status`](https://man7.org/linux/man-pages/man5/proc_pid_status.5.html) fasst Zustand, Elternprozess, Threads und Speicher lesbar zusammen.
+  - [`status`](https://man7.org/linux/man-pages/man5/proc_pid_status.5.html) fasst Zustand, Elternprozess, Threads und Speicher lesbar zusammen, dazu die Signalmasken aus dem Abschnitt über Signale.
   - [`cmdline`](https://man7.org/linux/man-pages/man5/proc_pid_cmdline.5.html) enthält die Argumente, getrennt durch Nullbytes – daher `tr '\0' ' '`.
-  - [`fd/`](https://man7.org/linux/man-pages/man5/proc_pid_fd.5.html) enthält für jeden offenen Dateideskriptor einen symbolischen Link: Dateien, Pipes, Sockets. So findest du heraus, wohin ein Prozess loggt.
-  - `cwd` und `exe` zeigen Arbeitsverzeichnis und Programmdatei; `environ` die Umgebungsvariablen (nur für Besitzer und root lesbar).
+  - [`fd/`](https://man7.org/linux/man-pages/man5/proc_pid_fd.5.html) enthält für jeden offenen Dateideskriptor einen symbolischen Link: Dateien, Pipes, Sockets. So findest du heraus, wohin ein Prozess loggt. Bei `thumbnailer` zeigen stdout und stderr auf einen Socket: systemd leitet beides ins Journal.
+  - `cwd` und `exe` zeigen Arbeitsverzeichnis und Programmdatei; `environ` die Umgebungsvariablen (nur für Besitzer und root lesbar). `exe` ist hier Perl, nicht das Skript.
 
   > [!PRAXIS] Die Platte ist voll, obwohl du das Log gelöscht hast
-  > Löschst du eine große Logdatei, die ein Prozess noch offen hält, entfernt `rm` nur den Namen. Der Speicherplatz wird erst frei, wenn der letzte Dateideskriptor geschlossen ist. In `ls -l /proc/<pid>/fd` steht dann `/var/log/app.log (deleted)`. Abhilfe: den Prozess neu starten oder ihn per Signal die Logdatei neu öffnen lassen – und künftig die Datei mit `truncate -s 0` leeren statt löschen oder `logrotate` einsetzen.
+  > Löschst du eine große Logdatei, die ein Prozess noch offen hält, entfernt `rm` nur den Namen. Der Speicherplatz wird erst frei, wenn der letzte Dateideskriptor geschlossen ist. In `ls -l /proc/<pid>/fd` steht dann `… (deleted)`, wie oben bei `thumbnailer.log`. `lsof +L1` listet alle offenen Dateien ohne Namen im Dateisystem auf einmal. Abhilfe: den Prozess neu starten oder ihn per Signal die Logdatei neu öffnen lassen – und künftig die Datei mit `truncate -s 0` leeren statt löschen oder `logrotate` einsetzen.
+
+  ```console vm
+  $ lsof +L1
+  COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NLINK  NODE NAME
+  thumbnail 353  ops    3w   REG   0,22       31     0 13100 /home/ops/thumbnailer.log (deleted)
+  thumbnail 360  ops    3w   REG   0,22       31     0 13100 /home/ops/thumbnailer.log (deleted)
+  thumbnail 361  ops    3w   REG   0,22       31     0 13100 /home/ops/thumbnailer.log (deleted)
+  ```
+
+  Die beiden Worker haben den Dateideskriptor bei `fork` geerbt. Erst wenn alle drei Prozesse ihn schließen, gibt das Dateisystem den Platz frei.
+
+  **Zurück zu den Zombies.** Zum Schluss räumst du `thumbnailer` ab. `kill -9` auf die Zombies selbst läuft ohne Fehler durch und bewirkt nichts. Erst wenn der Elternprozess endet, übernimmt PID 1 die Zombies und holt ihren Status ab:
+
+  ```console vm
+  $ kill -9 $(ps -eo pid=,stat= | awk '$2 ~ /^Z/ {print $1}')
+  $ ps -eo pid,ppid,stat,cmd | awk '$3 ~ /^Z/'
+    362   353 Z    [thumbnailer] <defunct>
+    363   353 Z    [thumbnailer] <defunct>
+  $ kill $(pgrep -o thumbnailer)
+  $ sleep 1; ps -eo pid,ppid,stat,cmd | awk '$3 ~ /^Z/'
+  ```
+
+  Die letzte Ausgabe ist leer. Weil `thumbnailer` ein systemd-Dienst ist, hat systemd beim Ende des Hauptprozesses auch die beiden Worker beendet.
 
   ## Häufige Fehler
 
@@ -266,6 +436,8 @@ lesson: |
   - **Load Average ohne Kernzahl bewerten** und hohen Load automatisch für ein CPU-Problem halten, obwohl `wa` hoch ist.
   - **„Nur noch 300 MB frei!“** Die Spalte `free` ist kein Alarmsignal; `available` ist die relevante Zahl.
   - **Dienste mit `nohup`, `screen` oder `&` betreiben.** Kein Neustart, keine Logs im Journal, nach dem Reboot weg.
+  - **Den Prozess auf dem Port beenden, ohne nach dem Elternprozess zu sehen.** Startet ihn eine Schleife oder ein Dienst mit `Restart=` neu, ist der Port zwei Sekunden später wieder belegt. Erst `ps -o pid,ppid,unit -p <pid>`, dann beenden, was ihn startet.
+  - **`trap '' TERM` in einem Startskript.** Ignorierte Signale überleben `execve`, das gestartete Programm reagiert nicht mehr auf `SIGTERM`, und jeder `systemctl stop` endet nach `TimeoutStopSec=` mit `SIGKILL`. Erkennbar am gesetzten Bit `0x4000` in `SigIgn`.
 
   ## Zusammenfassung
 
@@ -273,10 +445,10 @@ lesson: |
   - Exit-Status `0` heißt Erfolg; `127` Befehl nicht gefunden; `128 + n` Tod durch Signal `n` (130, 137, 143).
   - `ps -eo …`, `pgrep -af` und `pstree -p` zeigen, was läuft; `top` zeigt Load, CPU-Aufteilung und Speicher.
   - Load Average zählt `R`- und `D`-Prozesse und ist nur im Verhältnis zu `nproc` aussagekräftig; beim Speicher zählt `available`.
-  - Erst `SIGTERM` (Aufräumen möglich), dann nach einer Wartezeit `SIGKILL` (kein Aufräumen). `SIGHUP` lässt viele Daemons ihre Konfiguration neu laden.
+  - Erst `SIGTERM` (Aufräumen möglich), dann nach einer Wartezeit `SIGKILL` (kein Aufräumen). `SIGHUP` lässt viele Daemons ihre Konfiguration neu laden. Ignorierte Signale überleben `execve`; `SigIgn` und `SigCgt` in `/proc/<pid>/status` zeigen, was ein Prozess ignoriert oder abfängt.
   - Zombies sind tote Prozesse, deren Status niemand abgeholt hat – behandelt wird der Elternprozess. Waisen werden von PID 1 oder einem Subreaper übernommen.
   - Job Control (`&`, `Strg+Z`, `bg`, `fg`, `jobs`) ist fürs interaktive Arbeiten da; dauerhafte Dienste gehören in systemd.
-  - `/proc/<pid>/status`, `cmdline`, `fd` und `cwd` beantworten die meisten Fragen zu einem laufenden Prozess.
+  - `/proc/<pid>/status`, `cmdline`, `fd` und `cwd` beantworten die meisten Fragen zu einem laufenden Prozess. Wer einen Port hält, zeigen `sudo ss -ltnp`, `lsof -i` und `fuser`; wer ihn gestartet hat, `ps -o ppid,unit`.
 exercises:
   - id: fork-exec-aussagen
     type: choice
@@ -426,6 +598,31 @@ exercises:
         url: https://man7.org/linux/man-pages/man7/signal.7.html#DESCRIPTION
       - title: Bash Manual · Signals
         url: https://www.gnu.org/software/bash/manual/html_node/Signals.html
+
+  - id: signal-erbe
+    type: output
+    title: Zweimal derselbe Handler
+    prompt: |
+      Beide inneren Shells setzen denselben `trap` für `SIGTERM` und schicken sich dann selbst `SIGTERM`. Dazwischen ändert das äußere Skript eine Zeile. Was steht auf stdout?
+    lang: bash
+    code: |
+      bash -c 'trap "echo A: abgefangen; exit 0" TERM; kill -TERM $$; echo "A: läuft weiter"'
+      trap '' TERM
+      bash -c 'trap "echo B: abgefangen; exit 0" TERM; kill -TERM $$; echo "B: läuft weiter"'
+    expected: |
+      A: abgefangen
+      B: läuft weiter
+    verify: true
+    explanation: |
+      Shell A startet mit der Standardwirkung für `SIGTERM`, ihr `trap` greift, sie meldet sich und endet mit `exit 0`. Vor Shell B setzt das äußere Skript `SIGTERM` mit `trap ''` auf „ignorieren“. Diese Einstellung erbt das Kind bei `fork` und behält sie über `execve` hinweg, denn nur abgefangene Signale setzt der Kernel dort zurück. Eine nicht interaktive Bash kann Signale, die beim Start schon ignoriert waren, weder abfangen noch zurücksetzen: Ihr `trap` bleibt wirkungslos, das Signal verpufft, und B läuft weiter. Genau so arbeitet `nohup` mit `SIGHUP` – und genau so macht ein Startskript mit `trap '' TERM` einen Dienst taub für `systemctl stop`.
+    hints:
+      - Was passiert bei `execve` mit Signalen, die abgefangen werden, und was mit ignorierten?
+      - Die Bash-Doku zu `trap` sagt etwas über Signale, die schon „upon entry to the shell“ ignoriert sind.
+    resources:
+      - title: signal(7) – Signal dispositions
+        url: https://man7.org/linux/man-pages/man7/signal.7.html#DESCRIPTION
+      - title: bash(1) – SHELL BUILTIN COMMANDS (trap)
+        url: https://man7.org/linux/man-pages/man1/bash.1.html#SHELL_BUILTIN_COMMANDS
 
   - id: ps-spalten
     type: command
@@ -651,7 +848,7 @@ exercises:
     type: practice
     title: Prozess-Detektiv
     prompt: |
-      Arbeite in einer Bash (tippe `bash`, wenn du in fish bist) und verfolge einen Prozess durch seinen Lebenszyklus:
+      Arbeite in einer Bash (tippe `bash`, wenn du in fish bist) und verfolge einen Prozess durch seinen Lebenszyklus. Das Terminal der Lektion eignet sich dafür genauso wie dein eigener Rechner. In der VM führt die Kette in `pstree` über `login` statt über deinen Terminal-Emulator.
 
       1. Starte `sleep 600` im Vordergrund und halte ihn mit `Strg+Z` an. Prüfe mit `ps`, in welchem Zustand er ist.
       2. Setze ihn mit `bg` im Hintergrund fort und prüfe den Zustand erneut.
@@ -705,3 +902,189 @@ exercises:
         url: https://www.gnu.org/software/bash/manual/html_node/Job-Control-Builtins.html
       - title: systemd-run(1)
         url: https://www.freedesktop.org/software/systemd/man/latest/systemd-run.html
+
+  - id: api-startet-nicht
+    type: scenario
+    title: Die neue Version startet nicht
+    prompt: |
+      Heute früh wurde Version 2.4.0 der Lagerbestand-API auf `web01` ausgerollt: `inventory-api.service`, aktiviert, Port 8080. Der Dienst steht aber auf `failed`, und `curl http://localhost:8080/version` antwortet trotzdem – mit `2.3.1`. Als Dienst ist 2.3.1 nirgends mehr eingerichtet.
+
+      Bring 2.4.0 als Dienst zum Laufen. Danach soll von 2.3.1 nichts mehr laufen. Du bist als `ops` angemeldet und hast `sudo`.
+    setup: |
+      set -e
+      useradd --system --no-create-home --shell /usr/sbin/nologin inventory
+      for v in 2.3.1 2.4.0; do
+        install -d /opt/inventory/$v/bin /opt/inventory/$v/www
+        echo "$v" > /opt/inventory/$v/www/version
+        echo ok > /opt/inventory/$v/www/health
+        printf '#!/bin/sh\n# Lagerbestand-API %s\nexec busybox httpd -f -p 8080 -h /opt/inventory/%s/www\n' "$v" "$v" > /opt/inventory/$v/bin/inventory-api
+        chmod 755 /opt/inventory/$v/bin/inventory-api
+      done
+      cat > /opt/inventory/2.3.1/keepalive.sh <<'EOF'
+      #!/bin/bash
+      # Testlauf von 2.3.1: startet die API neu, falls sie stirbt
+      while true; do
+        /opt/inventory/2.3.1/bin/inventory-api
+        echo "$(date '+%F %T') inventory-api beendet (Status $?), Neustart in 2 s"
+        sleep 2
+      done
+      EOF
+      chmod 755 /opt/inventory/2.3.1/keepalive.sh
+      cat > /etc/systemd/system/inventory-api.service <<'EOF'
+      [Unit]
+      Description=Lagerbestand-API
+
+      [Service]
+      User=inventory
+      ExecStart=/opt/inventory/2.4.0/bin/inventory-api
+
+      [Install]
+      WantedBy=multi-user.target
+      EOF
+      # Gestern Abend von Hand gestartet: als root, mit nohup, in einer längst geschlossenen Sitzung
+      runuser -l root -c 'nohup /opt/inventory/2.3.1/keepalive.sh >>/var/log/inventory-test.log 2>&1 </dev/null &'
+      until ss -ltnH 'sport = :8080' | grep -q .; do sleep 0.2; done
+      systemctl daemon-reload
+      systemctl enable --quiet inventory-api
+      systemctl start inventory-api
+    checks:
+      - name: inventory-api.service ist aktiv
+        run: systemctl is-active inventory-api
+      - name: Port 8080 gehört zu inventory-api.service
+        run: |
+          pid=$(ss -ltnpH 'sport = :8080' | grep -o 'pid=[0-9]*' | head -n1 | cut -d= -f2)
+          if [ -z "$pid" ]; then echo "Auf Port 8080 lauscht kein Prozess."; exit 1; fi
+          grep -q '/inventory-api.service$' "/proc/$pid/cgroup" || { echo "Port 8080 gehört einem Prozess außerhalb von inventory-api.service."; exit 1; }
+      - name: Die API meldet Version 2.4.0
+        run: test "$(curl -fsS --max-time 5 http://localhost:8080/version)" = 2.4.0
+      - name: Von 2.3.1 läuft kein Prozess mehr
+        run: |
+          if pgrep -f /opt/inventory/2.3.1 >/dev/null; then echo "Es laufen noch Prozesse von 2.3.1."; exit 1; fi
+    solution: |
+      # Der Dienst ist gescheitert. Warum?
+      systemctl status inventory-api --no-pager
+      journalctl -u inventory-api -n 5 --no-pager
+      # „httpd: bind: Address already in use“: Wer hält Port 8080? Ohne sudo bleibt die Spalte Process leer.
+      ss -ltnp 'sport = :8080'
+      sudo ss -ltnp 'sport = :8080'
+      pid=$(sudo fuser 8080/tcp 2>/dev/null | tr -d ' ')
+      # root, gestartet in einer Anmeldesitzung (session-….scope), nicht von systemd als Dienst
+      ps -o pid,ppid,user,unit,cmd -p "$pid"
+      # Der Elternprozess ist eine Neustart-Schleife. Erst sie beenden, sonst ist 2.3.1 nach 2 Sekunden zurück.
+      ppid=$(ps -o ppid= -p "$pid" | tr -d ' ')
+      ps -o pid,ppid,user,cmd -p "$ppid"
+      sudo kill "$ppid"
+      sudo kill "$pid"
+      sleep 1
+      pgrep -af /opt/inventory/2.3.1 || echo "von 2.3.1 läuft nichts mehr"
+      sudo systemctl start inventory-api
+      curl -fsS http://localhost:8080/version
+    hints:
+      - "`systemctl status inventory-api` und `journalctl -u inventory-api` sagen dir, warum der Dienst nicht läuft."
+      - "Wer lauscht auf Port 8080? `ss -ltnp` zeigt fremde Prozesse nur mit `sudo`; alternativ `sudo fuser -v 8080/tcp` oder `sudo lsof -i :8080`."
+      - "Ist der Port zwei Sekunden nach deinem `kill` wieder belegt? Sieh dir mit `ps -o pid,ppid,user,unit,cmd -p <pid>` den Elternprozess an und beende zuerst ihn."
+    explanation: |
+      Der Fehler hat drei Schichten. Der Dienst scheitert mit `httpd: bind: Address already in use`: Port 8080 ist belegt. Den Port hält ein Prozess von root, den `ss -ltnp` ohne `sudo` nicht zuordnen kann; `ps -o unit` zeigt `session-c1.scope`, also einen Start von Hand in einer Anmeldesitzung, keinen Dienst. Sein Elternprozess ist `keepalive.sh`, eine Schleife, die die alte Version nach jedem Ende neu startet. Wer nur die PID auf dem Port beendet, sieht 2.3.1 zwei Sekunden später wieder. Deshalb zuerst den Elternprozess beenden, dann das Kind, beides mit `SIGTERM`, und erst dann den Dienst starten.
+
+      Ein belegter Port ist ein Symptom. Vor dem `kill` stehen drei Fragen: Wer hält ihn (`ss -p`, `fuser`, `lsof -i`)? Wer hat ihn gestartet (`PPID`, `unit`)? Und kommt er von selbst zurück?
+    resources:
+      - title: ss(8)
+        url: https://man7.org/linux/man-pages/man8/ss.8.html
+      - title: fuser(1)
+        url: https://man7.org/linux/man-pages/man1/fuser.1.html
+      - title: ps(1) – STANDARD FORMAT SPECIFIERS
+        url: https://man7.org/linux/man-pages/man1/ps.1.html#STANDARD_FORMAT_SPECIFIERS
+
+  - id: neustart-haengt
+    type: scenario
+    title: Ein Neustart, der eine halbe Minute dauert
+    prompt: |
+      Das Deployment des Report-Workers hängt schon wieder: `sudo systemctl restart report-worker` kehrt erst nach einer halben Minute zurück, und danach fehlen im Export Daten. Der Worker soll beim Stoppen seinen Zwischenstand sichern und schreibt dann `SIGTERM empfangen, Zwischenstand gesichert` ins Journal. Diese Zeile kam seit dem letzten Release nie mehr. Das Entwicklerteam sagt, am Worker selbst habe sich nichts geändert.
+
+      Finde heraus, warum der Worker beim Stoppen nicht aufräumt, und repariere es: `systemctl restart report-worker` soll in wenigen Sekunden durchlaufen, und der Worker soll dabei seinen Zwischenstand sichern. Den Timeout zu verkürzen oder den Worker hart zu beenden, löst das Problem nicht.
+    setup: |
+      set -e
+      useradd --system --no-create-home --shell /usr/sbin/nologin reporting
+      install -d /opt/reporting/bin
+      cat > /opt/reporting/bin/report-worker <<'EOF'
+      #!/bin/bash
+      # Report-Worker: arbeitet die Export-Queue ab.
+      # Bei SIGTERM sichert er den Zwischenstand und beendet sich sauber.
+      trap 'echo "SIGTERM empfangen, Zwischenstand gesichert"; exit 0' TERM
+      echo "report-worker bereit, PID $$"
+      while true; do
+        sleep 5 &
+        wait $!
+      done
+      EOF
+      cat > /opt/reporting/bin/start-worker <<'EOF'
+      #!/bin/bash
+      # Startet den Report-Worker.
+      # Ein Abbruch mitten im Export hinterlässt halbe Dateien,
+      # deshalb soll uns weder Strg+C noch kill stören.
+      trap '' INT TERM
+      exec /opt/reporting/bin/report-worker
+      EOF
+      chmod 755 /opt/reporting/bin/report-worker /opt/reporting/bin/start-worker
+      cat > /etc/systemd/system/report-worker.service <<'EOF'
+      [Unit]
+      Description=Report-Worker (Export-Queue)
+
+      [Service]
+      User=reporting
+      ExecStart=/opt/reporting/bin/start-worker
+      TimeoutStopSec=30
+
+      [Install]
+      WantedBy=multi-user.target
+      EOF
+      systemctl daemon-reload
+      systemctl enable --quiet --now report-worker
+      # Das aktuelle Deployment: Der Neustart hängt gerade.
+      systemctl restart --no-block report-worker
+    checks:
+      - name: report-worker läuft
+        run: systemctl is-active report-worker
+      - name: Ein Neustart dauert weniger als 10 Sekunden
+        run: timeout 10 systemctl restart report-worker || { echo "systemctl restart report-worker braucht länger als 10 Sekunden."; exit 1; }
+      - name: Beim Neustart sichert der Worker seinen Zwischenstand
+        run: |
+          t=$(date +%s); sleep 1
+          timeout 10 systemctl restart report-worker
+          sleep 1
+          journalctl -u report-worker --since "@$t" -o cat | grep -q 'Zwischenstand gesichert' || { echo "Beim Neustart fehlt die Zeile „Zwischenstand gesichert“ im Journal."; exit 1; }
+    solution: |
+      # Der Dienst hängt im Stoppen: „deactivating (stop-sigterm)“
+      systemctl status report-worker --no-pager
+      journalctl -u report-worker -n 20 --no-pager
+      # Fängt der Hauptprozess SIGTERM ab? SigIgn = ignoriert, SigCgt = abgefangen
+      pid=$(systemctl show -p MainPID --value report-worker)
+      grep -E '^(Name|SigIgn|SigCgt)' /proc/$pid/status
+      # SigIgn 0x5006 enthält 0x4000 (Signal 15): TERM wird ignoriert, obwohl der Worker einen trap dafür hat.
+      systemctl cat report-worker --no-pager
+      cat /opt/reporting/bin/start-worker
+      # Das Startskript ignoriert INT und TERM und vererbt das per exec an den Worker.
+      sudo sed -i "/^trap '' INT TERM$/d" /opt/reporting/bin/start-worker
+      # Der laufende Prozess bleibt taub. Statt 30 Sekunden zu warten, ein letztes Mal hart beenden:
+      sudo systemctl kill --signal=KILL report-worker
+      sudo systemctl restart report-worker
+      sleep 1
+      grep -E '^Sig(Ign|Cgt)' /proc/$(systemctl show -p MainPID --value report-worker)/status
+      # Jetzt mit sauberem Stopp
+      time sudo systemctl restart report-worker
+      journalctl -u report-worker -n 5 --no-pager -o cat
+    hints:
+      - "`systemctl status report-worker` und `journalctl -u report-worker` zeigen, in welchem Zustand der Dienst hängt und wie systemd ihn am Ende beendet."
+      - "Fängt der Hauptprozess `SIGTERM` überhaupt ab? Sieh in `/proc/<pid>/status` nach `SigIgn` und `SigCgt`; die PID liefert `systemctl show -p MainPID --value report-worker`. Das Bit `0x4000` steht für Signal 15."
+      - "Der Worker hat einen `trap` für `TERM`, trotzdem ist das Signal ignoriert. Wer startet ihn? `systemctl cat report-worker` zeigt `ExecStart=`, und ignorierte Signale überleben `exec`."
+    explanation: |
+      systemd schickt beim Stoppen `SIGTERM`, wartet `TimeoutStopSec=` (hier 30 Sekunden) und schickt dann `SIGKILL`. Der Worker räumt nur auf, wenn sein `trap` für `TERM` greift. Das tut er nicht: `ExecStart=` zeigt auf `start-worker`, und dieses Skript setzt mit `trap '' INT TERM` beide Signale auf „ignorieren“, bevor es sich per `exec` durch den Worker ersetzt. Ignorierte Signale bleiben über `execve` ignoriert, und eine nicht interaktive Bash kann Signale, die beim Start schon ignoriert waren, nicht mehr abfangen. Deshalb steht das TERM-Bit in `SigIgn` (`0x5006`) und nicht in `SigCgt`. Ohne die Zeile im Startskript fängt der Worker `TERM` ab (`SigCgt` `0x14002`), sichert und endet in Sekundenbruchteilen.
+
+      `TimeoutStopSec=1` oder `KillSignal=SIGKILL` hätten das Warten verkürzt, aber den Datenverlust festgeschrieben. Wer verhindern will, dass ein Programm mitten in der Arbeit stirbt, fängt `SIGTERM` ab und beendet sich geordnet, statt das Signal zu ignorieren.
+    resources:
+      - title: signal(7) – Signal dispositions
+        url: https://man7.org/linux/man-pages/man7/signal.7.html#DESCRIPTION
+      - title: systemd.kill(5)
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemd.kill.html
+      - title: proc_pid_status(5)
+        url: https://man7.org/linux/man-pages/man5/proc_pid_status.5.html

@@ -28,7 +28,9 @@ const lesson: Page<{ name: 'lesson'; area: string; module: string }> = async (ma
         <p class="module-lead">${module.summary}</p>
         <div class="module-actions">
           <a class="btn primary" href="/${summary.id}/${module.id}/${firstOpen + 1}">${done ? `Übungen fortsetzen (${done}/${module.exercises.length})` : 'Direkt zu den Übungen'} ${raw(icons.arrow)}</a>
+          ${module.vm || module.lab ? html`<button type="button" class="btn" id="open-terminal">${raw(icons.play)} Linux-Terminal öffnen</button>` : ''}
         </div>
+        ${module.vm || module.lab ? html`<p class="module-terminal-note small">Die Beispiele mit „Im Terminal“ laufen in einem echten Debian im Browser, ohne Netzwerk. Probier sie aus und ändere sie.</p>` : ''}
       </div>
     </header>
     <div class="lesson-layout page">
@@ -85,7 +87,14 @@ const lesson: Page<{ name: 'lesson'; area: string; module: string }> = async (ma
   // Close the mobile contents before the jump so the target position is measured without it.
   const mobileToc = $<HTMLDetailsElement>('.toc-mobile', main);
   mobileToc.addEventListener('click', (event) => { if ((event.target as Element).closest('a')) mobileToc.open = false; });
-  const cleanCode = enhanceCode(main);
+  // The terminal (src/vm/dock.ts) and Linux itself load only when the learner asks for them.
+  let dock: Promise<import('../vm/dock.ts').Dock> | null = null;
+  const terminal = (commands?: string) => {
+    dock ??= import('../vm/dock.ts').then(({ createDock }) => createDock(module.lab));
+    void dock.then((d) => (commands === undefined ? d.open() : d.run(commands)));
+  };
+  main.querySelector('#open-terminal')?.addEventListener('click', () => terminal());
+  const cleanCode = enhanceCode(main, module.vm || module.lab ? terminal : undefined);
   const cleanNote = bindNote(main, summary.id, module.id);
   const unsubscribe = onProgressChange(() => {
     $<HTMLInputElement>('#read', main).checked = !!progress.read[module.id];
@@ -99,7 +108,7 @@ const lesson: Page<{ name: 'lesson'; area: string; module: string }> = async (ma
     const next = Math.max(0, module.exercises.findIndex((e) => !isDone(progress, e)));
     main.querySelectorAll<HTMLAnchorElement>('.module-actions a, .exercise-overview > a').forEach((a) => { a.href = `/${summary.id}/${module.id}/${next + 1}`; });
   });
-  return () => { observer.disconnect(); cleanCode(); cleanNote(); unsubscribe(); };
+  return () => { observer.disconnect(); cleanCode(); cleanNote(); unsubscribe(); void dock?.then((d) => d.dispose()); };
 };
 
 /** The editor keeps what is typed; a note changed elsewhere replaces it only while there are no own edits. */

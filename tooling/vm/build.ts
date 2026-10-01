@@ -1,10 +1,11 @@
 // pnpm vm:build – builds the Linux image for scenario exercises into vendor/vm/<image>/ (committed, like the
 // Pyodide wheels in vendor/pyodide). Steps:
-// 1. Docker builds the root filesystem from tooling/vm/Dockerfile and exports it as a tar.
-// 2. The v86 tools (tooling/vm/v86) turn it into one zstd file per file, which the browser fetches only when the VM
-//    reads it, plus a file table (fs.json) that only this boot needs: the snapshot carries its own.
-// 3. v86 boots the system under Node, waits for lp-agent and the login prompt and saves the state, so the
-//    browser starts in seconds instead of booting.
+// 1. Docker builds the root filesystem and the boot disk (GRUB, /boot) from tooling/vm/Dockerfile.
+// 2. The v86 tools (tooling/vm/v86) turn the root filesystem into one zstd file per file, which the browser fetches
+//    only when the VM reads it, plus a file table (fs.json) that only this boot needs: the snapshot carries its own.
+// 3. v86 boots the system under Node from the disk, lets update-grub replace the hand-written grub.cfg, reboots to
+//    prove that the generated one boots, waits for lp-agent and the login prompt and saves the state. The state
+//    includes the disk, so the browser starts in seconds and a reboot inside the VM goes through GRUB again.
 // Needs docker with buildx, python3 (3.14, or the zstandard module) and zstd. Takes a few minutes.
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
@@ -13,7 +14,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { V86 } from 'v86';
 import { AgentChannel } from '../../src/vm/channel.ts';
-import { VM_IMAGE, vmOptions } from '../../src/vm/config.ts';
+import { VM_DISK_SIZE, VM_IMAGE, vmOptions } from '../../src/vm/config.ts';
 import { ROOT } from '../content.ts';
 
 const HERE = join(ROOT, 'tooling/vm');
@@ -36,8 +37,11 @@ const work = mkdtempSync(join(tmpdir(), 'lp-vm-'));
 const tar = join(work, 'rootfs.tar');
 const fsJson = join(work, 'fs.json');
 try {
-  step('Root-Dateisystem mit Docker bauen');
+  step('Root-Dateisystem und Bootplatte mit Docker bauen');
+  run('docker', ['buildx', 'build', '--platform', 'linux/386', '--target', 'disk-image', '--output', `type=local,dest=${work}`, HERE]);
   run('docker', ['buildx', 'build', '--platform', 'linux/386', '--output', `type=tar,dest=${tar}`, HERE]);
+  const disk = readFileSync(join(work, 'disk.img'));
+  if (disk.byteLength !== VM_DISK_SIZE) throw new Error(`Die Bootplatte hat ${disk.byteLength} Byte statt ${VM_DISK_SIZE}.`);
 
   step(`Dateien nach ${OUT.replace(`${ROOT}/`, '')} schreiben`);
   rmSync(OUT, { recursive: true, force: true });
@@ -47,7 +51,7 @@ try {
   for (const bios of ['seabios.bin', 'vgabios.bin']) writeFileSync(join(OUT, bios), readFileSync(join(HERE, 'v86', bios)));
 
   step('System in v86 booten und Zustand speichern');
-  const state = await boot();
+  const state = await boot(disk.buffer.slice(disk.byteOffset, disk.byteOffset + disk.byteLength));
   const raw = join(work, 'state.bin');
   writeFileSync(raw, new Uint8Array(state));
   run('zstd', ['-19', '-q', '-f', raw, '-o', join(OUT, 'state.bin.zst')]);
@@ -62,6 +66,7 @@ try {
     files: files.length,
     filesBytes: total,
     stateBytes: bytes(join(OUT, 'state.bin.zst')),
+    diskBytes: VM_DISK_SIZE,
   };
   writeFileSync(join(OUT, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
   const mb = (n: number) => `${(n / 1024 / 1024).toFixed(1)} MB`;
@@ -70,7 +75,7 @@ try {
   rmSync(work, { recursive: true, force: true });
 }
 
-async function boot(): Promise<ArrayBuffer> {
+async function boot(disk: ArrayBuffer): Promise<ArrayBuffer> {
   const v86Dir = dirname(createRequire(import.meta.url).resolve('v86'));
   const emulator = new V86({
     ...vmOptions({
@@ -79,8 +84,7 @@ async function boot(): Promise<ArrayBuffer> {
       vgaBios: join(OUT, 'vgabios.bin'),
       fsJson,
       files: `${join(OUT, 'files')}/`,
-    }),
-    bzimage_initrd_from_filesystem: true,
+    }, disk),
     autostart: true,
   });
   const agent = new AgentChannel((bytes) => emulator.serial_send_bytes(1, bytes));
@@ -97,11 +101,26 @@ async function boot(): Promise<ArrayBuffer> {
     process.exit(1);
   }, BOOT_LIMIT);
 
-  await agent.ready();
-  console.log(`  Steuerkanal nach ${Math.round((Date.now() - started) / 1000)} s`);
-  const status = await agent.run('systemctl is-system-running --wait; systemctl --failed --no-legend --plain', 10 * 60_000);
-  console.log(`  System: ${status.output.trim().replace(/\n/g, '\n          ')}`);
-  if (!/^(running|degraded)/.test(status.output)) throw new Error('systemd ist nicht hochgefahren.');
+  const up = async (label: string) => {
+    await agent.ready();
+    console.log(`  ${label}: Steuerkanal nach ${Math.round((Date.now() - started) / 1000)} s`);
+    const status = await agent.run('systemctl is-system-running --wait; systemctl --failed --no-legend --plain', 10 * 60_000);
+    console.log(`  System: ${status.output.trim().replace(/\n/g, '\n          ')}`);
+    if (!/^(running|degraded)/.test(status.output)) throw new Error('systemd ist nicht hochgefahren.');
+  };
+  await up('Erster Start');
+  // The hand-written grub.cfg on the disk only has to boot once. update-grub writes the real one (serial menu, recovery
+  // entries, kernel line from /etc/default/grub), and a reboot proves that it boots, just as a learner's reboot will.
+  const grub = await agent.run('update-grub 2>&1', 10 * 60_000);
+  if (grub.code !== 0) throw new Error(`update-grub ist gescheitert:\n${grub.output}`);
+  console.log(`  update-grub: ${grub.output.trim().replace(/\n/g, '\n               ')}`);
+  console0 = '';
+  // lp-agent stops with the system; it answers first and the reboot follows two seconds later.
+  await agent.run("setsid -f sh -c 'sleep 2; systemctl reboot' >/dev/null 2>&1 </dev/null");
+  await up('Neustart über GRUB');
+  const cmdline = (await agent.run('cat /proc/cmdline; findmnt -no SOURCE /boot')).output.trim();
+  console.log(`  Kernelzeile und /boot: ${cmdline.replace(/\n/g, ', ')}`);
+  if (!cmdline.includes('BOOT_IMAGE=') || !cmdline.includes('/dev/sda1')) throw new Error('Der Neustart lief nicht über die erzeugte grub.cfg.');
   // The prompt is coloured and sets the window title, so compare without escape sequences.
   const plain = () => console0.replace(/\x1b\][^\x07]*\x07|\x1b\[[0-9;?]*[A-Za-z]/g, '');
   while (!plain().trimEnd().endsWith('ops@web01:~$')) await new Promise((resolve) => setTimeout(resolve, 500));
@@ -110,7 +129,8 @@ async function boot(): Promise<ArrayBuffer> {
   if (interfaces !== 'lo') throw new Error(`Die VM hat Netzwerkschnittstellen außer lo: ${interfaces.replace(/\n/g, ', ')}`);
   console.log('  Netzwerk: nur lo');
   // Keep kernel messages off the learner's terminal; drop caches so the state holds less memory.
-  await agent.run('dmesg -n 1; sync; echo 3 > /proc/sys/vm/drop_caches');
+  // The 9p root directory comes up as 0777 (fs2json has no entry for it); a server's / is 0755.
+  await agent.run('chmod 755 /; dmesg -n 1; sync; echo 3 > /proc/sys/vm/drop_caches');
   clearTimeout(limit);
   console.log(`  Bereit nach ${Math.round((Date.now() - started) / 1000)} s`);
   const state = await emulator.save_state();

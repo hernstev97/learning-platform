@@ -318,6 +318,8 @@ test('a scenario runs a real Linux in the browser, loaded only on start and only
   page.once('dialog', (dialog) => dialog.accept());
   await page.locator('#vm-reset').click();
   await expect(page.locator('#vm-steps')).toHaveText('');
+  // Prüfen comes back once the scenario is set up again and the fresh login shell takes input.
+  await expect(page.locator('#check')).toBeEnabled({ timeout: 60_000 });
   await expect(terminal).toContainText('ops@web01:~$', { timeout: 30_000 });
   await page.locator('#vm-screen').click();
   await page.keyboard.type('cat ~/hallo.txt');
@@ -328,6 +330,43 @@ test('a scenario runs a real Linux in the browser, loaded only on start and only
   const origin = new URL(page.url()).origin;
   expect(requests.slice(started).filter((url) => url.origin !== origin).map(String)).toEqual([]);
   expect(requests.some((url) => url.pathname.endsWith('/state.bin.zst'))).toBe(true);
+  expect(errors).toEqual([]);
+});
+
+test('a lesson opens a Linux terminal only on demand and types the commands of vm blocks', async ({ page }) => {
+  test.setTimeout(180_000);
+  const errors = errorsOf(page);
+  const requests: URL[] = [];
+  page.on('request', (request) => requests.push(new URL(request.url())));
+  await page.goto(base);
+  await expect(page.locator('#open-terminal')).toBeVisible();
+  const blocks = page.locator('.codeblock[data-vm]');
+  await expect(blocks).toHaveCount(2);
+  await expect(page.locator('.codeblock[data-lang="python"] .vm-run')).toHaveCount(0);
+  expect(requests.filter((url) => url.pathname.startsWith('/vm/'))).toEqual([]);
+
+  // The lab wrote ~/namen.txt before the prompt appeared; the block sorts it.
+  const started = requests.length;
+  await blocks.first().locator('.vm-run').click();
+  const terminal = page.locator('.vm-dock .xterm-rows');
+  await expect(terminal).toContainText(/Ada\s*Grace\s*Linus/, { timeout: 120_000 });
+  await blocks.nth(1).locator('.vm-run').click();
+  await expect(terminal).toContainText(/No.such.file.or.directory/, { timeout: 30_000 });
+  // After the lab the shell was logged in again: it belongs to the group the lab created.
+  await page.locator('.vm-dock .vm-screen').click();
+  await page.keyboard.type('id -nG');
+  await page.keyboard.press('Enter');
+  await expect(terminal).toContainText('lernende', { timeout: 30_000 });
+  await expect(page.locator('body')).toHaveClass(/vm-dock-open/);
+
+  await page.locator('#dock-toggle').click();
+  await expect(page.locator('.vm-dock .vm-screen')).toBeHidden();
+  await page.locator('#dock-toggle').click();
+  await page.locator('#dock-close').click();
+  await expect(page.locator('.vm-dock')).toHaveCount(0);
+  await expect(page.locator('body')).not.toHaveClass(/vm-dock-open/);
+  const origin = new URL(page.url()).origin;
+  expect(requests.slice(started).filter((url) => url.origin !== origin).map(String)).toEqual([]);
   expect(errors).toEqual([]);
 });
 

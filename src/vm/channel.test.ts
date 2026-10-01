@@ -46,6 +46,16 @@ describe('AgentChannel', () => {
     await expect(ready).resolves.toBeUndefined();
   });
 
+  it('tells boot listeners about every boot, also after a reset', () => {
+    const { channel, reply } = agent(() => null);
+    let boots = 0;
+    channel.onReady(() => boots++);
+    reply('@@ready\n');
+    channel.reset();
+    reply('@@ready\n');
+    expect(boots).toBe(2);
+  });
+
   it('gives up after the timeout and moves on to the next request', async () => {
     vi.useFakeTimers();
     const { channel, sent, reply } = agent(() => null);

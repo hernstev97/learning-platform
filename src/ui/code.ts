@@ -1,5 +1,7 @@
-// Adds copy buttons, Rust Playground links and Python run buttons to rendered code blocks.
+// Adds copy buttons, Rust Playground links, Python and SQL run buttons and "Im Terminal" for Linux commands to rendered
+// code blocks.
 import { onRunnerState, runnerNotice, runSnippet, runSqlScript, type SqlResultSet } from '../python/runner.ts';
+import { vmCommands } from '../vm/commands.ts';
 import { $$, escape, icons } from './dom.ts';
 import { rowCount, sqlTableMarkup } from './sql-table.ts';
 
@@ -67,7 +69,8 @@ function sqlOutputMarkup(results: SqlResultSet[], error: string | null): string 
   return tables + err || '<span class="run-label">Ergebnis</span>(keine Ergebnismenge – nur SELECT liefert Zeilen)';
 }
 
-export function enhanceCode(root: ParentNode): () => void {
+/** `terminal` receives the commands of a block marked `vm`; without it those blocks get no terminal button. */
+export function enhanceCode(root: ParentNode, terminal?: (commands: string) => void): () => void {
   const cleanups: (() => void)[] = [];
   for (const block of $$<HTMLElement>('.codeblock', root)) {
     if (block.dataset.enhanced) continue;
@@ -127,6 +130,14 @@ export function enhanceCode(root: ParentNode): () => void {
       bar.append(reset, run);
     } else {
       bar.append(copyButton(() => codeOf(block)));
+    }
+    if (block.dataset.vm !== undefined && terminal) {
+      const run = document.createElement('button');
+      run.type = 'button';
+      run.className = 'vm-run';
+      run.innerHTML = `${icons.play} Im Terminal`;
+      run.addEventListener('click', () => terminal(vmCommands(codeOf(block), block.dataset.lang ?? '')));
+      bar.append(run);
     }
   }
   return () => cleanups.forEach((fn) => fn());

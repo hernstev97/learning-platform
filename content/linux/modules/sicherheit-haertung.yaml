@@ -1,13 +1,13 @@
 id: sicherheit-haertung
 title: Sicherheit & Härtung
 level: 3
-minutes: 180
+minutes: 250
 summary: Du reduzierst die Angriffsfläche eines Servers mit überprüfbaren Maßnahmen, ohne den eigenen Zugang oder die Anwendung durch pauschale Regeln zu beschädigen.
 goals:
-  - Du leitest Maßnahmen aus einem konkreten Bedrohungsmodell ab.
-  - Du härtest SSH mit geprüftem Schlüsselzugang und einem Rückweg.
+  - Du leitest Maßnahmen aus einem konkreten Bedrohungsmodell ab und inventarisierst Dienste, SUID-Programme und sudo-Rechte.
+  - Du härtest SSH mit einem Drop-in, prüfst die wirksame Konfiguration mit `sshd -T` und testest neue Anmeldungen, bevor du die alte Sitzung schließt.
   - Du prüfst Updates, erreichbare Dienste, Firewall und Geheimnisse getrennt.
-  - Du begrenzt Dienstrechte und belegst Wirksamkeit und Funktionsfähigkeit.
+  - Du sperrst Dienste mit systemd-Optionen ein, liest `systemd-analyze security` und belegst, dass der Dienst danach weiter funktioniert.
 resources:
   - title: OpenSSH · sshd_config
     url: https://man.openbsd.org/sshd_config
@@ -19,10 +19,26 @@ resources:
     url: https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html
   - title: Docker · Packet filtering and firewalls
     url: https://docs.docker.com/engine/network/packet-filtering-firewalls/
+lab: |
+  set -e
+  # Ein ungehärteter Beispieldienst für den Abschnitt über Dienstrechte.
+  useradd --system --no-create-home --shell /usr/sbin/nologin report
+  install -d -o report -g report /var/lib/report
+  cat > /usr/local/bin/report-job <<'EOF'
+  #!/bin/sh
+  # Schreibt jede Minute den Zeitpunkt des letzten Laufs nach /var/lib/report.
+  while true; do
+    date '+%F %T' > /var/lib/report/letzter-lauf
+    sleep 60
+  done
+  EOF
+  chmod 755 /usr/local/bin/report-job
+  printf '[Unit]\nDescription=Berichtsdienst\n\n[Service]\nExecStart=/usr/local/bin/report-job\n' > /etc/systemd/system/report.service
+  systemctl daemon-reload
 lesson: |
   Ein kleiner Server mit einer Web-App braucht keine wahllose Sammlung von Härtungstipps. Er braucht ein klares Modell: Wer darf sich anmelden? Welche Dienste müssen aus dem Internet erreichbar sein? Welche Daten wären bei einem Einbruch oder einer Fehlbedienung gefährdet? Aus diesen Antworten entstehen konkrete Maßnahmen und konkrete Prüfungen.
 
-  Wir verwenden eine eigene Debian- oder Ubuntu-Test-VM als Arbeitsumgebung. Desktop- und Serverregeln unterscheiden sich, und eine Änderung am SSH-Zugang kann dich aussperren. Deshalb gehören ein dokumentierter Rückweg, eine zweite bestehende Sitzung und ein getesteter neuer Login zum Ablauf. Das ist kein Zusatz zum Härtungsprozess, sondern Teil seiner Funktionsanforderung.
+  Übe an einer Test-VM, nicht am Produktivserver. Desktop- und Serverregeln unterscheiden sich, und eine Änderung am SSH-Zugang kann dich aussperren. Deshalb gehören ein dokumentierter Rückweg, eine zweite bestehende Sitzung und ein getesteter neuer Login zum Ablauf. Das ist kein Zusatz zum Härtungsprozess, sondern Teil seiner Funktionsanforderung. Die Beispiele mit „Im Terminal“ laufen in einer Debian-12-VM im Browser. Dort härtest du SSH und Dienste wirklich; nur eine Firewall fehlt ihr, weil der Kernel der VM keine Netfilter-Module hat.
 
   ## Ein kleines Bedrohungsmodell
 
@@ -30,16 +46,49 @@ lesson: |
 
   Erstelle zuerst eine Bestandsaufnahme. Ein Dienst, den du nicht brauchst, muss nicht dauerhaft lauschen. Ein Entwicklungsserver sollte nicht versehentlich auf allen Interfaces erreichbar sein. Prüfe die tatsächlichen Sockets und den zugehörigen Prozess, statt allein die Paketliste anzusehen ([ss(8)](https://man7.org/linux/man-pages/man8/ss.8.html)).
 
-  ```bash
-  ss -tulpn
-  systemctl --failed
-  systemctl list-unit-files --state=enabled
-  ip -br addr
+  ```console vm
+  $ sudo ss -tulpn
+  Netid State  Recv-Q Send-Q Local Address:Port Peer Address:PortProcess
+  tcp   LISTEN 0      0            0.0.0.0:22        0.0.0.0:*    users:(("sshd",pid=238,fd=3))
+  tcp   LISTEN 0      0                  *:22              *:*    users:(("sshd",pid=238,fd=4))
+  $ systemctl --failed
+    UNIT LOAD ACTIVE SUB DESCRIPTION
+  0 loaded units listed.
+  $ ip -br addr
+  lo               UNKNOWN        127.0.0.1/8 ::1/128
   ```
 
-  Ohne zusätzliche Rechte zeigt `ss -p` nicht jeden fremden Prozess. Ein aktivierter Dienst muss nicht laufen, und ein laufender Dienst muss nicht über das Netzwerk erreichbar sein. Umgekehrt kann eine Socket-Unit bei Bedarf einen Dienst starten. Notiere deshalb jeweils den beobachteten Zustand und die Quelle, nicht nur „alles sicher“.
+  Ohne zusätzliche Rechte zeigt `ss -p` nicht jeden fremden Prozess. Ein aktivierter Dienst muss nicht laufen, und ein laufender Dienst muss nicht über das Netzwerk erreichbar sein. Umgekehrt kann eine Socket-Unit bei Bedarf einen Dienst starten; `systemctl list-unit-files --state=enabled` und `systemctl list-sockets` zeigen beides. Notiere deshalb jeweils den beobachteten Zustand und die Quelle, nicht nur „alles sicher“.
 
   **Least Privilege** bedeutet, Rechte auf die benötigte Aufgabe zu begrenzen. Eine Web-App braucht häufig einen Port oberhalb 1024, Leserechte auf ihren Code und Schreibrechte auf einen Datenordner. Sie braucht nicht automatisch Root, Zugriff auf sämtliche Home-Verzeichnisse oder den Docker-Socket. Ein separater Benutzer begrenzt Schäden, falls die Anwendung kompromittiert wird.
+
+  Zur Bestandsaufnahme gehören auch die Wege zu root. Programme mit SUID-Bit laufen mit den Rechten ihres Besitzers, egal wer sie startet; jedes davon ist ein möglicher Weg nach oben. Vergleiche die Liste mit dem, was die Pakete mitbringen. Ein SUID-Programm in `/home`, `/tmp` oder `/opt` ist ein Alarmzeichen ([find(1) · -perm](https://man7.org/linux/man-pages/man1/find.1.html)).
+
+  ```console vm
+  $ sudo find / -xdev -perm -4000 -type f
+  /usr/bin/chfn
+  /usr/bin/chsh
+  /usr/bin/gpasswd
+  /usr/bin/mount
+  /usr/bin/newgrp
+  /usr/bin/passwd
+  /usr/bin/pkexec
+  /usr/bin/su
+  /usr/bin/sudo
+  /usr/bin/umount
+  /usr/lib/dbus-1.0/dbus-daemon-launch-helper
+  /usr/lib/openssh/ssh-keysign
+  /usr/lib/polkit-1/polkit-agent-helper-1
+  $ sudo -l
+  Matching Defaults entries for ops on web01:
+      env_reset, mail_badpass, secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin, use_pty
+
+  User ops may run the following commands on web01:
+      (ALL : ALL) ALL
+      (ALL) NOPASSWD: ALL
+  ```
+
+  `-xdev` bleibt auf dem Dateisystem von `/` und steigt nicht in `/proc`, `/boot` oder eingehängte Datenträger ab. `dpkg -S /usr/bin/chfn` nennt das Paket zu einer Datei. `sudo -l` zeigt, was der aktuelle Benutzer über sudo darf; hier zweimal alles, einmal über die Gruppe `sudo` und einmal ohne Passwort über `/etc/sudoers.d/ops`. Auf einem echten Server gehört ein `NOPASSWD: ALL` für einen Alltagsbenutzer in die Liste der Befunde.
 
   > [!PRAXIS]
   > Schreibe vor jeder Maßnahme einen Satz: „Diese Einstellung soll dieses konkrete Risiko reduzieren; diese Prüfung zeigt anschließend, dass Schutz und Anwendung funktionieren.“
@@ -74,23 +123,52 @@ lesson: |
 
   Passwort- und keyboard-interactive-Authentifizierung sind verschiedene Wege. Wer nur `PasswordAuthentication no` setzt, hat nicht automatisch jeden passwortähnlichen Weg ausgeschlossen. `PermitRootLogin no` sperrt direkte Root-Anmeldungen. `AllowUsers` schränkt Konten ein; ergänze alle tatsächlich benötigten Zugänge, bevor du diese Liste aktivierst. Die Optionen und ihr Zusammenspiel stehen in [sshd_config(5)](https://man.openbsd.org/sshd_config).
 
-  Konfigurationsdateien können Includes und Match-Blöcke enthalten. Ein irgendwo sichtbarer Wert ist deshalb kein Beweis für die effektive Einstellung eines bestimmten Benutzers. Prüfe erst die Syntax und dann bei Bedarf die effektive Konfiguration für einen konkreten Verbindungskontext ([sshd(8)](https://man.openbsd.org/sshd)).
+  **Wohin damit?** Schreib eigene Einstellungen nicht in `sshd_config` selbst, sondern in ein Drop-in unter `/etc/ssh/sshd_config.d/`. Paket-Updates ersetzen dann nicht deine Änderungen, und du siehst auf einen Blick, was von dir stammt. Dabei gilt eine Regel, die viele überrascht: Für jede Option übernimmt sshd den **ersten** Wert, den es liest. Debian und Ubuntu binden die Drop-ins ganz oben in `sshd_config` ein, in alphabetischer Reihenfolge der Dateinamen:
 
-  ```bash
+  ```console vm
+  $ grep -n '^Include' /etc/ssh/sshd_config
+  12:Include /etc/ssh/sshd_config.d/*.conf
+  $ sudo sshd -T | grep -E '^(permitrootlogin|passwordauthentication|kbdinteractiveauthentication)'
+  permitrootlogin without-password
+  passwordauthentication yes
+  kbdinteractiveauthentication no
+  ```
+
+  `sshd -T` gibt die wirksame Konfiguration aus, nach allen Includes und Standardwerten. `without-password` ist der alte Name für `prohibit-password`: root darf sich ab Werk mit Schlüssel anmelden, nur nicht mit Passwort. Cloud-Images bringen oft eigene Drop-ins mit. cloud-init schreibt zum Beispiel `50-cloud-init.conf`, je nach Anbieter mit `PasswordAuthentication yes`. Ein eigenes `99-haertung.conf` kommt dann zu spät:
+
+  ```bash vm
+  printf 'PasswordAuthentication yes\n' | sudo tee /etc/ssh/sshd_config.d/50-cloud-init.conf
+  printf 'PasswordAuthentication no\n' | sudo tee /etc/ssh/sshd_config.d/99-haertung.conf
+  sudo sshd -T | grep '^passwordauthentication'    # yes: 50-… wird zuerst gelesen
+  sudo mv /etc/ssh/sshd_config.d/99-haertung.conf /etc/ssh/sshd_config.d/10-haertung.conf
+  sudo sshd -T | grep '^passwordauthentication'    # no
+  sudo rm /etc/ssh/sshd_config.d/10-haertung.conf /etc/ssh/sshd_config.d/50-cloud-init.conf
+  ```
+
+  Konfigurationsdateien können außerdem Match-Blöcke enthalten. Ein irgendwo sichtbarer Wert ist deshalb kein Beweis für die effektive Einstellung eines bestimmten Benutzers. Prüfe erst die Syntax und dann bei Bedarf die effektive Konfiguration für einen konkreten Verbindungskontext ([sshd(8)](https://man.openbsd.org/sshd)).
+
+  ```bash vm
   sudo sshd -t
-  sudo sshd -T -C user=deploy,host=client.example,addr=192.0.2.10
-  systemctl status ssh.service
-  # Erst nach erfolgreicher Prüfung, auf einer VM mit diesem Dienstnamen:
+  sudo sshd -T -C user=deploy,host=client.example,addr=192.0.2.10 | grep -E '^(passwordauthentication|permitrootlogin)'
+  systemctl status ssh.service --no-pager
+  # Erst nach erfolgreicher Prüfung:
   sudo systemctl reload ssh.service
   ```
 
-  Auf anderen Distributionen heißt die Unit `sshd.service`; ermittle den tatsächlichen Namen. Behalte die bisherige Sitzung offen und prüfe **eine neue** Anmeldung mit dem vorgesehenen Schlüssel. Teste außerdem, dass die unerwünschte Loginmethode nicht mehr akzeptiert wird. Erst wenn beide Prüfungen passen, schließt du die alte Sitzung. `sshd -t` prüft keine Erreichbarkeit und keinen Schlüsselbesitz.
+  Auf Fedora und Arch heißt die Unit `sshd.service`; ermittle den tatsächlichen Namen. `reload` lässt sshd sich selbst neu starten (`Received SIGHUP; restarting.` im Journal). Bestehende Sitzungen laufen weiter, neue Verbindungen nimmt er nach einem kurzen Moment wieder an. Behalte die bisherige Sitzung offen und prüfe **eine neue** Anmeldung mit dem vorgesehenen Schlüssel. Teste außerdem, dass die unerwünschte Loginmethode nicht mehr akzeptiert wird. Das geht ohne Passwort-Eingabe:
+
+  ```console
+  $ ssh -o PubkeyAuthentication=no -o BatchMode=yes deploy@web01 true
+  deploy@web01: Permission denied (publickey).
+  ```
+
+  In den Klammern stehen die Methoden, die der Server noch anbietet. Vor der Härtung stünde dort `publickey,password`. Erst wenn beide Prüfungen passen, schließt du die alte Sitzung. `sshd -t` prüft keine Erreichbarkeit und keinen Schlüsselbesitz.
 
   **Fail2ban** kann wiederholte fehlgeschlagene Anmeldungen anhand von Logs erkennen und Quellen zeitweise sperren. Das reduziert bestimmte automatisierte Versuche, ersetzt aber weder korrekte Authentifizierung noch Updates. Logquelle, Filter und Firewall-Aktion müssen zusammenpassen; andernfalls sieht eine aktivierte Jail wirksamer aus, als sie ist ([Fail2ban-Projekt](https://github.com/fail2ban/fail2ban)).
 
   ## Firewall und wirkliche Erreichbarkeit
 
-  Eine Host-Firewall erlaubt benötigte Eingänge und verwirft den Rest. Auf Ubuntu ist UFW eine übliche Oberfläche. nftables bietet das zugrunde liegende Linux-Regelmodell mit Tabellen, Chains und Hooks; firewalld verwaltet Regeln über Zonen und weitere Konzepte. Wähle eine verwaltete Konfiguration, statt mehrere Werkzeuge ohne klares Zusammenspiel auf denselben Regeln arbeiten zu lassen ([Ubuntu · Firewall](https://ubuntu.com/server/docs/how-to/security/firewalls/)).
+  Eine Host-Firewall erlaubt benötigte Eingänge und verwirft den Rest. Auf Ubuntu ist UFW eine übliche Oberfläche. nftables bietet das zugrunde liegende Linux-Regelmodell mit Tabellen, Chains und Hooks; firewalld verwaltet Regeln über Zonen und weitere Konzepte. Wähle eine verwaltete Konfiguration, statt mehrere Werkzeuge ohne klares Zusammenspiel auf denselben Regeln arbeiten zu lassen ([Ubuntu · Firewall](https://ubuntu.com/server/docs/how-to/security/firewalls/)). Die Übungs-VM kann keine Pakete filtern; die folgenden Befehle probierst du auf einer eigenen VM aus.
 
   ```bash
   # Für eine eigene VM mit SSH auf Port 22 und öffentlichem HTTPS:
@@ -120,9 +198,23 @@ lesson: |
 
   `git check-ignore` zeigt eine Ignore-Regel, entfernt aber keine bereits verfolgte Datei aus der Historie. Prüfe den Zustand, ohne den Inhalt des Geheimnisses auszugeben. Umgebungsvariablen sind bequem, aber kein allgemeiner sicherer Tresor; je nach Umgebung können sie in Diagnoseinformationen sichtbar werden. Für systemd-Dienste sind dessen Credential-Mechanismen eine mögliche weiterführende Option ([systemd.exec · Credentials](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#Credentials)).
 
-  Ein systemd-Drop-in kann die Rechte eines Dienstes weiter beschränken:
+  In der Übungs-VM liegt ein Berichtsdienst, der jede Minute einen Zeitstempel nach `/var/lib/report` schreibt. Seine Unit enthält nur `ExecStart=`, er liefe also als root und ohne Einschränkung:
 
-  ```ini
+  ```console vm
+  $ systemctl cat report.service
+  # /etc/systemd/system/report.service
+  [Unit]
+  Description=Berichtsdienst
+
+  [Service]
+  ExecStart=/usr/local/bin/report-job
+  $ systemd-analyze security --no-pager report.service | tail -1
+  → Overall exposure level for report.service: 9.6 UNSAFE :-{
+  ```
+
+  Ein systemd-Drop-in kann die Rechte eines Dienstes beschränken, ohne die Unit des Herstellers zu ändern:
+
+  ```ini title=/etc/systemd/system/report.service.d/haertung.conf
   [Service]
   User=report
   Group=report
@@ -134,39 +226,86 @@ lesson: |
 
   Der Datenpfad muss existieren und passende Unix-Rechte besitzen. `ProtectSystem=strict` macht weite Teile des Dateisystems innerhalb des Dienstkontexts schreibgeschützt; `ReadWritePaths` nimmt gezielte Pfade davon aus. Das gewährt noch keine Dateirechte. `PrivateTmp` gibt dem Dienst eine eigene Sicht auf temporäre Verzeichnisse. `NoNewPrivileges` verhindert bestimmte neue Privilegien über `execve`; es entzieht keine schon vorhandenen Rechte ([systemd.exec](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html)).
 
-  ```bash
-  systemctl cat report.service
-  systemd-analyze security report.service
-  journalctl -u report.service -b -n 50
+  ```bash vm
+  sudo mkdir -p /etc/systemd/system/report.service.d
+  printf '%s\n' '[Service]' 'User=report' 'Group=report' 'NoNewPrivileges=yes' 'PrivateTmp=yes' \
+    'ProtectSystem=strict' 'ReadWritePaths=/var/lib/report' |
+    sudo tee /etc/systemd/system/report.service.d/haertung.conf
+  sudo systemctl daemon-reload
+  sudo systemctl start report
+  systemctl show -p User -p ActiveState report
+  systemd-analyze security --no-pager report.service | tail -1
   ```
 
-  Die Sicherheitsbewertung von `systemd-analyze` ist eine Heuristik über konfigurierte Maßnahmen, keine Sicherheitszertifizierung. Härte schrittweise und teste danach Start, normale Nutzung, Datenpersistenz, temporäre Dateien und Updates. Eine Einstellung, die einen notwendigen Schreibpfad blockiert, braucht eine begründete Ausnahme statt eine vollständige Abschaltung der Sandbox.
+  Der Dienst läuft jetzt als `report`, die Bewertung sinkt aber nur auf 8,5 („EXPOSED“). Die Liste ohne `tail` zeigt, warum: Jede Zeile mit ✗ ist eine Maßnahme, die fehlt, rechts steht ihr Gewicht. Viel Gewicht haben die Capabilities, die selbst ein Nicht-root-Prozess noch im Bounding Set trägt, der Zugriff auf Geräte, Kernel-Einstellungen und Home-Verzeichnisse sowie erlaubte Socket-Typen und Systemaufrufe:
+
+  ```ini
+  [Service]
+  # Flüchtige eigene UID; schließt ProtectSystem=strict ein.
+  DynamicUser=yes
+  # /var/lib/report anlegen, dem Dienst übergeben und beschreibbar lassen.
+  StateDirectory=report
+  # Keine Capabilities, auch nicht über Umwege.
+  CapabilityBoundingSet=
+  PrivateDevices=yes
+  ProtectHome=yes
+  ProtectKernelTunables=yes
+  ProtectKernelModules=yes
+  ProtectControlGroups=yes
+  RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+  SystemCallFilter=@system-service
+  ```
+
+  Muss ein Dienst ohne root auf einem Port unter 1024 lauschen, gibt ihm `AmbientCapabilities=CAP_NET_BIND_SERVICE` genau diese eine Fähigkeit; `CapabilityBoundingSet=CAP_NET_BIND_SERVICE` lässt dann auch nur sie zu. Nach jeder Änderung gilt: `daemon-reload`, `restart`, Journal lesen, die echte Funktion prüfen.
+
+  Die Sicherheitsbewertung von `systemd-analyze` ist eine Heuristik über konfigurierte Maßnahmen, keine Sicherheitszertifizierung. Unter 5,0 nennt systemd das Ergebnis „OK“, ab 5,0 „MEDIUM“, ab 7,5 „EXPOSED“, ab 9,0 „UNSAFE“ ([systemd-analyze · security](https://www.freedesktop.org/software/systemd/man/latest/systemd-analyze.html)). Auch sshd steht bei 9,6, weil es als root Benutzer wechseln muss:
+
+  ```console vm
+  $ systemd-analyze security --no-pager ssh.service | tail -1
+  → Overall exposure level for ssh.service: 9.6 UNSAFE :-{
+  ```
+
+  Härte schrittweise und teste danach Start, normale Nutzung, Datenpersistenz, temporäre Dateien und Updates. Eine Einstellung, die einen notwendigen Schreibpfad blockiert, braucht eine begründete Ausnahme statt eine vollständige Abschaltung der Sandbox.
 
   **AppArmor** und **SELinux** ergänzen das klassische Rechtemodell um weitere Richtlinien. AppArmor arbeitet wesentlich mit Profilen und Pfaden, SELinux mit Labels und Regeln. Ein Zugriff kann trotz `chmod 777` verweigert werden. Prüfe im Fehlerfall die passenden Auditmeldungen und repariere die konkrete Richtlinie, statt den Mechanismus dauerhaft auszuschalten ([Ubuntu · AppArmor](https://ubuntu.com/server/docs/how-to/security/apparmor/), [SELinux-Projekt](https://selinuxproject.org/)).
 
   ## Nachweise, Logs und häufige Fehler
 
-  Prüfe erfolgreiche und fehlgeschlagene Anmeldungen über die tatsächlich vorhandene SSH-Unit und Logkonfiguration. `last` wertet übliche Loginaufzeichnungen aus, `lastb` fehlgeschlagene Anmeldungen, sofern die jeweilige Datenquelle geführt wird. Fehlende Einträge beweisen nicht, dass nichts passiert ist. Uhrzeit, Rotation und Aufbewahrung gehören zur Interpretation.
+  Prüfe erfolgreiche und fehlgeschlagene Anmeldungen über die tatsächlich vorhandene SSH-Unit und Logkonfiguration. `last` wertet übliche Loginaufzeichnungen aus, `lastb` (nur als root) fehlgeschlagene Anmeldungen, sofern die jeweilige Datenquelle geführt wird. Fehlende Einträge beweisen nicht, dass nichts passiert ist. Uhrzeit, Rotation und Aufbewahrung gehören zur Interpretation.
 
-  ```bash
-  journalctl -u ssh.service --since today
-  journalctl -u sshd.service --since today
-  last -n 5
+  ```console vm
+  $ journalctl -u ssh --no-pager -n 3
+  Oct 01 17:12:18 web01 systemd[1]: Reloaded ssh.service - OpenBSD Secure Shell server.
+  Oct 01 17:12:21 web01 sshd[238]: Server listening on 0.0.0.0 port 22.
+  Oct 01 17:12:21 web01 sshd[238]: Server listening on :: port 22.
+  $ last -n 3
+  ops      ttyS0                         Thu Oct  1 11:50    gone - no logout
+  reboot   system boot  6.1.0-53-686     Thu Oct  1 11:50   still running
+  …
   ```
 
-  Ein Auditwerkzeug wie Lynis kann weitere Prüfpunkte liefern. Sortiere Ergebnisse nach tatsächlichem Risiko und Anwendungsbedarf; eine lange Liste von Empfehlungen ist kein automatisch auszuführender Plan ([Lynis-Dokumentation](https://cisofy.com/documentation/lynis/)). Typische Fehler sind ungeprüftes Kopieren von SSH-Regeln, eine Firewall ohne neue Verbindung zu testen und ein guter Scanwert ohne Backup- oder Restorefähigkeit.
+  Auf Fedora und Arch heißt der Aufruf `journalctl -u sshd`. Ein Auditwerkzeug wie Lynis kann weitere Prüfpunkte liefern. Sortiere Ergebnisse nach tatsächlichem Risiko und Anwendungsbedarf; eine lange Liste von Empfehlungen ist kein automatisch auszuführender Plan ([Lynis-Dokumentation](https://cisofy.com/documentation/lynis/)).
+
+  Typische Fehler:
+
+  - **SSH-Regeln ungeprüft kopieren.** Ein Drop-in mit dem falschen Namen wird von einem früheren still überstimmt. Erst `sshd -T` zeigt, was gilt.
+  - **Reload ohne neuen Login.** `sshd -t` ist grün, aber `AllowUsers` hat den eigenen Benutzer vergessen. Die offene Sitzung ist dann der einzige Rückweg.
+  - **Eine Firewall aktivieren, ohne eine neue Verbindung zu testen.**
+  - **Sandbox bis zum Ausfall.** `ProtectSystem=strict` ohne Ausnahme für das Datenverzeichnis, und der Dienst schreibt nichts mehr; ein Dienst auf Port 80 ohne root und ohne `CAP_NET_BIND_SERVICE` lauscht nicht mehr. Das Journal nennt beides (`Read-only file system`, `bind: Permission denied`).
+  - **Ein guter Score ohne Funktionsprüfung, ein gutes Audit ohne Backup.** Beides beweist nicht, dass der Dienst läuft oder sich wiederherstellen lässt.
 
   > [!INTERVIEW]
   > „Wie härtest du einen Server?“ – Ich beginne mit Zugriffen und Schutzgütern, reduziere unnötige Dienste, pflege Updates, begrenze Identitäten und prüfe jede Maßnahme von außen und aus Sicht der Anwendung. Zu jeder Änderung gehört ein Rückweg.
 
   ## Zusammenfassung
 
-  - Beginne mit Bedrohungsmodell und tatsächlichem Bestand.
+  - Beginne mit Bedrohungsmodell und tatsächlichem Bestand: Sockets, aktivierte Dienste, SUID-Programme, sudo-Rechte.
   - Updates brauchen Aktivierung, Nachweis und Wartungsablauf.
-  - SSH-Härtung ist erst nach einer neuen getesteten Anmeldung abgeschlossen.
+  - SSH-Einstellungen gehören in ein Drop-in; für jede Option gilt der erste gelesene Wert, `sshd -T` zeigt das Ergebnis.
+  - SSH-Härtung ist erst nach einer neuen getesteten Anmeldung und einer abgelehnten verbotenen Methode abgeschlossen.
   - Firewallregeln und externe Erreichbarkeit sind getrennte Nachweise.
   - Geheimnisse brauchen begrenzte Verteilung und bei Lecks Rotation.
-  - Diensthärtung ergänzt klassische Rechte und muss funktional geprüft werden.
+  - Diensthärtung ergänzt klassische Rechte: eigener Benutzer, Schreibsperre mit gezielten Ausnahmen, nur nötige Capabilities. `systemd-analyze security` misst die Maßnahmen, Neustart und echter Abruf die Funktion.
   - Ein Audit liefert Hinweise, keine pauschale Sicherheitsgarantie.
 exercises:
   - id: ssh-ablauf
@@ -224,6 +363,36 @@ exercises:
     expected: '600'
     verify: true
     explanation: Nur der Besitzer hat hier Lese- und Schreibrechte. Die Übung prüft den Modus, nicht frühere Kopien, Git-Historie oder den vollständigen Schutz eines echten Secrets.
+  - id: sshd-erster-treffer
+    type: output
+    title: Welcher Wert gewinnt?
+    prompt: Ein Debian-Server stammt aus dem Cloud-Image eines Hosters; ein Kollege hat ein eigenes Drop-in ergänzt. Was gibt der letzte Befehl aus?
+    lang: console
+    code: |
+      $ grep -n -E '^(Include|PermitRootLogin|X11Forwarding)' /etc/ssh/sshd_config
+      12:Include /etc/ssh/sshd_config.d/*.conf
+      33:PermitRootLogin yes
+      90:X11Forwarding yes
+      $ ls /etc/ssh/sshd_config.d/
+      50-cloud-init.conf  90-haertung.conf
+      $ cat /etc/ssh/sshd_config.d/50-cloud-init.conf
+      PasswordAuthentication yes
+      $ cat /etc/ssh/sshd_config.d/90-haertung.conf
+      PasswordAuthentication no
+      PermitRootLogin no
+      X11Forwarding no
+      $ sudo sshd -T | grep -E '^(permitrootlogin|passwordauthentication|x11forwarding)'
+    expected: |
+      permitrootlogin no
+      passwordauthentication yes
+      x11forwarding no
+    explanation: |
+      sshd übernimmt für jede Option den ersten Wert, den es liest. Das `Include` in Zeile 12 bindet die Drop-ins in alphabetischer Reihenfolge ein, bevor die übrigen Zeilen von `sshd_config` kommen. `PasswordAuthentication` setzt zuerst `50-cloud-init.conf`, das `no` aus `90-haertung.conf` wird ignoriert. `PermitRootLogin` und `X11Forwarding` setzt als Erstes `90-haertung.conf`; die Werte aus Zeile 33 und 90 kommen zu spät. Die Ausgabe von `sshd -T` folgt einer festen Reihenfolge des Programms, nicht der Reihenfolge im `grep`-Muster. Abhilfe: das eigene Drop-in vor `50-…` sortieren lassen, etwa `10-haertung.conf`.
+    resources:
+      - title: sshd_config(5)
+        url: https://man.openbsd.org/sshd_config
+      - title: sshd(8) – -T
+        url: https://man.openbsd.org/sshd#T
   - id: ssh-syntax
     type: command
     title: Vor dem Reload
@@ -242,6 +411,40 @@ exercises:
     resources:
       - title: ss(8)
         url: https://man7.org/linux/man-pages/man8/ss.8.html
+  - id: suid-finden
+    type: command
+    title: Wege zu root
+    prompt: Liste alle regulären Dateien mit gesetztem SUID-Bit auf dem Dateisystem von `/`. `find` soll nicht in andere eingehängte Dateisysteme wie `/proc` oder `/boot` absteigen; Fehlermeldungen über unlesbare Verzeichnisse vermeidest du mit sudo.
+    answers:
+      - sudo find / -xdev -perm -4000 -type f
+      - sudo find / -xdev -type f -perm -4000
+      - sudo find / -xdev -perm -u=s -type f
+      - sudo find / -xdev -type f -perm -u=s
+      - sudo find / -xdev -perm /4000 -type f
+      - sudo find / -xdev -type f -perm /4000
+      - sudo find / -xdev -perm /u=s -type f
+      - sudo find / -xdev -type f -perm /u=s
+      - sudo find / -type f -perm -4000 -xdev
+      - sudo find / -perm -4000 -type f -xdev
+    output: |
+      /usr/bin/chfn
+      /usr/bin/chsh
+      /usr/bin/gpasswd
+      /usr/bin/mount
+      /usr/bin/newgrp
+      /usr/bin/passwd
+      /usr/bin/pkexec
+      /usr/bin/su
+      /usr/bin/sudo
+      /usr/bin/umount
+      /usr/lib/dbus-1.0/dbus-daemon-launch-helper
+      /usr/lib/openssh/ssh-keysign
+      /usr/lib/polkit-1/polkit-agent-helper-1
+    explanation: |
+      `-perm -4000` verlangt, dass mindestens das SUID-Bit gesetzt ist (`-u=s` ist dieselbe Bedingung symbolisch, `/4000` heißt „irgendeines dieser Bits“ und ist bei nur einem Bit gleichwertig). `-xdev` bleibt auf dem Dateisystem des Startpunkts; `/proc`, `/sys` und eingehängte Datenträger würden sonst lange dauern oder Rauschen liefern. Ein SUID-Programm läuft mit den Rechten seines Besitzers, hier root. Die Liste oben ist der Standard eines Debian-Servers; jede Abweichung, etwa eine Datei in `/home` oder `/opt`, gehört untersucht. `dpkg -S datei` sagt, welches Paket sie mitgebracht hat. Steht `-xdev` hinter den Tests, warnt GNU find, weil es eine globale Option ist; das Ergebnis bleibt gleich.
+    resources:
+      - title: find(1)
+        url: https://man7.org/linux/man-pages/man1/find.1.html
   - id: firewall-https
     type: command
     title: Genau einen Webport freigeben
@@ -290,6 +493,214 @@ exercises:
     resources:
       - title: systemd.exec
         url: https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html
+  - id: ssh-haerten
+    type: scenario
+    title: Nur noch mit Schlüssel – wirklich?
+    prompt: |
+      `web01` geht nächste Woche ins Internet. Vorher soll SSH dicht sein, ohne dass sich jemand aussperrt. Die Vorgaben:
+
+      - Anmeldung nur noch mit Schlüssel: keine Passwörter, kein keyboard-interactive.
+      - Kein direkter Login als root, auch nicht mit dem Notfallschlüssel des Hosters, der in `/root/.ssh/authorized_keys` liegen bleibt.
+      - Nur `ops` und `deploy` dürfen sich per SSH anmelden. `praktikant` hat noch einen Schlüssel hinterlegt; sein Konto und seine Dateien bleiben für die Übergabe erhalten.
+      - `ops` (Schlüssel `~/.ssh/id_ed25519`) und die Deploy-Pipeline (`deploy`, Schlüssel `~/.ssh/deploy_ed25519` im Home von ops) melden sich danach weiter an.
+
+      Lege deine Einstellungen als Drop-in unter `/etc/ssh/sshd_config.d/` ab. Das System stammt aus dem Image eines Hosters.
+    setup: |
+      set -e
+      useradd -m -s /bin/bash deploy
+      useradd -m -s /bin/bash praktikant
+      # ops meldet sich mit ~/.ssh/id_ed25519 an, die Pipeline als deploy mit ~/.ssh/deploy_ed25519.
+      install -d -m 700 -o ops -g ops /home/ops/.ssh
+      runuser -u ops -- ssh-keygen -q -t ed25519 -N '' -C ops@laptop -f /home/ops/.ssh/id_ed25519
+      runuser -u ops -- ssh-keygen -q -t ed25519 -N '' -C deploy-pipeline -f /home/ops/.ssh/deploy_ed25519
+      install -m 600 -o ops -g ops /home/ops/.ssh/id_ed25519.pub /home/ops/.ssh/authorized_keys
+      echo "localhost $(cut -d' ' -f1,2 /etc/ssh/ssh_host_ed25519_key.pub)" > /home/ops/.ssh/known_hosts
+      chown ops:ops /home/ops/.ssh/known_hosts
+      install -d -m 700 -o deploy -g deploy /home/deploy/.ssh
+      install -m 600 -o deploy -g deploy /home/ops/.ssh/deploy_ed25519.pub /home/deploy/.ssh/authorized_keys
+      # Altlasten: der Schlüssel des Praktikanten und der Notfallschlüssel des Hosters für root.
+      install -d -m 700 /root/.ssh
+      ssh-keygen -q -t ed25519 -N '' -C praktikant@laptop -f /root/.ssh/praktikant
+      ssh-keygen -q -t ed25519 -N '' -C hoster-notfall -f /root/.ssh/hoster_notfall
+      install -d -m 700 -o praktikant -g praktikant /home/praktikant/.ssh
+      install -m 600 -o praktikant -g praktikant /root/.ssh/praktikant.pub /home/praktikant/.ssh/authorized_keys
+      install -m 600 /root/.ssh/hoster_notfall.pub /root/.ssh/authorized_keys
+      # Das Image des Hosters bringt ein Drop-in von cloud-init mit.
+      printf '# Created by cloud-init on instance boot automatically, do not edit.\n#\nPasswordAuthentication yes\n' > /etc/ssh/sshd_config.d/50-cloud-init.conf
+    checks:
+      - name: ops und deploy kommen weiter mit ihrem Schlüssel herein
+        run: |
+          for i in 1 2 3 4 5; do nc -z localhost 22 && break; sleep 1; done
+          runuser -u ops -- ssh -o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=accept-new ops@localhost true || { echo "ops kommt nicht herein."; exit 1; }
+          runuser -u ops -- ssh -o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=accept-new -i /home/ops/.ssh/deploy_ed25519 deploy@localhost true || { echo "deploy kommt nicht herein."; exit 1; }
+      - name: sshd bietet nur noch Schlüssel an, jetzt und nach einem Neustart
+        run: |
+          sshd -t || exit 1
+          for wert in 'passwordauthentication no' 'kbdinteractiveauthentication no'; do
+            sshd -T -C user=ops,host=localhost,addr=127.0.0.1 | grep -qx "$wert" || { echo "Konfiguration: $wert fehlt."; exit 1; }
+          done
+          for i in 1 2 3 4 5; do nc -z localhost 22 && break; sleep 1; done
+          out=$(runuser -u ops -- ssh -o BatchMode=yes -o ConnectTimeout=20 -o PubkeyAuthentication=no ops@localhost true 2>&1)
+          echo "$out"
+          case $out in *"Permission denied (publickey)."*) ;; *) exit 1 ;; esac
+      - name: root kommt nicht herein, obwohl der Notfallschlüssel hinterlegt ist
+        run: |
+          grep -q hoster-notfall /root/.ssh/authorized_keys || { echo "Der Notfallschlüssel fehlt in /root/.ssh/authorized_keys."; exit 1; }
+          out=$(ssh -o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -i /root/.ssh/hoster_notfall root@localhost true 2>&1)
+          echo "${out:-Anmeldung als root erfolgreich.}"
+          case $out in *"Permission denied"*) ;; *) exit 1 ;; esac
+      - name: praktikant kommt nicht mehr herein
+        run: |
+          [ -s /home/praktikant/.ssh/authorized_keys ] || { echo "Die Dateien von praktikant sollten bleiben."; exit 1; }
+          out=$(ssh -o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -i /root/.ssh/praktikant praktikant@localhost true 2>&1)
+          echo "${out:-Anmeldung als praktikant erfolgreich.}"
+          case $out in *"Permission denied"*) ;; *) exit 1 ;; esac
+    solution: |
+      # Bestand: Was gilt gerade, und woher kommt es?
+      sudo sshd -T | grep -E '^(passwordauthentication|kbdinteractiveauthentication|permitrootlogin|allowusers)'
+      grep -n '^Include' /etc/ssh/sshd_config
+      ls -l /etc/ssh/sshd_config.d/
+      cat /etc/ssh/sshd_config.d/50-cloud-init.conf
+      # Include steht oben in sshd_config, und für jede Option gilt der erste gelesene Wert.
+      # 50-cloud-init.conf setzt PasswordAuthentication yes; das eigene Drop-in muss davor sortieren.
+      printf '%s\n' 'PasswordAuthentication no' 'KbdInteractiveAuthentication no' 'PermitRootLogin no' 'AllowUsers ops deploy' | sudo tee /etc/ssh/sshd_config.d/10-haertung.conf
+      sudo sshd -t
+      sudo sshd -T | grep -E '^(passwordauthentication|kbdinteractiveauthentication|permitrootlogin|allowusers)'
+      sudo systemctl reload ssh
+      systemctl status ssh --no-pager | head -5
+      # Neue Anmeldungen testen, die laufende Sitzung bleibt offen:
+      ssh -o BatchMode=yes ops@localhost true && echo "ops: ok"
+      ssh -o BatchMode=yes -i ~/.ssh/deploy_ed25519 deploy@localhost true && echo "deploy: ok"
+      # Die verbotene Methode muss scheitern; in Klammern stehen nur noch erlaubte Methoden:
+      ssh -o BatchMode=yes -o PubkeyAuthentication=no ops@localhost true
+    hints:
+      - "Was gilt gerade wirklich? `sudo sshd -T | grep -E '^(passwordauthentication|kbdinteractiveauthentication|permitrootlogin|allowusers)'` zeigt die wirksamen Werte, egal aus welcher Datei sie stammen."
+      - "Dein Drop-in ist geschrieben, aber `sshd -T` zeigt weiter `passwordauthentication yes`? Schau, wo `Include` in `/etc/ssh/sshd_config` steht, was sonst in `sshd_config.d/` liegt und in welcher Reihenfolge sshd die Dateien liest. Für jede Option gilt der erste Wert."
+      - "Erst `sudo sshd -t`, dann `sudo systemctl reload ssh`. Teste danach neue Anmeldungen: `ssh -o BatchMode=yes ops@localhost true`, `ssh -i ~/.ssh/deploy_ed25519 deploy@localhost true` und `ssh -o PubkeyAuthentication=no -o BatchMode=yes ops@localhost true`. Die letzte Meldung nennt in Klammern, welche Methoden der Server noch anbietet."
+    explanation: |
+      Debian bindet `/etc/ssh/sshd_config.d/*.conf` am Anfang von `sshd_config` ein, in alphabetischer Reihenfolge, und sshd übernimmt für jede Option den ersten Wert, den es liest. `50-cloud-init.conf` aus dem Hoster-Image setzt `PasswordAuthentication yes`. Ein Drop-in `99-haertung.conf` mit `no` kommt zu spät und wird ohne Warnung ignoriert; `sshd -t` ist trotzdem zufrieden. Erst `sshd -T` zeigt den wirksamen Wert. Abhilfe ist ein Name, der vorher sortiert (`10-haertung.conf`), oder eine Änderung in der fremden Datei, die allerdings cloud-init gehört.
+
+      `AllowUsers ops deploy` lässt nur diese beiden herein, root und praktikant scheitern schon an der Liste. `PermitRootLogin no` sperrt root zusätzlich, falls jemand die Liste später erweitert. Bewiesen ist die Härtung erst durch neue Anmeldungen: Die erlaubten klappen, die verbotene Methode wird abgelehnt, und `Permission denied (publickey)` nennt in Klammern genau die Methoden, die der Server noch anbietet. Bis diese Tests grün sind, bleibt die alte Sitzung offen; `reload` beendet sie nicht.
+    resources:
+      - title: sshd_config(5)
+        url: https://man.openbsd.org/sshd_config
+      - title: sshd(8) – -T und -C
+        url: https://man.openbsd.org/sshd#T
+  - id: dienst-einsperren
+    type: scenario
+    title: Der Berichtsdienst kommt in den Käfig
+    prompt: |
+      Ein Sicherheitsaudit hat `report.service` auf `web01` bemängelt: Der Dienst läuft als root und ohne jede Einschränkung, `systemd-analyze security` bewertet ihn mit 9,6 („UNSAFE“). Er liefert Berichte unter `http://127.0.0.1/bericht.txt` aus, und andere Systeme holen sie dort ab.
+
+      Härte den Dienst so, dass
+
+      - er nicht mehr als root läuft,
+      - `systemd-analyze security report.service` ihn mit „OK“ bewertet, also mit einem Wert unter 5,0,
+      - der Bericht weiter unter derselben Adresse erreichbar ist und alle zehn Sekunden aktualisiert wird.
+
+      Das Programm `/usr/local/bin/report-server` stammt vom Hersteller und bleibt unverändert; arbeite mit einem Drop-in für die Unit.
+    setup: |
+      set -e
+      mkdir -p /var/lib/report/www
+      cat > /usr/local/bin/report-server <<'EOF'
+      #!/bin/sh
+      # Berichtsdienst: liefert /var/lib/report/www auf http://127.0.0.1/ aus
+      # und schreibt alle 10 Sekunden einen neuen Bericht.
+      busybox httpd -f -p 127.0.0.1:80 -h /var/lib/report/www &
+      while true; do
+        date '+Bericht vom %F %T' > /var/lib/report/www/bericht.txt || exit 1
+        sleep 10
+      done
+      EOF
+      chmod 755 /usr/local/bin/report-server
+      cat > /etc/systemd/system/report.service <<'EOF'
+      [Unit]
+      Description=Berichtsdienst
+
+      [Service]
+      ExecStart=/usr/local/bin/report-server
+
+      [Install]
+      WantedBy=multi-user.target
+      EOF
+      systemctl daemon-reload
+      systemctl enable --now report 2>/dev/null
+    checks:
+      - name: report startet beim Boot und läuft nach einem Neustart des Dienstes
+        run: systemctl is-enabled report && systemctl restart report && sleep 3 && systemctl is-active report
+      - name: Der Bericht unter http://127.0.0.1/bericht.txt ist aktuell
+        run: |
+          zeile=$(curl -fsS --max-time 5 http://127.0.0.1/bericht.txt) || exit 1
+          echo "$zeile"
+          stand=$(date -d "${zeile#Bericht vom }" +%s) || exit 1
+          [ $(( $(date +%s) - stand )) -lt 60 ] || { echo "Der Bericht ist älter als eine Minute."; exit 1; }
+      - name: report läuft nicht als root
+        run: |
+          pid=$(systemctl show -p MainPID --value report)
+          uid=$(awk '/^Uid:/ { print $2 }' "/proc/$pid/status")
+          echo "UID des Hauptprozesses: ${uid:-unbekannt}"
+          [ -n "$uid" ] && [ "$uid" != 0 ]
+      - name: systemd-analyze security bewertet report mit OK (unter 5,0)
+        run: |
+          zeile=$(systemd-analyze security --no-pager report.service | tail -1)
+          echo "$zeile"
+          wert=$(echo "$zeile" | grep -o '[0-9]*\.[0-9]' | tail -1)
+          awk -v w="$wert" 'BEGIN { exit !(w != "" && w < 5.0) }'
+    solution: |
+      # Ausgangslage: root, keine Sandbox.
+      systemd-analyze security --no-pager report.service | tail -1
+      systemctl cat report.service
+      cat /usr/local/bin/report-server
+      # Der Dienst lauscht auf Port 80 und schreibt nach /var/lib/report/www. Erster Versuch:
+      sudo mkdir -p /etc/systemd/system/report.service.d
+      printf '%s\n' '[Service]' 'DynamicUser=yes' | sudo tee /etc/systemd/system/report.service.d/haertung.conf
+      sudo systemctl daemon-reload
+      sudo systemctl restart report
+      sleep 3
+      journalctl -u report -n 10 --no-pager
+      # cannot create /var/lib/report/www/bericht.txt: Read-only file system (DynamicUser= schließt ProtectSystem=strict ein)
+      # Mit StateDirectory= käme als Nächstes: httpd: bind: Permission denied (Port 80 braucht CAP_NET_BIND_SERVICE)
+      sudo tee /etc/systemd/system/report.service.d/haertung.conf <<'EOF'
+      [Service]
+      DynamicUser=yes
+      StateDirectory=report
+      AmbientCapabilities=CAP_NET_BIND_SERVICE
+      CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+      NoNewPrivileges=yes
+      ProtectSystem=strict
+      ProtectHome=yes
+      PrivateTmp=yes
+      PrivateDevices=yes
+      ProtectKernelTunables=yes
+      ProtectKernelModules=yes
+      ProtectKernelLogs=yes
+      ProtectControlGroups=yes
+      RestrictAddressFamilies=AF_INET AF_UNIX
+      RestrictNamespaces=yes
+      LockPersonality=yes
+      SystemCallArchitectures=native
+      EOF
+      sudo systemctl daemon-reload
+      sudo systemctl restart report
+      sleep 3
+      systemctl status report --no-pager | head -12
+      curl -fsS http://127.0.0.1/bericht.txt
+      systemd-analyze security --no-pager report.service | tail -1
+    hints:
+      - "Lies zuerst, was der Dienst tut: `systemctl cat report.service` und `cat /usr/local/bin/report-server`. Auf welchem Port lauscht er, wohin schreibt er?"
+      - "Nach jedem Versuch: `sudo systemctl daemon-reload`, `sudo systemctl restart report`, dann `journalctl -u report -n 20`. `Read-only file system` heißt: Das Datenverzeichnis braucht eine Ausnahme (`StateDirectory=` oder `ReadWritePaths=`). `bind: Permission denied` heißt: Port 80 braucht `CAP_NET_BIND_SERVICE`."
+      - "`systemd-analyze security --no-pager report.service` listet jede fehlende Maßnahme mit ✗ und ihrem Gewicht. Viel bringen ein eigener Benutzer (`DynamicUser=yes` oder `User=`), `CapabilityBoundingSet=`, `PrivateDevices=`, `ProtectHome=`, `ProtectKernelTunables=`, `ProtectKernelModules=`, `ProtectControlGroups=` und `RestrictAddressFamilies=`."
+    explanation: |
+      Ein root-Dienst ohne Sandbox darf alles, was root darf; eine Lücke in ihm ist eine Lücke im ganzen System. Die Härtung nimmt ihm, was er nicht braucht, und lässt ihm genau zwei Dinge: Schreiben in `/var/lib/report` und Lauschen auf Port 80. `DynamicUser=yes` vergibt eine eigene, flüchtige UID und schließt `ProtectSystem=strict` ein, deshalb scheitert der erste Versuch mit `Read-only file system`. `StateDirectory=report` übergibt das Datenverzeichnis dem Dienstbenutzer und nimmt es von der Schreibsperre aus. Ports unter 1024 darf nur ein Prozess mit `CAP_NET_BIND_SERVICE` öffnen: `AmbientCapabilities=` gibt dem Dienst genau diese Capability, `CapabilityBoundingSet=` begrenzt ihn auf sie. Mit einem festen Benutzer (`User=report`) geht es genauso, dann mit `ReadWritePaths=/var/lib/report` und passendem Besitzer des Verzeichnisses.
+
+      Der Score ist eine Heuristik über gesetzte Optionen. Ob der Dienst danach noch funktioniert, sagt er nicht; das beweisen erst Neustart, Journal und der echte Abruf. Gehärtet ist ein Dienst, wenn beides stimmt.
+    resources:
+      - title: systemd.exec – Sandboxing
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#Sandboxing
+      - title: systemd.exec – DynamicUser=
+        url: https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#DynamicUser=
+      - title: capabilities(7) – CAP_NET_BIND_SERVICE
+        url: https://man7.org/linux/man-pages/man7/capabilities.7.html
   - id: haertungsnachweis
     type: practice
     title: Einen überprüfbaren Härtungsbericht schreiben
