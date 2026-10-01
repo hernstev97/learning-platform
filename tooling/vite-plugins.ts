@@ -121,7 +121,9 @@ export function vm(): Plugin {
 /** Changes with v86 and with every image build; names the service worker's VM cache. */
 export function vmVersion(): string {
   const v86 = JSON.parse(readFileSync(join(ROOT, 'node_modules/v86/package.json'), 'utf8')).version as string;
-  const images = readdirSync(join(ROOT, 'vendor/vm')).sort().map((image) => readFileSync(join(ROOT, 'vendor/vm', image, 'manifest.json'), 'utf8'));
+  // Every image is a folder with a manifest; stray files such as .DS_Store are not images.
+  const images = readdirSync(join(ROOT, 'vendor/vm'), { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort()
+    .map((image) => readFileSync(join(ROOT, 'vendor/vm', image, 'manifest.json'), 'utf8'));
   return createHash('sha256').update([v86, ...images].join('\n')).digest('hex').slice(0, 12);
 }
 
