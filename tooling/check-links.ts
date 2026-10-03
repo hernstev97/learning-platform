@@ -74,7 +74,8 @@ async function worker() {
     if (anchor && body && !/^:~:/.test(anchor)) {
       const escaped = decodeURIComponent(anchor).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       // GitHub renders README headings with ids prefixed by `user-content-`; the URL leaves the prefix out.
-      if (!new RegExp(`(id|name)\\s*=\\s*["']?(?:user-content-)?${escaped}["'\\s>]`).test(body)) problems.push(`Anker fehlt  ${url}\n      in ${[...new Set(uses.get(url))].join(', ')}`);
+      const prefix = new URL(page).hostname === 'github.com' ? '(?:user-content-)?' : '';
+      if (!new RegExp(`(id|name)\\s*=\\s*["']?${prefix}${escaped}["'\\s>]`).test(body)) problems.push(`Anker fehlt  ${url}\n      in ${[...new Set(uses.get(url))].join(', ')}`);
     }
   }
 }
