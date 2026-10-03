@@ -14,21 +14,23 @@ export const slug = (value: string) => value.toLowerCase()
 const LABELS: Record<string, string> = {
   kotlin: 'Kotlin', rust: 'Rust', python: 'Python', shell: 'Shell', console: 'Terminal', yaml: 'YAML', toml: 'TOML', json: 'JSON',
   sql: 'SQL', xml: 'XML', dockerfile: 'Dockerfile', ini: 'Konfiguration', diff: 'Diff', text: 'Text',
-  excel: 'Excel-Formel', powerquery: 'Power Query (M)', csv: 'CSV',
+  excel: 'Excel-Formel', powerquery: 'Power Query (M)', csv: 'CSV', typescript: 'TypeScript', javascript: 'JavaScript',
 };
 
 /** Render a fenced code block; shared by lessons and exercise code. */
 export function codeBlock(text: string, info = ''): string {
   const [lang = '', ...flags] = info.trim().split(/\s+/);
   const name = languageOf(lang);
-  // Python runs as a script; SQL runs statement by statement against a fresh in-memory SQLite database.
-  const runnable = flags.includes('run') && (name === 'python' || name === 'sql');
+  // Python runs as a script (or, marked `pytest`, as a test file under pytest); SQL runs statement by statement
+  // against a fresh in-memory SQLite database.
+  const pytest = flags.includes('pytest') && name === 'python';
+  const runnable = pytest || (flags.includes('run') && (name === 'python' || name === 'sql'));
   // Shell commands that run unchanged in the Linux VM get a button that types them into the lesson's terminal.
   const vm = flags.includes('vm') && (name === 'shell' || name === 'console');
   const playground = name === 'rust' && /\bfn main\s*\(/.test(text) && !flags.includes('norun') && !flags.includes('nocheck');
   const title = flags.find((flag) => flag.startsWith('title='))?.slice(6).replace(/_/g, ' ');
-  const label = title ?? LABELS[name] ?? (lang || 'Text');
-  const attrs = [`data-lang="${escape(name)}"`, runnable ? `data-run="${name}"` : '', vm ? 'data-vm' : '', playground ? 'data-playground="rust"' : ''].filter(Boolean).join(' ');
+  const label = title ?? (pytest ? 'Python · pytest' : LABELS[name]) ?? (lang || 'Text');
+  const attrs = [`data-lang="${escape(name)}"`, runnable ? `data-run="${pytest ? 'pytest' : name}"` : '', vm ? 'data-vm' : '', playground ? 'data-playground="rust"' : ''].filter(Boolean).join(' ');
   const body = runnable
     ? `<textarea class="code-editor" wrap="off" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="${name === 'sql' ? 'SQL' : 'Python'}-Code, editierbar">${escape(text)}</textarea>`
     : `<pre tabindex="0"><code>${highlight(text, name)}</code></pre>`;

@@ -73,7 +73,9 @@ async function worker() {
     if (status < 200 || status >= 400) { problems.push(`${status || 'Netzwerkfehler'}  ${url}\n      in ${[...new Set(uses.get(url))].join(', ')}`); continue; }
     if (anchor && body && !/^:~:/.test(anchor)) {
       const escaped = decodeURIComponent(anchor).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      if (!new RegExp(`(id|name)=["']?${escaped}["'\\s>]`).test(body)) problems.push(`Anker fehlt  ${url}\n      in ${[...new Set(uses.get(url))].join(', ')}`);
+      // GitHub renders README headings with ids prefixed by `user-content-`; the URL leaves the prefix out.
+      const prefix = new URL(page).hostname === 'github.com' ? '(?:user-content-)?' : '';
+      if (!new RegExp(`(id|name)\\s*=\\s*["']?${prefix}${escaped}["'\\s>]`).test(body)) problems.push(`Anker fehlt  ${url}\n      in ${[...new Set(uses.get(url))].join(', ')}`);
     }
   }
 }

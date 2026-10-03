@@ -1,5 +1,8 @@
 import { test, expect, type Page } from '@playwright/test';
-import { loadContent } from '../tooling/content.ts';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { parse as parseYaml } from 'yaml';
+import { CONTENT, lessonBlocks, loadContent } from '../tooling/content.ts';
 import type { Exercise } from '../src/content/types.ts';
 import { gapSolution } from '../src/engine/answers.ts';
 
@@ -131,7 +134,7 @@ for (const area of loaded.catalog.areas) {
     expect(errors).toEqual([]);
   });
 
-  if (['python', 'automation', 'data'].includes(area.id)) test(`${area.id}: every runnable solution passes in the actual browser runtime`, async ({ page }) => {
+  if (['python', 'automation', 'data', 'testing'].includes(area.id)) test(`${area.id}: every runnable solution passes in the actual browser runtime`, async ({ page }) => {
     test.setTimeout(480_000);
     const errors: string[] = [];
     page.on('pageerror', (error) => errors.push(error.message));
@@ -151,6 +154,31 @@ for (const area of loaded.catalog.areas) {
       }
     }
     expect(executed).toBeGreaterThan(0);
+    expect(errors).toEqual([]);
+  });
+
+  // `pnpm verify` runs lesson pytest blocks with CPython; this runs them where learners do, in Pyodide.
+  const pytestBlocks = Object.values(loaded.areas[area.id].modules).filter((module) => !module.bear).map((module) => ({
+    module,
+    blocks: lessonBlocks(String(parseYaml(readFileSync(join(CONTENT, area.id, 'modules', `${module.id}.yaml`), 'utf8')).lesson ?? ''))
+      .filter((block) => block.lang === 'python' && block.flags.includes('pytest')),
+  })).filter(({ blocks }) => blocks.length);
+  if (pytestBlocks.length) test(`${area.id}: every pytest lesson block gives its expected result in the browser runtime`, async ({ page }) => {
+    test.setTimeout(300_000);
+    const errors: string[] = [];
+    page.on('pageerror', (error) => errors.push(error.message));
+    for (const { module, blocks } of pytestBlocks) {
+      await page.goto(`/${area.id}/${module.id}`);
+      const rendered = page.locator('.codeblock[data-run="pytest"]');
+      await expect(rendered).toHaveCount(blocks.length);
+      for (const [i, block] of blocks.entries()) {
+        const output = rendered.nth(i).locator('.run-output');
+        await rendered.nth(i).getByRole('button', { name: 'Ausführen' }).click();
+        await expect(output, `${module.id}, pytest-Block ${i + 1}`).toContainText(/\d+ (passed|failed)/, { timeout: 90_000 });
+        if (block.flags.includes('fails')) await expect(output, `${module.id}, pytest-Block ${i + 1}`).toContainText(/\d+ failed/);
+        else await expect(output, `${module.id}, pytest-Block ${i + 1}`).not.toHaveClass(/error/);
+      }
+    }
     expect(errors).toEqual([]);
   });
 }

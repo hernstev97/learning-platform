@@ -1,0 +1,853 @@
+id: e2e-tests
+title: End-to-End-Tests mit Playwright
+level: 2
+minutes: 150
+summary: Wenige kritische Abläufe – Registrierung, Buchen und Bezahlen, Rückgabe – im echten Browser absichern, mit Locators und Web-first-Assertions, isolierten Kontexten und Testdaten aus der API, und alles andere bewusst tiefer testen.
+goals:
+  - Du wählst die wenigen Journeys, die einen E2E-Test rechtfertigen, und begründest für andere Prüfungen eine tiefere Ebene.
+  - Du schreibst Playwright-Tests mit nutzernahen Locators und Web-first-Assertions, die ohne feste Wartezeiten auskommen.
+  - Du isolierst Tests über Browser-Kontexte, eine gespeicherte Anmeldung aus einem Setup-Projekt und eigene Testdaten aus der API.
+  - Du setzt `page.route`, Fixtures und Page Objects gezielt ein und kennst ihre Kosten.
+  - Du beschleunigst eine Suite mit Parallelität und Sharding und untersuchst rote Läufe mit Retries und dem Trace Viewer.
+resources:
+  - title: Playwright · Best Practices
+    url: https://playwright.dev/docs/best-practices
+  - title: Playwright · Authentication
+    url: https://playwright.dev/docs/auth
+  - title: Playwright · Fixtures
+    url: https://playwright.dev/docs/test-fixtures
+  - title: Playwright · Trace Viewer
+    url: https://playwright.dev/docs/trace-viewer
+lesson: |
+  Radwerk hatte 2025 eine E2E-Suite mit 380 Tests. Sie prüfte jede Preisregel, jede Meldung des Buchungsformulars und jeden Filter der Stationskarte – alles durch den Browser. Ein Lauf dauerte 50 Minuten, etwa jeder fünfzehnte war rot, ohne dass etwas kaputt war. Das Team klickte auf „Re-run“, bis es grün wurde. Dann kam ein echter Fehler: Nach dem Bezahlen zeigte die Seite manchmal die Bestätigung einer fremden Reservierung. Der rote Lauf, der ihn meldete, sah aus wie alle anderen. Niemand sah hin.
+
+  Heute sichert Radwerk mit Playwright Test drei Abläufe ab, ohne die das Geschäft steht: Registrierung, Buchen und Bezahlen, Rückgabe. 14 Tests, drei Minuten. Alles andere testet das Team tiefer. Dieses Modul zeigt, wie diese Tests aussehen und warum es nicht mehr werden. Die Beispiele nutzen Playwright 1.63. Komponenten mit Testing Library zu testen, behandelt [Frontend-Tests](/testing/frontend-tests).
+
+  ## Wofür E2E-Tests da sind: wenige kritische Journeys
+
+  Ein End-to-End-Test bedient die fertige Anwendung wie eine Kundin: echter Browser, echte Website, echte API, echte Datenbank. Nur er zeigt, ob die Teile zusammenpassen – Session-Cookie und Weiterleitung nach dem Login, die Reservierungsnummer, die vom Backend über die Zahlungsseite bis in „Meine Fahrten“ wandert, die Konfiguration der Umgebung mit CORS, Umgebungsvariablen und Routing. Dafür zahlst du:
+
+  - **Zeit.** Ein Test dauert Sekunden statt Millisekunden.
+  - **Unsicherheit.** Mehr bewegliche Teile heißt mehr Gelegenheiten für Zufall: Netz, asynchrone Oberfläche, Testdaten, Drittanbieter.
+  - **Schlechte Fehlerortung.** „Buchen fehlgeschlagen“ sagt nicht, ob Formular, API, Datenbank oder Zahlung schuld ist.
+  - **Pflege.** Eine Umgestaltung der Seite trifft viele Tests gleichzeitig, und die Suite braucht eine eigene Umgebung mit Daten.
+
+  Deshalb testet E2E Journeys, keine Regeln. Für Radwerk sieht die Aufteilung so aus:
+
+  | Journey | Prüft nur E2E | Gehört tiefer |
+  | --- | --- | --- |
+  | Registrierung | Konto anlegen, Sitzung, Weiterleitung ins Konto | Passwortregeln (Komponententest), doppelte E-Mail-Adresse → 409 (API-Test) |
+  | Buchen und Bezahlen | Station → Reservierung → Paystream → Bestätigung → „Meine Fahrten“ | Tarif, Tageshöchstpreis, Gutscheine (Unit), Konflikt 409 (API und Komponente), Webhook-Format von Paystream (Contract) |
+  | Rückgabe | Fahrt beenden, Rechnung erscheint im Konto | Minutenabrechnung und Zeitzone (Unit), Rechnungsformat (API) |
+
+  Pro Journey gibt es einen Normalfall und die ein, zwei Fehlerfälle, die erst im Zusammenspiel entstehen, etwa eine abgelehnte Zahlung. Die Begründung liefert die Regel aus [Testpyramide und Testgrenzen](/testing/testpyramide): Jedes Risiko auf der niedrigsten Ebene testen, die es zuverlässig zeigt, und dieselbe Prüfung nicht auf mehreren Ebenen wiederholen.
+
+  > [!MERKE]
+  > Ein E2E-Test pro Geschäftsablauf, nicht pro Regel. Jede Regel, die eine tiefere Ebene zuverlässig zeigt, gehört dorthin.
+
+  ## Locators und Web-first-Assertions: warten ohne waitForTimeout
+
+  So sieht die Journey „Buchen und Bezahlen“ aus. Die Fixture `kunde` legt eine eigene Testkundin an und meldet sie an; dazu später mehr.
+
+  ```ts title=e2e/buchen.spec.ts
+  import { test, expect } from './fixtures'
+
+  test('Kundin reserviert ein City-Rad und bezahlt mit Paystream', async ({ page, kunde }) => {
+    await page.goto('/stationen/hbf')
+    await page.getByLabel('Dauer').selectOption('1 Stunde')
+    await page
+      .getByRole('listitem')
+      .filter({ hasText: 'City-Rad 17' })
+      .getByRole('button', { name: 'Reservieren' })
+      .click()
+
+    await expect(page.getByText('Zu zahlen: 3,00 €')).toBeVisible()
+    await page.getByLabel('Kartennummer').fill('4242 4242 4242 4242')
+    await page.getByRole('button', { name: 'Mit Paystream bezahlen' }).click()
+    await expect(page.getByRole('status')).toHaveText('Bezahlt')
+
+    await page.goto('/konto')
+    await expect(page.getByRole('listitem').filter({ hasText: 'City-Rad 17' })).toContainText('bezahlt')
+  })
+  ```
+
+  Die Locators folgen derselben Idee wie Testing Library: Rolle und Name zuerst, dann Label und Text, Test-IDs zuletzt. `filter({ hasText })` grenzt eine Liste auf den Eintrag mit dem richtigen Rad ein. Ein Locator ist eine Beschreibung, kein gefundenes Element: Playwright sucht bei jeder Aktion neu. Passt er auf mehrere Elemente, wirft die Aktion einen Fehler, statt still das erste zu nehmen.
+
+  Vor jeder Aktion wartet Playwright, bis das Element bereit ist: sichtbar, ruhig (keine Animation), aktiviert und nicht von etwas anderem verdeckt ([Auto-waiting](https://playwright.dev/docs/actionability)). Assertions wie `toBeVisible`, `toHaveText` und `toHaveURL` sind *web-first*: Sie prüfen wiederholt, bis die Bedingung stimmt oder der Expect-Timeout von 5 Sekunden abläuft ([Auto-retrying assertions](https://playwright.dev/docs/test-assertions#auto-retrying-assertions)). Deshalb braucht der Test oben keine einzige Pause, obwohl die Zahlungsprüfung eine Weile dauert.
+
+  ```ts
+  // schlecht: feste Pause und Momentaufnahme
+  await page.waitForTimeout(2000)
+  expect(await page.getByRole('status').textContent()).toBe('Bezahlt')
+
+  // gut: wartet, bis der Text stimmt, höchstens bis zum Expect-Timeout
+  await expect(page.getByRole('status')).toHaveText('Bezahlt')
+  ```
+
+  Ohne die Pause scheitert die erste Variante mit `Expected: "Bezahlt"`, `Received: "Zahlung wird geprüft …"`. Mit Pause wartet sie auf schnellen Rechnern zwei Sekunden zu lang und ist auf einer ausgelasteten CI-Maschine trotzdem zu kurz. Die Doku nennt `waitForTimeout` deshalb „inherently flaky“ ([page.waitForTimeout](https://playwright.dev/docs/api/class-page#page-wait-for-timeout)).
+
+  Willst du auf eine Netzantwort warten, starte das Warten vor der Aktion, die sie auslöst. `page.waitForResponse` lauscht erst ab dem Aufruf; eine Antwort, die schon da war, verpasst es:
+
+  ```ts
+  const zahlung = page.waitForResponse('**/zahlung')
+  await page.getByRole('button', { name: 'Mit Paystream bezahlen' }).click()
+  expect((await zahlung).ok()).toBe(true)
+  ```
+
+  Warten ist nur eine von vielen Ursachen für Tests, die mal grün und mal rot sind. Zeit, geteilter Zustand und Reihenfolge behandelt [Flaky Tests](/testing/flaky-tests).
+
+  ## Isolation: Browser-Kontexte, Anmeldung und Testdaten
+
+  Jeder Test bekommt einen neuen Browser-Kontext, vergleichbar mit einem frischen Inkognito-Profil: eigene Cookies, eigener Local Storage, eigener Cache. Ein Kontext entsteht in Millisekunden, deshalb kann Playwright das für jeden Test tun ([Isolation](https://playwright.dev/docs/browser-contexts#how-playwright-achieves-test-isolation)). Der Browser ist damit isoliert. Der Server ist es nicht: Alle Tests teilen dieselbe Datenbank.
+
+  Sich in jedem Test über das Formular anzumelden, kostet Sekunden und testet das Login 14-mal. Stattdessen meldet ein Setup-Projekt die Stammkundin einmal an und speichert Cookies und Local Storage mit `storageState` in eine Datei. Die anderen Projekte hängen davon ab und starten bereits angemeldet ([Authentication · Shared account](https://playwright.dev/docs/auth#basic-shared-account-in-all-tests)):
+
+  ```ts title=playwright.config.ts
+  import { defineConfig, devices } from '@playwright/test'
+
+  export default defineConfig({
+    testDir: './e2e',
+    fullyParallel: true,
+    forbidOnly: !!process.env.CI,
+    retries: process.env.CI ? 2 : 0,
+    workers: process.env.CI ? 1 : undefined,   // in der CI: ein Worker je Maschine, Tempo über Shards
+    reporter: process.env.CI ? 'blob' : 'html',
+    use: {
+      baseURL: process.env.RADWERK_URL ?? 'http://127.0.0.1:4010',
+      trace: 'on-first-retry',
+    },
+    projects: [
+      { name: 'setup', testMatch: /.*\.setup\.ts/ },
+      {
+        name: 'chromium',
+        use: { ...devices['Desktop Chrome'], storageState: 'playwright/.auth/stammkundin.json' },
+        dependencies: ['setup'],
+      },
+    ],
+  })
+  ```
+
+  ```ts title=e2e/auth.setup.ts
+  import { test as setup, expect } from '@playwright/test'
+
+  const authFile = 'playwright/.auth/stammkundin.json'
+
+  setup('Stammkundin anmelden', async ({ page }) => {
+    await page.goto('/anmelden')
+    await page.getByLabel('E-Mail').fill('stammkundin@test.radwerk.de')
+    await page.getByLabel('Passwort').fill(process.env.STAMMKUNDIN_PASSWORT!)
+    await page.getByRole('button', { name: 'Anmelden' }).click()
+    await expect(page.getByRole('heading', { name: 'Hallo Stammkundin' })).toBeVisible()
+    await page.context().storageState({ path: authFile })
+  })
+  ```
+
+  Die Assertion vor `storageState` ist wichtig: Erst wenn das Konto sichtbar ist, steht das Session-Cookie fest. Die Datei enthält gültige Sitzungen und gehört in `.gitignore`.
+
+  Ein gemeinsames Konto taugt nur für Tests, die den Serverzustand nicht ändern – das sagt auch die Doku. Bucht ein Test ein Rad, während ein anderer „Meine Fahrten“ prüft, sehen sie sich gegenseitig. Tests, die Daten ändern, bekommen deshalb eigene Daten: eine eigene Kundin, angelegt über eine Test-API der Testumgebung (siehe Fixtures unten). Die Registrierung braucht dagegen einen abgemeldeten Start, also einen leeren Speicherzustand: `test.use({ storageState: { cookies: [], origins: [] } })`.
+
+  Vorbedingungen legst du über die API an, nicht über die Oberfläche. Der Rückgabe-Test braucht eine bezahlte Reservierung. Sie per Klick zu erzeugen, hieße, die Buchungs-Journey ein zweites Mal zu testen – langsamer und mit einer Abhängigkeit mehr. Die Test-API legt sie direkt als bezahlt an ([API testing · Establishing preconditions](https://playwright.dev/docs/api-testing#establishing-preconditions)):
+
+  ```ts title=e2e/rueckgabe.spec.ts
+  test('Rückgabe beendet die Fahrt und zeigt die Rechnung', async ({ page, kunde }) => {
+    const antwort = await page.request.post('/api/test/reservierungen', {
+      data: { rad: 'City-Rad 23', minuten: 45 },
+    })
+    const { nummer } = await antwort.json()
+
+    await page.goto('/konto')
+    await page
+      .getByRole('listitem')
+      .filter({ hasText: nummer })
+      .getByRole('button', { name: 'Fahrt beenden' })
+      .click()
+
+    // Der Betrag hängt von der Fahrzeit ab; die Berechnung prüfen Unit-Tests.
+    await expect(page.getByRole('status')).toHaveText(/^Rückgabe bestätigt\. Rechnung: \d+,\d{2}\s€$/)
+  })
+  ```
+
+  `page.request` teilt die Cookies mit dem Browser-Kontext, die Anfrage läuft also als angemeldete Kundin. Der reguläre Ausdruck nutzt `\s` vor dem Euro-Zeichen, weil `Intl.NumberFormat` dort ein geschütztes Leerzeichen setzt. Beim Vergleich mit einem String gleicht Playwright Leerraum an, bei einem regulären Ausdruck nicht; mit einem normalen Leerzeichen vor `€` scheiterte dieser Test.
+
+  Eindeutige Daten erzeugst du mit `crypto.randomUUID()`. `testInfo.testId` unterscheidet zwar parallele Tests, ist aber in jedem Lauf und bei jedem Retry gleich. Gegen eine Staging-Datenbank, die Daten behält, kollidiert eine damit gebaute E-Mail-Adresse spätestens beim zweiten Lauf. Für Ressourcen, die es nur einmal gibt, etwa die Händlereinstellungen im Paystream-Sandbox-Konto, kennt Playwright seit 1.63 Locks: `test('…', { lock: 'paystream-konto' }, …)` läuft nie gleichzeitig mit einem anderen Test, der denselben Lock hält ([Test locks](https://playwright.dev/docs/test-parallel#test-locks)).
+
+  ## Netzwerk abfangen mit page.route – und wann nicht
+
+  `page.route` fängt Anfragen ab, die die Seite stellt, und beantwortet, verändert oder verwirft sie ([Network · Handle requests](https://playwright.dev/docs/network#handle-requests)). Der Paystream-Baustein auf der Bezahlseite schickt die Kartendaten direkt aus dem Browser an Paystream. Für den Fehlerfall soll Paystream ablehnen, und zwar in jedem Lauf gleich. Statt sich auf die Sandbox zu verlassen, antwortet der Test selbst:
+
+  ```ts
+  test('abgelehnte Zahlung lässt die Reservierung offen', async ({ page, kunde }) => {
+    await page.route('**/v1/zahlungen', (route) =>
+      route.fulfill({ json: { id: null, status: 'declined', grund: 'Karte abgelehnt' } }),
+    )
+    await page.goto('/stationen/hbf')
+    await page.getByRole('listitem').filter({ hasText: 'E-Bike 4' }).getByRole('button', { name: 'Reservieren' }).click()
+    await page.getByLabel('Kartennummer').fill('4242 4242 4242 4242')
+    await page.getByRole('button', { name: 'Mit Paystream bezahlen' }).click()
+
+    await expect(page.getByRole('status')).toHaveText('Zahlung abgelehnt: Karte abgelehnt')
+  })
+  ```
+
+  `page.route` passt für Drittanbieter im Browser, die du nicht kontrollierst – Zahlungsbausteine, Karten, Analytics –, und für Fehlerfälle, die sich echt kaum herstellen lassen. Die Doku rät ausdrücklich, fremde Dienste nicht mitzutesten ([Best Practices · Third-party dependencies](https://playwright.dev/docs/best-practices#avoid-testing-third-party-dependencies)). Es passt nicht für die eigene API: Stubbt ein Journey-Test alle Aufrufe an `/api/**`, prüft er nur noch die Oberfläche – das kann ein Komponententest mit MSW schneller. Und es sieht keine Aufrufe zwischen Servern. Bestätigt das Radwerk-Backend die Zahlung bei Paystream oder empfängt es deren Webhook, läuft nichts davon durch den Browser. Dafür nutzt die Testumgebung die Paystream-Sandbox oder einen Fake-Dienst, und das Format der Webhooks sichert ein [Contract Test](/testing/contract-testing).
+
+  ## Fixtures und Page Objects
+
+  Fixtures liefern einem Test, was er braucht, und räumen danach auf ([Fixtures · Creating a fixture](https://playwright.dev/docs/test-fixtures#creating-a-fixture)). Der Code vor `use` ist der Aufbau, der Code danach der Abbau – er läuft auch, wenn der Test scheitert. Playwright baut eine Fixture nur, wenn ein Test sie in seiner Parameterliste nennt. Anders als ein `beforeEach` sieht man so jedem Test an, wovon er abhängt.
+
+  ```ts title=e2e/fixtures.ts
+  import { test as base, expect } from '@playwright/test'
+  import { Stationsseite } from './stationsseite'
+
+  type Kunde = { email: string; passwort: string; name: string }
+
+  export const test = base.extend<{ kunde: Kunde; stationsseite: Stationsseite }>({
+    kunde: async ({ page }, use) => {
+      const antwort = await page.request.post('/api/test/kunden', { data: { name: 'Mia Test' } })
+      const kunde: Kunde = await antwort.json()
+      await page.request.post('/api/anmelden', { data: { email: kunde.email, passwort: kunde.passwort } })
+      await use(kunde)
+      await page.request.delete(`/api/test/kunden/${encodeURIComponent(kunde.email)}`)
+    },
+    stationsseite: async ({ page }, use) => {
+      await use(new Stationsseite(page))
+    },
+  })
+
+  export { expect }
+  ```
+
+  Die Test-API (`/api/test/…`) gibt es nur in der Testumgebung. Sie legt Kundinnen mit zufälliger E-Mail-Adresse an, damit parallele Tests sich nicht in die Quere kommen.
+
+  Ein Page Object bündelt die Locators und Aktionen einer Seite in einer Klasse ([Page object models](https://playwright.dev/docs/pom)):
+
+  ```ts title=e2e/stationsseite.ts
+  import type { Locator, Page } from '@playwright/test'
+
+  export class Stationsseite {
+    readonly page: Page
+    readonly dauer: Locator
+
+    constructor(page: Page) {
+      this.page = page
+      this.dauer = page.getByLabel('Dauer')
+    }
+
+    async oeffnen(station: string) {
+      await this.page.goto(`/stationen/${station}`)
+    }
+
+    async reservieren(rad: string) {
+      await this.page
+        .getByRole('listitem')
+        .filter({ hasText: rad })
+        .getByRole('button', { name: 'Reservieren' })
+        .click()
+    }
+  }
+  ```
+
+  Der Vorteil: Heißt der Knopf morgen „Jetzt reservieren“, änderst du eine Zeile statt zehn Tests, und der Test liest sich wie eine Folge von Schritten. Der Preis: eine Schicht mehr, die man lesen muss. Page Objects wachsen gern zu Klassen mit 40 Methoden für jede Seite, und Assertions, die in ihnen versteckt sind, machen Tests schwer verständlich. Bei 14 Tests lohnt sich ein Page Object nur für Seiten, die mehrere Tests nutzen. Die Assertions bleiben im Test.
+
+  ## Parallelität, Sharding, Retries und Trace Viewer
+
+  Playwright führt Testdateien in parallelen Worker-Prozessen aus; `fullyParallel: true` verteilt auch die Tests einer Datei. Das funktioniert nur mit den isolierten Daten aus dem Abschnitt oben – teilen zwei Tests eine Reservierung, entscheidet der Zufall der Verteilung. Reicht ein Rechner nicht, teilt Sharding die Suite auf mehrere Maschinen. In der CI empfiehlt Playwright einen Worker pro Maschine, damit jeder Test die volle Leistung bekommt; Tempo kommt dort aus Shards ([CI · Workers](https://playwright.dev/docs/ci#workers)). Jeder Shard führt auch das Setup-Projekt aus. Mit dem Reporter `blob` legt jeder Shard einen Bericht ab, `merge-reports` fügt sie zusammen ([Sharding · Merging reports](https://playwright.dev/docs/test-sharding#merging-reports-from-multiple-shards)). Wie die CI die Shards startet und die Berichte einsammelt, zeigt [Tests in der CI](/testing/ci-pipelines).
+
+  ```console
+  $ npx playwright test --shard=1/2
+  $ npx playwright test --shard=2/2
+  $ npx playwright merge-reports --reporter html ./all-blob-reports
+  ```
+
+  Retries wiederholen einen roten Test. Playwright unterscheidet dann drei Ergebnisse: *passed* (beim ersten Versuch grün), *flaky* (erst im Retry grün) und *failed*:
+
+  ```console
+  $ npx playwright test --retries=2 --reporter=list
+  Running 7 tests using 6 workers
+    ✓  1 [setup] › e2e/auth.setup.ts:5:1 › Stammkundin anmelden (976ms)
+    ✓  3 [chromium] › e2e/konto.spec.ts:3:1 › Stammkundin sieht ihr Konto (89ms)
+    …
+    ✘  6 [chromium] › e2e/zahlungsseite.spec.ts:3:1 › Zahlungsseite zeigt den Betrag (692ms)
+    ✓  8 [chromium] › e2e/zahlungsseite.spec.ts:3:1 › Zahlungsseite zeigt den Betrag (retry #1) (187ms)
+    …
+    1 flaky
+      [chromium] › e2e/zahlungsseite.spec.ts:3:1 › Zahlungsseite zeigt den Betrag
+    6 passed (3.2s)
+  ```
+
+  Die Pipeline ist grün, aber „1 flaky“ ist ein Fehlerbericht. Retries kaufen Zeit, sie beheben nichts. Hätte Radwerk 2025 jeden flaky Test als Aufgabe behandelt, wäre die fremde Reservierung früh aufgefallen. Seit 1.62 führt `retryStrategy: 'isolated'` die Wiederholungen erst am Ende aus, nacheinander in einem einzigen Worker. Besteht ein Test erst dort, deutet das auf eine Wechselwirkung mit anderen Tests hin.
+
+  Für die Ursache gibt es den Trace Viewer. `trace: 'on-first-retry'` zeichnet beim ersten Retry eine Spur auf: jede Aktion mit DOM-Schnappschuss davor und danach, Netzwerkanfragen, Konsolenausgaben, den Quelltext und die Fehlermeldung ([Trace Viewer · Features](https://playwright.dev/docs/trace-viewer#trace-viewer-features)). Geöffnet wird sie mit `npx playwright show-trace pfad/zur/trace.zip` oder unter trace.playwright.dev. Diese Spur zeigt den Wiederholungsversuch, nicht den ersten Fehlschlag. Wer genau den sehen will, nimmt `'retain-on-first-failure'`: Playwright zeichnet jeden ersten Versuch auf und behält die Spur nur, wenn er scheitert ([Trace modes](https://playwright.dev/docs/test-use-options#trace-modes)). Traces für jeden Lauf (`'on'`) kosten spürbar Zeit und Speicher.
+
+  > [!PRAXIS] Die E2E-Suite von Radwerk
+  > 14 Tests für drei Journeys, vier Shards pro Pull Request mit je einem Worker, wie es die Playwright-Doku für die CI empfiehlt; `fullyParallel` verteilt die einzelnen Tests auf die Shards. Drei Minuten Laufzeit. `retries: 2` nur in der CI, Traces beim ersten Retry als Artefakt. Jeder Test mit dem Ergebnis „flaky“ landet als Ticket im Sprint; wer einen neuen E2E-Test vorschlägt, nennt im Pull Request das Risiko, das keine tiefere Ebene abdeckt. Nachts läuft dieselbe Suite gegen die echte Paystream-Sandbox ohne Stubs.
+
+  ## Häufige Fehler
+
+  - **Regeln E2E testen.** Jede Preisregel als Browser-Test macht die Suite langsam und rot aus den falschen Gründen. Regeln gehören in Unit- und Komponententests.
+  - **Feste Pausen.** `waitForTimeout(2000)` ist zu lang auf dem Laptop und zu kurz in der CI. Web-first-Assertions warten genau so lange wie nötig.
+  - **Momentaufnahmen in `expect`.** `expect(await locator.isVisible()).toBe(true)` prüft einmal. `await expect(locator).toBeVisible()` wiederholt.
+  - **`await` vor `expect` vergessen.** Der Test wartet nicht auf die Bedingung, die nächste Aktion läuft zu früh. Steht die Assertion am Ende, schließt Playwright die Seite, während sie noch prüft, und der Bericht zeigt einen verwirrenden Fehler mit `Received: ""` und „session closed“. Die ESLint-Regel `@typescript-eslint/no-floating-promises` findet das.
+  - **Auf eine Antwort warten, die schon da war.** `waitForResponse` vor der auslösenden Aktion starten.
+  - **CSS- und XPath-Selektoren.** `div.btn-primary > span` bricht beim nächsten Redesign. Rollen, Labels, Texte.
+  - **Abhängige Tests.** Test 2 nutzt die Buchung aus Test 1 und scheitert, sobald er allein, parallel oder im Retry läuft. Jeder Test legt seine Daten selbst an.
+  - **Ein Konto für alle.** Tests, die buchen, sehen gegenseitig ihre Reservierungen. Eigene Kundin pro Test.
+  - **Retries hochdrehen.** `retries: 5` macht die Pipeline grün und versteckt die Ursache.
+
+  > [!INTERVIEW] „Wie viele E2E-Tests sollte ein Projekt haben?“
+  > So wenige wie möglich und so viele, wie es geschäftskritische Abläufe gibt. Bei einem Fahrradverleih sind das Registrierung, Buchen mit Bezahlung und Rückgabe – je ein Normalfall und die Fehlerfälle, die nur im Zusammenspiel entstehen. Jede einzelne Regel teste ich tiefer, weil sie dort schneller läuft, verlässlicher ist und ein roter Test sofort sagt, wo der Fehler liegt. E2E-Tests schreibe ich mit Locators über Rollen und Web-first-Assertions, isoliere sie über eigene Testdaten aus der API und behandle jeden flaky Test als Bug, mit dem Trace als erstem Beweisstück.
+
+  ## Zusammenfassung
+
+  - E2E-Tests sichern wenige Journeys ab, die nur im Zusammenspiel aller Teile scheitern können. Regeln, Validierung und Statuscodes gehören tiefer.
+  - Locators über Rolle, Label und Text; Playwright wartet vor jeder Aktion auf Bereitschaft, Web-first-Assertions wiederholen bis zum Timeout. `waitForTimeout` und Momentaufnahmen machen Tests flaky.
+  - Jeder Test hat einen eigenen Browser-Kontext. Die Anmeldung kommt einmal aus einem Setup-Projekt (`storageState`, `dependencies`); Tests, die Daten ändern, bekommen eigene Kundinnen und Vorbedingungen über die API.
+  - `page.route` für Drittanbieter im Browser und schwer erzeugbare Fehler, nicht für die eigene API; Aufrufe zwischen Servern sieht es nicht.
+  - Fixtures (`test.extend`, Aufbau vor `use`, Abbau danach) machen Abhängigkeiten sichtbar. Page Objects schlank halten, Assertions im Test.
+  - `fullyParallel` und Sharding setzen isolierte Daten voraus. Retries ergeben „flaky“, nicht „grün“; `trace: 'on-first-retry'` liefert die Spur zur Ursache.
+exercises:
+  - id: journeys-waehlen
+    type: choice
+    title: Was gehört in die E2E-Suite?
+    prompt: |
+      Radwerk will die E2E-Suite klein halten. Welche dieser Prüfungen gehören hinein?
+    options:
+      - text: Eine neue Kundin registriert sich und landet angemeldet in ihrem Konto.
+        correct: true
+        why: Formular, API, Datenbank, Session-Cookie und Weiterleitung müssen zusammenspielen. Das zeigt nur ein Test durch die ganze Anwendung.
+      - text: Eine Kundin reserviert ein Rad, bezahlt mit der Paystream-Testkarte und sieht die Reservierung unter „Meine Fahrten“.
+        correct: true
+        why: Die zentrale Journey. Die Reservierungsnummer wandert durch Website, API, Zahlung und Konto – genau dort steckte der Fehler mit der fremden Bestätigung.
+      - text: Nach „Fahrt beenden“ zeigt das Konto eine Rechnung.
+        correct: true
+        why: Die Rückgabe ist der dritte geschäftskritische Ablauf. Ob die Rechnung erscheint, prüft E2E; den genauen Betrag prüfen Unit-Tests.
+      - text: 9 Stunden City-Rad an einem Tag kosten höchstens 1 500 Cent.
+        correct: false
+        why: Der Tageshöchstpreis ist eine Rechenregel mit vielen Grenzfällen (Tageswechsel in Europe/Berlin, Sommerzeit). Ein Unit-Test prüft sie alle in Millisekunden.
+      - text: Ein Gutscheincode in Kleinbuchstaben zeigt eine Formatmeldung.
+        correct: false
+        why: Formatprüfung als reine Funktion, die Meldung als Komponententest. Im Browser kostet derselbe Fall Sekunden.
+      - text: Eine überlappende Reservierung beantwortet die API mit 409.
+        correct: false
+        why: Ein Versprechen der API an alle Clients. Das prüft ein API-Test direkt am Endpunkt, ohne Browser.
+    explanation: |
+      Die Suite enthält die drei Abläufe, ohne die das Geschäft steht, und prüft dort das Zusammenspiel. Regeln, Formatfehler und Statuscodes liegen auf Ebenen, die sie schneller, verlässlicher und mit besserer Fehlerortung zeigen. Wer sie zusätzlich E2E testet, prüft dasselbe doppelt und bezahlt mit Laufzeit und Flakiness.
+    resources:
+      - title: Playwright · Best Practices, Testing philosophy
+        url: https://playwright.dev/docs/best-practices#testing-philosophy
+
+  - id: konto-waehlen
+    type: choice
+    title: Wer darf das gemeinsame Konto nutzen?
+    prompt: |
+      Das Setup-Projekt meldet die Stammkundin einmal an, und das Projekt `chromium` startet jeden Test mit ihrem `storageState`. Die Tests laufen mit `fullyParallel: true`. Welche Tests dürfen dieses gemeinsame Konto nutzen?
+    options:
+      - text: Prüft, dass „Mein Konto“ die hinterlegte Lieferadresse zeigt.
+        correct: true
+        why: Der Test liest nur. Egal, wie viele Tests gleichzeitig mit diesem Konto laufen, er sieht immer dieselbe Adresse.
+      - text: Prüft, dass die Tarifseite angemeldeten Kundinnen den Abo-Preis zeigt.
+        correct: true
+        why: Ebenfalls nur lesend. Ein gemeinsames Konto spart hier die Anmeldung in jedem Test.
+      - text: Bucht ein Rad und prüft, dass es unter „Meine Fahrten“ steht.
+        correct: false
+        why: Der Test ändert den Serverzustand. Parallel laufende Buchungstests schreiben in dieselbe Liste; Prüfungen wie „genau eine Fahrt“ werden zufällig rot. Er braucht eine eigene Kundin.
+      - text: Ändert die bevorzugte Zahlungsart der Kundin auf Lastschrift.
+        correct: false
+        why: Eine geteilte Einstellung. Bezahlt ein anderer Test gleichzeitig, läuft er plötzlich mit Lastschrift. Eigene Kundin oder, wenn es die Ressource nur einmal gibt, ein Lock.
+      - text: Registriert ein neues Konto über das Formular.
+        correct: false
+        why: "Die Registrierung muss abgemeldet starten. Sie braucht `test.use({ storageState: { cookies: [], origins: [] } })`."
+    explanation: |
+      Browser-Kontexte isolieren Cookies und Speicher, aber nicht die Datenbank. Ein gemeinsames Konto aus dem Setup-Projekt passt deshalb nur zu Tests, die nichts ändern – das empfiehlt auch die Playwright-Doku. Tests, die buchen oder Einstellungen ändern, bekommen eigene Testdaten, am billigsten über eine Fixture, die eine Kundin per API anlegt und anmeldet.
+    resources:
+      - title: Playwright · Authentication, shared account
+        url: https://playwright.dev/docs/auth#basic-shared-account-in-all-tests
+      - title: Playwright · One account per parallel worker
+        url: https://playwright.dev/docs/auth#moderate-one-account-per-parallel-worker
+
+  - id: setup-reihenfolge
+    type: order
+    title: Einmal anmelden, überall angemeldet
+    prompt: |
+      Bring die Zeilen des Setup-Tests in eine funktionierende Reihenfolge. Er meldet die Stammkundin an und speichert den Zustand erst, wenn die Anmeldung sicher abgeschlossen ist.
+    lang: ts
+    lines: |
+      import { test as setup, expect } from '@playwright/test'
+      const authFile = 'playwright/.auth/stammkundin.json'
+      setup('Stammkundin anmelden', async ({ page }) => {
+        await page.goto('/anmelden')
+        await page.getByLabel('E-Mail').fill('stammkundin@test.radwerk.de')
+        await page.getByLabel('Passwort').fill(process.env.STAMMKUNDIN_PASSWORT!)
+        await page.getByRole('button', { name: 'Anmelden' }).click()
+        await expect(page.getByRole('heading', { name: 'Hallo Stammkundin' })).toBeVisible()
+        await page.context().storageState({ path: authFile })
+      })
+    alternatives:
+      - [1, 2, 3, 4, 6, 5, 7, 8, 9, 10]
+      - [2, 1, 3, 4, 5, 6, 7, 8, 9, 10]
+      - [2, 1, 3, 4, 6, 5, 7, 8, 9, 10]
+    hints:
+      - Die Felder können in beliebiger Reihenfolge ausgefüllt werden, der Klick kommt danach.
+      - Was steht in der Datei, wenn `storageState` direkt nach dem Klick läuft und die Weiterleitung das Cookie erst noch setzt?
+    explanation: |
+      Der Setup-Test bedient das Login einmal wie eine Kundin. Entscheidend ist die vorletzte Zeile: Die Assertion wartet, bis das Konto sichtbar ist, und damit bis das Session-Cookie gesetzt ist. Ohne sie könnte `storageState` den Zustand mitten in der Weiterleitung speichern, und alle abhängigen Tests starten abgemeldet. Das Passwort kommt aus einer Umgebungsvariablen, nicht aus dem Code.
+    resources:
+      - title: Playwright · Authentication
+        url: https://playwright.dev/docs/auth#basic-shared-account-in-all-tests
+
+  - id: poll-uhr
+    type: output
+    title: Wann bemerkt die Assertion die Zahlung?
+    prompt: |
+      Das Programm modelliert eine wiederholende Assertion mit einer Fake-Uhr, wie `expect.poll` in Playwright: prüfen, Pause, prüfen … Die Pausen sind Playwrights Standard `[100, 250, 500, 1000]`, die letzte wiederholt sich. Die Seite zeigt 1 200 ms nach dem Klick „bezahlt“. Was gibt das Programm aus?
+    lang: typescript
+    code: |
+      let jetzt = 0
+
+      function status(): string {
+        return jetzt >= 1200 ? 'bezahlt' : 'offen'
+      }
+
+      function poll(soll: string, timeout: number): string {
+        const pausen = [100, 250, 500, 1000]
+        for (let versuch = 1; ; versuch++) {
+          if (status() === soll) return `bestanden bei ${jetzt} ms, ${versuch}. Versuch`
+          const pause = pausen[Math.min(versuch - 1, pausen.length - 1)]
+          if (jetzt + pause > timeout) return `Timeout bei ${jetzt} ms, Status ${status()}`
+          jetzt += pause
+        }
+      }
+
+      console.log(`Momentaufnahme: ${status()}`)
+      console.log(poll('bezahlt', 5000))
+      jetzt = 0
+      console.log(poll('bezahlt', 1000))
+    expected: |
+      Momentaufnahme: offen
+      bestanden bei 1850 ms, 5. Versuch
+      Timeout bei 850 ms, Status offen
+    hints:
+      - "Addiere die Pausen: 0, 100, 350, 850, 1 850 …"
+      - Beim zweiten Aufruf ist nach 850 ms die nächste Pause 1 000 ms lang. Passt sie noch in den Timeout?
+    explanation: |
+      Die Momentaufnahme bei 0 ms sieht „offen“ – so scheitert `expect(await locator.textContent()).toBe(…)`. Die wiederholende Prüfung schaut bei 0, 100, 350, 850 und 1 850 ms; der Status wechselt bei 1 200 ms, bemerkt wird er beim fünften Versuch. Mit 1 000 ms Timeout passt nach 850 ms keine weitere Pause mehr, die Assertion gibt auf. Daraus folgen zwei Dinge: Ein zu knapper Timeout macht einen Test rot, obwohl die Seite gleich fertig wäre, und die Abstände wachsen, damit lange Wartezeiten nicht hunderte Prüfungen kosten. Das Modell bildet `expect.poll` ab; Web-first-Assertions wie `toHaveText` prüfen intern noch dichter.
+    resources:
+      - title: Playwright · expect.poll
+        url: https://playwright.dev/docs/test-assertions#expectpoll
+
+  - id: zu-spaet-gelauscht
+    type: output
+    title: Wer zu spät zuhört
+    prompt: |
+      `warteAufAntwort` arbeitet wie `page.waitForResponse`: Es lauscht ab seinem Aufruf auf Antworten und gibt nach dem Timeout auf. Was gibt das Programm aus?
+    lang: typescript
+    code: |
+      import { EventEmitter } from 'node:events'
+
+      const seite = new EventEmitter()
+
+      // Der Klick schickt die Zahlung ab; die Antwort ist sofort da.
+      async function klickeBezahlen(): Promise<void> {
+        console.log('Klick')
+        await Promise.resolve()
+        seite.emit('response', '/api/reservierungen/R-1042/zahlung')
+      }
+
+      function warteAufAntwort(teil: string, timeoutMs: number): Promise<string> {
+        return new Promise((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error(`Timeout nach ${timeoutMs} ms`)), timeoutMs)
+          seite.on('response', (url: string) => {
+            if (url.includes(teil)) {
+              clearTimeout(timer)
+              resolve(url)
+            }
+          })
+        })
+      }
+
+      // A: erst klicken, dann warten
+      await klickeBezahlen()
+      try {
+        console.log('A:', await warteAufAntwort('/zahlung', 50))
+      } catch (fehler) {
+        console.log('A:', (fehler as Error).message)
+      }
+
+      // B: erst lauschen, dann klicken, dann warten
+      const antwort = warteAufAntwort('/zahlung', 50)
+      await klickeBezahlen()
+      console.log('B:', await antwort)
+    expected: |
+      Klick
+      A: Timeout nach 50 ms
+      Klick
+      B: /api/reservierungen/R-1042/zahlung
+    hints:
+      - In Variante A ist die Antwort schon gemeldet, bevor `warteAufAntwort` seinen Listener registriert.
+    explanation: |
+      Ein `EventEmitter` gibt Ereignisse nur an Listener weiter, die in diesem Moment registriert sind. In Variante A ist die Antwort schon durch, als der Listener entsteht; er wartet vergeblich bis zum Timeout. In Variante B lauscht er vor dem Klick und bekommt die Antwort. Genau so arbeitet `page.waitForResponse`. Deshalb steht in Playwright-Tests das Warte-Promise vor der Aktion und das `await` danach. Im echten Netz ist die Antwort meist langsamer als die nächste Codezeile; Variante A ist dann mal grün und mal rot.
+    resources:
+      - title: Playwright · page.waitForResponse
+        url: https://playwright.dev/docs/api/class-page#page-wait-for-response
+      - title: Node.js · EventEmitter
+        url: https://nodejs.org/api/events.html#class-eventemitter
+
+  - id: journey-luecken
+    type: gap
+    title: Die Buchungs-Journey vervollständigen
+    prompt: |
+      Ergänze den Journey-Test: das Auswahlfeld über sein Label finden und die Dauer wählen, die Liste auf das richtige Rad eingrenzen, auf die Preisanzeige warten, die Kartennummer eintragen und die Statusmeldung mit einer Web-first-Assertion prüfen.
+    lang: ts
+    code: |
+      test('Kundin reserviert ein City-Rad und bezahlt mit Paystream', async ({ page, kunde }) => {
+        await page.goto('/stationen/hbf')
+        await page.⟦getByLabel⟧('Dauer').⟦selectOption⟧('1 Stunde')
+        await page
+          .getByRole('listitem')
+          .⟦filter⟧({ hasText: 'City-Rad 17' })
+          .getByRole('button', { name: 'Reservieren' })
+          .click()
+
+        await expect(page.getByText('Zu zahlen: 3,00 €')).⟦toBeVisible()⟧
+        await page.getByLabel('Kartennummer').⟦fill⟧('4242 4242 4242 4242')
+        await page.getByRole('button', { name: 'Mit Paystream bezahlen' }).click()
+        ⟦await expect(page.getByRole('status'))⟧.toHaveText('Bezahlt')
+      })
+    gaps:
+      - label: Feld über das Label
+        hint: Playwright heißt hier etwas kürzer als Testing Library.
+      - label: Option wählen
+        hint: Die Methode für `<select>`-Felder; sie akzeptiert Wert oder Beschriftung der Option.
+      - label: Liste eingrenzen
+        hint: Eine Locator-Methode, die nach Text einschränkt.
+      - label: Auf Sichtbarkeit warten
+        hint: Eine Web-first-Assertion für „ist zu sehen“.
+      - label: Feld ausfüllen
+        hint: Setzt den Wert eines Eingabefelds in einem Schritt.
+      - label: Web-first-Assertion
+        hint: Ohne `await` vor `expect` läuft die Prüfung ins Leere.
+    explanation: |
+      `getByLabel` und `getByRole` sind die nutzernahen Locators, `selectOption` wählt eine Option per Wert oder Beschriftung. `filter({ hasText })` grenzt die Listeneinträge auf das gewünschte Rad ein, danach sucht `getByRole` den Knopf nur in diesem Eintrag. `fill` setzt den Wert und wartet vorher, bis das Feld bereit ist. `toBeVisible` und `toHaveText` wiederholen ihre Prüfung bis zum Expect-Timeout und brauchen deshalb das `await` davor – ohne es endet der Test, bevor die Prüfung fertig ist.
+    resources:
+      - title: Playwright · Filtering locators
+        url: https://playwright.dev/docs/locators#filtering-locators
+      - title: Playwright · Auto-retrying assertions
+        url: https://playwright.dev/docs/test-assertions#auto-retrying-assertions
+
+  - id: config-luecken
+    type: gap
+    title: Konfiguration mit Setup-Projekt
+    prompt: |
+      Ergänze die Konfiguration:
+
+      1. Auch die Tests innerhalb einer Datei sollen parallel laufen.
+      2. Beim ersten Retry eines Tests soll ein Trace entstehen.
+      3. Das Projekt `setup` soll genau die Dateien mit der Endung `.setup.ts` ausführen.
+      4. Das Projekt `chromium` soll mit dem gespeicherten Zustand aus `playwright/.auth/stammkundin.json` starten …
+      5. … und erst laufen, wenn das Projekt `setup` fertig ist.
+    lang: ts
+    code: |
+      export default defineConfig({
+        testDir: './e2e',
+        fullyParallel: ⟦true⟧,
+        retries: process.env.CI ? 2 : 0,
+        use: {
+          baseURL: process.env.RADWERK_URL ?? 'http://127.0.0.1:4010',
+          trace: ⟦'on-first-retry'⟧,
+        },
+        projects: [
+          { name: 'setup', ⟦testMatch⟧: /.*\.setup\.ts/ },
+          {
+            name: 'chromium',
+            use: { ...devices['Desktop Chrome'], ⟦storageState⟧: 'playwright/.auth/stammkundin.json' },
+            ⟦dependencies: ['setup']⟧,
+          },
+        ],
+      })
+    gaps:
+      - label: Parallel innerhalb einer Datei
+        hint: Ein Wahrheitswert.
+      - label: Trace-Modus
+        hint: Ein String aus drei Wörtern mit Bindestrichen.
+      - label: Dateien des Setup-Projekts
+        hint: Die Option nimmt einen regulären Ausdruck oder Glob für Testdateien.
+      - label: Gespeicherter Zustand
+        hint: Dieselbe Option, die `page.context()` als Methode zum Speichern hat.
+      - label: Abhängigkeit
+        hint: Eine Liste von Projektnamen, die vorher laufen.
+    explanation: |
+      `fullyParallel: true` verteilt auch die Tests einer Datei auf Worker. `trace: 'on-first-retry'` zeichnet nur auf, wenn ein Test wiederholt wird – billig im Normalfall, aussagekräftig im Fehlerfall. `testMatch` beschränkt das Setup-Projekt auf die Setup-Dateien. `storageState` lädt Cookies und Local Storage in jeden neuen Kontext, und `dependencies: ['setup']` sorgt dafür, dass die Datei existiert, bevor der erste Test startet.
+    resources:
+      - title: Playwright · Authentication, setup project
+        url: https://playwright.dev/docs/auth#basic-shared-account-in-all-tests
+      - title: Playwright · Trace Viewer, recording a trace
+        url: https://playwright.dev/docs/trace-viewer#recording-a-trace
+
+  - id: fixture-luecken
+    type: gap
+    title: Eine Kundin pro Test
+    prompt: |
+      Die Fixture `kunde` legt über die Test-API eine Kundin an, meldet sie im Browser-Kontext des Tests an, übergibt sie an den Test und löscht sie danach. Ergänze die Lücken. Der zweite Parameter der Fixture-Funktion heißt wie in der Playwright-Doku.
+    lang: ts
+    code: |
+      export const test = base.⟦extend⟧<{ kunde: Kunde }>({
+        kunde: async ({ page }, ⟦use⟧) => {
+          const antwort = await page.⟦request⟧.post('/api/test/kunden', { data: { name: 'Mia Test' } })
+          const kunde: Kunde = await antwort.json()
+          await page.request.post('/api/anmelden', { data: { email: kunde.email, passwort: kunde.passwort } })
+          ⟦await use(kunde)⟧
+          await page.request.delete(`/api/test/kunden/${encodeURIComponent(kunde.email)}`)
+        },
+      })
+    gaps:
+      - label: Test-Objekt erweitern
+        hint: Die Methode, mit der eigene Fixtures entstehen.
+      - label: Zweiter Parameter
+        hint: Die Funktion, die den Wert an den Test übergibt.
+      - label: Anfragen mit den Cookies der Seite
+        hint: Eine Eigenschaft von `page`, die einen API-Client liefert.
+      - label: Wert übergeben
+        hint: Hier pausiert die Fixture, bis der Test fertig ist.
+    explanation: |
+      `base.extend` erzeugt ein neues `test` mit zusätzlichen Fixtures. Alles vor `await use(kunde)` ist Aufbau, alles danach Abbau; der Abbau läuft auch, wenn der Test scheitert. `page.request` teilt die Cookies mit dem Browser-Kontext: Die Anmeldung per API setzt das Session-Cookie direkt dort, wo der Test gleich klickt. Ein isolierter Client aus `playwright.request.newContext()` hätte eigene Cookies, und die Seite bliebe abgemeldet.
+    resources:
+      - title: Playwright · Creating a fixture
+        url: https://playwright.dev/docs/test-fixtures#creating-a-fixture
+      - title: Playwright · Context request vs global request
+        url: https://playwright.dev/docs/api-testing#context-request-vs-global-request
+
+  - id: momentaufnahme
+    type: bug
+    title: Rot, während die Zahlung noch geprüft wird
+    prompt: |
+      Der Test scheitert in der CI in etwa jedem dritten Lauf, lokal fast nie:
+
+      ```text
+      Error: expect(received).toBe(expected) // Object.is equality
+
+      Expected: "Bezahlt"
+      Received: "Zahlung wird geprüft …"
+      ```
+
+      Die Zahlung funktioniert; die Bestätigung erscheint nach einer kurzen Prüfung. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: ts
+    code: |
+      test('Kundin bezahlt die Reservierung', async ({ page, kunde }) => {
+        await page.goto('/stationen/hbf')
+        await page.getByRole('listitem').filter({ hasText: 'City-Rad 17' }).getByRole('button', { name: 'Reservieren' }).click()
+        await page.getByLabel('Kartennummer').fill('4242 4242 4242 4242')
+        await page.getByRole('button', { name: 'Mit Paystream bezahlen' }).click()
+        expect(await page.getByRole('status').textContent()).toBe('Bezahlt')
+      })
+    lines: [6]
+    fix:
+      - line: 6
+        answers:
+          - "await expect(page.getByRole('status')).toHaveText('Bezahlt')"
+          - "await expect(page.getByRole('status')).toContainText('Bezahlt')"
+          - "await expect(page.getByText('Bezahlt')).toBeVisible()"
+    hints:
+      - "`textContent()` liest den Text genau einmal. Was steht im Moment direkt nach dem Klick dort?"
+      - Gesucht ist eine Assertion, die selbst wiederholt.
+    explanation: |
+      `await page.getByRole('status').textContent()` liest den Text zu einem Zeitpunkt, und `expect(…).toBe(…)` vergleicht diesen einen Wert. Direkt nach dem Klick steht dort noch „Zahlung wird geprüft …“; auf einem schnellen Laptop ist die Prüfung meist schon durch, auf einer ausgelasteten CI-Maschine nicht. `await expect(locator).toHaveText('Bezahlt')` prüft wiederholt, bis der Text stimmt oder der Expect-Timeout abläuft. Eine Pause davor wäre keine Reparatur, nur eine längere Wette.
+    resources:
+      - title: Playwright · Best Practices, web-first assertions
+        url: https://playwright.dev/docs/best-practices#use-web-first-assertions
+
+  - id: registrierung-retry
+    type: bug
+    title: Grün am ersten Tag, danach nie wieder
+    prompt: |
+      Die Suite läuft gegen die Staging-Umgebung; deren Datenbank behält ihre Daten zwischen den Läufen. Dieser Test war im ersten Lauf grün. Seitdem scheitert er in jedem Lauf, auch in jedem Retry:
+
+      ```text
+      Error: expect(page).toHaveURL(expected) failed
+
+      Expected: "https://staging.radwerk.de/konto"
+      Received: "https://staging.radwerk.de/registrieren"
+      ```
+
+      Im Trace steht unter dem Formular „E-Mail-Adresse schon registriert“. Finde die fehlerhafte Zeile und korrigiere sie. Behalte das Schema `neu-…@test.radwerk.de` bei; der variable Teil soll eine zufällige UUID sein.
+    lang: ts
+    code: |
+      import { test, expect } from '@playwright/test'
+
+      test.use({ storageState: { cookies: [], origins: [] } })
+
+      test('neue Kundin registriert sich und landet in ihrem Konto', async ({ page }, testInfo) => {
+        const email = `neu-${testInfo.testId}@test.radwerk.de`
+
+        await page.goto('/registrieren')
+        await page.getByLabel('Name').fill('Mia Neu')
+        await page.getByLabel('E-Mail').fill(email)
+        await page.getByLabel('Passwort').fill('Sicher-5678')
+        await page.getByRole('button', { name: 'Konto anlegen' }).click()
+
+        await expect(page).toHaveURL('/konto')
+        await expect(page.getByRole('heading', { name: 'Hallo Mia Neu' })).toBeVisible()
+      })
+    lines: [6]
+    fix:
+      - line: 6
+        answers:
+          - "const email = `neu-${crypto.randomUUID()}@test.radwerk.de`"
+          - "const email = `neu-${globalThis.crypto.randomUUID()}@test.radwerk.de`"
+          - "const email = 'neu-' + crypto.randomUUID() + '@test.radwerk.de'"
+    hints:
+      - "`testInfo.testId` wird aus Datei, Titel und Projekt berechnet. Ändert sich davon etwas zwischen zwei Läufen?"
+      - Du brauchst einen Wert, der in jedem Lauf und jedem Retry neu ist.
+    explanation: |
+      `testInfo.testId` ist ein Hash aus Datei, Testtitel und Projekt. Er unterscheidet Tests innerhalb eines Laufs, ist aber in jedem Lauf und bei jedem Retry gleich. Gegen eine frisch aufgesetzte Datenbank fällt das nie auf; gegen Staging, die ihre Daten behält, registriert schon der zweite Lauf dieselbe Adresse und bekommt „schon registriert“. `crypto.randomUUID()` ist in Node global und liefert bei jedem Versuch eine neue Adresse. `randomUUID()` allein bräuchte einen Import aus `node:crypto`, den diese Datei nicht hat. Testdaten müssen pro Lauf und pro Versuch eindeutig sein, nicht nur pro Test.
+    resources:
+      - title: Playwright · TestInfo.testId
+        url: https://playwright.dev/docs/api/class-testinfo#test-info-test-id
+      - title: Node.js · crypto.randomUUID
+        url: https://nodejs.org/api/crypto.html#cryptorandomuuidoptions
+
+  - id: route-erklaeren
+    type: explain
+    title: Ein E2E-Test ohne Backend
+    prompt: |
+      Ein Kollege hat die flaky Buchungs-Journey „stabilisiert“. Seitdem ist sie immer grün. Erkläre im Review, was dieser Test jetzt noch absichert, was nicht mehr, und wie du die Aufgabe stattdessen verteilen würdest.
+    lang: ts
+    code: |
+      test('Kundin reserviert ein City-Rad und bezahlt', async ({ page }) => {
+        await page.route('**/api/**', async (route) => {
+          const url = route.request().url()
+          if (url.endsWith('/api/reservierungen')) {
+            return route.fulfill({ status: 201, json: { nummer: 'R-1' } })
+          }
+          if (url.endsWith('/zahlung')) return route.fulfill({ json: { status: 'bezahlt' } })
+          return route.fulfill({ json: {} })
+        })
+        await page.route('**/v1/zahlungen', (route) =>
+          route.fulfill({ json: { id: 'pay_1', status: 'succeeded' } }),
+        )
+
+        await page.goto('/stationen/hbf')
+        await page.getByRole('listitem').filter({ hasText: 'City-Rad 17' }).getByRole('button', { name: 'Reservieren' }).click()
+        await page.getByLabel('Kartennummer').fill('4242 4242 4242 4242')
+        await page.getByRole('button', { name: 'Mit Paystream bezahlen' }).click()
+        await expect(page.getByRole('status')).toHaveText('Bezahlt')
+      })
+    points:
+      - Er ist kein E2E-Test mehr. Jede Antwort der eigenen API und von Paystream kommt aus dem Test; Backend, Datenbank, Sitzung und Zahlung laufen nicht mit. Ein Fehler wie die fremde Reservierungsnummer bliebe unsichtbar.
+      - Er prüft nur noch die Oberfläche im Browser – das kann ein Komponententest mit MSW schneller und mit besserer Fehlerortung.
+      - Die Stubs können von der echten API abweichen. Benennt das Backend ein Feld um, bleibt der Test grün.
+      - Die Flakiness ist nicht behoben, sondern verdeckt. Die Ursache sucht man mit dem Trace des roten Laufs.
+      - "`page.route` gehört zu Drittanbietern im Browser und schwer erzeugbaren Fehlern, etwa der abgelehnten Paystream-Zahlung; die eigene API bleibt im Journey-Test echt."
+    explanation: |
+      „Der Test ist jetzt grün, weil er nichts mehr Echtes berührt. Alle Aufrufe an `/api/**` und an Paystream beantwortet der Test selbst, mit einer erfundenen Reservierungsnummer. Damit prüft er nur noch, dass die Seite Knöpfe und Meldungen richtig verdrahtet – das kann ein Komponententest mit MSW in Millisekunden. Was ein E2E-Test zeigen soll, fehlt: dass Website, API, Datenbank, Sitzung und Zahlung zusammenarbeiten. Der Fehler mit der fremden Bestätigung wäre so nie aufgefallen. Außerdem können die Stubs von der API abweichen, ohne dass es jemand merkt. Mein Vorschlag: Das Verhalten der Oberfläche wandert in Komponententests mit MSW. Der Journey-Test läuft gegen das echte Backend; abgefangen wird nur, was wir nicht kontrollieren – die Paystream-Antwort für den Fall einer abgelehnten Karte. Und die ursprüngliche Flakiness untersuchen wir mit dem Trace, statt sie wegzustubben.“
+    resources:
+      - title: Playwright · Avoid testing third-party dependencies
+        url: https://playwright.dev/docs/best-practices#avoid-testing-third-party-dependencies
+      - title: Playwright · Mock APIs
+        url: https://playwright.dev/docs/mock#mock-api-requests
+
+  - id: suite-beschleunigen
+    type: choice
+    title: 22 Minuten und jeder zehnte Lauf rot
+    prompt: |
+      Die E2E-Suite eines Teams ist auf 90 Tests gewachsen. Sie läuft 22 Minuten und ist in etwa jedem zehnten Lauf rot, ohne dass ein Fehler vorliegt. Welche Maßnahmen helfen wirklich?
+    options:
+      - text: Prüfungen von Preisregeln, Formatfehlern und Statuscodes in Unit-, Komponenten- und API-Tests verschieben und aus der E2E-Suite löschen.
+        correct: true
+        why: Weniger E2E-Tests heißt weniger Laufzeit und weniger Stellen, an denen Zufall zuschlagen kann. Die tieferen Ebenen zeigen dieselben Risiken schneller.
+      - text: "`fullyParallel: true` und Sharding auf mehrere CI-Maschinen – nachdem jeder Test eigene Daten und eine eigene Kundin hat."
+        correct: true
+        why: Parallelität verkürzt die Laufzeit, setzt aber Isolation voraus. Ohne eigene Daten macht sie eine flaky Suite noch flakier.
+      - text: "`trace: 'on-first-retry'` einschalten und die Traces der roten Läufe auswerten."
+        correct: true
+        why: Der Trace zeigt Aktionen, DOM, Netz und Konsole eines Versuchs – der schnellste Weg zur Ursache. `'on-first-retry'` zeichnet den Retry auf; den gescheiterten Erstversuch selbst hält `'retain-on-first-failure'` fest.
+      - text: "`retries: 5` setzen, damit die Pipeline grün wird."
+        correct: false
+        why: Die Pipeline wird grün, die Ursache bleibt, und jeder Wiederholungsversuch kostet zusätzlich Zeit. Ein Test, der fünf Versuche braucht, ist ein Bug.
+      - text: Vor jeder Assertion `await page.waitForTimeout(1000)` einfügen.
+        correct: false
+        why: Bei 90 Tests mit mehreren Assertions kostet das Minuten und bleibt eine Wette auf die Zeit. Web-first-Assertions warten genau so lange wie nötig.
+    explanation: |
+      Eine langsame, flaky E2E-Suite hat meist zwei Ursachen: zu viele Tests auf der teuersten Ebene und Tests, die sich Daten teilen oder auf feste Zeiten verlassen. Dagegen helfen Tests verschieben, Isolation und dann Parallelität, und der Trace für jede verbleibende Ursache. Retries und Pausen verstecken das Problem nur. Mehr zu den Ursachen und zu Quarantäne steht in [Flaky Tests](/testing/flaky-tests).
+    resources:
+      - title: Playwright · Parallelism
+        url: https://playwright.dev/docs/test-parallel
+      - title: Playwright · Sharding
+        url: https://playwright.dev/docs/test-sharding
+
+  - id: rueckgabe-schreiben
+    type: practice
+    title: Die Rückgabe-Journey
+    prompt: |
+      Schreibe den E2E-Test für die Rückgabe. Gegeben sind die Fixture `kunde` aus der Lektion und diese Fakten der Testumgebung:
+
+      - `POST /api/test/reservierungen` mit `{ "rad": "City-Rad 23", "minuten": 45 }` legt für die angemeldete Kundin eine **bezahlte** Reservierung an und antwortet mit `{ "nummer": "R-…" }`.
+      - `/konto` zeigt jede Reservierung als Listeneintrag mit Nummer, Rad, Status und – bei bezahlten – einem Knopf „Fahrt beenden“.
+      - Nach dem Klick erscheint eine Meldung mit der Rolle `status`: „Rückgabe bestätigt. Rechnung: 3,00 €“. Der Betrag hängt in der echten Umgebung von der Fahrzeit ab.
+
+      Ergänze in `e2e/fixtures.ts` eine Fixture `bezahlteReservierung`, die die Nummer liefert, und schreib den Test in `e2e/rueckgabe.spec.ts`.
+    lang: ts
+    starter: |
+      // e2e/fixtures.ts – ergänze die Fixture
+      export const test = base.extend<{ kunde: Kunde; bezahlteReservierung: string }>({
+        kunde: async ({ page }, use) => {
+          // wie in der Lektion
+        },
+      })
+
+      // e2e/rueckgabe.spec.ts
+      test('Rückgabe beendet die Fahrt und zeigt die Rechnung', async ({ page }) => {
+        // …
+      })
+    solution: |
+      // e2e/fixtures.ts
+      export const test = base.extend<{ kunde: Kunde; bezahlteReservierung: string }>({
+        kunde: async ({ page }, use) => {
+          const antwort = await page.request.post('/api/test/kunden', { data: { name: 'Mia Test' } })
+          const kunde: Kunde = await antwort.json()
+          await page.request.post('/api/anmelden', { data: { email: kunde.email, passwort: kunde.passwort } })
+          await use(kunde)
+          await page.request.delete(`/api/test/kunden/${encodeURIComponent(kunde.email)}`)
+        },
+        // hängt von kunde ab: erst anmelden, dann reservieren
+        bezahlteReservierung: async ({ page, kunde }, use) => {
+          const antwort = await page.request.post('/api/test/reservierungen', {
+            data: { rad: 'City-Rad 23', minuten: 45 },
+          })
+          expect(antwort.ok()).toBeTruthy()
+          const { nummer } = await antwort.json()
+          await use(nummer)
+        },
+      })
+
+      // e2e/rueckgabe.spec.ts
+      import { test, expect } from './fixtures'
+
+      test('Rückgabe beendet die Fahrt und zeigt die Rechnung', async ({ page, bezahlteReservierung }) => {
+        await page.goto('/konto')
+        await page
+          .getByRole('listitem')
+          .filter({ hasText: bezahlteReservierung })
+          .getByRole('button', { name: 'Fahrt beenden' })
+          .click()
+
+        // Der genaue Betrag hängt von der Fahrzeit ab; die Berechnung prüfen Unit-Tests.
+        await expect(page.getByRole('status')).toHaveText(/^Rückgabe bestätigt\. Rechnung: \d+,\d{2}\s€$/)
+      })
+    checklist:
+      - "Die Fixture `bezahlteReservierung` hängt von `kunde` ab (steht in ihrer Parameterliste), damit die Kundin angemeldet ist, bevor reserviert wird."
+      - "Die Reservierung entsteht über `page.request` und die Test-API, nicht durch Klicks durch die Buchungs-Journey."
+      - "Die Fixture prüft, dass die Test-API erfolgreich geantwortet hat, bevor sie die Nummer übergibt."
+      - "Der Test findet den Eintrag über die Reservierungsnummer (`filter({ hasText })`) und den Knopf über Rolle und Namen."
+      - "Die Prüfung ist eine Web-first-Assertion mit `await expect(…)`, ohne `waitForTimeout`."
+      - "Der Test prüft, dass eine Rechnung mit Betrag erscheint, nicht den exakten Betrag – und eine Begründung steht im Kommentar."
+      - "Der reguläre Ausdruck berücksichtigt das geschützte Leerzeichen vor `€` (`\\s` statt Leerzeichen) oder der Test vergleicht einen String."
+    hints:
+      - Eine Fixture darf andere Fixtures nutzen. Nenne `kunde` in der Parameterliste, auch wenn du den Wert nicht brauchst.
+      - "`toHaveText` akzeptiert auch einen regulären Ausdruck."
+    explanation: |
+      Die Vorbedingung – eine bezahlte Reservierung – kommt aus der Test-API. Sie per Oberfläche herzustellen, hieße, die Buchung ein zweites Mal E2E zu testen, und machte die Rückgabe von deren Erfolg abhängig. Die Fixture `bezahlteReservierung` nennt `kunde` in ihrer Parameterliste; Playwright baut deshalb zuerst die Kundin auf und meldet sie an. Der Test grenzt den Listeneintrag über die Nummer ein, damit andere Reservierungen ihn nicht stören. Den exakten Betrag prüft er nicht: Er hängt von der Fahrzeit und damit von der Uhr des Servers ab, und die Berechnung ist mit Unit-Tests schon abgedeckt. E2E zeigt nur, dass die Rechnung erscheint.
+    resources:
+      - title: Playwright · Fixtures, execution order
+        url: https://playwright.dev/docs/test-fixtures#execution-order
+      - title: Playwright · Establishing preconditions
+        url: https://playwright.dev/docs/api-testing#establishing-preconditions

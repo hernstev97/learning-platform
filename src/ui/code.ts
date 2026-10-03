@@ -1,6 +1,6 @@
-// Adds copy buttons, Rust Playground links, Python and SQL run buttons and "Im Terminal" for Linux commands to rendered
-// code blocks.
-import { onRunnerState, runnerNotice, runSnippet, runSqlScript, type SqlResultSet } from '../python/runner.ts';
+// Adds copy buttons, Rust Playground links, Python, pytest and SQL run buttons and "Im Terminal" for Linux commands to
+// rendered code blocks.
+import { onRunnerState, runnerNotice, runPytest, runSnippet, runSqlScript, type SqlResultSet } from '../python/runner.ts';
 import { vmCommands } from '../vm/commands.ts';
 import { $$, escape, icons } from './dom.ts';
 import { rowCount, sqlTableMarkup } from './sql-table.ts';
@@ -62,6 +62,12 @@ export function outputMarkup(stdout: string, error: string | null): string {
   return out + (out && err ? '\n' : '') + err || '<span class="run-label">Ausgabe</span>(keine Ausgabe)';
 }
 
+/** pytest's report as it appears in a terminal. */
+function pytestOutputMarkup(report: string, error: string | null): string {
+  const err = error ? `<span class="run-label">Fehler</span>${escape(error)}\n` : '';
+  return `${err}<span class="run-label">pytest</span>${escape(report) || '(keine Ausgabe)'}`;
+}
+
 /** Every result set of a SQL block as a table; statements without a result (CREATE, INSERT) show nothing. */
 function sqlOutputMarkup(results: SqlResultSet[], error: string | null): string {
   const tables = results.map((result, i) => `<span class="run-label">${results.length > 1 ? `Ergebnis ${i + 1} · ` : 'Ergebnis · '}${rowCount(result.rows.length)}${result.truncated ? ' (gekürzt)' : ''}</span>${sqlTableMarkup(result.columns, result.rows, result.cells)}`).join('');
@@ -86,7 +92,7 @@ export function enhanceCode(root: ParentNode, terminal?: (commands: string) => v
       bar.append(link);
     }
     const language = block.dataset.run;
-    if (language === 'python' || language === 'sql') {
+    if (language === 'python' || language === 'pytest' || language === 'sql') {
       const editor = block.querySelector<HTMLTextAreaElement>('textarea')!;
       const original = editor.value;
       autosize(editor, 2);
@@ -113,6 +119,11 @@ export function enhanceCode(root: ParentNode, terminal?: (commands: string) => v
             const result = await runSqlScript(editor.value);
             output.classList.toggle('error', !!result.error);
             output.innerHTML = sqlOutputMarkup(result.results, result.error);
+          } else if (language === 'pytest') {
+            const result = await runPytest(editor.value);
+            output.classList.add('pytest');
+            output.classList.toggle('error', result.exit_code !== 0);
+            output.innerHTML = pytestOutputMarkup(result.stdout, result.error);
           } else {
             const result = await runSnippet(editor.value);
             output.classList.toggle('error', !!result.error);

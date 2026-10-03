@@ -1,7 +1,8 @@
 // pnpm verify [bereich | bereich/modul ...]
 // Executes what can be executed locally, so published solutions are known to work:
 //  - Python `code` exercises: the solution passes every test, the starter fails at least one.
-//  - Python/Rust `output` exercises: the program prints exactly the expected output.
+//  - Python/Rust/TypeScript/JavaScript `output` exercises: the program prints exactly the expected output
+//    (TypeScript and JavaScript run in Node; only code without imports of npm packages works there).
 //  - Rust programs (gap, order, practice, lesson blocks with fn main): they compile; #[test]s pass.
 //  - Python lesson blocks marked `run`: they run without an exception (unless flagged `fails`).
 //  - Shell `output` exercises only with `verify: true` (they run in a throwaway directory).
@@ -9,9 +10,10 @@
 //    in a throwaway directory and must exit 0 (used for Git break-and-repair labs).
 //  - SQL (`sql` exercises, `output` exercises and lesson blocks marked `run`) runs in Pyodide under Node,
 //    i.e. with exactly the SQLite version of the browser: solutions return rows, starters do not already.
-//  - Python that imports pandas or numpy runs in a virtual environment with the versions Pyodide ships
-//    (node_modules/.cache/verify-python, created with uv on first use).
-// Needs python3 and rustc, for pandas also uv. Kotlin is not compiled (no toolchain dependency); the Bear
+//  - Python lesson blocks marked `pytest`: pytest runs them; all tests pass (with `fails`: some fail).
+//  - Python that imports pandas or numpy, uses pytest or Hypothesis or calls `run_pytest` runs in a virtual
+//    environment with the versions the browser loads (node_modules/.cache/verify-python, created with uv on first use).
+// Needs python3 and rustc, for pandas and pytest also uv. Kotlin is not compiled (no toolchain dependency); the Bear
 // course is checked by its own generator instead.
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -21,7 +23,9 @@ import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { ROOT, lessonBlocks, loadContent } from './content.ts';
 import { assemble, fixedCode, gapSolution, normalizeOutput } from '../src/engine/answers.ts';
+import { languageOf } from '../src/engine/highlight.ts';
 import { compareSql } from '../src/engine/sql.ts';
+import { testPins, USES_TESTS } from '../src/python/packages.ts';
 import type { BugExercise, GapExercise, OrderExercise, OutputExercise, SqlExercise } from '../src/content/types.ts';
 
 type Job = { label: string; run: () => Promise<string | null> };
@@ -51,29 +55,30 @@ function exec(command: string, args: string[], options: { input?: string; cwd?: 
   });
 }
 
-// pandas and numpy in the browser's versions, pinned by Pyodide's lock file.
+// pandas and numpy in the browser's versions, pinned by Pyodide's lock file, plus pytest and Hypothesis in the
+// versions of the wheels the browser loads.
 const DATA_PACKAGES = ['numpy', 'pandas', 'python-dateutil', 'pytz', 'six'];
 const USES_DATA = /^\s*(?:import|from)\s+(?:pandas|numpy)\b/m;
-let dataPython: Promise<string> | null = null;
-function dataEnvironment(): Promise<string> {
-  dataPython ??= (async () => {
+let packagePython: Promise<string> | null = null;
+function packageEnvironment(): Promise<string> {
+  packagePython ??= (async () => {
     const lock = JSON.parse(readFileSync(join(ROOT, 'node_modules/pyodide/pyodide-lock.json'), 'utf8'));
-    const pins = DATA_PACKAGES.map((name) => `${name}==${lock.packages[name].version}`);
+    const pins = [...DATA_PACKAGES.map((name) => `${name}==${lock.packages[name].version}`), ...testPins()];
     const dir = join(ROOT, 'node_modules/.cache/verify-python', createHash('sha256').update(pins.join(' ')).digest('hex').slice(0, 12));
     const bin = join(dir, 'bin/python');
     if (existsSync(bin)) return bin;
     for (const args of [['venv', '--quiet', '--python', '3.14', dir], ['pip', 'install', '--quiet', '--python', bin, ...pins]]) {
       const result = await exec('uv', args, { timeout: 300000 });
-      if (result.code !== 0) throw new Error(`uv ${args[0]} fehlgeschlagen (für pandas-Übungen wird uv gebraucht):\n${result.stderr.trim()}`);
+      if (result.code !== 0) throw new Error(`uv ${args[0]} fehlgeschlagen (für pandas- und pytest-Übungen wird uv gebraucht):\n${result.stderr.trim()}`);
     }
     return bin;
   })();
-  return dataPython;
+  return packagePython;
 }
 
 async function python(job: { code: string; setup?: string; tests?: { code: string }[] } & Record<string, unknown>): Promise<any> {
   const source = [job.setup ?? '', job.code, ...(job.tests ?? []).map((test) => test.code)].join('\n');
-  const interpreter = USES_DATA.test(source) ? await dataEnvironment() : 'python3';
+  const interpreter = job.kind === 'pytest' || USES_DATA.test(source) || USES_TESTS.test(source) ? await packageEnvironment() : 'python3';
   const result = await exec(interpreter, [HARNESS], { input: JSON.stringify(job), timeout: 15000 });
   if (result.timedOut) throw new Error('Zeitüberschreitung (15 s)');
   if (result.code !== 0) throw new Error(result.stderr.trim().split('\n').slice(-5).join('\n'));
@@ -146,6 +151,21 @@ async function bash(code: string, options: { strict?: boolean } = {}): Promise<{
   }
 }
 
+/** TypeScript and JavaScript `output` exercises run in Node (TypeScript through Node's type stripping). */
+async function script(code: string, language: string): Promise<{ stdout: string }> {
+  const dir = mkdtempSync(join(tmpdir(), 'verify-script-'));
+  try {
+    const file = join(dir, language === 'typescript' ? 'main.ts' : 'main.mjs');
+    writeFileSync(file, code);
+    const result = await exec(process.execPath, ['--disable-warning=ExperimentalWarning', file], { cwd: dir, timeout: 15000 });
+    if (result.timedOut) throw new Error('Zeitüberschreitung (15 s)');
+    if (result.code !== 0) throw new Error(`Exit-Code ${result.code}\n${result.stderr.trim().split('\n').slice(0, 15).join('\n')}`);
+    return { stdout: result.stdout };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 const diff = (expected: string, actual: string) => `erwartet:\n${expected.replace(/^/gm, '    │ ')}\n  tatsächlich:\n${actual.replace(/^/gm, '    │ ')}`;
 const jobs: Job[] = [];
 let skipped = 0;
@@ -183,6 +203,11 @@ for (const { area, module, file, exercise: authored, normalized } of loaded.raw)
     } else if (['bash', 'sh', 'shell'].includes(lang) && authored.verify === true) {
       jobs.push({ label, run: async () => {
         const { stdout } = await bash(ex.code);
+        return normalizeOutput(stdout) === normalizeOutput(ex.expected[0]) ? null : diff(normalizeOutput(ex.expected[0]), normalizeOutput(stdout));
+      } });
+    } else if (['typescript', 'javascript'].includes(languageOf(lang))) {
+      jobs.push({ label, run: async () => {
+        const { stdout } = await script(ex.code, languageOf(lang));
         return normalizeOutput(stdout) === normalizeOutput(ex.expected[0]) ? null : diff(normalizeOutput(ex.expected[0]), normalizeOutput(stdout));
       } });
     } else if (lang === 'sql') {
@@ -241,7 +266,14 @@ for (const areaId of Object.keys(loaded.areas)) {
     const lesson = String(parseYaml(readFileSync(file, 'utf8')).lesson ?? '');
     for (const { n, lang, flags, code } of lessonBlocks(lesson)) {
       const label = `${areaId}/modules/${module.id}.yaml › Lektion, Codeblock ${n} (${lang})`;
-      if (lang === 'python' && flags.includes('run')) {
+      if (lang === 'python' && flags.includes('pytest')) {
+        jobs.push({ label, run: async () => {
+          const result = await python({ kind: 'pytest', code });
+          if (result.error) return `${result.error}\n${result.stdout}`;
+          if (flags.includes('fails')) return result.exit_code === 1 ? null : 'als "fails" markiert, aber alle Tests bestehen';
+          return result.exit_code === 0 ? null : `Tests schlagen fehl:\n${result.stdout}`;
+        } });
+      } else if (lang === 'python' && flags.includes('run')) {
         jobs.push({ label, run: async () => {
           const result = await python({ kind: 'snippet', code });
           if (flags.includes('fails')) return result.error ? null : 'als "fails" markiert, läuft aber fehlerfrei';

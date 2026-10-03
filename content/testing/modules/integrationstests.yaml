@@ -1,0 +1,1357 @@
+id: integrationstests
+title: Integrationstests
+level: 2
+minutes: 150
+summary: Repositories gegen eine echte Datenbank testen statt gegen Mocks – mit Fixtures, die Schema und Transaktionen im Griff haben, Testdaten aus Buildern, Dateien in tmp_path und einem ehrlichen Blick darauf, wo SQLite nicht PostgreSQL ist.
+goals:
+  - Du unterscheidest schmale und breite Integrationstests und begründest, welche Fehler nur ein Test gegen die echte Datenbank zeigt.
+  - Du testest ein Repository gegen echtes SQLite und deckst die Grenzfälle halboffener Zeitintervalle ab.
+  - Du wählst zwischen frischem Schema pro Test und Rollback pro Test und setzt Fixture-Scopes passend ein.
+  - Du hältst Testdaten mit Buildern und Factory-Fixtures klein und testest Dateizugriffe mit `tmp_path`.
+  - Du benennst, wo SQLite sich anders verhält als PostgreSQL, und testest gegen echtes PostgreSQL mit Testcontainers.
+resources:
+  - title: Martin Fowler · IntegrationTest
+    url: https://martinfowler.com/bliki/IntegrationTest.html
+  - title: pytest · Fixture-Scopes
+    url: https://docs.pytest.org/en/stable/how-to/fixtures.html#scope-sharing-fixtures-across-classes-modules-packages-or-session
+  - title: Python · sqlite3 – Transaktionen steuern
+    url: https://docs.python.org/3/library/sqlite3.html#sqlite3-controlling-transactions
+  - title: Testcontainers for Python · PostgreSQL
+    url: https://testcontainers-python.readthedocs.io/en/latest/modules/postgres/README.html
+lesson: |
+  Montagmorgen im Support-Postfach von Radwerk: „Das E-Bike an der Station Hauptbahnhof ist bis 11 Uhr reserviert. Ab 11 Uhr kann ich es trotzdem nicht buchen.“ Die 214 Tests des Buchungsdienstes sind grün. Der Fehler steckt in einer SQL-Zeile des Repositorys, und diese Zeile lief in keinem Test: Überall, wo der Dienst das Repository brauchte, stand ein Mock.
+
+  Integrationstests schließen diese Lücke. Sie prüfen deinen Code zusammen mit etwas, das du nicht selbst geschrieben hast. Hier sind das Datenbank und Dateisystem; HTTP behandelt [Backend- und API-Tests](/testing/api-tests). Die Beispiele laufen mit SQLite im Browser. Radwerk nutzt in Produktion PostgreSQL, und wo das einen Unterschied macht, steht es dabei.
+
+  ## Schmale und breite Integrationstests
+
+  „Integrationstest“ heißt in jedem Team etwas anderes. Martin Fowler trennt zwei Bedeutungen ([IntegrationTest](https://martinfowler.com/bliki/IntegrationTest.html)):
+
+  - Ein **schmaler Integrationstest** prüft nur den Teil deines Codes, der mit einer externen Komponente spricht, etwa das Repository mit seiner Datenbank. Er nutzt eine Testinstanz dieser Komponente und läuft mit pytest wie ein Unit-Test.
+  - Ein **breiter Integrationstest** startet viele Teile gemeinsam: Buchungsdienst, Datenbank, Zahlungsdienst, Mailversand. Er zeigt, ob alles zusammenspielt, braucht eine eigene Umgebung und sagt bei einem Fehler nicht, wo er liegt.
+
+  Dieses Modul handelt von schmalen Tests. Sie beantworten eine Frage, die kein Unit-Test beantworten kann: Versteht die Gegenseite, was mein Code ihr schickt, so, wie ich es meine? Ein Mock antwortet, was du ihm vorgibst, die Datenbank, was im SQL steht.
+
+  | Fehler | Unit-Test mit Mock-Repository | Repository gegen echte DB |
+  | --- | --- | --- |
+  | Service ruft das Repository mit falschen Werten auf | ja | ja, aber teurer |
+  | SQL-Bedingung falsch (`<=` statt `<`, falsche Spalte) | nein | ja |
+  | Constraint fehlt (`NOT NULL`, Fremdschlüssel, `CHECK`) | nein | ja |
+  | Datumsformat, Zeitzone oder Typ beim Speichern falsch | nein | ja |
+  | Änderungen nicht committet | nein | ja |
+  | Fachregel falsch (Tarif, Tageshöchstpreis) | ja, schnell | ja, aber langsam |
+
+  Die letzte Zeile ist die Kehrseite: Fachlogik ohne Datenbankbezug testest du ohne Datenbank (siehe [Testpyramide und Testgrenzen](/testing/testpyramide)). Ein Integrationstest deckt die Naht ab, nicht die ganze Anwendung.
+
+  ## Ein Repository gegen echtes SQLite testen
+
+  Das Radwerk-Repository speichert Reservierungen und lehnt Überschneidungen ab. Reservierungen sind halboffene Intervalle `[start, ende)`: Eine Reservierung von 10 bis 11 Uhr belegt das Rad bis kurz vor 11, um 11 Uhr ist es frei. Zwei solche Intervalle `[a, b)` und `[c, d)` überschneiden sich genau dann, wenn `a < d` und `c < b`. Der Block enthält das Repository so, wie es im Release stand, einen Test mit Mock und zwei Tests gegen eine echte In-Memory-Datenbank. Führe ihn aus:
+
+  ```python pytest fails
+  import sqlite3
+  from datetime import datetime, timezone
+  from unittest.mock import Mock
+
+  import pytest
+
+  SCHEMA = """
+  CREATE TABLE reservierungen (
+      id INTEGER PRIMARY KEY,
+      rad_id INTEGER NOT NULL,
+      kunde_id INTEGER NOT NULL,
+      start TEXT NOT NULL,  -- UTC im ISO-Format
+      ende TEXT NOT NULL
+  );
+  """
+
+
+  class Belegt(Exception):
+      pass
+
+
+  def als_text(zeitpunkt):
+      return zeitpunkt.astimezone(timezone.utc).isoformat()
+
+
+  class ReservierungsRepository:
+      def __init__(self, con):
+          self.con = con
+
+      def anlegen(self, rad_id, kunde_id, start, ende):
+          konflikt = self.con.execute(
+              "SELECT id FROM reservierungen WHERE rad_id = ? AND start <= ? AND ? <= ende",
+              (rad_id, als_text(ende), als_text(start)),
+          ).fetchone()
+          if konflikt:
+              raise Belegt(f"Rad {rad_id} ist belegt durch Reservierung {konflikt[0]}")
+          cursor = self.con.execute(
+              "INSERT INTO reservierungen (rad_id, kunde_id, start, ende) VALUES (?, ?, ?, ?)",
+              (rad_id, kunde_id, als_text(start), als_text(ende)),
+          )
+          return cursor.lastrowid
+
+
+  def um(stunde, minute=0):
+      return datetime(2026, 10, 5, stunde, minute, tzinfo=timezone.utc)
+
+
+  def test_mit_mock_ist_alles_gruen():
+      con = Mock()
+      con.execute.return_value.fetchone.return_value = None  # „keine Überschneidung“
+      ReservierungsRepository(con).anlegen(7, 2, um(11), um(12))
+      assert con.execute.call_count == 2
+
+
+  @pytest.fixture
+  def repo():
+      con = sqlite3.connect(":memory:")
+      con.executescript(SCHEMA)
+      yield ReservierungsRepository(con)
+      con.close()
+
+
+  def test_direkt_danach_ist_frei(repo):
+      repo.anlegen(7, 1, um(10), um(11))
+      repo.anlegen(7, 2, um(11), um(12))
+
+
+  def test_ueberschneidung_ist_belegt(repo):
+      repo.anlegen(7, 1, um(10), um(11))
+      with pytest.raises(Belegt):
+          repo.anlegen(7, 2, um(10, 30), um(11, 30))
+  ```
+
+  Der Mock-Test ist grün. Er prüft, dass das Repository zweimal `execute` aufruft, und gibt selbst vor, dass es keine Überschneidung gibt. Ob die SQL-Bedingung stimmt, kann er nicht wissen. Der Test gegen SQLite scheitert mit `Belegt: Rad 7 ist belegt durch Reservierung 1` – die Support-Mail als Testausgabe. Ändere im Block beide `<=` zu `<` und führe ihn erneut aus: Alle drei Tests werden grün.
+
+  Der Test ist billig: `sqlite3.connect(":memory:")` legt eine Datenbank im Arbeitsspeicher an, die mit der Verbindung verschwindet, und jeder Test bekommt ein frisches Schema. Er ist auch robust, weil er nur über `anlegen` spricht. Wie das SQL formuliert ist, bleibt frei, solange das Verhalten stimmt.
+
+  Welche Fälle gehören dazu? Grenzwerte wie in [Unit-Tests mit pytest](/testing/unit-tests), angewandt auf zwei Intervalle: direkt davor, direkt danach, Überschneidung am Anfang und am Ende, enthalten, umschließend, anderes Rad.
+
+  Zeitpunkte wandelt das Repository mit einer einzigen Hilfsfunktion in UTC-Text um, statt sich auf die eingebauten `datetime`-Adapter von `sqlite3` zu verlassen. Die sind seit Python 3.12 veraltet ([sqlite3 · Default adapters and converters](https://docs.python.org/3/library/sqlite3.html#default-adapters-and-converters-deprecated)).
+
+  > [!MERKE]
+  > Ein Mock bestätigt deine Annahmen über die Datenbank. Widerlegen kann sie nur die Datenbank selbst. Code, der SQL enthält, testest du gegen eine echte Datenbank.
+
+  ## Fixtures: frisches Schema oder Rollback pro Test
+
+  Eine Datenbank-Fixture entscheidet, wie oft das Schema entsteht und wie jeder Test zu einer leeren Datenbank kommt. Es gibt zwei gängige Antworten.
+
+  **Frisches Schema pro Test.** Die Fixture hat den Standard-Scope `function`, wie `repo` oben. Das ist die einfachste und sicherste Isolation, auch für Code, der selbst `commit()` aufruft. SQLite im Speicher braucht dafür weniger als eine Millisekunde, PostgreSQL mit 80 Migrationen Sekunden – pro Test.
+
+  **Schema einmal, Rollback pro Test.** Eine Fixture mit `scope="module"` oder `scope="session"` legt Verbindung und Schema einmal an ([pytest · Scopes](https://docs.pytest.org/en/stable/how-to/fixtures.html#scope-sharing-fixtures-across-classes-modules-packages-or-session)). Eine zweite mit Scope `function` reicht die Verbindung an den Test weiter und rollt danach zurück, was er geschrieben hat:
+
+  ```python pytest
+  import sqlite3
+
+  import pytest
+
+  protokoll = []
+
+
+  @pytest.fixture(scope="module")
+  def verbindung():
+      con = sqlite3.connect(":memory:", autocommit=True)
+      con.execute("CREATE TABLE reservierungen (id INTEGER PRIMARY KEY, rad_id INTEGER NOT NULL)")
+      con.autocommit = False  # ab hier ist immer eine Transaktion offen
+      protokoll.append("Schema angelegt")
+      yield con
+      con.close()
+
+
+  @pytest.fixture
+  def db(verbindung):
+      yield verbindung
+      verbindung.rollback()
+      protokoll.append("zurückgerollt")
+
+
+  def test_legt_an(db):
+      db.execute("INSERT INTO reservierungen (rad_id) VALUES (7)")
+      assert db.execute("SELECT count(*) FROM reservierungen").fetchone() == (1,)
+
+
+  def test_sieht_nichts_vom_vorigen_test(db):
+      assert db.execute("SELECT count(*) FROM reservierungen").fetchone() == (0,)
+
+
+  def test_protokoll():
+      assert protokoll == ["Schema angelegt", "zurückgerollt", "zurückgerollt"]
+  ```
+
+  Mit `--setup-show` zeigt pytest, wann es welche Fixture auf- und abbaut. `M` steht für den Scope `module`, `F` für `function`:
+
+  ```console
+  $ pytest --setup-show test_repo.py
+  …
+  collected 3 items
+
+  test_repo.py
+      SETUP    M verbindung
+          SETUP    F db (fixtures used: verbindung)
+          test_repo.py::test_legt_an (fixtures used: db, verbindung).
+          TEARDOWN F db
+          SETUP    F db (fixtures used: verbindung)
+          test_repo.py::test_sieht_nichts_vom_vorigen_test (fixtures used: db, verbindung).
+          TEARDOWN F db
+          test_repo.py::test_protokoll.
+      TEARDOWN M verbindung
+
+  ============================== 3 passed in 0.09s ===============================
+  ```
+
+  Im Block steckt eine Falle aus Pythons `sqlite3`. Mit `autocommit=False` hält das Modul immer eine Transaktion offen ([sqlite3 · autocommit](https://docs.python.org/3/library/sqlite3.html#sqlite3.Connection.autocommit)). Dann verwirft `rollback()` alles seit dem letzten Commit, auch eine Tabelle aus derselben Transaktion. Deshalb entsteht das Schema mit `autocommit=True`, erst danach schaltet die Fixture um. Dasselbe gilt für `PRAGMA foreign_keys = ON`: In einer offenen Transaktion ignoriert SQLite es ohne Fehlermeldung.
+
+  Ohne `autocommit`-Argument gilt das ältere Standardverhalten ([`LEGACY_TRANSACTION_CONTROL`](https://docs.python.org/3/library/sqlite3.html#sqlite3-transaction-control-isolation-level)): `sqlite3` öffnet eine Transaktion erst vor `INSERT`, `UPDATE`, `DELETE` oder `REPLACE`. Schema und Pragmas direkt nach `connect()` laufen dann außerhalb einer Transaktion, Schreibzugriffe brauchen ein `commit()`.
+
+  Der Rollback-Ansatz ist schnell, aber an Bedingungen geknüpft:
+
+  - **Der Code unter Test committet nicht selbst.** Ein `commit()` im Repository schreibt die Testdaten fest, der Rollback findet danach nichts mehr. Auch im Produktivcode ist das die bessere Aufteilung: Das Repository schreibt, die aufrufende Schicht entscheidet über `commit`. SQLAlchemy kann eine Session in eine äußere Test-Transaktion einbinden und ihre Commits in Savepoints umlenken ([SQLAlchemy · Joining a Session into an External Transaction](https://docs.sqlalchemy.org/en/21/orm/session_transaction.html#joining-a-session-into-an-external-transaction-such-as-for-test-suites)).
+  - **Was erst beim Commit passiert, bleibt ungetestet.** Verzögerte Constraints (`DEFERRABLE INITIALLY DEFERRED`) prüft die Datenbank erst beim Commit, und eine zweite Verbindung sieht die Testdaten nie.
+  - **Ein Test, der aus der Transaktion ausbricht, verschmutzt alle folgenden.** Symptom: einzeln grün, zusammen rot.
+
+  > [!TIP] Faustregel für den Scope
+  > Nimm `function`, solange das Anlegen billig ist. Wechsle zu `module` oder `session` plus Rollback, wenn der Aufbau messbar Zeit kostet – typischerweise bei PostgreSQL mit Migrationen.
+
+  ## Testdaten und Dateien: Builder und tmp_path
+
+  Ein Test, der fünf Spalten setzt, obwohl ihn nur die Uhrzeit interessiert, bricht bei jeder neuen Pflichtspalte und versteckt, worum es ihm geht. Zwei Muster halten Testdaten klein:
+
+  - Ein **Test Data Builder** ist eine Funktion mit gültigen Standardwerten. Der Test überschreibt nur, was für ihn zählt: `reservierung(kunde_id=42)`. Kommt eine Pflichtspalte dazu, änderst du eine Stelle.
+  - Eine **Factory-Fixture** gibt eine Funktion zurück statt fertiger Daten ([pytest · Factories as fixtures](https://docs.pytest.org/en/stable/how-to/fixtures.html#factories-as-fixtures)). Der Test ruft `neues_rad("ebike")` so oft auf, wie er Räder braucht.
+
+  Ein Abzug der Produktionsdaten mit 40 Stationen macht die Suite langsam, und niemand weiß mehr, welche Zeile welchen Test grün hält. Für ORM-Modelle gibt es Bibliotheken wie factory_boy; für ein paar Tabellen reicht eine Funktion.
+
+  Dateien testest du mit der Fixture `tmp_path`: Jeder Test bekommt ein eigenes, leeres Verzeichnis ([pytest · tmp_path](https://docs.pytest.org/en/stable/how-to/tmp_path.html#the-tmp-path-fixture)). Ein Test, der nach `./radwerk.db` schreibt, findet beim nächsten Lauf die Datei vom letzten Mal.
+
+  Die Stationen von Radwerk speichern Reservierungen offline in einer SQLite-Datei, damit das Schloss ohne Netz weiß, wer das Rad öffnen darf. Das wichtigste Versprechen: Was `anlegen` bestätigt hat, ist nach einem Neustart noch da.
+
+  ```python pytest
+  import sqlite3
+  from datetime import datetime, timedelta, timezone
+
+  SCHEMA = """CREATE TABLE IF NOT EXISTS reservierungen (
+      id INTEGER PRIMARY KEY, rad_id INTEGER NOT NULL, kunde_id INTEGER NOT NULL,
+      start TEXT NOT NULL, ende TEXT NOT NULL)"""
+
+
+  class Speicher:
+      def __init__(self, pfad):
+          self.con = sqlite3.connect(pfad)
+          self.con.execute(SCHEMA)
+
+      def anlegen(self, rad_id, kunde_id, start, ende):
+          self.con.execute(
+              "INSERT INTO reservierungen (rad_id, kunde_id, start, ende) VALUES (?, ?, ?, ?)",
+              (rad_id, kunde_id, start.isoformat(), ende.isoformat()),
+          )
+          self.con.commit()
+
+      def fuer_kunde(self, kunde_id):
+          sql = "SELECT rad_id FROM reservierungen WHERE kunde_id = ? ORDER BY start"
+          return [rad_id for (rad_id,) in self.con.execute(sql, (kunde_id,))]
+
+      def schliessen(self):
+          self.con.close()
+
+
+  MONTAG = datetime(2026, 10, 5, 10, tzinfo=timezone.utc)
+
+
+  def reservierung(**abweichungen):
+      """Test Data Builder: gültige Standardwerte, der Test nennt nur, was für ihn zählt."""
+      standard = {"rad_id": 7, "kunde_id": 1, "start": MONTAG, "ende": MONTAG + timedelta(hours=1)}
+      return standard | abweichungen
+
+
+  def test_reservierung_ueberlebt_neustart(tmp_path):
+      datei = tmp_path / "station.db"
+      vorher = Speicher(datei)
+      vorher.anlegen(**reservierung(kunde_id=42))
+      # kein schliessen(): wie ein Absturz direkt nach dem Speichern
+      nachher = Speicher(datei)
+      assert nachher.fuer_kunde(42) == [7]
+      vorher.schliessen()
+      nachher.schliessen()
+  ```
+
+  Der Test öffnet eine zweite Verbindung auf dieselbe Datei, wie die Station nach einem Absturz. Nur so prüft er, ob wirklich committet wurde: Eine Verbindung liest ihre eigenen offenen Änderungen, andere sehen sie erst nach dem Commit ([SQLite · Isolation](https://sqlite.org/isolation.html)). Lösche im Block die Zeile `self.con.commit()` und führe ihn erneut aus. `close()` committet übrigens nicht.
+
+  ## SQLite ist nicht PostgreSQL
+
+  SQLite im Test und PostgreSQL in Produktion ist verlockend: kein Server, Tests in Millisekunden. Das geht gut, solange dein SQL nur nutzt, was beide gleich können. Die Unterschiede liegen dort, wo Fehler teuer werden:
+
+  | Bereich | SQLite | PostgreSQL |
+  | --- | --- | --- |
+  | Typen | Typaffinität: `INTEGER` nimmt auch `'sieben'`. Kein Zeittyp, Zeitpunkte sind Text oder Zahl. | Strenge Typen, `timestamptz`, Bereichstypen wie `tstzrange` |
+  | Constraints | Fremdschlüssel nur mit `PRAGMA foreign_keys = ON` je Verbindung. Keine Exclusion Constraints. | Fremdschlüssel immer aktiv. `EXCLUDE` verhindert überlappende Bereiche. |
+  | Transaktionen und Sperren | Ein Schreiber pro Datenbank, serialisierbar. Kein `SELECT … FOR UPDATE`. | Viele gleichzeitige Schreiber, Standard `READ COMMITTED`, Zeilensperren mit `SELECT … FOR UPDATE` |
+  | Datum und Zeit | `datetime()`, `strftime()`, `unixepoch()`; keine benannten Zeitzonen, nur die Modifikatoren `utc` und `localtime` | `now()`, `date_trunc()`, `AT TIME ZONE 'Europe/Berlin'`, `interval` |
+  | Text | `LIKE` ignoriert Groß- und Kleinschreibung bei ASCII | `LIKE` unterscheidet sie, `ILIKE` nicht |
+
+  Die Typaffinität ([SQLite · Datatypes](https://sqlite.org/datatype3.html#type_affinity)) siehst du direkt: SQLite wandelt `'7'` in eine Zahl um, weil es geht, und speichert `'sieben'` als Text, weil es nicht geht. PostgreSQL mit `integer` und `timestamptz` lehnt die zweite Zeile mit `invalid input syntax` ab. `STRICT`-Tabellen (seit SQLite 3.37) lehnen `'sieben'` ebenfalls ab, einen Zeittyp haben auch sie nicht.
+
+  ```sql run
+  CREATE TABLE reservierungen (id INTEGER PRIMARY KEY, rad_id INTEGER NOT NULL, start TEXT NOT NULL);
+  INSERT INTO reservierungen (rad_id, start) VALUES ('7', '2026-10-05T10:00:00+00:00');
+  INSERT INTO reservierungen (rad_id, start) VALUES ('sieben', 'nächsten Dienstag');
+  SELECT id, rad_id, typeof(rad_id), start FROM reservierungen;
+  ```
+
+  Am schwersten wiegt für Radwerk die Zeile „Transaktionen und Sperren“. Das Repository prüft erst, ob das Rad frei ist, und legt dann an. Kommen zwei Anfragen gleichzeitig, können in PostgreSQL bei `READ COMMITTED` beide „frei“ lesen und beide anlegen ([Transaction Isolation](https://www.postgresql.org/docs/current/transaction-iso.html#XACT-READ-COMMITTED)). Die Tests oben laufen nacheinander über eine Verbindung und zeigen das nicht. Auch zwei Verbindungen auf SQLite sagen wenig darüber: SQLite sperrt die ganze Datenbank für einen Schreiber, PostgreSQL sperrt Zeilen und lässt viele Schreiber gleichzeitig arbeiten. Zuverlässig verhindert die Doppelbuchung dort ein Exclusion Constraint in der Datenbank selbst:
+
+  ```sql
+  CREATE EXTENSION IF NOT EXISTS btree_gist;
+
+  CREATE TABLE reservierungen (
+      id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+      rad_id integer NOT NULL,
+      kunde_id integer NOT NULL,
+      zeitraum tstzrange NOT NULL,
+      EXCLUDE USING gist (rad_id WITH =, zeitraum WITH &&)
+  );
+  ```
+
+  `tstzrange(start, ende)` ist ohne weitere Angabe halboffen `[)`, `&&` heißt „überschneidet sich“, und `btree_gist` erlaubt den Gleichheitsvergleich auf `rad_id` im selben GiST-Index ([PostgreSQL · Exclusion Constraints](https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-EXCLUSION)). Seit PostgreSQL 18 geht dasselbe kürzer als `UNIQUE (rad_id, zeitraum WITHOUT OVERLAPS)`, ebenfalls mit `btree_gist`. SQLite kann das nicht nachbilden; ein Test für diesen Constraint muss gegen PostgreSQL laufen.
+
+  ### Testcontainers: echtes PostgreSQL im Test
+
+  Testcontainers startet für die Testsitzung einen Docker-Container mit der Datenbank, wartet, bis sie Verbindungen annimmt, und entfernt ihn am Ende. Eine `conftest.py` für Radwerk (braucht Docker, läuft also lokal und in der CI, nicht im Browser):
+
+  ```python
+  import psycopg
+  import pytest
+  from testcontainers.community.postgres import PostgresContainer
+
+  from radwerk.schema import SCHEMA
+
+
+  @pytest.fixture(scope="session")
+  def postgres_url():
+      with PostgresContainer("postgres:18", driver=None) as postgres:
+          url = postgres.get_connection_url()
+          with psycopg.connect(url, autocommit=True) as con:
+              con.execute(SCHEMA)
+          yield url
+
+
+  @pytest.fixture
+  def db(postgres_url):
+      with psycopg.connect(postgres_url) as con:
+          yield con
+          con.rollback()
+
+
+  def test_datenbank_verhindert_doppelbuchung(db):
+      sql = "INSERT INTO reservierungen (rad_id, kunde_id, zeitraum) VALUES (7, %s, tstzrange(%s, %s))"
+      db.execute(sql, (1, "2026-10-05 10:00+02", "2026-10-05 11:00+02"))
+      with pytest.raises(psycopg.errors.ExclusionViolation):
+          db.execute(sql, (2, "2026-10-05 10:30+02", "2026-10-05 11:30+02"))
+  ```
+
+  Seit Version 4.15 liegt die Klasse in `testcontainers.community.postgres`; der ältere Import `testcontainers.postgres` aus vielen Anleitungen funktioniert noch, mit Deprecation-Warnung ([Testcontainers for Python · PostgreSQL](https://testcontainers-python.readthedocs.io/en/latest/modules/postgres/README.html)). `driver=None` liefert eine URL ohne SQLAlchemy-Treiberzusatz, die psycopg direkt versteht. Am Ende des `with`-Blocks committet psycopg eine offene Transaktion; der `rollback()` davor lässt nichts mehr offen. Der Container startet einmal pro Sitzung, was je nach Rechner 5 bis 20 Sekunden dauert; beim ersten Mal kommt der Download des Images dazu. Danach kostet jeder Test Millisekunden. Nimm dieselbe Hauptversion wie in Produktion.
+
+  > [!PRAXIS] Eine Datenbank für Test und Produktion
+  > Viele Teams lassen Repository-Tests lokal und in der CI gegen PostgreSQL laufen und verzichten auf SQLite, sobald das SQL Postgres-Funktionen nutzt. SQLite bleibt für Code, der wirklich SQLite verwendet, wie den Offline-Speicher der Stationen. Ein Repository, das nur gegen SQLite getestet ist, aber auf PostgreSQL läuft, ist in den Punkten der Tabelle oben ungetestet.
+
+  ## Isolation, Parallelität und Tempo
+
+  Ein Test ist isoliert, wenn sein Ergebnis nicht davon abhängt, welche Tests vorher, danach oder gleichzeitig laufen. Bei Datenbanken gefährden drei Dinge die Isolation:
+
+  - **Geteilter Zustand.** Ein Test lässt Daten zurück, weil er committet oder die Fixture einen zu breiten Scope hat. Symptom: einzeln grün, zusammen rot.
+  - **Aussagen über die ganze Tabelle.** `assert anzahl == 3` bricht, sobald ein anderer Test Daten sehen kann. Frag nach den Daten, die der Test selbst angelegt hat, etwa über eine eigene `kunde_id`.
+  - **Parallele Läufe.** [pytest-xdist](https://pytest-xdist.readthedocs.io/en/stable/how-to.html#identifying-the-worker-process-during-a-test) verteilt Tests mit `-n auto` auf mehrere Prozesse. Session-Fixtures laufen dann einmal pro Worker, jeder Worker startet seinen eigenen Container. Teilen sich die Worker einen Datenbankserver, braucht jeder eine eigene Datenbank mit eigenem Namen; die Fixture `worker_id` liefert `gw0`, `gw1` und so weiter. `tmp_path` und `:memory:` sind ohnehin pro Test getrennt.
+
+  Wer lokal ohne Docker arbeiten will, markiert die Postgres-Tests und wählt sie ab:
+
+  ```toml
+  [tool.pytest.ini_options]
+  markers = ["postgres: braucht Docker und startet PostgreSQL per Testcontainers"]
+  ```
+
+  Die Tests bekommen `@pytest.mark.postgres`, und `pytest -m "not postgres"` läuft lokal in Sekunden. Die CI führt alles aus: Die Markierung verschiebt die Postgres-Tests dorthin, wo Docker sicher da ist, sie ersetzt sie nicht.
+
+  ## Häufige Fehler
+
+  - **Repository mit Mock testen.** Der Test prüft, dass `execute` aufgerufen wird, nicht, was das SQL tut. Symptom: grüne Tests, falsche Daten in Produktion.
+  - **Nur den Normalfall testen.** Überschneidungen haben Grenzen: direkt davor, direkt danach, enthalten, umschließend. Jede Grenze braucht einen Fall.
+  - **`commit()` im Repository plus Rollback-Fixture.** Die Daten bleiben trotz Rollback, Tests sind einzeln grün und zusammen rot. Transaktionen gehören in die aufrufende Schicht, oder die Fixture legt pro Test ein frisches Schema an.
+  - **`PRAGMA foreign_keys = ON` in einer offenen Transaktion.** SQLite ignoriert es, und `pytest.raises(sqlite3.IntegrityError)` meldet `DID NOT RAISE`. Setze das Pragma, bevor eine Transaktion beginnt.
+  - **Zeitpunkte in wechselndem Textformat.** SQLite vergleicht `'2026-10-05 10:00'` und `'2026-10-05T10:00'` Zeichen für Zeichen, das Leerzeichen ist kleiner als `T`. Schreibe Zeitpunkte nur über eine Hilfsfunktion.
+  - **SQLite-Tests als Beleg für PostgreSQL.** Was in Produktion auf PostgreSQL läuft, testest du mindestens in der CI gegen PostgreSQL.
+
+  > [!INTERVIEW] „Mockst du die Datenbank in deinen Tests?“
+  > In Unit-Tests der Fachlogik ja, dort steht hinter dem Repository-Interface ein Fake. Das Repository selbst teste ich nie mit Mock: Sein Inhalt ist SQL, und ob das stimmt, weiß nur die Datenbank. Diese Tests laufen gegen dieselbe Datenbank wie in Produktion, bei PostgreSQL per Testcontainers – Container und Schema einmal pro Sitzung, Rollback nach jedem Test. So decke ich Grenzfälle, Constraints und Typen ab, und die Suite bleibt schnell.
+
+  ## Zusammenfassung
+
+  - Schmale Integrationstests prüfen eine Naht: deinen Code plus eine echte Instanz der Komponente dahinter. Breite Tests starten viele Komponenten und lokalisieren Fehler schlecht.
+  - Code mit SQL testest du gegen eine echte Datenbank. Ein Mock bestätigt nur, was du ihm vorgibst.
+  - `[a, b)` und `[c, d)` überschneiden sich, wenn `a < d` und `c < b`. Direkt davor und direkt danach gehören in jeden Test.
+  - Frisches Schema pro Test isoliert am besten. Rollback pro Test ist schneller und verlangt, dass der Code unter Test nicht selbst committet.
+  - Builder und Factory-Fixtures halten Testdaten minimal.
+  - `tmp_path` gibt jedem Test ein eigenes Verzeichnis. Ob Daten dauerhaft gespeichert sind, prüft eine zweite Verbindung.
+  - SQLite unterscheidet sich von PostgreSQL bei Typen, Constraints, Sperren und Datumsfunktionen. Testcontainers bringt echtes PostgreSQL in die Testsitzung.
+exercises:
+  - id: schmal-oder-breit
+    type: choice
+    title: Welcher Test prüft eine einzelne Naht?
+    prompt: Welche dieser Tests sind schmale Integrationstests im Sinne von Martin Fowler?
+    options:
+      - text: Ein pytest-Test legt über `ReservierungsRepository` zwei Reservierungen in einer In-Memory-SQLite-Datenbank an und erwartet, dass die zweite abgelehnt wird.
+        correct: true
+        why: Er prüft genau eine Naht, Repository und Datenbank, mit einer Testinstanz der Datenbank und läuft wie ein Unit-Test.
+      - text: Ein Test startet Buchungsdienst, PostgreSQL, die Paystream-Sandbox und den Mailservice per Docker Compose und bucht über die REST-API eine Fahrt.
+        correct: false
+        why: Das ist ein breiter Integrationstest. Er braucht alle Komponenten live und zeigt bei einem Fehler nicht, welche Naht schuld ist.
+      - text: Ein Test lässt den Tagesexport eine CSV-Datei in `tmp_path` schreiben und liest sie danach mit dem `csv`-Modul wieder ein.
+        correct: true
+        why: Die externe Komponente ist hier das Dateisystem. Geprüft wird nur der Code, der die Datei schreibt.
+      - text: Ein Test ruft `mietpreis(31)` auf und erwartet 300 Cent.
+        correct: false
+        why: Hier spricht kein Code mit einer externen Komponente. Das ist ein Unit-Test.
+      - text: Ein Test schickt die Anfragen des Paystream-Clients an einen lokalen Fake-Server, der die dokumentierten Antworten von Paystream nachbildet.
+        correct: true
+        why: Fowler zählt das ausdrücklich dazu. Ein schmaler Test darf statt des echten Dienstes ein Double nutzen, solange er den Code prüft, der mit dem Dienst spricht – hier HTTP-Aufruf, Serialisierung und Fehlerbehandlung des Clients.
+    explanation: |
+      Schmal heißt: Der Test prüft den Teil deines Codes, der mit genau einer externen Komponente spricht, gegen eine Testinstanz oder ein Double dieser Komponente. Er läuft mit dem normalen Testwerkzeug und ist schnell. Breite Tests brauchen alle Dienste gleichzeitig. Sie fangen Fehler im Zusammenspiel, lokalisieren sie aber schlecht und sind teuer im Betrieb. Ein reiner Funktionsaufruf ohne externe Komponente ist kein Integrationstest.
+    resources:
+      - title: Martin Fowler · IntegrationTest
+        url: https://martinfowler.com/bliki/IntegrationTest.html
+
+  - id: was-nur-die-datenbank-zeigt
+    type: choice
+    title: Was der Mock nicht sehen kann
+    prompt: |
+      Der Unit-Test für `ReservierungsService.buchen` ersetzt das Repository durch einen `Mock`. Welche Fehler kann dieser Test **nicht** finden?
+    options:
+      - text: In der SQL-Abfrage für Überschneidungen steht `<=` statt `<`.
+        correct: true
+        why: Das SQL läuft nie. Der Mock liefert, was der Test ihm vorgibt, egal was in der Abfrage steht.
+      - text: Im Schema fehlt der Fremdschlüssel auf `raeder`, Reservierungen für nicht existierende Räder werden gespeichert.
+        correct: true
+        why: Ohne Datenbank gibt es kein Schema und keinen Constraint, der greifen oder fehlen könnte.
+      - text: Das Repository speichert `start` mal als `2026-10-05 10:00`, mal als `2026-10-05T10:00`, und der Textvergleich in SQLite übersieht dadurch Überschneidungen.
+        correct: true
+        why: Das Format zeigt sich erst beim Speichern und Vergleichen in der Datenbank.
+      - text: Der Service ruft `repo.anlegen` auch für gesperrte Kunden auf.
+        correct: false
+        why: Genau das kann der Mock sehen. Mit `repo.anlegen.assert_not_called()` prüft der Test, dass der Aufruf ausbleibt.
+      - text: Der Service berechnet den Preis der Reservierung falsch.
+        correct: false
+        why: Die Preisberechnung ist Fachlogik im Service. Ein Unit-Test findet den Fehler mit oder ohne Mock.
+    explanation: |
+      Ein Mock ersetzt das Repository samt Datenbank. Alles, was auf der anderen Seite der Naht passiert – SQL, Constraints, Typen, Formate –, existiert im Test nicht. Der Mock-Test sieht nur, wie der Service das Repository benutzt. Deshalb brauchst du beides: Unit-Tests für die Logik im Service und Integrationstests für das Repository gegen eine echte Datenbank.
+    resources:
+      - title: Martin Fowler · Mocks Aren't Stubs
+        url: https://martinfowler.com/articles/mocksArentStubs.html
+
+  - id: zweite-verbindung
+    type: output
+    title: Wer sieht was, und wann?
+    prompt: |
+      Zwei Verbindungen öffnen dieselbe Datei. `sqlite3` läuft mit Standardeinstellungen: `CREATE TABLE` wird sofort festgeschrieben, ein `INSERT` öffnet eine Transaktion. Was gibt das Programm aus?
+    lang: python
+    code: |
+      import sqlite3
+      import tempfile
+      from pathlib import Path
+
+      datei = Path(tempfile.mkdtemp()) / "station.db"
+      app = sqlite3.connect(datei)
+      test = sqlite3.connect(datei)
+      app.execute("CREATE TABLE reservierungen (id INTEGER PRIMARY KEY, rad_id INTEGER)")
+
+
+      def anzahl(con):
+          return con.execute("SELECT count(*) FROM reservierungen").fetchone()[0]
+
+
+      app.execute("INSERT INTO reservierungen (rad_id) VALUES (7)")
+      print(anzahl(app), anzahl(test))
+      app.commit()
+      print(anzahl(app), anzahl(test))
+      app.execute("INSERT INTO reservierungen (rad_id) VALUES (8)")
+      app.close()
+      print(anzahl(test))
+    expected: |
+      1 0
+      1 1
+      1
+    explanation: |
+      Eine Verbindung sieht ihre eigenen offenen Änderungen, deshalb zählt `app` schon vor dem Commit 1. Die zweite Verbindung sieht nur Festgeschriebenes: erst 0, nach `commit()` 1. Das zweite `INSERT` geht verloren, weil `close()` nicht committet; SQLite rollt die offene Transaktion zurück. Für Tests folgt daraus: Ob Code wirklich speichert, zeigt nur eine zweite Verbindung.
+    resources:
+      - title: SQLite · Isolation In SQLite
+        url: https://sqlite.org/isolation.html
+      - title: Python · sqlite3.Connection.close
+        url: https://docs.python.org/3/library/sqlite3.html#sqlite3.Connection.close
+
+  - id: datum-als-text
+    type: output
+    title: Eine Überschneidung zu wenig
+    prompt: |
+      Die neue Reservierung soll von 10:30 bis 10:45 gehen. Was gibt das Skript aus? Schreib die Ausgabe wie die `sqlite3`-Kommandozeile im Standardmodus: Werte durch `|` getrennt, keine Kopfzeile.
+    lang: sql
+    code: |
+      CREATE TABLE reservierungen (id INTEGER PRIMARY KEY, rad_id INTEGER, start TEXT, ende TEXT);
+      INSERT INTO reservierungen (rad_id, start, ende) VALUES
+        (7, '2026-10-05 10:00', '2026-10-05 11:00'),
+        ('7', '2026-10-05T10:00', '2026-10-05T11:00');
+
+      SELECT id, typeof(rad_id) FROM reservierungen;
+
+      SELECT count(*) FROM reservierungen
+      WHERE rad_id = 7 AND start < '2026-10-05T10:45' AND '2026-10-05T10:30' < ende;
+    expected: |
+      1|integer
+      2|integer
+      1
+    explanation: |
+      `'7'` landet als Zahl in der Tabelle, weil die Spalte `INTEGER`-Affinität hat und sich der Text verlustfrei umwandeln lässt. Die Zeitpunkte sind dagegen Text, und SQLite vergleicht sie Zeichen für Zeichen. Bei Zeile 1 steht an Position 11 ein Leerzeichen, in der Abfrage ein `T`. Das Leerzeichen ist kleiner, also ist `'2026-10-05T10:30' < '2026-10-05 11:00'` falsch, und die Überschneidung mit Zeile 1 fällt durch. PostgreSQL mit `timestamptz` vergleicht Zeitpunkte statt Zeichen. In SQLite hilft nur ein einheitliches Format aus einer einzigen Hilfsfunktion – und ein Test, der Daten so speichert, wie es der Produktivcode tut.
+    resources:
+      - title: SQLite · Datatypes In SQLite
+        url: https://sqlite.org/datatype3.html#type_affinity
+      - title: SQLite · Date And Time Functions
+        url: https://sqlite.org/lang_datefunc.html
+
+  - id: rollback-fixture
+    type: gap
+    title: Schema einmal, Rollback jedes Mal
+    prompt: |
+      Die Fixtures sollen Verbindung und Schema einmal pro Testdatei anlegen. Jeder Test bekommt ein Repository auf dieser Verbindung, und was er geschrieben hat, wird danach verworfen. Das Repository selbst committet nicht. Ergänze die Lücken.
+    lang: python
+    code: |
+      import sqlite3
+
+      import pytest
+
+      from reservierungen import SCHEMA, ReservierungsRepository
+
+
+      @pytest.fixture(scope=⟦"module"⟧)
+      def verbindung():
+          con = sqlite3.connect(":memory:", autocommit=True)
+          con.execute("PRAGMA foreign_keys = ON")
+          con.executescript(SCHEMA)
+          con.autocommit = ⟦False⟧
+          ⟦yield con⟧
+          con.close()
+
+
+      @pytest.fixture
+      def repo(verbindung):
+          yield ReservierungsRepository(verbindung)
+          ⟦verbindung.rollback()⟧
+    gaps:
+      - label: Scope
+        hint: Einmal pro Testdatei – wie heißt dieser Scope in pytest?
+      - label: Transaktionsmodus
+        hint: Ab jetzt soll `sqlite3` immer eine Transaktion offen halten, damit es etwas zurückzurollen gibt.
+      - label: Übergabe an die Tests
+        hint: Eine Fixture mit Aufräumarbeit gibt ihren Wert mit einem Schlüsselwort weiter und läuft danach weiter.
+      - label: Aufräumen nach jedem Test
+        hint: Verwirf alles seit dem letzten Commit.
+    explanation: |
+      `scope="module"` legt Verbindung und Schema einmal pro Testdatei an. Schema und Pragma laufen mit `autocommit=True`, damit sie sofort festgeschrieben sind: Ein späterer Rollback darf die Tabellen nicht mitnehmen, und `PRAGMA foreign_keys` wirkt nur außerhalb einer Transaktion. Danach schaltet `con.autocommit = False` auf PEP-249-Verhalten um, bei dem immer eine Transaktion offen ist. `yield con` übergibt die Verbindung, der Code danach läuft nach dem letzten Test der Datei. Die Fixture `repo` hat den Scope `function` und rollt nach jedem Test zurück. Das funktioniert nur, weil das Repository nicht selbst committet.
+    resources:
+      - title: pytest · Yield fixtures
+        url: https://docs.pytest.org/en/stable/how-to/fixtures.html#yield-fixtures-recommended
+      - title: Python · sqlite3.Connection.autocommit
+        url: https://docs.python.org/3/library/sqlite3.html#sqlite3.Connection.autocommit
+
+  - id: ueberschneidung-tests
+    type: code
+    title: Tests, die Doppelbuchungen bemerken
+    prompt: |
+      `reservierungen.py` enthält ein Repository, das seine Daten in SQLite speichert:
+
+      - `verbinde()` gibt eine neue In-Memory-Datenbank mit Schema zurück.
+      - `ReservierungsRepository(con).anlegen(rad_id, kunde_id, start, ende)` speichert eine Reservierung und gibt ihre ID zurück. `start` und `ende` sind `datetime`-Werte mit Zeitzone.
+      - Ist **dasselbe Rad** im Zeitraum schon reserviert, egal von wem, wirft `anlegen` die Exception `Belegt` und speichert nichts.
+
+      Die Regel: Reservierungen sind halboffene Intervalle `[start, ende)`. Zwei Reservierungen desselben Rads dürfen sich nicht überschneiden. Eine Reservierung, die um 11:00 endet, und eine, die um 11:00 beginnt, überschneiden sich nicht. Verschiedene Räder sind voneinander unabhängig.
+
+      Schreibe pytest-Tests gegen die echte Datenbank. Sie müssen mit dem richtigen Repository grün sein und jede fehlerhafte Variante, die die Prüfung bereithält, rot werden lassen.
+    lang: python
+    setup: |
+      from pathlib import Path
+
+      RICHTIG = '''
+      import sqlite3
+      from datetime import timezone
+
+      SCHEMA = """
+      CREATE TABLE reservierungen (
+          id INTEGER PRIMARY KEY,
+          rad_id INTEGER NOT NULL,
+          kunde_id INTEGER NOT NULL,
+          start TEXT NOT NULL,
+          ende TEXT NOT NULL,
+          CHECK (start < ende)
+      );
+      """
+
+
+      class Belegt(Exception):
+          pass
+
+
+      def verbinde():
+          con = sqlite3.connect(":memory:")
+          con.executescript(SCHEMA)
+          return con
+
+
+      def als_text(zeitpunkt):
+          return zeitpunkt.astimezone(timezone.utc).isoformat()
+
+
+      class ReservierungsRepository:
+          def __init__(self, con):
+              self.con = con
+
+          def anlegen(self, rad_id, kunde_id, start, ende):
+              konflikt = self.con.execute(
+                  "SELECT id FROM reservierungen WHERE rad_id = ? AND start < ? AND ? < ende",
+                  (rad_id, als_text(ende), als_text(start)),
+              ).fetchone()
+              if konflikt:
+                  raise Belegt(f"Rad {rad_id} ist belegt durch Reservierung {konflikt[0]}")
+              cursor = self.con.execute(
+                  "INSERT INTO reservierungen (rad_id, kunde_id, start, ende) VALUES (?, ?, ?, ?)",
+                  (rad_id, kunde_id, als_text(start), als_text(ende)),
+              )
+              return cursor.lastrowid
+      '''
+      BEDINGUNG = "start < ? AND ? < ende"
+      MUTANTEN = {
+          "grenze_ende": RICHTIG.replace(BEDINGUNG, "start < ? AND ? <= ende"),
+          "grenze_start": RICHTIG.replace(BEDINGUNG, "start <= ? AND ? < ende"),
+          "nur_beginn": RICHTIG.replace(BEDINGUNG, "start < ? AND ? <= start"),
+          "spalte": RICHTIG.replace("WHERE rad_id = ?", "WHERE kunde_id = ?").replace("(rad_id, als_text(ende)", "(kunde_id, als_text(ende)"),
+      }
+      assert all(m != RICHTIG for m in MUTANTEN.values()), "Ein Mutant ist identisch mit der richtigen Version."
+      assert MUTANTEN["spalte"].count("kunde_id = ?") == 1 and "(kunde_id, als_text(ende)" in MUTANTEN["spalte"]
+      Path("reservierungen.py").write_text(RICHTIG)
+    starter: |
+      from datetime import datetime, timezone
+
+      import pytest
+      from reservierungen import Belegt, ReservierungsRepository, verbinde
+
+
+      @pytest.fixture
+      def repo():
+          con = verbinde()
+          yield ReservierungsRepository(con)
+          con.close()
+
+
+      def um(stunde, minute=0):
+          return datetime(2026, 10, 5, stunde, minute, tzinfo=timezone.utc)
+
+
+      def test_ueberschneidung():
+          ...
+    solution: |
+      from datetime import datetime, timezone
+
+      import pytest
+      from reservierungen import Belegt, ReservierungsRepository, verbinde
+
+
+      @pytest.fixture
+      def repo():
+          con = verbinde()
+          yield ReservierungsRepository(con)
+          con.close()
+
+
+      def um(stunde, minute=0):
+          return datetime(2026, 10, 5, stunde, minute, tzinfo=timezone.utc)
+
+
+      def test_direkt_danach_ist_frei(repo):
+          repo.anlegen(7, 1, um(10), um(11))
+          repo.anlegen(7, 2, um(11), um(12))
+
+
+      def test_direkt_davor_ist_frei(repo):
+          repo.anlegen(7, 1, um(11), um(12))
+          repo.anlegen(7, 2, um(10), um(11))
+
+
+      @pytest.mark.parametrize(
+          "start, ende",
+          [
+              (um(9, 30), um(10, 30)),
+              (um(10, 30), um(11, 30)),
+              (um(10, 15), um(10, 45)),
+              (um(9), um(12)),
+              (um(10), um(11)),
+          ],
+          ids=["am-anfang", "am-ende", "enthalten", "umschliessend", "gleich"],
+      )
+      def test_ueberschneidung_ist_belegt(repo, start, ende):
+          repo.anlegen(7, 1, um(10), um(11))
+          with pytest.raises(Belegt):
+              repo.anlegen(7, 2, start, ende)
+
+
+      def test_anderes_rad_zur_selben_zeit_ist_frei(repo):
+          repo.anlegen(7, 1, um(10), um(11))
+          repo.anlegen(8, 1, um(10), um(11))
+    tests:
+      - name: Grün gegen das richtige Repository
+        code: |
+          lauf = run_pytest({"reservierungen.py": RICHTIG})
+          assert lauf.ok, lauf.output
+      - name: Fängt einen Grenzfehler am Ende einer Reservierung
+        code: |
+          lauf = run_pytest({"reservierungen.py": MUTANTEN["grenze_ende"]})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl eine Reservierung, die genau beim Ende einer anderen beginnt, jetzt als belegt gilt."
+      - name: Fängt einen Grenzfehler am Anfang einer Reservierung
+        code: |
+          lauf = run_pytest({"reservierungen.py": MUTANTEN["grenze_start"]})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl eine Reservierung, die genau beim Beginn einer anderen endet, jetzt als belegt gilt."
+      - name: Fängt eine unvollständige Überschneidungsprüfung
+        code: |
+          lauf = run_pytest({"reservierungen.py": MUTANTEN["nur_beginn"]})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl das Repository nur noch Reservierungen erkennt, die innerhalb des neuen Zeitraums beginnen. Was ist mit einer, die vorher beginnt und hineinragt?"
+      - name: Fängt eine Prüfung über die falsche Spalte
+        code: |
+          lauf = run_pytest({"reservierungen.py": MUTANTEN["spalte"]})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl das Repository Überschneidungen pro Kunde statt pro Rad prüft."
+    hints:
+      - Zeichne die bestehende Reservierung 10–11 Uhr als Strecke und überlege, wo eine zweite liegen kann – davor, danach, darüber, darin.
+      - Für jede Grenze brauchst du einen Fall, der gerade noch frei ist, und einen, der gerade schon belegt ist. `pytest.mark.parametrize` hält das kurz.
+      - Lass die zweite Reservierung von einem anderen Kunden kommen. Und prüfe, dass ein anderes Rad zur selben Zeit frei ist.
+    explanation: |
+      Die Bedingung `start < neues_ende AND neuer_start < ende` hat zwei Vergleiche und damit zwei Grenzen. „Direkt danach“ prüft die eine, „direkt davor“ die andere; wer nur eine Richtung testet, übersieht einen der Grenzfehler. Ein Fall, in dem die neue Reservierung in eine bestehende hineinragt, fängt die Variante, die nur nach Reservierungen sucht, die im neuen Zeitraum beginnen. Und weil die Regel pro Rad gilt, gehört ein zweiter Kunde auf dasselbe Rad in den Test. Keine dieser Varianten hätte ein Test mit gemocktem Datenbankzugriff bemerkt: Das SQL wäre nie gelaufen.
+    resources:
+      - title: pytest · How to parametrize fixtures and test functions
+        url: https://docs.pytest.org/en/stable/how-to/parametrize.html
+      - title: PostgreSQL · Range Types (Grenzen von Intervallen)
+        url: https://www.postgresql.org/docs/current/rangetypes.html#RANGETYPES-INCLUSIVITY
+
+  - id: fixtures-schreiben
+    type: code
+    title: Fixtures für das Repository
+    prompt: |
+      Schreibe eine `conftest.py` für die Testdatei unten. `reservierungen.py` enthält `SCHEMA` (Tabellen `raeder` mit `id` und `typ` sowie `reservierungen` mit Fremdschlüssel `rad_id` auf `raeder`) und `ReservierungsRepository(con)`. Gebraucht werden drei Fixtures:
+
+      - `db` – pro Test eine frische In-Memory-Datenbank mit dem Schema und eingeschalteten Fremdschlüsseln (`PRAGMA foreign_keys = ON`). Nach dem Test wird die Verbindung geschlossen.
+      - `neues_rad` – eine Factory-Fixture: `neues_rad()` legt ein City-Rad an (`typ` = `'city'`) und gibt seine ID zurück, `neues_rad("ebike")` ein E-Bike.
+      - `repo` – ein `ReservierungsRepository` auf `db`.
+
+      ```python
+      # test_repo.py
+      import sqlite3
+
+      import pytest
+
+      gesehen = []
+
+
+      def test_anlegen_und_lesen(repo, neues_rad, db):
+          gesehen.append(db)
+          city = neues_rad()
+          ebike = neues_rad("ebike")
+          repo.anlegen(city, 1, "2026-10-05T10:00", "2026-10-05T11:00")
+          repo.anlegen(ebike, 1, "2026-10-05T12:00", "2026-10-05T13:00")
+          assert repo.fuer_kunde(1) == [city, ebike]
+
+
+      def test_jeder_test_beginnt_leer(db):
+          assert db.execute("SELECT count(*) FROM reservierungen").fetchone() == (0,)
+          assert db.execute("SELECT count(*) FROM raeder").fetchone() == (0,)
+
+
+      def test_fremdschluessel_werden_geprueft(repo):
+          with pytest.raises(sqlite3.IntegrityError):
+              repo.anlegen(999, 1, "2026-10-05T10:00", "2026-10-05T11:00")
+
+
+      def test_verbindung_wird_geschlossen():
+          with pytest.raises(sqlite3.ProgrammingError):
+              gesehen[0].execute("SELECT 1")
+
+
+      def test_typ_des_rads(db, neues_rad):
+          rad = neues_rad("ebike")
+          assert db.execute("SELECT typ FROM raeder WHERE id = ?", (rad,)).fetchone() == ("ebike",)
+      ```
+    lang: python
+    setup: |
+      from pathlib import Path
+
+      MODUL = '''
+      SCHEMA = """
+      CREATE TABLE raeder (
+          id INTEGER PRIMARY KEY,
+          typ TEXT NOT NULL CHECK (typ IN ('city', 'ebike'))
+      );
+      CREATE TABLE reservierungen (
+          id INTEGER PRIMARY KEY,
+          rad_id INTEGER NOT NULL REFERENCES raeder (id),
+          kunde_id INTEGER NOT NULL,
+          start TEXT NOT NULL,
+          ende TEXT NOT NULL
+      );
+      """
+
+
+      class ReservierungsRepository:
+          def __init__(self, con):
+              self.con = con
+
+          def anlegen(self, rad_id, kunde_id, start, ende):
+              cursor = self.con.execute(
+                  "INSERT INTO reservierungen (rad_id, kunde_id, start, ende) VALUES (?, ?, ?, ?)",
+                  (rad_id, kunde_id, start, ende),
+              )
+              return cursor.lastrowid
+
+          def fuer_kunde(self, kunde_id):
+              sql = "SELECT rad_id FROM reservierungen WHERE kunde_id = ? ORDER BY start"
+              return [rad_id for (rad_id,) in self.con.execute(sql, (kunde_id,))]
+      '''
+
+      TESTS = '''
+      import sqlite3
+
+      import pytest
+
+      gesehen = []
+
+
+      def test_anlegen_und_lesen(repo, neues_rad, db):
+          gesehen.append(db)
+          city = neues_rad()
+          ebike = neues_rad("ebike")
+          repo.anlegen(city, 1, "2026-10-05T10:00", "2026-10-05T11:00")
+          repo.anlegen(ebike, 1, "2026-10-05T12:00", "2026-10-05T13:00")
+          assert repo.fuer_kunde(1) == [city, ebike]
+
+
+      def test_jeder_test_beginnt_leer(db):
+          assert db.execute("SELECT count(*) FROM reservierungen").fetchone() == (0,)
+          assert db.execute("SELECT count(*) FROM raeder").fetchone() == (0,)
+
+
+      def test_fremdschluessel_werden_geprueft(repo):
+          with pytest.raises(sqlite3.IntegrityError):
+              repo.anlegen(999, 1, "2026-10-05T10:00", "2026-10-05T11:00")
+
+
+      def test_verbindung_wird_geschlossen():
+          with pytest.raises(sqlite3.ProgrammingError):
+              gesehen[0].execute("SELECT 1")
+
+
+      def test_typ_des_rads(db, neues_rad):
+          rad = neues_rad("ebike")
+          assert db.execute("SELECT typ FROM raeder WHERE id = ?", (rad,)).fetchone() == ("ebike",)
+      '''
+      Path("reservierungen.py").write_text(MODUL)
+
+
+      def ergebnis(test):
+          return LAUF.outcomes.get(test, "nicht gelaufen")
+    starter: |
+      import sqlite3
+
+      import pytest
+      from reservierungen import SCHEMA, ReservierungsRepository
+
+
+      @pytest.fixture
+      def db():
+          ...
+
+
+      @pytest.fixture
+      def neues_rad(db):
+          ...
+
+
+      @pytest.fixture
+      def repo(db):
+          ...
+    solution: |
+      import sqlite3
+
+      import pytest
+      from reservierungen import SCHEMA, ReservierungsRepository
+
+
+      @pytest.fixture
+      def db():
+          con = sqlite3.connect(":memory:")
+          con.execute("PRAGMA foreign_keys = ON")
+          con.executescript(SCHEMA)
+          yield con
+          con.close()
+
+
+      @pytest.fixture
+      def neues_rad(db):
+          def anlegen(typ="city"):
+              return db.execute("INSERT INTO raeder (typ) VALUES (?)", (typ,)).lastrowid
+
+          return anlegen
+
+
+      @pytest.fixture
+      def repo(db):
+          return ReservierungsRepository(db)
+    tests:
+      - name: Die Testdatei läuft mit deinen Fixtures
+        code: |
+          LAUF = run_pytest({"reservierungen.py": MODUL, "test_repo.py": TESTS}, args=["test_repo.py"], name="conftest.py")
+          assert ergebnis("test_anlegen_und_lesen") == "passed", LAUF.output
+          assert ergebnis("test_typ_des_rads") == "passed", LAUF.output
+      - name: Jeder Test beginnt mit leeren Tabellen
+        code: |
+          assert ergebnis("test_jeder_test_beginnt_leer") == "passed", "Ein Test sieht die Daten eines früheren Tests. Welchen Scope hat `db`?\n" + LAUF.output
+      - name: Fremdschlüssel werden geprüft
+        code: |
+          assert ergebnis("test_fremdschluessel_werden_geprueft") == "passed", "Eine Reservierung für ein Rad, das es nicht gibt, wird gespeichert. SQLite prüft Fremdschlüssel nur nach `PRAGMA foreign_keys = ON` – und nicht innerhalb einer offenen Transaktion.\n" + LAUF.output
+      - name: Die Verbindung wird nach dem Test geschlossen
+        code: |
+          assert ergebnis("test_verbindung_wird_geschlossen") == "passed", "Die Verbindung aus einem früheren Test ist noch offen. Jeder Test braucht eine eigene Verbindung, die nach `yield` geschlossen wird.\n" + LAUF.output
+    hints:
+      - "`db` ist eine Yield-Fixture: Verbindung öffnen, Pragma, Schema, `yield`, schließen."
+      - Das Pragma muss vor dem Schema und vor jeder Transaktion laufen. Mit den Standardeinstellungen von `sqlite3.connect` geht das direkt nach dem Verbinden.
+      - Eine Factory-Fixture definiert innen eine Funktion und gibt sie mit `return` zurück. `cursor.lastrowid` liefert die ID der eingefügten Zeile.
+    explanation: |
+      Die Fixture `db` hat den Standard-Scope `function`, also bekommt jeder Test eine eigene Datenbank – das macht `test_jeder_test_beginnt_leer` grün, egal in welcher Reihenfolge die Tests laufen. `PRAGMA foreign_keys = ON` wirkt pro Verbindung und nur außerhalb einer Transaktion; ohne das Pragma ist `REFERENCES` in SQLite Dekoration. Der Code nach `yield` schließt die Verbindung auch dann, wenn der Test scheitert. `neues_rad` gibt eine Funktion zurück, damit ein Test beliebig viele Räder mit eigenen IDs anlegen kann, ohne IDs fest einzutragen. Weil `neues_rad` und `repo` beide `db` anfordern, bekommen sie innerhalb eines Tests dieselbe Verbindung: pytest erzeugt jede Fixture pro Scope nur einmal.
+    resources:
+      - title: pytest · Factories as fixtures
+        url: https://docs.pytest.org/en/stable/how-to/fixtures.html#factories-as-fixtures
+      - title: SQLite · Enabling Foreign Key Support
+        url: https://sqlite.org/foreignkeys.html#fk_enable
+      - title: pytest · conftest.py
+        url: https://docs.pytest.org/en/stable/reference/fixtures.html#conftest-py-sharing-fixtures-across-multiple-files
+
+  - id: speicher-tests
+    type: code
+    title: Was nach dem Neustart noch da ist
+    prompt: |
+      Die Stationen speichern Reservierungen offline in einer SQLite-Datei. `speicher.py` enthält die Klasse `Speicher`:
+
+      - `Speicher(pfad)` öffnet die SQLite-Datei `pfad` oder legt sie an. Eine vorhandene Datei behält ihre Reservierungen.
+      - `anlegen(rad_id, kunde_id, start, ende)` speichert eine Reservierung (`start` und `ende` als Text) und gibt ihre ID zurück. Sobald `anlegen` zurückkehrt, ist die Reservierung dauerhaft gespeichert: Ein zweiter `Speicher` auf derselben Datei sieht sie, auch wenn der erste nie geschlossen wurde.
+      - `fuer_kunde(kunde_id)` gibt die Reservierungen des Kunden als Liste von Tupeln `(rad_id, start, ende)` zurück, sortiert nach `start`.
+      - `schliessen()` schließt die Datei.
+      - Alle Daten liegen in der Datei `pfad` und nirgendwo sonst.
+
+      Schreibe pytest-Tests mit `tmp_path`. Sie müssen mit dem richtigen `Speicher` grün sein und jede fehlerhafte Variante rot werden lassen.
+    lang: python
+    setup: |
+      from pathlib import Path
+
+      RICHTIG = '''
+      import sqlite3
+
+      SCHEMA = """
+      CREATE TABLE IF NOT EXISTS reservierungen (
+          id INTEGER PRIMARY KEY,
+          rad_id INTEGER NOT NULL,
+          kunde_id INTEGER NOT NULL,
+          start TEXT NOT NULL,
+          ende TEXT NOT NULL
+      )
+      """
+
+
+      class Speicher:
+          def __init__(self, pfad):
+              self.con = sqlite3.connect(pfad)
+              self.con.execute(SCHEMA)
+
+          def anlegen(self, rad_id, kunde_id, start, ende):
+              cursor = self.con.execute(
+                  "INSERT INTO reservierungen (rad_id, kunde_id, start, ende) VALUES (?, ?, ?, ?)",
+                  (rad_id, kunde_id, start, ende),
+              )
+              self.con.commit()
+              return cursor.lastrowid
+
+          def fuer_kunde(self, kunde_id):
+              sql = "SELECT rad_id, start, ende FROM reservierungen WHERE kunde_id = ? ORDER BY start"
+              return self.con.execute(sql, (kunde_id,)).fetchall()
+
+          def schliessen(self):
+              self.con.close()
+      '''
+      MUTANTEN = {
+          "commit": RICHTIG.replace("        self.con.commit()\n", ""),
+          "schema": RICHTIG.replace("CREATE TABLE IF NOT EXISTS", "CREATE TABLE"),
+          "pfad": RICHTIG.replace("sqlite3.connect(pfad)", 'sqlite3.connect("radwerk.db")'),
+      }
+      assert all(m != RICHTIG for m in MUTANTEN.values()), "Ein Mutant ist identisch mit der richtigen Version."
+      Path("speicher.py").write_text(RICHTIG)
+    starter: |
+      from speicher import Speicher
+
+
+      def test_speicher(tmp_path):
+          ...
+    solution: |
+      from speicher import Speicher
+
+
+      def test_reservierung_ueberlebt_absturz(tmp_path):
+          erster = Speicher(tmp_path / "station.db")
+          erster.anlegen(7, 42, "2026-10-05T10:00", "2026-10-05T11:00")
+          zweiter = Speicher(tmp_path / "station.db")
+          assert zweiter.fuer_kunde(42) == [(7, "2026-10-05T10:00", "2026-10-05T11:00")]
+          erster.schliessen()
+          zweiter.schliessen()
+
+
+      def test_wieder_oeffnen_behaelt_daten(tmp_path):
+          speicher = Speicher(tmp_path / "station.db")
+          speicher.anlegen(7, 42, "2026-10-05T10:00", "2026-10-05T11:00")
+          speicher.schliessen()
+          speicher = Speicher(tmp_path / "station.db")
+          speicher.anlegen(8, 42, "2026-10-05T09:00", "2026-10-05T09:30")
+          assert [rad for rad, _, _ in speicher.fuer_kunde(42)] == [8, 7]
+          speicher.schliessen()
+
+
+      def test_daten_liegen_nur_in_der_eigenen_datei(tmp_path):
+          a = Speicher(tmp_path / "a.db")
+          a.anlegen(7, 42, "2026-10-05T10:00", "2026-10-05T11:00")
+          b = Speicher(tmp_path / "b.db")
+          assert b.fuer_kunde(42) == []
+          assert (tmp_path / "a.db").exists()
+          a.schliessen()
+          b.schliessen()
+    tests:
+      - name: Grün gegen den richtigen Speicher
+        code: |
+          lauf = run_pytest({"speicher.py": RICHTIG})
+          assert lauf.ok, lauf.output
+      - name: Fängt Daten, die nicht dauerhaft gespeichert werden
+        code: |
+          lauf = run_pytest({"speicher.py": MUTANTEN["commit"]})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl `anlegen` nicht mehr committet. Eine zweite Verbindung würde das sehen."
+      - name: Fängt einen Fehler beim Öffnen einer vorhandenen Datei
+        code: |
+          lauf = run_pytest({"speicher.py": MUTANTEN["schema"]})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl sich eine vorhandene Datei nicht mehr öffnen lässt."
+      - name: Fängt einen Fehler beim Speicherort
+        code: |
+          lauf = run_pytest({"speicher.py": MUTANTEN["pfad"]})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl der Speicher den Pfad ignoriert und immer dieselbe Datei im Arbeitsverzeichnis benutzt."
+    hints:
+      - Einen Neustart nach einem Absturz stellst du mit einem zweiten `Speicher`-Objekt auf derselben Datei nach, ohne das erste zu schließen.
+      - Öffne eine Datei, die es schon gibt. Was muss dabei mit dem Schema passieren?
+      - Zwei Speicher mit verschiedenen Dateien in `tmp_path` dürfen nichts voneinander wissen.
+    explanation: |
+      Der Test mit zweiter Verbindung fängt das fehlende `commit()`: Die erste Verbindung sähe ihre eigenen offenen Änderungen, die zweite nicht. Wer eine vorhandene Datei erneut öffnet, bemerkt, dass `CREATE TABLE` ohne `IF NOT EXISTS` an der bestehenden Tabelle scheitert – ein Fehler, der nur beim zweiten Start einer Station auftritt, also nie in einem Test mit frischer Datei. Und zwei Dateien in `tmp_path`, die unabhängig bleiben müssen, entlarven einen Speicher, der den Pfad ignoriert. `tmp_path` sorgt dafür, dass jeder Test mit leeren Dateien beginnt und keine Reste im Projektverzeichnis bleiben.
+    resources:
+      - title: pytest · The tmp_path fixture
+        url: https://docs.pytest.org/en/stable/how-to/tmp_path.html#the-tmp-path-fixture
+      - title: SQLite · CREATE TABLE … IF NOT EXISTS
+        url: https://sqlite.org/lang_createtable.html
+
+  - id: commit-im-repository
+    type: bug
+    title: Einzeln grün, zusammen rot
+    prompt: |
+      `pytest tests/test_buchungen.py` ist grün, `pytest tests/test_kunden.py` auch. Zusammen (`pytest tests/`, die Buchungstests laufen zuerst) scheitert `test_neuer_kunde_hat_keine_reservierungen` aus `test_kunden.py` mit `assert [7] == []`. Die Fixtures sollen so bleiben, wie sie sind: Schema einmal pro Sitzung, Rollback nach jedem Test. Welche Zeile bricht die Isolation?
+    lang: python
+    code: |
+      class ReservierungsRepository:
+          def __init__(self, con):
+              self.con = con
+
+          def anlegen(self, rad_id, kunde_id, start, ende):
+              cursor = self.con.execute(
+                  "INSERT INTO reservierungen (rad_id, kunde_id, start, ende) VALUES (?, ?, ?, ?)",
+                  (rad_id, kunde_id, start, ende),
+              )
+              self.con.commit()
+              return cursor.lastrowid
+
+
+      # conftest.py
+      @pytest.fixture(scope="session")
+      def verbindung():
+          con = sqlite3.connect(":memory:", autocommit=True)
+          con.executescript(SCHEMA)
+          con.autocommit = False
+          yield con
+          con.close()
+
+
+      @pytest.fixture
+      def repo(verbindung):
+          yield ReservierungsRepository(verbindung)
+          verbindung.rollback()
+    lines: [10]
+    explanation: |
+      `self.con.commit()` schreibt die Reservierung fest, bevor die Fixture zurückrollt. Der Rollback verwirft danach nur noch, was seit diesem Commit passiert ist, also nichts. Die Reservierung aus `test_buchungen.py` bleibt in der gemeinsamen Datenbank und taucht im Kundentest auf, der danach läuft. Einzeln laufen beide grün, weil keiner vorher etwas festschreibt. Die Lösung liegt im Produktivcode: Das Repository schreibt, die aufrufende Schicht entscheidet über den Commit, etwa ein Service mit `with con:` um den ganzen Anwendungsfall. Das hat einen zweiten Vorteil: Zwei Schreibvorgänge eines Anwendungsfalls landen gemeinsam oder gar nicht in der Datenbank. Muss das Repository committen, braucht der Test eine frische Datenbank pro Test statt Rollback.
+    resources:
+      - title: Python · sqlite3 – Transaktionen steuern
+        url: https://docs.python.org/3/library/sqlite3.html#sqlite3-controlling-transactions
+      - title: Python · Connection als Kontextmanager
+        url: https://docs.python.org/3/library/sqlite3.html#sqlite3-connection-context-manager
+
+  - id: mock-test-ersetzen
+    type: code
+    title: Ein Test, der jede Umformulierung bestraft
+    prompt: |
+      Ein Kollege hat in `reservierungen.py` die SQL-Abfrage von `kommende` umformuliert, ohne das Verhalten zu ändern. Der Test im Editor wurde rot. Er prüft den SQL-Text statt des Ergebnisses.
+
+      `ReservierungsRepository(con).kommende(kunde_id, ab)` gibt die IDs aller Reservierungen des Kunden zurück, die zum Zeitpunkt `ab` noch nicht vorbei sind, sortiert nach `start`. Reservierungen sind halboffen `[start, ende)`: Eine Reservierung, die um 11:00 endet, ist um 11:00 vorbei; eine, die um 10:00 begann und um 12:00 endet, läuft um 11:00 noch und gehört dazu. `anlegen(rad_id, kunde_id, start, ende)` und `verbinde()` funktionieren wie gewohnt; Zeitpunkte sind `datetime` mit Zeitzone.
+
+      Ersetze den Mock-Test durch Tests gegen die echte Datenbank (`verbinde()`). Sie müssen bei der ursprünglichen und der umformulierten Abfrage grün sein und bei fehlerhaften Varianten rot.
+    lang: python
+    setup: |
+      from pathlib import Path
+
+      RICHTIG = '''
+      import sqlite3
+      from datetime import timezone
+
+      SCHEMA = """
+      CREATE TABLE reservierungen (
+          id INTEGER PRIMARY KEY,
+          rad_id INTEGER NOT NULL,
+          kunde_id INTEGER NOT NULL,
+          start TEXT NOT NULL,
+          ende TEXT NOT NULL
+      );
+      """
+
+
+      def verbinde():
+          con = sqlite3.connect(":memory:")
+          con.executescript(SCHEMA)
+          return con
+
+
+      def als_text(zeitpunkt):
+          return zeitpunkt.astimezone(timezone.utc).isoformat()
+
+
+      class ReservierungsRepository:
+          def __init__(self, con):
+              self.con = con
+
+          def anlegen(self, rad_id, kunde_id, start, ende):
+              cursor = self.con.execute(
+                  "INSERT INTO reservierungen (rad_id, kunde_id, start, ende) VALUES (?, ?, ?, ?)",
+                  (rad_id, kunde_id, als_text(start), als_text(ende)),
+              )
+              return cursor.lastrowid
+
+          def kommende(self, kunde_id, ab):
+              zeilen = self.con.execute(
+                  "SELECT id FROM reservierungen WHERE kunde_id = ? AND ende > ? ORDER BY start",
+                  (kunde_id, als_text(ab)),
+              ).fetchall()
+              return [reservierung_id for (reservierung_id,) in zeilen]
+      '''
+      UMFORMULIERT = RICHTIG.replace(
+          '"SELECT id FROM reservierungen WHERE kunde_id = ? AND ende > ? ORDER BY start",\n'
+          '            (kunde_id, als_text(ab)),',
+          '"SELECT id FROM reservierungen WHERE ? < ende AND kunde_id = ? ORDER BY start ASC",\n'
+          '            (als_text(ab), kunde_id),',
+      )
+      MUTANTEN = {
+          "laufende": RICHTIG.replace("AND ende > ?", "AND start > ?"),
+          "grenze": RICHTIG.replace("AND ende > ?", "AND ende >= ?"),
+          "sortierung": RICHTIG.replace("ORDER BY start", "ORDER BY id"),
+      }
+      assert UMFORMULIERT != RICHTIG, "Die Umformulierung hat nichts geändert."
+      assert all(m != RICHTIG for m in MUTANTEN.values()), "Ein Mutant ist identisch mit der richtigen Version."
+      Path("reservierungen.py").write_text(RICHTIG)
+    starter: |
+      from datetime import datetime, timezone
+      from unittest.mock import Mock
+
+      from reservierungen import ReservierungsRepository, verbinde
+
+
+      def um(stunde):
+          return datetime(2026, 10, 5, stunde, tzinfo=timezone.utc)
+
+
+      def test_kommende_reservierungen():
+          con = Mock()
+          con.execute.return_value.fetchall.return_value = [(3,), (5,)]
+          ergebnis = ReservierungsRepository(con).kommende(42, um(11))
+          con.execute.assert_called_once_with(
+              "SELECT id FROM reservierungen WHERE kunde_id = ? AND ende > ? ORDER BY start",
+              (42, "2026-10-05T11:00:00+00:00"),
+          )
+          assert ergebnis == [3, 5]
+    solution: |
+      from datetime import datetime, timezone
+
+      import pytest
+      from reservierungen import ReservierungsRepository, verbinde
+
+
+      def um(stunde):
+          return datetime(2026, 10, 5, stunde, tzinfo=timezone.utc)
+
+
+      @pytest.fixture
+      def repo():
+          con = verbinde()
+          yield ReservierungsRepository(con)
+          con.close()
+
+
+      def test_kommende_reservierungen(repo):
+          spaeter = repo.anlegen(7, 42, um(14), um(15))
+          laufend = repo.anlegen(8, 42, um(10), um(12))
+          repo.anlegen(9, 42, um(8), um(11))  # endet genau um 11 Uhr: vorbei
+          repo.anlegen(7, 99, um(12), um(13))  # anderer Kunde
+          assert repo.kommende(42, um(11)) == [laufend, spaeter]
+    tests:
+      - name: Grün gegen die ursprüngliche Abfrage
+        code: |
+          lauf = run_pytest({"reservierungen.py": RICHTIG})
+          assert lauf.ok, lauf.output
+      - name: Grün gegen die umformulierte Abfrage
+        code: |
+          lauf = run_pytest({"reservierungen.py": UMFORMULIERT})
+          assert lauf.ok, "Deine Tests schlagen bei einer Abfrage an, die sich gleich verhält. Prüfe das Ergebnis, nicht den SQL-Text.\n" + lauf.output
+      - name: Fängt einen Fehler bei laufenden Reservierungen
+        code: |
+          lauf = run_pytest({"reservierungen.py": MUTANTEN["laufende"]})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl Reservierungen fehlen, die zum Zeitpunkt `ab` schon begonnen haben, aber noch laufen."
+      - name: Fängt einen Grenzfehler am Ende
+        code: |
+          lauf = run_pytest({"reservierungen.py": MUTANTEN["grenze"]})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl eine Reservierung, die genau zum Zeitpunkt `ab` endet, noch mitgezählt wird."
+      - name: Fängt eine falsche Sortierung
+        code: |
+          lauf = run_pytest({"reservierungen.py": MUTANTEN["sortierung"]})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl nach Anlagereihenfolge statt nach Start sortiert wird."
+    hints:
+      - Lege die Testdaten mit `anlegen` in einer echten Datenbank an und vergleiche das Ergebnis von `kommende` mit den IDs, die `anlegen` zurückgegeben hat.
+      - Du brauchst eine laufende, eine spätere und eine Reservierung, die genau zum Zeitpunkt `ab` endet – und eines anderen Kunden.
+      - Lege die spätere Reservierung zuerst an, sonst stimmt die Reihenfolge der IDs zufällig mit der Startzeit überein.
+    explanation: |
+      Der Mock-Test vergleicht den SQL-Text und liefert sich das Ergebnis selbst. Er schlägt bei jeder Änderung an, harmlos oder nicht, und sagt nichts darüber, ob die Abfrage die richtigen Zeilen findet. So ein Test heißt Change Detector: Er bremst Refactorings und fängt Fehler nur zufällig. Der Test gegen SQLite prüft das Verhalten. Jede Formulierung, die dieselben Zeilen in derselben Reihenfolge liefert, besteht ihn. Die Testdaten decken jede Grenze ab: laufend, genau vorbei, später, anderer Kunde, und sie sind absichtlich nicht in Startreihenfolge angelegt.
+    resources:
+      - title: Martin Fowler · Mocks Aren't Stubs
+        url: https://martinfowler.com/articles/mocksArentStubs.html
+      - title: Python · unittest.mock – assert_called_once_with
+        url: https://docs.python.org/3/library/unittest.mock.html#unittest.mock.Mock.assert_called_once_with
+
+  - id: testcontainers-erklaeren
+    type: explain
+    title: Eine conftest.py mit echtem PostgreSQL
+    prompt: |
+      Diese `conftest.py` liegt im Radwerk-Backend. Erkläre einer neuen Kollegin, was die beiden Fixtures tun, warum sie diese Scopes haben und was diese Tests zeigen können, was Tests mit SQLite nicht zeigen.
+    lang: python
+    code: |
+      import psycopg
+      import pytest
+      from testcontainers.community.postgres import PostgresContainer
+
+      from radwerk.schema import SCHEMA
+
+
+      @pytest.fixture(scope="session")
+      def postgres_url():
+          with PostgresContainer("postgres:18", driver=None) as postgres:
+              url = postgres.get_connection_url()
+              with psycopg.connect(url, autocommit=True) as con:
+                  con.execute(SCHEMA)
+              yield url
+
+
+      @pytest.fixture
+      def db(postgres_url):
+          with psycopg.connect(postgres_url) as con:
+              yield con
+              con.rollback()
+    points:
+      - "`postgres_url` startet einmal pro Testsitzung einen PostgreSQL-Container, legt das Schema an und entfernt den Container nach dem letzten Test – die teuren Schritte laufen einmal."
+      - "`db` gibt jedem Test eine eigene Verbindung und rollt danach zurück, sodass jeder Test mit leeren Tabellen beginnt, ohne das Schema neu aufzubauen."
+      - Die Tests laufen gegen dieselbe Datenbank und Hauptversion wie in Produktion und sehen deshalb strenge Typen, `timestamptz`, Exclusion Constraints und PostgreSQL-Funktionen, die SQLite nicht kennt.
+      - Grenzen des Rollbacks – Code, der selbst committet, und Verhalten, das erst beim Commit oder mit mehreren Verbindungen auftritt, braucht eine andere Isolation.
+    explanation: |
+      `postgres_url` hat den Scope `session`: Der Container startet einmal pro Testlauf, das kostet Sekunden. Im selben Schritt legt die Fixture mit einer Autocommit-Verbindung das Schema an, am besten mit denselben Migrationen wie in Produktion. Der `with`-Block entfernt den Container nach dem letzten Test. `db` hat den Scope `function`: Jeder Test bekommt eine neue Verbindung, schreibt in deren Transaktion, und `rollback()` verwirft alles danach. Das ist billig und isoliert die Tests voneinander. Der Gewinn gegenüber SQLite liegt bei allem, was PostgreSQL anders macht: strenge Typen, Zeitstempel mit Zeitzone, Bereichstypen und Exclusion Constraints gegen Doppelbuchungen, eigene Datumsfunktionen. Was die Fixture nicht abdeckt, ist Code, der selbst committet, und Verhalten, das erst nach dem Commit oder zwischen zwei Verbindungen sichtbar wird. Solche Tests brauchen eine frische Datenbank oder räumen mit `TRUNCATE` auf.
+    resources:
+      - title: Testcontainers for Python · PostgreSQL
+        url: https://testcontainers-python.readthedocs.io/en/latest/modules/postgres/README.html
+      - title: psycopg · Connection context
+        url: https://www.psycopg.org/psycopg3/docs/basic/usage.html#connection-context
+
+  - id: constraint-testen
+    type: choice
+    title: Wo prüfst du den Exclusion Constraint?
+    prompt: |
+      Radwerk ergänzt in PostgreSQL `EXCLUDE USING gist (rad_id WITH =, zeitraum WITH &&)`, damit Doppelbuchungen auch bei gleichzeitigen Anfragen unmöglich sind. Mit welchem Test sicherst du ab, dass dieser Constraint existiert und greift – zuverlässig und so günstig wie möglich?
+    options:
+      - text: Ein Repository-Test gegen PostgreSQL per Testcontainers legt zwei überlappende Reservierungen für dasselbe Rad an und erwartet bei der zweiten `psycopg.errors.ExclusionViolation`.
+        correct: true
+        why: Das ist die niedrigste Ebene, auf der der Constraint existiert. Der Test braucht PostgreSQL, läuft aber in Millisekunden, sobald der Container steht, und zeigt bei einem Fehler genau auf das Schema.
+      - text: Ein Repository-Test gegen SQLite im Speicher mit denselben zwei Reservierungen.
+        correct: false
+        why: SQLite kennt weder `tstzrange` noch Exclusion Constraints. Grün wäre der Test höchstens, weil die Prüfung im Anwendungscode greift – über den Constraint sagt er nichts.
+      - text: Ein Unit-Test des Services mit einem Mock-Repository, das beim zweiten `anlegen` eine `ExclusionViolation` wirft.
+        correct: false
+        why: Der Mock wirft, weil der Test es ihm sagt. So prüfst du, wie der Service auf den Fehler reagiert, nicht, ob die Datenbank ihn auslöst.
+      - text: Ein End-to-End-Test, in dem zwei Browser gleichzeitig dasselbe Rad buchen.
+        correct: false
+        why: Er kann die Doppelbuchung zeigen, ist aber langsam, vom Timing abhängig und zeigt bei einem Fehler nicht, ob Schema, Repository oder Oberfläche schuld ist.
+    explanation: |
+      Teste jedes Risiko auf der niedrigsten Ebene, die es zuverlässig zeigt. Der Constraint ist eine Eigenschaft des PostgreSQL-Schemas, also gehört sein Test zum Repository gegen PostgreSQL. Gleichzeitigkeit musst du dafür nicht nachstellen: Zwei nacheinander eingefügte Zeilen beweisen, dass der Constraint existiert, und dass PostgreSQL ihn auch bei parallelen Transaktionen durchsetzt, garantiert die Datenbank selbst. Der Service-Test mit Mock bleibt sinnvoll, aber für eine andere Frage: Macht der Service aus der `ExclusionViolation` eine verständliche Fehlermeldung?
+    resources:
+      - title: PostgreSQL · Exclusion Constraints
+        url: https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-EXCLUSION
+
+  - id: testplan-verlaengern
+    type: practice
+    title: Testplan für „Reservierung verlängern“
+    prompt: |
+      Neues Feature im Radwerk-Backend: `ReservierungsService.verlaengern(kunde_id, reservierung_id, neues_ende)`. Regeln:
+
+      - Die Reservierung muss dem Kunden gehören.
+      - `neues_ende` muss nach dem bisherigen Ende liegen und darf höchstens 7 Tage nach jetzt liegen.
+      - Die verlängerte Reservierung darf keine andere Reservierung desselben Rads überschneiden (halboffene Intervalle `[start, ende)`).
+      - Das Repository speichert mit einem `UPDATE` und prüft Überschneidungen per SQL; in Produktion läuft PostgreSQL.
+
+      Schreibe einen kurzen Testplan: welche Fälle du testest, auf welcher Ebene (Unit-Test des Services mit Fake-Repository und fester Uhr, Repository-Test gegen die Datenbank, API-Test) und warum dort.
+    lang: text
+    solution: |
+      Unit-Tests des Services (Fake-Repository, feste Uhr – schnell, keine Datenbank nötig)
+      - Fremde Reservierung -> Fehler "nicht gefunden"; Fake bekommt kein Update.
+      - neues_ende == altes Ende und neues_ende vor altem Ende -> Fehler.
+      - neues_ende genau jetzt + 7 Tage -> erlaubt; eine Sekunde später -> Fehler.
+      - Repository meldet "belegt" -> Service gibt eine verständliche Fehlermeldung.
+
+      Repository-Tests gegen PostgreSQL (Testcontainers, Rollback pro Test)
+      - Verlängern bis genau zum Start der nächsten Reservierung desselben Rads -> erlaubt.
+      - Verlängern eine Minute in die nächste Reservierung hinein -> belegt.
+      - Die eigene, alte Version der Reservierung zählt nicht als Überschneidung
+        (sonst scheitert jede Verlängerung an sich selbst).
+      - Reservierung eines anderen Rads im neuen Zeitraum -> erlaubt.
+      - Exclusion Constraint greift auch beim UPDATE.
+
+      API-Test (je ein Fall pro Antwortart)
+      - Erfolgreiche Verlängerung -> 200 mit neuem Ende.
+      - Fremde Reservierung -> 404, belegt -> 409.
+      Keine Grenzfälle auf API-Ebene: die stehen schon darunter.
+    checklist:
+      - Die Überschneidungsfälle (direkt anschließend erlaubt, eine Minute zu weit belegt, anderes Rad frei) stehen als Repository-Test gegen eine echte Datenbank, nicht mit Mock.
+      - Du testest, dass die Reservierung sich nicht mit ihrer eigenen alten Version überschneidet.
+      - Die 7-Tage-Grenze und „nach dem bisherigen Ende“ testest du ohne Datenbank, mit fester Uhr und genau an der Grenze.
+      - Die Repository-Tests laufen gegen PostgreSQL, weil Produktion PostgreSQL nutzt und der Exclusion Constraint dort lebt.
+      - Auf API-Ebene steht ein Fall pro Statuscode, keine Wiederholung der Grenzfälle.
+    explanation: |
+      Der wichtigste Fall ist der unauffälligste: Eine Verlängerung überschneidet sich immer mit der Reservierung, die verlängert wird. Prüft das SQL `rad_id = ? AND start < ? AND ? < ende` ohne `id <> ?`, scheitert jede Verlängerung an sich selbst. Diesen Fehler sieht nur ein Test gegen die Datenbank. Die Zeitregeln brauchen keine Datenbank, wohl aber eine feste Uhr, sonst hängt das Ergebnis vom Testzeitpunkt ab (siehe [Testbarkeit durch Design](/testing/testbares-design)). Auf API-Ebene prüfst du die Übersetzung in Statuscodes, nicht noch einmal jede Grenze.
+    resources:
+      - title: Martin Fowler · The Practical Test Pyramid
+        url: https://martinfowler.com/articles/practical-test-pyramid.html

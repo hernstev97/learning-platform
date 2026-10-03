@@ -83,12 +83,20 @@ const LANGUAGES: Record<string, Language> = {
     rules: [[/"(?:[^"]|"")*"?/y, 'string']],
     keywords: words(''),
   },
+  // TypeScript and JavaScript, including TSX: tests with Vitest, Testing Library and Playwright.
+  typescript: {
+    rules: [...cStyle, [/`(?:\\.|[^`\\])*`?/y, 'string'], [/"(?:\\.|[^"\\\n])*"?/y, 'string'], [/'(?:\\.|[^'\\\n])*'?/y, 'string'], [/@[A-Za-z_][\w.]*/y, 'annotation'], number],
+    keywords: words(`abstract any as async await boolean break case catch class const constructor continue declare default delete do else enum export extends false finally for from function get if implements import in infer instanceof interface keyof let namespace never new null number of private protected public readonly return satisfies set static string super switch symbol this throw true try type typeof undefined unknown var void while yield`),
+    types: true, calls: true,
+  },
 };
+LANGUAGES.javascript = LANGUAGES.typescript;
 const ALIASES: Record<string, string> = {
   kt: 'kotlin', kts: 'kotlin', gradle: 'kotlin', java: 'kotlin', groovy: 'kotlin', rs: 'rust', py: 'python', python3: 'python',
   bash: 'shell', sh: 'shell', zsh: 'shell', fish: 'shell', terminal: 'shell', yml: 'yaml', jsonc: 'json', docker: 'dockerfile',
   containerfile: 'dockerfile', systemd: 'ini', service: 'ini', conf: 'ini', cfg: 'ini', html: 'xml', svg: 'xml', pycon: 'python',
   xlsx: 'excel', formula: 'excel', m: 'powerquery', pq: 'powerquery', tsv: 'csv',
+  ts: 'typescript', tsx: 'typescript', mts: 'typescript', cts: 'typescript', js: 'javascript', jsx: 'javascript', mjs: 'javascript', cjs: 'javascript',
 };
 export const languageOf = (lang: string | undefined | null) => {
   const l = (lang ?? '').toLowerCase();

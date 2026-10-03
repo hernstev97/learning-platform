@@ -1,0 +1,1170 @@
+id: teststrategie
+title: Teststrategie für ein Feature
+level: 3
+minutes: 180
+summary: Ein Feature von der Anforderung bis zum Betrieb durchdenken – Beispiele statt vager Regeln, Risiken nach Wahrscheinlichkeit und Auswirkung, für jedes Risiko die passende Ebene, ein Testplan auf einer Seite, nichtfunktionale und explorative Tests, Review und Kennzahlen. Am Beispiel „Gutscheincodes im Buchungsprozess“.
+goals:
+  - Du übersetzt vage Anforderungen mit Product Owner und Team in konkrete Beispiele und findest dabei offene Fragen, bevor Code entsteht.
+  - Du bewertest die Risiken eines Features nach Wahrscheinlichkeit und Auswirkung und leitest daraus ab, wo Tests sich lohnen und wo nicht.
+  - Du ordnest jedem Risiko begründet die niedrigste Testebene zu, die es zuverlässig zeigt, und benennst, was bewusst ungetestet bleibt.
+  - Du schreibst einen Testplan auf einer Seite mit nichtfunktionalen Prüfungen und explorativen Sessions.
+  - Du beurteilst Tests im Code-Review danach, ob sie Fehler finden, und misst den Erfolg einer Strategie mit Escaped Defects, Change Failure Rate, Laufzeit und Flake-Rate.
+  - Du vertrittst deine Teststrategie im Interview in wenigen Minuten, strukturiert von den Risiken her.
+resources:
+  - title: Martin Fowler · Specification By Example
+    url: https://martinfowler.com/bliki/SpecificationByExample.html
+  - title: Martin Fowler · The Practical Test Pyramid
+    url: https://martinfowler.com/articles/practical-test-pyramid.html
+  - title: DORA · Software delivery performance metrics
+    url: https://dora.dev/guides/dora-metrics/
+  - title: OWASP · OAT-002 Token Cracking
+    url: https://owasp.org/www-project-automated-threats-to-web-applications/assets/oats/EN/OAT-002_Token_Cracking
+lesson: |
+  Im Refinement liegt Ticket RW-501: „Als Kundin möchte ich beim Buchen einen Gutscheincode eingeben, damit ich den Rabatt aus dem Newsletter bekomme.“ Marketing plant für Juni eine Sommerkampagne. Die Produktmanagerin fragt: „Wie testen wir das?“ Zwei Antworten liegen nahe, und beide sind schlecht. „Ein paar Unit-Tests und einmal durchklicken“ lässt die Hälfte der Risiken liegen. „Alles End-to-End automatisieren“ kostet Wochen, erzeugt eine langsame Suite und findet trotzdem nicht, was passiert, wenn dieselbe Kundin in App und Website gleichzeitig bucht.
+
+  Dieses Modul geht das Feature einmal vollständig durch, so wie du es im Job tust: von den Anforderungen über die Risiken zur Wahl der Ebenen, zu nichtfunktionalen und explorativen Tests, zu einem Testplan auf einer Seite, zum Review und zu Kennzahlen danach. Die Werkzeuge kennst du aus den anderen Modulen. Hier geht es um die Entscheidungen.
+
+  ## Anforderungen in Beispiele übersetzen
+
+  Das Ticket nennt fünf Regeln:
+
+  - Ein Code besteht aus `RW-` und sechs Großbuchstaben oder Ziffern, etwa `RW-SOMMER`.
+  - Jede Kundin kann einen Code einmal einlösen.
+  - Ein Code gilt bis einschließlich zu seinem Ablaufdatum.
+  - Der Rabatt ist ein Prozentsatz oder ein fester Betrag in Cent.
+  - Der Preis fällt nie unter 0.
+
+  Das klingt präzise und lässt doch vieles offen: die Zeitzone des Ablaufdatums, Groß- und Kleinschreibung bei der Eingabe, die Rundung beim Prozentrabatt, die Zahlung, wenn der Preis auf 0 fällt, und das Verhalten bei zwei gleichzeitigen Buchungen. Solche Lücken findest du am schnellsten mit **Specification by Example** ([Martin Fowler](https://martinfowler.com/bliki/SpecificationByExample.html)): Product Owner, Entwicklung und Test schreiben gemeinsam konkrete Fälle auf, mit Zahlen statt Adjektiven. Jeder Fall ist ein Akzeptanzkriterium und später ein Test. Für die Kampagnen gilt: `RW-SOMMER` gibt 15 % bis 31.08.2026, `RW-START5` gibt 500 Cent bis 31.12.2026.
+
+  | # | Situation | Ergebnis |
+  | --- | --- | --- |
+  | 1 | Fahrt kostet 450 Cent, Code `RW-SOMMER` | 383 Cent (Rabatt 67,5 → abgerundet 67) |
+  | 2 | Fahrt kostet 120 Cent, Code `RW-START5` | 0 Cent, **keine** Zahlung bei Paystream |
+  | 3 | `RW-SOMMER`, gebucht am 31.08. um 23:59 Uhr Berliner Zeit | gilt |
+  | 4 | `RW-SOMMER`, gebucht am 01.09. um 0:10 Uhr Berliner Zeit (31.08., 22:10 UTC) | abgelehnt, abgelaufen |
+  | 5 | Eingabe `␣rw-sommer␣` | wird zu `RW-SOMMER`, gilt |
+  | 6 | `RW-SOMME`, `RW-SOMMER1`, `RW-SOMMÉR` | abgelehnt, Format ungültig |
+  | 7 | Dieselbe Kundin löst `RW-SOMMER` ein zweites Mal ein | abgelehnt, bereits eingelöst |
+  | 8 | Dieselbe Kundin bucht gleichzeitig in App und Website mit `RW-SOMMER` | genau eine Buchung bekommt den Rabatt |
+
+  Drei Antworten musste die Produktmanagerin erst klären. Der Rabatt wird zugunsten von Radwerk abgerundet. Es zählt der Berliner Kalendertag der Buchung, nicht der Fahrt. Und Beispiel 2 brachte eine Frage auf, die niemand gestellt hatte: Paystream lehnt Zahlungen in Höhe von 0 Cent ab, also muss die Buchung in diesem Fall ohne Zahlung auskommen. Ohne das Beispiel wäre das in Produktion aufgefallen.
+
+  Die Beispiele sagen auch, was das Design leisten muss, damit es testbar ist: die Regeln als reine Funktionen, die Uhrzeit als Parameter statt `datetime.now()` im Code, die Einlösungen hinter einer Schnittstelle (mehr in [Testbarkeit durch Design](/testing/testbares-design)). Dann werden die Beispiele direkt zu Tests:
+
+  ```python pytest
+  import re
+  from datetime import UTC, date, datetime
+  from zoneinfo import ZoneInfo
+
+  import pytest
+
+  BERLIN = ZoneInfo("Europe/Berlin")
+  FORMAT = re.compile(r"RW-[A-Z0-9]{6}")
+
+
+  def normalisiere(eingabe: str) -> str:
+      return eingabe.strip().upper()
+
+
+  def ist_gueltiges_format(code: str) -> bool:
+      return FORMAT.fullmatch(code) is not None
+
+
+  def noch_gueltig(ablauf: date, jetzt: datetime) -> bool:
+      return jetzt.astimezone(BERLIN).date() <= ablauf
+
+
+  def rabattiere(preis: int, art: str, wert: int) -> int:
+      rabatt = preis * wert // 100 if art == "prozent" else wert
+      return max(0, preis - rabatt)
+
+
+  @pytest.mark.parametrize(
+      "preis, art, wert, erwartet",
+      [
+          pytest.param(450, "prozent", 15, 383, id="bsp1-prozent-abgerundet"),
+          pytest.param(120, "betrag", 500, 0, id="bsp2-nie-unter-null"),
+      ],
+  )
+  def test_rabatt(preis, art, wert, erwartet):
+      assert rabattiere(preis, art, wert) == erwartet
+
+
+  @pytest.mark.parametrize(
+      "jetzt, gilt",
+      [
+          pytest.param(datetime(2026, 8, 31, 21, 59, tzinfo=UTC), True, id="bsp3-23-59-berlin"),
+          pytest.param(datetime(2026, 8, 31, 22, 10, tzinfo=UTC), False, id="bsp4-0-10-berlin"),
+      ],
+  )
+  def test_ablauf_gilt_bis_mitternacht_berliner_zeit(jetzt, gilt):
+      assert noch_gueltig(date(2026, 8, 31), jetzt) is gilt
+
+
+  @pytest.mark.parametrize(
+      "eingabe, gueltig",
+      [(" rw-sommer ", True), ("RW-SOMME", False), ("RW-SOMMER1", False), ("RW-SOMMÉR", False)],
+  )
+  def test_codeformat_nach_normalisierung(eingabe, gueltig):
+      assert ist_gueltiges_format(normalisiere(eingabe)) is gueltig
+  ```
+
+  Die IDs verweisen auf die Beispieltabelle. Wer einen roten Test sieht, findet das Akzeptanzkriterium dazu.
+
+  ## Risiken bewerten: Wahrscheinlichkeit mal Auswirkung
+
+  Tests kosten Zeit beim Schreiben, Laufzeit in jeder Pipeline und Pflege bei jeder Änderung. Sie lohnen sich dort, wo sie ein Risiko senken. Ein **Risiko** ist etwas, das schiefgehen kann, zusammen mit seinen Folgen. Du bewertest es grob auf zwei Achsen:
+
+  - **Wahrscheinlichkeit** (1–3): Steigt mit neuer oder komplexer Logik, vielen Kombinationen, Nebenläufigkeit, Zeitzonen, fremden Systemen und Code, der sich oft ändert.
+  - **Auswirkung** (1–3): Steigt mit Geldverlust, Sicherheitslücken, nicht möglichen Buchungen und Schaden für das Vertrauen der Kundschaft.
+
+  | Risiko | W | A | W × A |
+  | --- | --- | --- | --- |
+  | R1 Rabatt falsch berechnet (Rundung, Prozent und Betrag verwechselt, Preis unter 0) | 3 | 3 | 9 |
+  | R2 Code mehrfach eingelöst, etwa bei zwei gleichzeitigen Buchungen | 2 | 3 | 6 |
+  | R3 Codes werden durch Ausprobieren gefunden | 2 | 3 | 6 |
+  | R4 Android-App versteht die neuen Felder oder Fehler nicht | 2 | 3 | 6 |
+  | R5 Buchung mit 0 Cent scheitert bei Paystream | 2 | 3 | 6 |
+  | R6 Ablauf an der Tagesgrenze falsch (UTC statt Berlin) | 2 | 2 | 4 |
+  | R7 Fehlermeldung für Screenreader nicht wahrnehmbar | 2 | 2 | 4 |
+  | R8 Kampagnenstart überlastet die Buchung | 1 | 3 | 3 |
+  | R9 Eingabe mit Leerzeichen oder Kleinbuchstaben wird abgelehnt | 3 | 1 | 3 |
+
+  Die Zahlen sind grob, und das reicht. Ihr Wert liegt im Gespräch: Bewertet das Backend R2 mit Wahrscheinlichkeit 1 und Marketing mit 3, weil Kampagnencodes erfahrungsgemäß auf Schnäppchenseiten landen, hat das Team etwas gelernt. Bei gleicher Punktzahl geht die höhere Auswirkung vor: Ein seltener, teurer Fehler wiegt schwerer als ein häufiger, harmloser. Ganz unten landet, was bewusst offen bleibt, etwa ein unklarer Hilfetext.
+
+  ## Testebenen je Risiko begründen
+
+  Für jedes Risiko gilt die Regel aus [Testpyramide und Testgrenzen](/testing/testpyramide): Teste es auf der niedrigsten Ebene, die es zuverlässig zeigt, und prüfe jede Regel nur auf einer Ebene.
+
+  | Risiko | Ebene | Begründung |
+  | --- | --- | --- |
+  | R1, R6, R9 | Unit-Tests mit Beispielen, Properties mit Hypothesis | reine Logik, Uhr als Parameter; tausend Kombinationen kosten Millisekunden |
+  | R2 | Integrationstest gegen PostgreSQL | nur die Datenbank garantiert Eindeutigkeit, wenn zwei Transaktionen gleichzeitig schreiben |
+  | R3 | API-Test | die Bremse sitzt in der HTTP-Schicht; Status 429 und `Retry-After` gehören zur Schnittstelle |
+  | R4 | Contract Test mit Pact | prüft, was die App erwartet, ohne App und Backend gemeinsam zu starten |
+  | R5 | Unit-Test des Buchungsdienstes mit Fake-Zahlungsadapter | „bei 0 Cent keine Autorisierung“ ist Logik im Dienst, Paystream wird dafür nicht gebraucht |
+  | R7 | Komponententest mit Testing Library und axe, einmal manuell mit Screenreader | Rolle und Text der Meldung sind im DOM prüfbar, das Vorlesen nur am echten Gerät |
+  | R8 | Lasttest gegen Staging vor dem Kampagnenstart | teuer und nur vor dem Ereignis nötig |
+  | Durchstich | ein End-to-End-Test | zeigt, dass Website, API und Datenbank zusammenarbeiten |
+
+  **R1 mit Properties.** Die Beispiele prüfen ausgewählte Punkte. Mit [Property-based Testing](/testing/property-based-testing) prüfst du Eigenschaften für alle Preise und Rabatte: Der neue Preis liegt zwischen 0 und dem alten, und eine teurere Fahrt wird mit demselben Gutschein nie billiger. Entfernst du `max(0, …)`, findet Hypothesis sofort `preis=0, rabatt=('betrag', 1)`.
+
+  ```python pytest
+  from hypothesis import given, strategies as st
+
+
+  def rabattiere(preis: int, art: str, wert: int) -> int:
+      rabatt = preis * wert // 100 if art == "prozent" else wert
+      return max(0, preis - rabatt)
+
+
+  preise = st.integers(min_value=0, max_value=100_000)
+  rabatte = st.one_of(
+      st.tuples(st.just("prozent"), st.integers(min_value=0, max_value=100)),
+      st.tuples(st.just("betrag"), st.integers(min_value=0, max_value=100_000)),
+  )
+
+
+  @given(preis=preise, rabatt=rabatte)
+  def test_neuer_preis_liegt_zwischen_null_und_altem_preis(preis, rabatt):
+      art, wert = rabatt
+      assert 0 <= rabattiere(preis, art, wert) <= preis
+
+
+  @given(preis=preise, mehr=st.integers(min_value=0, max_value=10_000), rabatt=rabatte)
+  def test_teurere_fahrt_wird_mit_demselben_gutschein_nie_billiger(preis, mehr, rabatt):
+      art, wert = rabatt
+      assert rabattiere(preis + mehr, art, wert) >= rabattiere(preis, art, wert)
+  ```
+
+  **R2 in der Datenbank.** „Erst prüfen, dann speichern“ hat eine Lücke: Zwei Anfragen prüfen gleichzeitig, beide finden keine Einlösung, beide speichern. Zuverlässig schließt sie eine Eindeutigkeitsregel in der Datenbank ([PostgreSQL · Unique Constraints](https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-UNIQUE-CONSTRAINTS)); eine Sperre mit `SELECT … FOR UPDATE` ginge auch, ist aber leichter zu vergessen. Der Integrationstest öffnet zwei Verbindungen und erwartet genau eine erfolgreiche Einlösung, gegen PostgreSQL wie in [Integrationstests](/testing/integrationstests). Die Regel selbst zeigt schon SQLite:
+
+  ```sql run fails
+  CREATE TABLE einloesungen (
+    kunde_id INTEGER NOT NULL,
+    code TEXT NOT NULL,
+    buchung_id INTEGER NOT NULL,
+    UNIQUE (kunde_id, code)
+  );
+  INSERT INTO einloesungen VALUES (7, 'RW-SOMMER', 8811);
+  INSERT INTO einloesungen VALUES (7, 'RW-SOMMER', 8812);
+  ```
+
+  Ein In-Memory-Fake wäre hier die falsche Wahl: Er läuft nacheinander und kennt keine Constraints. Der Test wäre grün, und das Risiko bliebe.
+
+  **R3 und das Fehlerformat an der API.** Abgelehnte Codes beantwortet die API mit 422 und einem Problem-Details-Objekt nach [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457#section-3). Website und App verzweigen über `type`:
+
+  ```json
+  {
+    "type": "https://api.radwerk.example/probleme/gutschein-abgelaufen",
+    "title": "Gutschein abgelaufen",
+    "status": 422,
+    "detail": "RW-SOMMER war bis zum 31.08.2026 gültig.",
+    "instance": "/buchungen/8812/gutschein"
+  }
+  ```
+
+  Ein API-Test prüft Status, Content-Type und `type` einmal pro Ablehnungsgrund (siehe [Backend- und API-Tests](/testing/api-tests)). Die Fixtures `client`, `kundin` und `buchung` liefern einen In-Process-Client, ein Anmelde-Token und eine angelegte Buchung:
+
+  ```python
+  PROBLEME = "https://api.radwerk.example/probleme/"
+
+
+  def test_abgelaufener_gutschein_liefert_problem_details(client, kundin, buchung):
+      antwort = client.post(f"/buchungen/{buchung}/gutschein", json={"code": "RW-WINTER"}, headers=kundin)
+      assert antwort.status_code == 422
+      assert antwort.headers["content-type"] == "application/problem+json"
+      assert antwort.json()["type"] == PROBLEME + "gutschein-abgelaufen"
+  ```
+
+  Der API-Test rechnet keinen Rabatt nach. Das tun die Unit-Tests schon.
+
+  **R4 mit einem Vertrag.** Die Android-App sendet den Code als Feld `code` an `POST /buchungen/{id}/gutschein` und liest `rabatt_cent`, `preis_cent` und den Problem-Typ. Genau das hält ein Consumer-Driven Contract fest ([Contract Testing](/testing/contract-testing)). Die Rundungsregel gehört nicht hinein: Wie gerechnet wird, prüft der Provider in seinen eigenen Tests.
+
+  **Ein Durchstich.** Ein einziger End-to-End-Test zeigt, dass alles verbunden ist: Login per gespeichertem Zustand, Code eingeben, buchen, Bestätigung sehen ([End-to-End-Tests mit Playwright](/testing/e2e-tests)). Er prüft keine Ablehnungsgründe und keine Rundung.
+
+  ```typescript
+  import { test, expect } from '@playwright/test';
+
+  test('Kundin bucht mit Gutscheincode', async ({ page }) => {
+    await page.goto('/stationen/leipzig-hbf/buchen');
+    await page.getByLabel('Gutscheincode').fill('RW-SOMMER');
+    await page.getByRole('button', { name: 'Einlösen' }).click();
+    await expect(page.getByRole('status')).toHaveText('RW-SOMMER: 15 % Rabatt auf diese Fahrt');
+    await page.getByRole('button', { name: 'Verbindlich buchen' }).click();
+    await expect(page.getByRole('heading', { name: 'Buchung bestätigt' })).toBeVisible();
+  });
+  ```
+
+  **Bewusst nicht getestet** wird auch etwas, und das steht im Plan: jeder Ablehnungsgrund im Browser (steht in Unit- und API-Tests), Gutschein × Tageshöchstpreis im End-to-End-Test (Unit-Test), Paystream selbst (fremder Dienst, vertraglich zugesichert) und das pixelgenaue Layout des Eingabefelds (geringes Risiko, Review im Design).
+
+  > [!MERKE]
+  > Jedes Risiko auf der niedrigsten Ebene, die es zuverlässig zeigt. Jede Regel nur auf einer Ebene. Was ungetestet bleibt, ist eine Entscheidung mit Begründung, kein Versehen.
+
+  ## Nichtfunktionale Risiken und exploratives Testen
+
+  Last, Sicherheit und Barrierefreiheit bekommen eigene Tests, wenn die Risikoanalyse es verlangt, nicht aus Gewohnheit.
+
+  ### Last vor der Kampagne
+
+  Der Newsletter geht an einem Dienstag um 10 Uhr an 80 000 Adressen. In der ersten halben Stunde kommt ein Vielfaches der üblichen Buchungen an, jede mit einer zusätzlichen Datenbankabfrage für den Code. Ein Lasttest gegen Staging, etwa mit [k6](https://grafana.com/docs/k6/latest/), simuliert die erwartete Spitze und prüft ein Ziel wie „95 % der Buchungen mit Gutschein unter 500 ms“. Er läuft einmal vor der Kampagne, nicht in jedem Pull Request.
+
+  ### Sicherheit: Gutscheincodes erraten
+
+  Massenhaftes Ausprobieren von Gutscheincodes hat bei OWASP einen eigenen Namen: [OAT-002 Token Cracking](https://owasp.org/www-project-automated-threats-to-web-applications/assets/oats/EN/OAT-002_Token_Cracking). Ob es sich lohnt, ist eine Rechenaufgabe. Radwerk verschickt 50 000 Codes zu je 5 Euro:
+
+  ```python run
+  moeglich = 36 ** 6        # sechs Zeichen aus A–Z und 0–9
+  gueltig = 50_000           # verschickte Codes
+  trefferquote = gueltig / moeglich
+
+  ohne_bremse = 50 * 60 * 60 * 24          # ein Skript mit 50 Anfragen pro Sekunde
+  mit_bremse = 10 * 24                      # 10 Fehlversuche pro Konto und Stunde
+
+  print(f"{moeglich:_} mögliche Codes")
+  print(f"ohne Bremse: {ohne_bremse * trefferquote:.0f} Treffer pro Tag")
+  print(f"mit Bremse:  {mit_bremse * trefferquote:.4f} Treffer pro Konto und Tag")
+  ```
+
+  Ohne Bremse findet ein einfaches Skript rund 99 gültige Codes am Tag. Mit 10 Fehlversuchen pro Konto und Stunde braucht ein Angreifer rund 180 Konten für einen Treffer am Tag. Deshalb kommen zur Bremse pro Konto eine pro IP-Adresse und ein Alarm auf die Gesamtzahl der Fehlversuche. Der API-Test prüft, dass der 11. Fehlversuch 429 bekommt.
+
+  > [!WARNING] Schutzmaßnahmen brauchen Tests
+  > Eine Rate-Limit-Middleware, die bei einem Umbau aus der Konfiguration fällt, merkt niemand: Alle funktionalen Tests bleiben grün. Nur ein Test, der die Grenze ausdrücklich prüft, schlägt dann an.
+
+  ### Barrierefreiheit
+
+  Eine Fehlermeldung, die nur rot aufleuchtet, erreicht blinde Kundinnen nicht. [WCAG 2.2](https://www.w3.org/TR/WCAG22/#status-messages) verlangt, dass Fehler als Text beschrieben werden (3.3.1) und Statusmeldungen ohne Fokuswechsel vorgelesen werden können (4.1.3). Im Komponententest prüfst du, dass das Feld ein Label hat und die Meldung als `role="status"` oder `role="alert"` mit Text erscheint, dazu ein automatischer Check mit axe ([Frontend-Tests](/testing/frontend-tests)). axe findet nur einen Teil der Probleme, deshalb hört sich einmal pro Release jemand den Ablauf mit einem Screenreader an.
+
+  ### Explorative Sessions mit Charter
+
+  Automatisierte Tests prüfen, woran jemand gedacht hat. **Exploratives Testen** sucht nach dem Rest: Lernen, Testentwurf und Ausführung passieren gleichzeitig. Ohne Struktur wird daraus Herumklicken. **Session-Based Test Management** ([Jon und James Bach](https://www.satisfice.com/download/session-based-test-management)) gibt ihm einen Rahmen: eine Charter als Auftrag, eine feste Zeit von 60 bis 90 Minuten, Notizen während der Session und eine kurze Nachbesprechung. Die Charter folgt oft dem Muster von Elisabeth Hendrickson: Erkunde *Ziel* mit *Mitteln*, um *Information* zu finden.
+
+  ```text
+  Charter: Erkunde die Gutscheineingabe in der Android-App
+           mit kopierten Codes, Flugmodus und zwei Geräten,
+           um Zustände zu finden, in denen Preis und Anzeige auseinanderlaufen.
+  Zeit: 60 min · Tester: Malik · Build 2026.10.3 (Staging)
+
+  Notizen
+  12:05  Code aus Mail kopiert, enthält Zeilenumbruch → abgelehnt   BUG RW-517
+  12:20  Code eingelöst, Flugmodus, Buchen → Spinner endlos           BUG RW-518
+  12:40  Gerät A löst ein, Gerät B zeigt den Code weiter als verfügbar  FRAGE an PO
+  Abdeckung: Eingabe, Offline, zwei Geräte · nicht geschafft: Barrierefreiheit
+  ```
+
+  Jeder gefundene Fehler wird ein Regressionstest auf der niedrigsten Ebene: RW-517 ein Unit-Test für `normalisiere` mit `"\n"`, RW-518 ein Komponententest für den Offline-Fall.
+
+  ## Der Testplan auf einer Seite
+
+  Der Testplan hält die Entscheidungen fest, damit Team, Product Owner und Reviewer dieselbe Vorstellung haben. Er passt auf eine Seite, steht im Ticket oder im Repository und ändert sich mit dem Feature.
+
+  ```text
+  Testplan RW-501 Gutscheincodes im Buchungsprozess          Stand 05.10.2026
+  Verantwortlich: Jana (Backend) · Malik (App) · Sophie (Web)
+
+  Im Scope     Format, Ablauf, einmal pro Kunde, Rabatt, Fehlerformat,
+               Anzeige in Web und App, Buchung mit 0 Cent
+  Nicht        Kampagnenverwaltung im Backoffice (RW-502), Paystream selbst
+
+  Risiko (W×A)                         Test                                  Wann
+  R1 Rabatt falsch (9)                 Unit + Hypothesis: rabattiere         PR
+  R2 doppelt eingelöst (6)             Integration gegen PostgreSQL          PR
+  R3 Codes erraten (6)                 API: 429 ab dem 11. Fehlversuch       PR
+  R4 App versteht Antwort nicht (6)    Pact: Android ↔ Buchungs-API          PR
+  R5 0 Cent bei Paystream (6)          Unit: keine Autorisierung bei 0       PR
+  R6 Ablauf um Mitternacht (4)         Unit: noch_gueltig mit UTC-Zeiten     PR
+  R7 Meldung nicht vorgelesen (4)      Komponente + axe; Screenreader 1×     PR / Release
+  R8 Last bei Kampagnenstart (3)       k6 gegen Staging, p95 < 500 ms        vor Kampagne
+  R9 Leerzeichen, Kleinbuchstaben (3)  Unit: normalisiere                    PR
+  Durchstich                           1 E2E: Code einlösen und buchen       PR
+
+  Bewusst nicht  Ablehnungsgründe im E2E · Gutschein × Tageshöchstpreis im E2E
+                 · Pixel-Layout des Eingabefelds
+  Explorativ     2 Sessions à 60 min vor Release, Charter im Ticket
+  Testdaten      Codes per API im Setup, Kundin mit und ohne Plus, Uhr fixiert
+  Fertig, wenn   PR-Tests grün, Pact verifiziert, keine offenen Blocker aus Sessions
+  Offen          Ist ein Code nach Storno wieder frei? (PO, bis 07.10.)
+  Danach         Escaped Defects und Erstattungen „Gutschein“ im Monatsbericht
+  ```
+
+  > [!PRAXIS] Drei Perspektiven im Refinement
+  > Viele Teams schreiben die Beispiele zu dritt: jemand aus dem Fachbereich, jemand aus der Entwicklung, jemand mit Testblick („Three Amigos“). Bei Radwerk dauert das für RW-501 eine halbe Stunde. Die Beispieltabelle und der Testplan liegen danach im Ticket. Der Pull Request verlinkt die Zeilen, die er abdeckt, und der Reviewer prüft gegen den Plan statt gegen sein Bauchgefühl.
+
+  ## Tests im Review beurteilen und mit Metriken steuern
+
+  Im Review liest du Tests mit einer Frage im Kopf: **Welcher Fehler im Code würde diesen Test rot machen?** Fällt dir keiner ein, prüft der Test nichts. Die übrigen Punkte der Checkliste folgen daraus:
+
+  - Die Ebene passt zum Risiko, und derselbe Check steht nicht schon auf einer anderen Ebene.
+  - Der Name beschreibt Verhalten, die IDs verweisen auf Beispiele oder Tickets.
+  - Die Erwartung ist konkret und unabhängig berechnet: `== 383`, nicht `> 0` und nicht die Formel aus dem Code noch einmal.
+  - Grenzen sind abgedeckt: genau am Ablauftag, Rabatt größer als der Preis.
+  - Zeit, Zufall, Reihenfolge und Netzwerk sind kontrolliert; der Test läuft auch um Mitternacht und parallel.
+  - Testdaten sind minimal und sprechend, im Test steht keine Logik außer der Parametrisierung.
+  - Mocks prüfen Ergebnisse statt Aufrufreihenfolgen, und die Laufzeit passt zum Pull-Request-Lauf.
+
+  ```python pytest fails
+  def rabattiere(preis: int, art: str, wert: int) -> int:
+      rabatt = preis * wert // 100 if art == "prozent" else wert
+      return preis - rabatt  # max(0, …) vergessen
+
+
+  def test_rabatt_wird_abgezogen():  # aus dem Pull Request
+      assert rabattiere(450, "betrag", 100) < 450
+
+
+  def test_betrag_ueber_dem_preis_ergibt_null():  # nach dem Review
+      assert rabattiere(120, "betrag", 500) == 0
+  ```
+
+  Der erste Test ist grün, obwohl die wichtigste Regel fehlt. Er würde auch `rabatt * 2` oder `preis - 1` durchlassen. Der zweite prüft eine Grenze mit konkretem Wert und scheitert.
+
+  Ob die Strategie insgesamt trägt, zeigen Kennzahlen aus dem Betrieb, nicht eine Coverage-Quote:
+
+  - **Escaped Defects:** Fehler, die erst in Produktion auffallen, je Bereich und mit Ursache. Jeder davon ist ein Hinweis auf eine fehlende Ebene oder eine Lücke in der Risikoanalyse.
+  - **Change Failure Rate:** Anteil der Deployments, nach denen sofort jemand eingreifen muss, per Rollback oder Hotfix. Sie gehört zu den [DORA-Kennzahlen](https://dora.dev/guides/dora-metrics/).
+  - **Laufzeit der Suite:** Median und langsamste Läufe der Pull-Request-Pipeline. Wird sie zu langsam, umgeht das Team sie.
+  - **Flake-Rate:** Anteil der Läufe, die beim Wiederholen ohne Codeänderung grün werden. Steigt sie, glaubt bald niemand mehr einem Rot ([Flaky Tests](/testing/flaky-tests)).
+
+  Coverage bleibt ein Lückenfinder für das Review (siehe [Regressionsstrategien](/testing/regression-strategien)). Als Ziel erzeugt sie Tests ohne Aussage. Das gilt für jede Kennzahl: Auch der DORA-Leitfaden warnt davor, Metriken zu Zielen zu machen.
+
+  > [!INTERVIEW] „Wie würdest du ein Feature wie Gutscheincodes testen?“
+  > Ich fange bei den Regeln an und kläre sie mit konkreten Beispielen. Dabei fallen Fragen wie Zeitzone, Rundung und 0-Cent-Zahlungen auf. Dann bewerte ich die Risiken nach Wahrscheinlichkeit und Auswirkung. Die Rechenregeln teste ich in Unit-Tests mit Grenzwerten und Properties, „einmal pro Kunde“ in einem Integrationstest gegen die echte Datenbank, weil nur sie gleichzeitige Buchungen verhindert. Fehlerformat und Rate Limit prüfe ich an der API, die Kompatibilität mit der App über einen Contract Test. Dazu kommt ein einziger End-to-End-Test als Durchstich. Bewusst lasse ich Kombinationen im Browser weg, weil sie unten schon geprüft sind. Vor der Kampagne gibt es einen Lasttest und eine explorative Session. Ob das reicht, sehe ich an Escaped Defects und Change Failure Rate, nicht an der Coverage.
+
+  ## Häufige Fehler
+
+  - **Mit Werkzeugen statt mit Risiken anfangen.** „Wir brauchen Playwright“ ist keine Strategie. Erst Risiken, dann Ebenen, dann Werkzeuge.
+  - **Vage Akzeptanzkriterien.** „Der Rabatt wird korrekt berechnet“ lässt Rundung und Zeitzone offen. Konkrete Beispiele mit Zahlen schreiben.
+  - **Alles im End-to-End-Test.** Langsam, unzuverlässig, und Fehlerursachen bleiben unklar. Ein Durchstich reicht, die Regeln gehören nach unten.
+  - **Dieselbe Regel auf drei Ebenen.** Jede Änderung der Rundung bricht drei Tests. Jede Regel einmal, auf der niedrigsten passenden Ebene.
+  - **Nebenläufigkeit mit einem Fake testen.** Grün, aber ohne Aussage. Eindeutigkeit gehört in einen Test gegen die echte Datenbank.
+  - **Nichtfunktionales vergessen oder überall testen.** Rate Limit ohne Test fällt still weg, ein Lasttest in jedem Pull Request kostet nur Zeit. Die Risikoanalyse entscheidet.
+  - **„Explorativ“ ohne Charter.** Eine Stunde Herumklicken ohne Ziel und ohne Notizen. Charter, feste Zeit, Notizen, Fehler als Regressionstests.
+  - **Ein Testplan, den niemand liest.** Dreißig Seiten Vorlage veralten vor dem Release. Eine Seite, im Ticket, mit „bewusst nicht“ und offenen Fragen.
+
+  ## Zusammenfassung
+
+  - Konkrete Beispiele mit Zahlen klären Anforderungen, bevor Code entsteht, und werden direkt zu Tests.
+  - Risiken nach Wahrscheinlichkeit × Auswirkung bewerten; die Zahlen sind grob, der Nutzen liegt im Gespräch darüber.
+  - Jedes Risiko auf der niedrigsten Ebene, die es zuverlässig zeigt: Regeln im Unit-Test, Eindeutigkeit in der echten Datenbank, Fehlerformat und Rate Limit an der API, Kompatibilität im Vertrag, ein einziger Durchstich im Browser.
+  - Was ungetestet bleibt, steht mit Begründung im Plan.
+  - Last, Sicherheit und Barrierefreiheit bekommen eigene Tests, wenn das Risiko es verlangt; explorative Sessions mit Charter finden, woran niemand gedacht hat.
+  - Der Testplan passt auf eine Seite und lebt im Ticket.
+  - Im Review zählt, welchen Fehler ein Test findet. Ob die Strategie trägt, zeigen Escaped Defects, Change Failure Rate, Laufzeit und Flake-Rate.
+exercises:
+  - id: ebene-fuer-einmal-pro-kunde
+    type: choice
+    title: Zwei Buchungen, ein Gutschein
+    prompt: |
+      Regel: Jede Kundin kann einen Gutscheincode einmal einlösen. Der Buchungsdienst prüft zuerst, ob schon eine Einlösung existiert, und speichert dann die neue. Risiko: Dieselbe Kundin bucht in App und Website fast gleichzeitig mit demselben Code.
+
+      Welcher Test zeigt zuverlässig, ob das System die doppelte Einlösung verhindert?
+    options:
+      - text: Ein Integrationstest gegen PostgreSQL mit zwei Verbindungen, die gleichzeitig einlösen; genau eine darf erfolgreich sein.
+        correct: true
+        why: Nur die Datenbank kann Eindeutigkeit unter Nebenläufigkeit garantieren, etwa mit einem Unique Constraint auf `(kunde_id, code)`. Der Test prüft genau diese Garantie.
+      - text: Ein Unit-Test mit In-Memory-Fake, der zweimal nacheinander einlöst und beim zweiten Mal eine Ablehnung erwartet.
+        correct: false
+        why: Er prüft die Regel für den Fall nacheinander, das ist nützlich. Die Lücke zwischen Prüfen und Speichern bei zwei gleichzeitigen Anfragen sieht er nicht, und der Fake kennt keine Constraints.
+      - text: Ein End-to-End-Test mit zwei Browser-Kontexten, die gleichzeitig auf „Buchen“ klicken.
+        correct: false
+        why: Das Timing ist nicht steuerbar. Der Test wird mal grün, mal rot, abhängig davon, welche Anfrage zuerst ankommt – teuer und unzuverlässig.
+      - text: Ein API-Test mit gemocktem Repository, das beim zweiten Aufruf „bereits eingelöst“ meldet.
+        correct: false
+        why: Der Mock liefert, was du ihm vorgibst. Ob die echte Datenbank die zweite Einlösung verhindert, bleibt ungeprüft.
+    explanation: |
+      Das Risiko entsteht an einer Grenze: zwischen Dienst und Datenbank, wenn zwei Transaktionen überlappen. Deshalb braucht es einen Test gegen die echte Datenbank, und zwar gegen dieselbe wie in Produktion. Der Unit-Test mit Fake bleibt sinnvoll für die Regel selbst. Er ersetzt aber nicht den Integrationstest für die Garantie.
+    resources:
+      - title: PostgreSQL · Unique Constraints
+        url: https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-UNIQUE-CONSTRAINTS
+      - title: PostgreSQL · INSERT … ON CONFLICT
+        url: https://www.postgresql.org/docs/current/sql-insert.html#SQL-ON-CONFLICT
+
+  - id: was-in-den-vertrag-gehoert
+    type: choice
+    title: Was steht im Vertrag mit der App?
+    prompt: |
+      Für das Gutschein-Feature schreibt das Android-Team einen Consumer-Driven Contract gegen die Buchungs-API. Was gehört hinein? Mehrere Antworten sind richtig.
+    options:
+      - text: "`POST /buchungen/{id}/gutschein` akzeptiert einen Body mit dem Feld `code` (Text)."
+        correct: true
+        why: Das sendet die App. Ändert der Provider Pfad oder Feldnamen, bricht die App.
+      - text: Die Antwort enthält `rabatt_cent` und `preis_cent` als ganze Zahlen.
+        correct: true
+        why: Die App liest und zeigt diese Felder an. Ein Wechsel zu Euro als Kommazahl wäre ein Bruch des Vertrags.
+      - text: Bei einem abgelaufenen Code kommen Status 422, `application/problem+json` und der `type` für „abgelaufen“.
+        correct: true
+        why: Die App verzweigt über den Problem-Typ zur passenden Meldung. Der Vertrag beschreibt diese Interaktion mit einem Provider State wie „Code RW-WINTER ist abgelaufen“.
+      - text: 15 % von 450 Cent ergeben 383 Cent, weil der Rabatt abgerundet wird.
+        correct: false
+        why: Das ist Geschäftslogik des Providers. Sie gehört in seine Unit-Tests; im Vertrag würde sie jede Änderung der Rundung zu einem Vertragsbruch machen.
+      - text: Ein Code gilt bis Mitternacht Berliner Zeit seines Ablaufdatums.
+        correct: false
+        why: Auch das ist Logik des Providers. Der Vertrag sagt, wie die Antwort für einen abgelaufenen Code aussieht, nicht wann ein Code abläuft.
+    explanation: |
+      Ein Contract Test prüft, ob Consumer und Provider dieselbe Sprache sprechen: Felder, Typen, Statuscodes, Fehlerformat. Die Regeln dahinter testet der Provider auf der niedrigsten Ebene selbst. Wer Geschäftslogik in Verträge schreibt, bekommt Verträge, die bei jeder fachlichen Änderung brechen, und prüft dieselbe Regel doppelt.
+    resources:
+      - title: Pact · What is Pact good for?
+        url: https://docs.pact.io/getting_started/what_is_pact_good_for
+
+  - id: strategie-schritte
+    type: order
+    title: Von der Idee zur gemessenen Strategie
+    prompt: Bring die Schritte einer Teststrategie für ein neues Feature in eine sinnvolle Reihenfolge.
+    lang: text
+    lines: |
+      Mit Product Owner und Team Akzeptanzkriterien als konkrete Beispiele aufschreiben
+      Risiken sammeln und nach Wahrscheinlichkeit × Auswirkung bewerten
+      Jedem Risiko die niedrigste Ebene zuordnen, die es zuverlässig zeigt
+      Testplan auf einer Seite festhalten, auch was bewusst ungetestet bleibt
+      Tests zusammen mit dem Code schreiben und im Review mit der Checkliste prüfen
+      Vor dem Release explorative Sessions mit Charter durchführen
+      Nach dem Release Escaped Defects und Change Failure Rate beobachten
+    alternatives:
+      - [2, 1, 3, 4, 5, 6, 7]
+    explanation: |
+      Ohne Beispiele ist unklar, was richtig ist; ohne Risiken, was wichtig ist; ohne Ebenen, wo getestet wird. Beispiele und Risiken entstehen oft im selben Gespräch, deshalb zählt auch die Reihenfolge „erst Risiken, dann Beispiele“; das Modul beginnt mit den Beispielen, weil sie Risiken wie die 0-Cent-Zahlung erst sichtbar machen. Der Plan fasst diese Entscheidungen zusammen, bevor Tests entstehen. Explorative Sessions brauchen ein lauffähiges Feature und finden, was die geplanten Tests nicht abdecken. Die Kennzahlen nach dem Release schließen den Kreis: Ein Escaped Defect führt zurück zur Risikoanalyse.
+    resources:
+      - title: Martin Fowler · The Practical Test Pyramid – Acceptance Tests
+        url: https://martinfowler.com/articles/practical-test-pyramid.html#acceptance
+
+  - id: beispiele-nachrechnen
+    type: output
+    title: Die Beispieltabelle nachrechnen
+    prompt: |
+      Was gibt das Programm aus? `UTC` ist die Zeitzone UTC, `BERLIN` Mitteleuropa mit Sommerzeit (Ende August: UTC+2).
+    lang: python
+    code: |
+      from datetime import UTC, date, datetime
+      from zoneinfo import ZoneInfo
+
+      BERLIN = ZoneInfo("Europe/Berlin")
+
+
+      def rabattiere(preis, art, wert):
+          rabatt = preis * wert // 100 if art == "prozent" else wert
+          return max(0, preis - rabatt)
+
+
+      def noch_gueltig(ablauf, jetzt):
+          return jetzt.astimezone(BERLIN).date() <= ablauf
+
+
+      print(rabattiere(450, "prozent", 15))
+      print(rabattiere(299, "prozent", 33))
+      print(rabattiere(120, "betrag", 500))
+      ablauf = date(2026, 8, 31)
+      print(noch_gueltig(ablauf, datetime(2026, 8, 31, 21, 59, tzinfo=UTC)))
+      print(noch_gueltig(ablauf, datetime(2026, 8, 31, 22, 1, tzinfo=UTC)))
+      print(noch_gueltig(ablauf, datetime(2026, 8, 31, 23, 59, tzinfo=BERLIN)))
+    expected: |
+      383
+      201
+      0
+      True
+      False
+      True
+    explanation: |
+      `450 * 15 // 100` ist `6750 // 100 = 67`, also 383 Cent. `299 * 33 = 9867`, `// 100` ergibt 98, bleiben 201 – die Ganzzahldivision rundet den Rabatt ab, nicht den Preis. 500 Cent Rabatt auf 120 Cent würden −380 ergeben, `max(0, …)` macht 0 daraus. 21:59 UTC ist 23:59 in Berlin, noch der 31. August. 22:01 UTC ist 0:01 Uhr am 1. September in Berlin, der Code ist abgelaufen, obwohl der UTC-Tag noch der 31. ist. Der letzte Zeitpunkt liegt schon in Berliner Zeit vor und bleibt der 31.
+    resources:
+      - title: Python · zoneinfo
+        url: https://docs.python.org/3/library/zoneinfo.html#zoneinfo.ZoneInfo
+      - title: Python · Ganzzahldivision
+        url: https://docs.python.org/3/reference/expressions.html#binary-arithmetic-operations
+
+  - id: properties-fuer-gutscheine
+    type: gap
+    title: Eigenschaften statt Einzelfälle
+    prompt: |
+      Ergänze die Property-Tests für `rabattiere(preis, art, wert)`: Preise sind ganze Cent von 0 bis 100 000, `art` ist `"prozent"` oder `"betrag"`. Geprüft werden drei Eigenschaften – 100 % machen jede Fahrt kostenlos, ein Rabatt von 0 ändert nichts, und mehr Prozent machen eine Fahrt nie teurer.
+    lang: python
+    code: |
+      from hypothesis import given, strategies as st
+
+      from gutschein import rabattiere
+
+      preise = st.⟦integers⟧(min_value=0, max_value=100_000)
+      prozente = st.integers(min_value=0, max_value=100)
+
+
+      @given(preis=preise)
+      def test_hundert_prozent_machen_jede_fahrt_kostenlos(preis):
+          assert rabattiere(preis, "prozent", 100) == 0
+
+
+      @given(preis=preise, art=st.⟦sampled_from⟧(["prozent", "betrag"]))
+      def test_null_rabatt_aendert_nichts(preis, art):
+          assert rabattiere(preis, art, 0) == ⟦preis⟧
+
+
+      ⟦@given(preis=preise, prozent=prozente)⟧
+      def test_mehr_prozent_machen_die_fahrt_nie_teurer(preis, prozent):
+          mehr = min(prozent + 10, 100)
+          assert ⟦rabattiere(preis, "prozent", mehr) <= rabattiere(preis, "prozent", prozent)⟧
+    gaps:
+      - label: Strategie für ganze Zahlen
+        hint: Die Strategie heißt wie der Python-Typ, im Plural.
+      - label: Strategie für eine feste Auswahl
+        hint: Wählt ein Element aus einer Liste.
+      - label: Erwarteter Preis
+        hint: Ohne Rabatt bleibt der Preis, wie er ist.
+      - label: Decorator
+        hint: "`@given` mit beiden Parametern der Testfunktion als Schlüsselwortargumente."
+        accept: ["@given(prozent=prozente, preis=preise)"]
+      - label: Eigenschaft
+        hint: Der Preis mit mehr Prozent ist kleiner oder gleich dem Preis mit weniger Prozent.
+        accept:
+          - "rabattiere(preis, \"prozent\", prozent) >= rabattiere(preis, \"prozent\", mehr)"
+    explanation: |
+      `st.integers` und `st.sampled_from` erzeugen die Eingaben, `@given` verbindet sie mit den Parametern. Die erste Eigenschaft ist ein Grenzfall, die zweite eine Identität, die dritte eine metamorphe Relation: Du kennst das genaue Ergebnis nicht, aber wie sich zwei Ergebnisse zueinander verhalten müssen. Solche Properties finden Fehler, für die niemand ein Beispiel aufgeschrieben hat, etwa einen Rabatt, der bei hohen Prozenten größer wird als der Preis oder falsch rundet. Sie ergänzen die Beispieltabelle, statt sie zu ersetzen.
+    resources:
+      - title: Hypothesis · integers
+        url: https://hypothesis.readthedocs.io/en/latest/reference/strategies.html#hypothesis.strategies.integers
+      - title: Hypothesis · sampled_from
+        url: https://hypothesis.readthedocs.io/en/latest/reference/strategies.html#hypothesis.strategies.sampled_from
+
+  - id: gutscheinregeln-testen
+    type: code
+    title: Tests für die Gutscheinregeln
+    prompt: |
+      `gutschein.py` enthält drei Funktionen:
+
+      - `ist_gueltiges_format(code)` – `True`, wenn der **ganze** Code aus `RW-` und genau sechs Großbuchstaben (A–Z) oder Ziffern besteht. Kleinbuchstaben, Leerzeichen und weitere Zeichen sind ungültig.
+      - `noch_gueltig(ablauf, jetzt)` – `ablauf` ist ein `date`, `jetzt` ein zeitzonenbewusster `datetime`, meist in UTC aus der Datenbank. Der Code gilt bis einschließlich zum Ablaufdatum, gemessen am Kalendertag in `Europe/Berlin`.
+      - `rabattiere(preis, art, wert)` – `art` ist `"prozent"` oder `"betrag"`. Prozent: Rabatt `preis * wert // 100` (abgerundet). Betrag: Rabatt `wert` Cent. Der Preis fällt nie unter 0.
+
+      Schreibe pytest-Tests. Sie müssen gegen die richtige Implementierung grün sein und jede fehlerhafte Variante, die die Prüfung bereithält, rot werden lassen.
+    lang: python
+    setup: |
+      from pathlib import Path
+
+      RICHTIG = '''
+      import re
+      from datetime import date, datetime
+      from zoneinfo import ZoneInfo
+
+      BERLIN = ZoneInfo("Europe/Berlin")
+      FORMAT = re.compile(r"RW-[A-Z0-9]{6}")
+
+
+      def ist_gueltiges_format(code: str) -> bool:
+          return FORMAT.fullmatch(code) is not None
+
+
+      def noch_gueltig(ablauf: date, jetzt: datetime) -> bool:
+          return jetzt.astimezone(BERLIN).date() <= ablauf
+
+
+      def rabattiere(preis: int, art: str, wert: int) -> int:
+          if art == "prozent":
+              rabatt = preis * wert // 100
+          else:
+              rabatt = wert
+          return max(0, preis - rabatt)
+      '''
+      MUTANTEN = {
+          "format": RICHTIG.replace("FORMAT.fullmatch(code)", "FORMAT.match(code)"),
+          "ablauf": RICHTIG.replace(".date() <= ablauf", ".date() < ablauf"),
+          "zeitzone": RICHTIG.replace("jetzt.astimezone(BERLIN).date()", "jetzt.date()"),
+          "untergrenze": RICHTIG.replace("return max(0, preis - rabatt)", "return preis - rabatt"),
+      }
+      assert all(m != RICHTIG for m in MUTANTEN.values()), "Ein Mutant ist identisch mit der richtigen Version."
+      Path("gutschein.py").write_text(RICHTIG, encoding="utf-8")
+    starter: |
+      from datetime import UTC, date, datetime
+
+      from gutschein import ist_gueltiges_format, noch_gueltig, rabattiere
+
+
+      def test_gutscheinregeln():
+          ...
+    solution: |
+      from datetime import UTC, date, datetime
+
+      import pytest
+
+      from gutschein import ist_gueltiges_format, noch_gueltig, rabattiere
+
+
+      @pytest.mark.parametrize("code", ["RW-SOMMER", "RW-START5", "RW-000000"])
+      def test_gueltiges_format(code):
+          assert ist_gueltiges_format(code)
+
+
+      @pytest.mark.parametrize("code", ["RW-SOMME", "RW-SOMMER1", "rw-sommer", "RW-SOMMER "])
+      def test_ungueltiges_format(code):
+          assert not ist_gueltiges_format(code)
+
+
+      ABLAUF = date(2026, 8, 31)
+
+
+      def test_gilt_am_ablauftag_bis_mitternacht_berliner_zeit():
+          assert noch_gueltig(ABLAUF, datetime(2026, 8, 31, 21, 59, tzinfo=UTC))  # 23:59 in Berlin
+
+
+      def test_abgelaufen_ab_mitternacht_berliner_zeit():
+          assert not noch_gueltig(ABLAUF, datetime(2026, 8, 31, 22, 10, tzinfo=UTC))  # 0:10 Uhr am 1. September
+
+
+      @pytest.mark.parametrize(
+          "preis, art, wert, erwartet",
+          [(450, "prozent", 15, 383), (450, "prozent", 100, 0), (450, "betrag", 100, 350), (120, "betrag", 500, 0)],
+      )
+      def test_rabattiere(preis, art, wert, erwartet):
+          assert rabattiere(preis, art, wert) == erwartet
+    tests:
+      - name: Grün gegen die richtige Implementierung
+        code: |
+          lauf = run_pytest({"gutschein.py": RICHTIG})
+          assert lauf.ok, lauf.output
+      - name: Fängt einen Fehler bei der Formatprüfung
+        code: |
+          lauf = run_pytest({"gutschein.py": MUTANTEN["format"]})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl jetzt auch Codes mit Zeichen hinter den sechs Stellen durchgehen."
+      - name: Fängt einen Fehler beim Ablaufdatum
+        code: |
+          lauf = run_pytest({"gutschein.py": MUTANTEN["ablauf"]})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl Codes am Ablauftag selbst nicht mehr gelten."
+      - name: Fängt einen Fehler bei der Zeitzone
+        code: |
+          lauf = run_pytest({"gutschein.py": MUTANTEN["zeitzone"]})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl jetzt der UTC-Tag zählt statt des Berliner Tags. Prüfst du einen UTC-Zeitpunkt kurz nach Mitternacht Berliner Zeit?"
+      - name: Fängt einen Fehler bei der Untergrenze
+        code: |
+          lauf = run_pytest({"gutschein.py": MUTANTEN["untergrenze"]})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl der Preis jetzt negativ werden kann."
+    hints:
+      - Leite die Tests aus den Grenzen der Regeln ab – direkt am Ablauftag, kurz danach, ein Rabatt größer als der Preis, ein Code mit einem Zeichen zu viel.
+      - "Ende August gilt in Berlin Sommerzeit (UTC+2). `datetime(2026, 8, 31, 22, 10, tzinfo=UTC)` ist in Berlin schon der 1. September."
+      - "Format: `\"RW-SOMMER1\"` muss ungültig sein. Ablauf: 21:59 UTC am 31.08. gilt, 22:10 UTC nicht. Rabatt: `rabattiere(120, \"betrag\", 500) == 0`."
+    explanation: |
+      Jede fehlerhafte Variante sitzt an einer Grenze, die in der Beispieltabelle steht. `re.match` prüft nur den Anfang, deshalb gilt `RW-SOMMER1` damit als gültig; erst ein Code mit einem Zeichen zu viel zeigt den Unterschied zu `fullmatch`. `< ablauf` fällt nur am Ablauftag selbst auf. Der Zeitzonenfehler zeigt sich nur mit einem UTC-Zeitpunkt zwischen 22 und 24 Uhr, der in Berlin schon der nächste Tag ist; ein Test mit Berliner Zeit wäre grün geblieben. Und die Untergrenze braucht einen Betrag, der größer ist als der Preis.
+    resources:
+      - title: Python · re.fullmatch
+        url: https://docs.python.org/3/library/re.html#re.fullmatch
+      - title: pytest · Parametrizing tests
+        url: https://docs.pytest.org/en/stable/how-to/parametrize.html#pytest-mark-parametrize-parametrizing-test-functions
+
+  - id: risiken-priorisieren
+    type: code
+    title: Risiken in eine Reihenfolge bringen
+    prompt: |
+      Schreibe `priorisiere(risiken)` für das Risiko-Register des Teams. Jedes Risiko ist ein Dictionary mit `name`, `wahrscheinlichkeit` und `auswirkung`.
+
+      - `wahrscheinlichkeit` und `auswirkung` müssen jeweils die ganze Zahl 1, 2 oder 3 sein. Sonst wirft die Funktion `ValueError`, und die Meldung enthält den Namen des Risikos.
+      - Punkte = Wahrscheinlichkeit × Auswirkung.
+      - Entscheidung: ab 6 Punkten `"eigene Tests"`, bei 3 oder 4 Punkten `"mitprüfen"`, darunter `"bewusst offen"`.
+      - Sortierung: mehr Punkte zuerst; bei gleichen Punkten die höhere Auswirkung zuerst; danach alphabetisch nach Name.
+      - Rückgabe: eine Liste von Tupeln `(name, punkte, entscheidung)`. Die Eingabe bleibt unverändert.
+    lang: python
+    starter: |
+      def priorisiere(risiken: list[dict]) -> list[tuple[str, int, str]]:
+          ergebnis = []
+          for risiko in risiken:
+              punkte = risiko["wahrscheinlichkeit"] * risiko["auswirkung"]
+              ergebnis.append((risiko["name"], punkte, "eigene Tests" if punkte > 6 else "mitprüfen"))
+          return sorted(ergebnis, key=lambda eintrag: eintrag[1], reverse=True)
+    solution: |
+      def entscheide(punkte: int) -> str:
+          if punkte >= 6:
+              return "eigene Tests"
+          if punkte >= 3:
+              return "mitprüfen"
+          return "bewusst offen"
+
+
+      def priorisiere(risiken: list[dict]) -> list[tuple[str, int, str]]:
+          for risiko in risiken:
+              for feld in ("wahrscheinlichkeit", "auswirkung"):
+                  wert = risiko[feld]
+                  if type(wert) is not int or not 1 <= wert <= 3:
+                      raise ValueError(f"{risiko['name']}: {feld} muss 1, 2 oder 3 sein, nicht {wert!r}")
+          sortiert = sorted(
+              risiken,
+              key=lambda r: (-r["wahrscheinlichkeit"] * r["auswirkung"], -r["auswirkung"], r["name"]),
+          )
+          ergebnis = []
+          for risiko in sortiert:
+              punkte = risiko["wahrscheinlichkeit"] * risiko["auswirkung"]
+              ergebnis.append((risiko["name"], punkte, entscheide(punkte)))
+          return ergebnis
+    tests:
+      - name: Punkte und Entscheidung an allen Schwellen
+        code: |
+          risiken = [
+              {"name": "Rabatt falsch", "wahrscheinlichkeit": 3, "auswirkung": 3},
+              {"name": "Codes erraten", "wahrscheinlichkeit": 2, "auswirkung": 3},
+              {"name": "Ablauf um Mitternacht", "wahrscheinlichkeit": 2, "auswirkung": 2},
+              {"name": "Tippfehler im Feld", "wahrscheinlichkeit": 3, "auswirkung": 1},
+              {"name": "Hilfetext unklar", "wahrscheinlichkeit": 2, "auswirkung": 1},
+          ]
+          ergebnis = priorisiere(risiken)
+          erwartet = [
+              ("Rabatt falsch", 9, "eigene Tests"),
+              ("Codes erraten", 6, "eigene Tests"),
+              ("Ablauf um Mitternacht", 4, "mitprüfen"),
+              ("Tippfehler im Feld", 3, "mitprüfen"),
+              ("Hilfetext unklar", 2, "bewusst offen"),
+          ]
+          assert ergebnis == erwartet, f"bekommen {ergebnis!r}"
+      - name: Gleiche Punkte – höhere Auswirkung zuerst
+        code: |
+          risiken = [
+              {"name": "Tippfehler im Feld", "wahrscheinlichkeit": 3, "auswirkung": 1},
+              {"name": "Last bei Kampagnenstart", "wahrscheinlichkeit": 1, "auswirkung": 3},
+          ]
+          namen = [eintrag[0] for eintrag in priorisiere(risiken)]
+          assert namen == ["Last bei Kampagnenstart", "Tippfehler im Feld"], f"Reihenfolge: {namen!r}"
+      - name: Gleiche Punkte und Auswirkung – alphabetisch
+        code: |
+          risiken = [
+              {"name": "Doppelt eingelöst", "wahrscheinlichkeit": 2, "auswirkung": 3},
+              {"name": "App versteht Antwort nicht", "wahrscheinlichkeit": 2, "auswirkung": 3},
+              {"name": "Codes erraten", "wahrscheinlichkeit": 2, "auswirkung": 3},
+          ]
+          namen = [eintrag[0] for eintrag in priorisiere(risiken)]
+          assert namen == ["App versteht Antwort nicht", "Codes erraten", "Doppelt eingelöst"], f"Reihenfolge: {namen!r}"
+      - name: Ungültige Bewertungen werden abgelehnt
+        code: |
+          for falsch in [0, 4, "hoch", 2.5]:
+              risiko = {"name": "Last bei Kampagnenstart", "wahrscheinlichkeit": falsch, "auswirkung": 2}
+              try:
+                  priorisiere([risiko])
+              except ValueError as fehler:
+                  assert "Last bei Kampagnenstart" in str(fehler), f"Die Meldung nennt das Risiko nicht: {fehler}"
+              else:
+                  raise AssertionError(f"wahrscheinlichkeit={falsch!r} wurde akzeptiert")
+      - name: Eingabe bleibt unverändert
+        code: |
+          risiken = [
+              {"name": "B", "wahrscheinlichkeit": 1, "auswirkung": 1},
+              {"name": "A", "wahrscheinlichkeit": 3, "auswirkung": 3},
+          ]
+          kopie = [dict(r) for r in risiken]
+          priorisiere(risiken)
+          assert risiken == kopie, "priorisiere hat die Eingabeliste verändert"
+    hints:
+      - "Der Startcode hat drei Fehler: Die Schwelle für „eigene Tests“ liegt bei 6 (einschließlich), „bewusst offen“ fehlt, und bei gleichen Punkten ist die Reihenfolge zufällig. Prüfungen fehlen ganz."
+      - "Ein Sortierschlüssel kann ein Tupel sein: `(-punkte, -auswirkung, name)` sortiert absteigend nach Punkten und Auswirkung, aufsteigend nach Name."
+      - "Für die Prüfung: `type(wert) is not int or not 1 <= wert <= 3`. `isinstance(2.5, int)` ist `False`, `\"hoch\"` fängst du mit dem Typvergleich ab, bevor du vergleichst."
+    explanation: |
+      Die Punktzahl ist grob, deshalb zählt die Reihenfolge bei Gleichstand: Ein seltener Fehler mit hoher Auswirkung (Last am Kampagnentag) gehört vor einen häufigen, harmlosen (Tippfehler). `sorted` mit einem Tupel als Schlüssel erledigt alle drei Kriterien in einem Durchlauf und lässt die Eingabe unverändert. Die Prüfung der Bewertungen verhindert, dass ein Tippfehler wie `"hoch"` oder `4` still eine falsche Priorität erzeugt. Das Ergebnis ist ein Vorschlag fürs Gespräch, kein Urteil: Das Team kann eine Entscheidung begründet überstimmen.
+    resources:
+      - title: Python · Sorting HOW TO – Key Functions
+        url: https://docs.python.org/3/howto/sorting.html#key-functions
+
+  - id: schwachen-test-staerken
+    type: code
+    title: Ein Test, der nichts findet
+    prompt: |
+      Im Pull Request für die Gutscheineinlösung steht der Test im Editor. Er ist grün. Im Review fragst du: Welcher Fehler im Code würde ihn rot machen? Schreib ihn so um, dass er Fehler wirklich findet.
+
+      `einloesen(kunde_id, code, preis, heute, katalog, einloesungen)` aus `einloesung.py`:
+
+      - wirft `GutscheinAbgelehnt` mit `grund` `"unbekannt"`, wenn der Code nicht im `katalog` steht, `"abgelaufen"`, wenn `heute` nach dem Ablaufdatum liegt (am Ablaufdatum selbst gilt er noch), und `"bereits eingelöst"`, wenn diese Kundin den Code schon eingelöst hat;
+      - berechnet sonst den Rabatt (Prozent: `preis * wert // 100`, Betrag: `wert` Cent), merkt sich die Einlösung in `einloesungen` und gibt den neuen Preis zurück, nie unter 0.
+
+      `fakes.py` enthält `EinloesungenImSpeicher`, einen Fake für das Repository der Einlösungen. Die Prüfung lässt deine Tests gegen die richtige Implementierung und gegen vier fehlerhafte Varianten laufen.
+    lang: python
+    setup: |
+      from pathlib import Path
+
+      FAKES = '''
+      class EinloesungenImSpeicher:
+          """Fake für das Repository: merkt sich Paare (kunde_id, code)."""
+
+          def __init__(self):
+              self.paare = set()
+
+          def schon_eingeloest(self, kunde_id, code):
+              return (kunde_id, code) in self.paare
+
+          def merke(self, kunde_id, code):
+              self.paare.add((kunde_id, code))
+      '''
+      RICHTIG = '''
+      from dataclasses import dataclass
+      from datetime import date
+
+
+      class GutscheinAbgelehnt(Exception):
+          def __init__(self, grund: str):
+              super().__init__(grund)
+              self.grund = grund
+
+
+      @dataclass(frozen=True)
+      class Gutschein:
+          code: str
+          art: str  # "prozent" oder "betrag"
+          wert: int  # Prozent oder Cent
+          ablauf: date  # gültig bis einschließlich
+
+
+      def einloesen(kunde_id, code, preis, heute, katalog, einloesungen):
+          gutschein = katalog.get(code)
+          if gutschein is None:
+              raise GutscheinAbgelehnt("unbekannt")
+          if heute > gutschein.ablauf:
+              raise GutscheinAbgelehnt("abgelaufen")
+          if einloesungen.schon_eingeloest(kunde_id, code):
+              raise GutscheinAbgelehnt("bereits eingelöst")
+          if gutschein.art == "prozent":
+              rabatt = preis * gutschein.wert // 100
+          else:
+              rabatt = gutschein.wert
+          einloesungen.merke(kunde_id, code)
+          return max(0, preis - rabatt)
+      '''
+      MUTANTEN = {
+          "prozent": RICHTIG.replace("rabatt = preis * gutschein.wert // 100", "rabatt = gutschein.wert"),
+          "merken": RICHTIG.replace("    einloesungen.merke(kunde_id, code)\n", ""),
+          "ablauf": RICHTIG.replace("heute > gutschein.ablauf", "heute >= gutschein.ablauf"),
+          "untergrenze": RICHTIG.replace("return max(0, preis - rabatt)", "return preis - rabatt"),
+      }
+      assert all(m != RICHTIG for m in MUTANTEN.values()), "Ein Mutant ist identisch mit der richtigen Version."
+      Path("einloesung.py").write_text(RICHTIG, encoding="utf-8")
+      Path("fakes.py").write_text(FAKES, encoding="utf-8")
+    starter: |
+      from datetime import date
+
+      from einloesung import Gutschein, GutscheinAbgelehnt, einloesen
+      from fakes import EinloesungenImSpeicher
+
+      KATALOG = {
+          "RW-SOMMER": Gutschein("RW-SOMMER", "prozent", 15, date(2026, 8, 31)),
+          "RW-START5": Gutschein("RW-START5", "betrag", 500, date(2026, 12, 31)),
+      }
+
+
+      def test_einloesen():
+          preis = einloesen(7, "RW-SOMMER", 450, date(2026, 8, 1), KATALOG, EinloesungenImSpeicher())
+          assert preis is not None
+          assert preis >= 0
+    solution: |
+      from datetime import date
+
+      import pytest
+
+      from einloesung import Gutschein, GutscheinAbgelehnt, einloesen
+      from fakes import EinloesungenImSpeicher
+
+      KATALOG = {
+          "RW-SOMMER": Gutschein("RW-SOMMER", "prozent", 15, date(2026, 8, 31)),
+          "RW-START5": Gutschein("RW-START5", "betrag", 500, date(2026, 12, 31)),
+      }
+
+
+      @pytest.fixture
+      def einloesungen():
+          return EinloesungenImSpeicher()
+
+
+      def test_prozent_wird_abgezogen_und_abgerundet(einloesungen):
+          assert einloesen(7, "RW-SOMMER", 450, date(2026, 8, 1), KATALOG, einloesungen) == 383
+
+
+      def test_betrag_ueber_dem_preis_ergibt_null(einloesungen):
+          assert einloesen(7, "RW-START5", 120, date(2026, 8, 1), KATALOG, einloesungen) == 0
+
+
+      def test_gilt_am_ablauftag_selbst(einloesungen):
+          assert einloesen(7, "RW-SOMMER", 450, date(2026, 8, 31), KATALOG, einloesungen) == 383
+
+
+      def test_zweite_einloesung_derselben_kundin_wird_abgelehnt(einloesungen):
+          einloesen(7, "RW-SOMMER", 450, date(2026, 8, 1), KATALOG, einloesungen)
+          with pytest.raises(GutscheinAbgelehnt, match="bereits eingelöst"):
+              einloesen(7, "RW-SOMMER", 300, date(2026, 8, 2), KATALOG, einloesungen)
+    tests:
+      - name: Grün gegen die richtige Implementierung
+        code: |
+          lauf = run_pytest({"einloesung.py": RICHTIG, "fakes.py": FAKES})
+          assert lauf.ok, lauf.output
+      - name: Fängt einen Fehler beim Prozentrabatt
+        code: |
+          lauf = run_pytest({"einloesung.py": MUTANTEN["prozent"], "fakes.py": FAKES})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl 15 % jetzt als 15 Cent abgezogen werden. Prüfst du den genauen Preis?"
+      - name: Fängt einen Fehler bei „einmal pro Kunde“
+        code: |
+          lauf = run_pytest({"einloesung.py": MUTANTEN["merken"], "fakes.py": FAKES})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl dieselbe Kundin den Code beliebig oft einlösen kann."
+      - name: Fängt einen Fehler beim Ablaufdatum
+        code: |
+          lauf = run_pytest({"einloesung.py": MUTANTEN["ablauf"], "fakes.py": FAKES})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl Codes am Ablauftag selbst abgelehnt werden."
+      - name: Fängt einen Fehler bei der Untergrenze
+        code: |
+          lauf = run_pytest({"einloesung.py": MUTANTEN["untergrenze"], "fakes.py": FAKES})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl der Preis jetzt negativ werden kann."
+    hints:
+      - "`preis >= 0` ist für 383, 435 und 450 gleichermaßen wahr. Ein Test, der Fehler finden soll, erwartet einen genauen Wert."
+      - Jede Regel aus dem Prompt braucht einen eigenen Test – Prozent, Betrag größer als der Preis, der Ablauftag selbst und eine zweite Einlösung mit demselben Fake.
+      - "Für die zweite Einlösung: zweimal `einloesen` mit **derselben** `EinloesungenImSpeicher`-Instanz, der zweite Aufruf in `with pytest.raises(GutscheinAbgelehnt, match=\"bereits eingelöst\"):`."
+    explanation: |
+      Der ursprüngliche Test führt den Code aus, prüft aber fast nichts: `is not None` und `>= 0` sind für jeden plausiblen falschen Rabatt wahr. Im Review ist die Frage „Welcher Fehler macht ihn rot?“ deshalb wichtiger als die Coverage, die er erzeugt. Gute Tests erwarten konkrete, unabhängig berechnete Werte (383, nicht `> 0`), prüfen Grenzen (Ablauftag, Rabatt größer als Preis) und Zustand über mehrere Aufrufe (dieselbe Fake-Instanz für die zweite Einlösung). Der Fake bleibt hier richtig: Für die Regel „einmal pro Kunde“ genügt er; die Garantie bei gleichzeitigen Buchungen prüft der Integrationstest gegen PostgreSQL.
+    resources:
+      - title: pytest · pytest.raises
+        url: https://docs.pytest.org/en/stable/reference/reference.html#pytest-raises
+      - title: pytest · Fixtures
+        url: https://docs.pytest.org/en/stable/how-to/fixtures.html
+
+  - id: rate-limit-test
+    type: bug
+    title: Der Test will mehr Versuche als die Regel
+    prompt: |
+      Regel: Pro Kundenkonto sind 10 fehlgeschlagene Einlöseversuche pro Stunde erlaubt. Ab dem 11. Versuch antwortet die API mit Status 429, Problem-Typ `zu-viele-versuche` und dem Header `Retry-After`.
+
+      Der API-Test scheitert in der CI mit `assert 429 == 422` in Zeile 8. Ein Kollege schlägt vor, die Grenze in der API auf 11 zu erhöhen, „dann passt es“. Die API setzt die Regel aber richtig um. Finde die fehlerhafte Zeile im Test und korrigiere sie.
+    lang: python
+    code: |
+      PROBLEME = "https://api.radwerk.example/probleme/"
+
+
+      def test_nach_zehn_fehlversuchen_wird_gebremst(client, kundin, buchung):
+          url = f"/buchungen/{buchung}/gutschein"
+          for _ in range(11):
+              antwort = client.post(url, json={"code": "RW-AAAAAA"}, headers=kundin)
+              assert antwort.status_code == 422
+          antwort = client.post(url, json={"code": "RW-AAAAAA"}, headers=kundin)
+          assert antwort.status_code == 429
+          assert antwort.json()["type"] == PROBLEME + "zu-viele-versuche"
+          assert "retry-after" in antwort.headers
+    lines: [6]
+    fix:
+      - line: 6
+        answers:
+          - "for _ in range(10):"
+          - "for _ in range(1, 11):"
+          - "for versuch in range(10):"
+          - "for versuch in range(1, 11):"
+          - "for i in range(10):"
+          - "for _ in range(0, 10):"
+    explanation: |
+      Die Schleife schickt elf Fehlversuche und erwartet bei jedem 422. Nach der Regel bekommt aber schon der 11. Versuch 429 – deshalb scheitert der Test in der elften Runde. Richtig sind zehn Versuche mit 422, danach einer mit 429. Den Code an einen falschen Test anzupassen, hätte die Sicherheitsregel gelockert, ohne dass jemand es merkt. Zuerst die Regel lesen, dann entscheiden, ob Test oder Code falsch ist.
+    resources:
+      - title: OWASP API Security · API4:2023 Unrestricted Resource Consumption
+        url: https://owasp.org/API-Security/editions/2023/en/0xa4-unrestricted-resource-consumption/
+      - title: FastAPI · Testing with TestClient
+        url: https://fastapi.tiangolo.com/tutorial/testing/#using-testclient
+
+  - id: strategie-verteidigen
+    type: explain
+    title: Fünf Minuten im Interview
+    prompt: |
+      Im Interview fragt die Teamleiterin: „Wie würdest du ein Feature ‚Gutscheincodes beim Buchen‘ testen?“ Dein Plan-Ausschnitt steht unten. Erkläre die Strategie so, wie du sie im Gespräch vertreten würdest: warum diese Ebenen, was bewusst fehlt und woran du später merkst, ob sie funktioniert.
+    lang: text
+    code: |
+      R1 Rabatt falsch (9)            Unit + Hypothesis
+      R2 doppelt eingelöst (6)        Integration gegen PostgreSQL
+      R3 Codes erraten (6)            API: 429 ab dem 11. Fehlversuch
+      R4 App versteht Antwort nicht   Pact: Android ↔ Buchungs-API
+      R7 Meldung nicht vorgelesen     Komponente + axe, Screenreader 1×
+      R8 Last bei Kampagnenstart      k6 gegen Staging, vor Kampagne
+      Durchstich                      1 E2E: Code einlösen und buchen
+      Bewusst nicht                   Ablehnungsgründe und Kombinationen im E2E
+      Danach                          Escaped Defects, Change Failure Rate
+    points:
+      - Die Strategie beginnt bei Risiken, bewertet nach Wahrscheinlichkeit und Auswirkung, nicht bei Werkzeugen oder einer Pyramide als Selbstzweck.
+      - Jedes Risiko liegt auf der niedrigsten Ebene, die es zuverlässig zeigt – Regeln im Unit-Test, Eindeutigkeit in der echten Datenbank, Rate Limit an der API, Kompatibilität im Vertrag.
+      - Ein einziger End-to-End-Test prüft das Zusammenspiel; Regeln werden dort nicht wiederholt, damit die Suite schnell und stabil bleibt.
+      - Was ungetestet bleibt, ist begründet, und nichtfunktionale Tests gibt es dort, wo das Risiko liegt (Last vor der Kampagne, nicht in jedem Pull Request).
+      - Der Erfolg wird nach dem Release gemessen, mit Escaped Defects und Change Failure Rate statt Coverage, und die Strategie wird nach jedem Vorfall angepasst.
+    explanation: |
+      Ich würde bei den Risiken anfangen. Am teuersten ist ein falsch berechneter Rabatt, dann doppelte Einlösungen, erratene Codes und eine App, die die Antwort nicht versteht. Für jedes Risiko wähle ich die billigste Ebene, die es zuverlässig zeigt. Die Rechenregeln teste ich mit Unit-Tests und Properties, das sind tausende Fälle in Millisekunden. „Einmal pro Kunde“ hängt an der Datenbank, wenn zwei Buchungen gleichzeitig kommen, deshalb ein Integrationstest gegen PostgreSQL. Das Rate Limit ist Teil der HTTP-Schnittstelle, also ein API-Test. Für die App reicht ein Contract Test; dafür müssen App und Backend nicht gemeinsam laufen. End-to-End gibt es genau einen Test für den Durchstich, keine Ablehnungsgründe dort, die stehen schon unten. Last teste ich einmal vor der Kampagne, Barrierefreiheit im Komponententest plus einmal mit Screenreader. Nach dem Release schaue ich auf Escaped Defects und die Change Failure Rate. Kommt ein Fehler durch, wird er ein Test auf der passenden Ebene, und ich prüfe, warum die Risikoanalyse ihn übersehen hat.
+
+  - id: nichtfunktionale-pruefungen
+    type: choice
+    title: Was verdient einen eigenen Test?
+    prompt: |
+      Für das Gutschein-Feature diskutiert das Team nichtfunktionale Prüfungen. Die Kampagne startet mit einem Newsletter an 80 000 Adressen. Welche Maßnahmen sind angemessen? Mehrere Antworten sind richtig.
+    options:
+      - text: Ein API-Test, der prüft, dass der 11. Fehlversuch pro Konto und Stunde Status 429 bekommt
+        correct: true
+        why: Billig, deterministisch und für ein Sicherheitsrisiko (Codes erraten, OWASP OAT-002). Ohne Test fällt eine Rate-Limit-Middleware bei einem Umbau still weg.
+      - text: Ein Komponententest, der prüft, dass die Fehlermeldung als `role="status"` mit Text erscheint, plus ein axe-Check
+        correct: true
+        why: WCAG 2.2 verlangt Fehler als Text und vorlesbare Statusmeldungen. Rolle und Text lassen sich im DOM schnell prüfen.
+      - text: Ein Lasttest gegen Staging vor dem Kampagnenstart mit der erwarteten Spitze und einem Ziel für die 95-%-Antwortzeit
+        correct: true
+        why: Die Last kommt an einem bekannten Tag. Ein gezielter Test vorher beantwortet die Frage, ohne jeden Pull Request zu bremsen.
+      - text: Ein Lasttest mit 5 000 parallelen Nutzern in jedem Pull Request
+        correct: false
+        why: Teuer, langsam und in einer geteilten CI-Umgebung zu verrauscht für ein verlässliches Signal. Das Risiko entsteht an einem Tag, nicht bei jeder Änderung.
+      - text: Ein eigener Penetrationstest der Paystream-API
+        correct: false
+        why: Paystream ist ein fremder Dienst; seine Sicherheit regelt der Vertrag mit dem Anbieter. Testen musst du, wie dein Code Paystream benutzt.
+    explanation: |
+      Nichtfunktionale Tests folgen derselben Logik wie funktionale: Risiko bewerten, dann die billigste Prüfung wählen, die es zuverlässig zeigt, und zur richtigen Zeit ausführen. Rate Limit und Barrierefreiheit sind schnell und deterministisch prüfbar, also gehören sie in jeden Pull Request. Last ist teuer und an ein Ereignis gebunden, also einmal gezielt davor.
+    resources:
+      - title: OWASP · OAT-002 Token Cracking
+        url: https://owasp.org/www-project-automated-threats-to-web-applications/assets/oats/EN/OAT-002_Token_Cracking
+      - title: W3C · Understanding WCAG 2.2 Status Messages
+        url: https://www.w3.org/WAI/WCAG22/Understanding/status-messages.html
+
+  - id: kennzahlen-waehlen
+    type: choice
+    title: Funktioniert die Strategie?
+    prompt: |
+      Drei Monate nach dem Start der Gutscheine fragt die Teamleitung, ob die Teststrategie funktioniert. Welche Kennzahlen helfen bei der Antwort? Mehrere Antworten sind richtig.
+    options:
+      - text: Escaped Defects im Gutscheinbereich, jeweils mit Ursache
+        correct: true
+        why: Jeder Fehler, der erst in Produktion auffällt, zeigt eine Lücke – in der Risikoanalyse oder bei der Wahl der Ebene. Die Ursache sagt, welche.
+      - text: Change Failure Rate der Deployments
+        correct: true
+        why: Der Anteil der Deployments, die sofort Rollback oder Hotfix brauchen, misst, ob Fehler vor Produktion gestoppt werden. Eine der DORA-Kennzahlen.
+      - text: Laufzeit und Flake-Rate der Pull-Request-Suite
+        correct: true
+        why: Eine Strategie, die die Suite langsam oder unzuverlässig macht, scheitert im Alltag – das Team wartet nicht mehr oder glaubt keinem Rot.
+      - text: Line Coverage des Gutscheinmoduls
+        correct: false
+        why: Sie zeigt, was ausgeführt wurde, nicht ob Fehler gefunden werden. Ein Test ohne Assertion erhöht sie genauso. Im Review nützlich, als Erfolgsmaß nicht.
+      - text: Anzahl der Testfälle
+        correct: false
+        why: Mehr Tests sind nicht besser. Zehn Tests aus der Mitte eines Bereichs finden weniger als ein Test an der Grenze.
+    explanation: |
+      Eine Teststrategie soll Fehler vor Produktion stoppen, ohne die Lieferung zu bremsen. Escaped Defects und Change Failure Rate messen das Erste, Laufzeit und Flake-Rate das Zweite. Coverage und Testanzahl messen Aktivität, nicht Wirkung, und werden als Ziel schnell zu Zahlen, die man ohne Nutzen erhöhen kann.
+    resources:
+      - title: DORA · Software delivery performance metrics
+        url: https://dora.dev/guides/dora-metrics/
+
+  - id: testplan-kontingent
+    type: practice
+    title: Testplan für Firmengutscheine
+    prompt: |
+      Neues Ticket RW-540: **Firmengutscheine mit Kontingent.** Firmen kaufen einen Code für ihre Mitarbeitenden.
+
+      - Format wie bisher (`RW-` + sechs Großbuchstaben oder Ziffern), gültig bis einschließlich Ablaufdatum.
+      - Einlösen können nur Kundenkonten, die mit der Firma verknüpft sind.
+      - Jede Person einmal, insgesamt höchstens 200 Einlösungen pro Code.
+      - Rabatt 100 %, aber höchstens 1 500 Cent pro Fahrt; der Preis fällt nie unter 0.
+      - Die Firma bekommt am Monatsende eine Rechnung über die eingelösten Rabatte.
+
+      Schreibe den Testplan auf einer Seite: Risiken mit Bewertung, Ebene je Risiko mit Begründung, was bewusst nicht getestet wird, nichtfunktionale Aspekte, eine explorative Charter, offene Fragen.
+    lang: text
+    solution: |
+      Testplan RW-540 Firmengutscheine mit Kontingent
+
+      Risiko (W×A)                                  Test / Ebene                                 Wann
+      K2 Deckel 1 500 Cent falsch (3×3=9)             Unit + Properties: 0 ≤ neu ≤ preis,          PR
+                                                      Rabatt ≤ 1 500; Grenzen 1 499/1 500/1 501
+      K1 Kontingent überschritten bei gleichzeitigen   Integration PostgreSQL: 2 Verbindungen     PR
+         Einlösungen, 200./201. (2×3=6)                lösen die 200. ein, genau eine gewinnt
+                                                      (UPDATE … WHERE eingeloest < 200)
+      K3 Fremde Konten lösen ein (2×3=6)              API-Test: Konto ohne Firma → 403             PR
+                                                      mit Problem-Typ; Unit für Prüfregel
+      K4 Firmenrechnung stimmt nicht mit              Integration: Einlösungen eines Monats →      PR
+         Einlösungen überein (2×3=6)                  Rechnungssumme; Golden Master der Rechnung   nach Merge
+      K8 Fahrt kostet 0 Cent, Buchung ohne Zahlung    bestehender Unit-Test aus RW-501 (keine      PR
+         wird zum Normalfall (2×3=6)                  Autorisierung bei 0) um 100 % ergänzen
+      K5 App kennt neuen Fehler nicht (2×2=4)         Pact: neuer Problem-Typ                      PR
+                                                      „kontingent-erschoepft“, additiv
+      K6 Ablauf an Tagesgrenze (2×2=4)                bestehender Unit-Test noch_gueltig           –
+      K7 Last, wenn die Firma um 9 Uhr die Mail       k6 auf Staging, nur bei Firmen über          vor Start
+         verschickt (1×2=2)                           2 000 Mitarbeitenden                         großer Kunden
+      Durchstich                                      bestehender E2E um Firmenkonto ergänzen      PR
+
+      Bewusst nicht: Kontingent-Grenzen im E2E (Integration reicht), alle Rabattkombinationen
+      an der API (Unit), Rechnungs-PDF pixelgenau (Golden Master auf Text).
+      Monitoring: Alarm bei 90 % Kontingent an Vertrieb; Einlösungen pro Code und Tag.
+      Explorativ: „Erkunde Einlösen mit Firmenkonto auf zwei Geräten und nach Kontowechsel,
+      um falsch gezählte oder fremde Einlösungen zu finden“ (60 min, vor Release).
+      Offene Fragen: Zählt eine stornierte Buchung gegen das Kontingent? Was sieht ein
+      Mitarbeitender, wenn das Kontingent erschöpft ist? (PO bis Freitag)
+    checklist:
+      - Jedes Risiko hat eine Bewertung aus Wahrscheinlichkeit und Auswirkung, und die Reihenfolge folgt daraus.
+      - Das Kontingent bei gleichzeitigen Einlösungen wird gegen die echte Datenbank getestet, nicht mit einem Fake.
+      - Der Deckel von 1 500 Cent ist mit Grenzwerten auf Unit-Ebene geprüft, und Properties sichern „nie unter 0“ ab.
+      - Die Berechtigung (nur Konten der Firma) ist an der API geprüft, inklusive Statuscode und Fehlerformat.
+      - Die Änderung für die App ist als Vertrag beschrieben und additiv, alte App-Versionen brechen nicht.
+      - Der Plan nennt, was bewusst nicht getestet wird, mit Begründung.
+      - Es gibt mindestens eine explorative Charter im Format Ziel, Mittel, gesuchte Information.
+      - Offene Fragen haben eine verantwortliche Person und einen Termin.
+    explanation: |
+      Der Kern ist dasselbe Vorgehen wie bei RW-501, mit zwei neuen Risiken an Grenzen: Das Kontingent ist ein Zähler, den zwei Transaktionen gleichzeitig erhöhen können, und die Firmenrechnung verbindet Einlösungen mit Geld. Beides gehört in Integrationstests gegen die echte Datenbank. Der Deckel ist reine Logik und bleibt unten. Neu für die App ist nur ein Problem-Typ, also eine additive Vertragsänderung. Ob dein Plan anders aussieht, ist weniger wichtig als die Begründungen: Jede Zeile beantwortet, warum diese Ebene und nicht eine billigere.
+    resources:
+      - title: PostgreSQL · UPDATE
+        url: https://www.postgresql.org/docs/current/sql-update.html
+      - title: Martin Fowler · Specification By Example
+        url: https://martinfowler.com/bliki/SpecificationByExample.html
+
+  - id: explorative-charter
+    type: practice
+    title: Drei Charters für die Gutscheine
+    prompt: |
+      Die automatisierten Tests für RW-501 stehen. Vor dem Release planst du zwei Stunden exploratives Testen. Schreibe drei Charters im Format „Erkunde *Ziel* mit *Mitteln*, um *Information* zu finden“, je mit Zeitrahmen. Ergänze für eine davon, wie deine Notizen während der Session aussehen und was mit einem gefundenen Fehler passiert.
+    lang: text
+    solution: |
+      C1 Erkunde die Codeeingabe auf Website und App
+         mit kopierten Codes aus Mail und PDF, Autokorrektur, Diktierfunktion und Einfügen per Tastatur,
+         um Eingaben zu finden, die Menschen machen, aber die Normalisierung nicht kennt.   45 min
+      C2 Erkunde den Ablauf rund um den Ablaufzeitpunkt
+         mit einer auf 23:58 gestellten Staging-Uhr, offenen Buchungen und einer Buchung, die über
+         Mitternacht im Warenkorb liegt, um Zustände zu finden, in denen Anzeige und Prüfung
+         verschiedene Tage annehmen.                                                        45 min
+      C3 Erkunde Einlösen und Stornieren auf zwei Geräten
+         mit einem Konto auf App und Website, Flugmodus und Neuladen,
+         um doppelte, verlorene oder falsch angezeigte Einlösungen zu finden.                30 min
+
+      Notizen C3 (Malik, 14:00–14:30, Build 2026.10.3)
+      14:04  Einlösen auf App, Website zeigt Code weiter als „verfügbar“ bis Neuladen    FRAGE PO
+      14:12  Storno auf Website, App zeigt Rabatt weiter an                               BUG RW-521
+      14:25  Flugmodus nach „Einlösen“, Buchung später: Rabatt korrekt                   ok
+      Abdeckung: Einlösen, Storno, offline · nicht geschafft: zwei Konten im selben Haushalt
+
+      RW-521 → Ursache: App lädt Buchungsdetails aus dem Cache. Regressionstest als
+      Komponententest „nach Storno-Ereignis wird der Rabatt neu geladen“; nicht als E2E.
+    checklist:
+      - Jede Charter nennt Ziel, Mittel und gesuchte Information, nicht nur „Gutscheine testen“.
+      - Die Charters zielen auf Risiken, die automatisierte Tests schlecht abdecken – reale Eingaben, Zeitgrenzen, mehrere Geräte, offline.
+      - Jede Session hat einen festen Zeitrahmen zwischen 30 und 90 Minuten.
+      - Die Notizen halten Zeit, Beobachtung und Einordnung (Fehler, Frage, in Ordnung) fest, dazu was abgedeckt wurde und was nicht.
+      - Ein gefundener Fehler wird zu einem Ticket und einem Regressionstest auf der niedrigsten passenden Ebene.
+    explanation: |
+      Exploratives Testen ist geplante Arbeit mit offenem Ergebnis. Die Charter gibt die Richtung, ohne Schritte vorzuschreiben; der Zeitrahmen verhindert, dass eine Session ausufert; die Notizen machen sichtbar, was geprüft wurde und was nicht. Gute Charters richten sich auf das, was Automatisierung schlecht sieht: echte Eingabegewohnheiten, Zeitgrenzen in echten Uhren, mehrere Geräte. Jeder Fund kehrt als Test in die Suite zurück, sonst findet die nächste Session denselben Fehler wieder.
+    resources:
+      - title: Jon und James Bach · Session-Based Test Management
+        url: https://www.satisfice.com/download/session-based-test-management
+      - title: Martin Fowler · The Practical Test Pyramid – Exploratory Testing
+        url: https://martinfowler.com/articles/practical-test-pyramid.html#ExploratoryTesting
