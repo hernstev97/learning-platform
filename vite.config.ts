@@ -9,6 +9,6 @@ export default defineConfig(({ command, mode }) => ({
   }] : [])],
   resolve: { alias: command === 'serve' && mode === 'test-local' ? [{ find: /^(?:\.\.?\/)+app\.ts$/, replacement: fileURLToPath(new URL('./src/testing/local-app.ts', import.meta.url)) }] : [] },
   // The largest chunk is the search index (every area as plain text), loaded only when search is first opened.
-  build: { target: 'es2022', chunkSizeWarningLimit: 3000 },
+  build: { target: 'es2022', chunkSizeWarningLimit: 4000 },
   worker: { format: 'es' },
 }));

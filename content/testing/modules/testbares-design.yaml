@@ -1,0 +1,1215 @@
+id: testbares-design
+title: Testbarkeit durch Design
+level: 2
+minutes: 150
+summary: Code, der sich Zeit, Konfiguration, Datenbank und Netz selbst holt, lässt sich nur mit Tricks testen. Wer Abhängigkeiten hereinreicht und Entscheidungen von Ein- und Ausgabe trennt, testet mit festen Werten – und weiß, wann eine Abstraktion mehr kostet, als sie bringt.
+goals:
+  - Du erkennst versteckte Abhängigkeiten – globale Konfiguration, `datetime.now()`, Zufall, Singletons, I/O mitten in der Logik – und erklärst, was sie im Test anrichten.
+  - Du machst Abhängigkeiten ohne Framework austauschbar, über Parameter, Konstruktor-Injektion und ein `Clock`-Protokoll, und testest Zeitgrenzen in `Europe/Berlin` mit fester Uhr.
+  - Du trennst einen funktionalen Kern von einer dünnen imperativen Hülle und schneidest Ports und Adapter an den Systemgrenzen.
+  - Du sicherst Legacy-Code über Seams und Charakterisierungstests ab, bevor du ihn umbaust.
+  - Du wägst Testbarkeit gegen Test-induced Design Damage ab und begründest, wo eine Indirektion ihr Geld nicht wert ist.
+resources:
+  - title: Python · typing.Protocol
+    url: https://docs.python.org/3/library/typing.html#typing.Protocol
+  - title: Python · zoneinfo
+    url: https://docs.python.org/3/library/zoneinfo.html
+  - title: Alistair Cockburn · Hexagonal Architecture
+    url: https://alistair.cockburn.us/hexagonal-architecture/
+  - title: Martin Fowler · Legacy Seam
+    url: https://martinfowler.com/bliki/LegacySeam.html
+  - title: Martin Fowler · Is TDD Dead?
+    url: https://martinfowler.com/articles/is-tdd-dead/
+lesson: |
+  Der Test für den Tageshöchstpreis lief seit Wochen grün. In einer Nacht im Oktober schlug er im Nightly-Build um 0:30 Uhr fehl, am Morgen war er wieder grün. Geändert hatte niemand etwas. Die Funktion las die Uhrzeit mit `datetime.now()`, die Tarife aus einer globalen Konfiguration und die bisherigen Zahlungen direkt aus PostgreSQL. Der Test konnte keine dieser Eingaben festlegen, also hing sein Ergebnis davon ab, wann und wo er lief.
+
+  Testbarkeit ist eine Eigenschaft des Designs, nicht des Tests. Dieses Modul baut Radwerk-Code Schritt für Schritt um: Parameter, Konstruktor-Injektion, eine Uhr als Abhängigkeit, funktionaler Kern mit imperativer Hülle, Ports und Adapter. Für Legacy-Code ohne Tests zeigt es Seams und Charakterisierungstests – und am Ende, wo solche Umbauten mehr kosten, als sie bringen. Die Mock-Werkzeuge kennst du aus [Test Doubles und Mocks](/testing/test-doubles); hier geht es darum, sie selten zu brauchen.
+
+  ## Versteckte Abhängigkeiten: was Code schwer testbar macht
+
+  So sah der Fahrtabschluss bei Radwerk 2024 aus:
+
+  ```python title=radwerk/preise.py
+  import json
+  from datetime import datetime
+
+  import psycopg
+  import requests
+
+  KONFIG = json.load(open("/etc/radwerk/tarife.json"))
+  db = psycopg.connect(KONFIG["datenbank_url"])
+
+
+  def schliesse_fahrt_ab(fahrt_id: str) -> int:
+      kunde_id, rad_typ, minuten = db.execute(
+          "SELECT kunde_id, rad_typ, minuten FROM fahrten WHERE id = %s", (fahrt_id,)
+      ).fetchone()
+      tarif = KONFIG["tarife"][rad_typ]
+      heute = datetime.now().date()
+      (bisher,) = db.execute(
+          "SELECT coalesce(sum(betrag_cent), 0) FROM zahlungen WHERE kunde_id = %s AND tag = %s",
+          (kunde_id, heute),
+      ).fetchone()
+      preis = 0 if minuten <= 5 else -(-minuten // 30) * tarif["cent_je_30_min"]
+      preis = min(preis, max(0, tarif["tageshoechstpreis"] - bisher))
+      if preis > 0:
+          requests.post(
+              f"{KONFIG['paystream_url']}/charges",
+              json={"customer_id": kunde_id, "amount_cent": preis, "idempotency_key": fahrt_id},
+              timeout=5,
+          )
+      db.execute(
+          "INSERT INTO zahlungen (kunde_id, tag, betrag_cent) VALUES (%s, %s, %s)",
+          (kunde_id, heute, preis),
+      )
+      db.commit()
+      return preis
+  ```
+
+  Die Signatur verspricht: Fahrt-ID rein, Preis raus. Tatsächlich hängt das Ergebnis an Dingen, die nicht in der Signatur stehen:
+
+  | Versteckte Abhängigkeit | Im Code | Was sie im Test anrichtet |
+  | --- | --- | --- |
+  | Konfiguration beim Import | `KONFIG = json.load(…)` | Schon `import radwerk.preise` scheitert ohne `/etc/radwerk/tarife.json`. Jeder Test sieht dieselben Tarife. |
+  | Singleton auf Modulebene | `db = psycopg.connect(…)` | Der Import öffnet eine Datenbankverbindung. Ohne PostgreSQL läuft kein einziger Test. |
+  | Systemuhr | `datetime.now()` | Das Ergebnis hängt von Uhrzeit und Zeitzone des Rechners ab. Auf einem CI-Runner in UTC liegt der Kalendertag zwischen 0 und 2 Uhr deutscher Sommerzeit falsch. |
+  | I/O mitten in der Logik | `requests.post`, `INSERT` | Jeder Test braucht Netz und Datenbank und belastet womöglich echt. |
+  | Daten aus der Datenbank | `SELECT … sum(betrag_cent)` | Für „Tageshöchstpreis fast erreicht“ musst du erst passende Zeilen einfügen. |
+
+  Zufall gehört in dieselbe Liste: `uuid4()` für Buchungsnummern oder `random.choices` für Gutscheincodes liefern bei jedem Lauf etwas anderes. Ein [`random.Random`](https://docs.python.org/3/library/random.html#random.Random)-Objekt mit festem Seed als Parameter macht sie im Test reproduzierbar.
+
+  > [!MERKE] Testbar heißt kontrollierbar und beobachtbar
+  > Ein Test muss jede Eingabe festlegen und jede Wirkung sehen können. Alles, was eine Funktion sich selbst holt – Zeit, Zufall, Konfiguration, Daten, Netz –, ist eine Eingabe, die nicht in der Signatur steht.
+
+  Mit `patch` bekommst du auch diese Funktion unter Test, aber nur über Umwege: `open` und `psycopg.connect` müssen schon vor dem Import ersetzt sein, danach kommen Uhr und `requests` dran. Das sind vier Patches, jeder an einen internen Namen gebunden, und der Test bricht bei jedem Umbau. Der bessere Weg macht die Eingaben sichtbar.
+
+  ## Dependency Injection ohne Framework: Parameter, Konstruktor, Uhr
+
+  Der kleinste Schritt: Was die Funktion sich holt, bekommt sie als Parameter. Die Preisregel braucht keine Datenbank, nur Werte:
+
+  ```python
+  @dataclass(frozen=True)
+  class Tarif:
+      cent_je_30_min: int
+      tageshoechstpreis: int
+
+
+  def fahrpreis(minuten: int, tarif: Tarif, bisher_am_tag: int) -> int:
+      if minuten <= 5:
+          return 0
+      regulaer = -(-minuten // 30) * tarif.cent_je_30_min
+      return min(regulaer, max(0, tarif.tageshoechstpreis - bisher_am_tag))
+  ```
+
+  Das ist **Dependency Injection**: Der Aufrufer reicht hinein, was der Code braucht. In Python brauchst du dafür kein Framework. Werte, die sich bei jedem Aufruf ändern, werden Parameter. Langlebige Mitarbeiter wie Repository, Zahlungsdienst und Uhr bekommt ein Objekt einmal im Konstruktor:
+
+  ```python
+  class Fahrtabschluss:
+      def __init__(self, fahrten: Fahrten, zahlungen: Zahlungen, sms: Sms, uhr: Clock):
+          self._fahrten = fahrten
+          self._zahlungen = zahlungen
+          self._sms = sms
+          self._uhr = uhr
+
+
+  def baue_fahrtabschluss(umgebung: Mapping[str, str]) -> Fahrtabschluss:
+      """Composition Root: der einzige Ort, der die konkreten Klassen kennt."""
+      db = psycopg.connect(umgebung["DATABASE_URL"])
+      return Fahrtabschluss(
+          fahrten=PostgresFahrten(db),
+          zahlungen=PaystreamZahlungen(PaystreamClient(umgebung["PAYSTREAM_API_KEY"])),
+          sms=SmsGateway(umgebung["SMS_GATEWAY_URL"]),
+          uhr=SystemUhr(),
+      )
+  ```
+
+  `baue_fahrtabschluss` ist die **Composition Root**: Sie verdrahtet einmal beim Start, in der App-Factory oder im `main` des Nightly-Jobs. Tests rufen sie nicht auf, sondern bauen `Fahrtabschluss` mit Fakes. Ein Konstruktor mit acht Parametern ist kein Problem der Injektion, sondern ein Zeichen, dass die Klasse zu viel tut.
+
+  ### Zeit als Abhängigkeit: ein Clock-Protokoll
+
+  `datetime.now()` ist die häufigste versteckte Eingabe. Radwerk braucht die Zeit für den Kalendertag des Tageshöchstpreises, und zwar in `Europe/Berlin`, nicht in der Zeitzone des Servers. Die anderen Module ordnen eine Fahrt dem Tag zu, an dem sie beginnt. Dieses Beispiel weicht bewusst davon ab: Abgerechnet wird beim Abschluss, und die Fahrt zählt zu dem Tag, an dem sie abgeschlossen und kassiert wird. Dann kommt der Tag aus der aktuellen Uhrzeit, und genau an dieser versteckten Eingabe zeigt sich, warum die Uhr eine Abhängigkeit ist.
+
+  ```python pytest
+  from dataclasses import dataclass, field
+  from datetime import UTC, date, datetime
+  from typing import Protocol
+  from zoneinfo import ZoneInfo
+
+  BERLIN = ZoneInfo("Europe/Berlin")
+
+
+  class Clock(Protocol):
+      def now(self) -> datetime: ...
+
+
+  class SystemUhr:
+      def now(self) -> datetime:
+          return datetime.now(UTC)
+
+
+  @dataclass
+  class FesteUhr:
+      zeit: datetime
+
+      def now(self) -> datetime:
+          return self.zeit
+
+
+  @dataclass
+  class FakeTageskonto:
+      bezahlt: dict = field(default_factory=dict)  # (kunde_id, tag) -> Cent
+
+      def summe_am(self, kunde_id: str, tag: date) -> int:
+          return self.bezahlt.get((kunde_id, tag), 0)
+
+      def addiere(self, kunde_id: str, tag: date, cent: int) -> None:
+          self.bezahlt[(kunde_id, tag)] = self.summe_am(kunde_id, tag) + cent
+
+
+  class Tageskasse:
+      def __init__(self, konto, uhr: Clock):
+          self._konto = konto
+          self._uhr = uhr
+
+      def kassiere(self, kunde_id: str, minuten: int) -> int:
+          tag = self._uhr.now().astimezone(BERLIN).date()
+          preis = 0 if minuten <= 5 else -(-minuten // 30) * 150
+          preis = min(preis, max(0, 1500 - self._konto.summe_am(kunde_id, tag)))
+          self._konto.addiere(kunde_id, tag, preis)
+          return preis
+
+
+  def test_vor_mitternacht_greift_der_tageshoechstpreis():
+      konto = FakeTageskonto({("K-7", date(2026, 10, 3)): 1500})
+      uhr = FesteUhr(datetime(2026, 10, 3, 21, 50, tzinfo=UTC))  # 23:50 Uhr in Berlin
+
+      assert Tageskasse(konto, uhr).kassiere("K-7", minuten=47) == 0
+
+
+  def test_nach_mitternacht_in_berlin_beginnt_ein_neuer_tag():
+      konto = FakeTageskonto({("K-7", date(2026, 10, 3)): 1500})
+      uhr = FesteUhr(datetime(2026, 10, 3, 22, 30, tzinfo=UTC))  # 0:30 Uhr, schon der 4.
+
+      assert Tageskasse(konto, uhr).kassiere("K-7", minuten=47) == 300
+      assert konto.summe_am("K-7", date(2026, 10, 4)) == 300
+  ```
+
+  Die Uhr ist ein [`Protocol`](https://docs.python.org/3/library/typing.html#typing.Protocol): Jede Klasse mit einer Methode `now()` passt, ohne zu erben. `SystemUhr` liefert eine *aware* Zeit in UTC ([aware und naive Objekte](https://docs.python.org/3/library/datetime.html#aware-and-naive-objects)). Erst die Fachlogik rechnet sie mit [`astimezone`](https://docs.python.org/3/library/datetime.html#datetime.datetime.astimezone) und [`zoneinfo`](https://docs.python.org/3/library/zoneinfo.html#using-zoneinfo) in Berliner Ortszeit um. Die Tests legen die Zeit auf die Minute fest und prüfen genau die Grenze, an der der Bug aus der Einleitung saß. Ihr Ergebnis ist dasselbe, ob sie um 14 Uhr laufen oder um 0:30 Uhr.
+
+  Statt eines Protokolls genügt oft eine Funktion als Parameter, etwa `jetzt: Callable[[], datetime]`. Bibliotheken wie [time-machine](https://time-machine.readthedocs.io/en/latest/) verstellen die Uhr für den ganzen Prozess. Das hilft bei Legacy-Code, lässt die Abhängigkeit aber versteckt.
+
+  > [!WARNING] `jetzt=datetime.now()` als Default
+  > Ein Default-Wert wird einmal beim `def` ausgewertet, nicht bei jedem Aufruf ([Default-Argumente](https://docs.python.org/3/tutorial/controlflow.html#default-argument-values)). `def schliesse_ab(…, jetzt=datetime.now())` rechnet in einem langlebigen Serverprozess für immer mit der Startzeit. Übergib eine Uhr oder eine Funktion, nie den Zeitpunkt als Default.
+
+  ## Funktionaler Kern, imperative Hülle
+
+  Gary Bernhardt hat 2012 ein Muster benannt, das viele Doubles überflüssig macht: [Functional Core, Imperative Shell](https://www.destroyallsoftware.com/screencasts/catalog/functional-core-imperative-shell). Der **Kern** trifft alle Entscheidungen als reine Funktionen: gleiche Eingaben, gleiches Ergebnis, keine Wirkung nach außen. Die **Hülle** holt Daten, ruft den Kern und führt aus, was er entschieden hat. Sie enthält kaum Verzweigungen.
+
+  Bei Radwerk entscheidet der Kern über Preis und SMS-Text und gibt die Entscheidung als Wert zurück:
+
+  ```python pytest
+  from dataclasses import dataclass
+
+  import pytest
+
+
+  @dataclass(frozen=True)
+  class Tarif:
+      cent_je_30_min: int
+      tageshoechstpreis: int
+
+
+  CITY = Tarif(cent_je_30_min=150, tageshoechstpreis=1500)
+  E_BIKE = Tarif(cent_je_30_min=300, tageshoechstpreis=3000)
+
+
+  @dataclass(frozen=True)
+  class Abrechnung:
+      preis_cent: int
+      sms: str
+
+
+  def abrechnen(minuten: int, tarif: Tarif, bisher_am_tag: int, plus: bool = False) -> Abrechnung:
+      if minuten <= 5:
+          return Abrechnung(0, "Fehlstart, die Fahrt ist kostenlos.")
+      zu_zahlen = max(0, minuten - 30) if plus else minuten
+      regulaer = -(-zu_zahlen // 30) * tarif.cent_je_30_min
+      preis = min(regulaer, max(0, tarif.tageshoechstpreis - bisher_am_tag))
+      if preis < regulaer:
+          return Abrechnung(preis, f"{preis} Cent, Tageshöchstpreis erreicht.")
+      return Abrechnung(preis, f"{preis} Cent.")
+
+
+  @pytest.mark.parametrize(
+      "minuten, tarif, bisher, plus, preis",
+      [
+          (5, CITY, 0, False, 0),
+          (6, CITY, 0, False, 150),
+          (31, E_BIKE, 0, False, 600),
+          (47, CITY, 0, True, 150),
+          (47, CITY, 1400, False, 100),
+          (47, CITY, 1500, False, 0),
+      ],
+      ids=["fehlstart", "angefangene-halbe-stunde", "e-bike", "plus", "deckel-teilweise", "deckel-erreicht"],
+  )
+  def test_preis(minuten, tarif, bisher, plus, preis):
+      assert abrechnen(minuten, tarif, bisher, plus).preis_cent == preis
+
+
+  def test_sms_nennt_den_tageshoechstpreis():
+      assert abrechnen(47, CITY, bisher_am_tag=1400).sms == "100 Cent, Tageshöchstpreis erreicht."
+  ```
+
+  Kein einziges Double, sechs Fälle in einer Tabelle, und ein neuer Fall kostet eine Zeile. Die Hülle führt aus:
+
+  ```python
+  class Fahrtabschluss:
+      ...
+
+      def schliesse_ab(self, fahrt_id: str) -> Abrechnung:
+          fahrt = self._fahrten.hole(fahrt_id)
+          tag = self._uhr.now().astimezone(BERLIN).date()
+          bisher = self._fahrten.bezahlt_am(fahrt.kunde_id, tag)
+          abrechnung = abrechnen(fahrt.minuten, TARIFE[fahrt.rad_typ], bisher, fahrt.plus)
+          if abrechnung.preis_cent > 0:
+              self._zahlungen.belaste(fahrt.kunde_id, abrechnung.preis_cent, schluessel=fahrt_id)
+          self._fahrten.speichere_abrechnung(fahrt_id, tag, abrechnung.preis_cent)
+          self._sms.sende(fahrt.telefon, abrechnung.sms)
+          return abrechnung
+  ```
+
+  Sie liest, ruft den Kern und schreibt, mit einer einzigen Verzweigung. Ein, zwei Tests mit Fakes zeigen, dass sie die Teile richtig verbindet; die vielen Fälle prüfst du im Kern. Hängt eine Entscheidung von der Antwort der Außenwelt ab – Paystream lehnt ab, was nun? –, bleibt die Fehlerbehandlung in der Hülle. Wird die Reaktion darauf kompliziert, ruf lieber den Kern ein zweites Mal auf, als Logik in die Hülle zu ziehen.
+
+  ## Ports und Adapter an den Systemgrenzen
+
+  Die Hülle spricht mit der Außenwelt über **Ports**: Schnittstellen in der Sprache der Anwendung, hier `Fahrten`, `Zahlungen`, `Sms` und `Clock`. Ein **Adapter** setzt einen Port für eine Technik um: `PostgresFahrten` mit SQL, `PaystreamZahlungen` über das SDK, `InMemoryFahrten` für Tests. Alistair Cockburn nannte das [Hexagonal Architecture](https://alistair.cockburn.us/hexagonal-architecture/). Sein erklärtes Ziel: Eine Anwendung soll sich von Nutzern, Programmen und automatisierten Tests gleichermaßen steuern und getrennt von Datenbanken und Geräten entwickeln und testen lassen.
+
+  ```text
+   treibende Seite         Anwendung                      getriebene Seite
+   HTTP-Handler ─┐   ┌─────────────────────────┐   ┌─ Fahrten   ◄ PostgresFahrten    | InMemoryFahrten
+   Nightly-Job  ─┼──►│ Fahrtabschluss (Hülle)  │──►├─ Zahlungen ◄ PaystreamZahlungen | FakeZahlungen
+   Tests        ─┘   │ abrechnen() (Kern)      │   ├─ Sms       ◄ SmsGateway         | SmsSpy
+                     └─────────────────────────┘   └─ Clock     ◄ SystemUhr          | FesteUhr
+  ```
+
+  ```python title=radwerk/ports.py
+  class Fahrten(Protocol):
+      def hole(self, fahrt_id: str) -> Fahrt: ...
+      def bezahlt_am(self, kunde_id: str, tag: date) -> int: ...
+      def speichere_abrechnung(self, fahrt_id: str, tag: date, preis_cent: int) -> None: ...
+
+
+  class Zahlungen(Protocol):
+      def belaste(self, kunde_id: str, betrag_cent: int, schluessel: str) -> str: ...
+
+
+  class Sms(Protocol):
+      def sende(self, telefon: str, text: str) -> None: ...
+  ```
+
+  Zwei Regeln machen einen guten Port. Er spricht die Sprache der Anwendung (`bezahlt_am`, nicht `execute(sql)`). Und er ist so schmal, wie die Anwendung ihn braucht. Ein Port, der die Paystream-API eins zu eins nachbildet, ist eine Kopie des SDK, und jede SDK-Änderung schlägt bis in die Fachlogik durch.
+
+  Aus dem Schnitt folgt, was du wo testest (siehe [Testpyramide und Testgrenzen](/testing/testpyramide)):
+
+  | Teil | Test | Doubles |
+  | --- | --- | --- |
+  | Kern (`abrechnen`) | viele Unit-Tests, parametrisiert | keine |
+  | Hülle (`Fahrtabschluss`) | wenige Unit-Tests für den Ablauf | Fakes für die Ports, `FesteUhr` |
+  | Adapter (`PostgresFahrten`, `PaystreamZahlungen`) | Integrationstests gegen echte Datenbank und Sandbox | keine |
+  | Verdrahtung (Composition Root) | ein Smoke Test, der die App mit echten Adaptern startet | keine |
+
+  Wie du Adapter gegen eine echte Datenbank testest, zeigt [Integrationstests](/testing/integrationstests).
+
+  ## Legacy-Code: Seams und Charakterisierungstests
+
+  Code ohne Tests nennt Michael Feathers in *Working Effectively with Legacy Code* schlicht Legacy Code. Das Dilemma: Um sicher umzubauen, brauchst du Tests. Um Tests zu schreiben, musst du umbauen. Feathers' Ausweg beginnt mit einem **Seam**, „einer Stelle, an der du das Verhalten deines Programms ändern kannst, ohne an dieser Stelle zu editieren“ ([Fowler: Legacy Seam](https://martinfowler.com/bliki/LegacySeam.html)). In Python sind zwei Arten alltäglich:
+
+  - **Parameter mit Default:** Der Default bewahrt das alte Verhalten, alle Aufrufer bleiben unverändert, und der Test reicht etwas anderes herein.
+  - **Modulattribut:** Ein Name, den der Code zur Laufzeit in einem Modul nachschlägt, lässt sich mit `monkeypatch` ersetzen – ganz ohne Codeänderung, aber an Interna gebunden.
+
+  Der erste Umbau an der Legacy-Funktion ist klein und mechanisch:
+
+  ```diff
+  -def schliesse_fahrt_ab(fahrt_id: str) -> int:
+  +def schliesse_fahrt_ab(fahrt_id: str, jetzt: Callable[[], datetime] = datetime.now) -> int:
+       kunde_id, rad_typ, minuten = db.execute(
+       …
+  -    heute = datetime.now().date()
+  +    heute = jetzt().date()
+  ```
+
+  `jetzt` ist eine Funktion, kein Zeitpunkt: Der Default `datetime.now` wird bei jedem Aufruf neu gefragt. Das Verhalten bleibt exakt gleich, samt Zeitzonenfehler. Den behebst du in einem eigenen Schritt.
+
+  Bevor du weiter umbaust, hältst du fest, was der Code **heute** tut, nicht, was er tun sollte. Ein **Charakterisierungstest** entsteht so: Schreib eine Erwartung, lass den Test laufen und übernimm den echten Wert aus der Fehlermeldung. Ein Beispiel ist die alte Preisfunktion:
+
+  ```python pytest fails
+  def preis_alt(minuten, rad="city", plus=False):
+      # 2019 geschrieben, seitdem dreimal erweitert, nie getestet
+      if plus:
+          minuten = minuten - 30
+      if minuten <= 5:
+          return 0
+      satz = 300 if rad == "e-bike" else 150
+      halbe_stunden = minuten // 30
+      if minuten % 30:
+          halbe_stunden += 1
+      return halbe_stunden * satz
+
+
+  def test_city_rad_47_minuten():
+      assert preis_alt(47) == 300
+
+
+  def test_plus_kurz_nach_30_minuten():
+      assert preis_alt(33, plus=True) == 150  # Vermutung: 3 Minuten kosten eine halbe Stunde
+  ```
+
+  Der zweite Test scheitert und verrät den echten Wert: 0. Bei Radwerk Plus zieht der alte Code die 30 Freiminuten ab und wendet danach die Fehlstartregel auf den Rest an. Ob das gewollt ist, entscheidet die Fachabteilung, nicht der Test. Du übernimmst `== 0`, schreibst einen Kommentar dazu und baust erst um, wenn alle Charakterisierungstests grün sind. Einen Bug behebst du in einem eigenen Schritt mit eigenem Test, nie nebenbei im Refactoring. Für große Ausgaben wie Rechnungen oder Exporte wird daraus ein Golden Master, siehe [Regressionsstrategien](/testing/regression-strategien).
+
+  ## Test-induced Design Damage: wann Testbarkeit zu teuer wird
+
+  2014 erklärte David Heinemeier Hansson, der Erfinder von Ruby on Rails, TDD für tot und prägte den Begriff [Test-induced Design Damage](https://dhh.dk/2014/test-induced-design-damage.html): Code, der nur für Tests umgebaut wurde und dadurch schlechter wird. Sein Beispiel war Jim Weirichs Vorführung hexagonaler Architektur in Rails: Der Controller spricht nicht mehr direkt mit der Datenbank, sondern mit einem Repository, und die Aktion steckt in einem Command-Objekt, das über einen Listener zurückruft – alles, damit Unit-Tests schnell und ohne Datenbank laufen. Seine Gegenposition: Controller per Integrationstest prüfen, Modelltests ruhig gegen die Datenbank laufen lassen.
+
+  In der Gesprächsreihe [Is TDD Dead?](https://martinfowler.com/articles/is-tdd-dead/) hielten Kent Beck und Martin Fowler dagegen. Beck sah die Indirektionen nicht als Folge von TDD, sondern als einzelne Designentscheidungen: Werkzeuge, die sich manchmal lohnen und manchmal nicht. Er selbst nutze kaum Mocks. Fowler sah die Ursache im Wunsch nach Isolation, nicht in TDD. DHH hielt dagegen, dass jede zusätzliche Schicht beim Ändern synchron gehalten werden muss und deshalb teuer ist.
+
+  Beide Seiten haben recht, je nach Abhängigkeit. Für Radwerk ergibt sich diese Abwägung:
+
+  - **Lohnt sich:** Die Abhängigkeit ist langsam, nichtdeterministisch oder kostet Geld – Uhr, Zufall, Paystream, SMS. Oder die Logik hat viele Fälle, wie Tarife, Deckel und Gutscheine. Ein Clock-Parameter und ein reiner Kern kosten wenige Zeilen und machen den Code auch ohne Tests klarer.
+  - **Lohnt sich selten:** ein Repository-Interface mit genau einer Implementierung, nur damit Tests die eigene Datenbank mocken können, obwohl ein Repository-Test gegen einen laufenden PostgreSQL-Container nur Millisekunden kostet. Eine private Hilfsfunktion, die nur für einen Test öffentlich wird. Ein Port für jede Hilfsfunktion.
+  - **Prüffrage:** Würdest du die Abstraktion auch einführen, wenn es keine Tests gäbe? Wenn ja, ist sie Design. Wenn nein, prüfe, ob ein Test auf einer höheren Ebene dasselbe Risiko billiger abdeckt.
+
+  > [!INTERVIEW] „Ist Dependency Injection nicht Overengineering?“
+  > Nicht, wenn sie sich auf echte Grenzen beschränkt. Ich reiche Uhr, Zufall und externe Dienste wie den Zahlungsanbieter herein, weil Tests sie sonst nicht kontrollieren können und weil der Code dann zeigt, wovon er abhängt. Ein Framework brauche ich dafür nicht, Konstruktorparameter und eine Composition Root reichen. Die eigene Datenbank verstecke ich nicht hinter Interfaces, nur um sie zu mocken; dafür gibt es schnelle Integrationstests. DHHs Kritik nehme ich ernst: Jede Schicht muss sich auch ohne Tests rechtfertigen.
+
+  > [!PRAXIS] Radwerks Schnitt nach dem Umbau
+  > Der Tarifkern hat 140 parametrisierte Fälle und läuft in 0,3 Sekunden. `Fahrtabschluss` hat sechs Tests mit Fakes, `PaystreamZahlungen` läuft nachts gegen die Sandbox. Um den Port `Fahrten` gab es Streit: Die sechs Hüllentests könnten genauso gegen einen PostgreSQL-Container laufen. Der Fake blieb, weil dieselben Repository-Tests gegen ihn und gegen PostgreSQL laufen und die Hüllentests unter einer Sekunde halten. Seit die Uhr hereingereicht wird, gab es keinen Nightly-Fehler um Mitternacht mehr.
+
+  ## Häufige Fehler
+
+  - **`datetime.now()` oder `date.today()` in der Fachlogik.** Tests hängen an der Uhrzeit und scheitern nachts. Uhr oder Zeitpunkt hereinreichen.
+  - **Naive Zeiten und die Zeitzone des Servers.** Auf einem Server in UTC ist der Berliner Kalendertag nach Mitternacht falsch, im Sommer bis 2 Uhr, im Winter bis 1 Uhr. Aware in UTC rechnen und für Fachregeln mit `astimezone(BERLIN)` umrechnen.
+  - **Den Zeitpunkt als Default.** `jetzt=datetime.now()` wird einmal beim Import ausgewertet. Eine Funktion oder Uhr übergeben.
+  - **Konfiguration und Verbindungen beim Import.** Schon der Import scheitert im Test. In der Composition Root laden und hereinreichen.
+  - **Logik in der Hülle.** Sie bleibt ungetestet, weil die Hülle nur wenige Tests hat. Jede Entscheidung gehört in den Kern.
+  - **Ein Port, der die fremde API kopiert.** SDK-Änderungen schlagen bis in die Fachlogik durch. Ports in der Sprache der Anwendung schneiden.
+  - **Alles injizieren.** Logger, Hilfsfunktionen und `math` als Parameter blähen Konstruktoren auf und sagen nichts. Nur Grenzen injizieren.
+  - **Umbauen ohne Charakterisierungstests oder Bugs nebenbei reparieren.** Verhaltensänderungen fallen nicht mehr auf. Erst festhalten, dann umbauen, dann in einem eigenen Schritt korrigieren.
+
+  ## Zusammenfassung
+
+  - Testbarer Code lässt den Test jede Eingabe festlegen und jede Wirkung beobachten. Globale Konfiguration, Singletons, Uhr, Zufall und I/O in der Logik verhindern das.
+  - Dependency Injection braucht kein Framework: Werte als Parameter, langlebige Mitarbeiter über den Konstruktor, verdrahtet in einer Composition Root.
+  - Die Zeit kommt über eine Uhr herein, aware in UTC; Fachregeln rechnen in `Europe/Berlin` um. Tests legen sie fest und prüfen Mitternacht und Zeitumstellung.
+  - Der funktionale Kern entscheidet ohne Wirkung nach außen und wird mit vielen Beispielen ohne Doubles getestet; die imperative Hülle bleibt dünn.
+  - Ports sprechen die Sprache der Anwendung. Adapter setzen sie für eine Technik um und bekommen eigene Integrationstests.
+  - Bei Legacy-Code: Seam schaffen, Verhalten mit Charakterisierungstests festhalten, in kleinen Schritten umbauen. Bugs werden getrennt behoben.
+  - Jede Indirektion kostet. Sie lohnt sich an echten Grenzen und bei komplexer Logik, nicht als Selbstzweck für isolierte Unit-Tests.
+exercises:
+  - id: versteckte-eingaben
+    type: choice
+    title: Was der Test nicht festlegen kann
+    prompt: Welche Stellen machen `vergib_gutschein` schwer testbar, weil sie Eingaben enthalten, die ein Test nur über Patches festlegen kann?
+    lang: python
+    code: |
+      import logging
+      import random
+      import string
+      from datetime import date
+
+      from radwerk.einstellungen import EINSTELLUNGEN
+
+      log = logging.getLogger(__name__)
+      ZEICHEN = string.ascii_uppercase + string.digits
+
+
+      def vergib_gutschein(kunde_id: str, prozent: int) -> dict:
+          if prozent > EINSTELLUNGEN["max_rabatt_prozent"]:
+              raise ValueError("Rabatt zu hoch")
+          code = "RW-" + "".join(random.choices(ZEICHEN, k=6))
+          heute = date.today()
+          log.info("Gutschein %s für %s", code, kunde_id)
+          return {"code": code, "kunde_id": kunde_id, "prozent": prozent,
+                  "gueltig_bis": heute.replace(year=heute.year + 1)}
+    options:
+      - text: "`random.choices(ZEICHEN, k=6)`"
+        correct: true
+        why: Zufall – der Code ist bei jedem Lauf anders. Ein `random.Random`-Objekt als Parameter, im Test mit festem Seed, macht ihn reproduzierbar.
+      - text: "`date.today()`"
+        correct: true
+        why: Systemuhr und lokale Zeitzone. Am 29. Februar wirft `replace(year=…)` sogar `ValueError` – ein Test findet das nur, wenn er das Datum festlegen kann.
+      - text: "`EINSTELLUNGEN[\"max_rabatt_prozent\"]`"
+        correct: true
+        why: Globale Konfiguration. Jeder Test sieht denselben Wert, eine andere Grenze lässt sich nur per Patch einstellen.
+      - text: "`log.info(…)`"
+        correct: false
+        why: Eine Wirkung, die das Ergebnis nicht beeinflusst. pytest kann sie mit `caplog` beobachten; einen Logger hereinzureichen bringt nichts.
+      - text: "`ZEICHEN = string.ascii_uppercase + string.digits`"
+        correct: false
+        why: Eine Konstante. Sie ist bei jedem Lauf gleich und versteckt keine Eingabe.
+    explanation: |
+      Versteckte Eingaben sind Werte, die die Funktion sich selbst holt und die sich von Lauf zu Lauf oder von Umgebung zu Umgebung ändern: Zufall, Zeit, Konfiguration. Ein Test kann sie nur über Patches beeinflussen. Werden sie Parameter (`rng: random.Random`, `heute: date`, `max_rabatt: int`), schreibst du Tests mit festen Werten – und findest dabei den Absturz am 29. Februar. Logging ist eine Ausgabe ohne Einfluss auf das Ergebnis, eine Konstante ist keine Abhängigkeit.
+    resources:
+      - title: Python · random.Random
+        url: https://docs.python.org/3/library/random.html#random.Random
+      - title: Python · datetime.date.replace
+        url: https://docs.python.org/3/library/datetime.html#datetime.date.replace
+
+  - id: ebene-waehlen
+    type: choice
+    title: Welches Risiko, welcher Test?
+    prompt: |
+      Nach dem Umbau hat Radwerk einen reinen Kern `abrechnen`, die Hülle `Fahrtabschluss` mit Ports, die Adapter `PostgresFahrten` und `PaystreamZahlungen` und eine Composition Root. Welche Zuordnungen von Risiko zu Test sind sinnvoll?
+    options:
+      - text: Der Tageshöchstpreis bei einem Abschluss um 0:30 Uhr Berliner Zeit → Unit-Test der Hülle mit `FesteUhr` und Fakes.
+        correct: true
+        why: Die Grenze steckt in der Umrechnung mit `astimezone(BERLIN)` in der Hülle. Eine feste Uhr macht sie deterministisch, Fakes halten den Test schnell.
+      - text: "`PostgresFahrten.bezahlt_am` zählt nur Zahlungen des richtigen Tages → Integrationstest gegen eine echte PostgreSQL-Datenbank."
+        correct: true
+        why: Das Risiko steckt im SQL. Nur die echte Datenbank zeigt, ob die Abfrage stimmt; ein Mock würde deine Annahme wiederholen.
+      - text: Die App startet mit echten Adaptern und schließt in der Paystream-Sandbox eine Fahrt ab → ein Smoke Test nach dem Deployment.
+        correct: true
+        why: Verdrahtung und Konfiguration der Composition Root prüft nur ein Lauf mit echten Teilen. Einer reicht, die Fälle sind woanders abgedeckt.
+      - text: Alle Kombinationen aus Radtyp, Plus, Deckel und Fehlstart über die HTTP-API mit echter Datenbank.
+        correct: false
+        why: Langsam und teuer, und bei einem roten Test weißt du nicht, wo der Fehler steckt. Der reine Kern deckt dieselben Fälle in Millisekunden ab.
+      - text: "`abrechnen` mit einem Mock für `Tarif`, der prüft, dass `cent_je_30_min` gelesen wurde."
+        correct: false
+        why: Eine reine Funktion bekommt Werte, keine Doubles. Die Prüfung beschreibt die Implementierung, nicht das Ergebnis.
+    explanation: |
+      Der Schnitt in Kern, Hülle und Adapter beantwortet die Frage nach der Testebene fast von selbst. Jedes Risiko wird dort getestet, wo es entsteht, und auf der niedrigsten Ebene, die es zuverlässig zeigt: Rechenregeln im Kern, Zeitgrenzen und Ablauf in der Hülle mit fester Uhr, SQL und SDK im Adapter gegen das Original, die Verdrahtung einmal mit echten Teilen. Dieselben Fälle zusätzlich über die HTTP-API zu prüfen, verdoppelt die Kosten, ohne ein neues Risiko abzudecken.
+    resources:
+      - title: Alistair Cockburn · Hexagonal Architecture
+        url: https://alistair.cockburn.us/hexagonal-architecture/
+
+  - id: legacy-algorithmus
+    type: order
+    title: Schritte an Legacy-Code
+    prompt: |
+      Radwerk soll für E-Bikes einen Nachttarif bekommen. Die Preisberechnung ist Legacy-Code ohne Tests. Bring die Schritte in die Reihenfolge, die Michael Feathers in *Working Effectively with Legacy Code* empfiehlt.
+    lang: text
+    lines: |
+      Änderungsstellen finden: Wo in der Preisberechnung muss der Nachttarif hinein?
+      Testpunkte finden: Wo lässt sich der berechnete Preis beobachten?
+      Abhängigkeiten aufbrechen: Seams für Uhr und Datenbank schaffen, ohne das Verhalten zu ändern
+      Charakterisierungstests schreiben, die die heutigen Preise festhalten
+      Nachttarif einbauen und aufräumen, nach jedem Schritt mit grünen Tests
+    explanation: |
+      Feathers nennt das den „Legacy Code Change Algorithm“. Erst weißt du, *wo* du ändern musst, dann, *wo* du das Ergebnis beobachten kannst. Meist lässt sich der Code dort noch nicht im Test ausführen, weil er sich Uhr und Datenbank selbst holt – also schaffst du mit kleinen, mechanischen Umbauten Seams, die das Verhalten nicht ändern. Erst dann sind Charakterisierungstests möglich, und erst mit ihnen änderst du das Verhalten. Wer den Nachttarif vor den Tests einbaut, kann nicht mehr unterscheiden, welche Preisänderung gewollt war.
+    resources:
+      - title: Martin Fowler · Legacy Seam
+        url: https://martinfowler.com/bliki/LegacySeam.html
+
+  - id: default-argument
+    type: output
+    title: Wann wird der Default ausgewertet?
+    prompt: Was gibt dieses Programm aus?
+    lang: python
+    code: |
+      zaehler = 0
+
+
+      def naechste_nummer():
+          global zaehler
+          zaehler += 1
+          return f"B-{zaehler:03d}"
+
+
+      def buche(rad_id, nummer=naechste_nummer()):
+          return f"{nummer} {rad_id}"
+
+
+      def buche_neu(rad_id, nummer_von=naechste_nummer):
+          return f"{nummer_von()} {rad_id}"
+
+
+      print(buche("R-12"))
+      print(buche("R-7"))
+      print(buche_neu("R-12"))
+      print(buche_neu("R-7", nummer_von=lambda: "TEST-1"))
+      print(zaehler)
+    expected: |
+      B-001 R-12
+      B-001 R-7
+      B-002 R-12
+      TEST-1 R-7
+      2
+    explanation: |
+      `nummer=naechste_nummer()` ruft die Funktion genau einmal auf, beim Ausführen von `def buche` – deshalb bekommen beide Buchungen `B-001`. `buche_neu` bekommt die Funktion selbst als Default und ruft sie bei jedem Aufruf; der Test kann sie durch `lambda: "TEST-1"` ersetzen, ohne den Zähler anzufassen. Am Ende steht der Zähler auf 2: einmal beim `def`, einmal bei `buche_neu("R-12")`. Mit `jetzt=datetime.now()` passiert dasselbe wie bei `buche` – alle Aufrufe sehen die Zeit des Imports.
+    resources:
+      - title: Python · Default-Argumente
+        url: https://docs.python.org/3/tutorial/controlflow.html#default-argument-values
+
+  - id: berlin-kalendertag
+    type: output
+    title: Welcher Tag ist es in Berlin?
+    prompt: |
+      Was gibt dieses Programm aus? Die Sommerzeit endet 2026 am 25. Oktober um 3 Uhr, dann gilt wieder UTC+1.
+    lang: python
+    code: |
+      from datetime import UTC, datetime
+      from zoneinfo import ZoneInfo
+
+      BERLIN = ZoneInfo("Europe/Berlin")
+
+      starts = [
+          datetime(2026, 10, 3, 21, 59, tzinfo=UTC),
+          datetime(2026, 10, 3, 22, 0, tzinfo=UTC),
+          datetime(2026, 10, 24, 22, 30, tzinfo=UTC),
+          datetime(2026, 10, 25, 22, 30, tzinfo=UTC),
+      ]
+      for start in starts:
+          berlin = start.astimezone(BERLIN)
+          print(start.date(), f"{berlin:%Y-%m-%d %H:%M}")
+    expected: |
+      2026-10-03 2026-10-03 23:59
+      2026-10-03 2026-10-04 00:00
+      2026-10-24 2026-10-25 00:30
+      2026-10-25 2026-10-25 23:30
+    explanation: |
+      Im Oktober vor der Umstellung gilt Sommerzeit, UTC+2: 21:59 UTC ist 23:59 in Berlin, 22:00 UTC schon Mitternacht des nächsten Tags. Am 24. Oktober um 22:30 UTC ist es in Berlin noch Sommerzeit, also 0:30 am 25. Nach der Umstellung gilt UTC+1, deshalb wird aus 22:30 UTC am 25. Oktober 23:30 in Berlin. `start.date()` liefert in zwei von vier Fällen einen anderen Tag als die Berliner Uhr, und zwar genau in den Nächten, in denen der Tageshöchstpreis wechselt. Genau diese Grenzen gehören mit fester Uhr in Tests – um 22:00 UTC im Sommer, um 23:00 UTC im Winter.
+    resources:
+      - title: Python · zoneinfo
+        url: https://docs.python.org/3/library/zoneinfo.html#using-zoneinfo
+      - title: Python · datetime.astimezone
+        url: https://docs.python.org/3/library/datetime.html#datetime.datetime.astimezone
+
+  - id: clock-injizieren
+    type: gap
+    title: Eine Uhr hereinreichen
+    prompt: |
+      Die Reservierungsregeln sollen die Zeit nicht selbst holen. Ergänze das Protokoll, die Produktionsuhr (aware, in UTC), die feste Uhr für Tests und die Konstruktor-Injektion. `heute()` liefert den Kalendertag in Berlin.
+    lang: python
+    code: |
+      from datetime import UTC, date, datetime
+      from typing import ⟦Protocol⟧
+      from zoneinfo import ZoneInfo
+
+      BERLIN = ZoneInfo("Europe/Berlin")
+
+
+      class Clock(Protocol):
+          def now(self) -> datetime: ...
+
+
+      class SystemUhr:
+          def now(self) -> datetime:
+              return datetime.now(⟦UTC⟧)
+
+
+      class FesteUhr:
+          def __init__(self, zeit: datetime):
+              self.zeit = zeit
+
+          def now(self) -> datetime:
+              return ⟦self.zeit⟧
+
+
+      class Reservierungsregeln:
+          def __init__(self, uhr: Clock):
+              ⟦self._uhr = uhr⟧
+
+          def heute(self) -> date:
+              return self._uhr.now().⟦astimezone(BERLIN)⟧.date()
+    gaps:
+      - label: Strukturelle Schnittstelle
+        hint: Aus `typing` – eine Klasse passt, sobald sie die Methoden hat, ohne zu erben.
+      - label: Zeitzone der Systemuhr
+        hint: Die Konstante ist schon aus `datetime` importiert.
+        accept: ["tz=UTC"]
+      - label: Feste Zeit
+        hint: Die Uhr gibt zurück, was ihr der Test im Konstruktor mitgegeben hat.
+      - label: Uhr merken
+        hint: Speichere die Uhr in einem Attribut, das `heute` benutzt.
+      - label: Umrechnen
+        hint: Erst in Berliner Ortszeit umrechnen, dann das Datum nehmen.
+        accept: ["astimezone(tz=BERLIN)", "astimezone(ZoneInfo(\"Europe/Berlin\"))", "astimezone(tz=ZoneInfo(\"Europe/Berlin\"))"]
+    explanation: |
+      `Protocol` beschreibt die Schnittstelle strukturell: `SystemUhr` und `FesteUhr` erben nicht von `Clock` und passen trotzdem, weil sie `now()` haben. `datetime.now(UTC)` liefert eine aware Zeit; ohne Argument käme eine naive Zeit in der Zeitzone des Servers heraus. `FesteUhr` gibt die Zeit zurück, die der Test vorgibt. Die Uhr kommt über den Konstruktor herein und wird bei jedem `heute()` neu gefragt. `astimezone(BERLIN)` vor `.date()` sorgt dafür, dass 22:30 UTC im Sommer schon der nächste Tag ist.
+    resources:
+      - title: Python · typing.Protocol
+        url: https://docs.python.org/3/library/typing.html#typing.Protocol
+      - title: Python · datetime.now
+        url: https://docs.python.org/3/library/datetime.html#datetime.datetime.now
+
+  - id: uhr-einbauen
+    type: code
+    title: Reservierungsregeln mit eigener Uhr
+    prompt: |
+      `pruefe_reservierung(start, ende)` holt die aktuelle Zeit mit `datetime.now()`. Testen lässt sie sich nur zu bestimmten Uhrzeiten, und auf dem CI-Runner (UTC) rechnet sie mit dem falschen Kalendertag. Baue sie zu einer Klasse `Reservierungsregeln` um, die eine Uhr über den Konstruktor bekommt.
+
+      - `Reservierungsregeln(uhr)`: `uhr.now()` liefert die aktuelle Zeit als aware `datetime`. Die Tests übergeben eine `FesteUhr`, deren Zeit sie zwischen zwei Aufrufen ändern können.
+      - `pruefe(start, ende)` bekommt aware `datetime`-Werte (mal in Berliner Zeit, mal in UTC) und gibt `None` zurück, wenn die Reservierung erlaubt ist, sonst den ersten zutreffenden Fehlertext in dieser Reihenfolge:
+        1. `"Ende liegt nicht nach dem Start"`, wenn `ende <= start`,
+        2. `"Start liegt in der Vergangenheit"`, wenn `start` vor jetzt liegt (genau jetzt ist erlaubt),
+        3. `"Höchstens 7 Tage im Voraus"`, wenn der Berliner Kalendertag von `start` mehr als 7 Tage nach dem heutigen Berliner Kalendertag liegt. Ist heute in Berlin der 3. Oktober, sind Starts bis einschließlich 10. Oktober, 23:59 Uhr Berliner Zeit erlaubt.
+    lang: python
+    setup: |
+      from datetime import UTC, datetime
+      from zoneinfo import ZoneInfo
+
+      BERLIN = ZoneInfo("Europe/Berlin")
+
+
+      class FesteUhr:
+          def __init__(self, zeit):
+              self.zeit = zeit
+
+          def now(self):
+              return self.zeit
+
+
+      def berlin(tag, stunde, minute=0):
+          return datetime(2026, 10, tag, stunde, minute, tzinfo=BERLIN)
+    starter: |
+      from datetime import datetime, timedelta
+
+
+      def pruefe_reservierung(start, ende):
+          jetzt = datetime.now()
+          if ende <= start:
+              return "Ende liegt nicht nach dem Start"
+          if start < jetzt:
+              return "Start liegt in der Vergangenheit"
+          if start.date() > jetzt.date() + timedelta(days=7):
+              return "Höchstens 7 Tage im Voraus"
+          return None
+    solution: |
+      from datetime import timedelta
+      from zoneinfo import ZoneInfo
+
+      BERLIN = ZoneInfo("Europe/Berlin")
+
+
+      class Reservierungsregeln:
+          def __init__(self, uhr):
+              self._uhr = uhr
+
+          def pruefe(self, start, ende):
+              jetzt = self._uhr.now()
+              if ende <= start:
+                  return "Ende liegt nicht nach dem Start"
+              if start < jetzt:
+                  return "Start liegt in der Vergangenheit"
+              letzter_tag = jetzt.astimezone(BERLIN).date() + timedelta(days=7)
+              if start.astimezone(BERLIN).date() > letzter_tag:
+                  return "Höchstens 7 Tage im Voraus"
+              return None
+    tests:
+      - name: Eine gültige Reservierung
+        code: |
+          regeln = Reservierungsregeln(FesteUhr(berlin(3, 10)))
+          ergebnis = regeln.pruefe(berlin(5, 10), berlin(5, 11))
+          assert ergebnis is None, f"5. Oktober 10–11 Uhr, jetzt 3. Oktober 10 Uhr: erwartet None, bekommen {ergebnis!r}"
+      - name: Ende nicht nach dem Start
+        code: |
+          regeln = Reservierungsregeln(FesteUhr(berlin(3, 10)))
+          ergebnis = regeln.pruefe(berlin(5, 11), berlin(5, 11))
+          assert ergebnis == "Ende liegt nicht nach dem Start", f"bekommen {ergebnis!r}"
+      - name: Start in der Vergangenheit
+        code: |
+          regeln = Reservierungsregeln(FesteUhr(berlin(3, 10)))
+          ergebnis = regeln.pruefe(berlin(3, 9, 59), berlin(3, 11))
+          assert ergebnis == "Start liegt in der Vergangenheit", f"Start 9:59, jetzt 10:00: bekommen {ergebnis!r}"
+          ergebnis = regeln.pruefe(berlin(3, 10), berlin(3, 11))
+          assert ergebnis is None, f"Ein Start genau jetzt ist erlaubt, bekommen {ergebnis!r}"
+      - name: Grenze am siebten Kalendertag
+        code: |
+          regeln = Reservierungsregeln(FesteUhr(berlin(3, 10)))
+          ergebnis = regeln.pruefe(berlin(10, 23, 30), berlin(11, 0, 30))
+          assert ergebnis is None, f"Start am 10. Oktober 23:30 ist erlaubt, bekommen {ergebnis!r}"
+          ergebnis = regeln.pruefe(berlin(11, 0), berlin(11, 1))
+          assert ergebnis == "Höchstens 7 Tage im Voraus", f"Start am 11. Oktober 0:00 ist zu weit, bekommen {ergebnis!r}"
+      - name: Kalendertage zählen in Berlin, nicht in UTC
+        code: |
+          regeln = Reservierungsregeln(FesteUhr(datetime(2026, 10, 3, 22, 30, tzinfo=UTC)))
+          ergebnis = regeln.pruefe(berlin(11, 9), berlin(11, 10))
+          assert ergebnis is None, f"Jetzt ist in Berlin schon der 4. Oktober, also ist der 11. erlaubt. Bekommen {ergebnis!r}"
+          spaet = datetime(2026, 10, 11, 22, 30, tzinfo=UTC)
+          ergebnis = regeln.pruefe(spaet, datetime(2026, 10, 11, 23, 30, tzinfo=UTC))
+          assert ergebnis == "Höchstens 7 Tage im Voraus", f"11. Oktober 22:30 UTC ist in Berlin der 12. Oktober. Bekommen {ergebnis!r}"
+      - name: Die Uhr wird bei jedem Aufruf gefragt
+        code: |
+          uhr = FesteUhr(berlin(3, 10))
+          regeln = Reservierungsregeln(uhr)
+          assert regeln.pruefe(berlin(3, 9), berlin(3, 11)) == "Start liegt in der Vergangenheit"
+          uhr.zeit = berlin(3, 8)
+          ergebnis = regeln.pruefe(berlin(3, 9), berlin(3, 11))
+          assert ergebnis is None, f"Nach dem Zurückstellen der Uhr auf 8:00 liegt 9:00 in der Zukunft. Bekommen {ergebnis!r}"
+    hints:
+      - Speichere die Uhr im Konstruktor (`self._uhr = uhr`) und frag sie in `pruefe` mit `self._uhr.now()` – bei jedem Aufruf neu, nicht einmal im Konstruktor.
+      - Der letzte erlaubte Tag ist `jetzt.astimezone(BERLIN).date() + timedelta(days=7)`.
+      - Vergleiche ihn mit `start.astimezone(BERLIN).date()`, nicht mit `start.date()` – manche Tests übergeben `start` in UTC.
+    explanation: |
+      Die Uhr kommt über den Konstruktor herein und wird bei jedem Aufruf gefragt. Deshalb können die Tests jeden Zeitpunkt einstellen, auch 0:30 Uhr Berliner Zeit, und sogar die Uhr zwischen zwei Aufrufen verstellen. Der Vergleich `start < jetzt` funktioniert mit aware Zeiten unabhängig von ihrer Zeitzone, weil Python dabei die absoluten Zeitpunkte vergleicht. Kalendertage dagegen hängen an der Zeitzone: Beide Seiten werden mit `astimezone(BERLIN)` umgerechnet, bevor `.date()` den Tag nimmt. Der alte Code hätte um 0:30 Uhr deutscher Sommerzeit auf einem UTC-Server noch mit dem Vortag gerechnet.
+    resources:
+      - title: Python · aware und naive Objekte
+        url: https://docs.python.org/3/library/datetime.html#aware-and-naive-objects
+      - title: Python · zoneinfo
+        url: https://docs.python.org/3/library/zoneinfo.html#using-zoneinfo
+
+  - id: kern-herausloesen
+    type: code
+    title: Den Kern aus dem Nachtjob lösen
+    prompt: |
+      Der Nachtjob `rechne_tage_ab` im Editor holt die Fahrten einer Kundin aus der Datenbank, rechnet und belastet Paystream in einem Rutsch. Getestet hat ihn niemand, und er kennt weder Radwerk Plus noch Berliner Kalendertage. Zieh die Rechnung in einen funktionalen Kern heraus und mach die Hülle dünn.
+
+      **1. Kern:** `tagesbetraege(fahrten, plus=False)` ist eine reine Funktion – keine Uhr, keine Ein- oder Ausgabe, die Eingabeliste bleibt unverändert. `fahrten` ist eine Liste von Paaren `(start, minuten)`; `start` ist eine aware `datetime` in UTC. Rückgabe: ein Dictionary `{date: cent}` mit einem Eintrag für jeden Berliner Kalendertag, an dem mindestens eine Fahrt **beginnt**, auch wenn der Betrag 0 ist.
+
+      - Preis je Fahrt (City-Rad): 150 Cent je angefangene 30 Minuten; Fahrten bis einschließlich 5 Minuten kosten 0 Cent.
+      - Radwerk Plus (`plus=True`): Von jeder Fahrt über 5 Minuten zählen nur die Minuten über 30; davon kostet jede angefangene halbe Stunde 150 Cent.
+      - Tageshöchstpreis: höchstens 1 500 Cent je Kalendertag in `Europe/Berlin`.
+
+      **2. Hülle:** `rechne_tage_ab(kunde_id, fahrten_repo, zahlungen)` holt `fahrten_repo.fuer_kunde(kunde_id)` und `fahrten_repo.hat_plus(kunde_id)`, ruft `tagesbetraege` auf und belastet jeden Tag mit mehr als 0 Cent über `zahlungen.belaste(kunde_id, betrag_cent, schluessel)` mit `schluessel = f"{kunde_id}-{tag.isoformat()}"` – in aufsteigender Reihenfolge der Tage. Die Tests übergeben dafür Fakes.
+    lang: python
+    setup: |
+      from datetime import UTC, date, datetime
+
+
+      class FakeFahrten:
+          def __init__(self, fahrten, plus=False):
+              self._fahrten = fahrten
+              self._plus = plus
+
+          def fuer_kunde(self, kunde_id):
+              return list(self._fahrten)
+
+          def hat_plus(self, kunde_id):
+              return self._plus
+
+
+      class FakeZahlungen:
+          def __init__(self):
+              self.belastungen = []
+
+          def belaste(self, kunde_id, betrag_cent, schluessel):
+              self.belastungen.append((kunde_id, betrag_cent, schluessel))
+              return f"tx-{len(self.belastungen)}"
+
+
+      def utc(tag, stunde, minute=0):
+          return datetime(2026, 10, tag, stunde, minute, tzinfo=UTC)
+    starter: |
+      def rechne_tage_ab(kunde_id, db, paystream):
+          summen = {}
+          rows = db.execute("SELECT start, minuten FROM fahrten WHERE kunde_id = %s", (kunde_id,))
+          for start, minuten in rows:
+              tag = start.date()
+              preis = 0 if minuten <= 5 else -(-minuten // 30) * 150
+              summen[tag] = min(summen.get(tag, 0) + preis, 1500)
+          for tag, betrag in summen.items():
+              if betrag:
+                  paystream.charge(kunde_id, betrag, idempotency_key=f"{kunde_id}-{tag}")
+    solution: |
+      from zoneinfo import ZoneInfo
+
+      BERLIN = ZoneInfo("Europe/Berlin")
+      TAGESHOECHSTPREIS = 1500
+
+
+      def fahrpreis(minuten, plus):
+          if minuten <= 5:
+              return 0
+          zu_zahlen = max(0, minuten - 30) if plus else minuten
+          return -(-zu_zahlen // 30) * 150
+
+
+      def tagesbetraege(fahrten, plus=False):
+          summen = {}
+          for start, minuten in fahrten:
+              tag = start.astimezone(BERLIN).date()
+              summen[tag] = summen.get(tag, 0) + fahrpreis(minuten, plus)
+          return {tag: min(summe, TAGESHOECHSTPREIS) for tag, summe in summen.items()}
+
+
+      def rechne_tage_ab(kunde_id, fahrten_repo, zahlungen):
+          betraege = tagesbetraege(fahrten_repo.fuer_kunde(kunde_id), fahrten_repo.hat_plus(kunde_id))
+          for tag, betrag in sorted(betraege.items()):
+              if betrag > 0:
+                  zahlungen.belaste(kunde_id, betrag, f"{kunde_id}-{tag.isoformat()}")
+    tests:
+      - name: Eine Fahrt an einem Tag
+        code: |
+          ergebnis = tagesbetraege([(utc(3, 8), 47)])
+          assert ergebnis == {date(2026, 10, 3): 300}, f"bekommen {ergebnis}"
+      - name: Fehlstart und Radwerk Plus
+        code: |
+          fahrten = [(utc(3, 8), 5), (utc(3, 9), 33), (utc(3, 10), 30), (utc(3, 11), 61)]
+          ohne = tagesbetraege(fahrten)
+          assert ohne == {date(2026, 10, 3): 900}, f"ohne Plus: 0 + 300 + 150 + 450 = 900 erwartet, bekommen {ohne}"
+          mit = tagesbetraege(fahrten, plus=True)
+          assert mit == {date(2026, 10, 3): 450}, f"mit Plus: 0 + 150 + 0 + 300 = 450 erwartet, bekommen {mit}"
+          kostenlos = tagesbetraege([(utc(5, 9), 4)])
+          assert kostenlos == {date(2026, 10, 5): 0}, f"Ein Tag mit nur einem Fehlstart steht mit 0 Cent im Ergebnis. Bekommen {kostenlos}"
+      - name: Tageshöchstpreis
+        code: |
+          ergebnis = tagesbetraege([(utc(3, 6), 200), (utc(3, 12), 200), (utc(3, 15), 200)])
+          assert ergebnis == {date(2026, 10, 3): 1500}, f"3 × 1 050 Cent an einem Tag, gedeckelt auf 1 500. Bekommen {ergebnis}"
+      - name: Kalendertage in Berlin, auch nach der Zeitumstellung
+        code: |
+          ergebnis = tagesbetraege([(utc(3, 21, 50), 200), (utc(3, 22, 10), 200)])
+          erwartet = {date(2026, 10, 3): 1050, date(2026, 10, 4): 1050}
+          assert ergebnis == erwartet, f"21:50 UTC ist 23:50 in Berlin, 22:10 UTC schon der 4. Oktober. Bekommen {ergebnis}"
+          winter = tagesbetraege([(utc(25, 23, 30), 20)])
+          assert winter == {date(2026, 10, 26): 150}, f"Nach der Zeitumstellung ist 23:30 UTC in Berlin 0:30 am 26. Oktober. Bekommen {winter}"
+      - name: Der Kern ist rein
+        code: |
+          fahrten = [(utc(4, 9), 47), (utc(3, 9), 20)]
+          kopie = list(fahrten)
+          erstes = tagesbetraege(fahrten)
+          assert fahrten == kopie, "tagesbetraege darf die Eingabeliste nicht verändern."
+          assert tagesbetraege(fahrten) == erstes, "Zwei Aufrufe mit denselben Fahrten müssen dasselbe liefern."
+      - name: Die Hülle belastet jeden Tag einmal
+        code: |
+          repo = FakeFahrten([(utc(3, 22, 10), 200), (utc(3, 21, 50), 200), (utc(5, 9), 4)])
+          zahlungen = FakeZahlungen()
+          rechne_tage_ab("K-7", repo, zahlungen)
+          erwartet = [("K-7", 1050, "K-7-2026-10-03"), ("K-7", 1050, "K-7-2026-10-04")]
+          assert zahlungen.belastungen == erwartet, f"erwartet {erwartet}, bekommen {zahlungen.belastungen}"
+          plus = FakeZahlungen()
+          rechne_tage_ab("K-9", FakeFahrten([(utc(3, 8), 47)], plus=True), plus)
+          assert plus.belastungen == [("K-9", 150, "K-9-2026-10-03")], f"Die Hülle muss hat_plus an den Kern weitergeben. Bekommen {plus.belastungen}"
+    hints:
+      - Beginne mit einer kleinen Funktion `fahrpreis(minuten, plus)` für eine einzelne Fahrt, dann summiere je Tag.
+      - "Der Tag einer Fahrt ist `start.astimezone(BERLIN).date()` mit `BERLIN = ZoneInfo(\"Europe/Berlin\")`. Deckle erst die Tagessumme, nicht jede Fahrt."
+      - "Die Hülle ist drei Zeilen lang: Fahrten und Plus-Status holen, `tagesbetraege` aufrufen, über `sorted(betraege.items())` laufen und für Beträge über 0 `belaste` aufrufen."
+    explanation: |
+      Der Kern enthält jetzt jede Entscheidung: Preis je Fahrt, Plus, Kalendertag in Berlin, Tagesdeckel. Weil er rein ist, prüfen ihn die Tests mit Listen und Dictionaries, ohne ein einziges Double und ohne Uhr – die Zeitpunkte stecken in den Daten. Die Hülle liest, ruft den Kern und belastet; für sie reichen zwei Tests mit Fakes. Der alte Job ordnete Fahrten nach Mitternacht mit `start.date()` dem UTC-Tag zu und kannte Plus nicht; beides fällt erst jetzt in Tests auf. Der Schlüssel je Kundin und Tag sorgt dafür, dass ein zweiter Lauf des Jobs bei Paystream nicht noch einmal belastet.
+    resources:
+      - title: Destroy All Software · Functional Core, Imperative Shell
+        url: https://www.destroyallsoftware.com/screencasts/catalog/functional-core-imperative-shell
+      - title: Python · zoneinfo
+        url: https://docs.python.org/3/library/zoneinfo.html
+
+  - id: charakterisieren
+    type: code
+    title: Festhalten, was der alte Tarif tut
+    prompt: |
+      Radwerk will `preis_alt` aus `tarif_alt.py` durch neuen Code ersetzen. Eine Spezifikation gibt es nicht, und niemand weiß genau, was die Funktion in allen Fällen tut:
+
+      ```python
+      def preis_alt(minuten, rad="city", plus=False):
+          if plus:
+              minuten = minuten - 30
+          if minuten <= 5:
+              return 0
+          satz = 300 if rad == "e-bike" else 150
+          halbe_stunden = minuten // 30
+          if minuten % 30:
+              halbe_stunden += 1
+          return halbe_stunden * satz
+      ```
+
+      Schreibe pytest-Charakterisierungstests: Sie halten das **heutige** Verhalten fest, auch wo es merkwürdig ist. Sie müssen gegen den heutigen Code grün sein und jeden Umbau, der das Verhalten verändert, rot werden lassen. Halte mindestens fest: die Grenze, ab der eine Fahrt etwas kostet; die Rundung auf halbe Stunden; den Satz für `"e-bike"`; Radwerk Plus kurz nach 30 Minuten; Radtypen in anderer Schreibweise, etwa `"E-Bike"`.
+
+      Der Startcode enthält eine absichtlich falsche Vermutung. Lass prüfen und übernimm den echten Wert aus der Meldung.
+    lang: python
+    setup: |
+      from pathlib import Path
+
+      ALT = '''
+      def preis_alt(minuten, rad="city", plus=False):
+          if plus:
+              minuten = minuten - 30
+          if minuten <= 5:
+              return 0
+          satz = 300 if rad == "e-bike" else 150
+          halbe_stunden = minuten // 30
+          if minuten % 30:
+              halbe_stunden += 1
+          return halbe_stunden * satz
+      '''
+      UMBAUTEN = {
+          "plus_nach_fehlstart": ALT.replace(
+              "    if plus:\n        minuten = minuten - 30\n    if minuten <= 5:\n        return 0\n",
+              "    if minuten <= 5:\n        return 0\n    if plus:\n        minuten = max(0, minuten - 30)\n",
+          ),
+          "abgerundet": ALT.replace("    if minuten % 30:\n        halbe_stunden += 1\n", ""),
+          "grenze": ALT.replace("minuten <= 5", "minuten < 5"),
+          "radtyp": ALT.replace('rad == "e-bike"', 'rad.lower() == "e-bike"'),
+      }
+      assert all(m != ALT for m in UMBAUTEN.values()), "Ein Umbau ist identisch mit dem heutigen Code."
+      Path("tarif_alt.py").write_text(ALT, encoding="utf-8")
+    starter: |
+      from tarif_alt import preis_alt
+
+
+      def test_city_rad_47_minuten():
+          assert preis_alt(47) == 0  # Vermutung – lass prüfen und übernimm den echten Wert
+    solution: |
+      import pytest
+      from tarif_alt import preis_alt
+
+
+      @pytest.mark.parametrize(
+          "minuten, rad, plus, preis",
+          [
+              (5, "city", False, 0),
+              (6, "city", False, 150),
+              (30, "city", False, 150),
+              (31, "city", False, 300),
+              (47, "e-bike", False, 600),
+              (47, "E-Bike", False, 300),  # heute: andere Schreibweise zählt als City-Rad
+              (47, "lastenrad", False, 300),
+              (33, "city", True, 0),  # heute: ein Plus-Rest bis 5 Minuten ist frei
+              (36, "city", True, 150),
+          ],
+      )
+      def test_heutiges_verhalten(minuten, rad, plus, preis):
+          assert preis_alt(minuten, rad, plus) == preis
+    tests:
+      - name: Grün gegen den heutigen Code
+        code: |
+          lauf = run_pytest({"tarif_alt.py": ALT})
+          assert lauf.ok, lauf.output
+      - name: Bemerkt eine Änderung an der Fehlstartgrenze
+        code: |
+          lauf = run_pytest({"tarif_alt.py": UMBAUTEN["grenze"]})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl Fahrten an der Grenze jetzt etwas kosten."
+      - name: Bemerkt eine Änderung bei der Rundung
+        code: |
+          lauf = run_pytest({"tarif_alt.py": UMBAUTEN["abgerundet"]})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl angefangene halbe Stunden nicht mehr zählen."
+      - name: Bemerkt eine Änderung bei Radwerk Plus
+        code: |
+          lauf = run_pytest({"tarif_alt.py": UMBAUTEN["plus_nach_fehlstart"]})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl Plus-Fahrten knapp über 30 Minuten jetzt etwas kosten."
+      - name: Bemerkt eine Änderung bei den Radtypen
+        code: |
+          lauf = run_pytest({"tarif_alt.py": UMBAUTEN["radtyp"]})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl die Schreibweise des Radtyps jetzt anders behandelt wird."
+    hints:
+      - "Prüfe beide Seiten jeder Grenze: 5 und 6 Minuten, 30 und 31 Minuten."
+      - "Bei Plus zieht der Code zuerst 30 Minuten ab und prüft danach die Fehlstartregel. Was kommt für 33 Minuten heraus, was für 36?"
+      - "`rad == \"e-bike\"` vergleicht exakt. Halte fest, was `\"E-Bike\"` heute kostet – auch wenn es dir falsch vorkommt."
+    explanation: |
+      Ein Charakterisierungstest beschreibt, was der Code tut, nicht, was er tun sollte. Deshalb gehören auch die Merkwürdigkeiten hinein: Plus mit 33 Minuten kostet heute nichts, weil die Fehlstartregel nach dem Abzug der Freiminuten greift, und `"E-Bike"` mit großem E kostet wie ein City-Rad. Jeder Umbau in der Prüfung sieht nach einer Verbesserung aus – die Fehlstartregel zuerst prüfen, die Schreibweise ignorieren –, ändert aber Preise, die Kundinnen heute zahlen. Genau das sollen die Tests melden. Ob ein Verhalten ein Bug ist, entscheidet danach die Fachabteilung, und die Korrektur kommt in einem eigenen Schritt mit eigenem Test. Der Weg zum Wert ist immer derselbe: Vermutung hinschreiben, laufen lassen, den echten Wert aus der Meldung übernehmen.
+    resources:
+      - title: Martin Fowler · Legacy Seam
+        url: https://martinfowler.com/bliki/LegacySeam.html
+      - title: pytest · Assertion introspection
+        url: https://docs.pytest.org/en/stable/how-to/assert.html#assertion-introspection-details
+
+  - id: naive-kalendertag
+    type: bug
+    title: Der Deckel vom Vortag
+    prompt: |
+      Kundin K-7 hat am 3. Oktober schon 1 500 Cent bezahlt, ihren Tageshöchstpreis. Um 0:20 Uhr Berliner Zeit am 4. Oktober beendet sie eine neue Fahrt und zahlt nichts, weil `bisher_heute` noch 1 500 meldet. Ein Test mit `FesteUhr(datetime(2026, 10, 3, 22, 20, tzinfo=UTC))` erwartet von `bisher_heute("K-7")` 0 Cent, weil sie am 4. Oktober noch nichts bezahlt hat, und bekommt 1 500. Um 2:20 Uhr Berliner Zeit stimmt alles. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: python
+    code: |
+      from datetime import UTC, datetime
+      from zoneinfo import ZoneInfo
+
+      BERLIN = ZoneInfo("Europe/Berlin")
+
+
+      class SystemUhr:
+          def now(self) -> datetime:
+              return datetime.now(UTC)
+
+
+      class Tageskasse:
+          def __init__(self, konto, uhr):
+              self._konto = konto
+              self._uhr = uhr
+
+          def bisher_heute(self, kunde_id: str) -> int:
+              tag = self._uhr.now().date()
+              return self._konto.summe_am(kunde_id, tag)
+    lines: [18]
+    fix:
+      - line: 18
+        answers:
+          - tag = self._uhr.now().astimezone(BERLIN).date()
+          - tag = self._uhr.now().astimezone(tz=BERLIN).date()
+          - tag = self._uhr.now().astimezone(ZoneInfo("Europe/Berlin")).date()
+    hints:
+      - Die Uhr liefert eine aware Zeit in UTC. Welchen Kalendertag liefert `.date()` für 22:20 UTC?
+      - "`BERLIN` ist definiert, wird aber nirgends benutzt."
+    explanation: |
+      `self._uhr.now()` liefert 22:20 UTC am 3. Oktober. `.date()` nimmt das Datum in der Zeitzone des Objekts, also UTC – den 3. Oktober. In Berlin ist es zu diesem Zeitpunkt schon 0:20 Uhr am 4. Oktober. Erst `astimezone(BERLIN)` rechnet in Berliner Ortszeit um, dann liefert `.date()` den richtigen Kalendertag. Ab 2 Uhr Berliner Sommerzeit ist auch in UTC der 4. angebrochen, deshalb tritt der Fehler nur in den ersten zwei Stunden nach Mitternacht auf – im Winter in der ersten. Die Uhr selbst ist richtig: Sie soll UTC liefern, umrechnen ist Sache der Fachregel.
+    resources:
+      - title: Python · datetime.astimezone
+        url: https://docs.python.org/3/library/datetime.html#datetime.datetime.astimezone
+
+  - id: seam-erklaeren
+    type: explain
+    title: Zwei Seams im Erinnerungsjob
+    prompt: |
+      Der abendliche Erinnerungsjob war bisher ohne Parameter. Eine Kollegin hat ihn als ersten Schritt vor den Tests so umgebaut. Erkläre im Review, was die beiden neuen Parameter bewirken, warum kein Aufrufer geändert werden musste, welche Abhängigkeit weiter versteckt ist und welche Falle in einem der Defaults steckt.
+    lang: python
+    code: |
+      from datetime import UTC, datetime, timedelta
+      from typing import Callable
+      from zoneinfo import ZoneInfo
+
+      from radwerk import db, sms
+
+      BERLIN = ZoneInfo("Europe/Berlin")
+
+
+      def verschicke_erinnerungen(
+          jetzt: Callable[[], datetime] = lambda: datetime.now(UTC),
+          sende_sms: Callable[[str, str], None] = sms.sende_sms,
+      ) -> int:
+          morgen = (jetzt().astimezone(BERLIN) + timedelta(days=1)).date()
+          anzahl = 0
+          for r in db.reservierungen_am(morgen):
+              sende_sms(r.telefon, f"Erinnerung: Dein Rad {r.rad_id} wartet morgen ab {r.uhrzeit} Uhr.")
+              anzahl += 1
+          return anzahl
+    points:
+      - Beide Parameter sind Seams im Sinne von Feathers – Zeit und SMS-Versand lassen sich im Test ersetzen, ohne den Funktionskörper später wieder anzufassen; der Aufruf ist die Stelle, an der entschieden wird.
+      - "Die Defaults bewahren das alte Verhalten: Der Cronjob ruft weiter `verschicke_erinnerungen()` auf, kein Aufrufer ändert sich – ein kleiner, risikoarmer Umbau vor den ersten Tests."
+      - "`jetzt` ist eine Funktion, kein Zeitpunkt, und wird bei jedem Aufruf gefragt. `jetzt=datetime.now(UTC)` wäre einmal beim Import ausgewertet worden."
+      - "`db` bleibt eine versteckte Abhängigkeit auf Modulebene: Tests brauchen weiter eine Datenbank oder `monkeypatch` – der nächste Seam."
+      - "Falle: Der Default `sms.sende_sms` wird beim `def` gebunden. Ein späteres `monkeypatch.setattr(sms, \"sende_sms\", …)` erreicht ihn nicht; Tests müssen `sende_sms=` ausdrücklich übergeben."
+    explanation: |
+      Der Umbau schafft zwei Seams: Zeit und SMS-Versand kommen jetzt als Parameter herein. Weil beide einen Default haben, der das bisherige Verhalten liefert, ändert sich für den Cronjob nichts – genau so sollen erste Schritte an Legacy-Code aussehen: klein, mechanisch, ohne Verhaltensänderung. Bei `jetzt` ist die Form wichtig. Übergeben wird eine Funktion, die bei jedem Lauf die aktuelle Zeit liefert; ein Zeitpunkt als Default wäre beim Import eingefroren. Die Datenbank ist noch nicht entkoppelt, das wäre der nächste Seam, etwa ein Parameter `reservierungen_am`. Und eine Falle steckt im zweiten Default: Er bindet beim `def` die Funktion, die `sms.sende_sms` in diesem Moment ist. Ein Test, der später `sms.sende_sms` patcht, erreicht den Default nicht mehr und verschickt echte SMS. Tests übergeben deshalb immer `sende_sms=` ausdrücklich.
+    resources:
+      - title: Martin Fowler · Legacy Seam
+        url: https://martinfowler.com/bliki/LegacySeam.html
+      - title: Python · Funktionsdefinitionen (Defaults)
+        url: https://docs.python.org/3/reference/compound_stmts.html#function-definitions
+
+  - id: design-damage
+    type: choice
+    title: Design oder Schaden?
+    prompt: |
+      Im Radwerk-Backend stehen fünf Änderungen zur Diskussion, alle mit „macht das Testen leichter“ begründet. Welche sind Test-induced Design Damage – Indirektion, die nur den Tests dient und den Code schlechter macht?
+    options:
+      - text: Ein Interface `FahrtenRepository` mit genau einer Implementierung, eingeführt, damit Unit-Tests die eigene PostgreSQL-Datenbank wegmocken können, obwohl ein Repository-Test gegen PostgreSQL im Container nur Millisekunden kostet.
+        correct: true
+        why: Die Abstraktion hat keinen Nutzen außer dem Mock, und der Mock prüft nur eigene Annahmen über SQL. Ein schneller Test gegen die echte Datenbank zeigt mehr. Anders liegt der Fall bei einem Fake, der dieselben Repository-Tests besteht wie PostgreSQL – das ist eine zweite echte Implementierung.
+      - text: "`_runde_auf_halbe_stunden` wird öffentlich gemacht, damit ein Test sie direkt aufrufen kann."
+        correct: true
+        why: Die öffentliche Schnittstelle wächst nur für den Test, und jeder Umbau der Hilfsfunktion bricht ihn. Teste die Rundung über `mietpreis`.
+      - text: Ein `Clock`-Parameter statt `datetime.now()` in der Tarifberechnung.
+        correct: false
+        why: Zeit ist nichtdeterministisch, und der Parameter zeigt, dass die Berechnung von ihr abhängt. Das macht den Code auch ohne Tests klarer.
+      - text: Die Preisberechnung wird als reine Funktion aus dem HTTP-Handler herausgezogen.
+        correct: false
+        why: Das trennt Entscheidung von Ein- und Ausgabe. Der Handler wird lesbarer, und Nightly-Job und App nutzen dieselbe Logik.
+      - text: Ein Adapter `PaystreamZahlungen` vor dem Paystream-SDK.
+        correct: false
+        why: Eine fremde API, die echtes Geld bewegt und sich mit SDK-Versionen ändert – eine echte Grenze. Der Adapter begrenzt Änderungen auf eine Datei.
+    explanation: |
+      Die Prüffrage aus der Lektion trennt die Fälle: Würdest du die Änderung auch ohne Tests machen? Clock-Parameter, reiner Kern und Adapter vor einer fremden API verbessern den Code selbst – sie machen Abhängigkeiten sichtbar und Logik wiederverwendbar. Das Interface mit einer einzigen Implementierung und die geöffnete Hilfsfunktion existieren nur, damit ein bestimmter Teststil möglich wird. Für sie gibt es billigere Wege: einen Test gegen die echte, schnelle Datenbank und einen Test über die öffentliche Funktion. Das ist der Kern von DHHs Kritik.
+    resources:
+      - title: DHH · Test-induced design damage
+        url: https://dhh.dk/2014/test-induced-design-damage.html
+      - title: Martin Fowler · Is TDD Dead?
+        url: https://martinfowler.com/articles/is-tdd-dead/
+
+  - id: erinnerungen-umbauen
+    type: practice
+    title: Der Erinnerungsjob im Zielzustand
+    prompt: |
+      Der Erinnerungsjob aus der Erklär-Aufgabe ist mit Charakterisierungstests abgesichert. Bau ihn jetzt in den Zielzustand um. Jeden Abend um 18 Uhr Berliner Zeit bekommen alle Kundinnen eine SMS, deren Reservierung am **nächsten Berliner Kalendertag** beginnt.
+
+      1. **Kern** (rein): `morgen(jetzt) -> tuple[datetime, datetime]` liefert den nächsten Berliner Kalendertag als halboffenes Intervall `[start, ende)` aus aware `datetime`-Werten. `erinnerungstexte(reservierungen) -> list[tuple[str, str]]` liefert `(telefon, text)` mit der Startzeit in Berliner Zeit, nach Start sortiert.
+      2. **Ports:** `Reservierungen` mit `zwischen(start, ende)`, `Sms` mit `sende(telefon, text)` und eine Uhr.
+      3. **Hülle:** `Erinnerungsjob(reservierungen, sms, uhr)` mit `lauf() -> int` (Anzahl gesendeter SMS).
+      4. **Testplan** als Kommentar: Welche Tests auf welcher Ebene, und warum? Denk an die Nacht der Zeitumstellung am 25. Oktober 2026.
+
+      Eine Reservierung hat die Attribute `telefon`, `rad_id` und `start` (aware `datetime`).
+    lang: python
+    starter: |
+      from datetime import datetime, time, timedelta
+      from typing import Protocol
+      from zoneinfo import ZoneInfo
+
+      BERLIN = ZoneInfo("Europe/Berlin")
+
+
+      def morgen(jetzt: datetime) -> tuple[datetime, datetime]:
+          ...
+
+
+      def erinnerungstexte(reservierungen) -> list[tuple[str, str]]:
+          ...
+
+
+      class Erinnerungsjob:
+          ...
+
+
+      # Testplan:
+    solution: |
+      from datetime import datetime, time, timedelta
+      from typing import Protocol
+      from zoneinfo import ZoneInfo
+
+      BERLIN = ZoneInfo("Europe/Berlin")
+
+
+      # --- Kern: rein, ohne Uhr und ohne I/O ---
+
+      def morgen(jetzt: datetime) -> tuple[datetime, datetime]:
+          tag = jetzt.astimezone(BERLIN).date() + timedelta(days=1)
+          start = datetime.combine(tag, time(0), tzinfo=BERLIN)
+          ende = datetime.combine(tag + timedelta(days=1), time(0), tzinfo=BERLIN)
+          return start, ende
+
+
+      def erinnerungstexte(reservierungen) -> list[tuple[str, str]]:
+          return [
+              (r.telefon, f"Erinnerung: Dein Rad {r.rad_id} wartet morgen ab {r.start.astimezone(BERLIN):%H:%M} Uhr.")
+              for r in sorted(reservierungen, key=lambda r: r.start)
+          ]
+
+
+      # --- Ports ---
+
+      class Reservierungen(Protocol):
+          def zwischen(self, start: datetime, ende: datetime) -> list: ...
+
+
+      class Sms(Protocol):
+          def sende(self, telefon: str, text: str) -> None: ...
+
+
+      class Clock(Protocol):
+          def now(self) -> datetime: ...
+
+
+      # --- Hülle ---
+
+      class Erinnerungsjob:
+          def __init__(self, reservierungen: Reservierungen, sms: Sms, uhr: Clock):
+              self._reservierungen = reservierungen
+              self._sms = sms
+              self._uhr = uhr
+
+          def lauf(self) -> int:
+              start, ende = morgen(self._uhr.now())
+              texte = erinnerungstexte(self._reservierungen.zwischen(start, ende))
+              for telefon, text in texte:
+                  self._sms.sende(telefon, text)
+              return len(texte)
+
+
+      # Testplan:
+      # - Kern, viele Unit-Tests ohne Doubles: morgen() um 18 Uhr, kurz vor und kurz nach
+      #   Mitternacht, am 24.10.2026 (der 25.10. dauert 25 Stunden: 22:00 UTC bis 23:00 UTC
+      #   am Folgetag) und vor der Umstellung im März (23 Stunden). erinnerungstexte():
+      #   Uhrzeit in Berliner Zeit, Sortierung, leere Liste.
+      # - Hülle, ein bis zwei Tests mit FesteUhr, InMemoryReservierungen und SmsSpy:
+      #   fragt das richtige Intervall ab und sendet jede Erinnerung genau einmal.
+      # - Adapter PostgresReservierungen.zwischen: Integrationstest gegen PostgreSQL,
+      #   halboffene Grenzen (Start genau um Mitternacht gehört zum Tag, Ende nicht).
+      # - Verdrahtung und Cron um 18 Uhr Berliner Zeit: ein Smoke Test nach dem Deployment.
+      # - Nicht getestet: ob der SMS-Anbieter zustellt – das zeigt sein Monitoring.
+    checklist:
+      - "`morgen` und `erinnerungstexte` sind rein: keine Uhr, keine Datenbank, kein Versand."
+      - Der Kern rechnet den Kalendertag in `Europe/Berlin` aus, das Intervall ist halboffen `[start, ende)`.
+      - Ein geplanter Test prüft die Nacht der Zeitumstellung, der 25. Oktober 2026 dauert 25 Stunden.
+      - Die Uhrzeit in der SMS ist Berliner Zeit, nicht UTC.
+      - "`Erinnerungsjob` bekommt Reservierungen, SMS und Uhr über den Konstruktor und trifft selbst keine Fachentscheidung."
+      - Der Testplan ordnet Kern, Hülle, Adapter und Verdrahtung je einer Ebene zu und begründet das.
+    explanation: |
+      Der Kern beantwortet die beiden schwierigen Fragen – welcher Zeitraum ist „morgen“, und wie lautet die Nachricht – ohne jede Abhängigkeit. Deshalb lassen sich gerade die heiklen Fälle mit einer Zeile pro Test prüfen: Am 25. Oktober 2026 liegt Mitternacht in Berlin um 22:00 UTC am 24., die nächste Mitternacht um 23:00 UTC am 25. Der Tag dauert 25 Stunden, und ein Job, der „jetzt plus 24 Stunden“ rechnet, verpasst die letzte Stunde. Vorsicht beim Nachrechnen: Python subtrahiert zwei Zeiten mit demselben `tzinfo` nach Wanduhr und meldet einen Tag; erst nach `astimezone(UTC)` siehst du 25 Stunden. Die Hülle verbindet nur noch Uhr, Repository und SMS und braucht ein, zwei Tests mit Fakes. Ob die SQL-Abfrage die halboffenen Grenzen richtig umsetzt, zeigt nur die echte Datenbank.
+    resources:
+      - title: Python · datetime.combine
+        url: https://docs.python.org/3/library/datetime.html#datetime.datetime.combine
+      - title: Python · zoneinfo
+        url: https://docs.python.org/3/library/zoneinfo.html#using-zoneinfo

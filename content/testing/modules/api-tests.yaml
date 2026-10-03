@@ -1,0 +1,1575 @@
+id: api-tests
+title: Backend- und API-Tests
+level: 2
+minutes: 150
+summary: Eine HTTP-API als Versprechen an ihre Clients testen – Statuscodes, Header, Body und Problem Details, 401, 403 und 404, Idempotenz und Konflikte –, in-process mit einem Testclient und mit klarer Aufteilung, was Handler, Service und Repository jeweils abdecken.
+goals:
+  - Du benennst, was eine HTTP-API ihren Clients verspricht, und prüfst Statuscodes, Header, Body und Fehlerformat nach RFC 9457.
+  - Du testest eine API in-process mit einem Testclient und wägst ab, wann ein Test gegen einen laufenden Server nötig ist.
+  - Du unterscheidest 401, 403 und 404 und prüfst, dass fremde Ressourcen unsichtbar bleiben.
+  - Du testest Idempotenz mit `Idempotency-Key` und Konflikte mit 409.
+  - Du verteilst Tests begründet auf Handler, Service und Repository und wiederholst Grenzfälle nicht auf HTTP-Ebene.
+resources:
+  - title: RFC 9110 · HTTP Semantics, Status Codes
+    url: https://www.rfc-editor.org/rfc/rfc9110.html#name-status-codes
+  - title: RFC 9457 · Problem Details for HTTP APIs
+    url: https://www.rfc-editor.org/rfc/rfc9457.html#name-members-of-a-problem-detail
+  - title: FastAPI · Testing
+    url: https://fastapi.tiangolo.com/tutorial/testing/#using-testclient
+  - title: Python · wsgiref.util.setup_testing_defaults
+    url: https://docs.python.org/3/library/wsgiref.html#wsgiref.util.setup_testing_defaults
+lesson: |
+  Ein Release des Radwerk-Backends räumt die Fehlerbehandlung auf. Alle Unit-Tests sind grün, die Buchungslogik ist unverändert. Am nächsten Morgen zeigt die Android-App bei einer Buchung mit falscher Uhrzeit nur noch „Unbekannter Fehler“ statt „Das Ende muss nach dem Start liegen“. Der Grund: Validierungsfehler kommen jetzt mit Status 400 statt 422, und die App wertet die Feldfehler nur bei 422 aus. Kein Test hatte den Statuscode geprüft.
+
+  Eine HTTP-API ist ein Versprechen an Clients, die du nicht kontrollierst. Ältere App-Versionen bleiben monatelang installiert. API-Tests sichern dieses Versprechen ab. Datenbankzugriffe behandelt [Integrationstests](/testing/integrationstests), Verträge zwischen Teams [Contract Testing](/testing/contract-testing).
+
+  ## Eine HTTP-API ist ein Versprechen
+
+  Ein Client verlässt sich auf vier Dinge. Der **Statuscode** steuert seinen Ablauf: 201 heißt „anzeigen“, 409 „anderen Zeitraum vorschlagen“, 401 „neu anmelden“. **Header** entscheiden, wie er die Antwort liest: `Content-Type` wählt den Parser, `Location` nennt die neue Ressource, `WWW-Authenticate` das Anmeldeverfahren. Die **Form des Bodys** – Feldnamen, Typen, Datumsformat – bestimmt, ob die App ihn versteht. Und das **Fehlerformat** entscheidet, ob sie dem Menschen sagen kann, was er ändern soll.
+
+  Für Fehler gibt es mit RFC 9457 ein Standardformat, *Problem Details* ([RFC 9457 · Members](https://www.rfc-editor.org/rfc/rfc9457.html#name-members-of-a-problem-detail)). Der Medientyp ist `application/problem+json`. `type` ist eine URI, die die Art des Problems kennzeichnet, `title` eine kurze Zusammenfassung, `status` wiederholt den HTTP-Status, `detail` erklärt diesen Einzelfall für Menschen. Eigene Felder wie `fehler` sind als Erweiterung erlaubt:
+
+  ```text
+  HTTP/1.1 422 Unprocessable Content
+  Content-Type: application/problem+json
+  ```
+
+  ```json
+  {
+    "type": "https://api.radwerk.example/probleme/ungueltige-reservierung",
+    "title": "Ungültige Reservierung",
+    "status": 422,
+    "detail": "Mindestens ein Feld ist ungültig.",
+    "fehler": [{"feld": "ende", "meldung": "Das Ende muss nach dem Start liegen."}]
+  }
+  ```
+
+  Clients sollen `detail` nicht auswerten, sagt die RFC; dafür sind `type` und Erweiterungen da. Für Tests heißt das: Prüfe `type`, `status` und `fehler`, nicht den Wortlaut.
+
+  Keine API muss alles können. Radwerk verspricht für `POST /reservierungen` diese Antworten, gestützt auf RFC 9110 ([Status Codes](https://www.rfc-editor.org/rfc/rfc9110.html#name-status-codes)):
+
+  | Status | Bedeutung bei Radwerk |
+  | --- | --- |
+  | 201 Created | angelegt; `Location` zeigt auf `/reservierungen/<id>` |
+  | 400 Bad Request | Body ist kein gültiges JSON |
+  | 401 Unauthorized | Token fehlt oder ist ungültig; `WWW-Authenticate: Bearer` |
+  | 403 Forbidden | Token gültig, darf aber nicht buchen |
+  | 409 Conflict | Rad im Zeitraum schon reserviert |
+  | 415 Unsupported Media Type | `Content-Type` ist nicht `application/json` |
+  | 422 Unprocessable Content | JSON lesbar, aber Felder ungültig |
+
+  Die Grenze zwischen 400 und 422 ist eine Entscheidung, die du einmal triffst und dann testest.
+
+  > [!WARNING] Framework-Standard ist nicht dein Vertrag
+  > FastAPI (geprüft mit 0.142) antwortet ohne eigene Exception-Handler auch auf kaputtes JSON und auf einen fehlenden `Content-Type` mit 422, und zwar im Format `{"detail": [...]}`, nicht als Problem Details. Wer RFC 9457 verspricht, baut es selbst ein – und ein Test hält es fest, damit ein Framework-Update es nicht still ändert.
+
+  ## In-process testen: Testclient statt laufender Server
+
+  Ein Python-Webframework ist am Ende eine Funktion. Bei WSGI, dem Standard hinter Flask und Django, bekommt sie die Anfrage als `dict` namens `environ` und meldet Status und Header über `start_response` ([PEP 3333](https://peps.python.org/pep-3333/#specification-details)). Testen heißt also: `dict` bauen, Funktion aufrufen. `setup_testing_defaults` aus `wsgiref.util` ergänzt alles, was ein Server sonst einträgt:
+
+  ```python run
+  import json
+  from wsgiref.util import setup_testing_defaults
+
+
+  def app(environ, start_response):
+      if environ.get("HTTP_AUTHORIZATION") != "Bearer token-anna":
+          start_response("401 Unauthorized", [("WWW-Authenticate", "Bearer")])
+          return [b""]
+      start_response("200 OK", [("Content-Type", "application/json")])
+      return [json.dumps({"id": 17, "rad_id": 7}).encode()]
+
+
+  environ = {"REQUEST_METHOD": "GET", "PATH_INFO": "/reservierungen/17",
+             "HTTP_AUTHORIZATION": "Bearer token-anna"}
+  setup_testing_defaults(environ)
+
+
+  def start_response(status, headers):
+      print(status, headers)
+
+
+  print(b"".join(app(environ, start_response)))
+  ```
+
+  Ein **Testclient** verpackt genau das: Er übersetzt `client.get(pfad, headers=…)` in ein `environ`, ruft die App auf und gibt Status, Header und Body als Objekt zurück. Kein Port, kein Netzwerk, kein Warten auf einen Serverstart. Flask liefert ihn als `app.test_client()` ([Flask · Testing](https://flask.palletsprojects.com/en/stable/testing/#sending-requests-with-the-test-client)), FastAPI als `TestClient` aus Starlette für ASGI ([FastAPI · Testing](https://fastapi.tiangolo.com/tutorial/testing/#using-testclient)):
+
+  ```python
+  from fastapi.testclient import TestClient
+
+  from radwerk.api import app
+
+
+  def test_ohne_token_401():
+      antwort = TestClient(app).get("/reservierungen/17")
+      assert antwort.status_code == 401
+      assert antwort.headers["www-authenticate"] == "Bearer"
+  ```
+
+  Der Testclient von Starlette braucht ein HTTP-Clientpaket. Starlette 1.7 bevorzugt `httpx2` und warnt bei `httpx` mit einer `StarletteDeprecationWarning`. Mit beiden bekommst du ein Antwortobjekt mit `status_code`, `headers` und `json()`.
+
+  Die Alternative ist ein Test gegen einen **laufenden Server**: uvicorn starten, Port abwarten, mit einem HTTP-Client anfragen. Das prüft zusätzlich echtes HTTP-Parsing und die Serverkonfiguration, gegen die echte Umgebung auch Proxy und TLS. Es kostet Startzeit, freie Ports und Wartelogik, die gern flaky wird. Die Arbeitsteilung in der Praxis: Hunderte In-Process-Tests für das Verhalten, eine Handvoll Smoke Tests gegen die echte Umgebung nach dem Deployment.
+
+  ## Statuscodes, Header und Body prüfen
+
+  Der folgende Block enthält einen Ausschnitt der Radwerk-API, einen kleinen Testclient im Stil von Flask und Starlette und vier Tests. Die App ist absichtlich kurz; sie prüft beim Anlegen nur Pflichtfelder.
+
+  ```python pytest
+  import io
+  import json
+  from http import HTTPStatus
+  from wsgiref.headers import Headers
+  from wsgiref.util import setup_testing_defaults
+
+  import pytest
+
+  # Die App: ein Ausschnitt der Radwerk-API
+  TOKENS = {"token-anna": 1, "token-ben": 2}
+
+
+  def problem(status, typ, detail, **erweiterungen):
+      body = {"type": f"https://api.radwerk.example/probleme/{typ}", "title": HTTPStatus(status).phrase,
+              "status": status, "detail": detail, **erweiterungen}
+      return status, [("Content-Type", "application/problem+json")], body
+
+
+  class BuchungsApi:
+      def __init__(self):
+          self.reservierungen, self.besitzer = {}, {}
+
+      def __call__(self, environ, start_response):
+          status, headers, body = self.verarbeite(environ)
+          start_response(f"{status} {HTTPStatus(status).phrase}", headers)
+          return [json.dumps(body).encode()]
+
+      def verarbeite(self, environ):
+          kunde = TOKENS.get(environ.get("HTTP_AUTHORIZATION", "").removeprefix("Bearer "))
+          if kunde is None:
+              status, headers, body = problem(401, "nicht-angemeldet", "Gültiges Bearer-Token fehlt.")
+              return status, [*headers, ("WWW-Authenticate", "Bearer")], body
+          if environ["REQUEST_METHOD"] == "POST":
+              daten = json.loads(environ["wsgi.input"].read(int(environ["CONTENT_LENGTH"])))
+              fehlend = [feld for feld in ("rad_id", "start", "ende") if feld not in daten]
+              if fehlend:
+                  return problem(422, "ungueltige-reservierung", "Pflichtfelder fehlen.", fehlend=fehlend)
+              neu = {"id": len(self.reservierungen) + 1, **daten}
+              self.reservierungen[neu["id"]], self.besitzer[neu["id"]] = neu, kunde
+              return 201, [("Content-Type", "application/json"), ("Location", f"/reservierungen/{neu['id']}")], neu
+          kennung = int(environ["PATH_INFO"].removeprefix("/reservierungen/"))
+          if self.besitzer.get(kennung) != kunde:  # unbekannt oder fremd: dieselbe Antwort
+              return problem(404, "nicht-gefunden", f"Keine Reservierung {kennung}.")
+          return 200, [("Content-Type", "application/json")], self.reservierungen[kennung]
+
+
+  # Der Testclient: baut das environ und ruft die App im selben Prozess auf
+  class Antwort:
+      def __init__(self, status, headers, content):
+          self.status_code, self.headers, self.content = int(status.split()[0]), Headers(headers), content
+
+      def json(self):
+          return json.loads(self.content)
+
+
+  class TestClient:
+      __test__ = False  # für pytest keine Testklasse
+
+      def __init__(self, app):
+          self.app = app
+
+      def request(self, methode, pfad, json_body=None, headers=None):
+          content = json.dumps(json_body).encode() if json_body is not None else b""
+          environ = {"REQUEST_METHOD": methode, "PATH_INFO": pfad, "CONTENT_TYPE": "application/json",
+                     "CONTENT_LENGTH": str(len(content)), "wsgi.input": io.BytesIO(content)}
+          for name, wert in (headers or {}).items():
+              environ["HTTP_" + name.upper().replace("-", "_")] = wert
+          setup_testing_defaults(environ)
+          gestartet = {}
+          content = b"".join(self.app(environ, lambda status, kopf: gestartet.update(status=status, kopf=kopf)))
+          return Antwort(gestartet["status"], gestartet["kopf"], content)
+
+
+  # Die Tests
+  ANNA, BEN = {"Authorization": "Bearer token-anna"}, {"Authorization": "Bearer token-ben"}
+  GUELTIG = {"rad_id": 7, "start": "2026-10-05T10:00:00+02:00", "ende": "2026-10-05T11:00:00+02:00"}
+
+
+  @pytest.fixture
+  def client():
+      return TestClient(BuchungsApi())  # jede App-Instanz beginnt leer
+
+
+  def test_anlegen_liefert_201_und_location(client):
+      antwort = client.request("POST", "/reservierungen", GUELTIG, ANNA)
+      assert antwort.status_code == 201
+      assert antwort.headers["Content-Type"] == "application/json"
+      assert antwort.headers["Location"] == f"/reservierungen/{antwort.json()['id']}"
+
+
+  def test_fehlende_felder_als_problem_details(client):
+      antwort = client.request("POST", "/reservierungen", {"rad_id": 7}, ANNA)
+      assert antwort.status_code == 422
+      assert antwort.headers["Content-Type"] == "application/problem+json"
+      assert antwort.json()["status"] == 422
+      assert antwort.json()["fehlend"] == ["start", "ende"]
+
+
+  def test_ohne_token_401_mit_www_authenticate(client):
+      antwort = client.request("GET", "/reservierungen/1")
+      assert antwort.status_code == 401
+      assert antwort.headers["WWW-Authenticate"] == "Bearer"
+
+
+  def test_fremde_reservierung_bleibt_unsichtbar(client):
+      neu = client.request("POST", "/reservierungen", GUELTIG, ANNA).json()
+      assert client.request("GET", f"/reservierungen/{neu['id']}", headers=BEN).status_code == 404
+      assert client.request("GET", f"/reservierungen/{neu['id']}", headers=ANNA).status_code == 200
+  ```
+
+  Jeder Test prüft, was ein Client auswertet: Status, `Content-Type`, `Location`, die Felder, die für diesen Fall zählen. Er prüft nicht den ganzen Body mit `==`, nicht die Reihenfolge der Felder und nicht den Text in `detail`. Ein Test, der die komplette Antwort vergleicht, scheitert, sobald die API ein Feld *hinzufügt* – eine Änderung, die kein Client bemerkt, der nach dem Prinzip des [Tolerant Reader](https://martinfowler.com/bliki/TolerantReader.html) liest. Solche Tests bremsen jede Weiterentwicklung und werden irgendwann mit „Erwartung aktualisiert“ grün gemacht, ohne dass jemand hinsieht.
+
+  > [!MERKE]
+  > Ein API-Test wird rot, wenn ein Client etwas bemerken würde, und bleibt grün, wenn keiner es bemerkt.
+
+  Zwei Details am Testclient: `__test__ = False` verhindert, dass pytest die Klasse wegen ihres Namens als Testklasse einsammelt; Starlette macht es genauso. Und weil jede `BuchungsApi()` leer beginnt, braucht kein Test Aufräumcode. Die Antwort folgt dem Vorbild von Starlette (`json()` als Methode); bei Flask ist `antwort.json` eine Eigenschaft. Ein fehlender Header ergibt hier `None`, bei Flask und Starlette einen `KeyError`, dort nimmst du `headers.get()`.
+
+  ## Authentifizierung und Autorisierung: 401, 403, 404
+
+  Die drei Codes beantworten verschiedene Fragen ([RFC 9110 · 401](https://www.rfc-editor.org/rfc/rfc9110.html#name-401-unauthorized)):
+
+  - **401** heißt „Wer bist du?“: Token fehlt, ist abgelaufen oder ungültig. Die Antwort muss `WWW-Authenticate` enthalten. Die App reagiert mit einer neuen Anmeldung.
+  - **403** heißt „Ich weiß, wer du bist, aber das darfst du nicht“: zum Beispiel ein Token, das nur lesen darf. Für OAuth-Bearer-Tokens heißt dieser Fall in RFC 6750 `insufficient_scope`.
+  - **404** für eine fremde Reservierung: RFC 9110 erlaubt ausdrücklich, ein verbotenes Ziel als „nicht gefunden“ zu verstecken ([404 Not Found](https://www.rfc-editor.org/rfc/rfc9110.html#name-404-not-found)). Ben soll nicht durch Probieren herausfinden, welche Reservierungsnummern existieren. Fremd und unbekannt müssen deshalb exakt gleich aussehen.
+
+  Der häufigste Fehler in diesem Feld ist der fehlende Test für fremde Ressourcen. Die App funktioniert für jeden Nutzer mit seinen eigenen Daten, und erst ein Angreifer probiert die Nummer des Nachbarn. OWASP führt das als Nummer eins der API-Risiken (*Broken Object Level Authorization*). Deshalb gehört zu jedem Endpunkt mit ID ein Test mit zwei Nutzern, wie `test_fremde_reservierung_bleibt_unsichtbar` oben.
+
+  Die Entscheidung selbst ist reine Logik. Als Funktion getestet, wird sie zur Entscheidungstabelle:
+
+  ```python pytest
+  import pytest
+
+
+  def entscheide(kunde, aktion, besitzer_id):
+      """Status für eine Anfrage auf eine Reservierung, bevor der Handler etwas tut."""
+      if kunde is None:
+          return 401  # wer bist du?
+      if aktion not in kunde["rechte"]:
+          return 403  # bekannt, aber das Token erlaubt es nicht
+      if besitzer_id != kunde["id"]:
+          return 404  # unbekannt oder fremd: von außen nicht zu unterscheiden
+      return 200
+
+
+  ANNA = {"id": 1, "rechte": {"lesen", "stornieren"}}
+  ANNA_NUR_LESEN = {"id": 1, "rechte": {"lesen"}}
+
+
+  @pytest.mark.parametrize(
+      "kunde, aktion, besitzer_id, status",
+      [
+          (None, "lesen", 1, 401),
+          (ANNA_NUR_LESEN, "stornieren", 1, 403),
+          (ANNA_NUR_LESEN, "stornieren", 2, 403),
+          (ANNA, "lesen", 2, 404),
+          (ANNA, "lesen", None, 404),
+          (ANNA, "stornieren", 1, 200),
+      ],
+      ids=["ohne-token", "falsches-recht", "falsches-recht-fremd", "fremd", "unbekannt", "eigene"],
+  )
+  def test_entscheidung(kunde, aktion, besitzer_id, status):
+      assert entscheide(kunde, aktion, besitzer_id) == status
+  ```
+
+  Die Reihenfolge der Prüfungen ist Teil des Vertrags: Das Recht wird vor dem Laden der Ressource geprüft, damit auch 403 nichts über fremde Reservierungen verrät. Auf HTTP-Ebene genügt dann je Endpunkt ein Test pro Statuscode.
+
+  ## Idempotenz und Konflikte
+
+  Mobilfunk verliert Antworten. Die Buchung kam beim Server an, die Bestätigung nicht beim Handy, die App schickt dieselbe Anfrage noch einmal. `GET`, `PUT` und `DELETE` sind laut RFC 9110 idempotent: Zweimal ausgeführt wirken sie wie einmal ([Idempotent Methods](https://www.rfc-editor.org/rfc/rfc9110.html#name-idempotent-methods)). `POST` ist es nicht. Der Header `Idempotency-Key` macht es nachträglich idempotent: Der Client erzeugt pro Buchung einen zufälligen Schlüssel, und der Server gibt bei einer Wiederholung die gespeicherte Antwort zurück, statt noch einmal zu buchen. Beschrieben ist der Header in einem Internet-Draft der IETF ([draft-ietf-httpapi-idempotency-key-header](https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/)). Die letzte Fassung stammt vom Oktober 2025 und ist inzwischen abgelaufen, ein RFC ist daraus nicht geworden. Stripe und andere Zahlungs-APIs nutzen das Muster trotzdem seit Jahren. Kommt derselbe Schlüssel mit einem anderen Body, empfiehlt der Draft 422.
+
+  Die Logik dahinter braucht kein HTTP. Ein Spy zählt, wie oft wirklich gebucht wird:
+
+  ```python pytest
+  class Idempotenz:
+      def __init__(self):
+          self.gesehen = {}
+
+      def ausfuehren(self, kunde_id, schluessel, anfrage, aktion):
+          eintrag = self.gesehen.get((kunde_id, schluessel))
+          if eintrag is not None:
+              fruehere_anfrage, ergebnis = eintrag
+              if fruehere_anfrage != anfrage:
+                  raise ValueError("Idempotency-Key mit anderem Body wiederverwendet")
+              return ergebnis
+          ergebnis = aktion()
+          self.gesehen[(kunde_id, schluessel)] = (anfrage, ergebnis)
+          return ergebnis
+
+
+  def test_wiederholung_bucht_nicht_noch_einmal():
+      buchungen = []
+
+      def buchen():
+          buchungen.append("Rad 7")
+          return {"id": len(buchungen)}
+
+      idempotenz = Idempotenz()
+      erste = idempotenz.ausfuehren(1, "c1f9", {"rad_id": 7}, buchen)
+      zweite = idempotenz.ausfuehren(1, "c1f9", {"rad_id": 7}, buchen)
+      assert zweite == erste
+      assert buchungen == ["Rad 7"]
+  ```
+
+  Auf HTTP-Ebene prüft dann ein Test, dass der Header ankommt: zwei identische `POST`s mit demselben Schlüssel, zweimal 201 mit derselben ID, und `GET` findet genau eine Reservierung.
+
+  **Konflikte** meldet 409: Das Rad ist belegt, die Anfrage war in Ordnung, der Zustand passt nicht. Eine zweite Art Konflikt entsteht beim Ändern: Zwei Mitarbeiter bearbeiten dieselbe Reservierung, der zweite überschreibt den ersten. Dagegen helfen bedingte Anfragen: Der Server liefert ein `ETag`, der Client schickt es mit `If-Match` zurück, und passt es nicht mehr, antwortet der Server mit 412 ([Conditional Requests](https://www.rfc-editor.org/rfc/rfc9110.html#name-conditional-requests)). Der Test dafür ist kurz: lesen, von zweiter Seite ändern, mit altem ETag ändern, 412 erwarten.
+
+  ## Handler, Service, Repository: was wo getestet wird
+
+  Ein Backend wie das von Radwerk hat drei Schichten, und jede hat ihre eigenen Fehler:
+
+  | Schicht | Was sie entscheidet | Wie du sie testest |
+  | --- | --- | --- |
+  | Handler (HTTP) | Parsing, Statuscodes, Header, Problem Details, Token lesen | Testclient, ein Fall je Antwortart |
+  | Service | Fachregeln: Überschneidung, 7 Tage im Voraus, Idempotenz, Rechte | Unit-Tests mit Fakes und fester Uhr, alle Grenzfälle |
+  | Repository | SQL, Constraints, Transaktionen | gegen eine echte Datenbank |
+
+  Die Regel aus der [Testpyramide](/testing/testpyramide) gilt auch hier: Jedes Risiko auf der niedrigsten Ebene, die es zuverlässig zeigt. Die sieben Grenzfälle der Überschneidung stehen im Repository-Test, die 7-Tage-Grenze im Service-Test. Auf HTTP-Ebene steht je ein Test, dass „belegt“ als 409 und „zu weit im Voraus“ als 422 ankommt. Alle Grenzfälle noch einmal über HTTP zu testen, macht die Suite langsamer und jede Änderung teurer, ohne einen Fehler mehr zu finden.
+
+  Damit Handler-Tests keine Datenbank brauchen, ersetzt FastAPI Abhängigkeiten für die Dauer eines Tests ([FastAPI · Dependency overrides](https://fastapi.tiangolo.com/advanced/testing-dependencies/#use-the-app-dependency-overrides-attribute)):
+
+  ```python
+  import pytest
+  from fastapi.testclient import TestClient
+
+  from radwerk.api import app, get_repo
+  from radwerk.fakes import InMemoryReservierungen
+
+
+  @pytest.fixture
+  def client():
+      repo = InMemoryReservierungen()
+      app.dependency_overrides[get_repo] = lambda: repo  # Fake statt PostgreSQL
+      with TestClient(app) as client:
+          yield client
+      app.dependency_overrides.clear()
+
+
+  def test_belegtes_rad_liefert_409(client):
+      kopf = {"Authorization": "Bearer token-anna"}
+      daten = {"rad_id": 7, "start": "2026-10-05T10:00:00+02:00", "ende": "2026-10-05T11:00:00+02:00"}
+      assert client.post("/reservierungen", json=daten, headers=kopf).status_code == 201
+      antwort = client.post("/reservierungen", json=daten, headers=kopf)
+      assert antwort.status_code == 409
+      assert antwort.headers["content-type"] == "application/problem+json"
+  ```
+
+  `dependency_overrides` hängt am App-Objekt und gilt für alle Tests, bis jemand es leert. Das `clear()` nach `yield` gehört deshalb in jede solche Fixture.
+
+  > [!PRAXIS] Was im Code-Review an API-Tests auffällt
+  > Ein Test pro Endpunkt, der nur den Erfolgsfall prüft. Kein Test mit fremdem Token. `assert response.json() == {…}` über den ganzen Body. Grenzfälle der Fachlogik zehnfach über HTTP. Fixtures, die `dependency_overrides` setzen und nie leeren. Und Tests, die einen laufenden Server auf Port 8000 erwarten und auf dem CI-Runner scheitern, weil dort schon etwas läuft.
+
+  ## Häufige Fehler
+
+  - **Nur den Erfolgsfall testen.** Fehlerantworten sind Teil des Vertrags. Jede Antwortart aus der Tabelle braucht einen Test.
+  - **Den ganzen Body vergleichen.** Ein neues Feld macht den Test rot, obwohl kein Client bricht. Prüfe die Felder, die für den Fall zählen.
+  - **`detail` oder `title` prüfen.** Texte ändern sich. Prüfe `type`, `status` und Erweiterungen wie `fehler`.
+  - **Fremde Ressourcen vergessen.** Jeder Endpunkt mit ID braucht einen Test mit zwei Nutzern, und fremd muss genauso aussehen wie unbekannt.
+  - **401 und 403 verwechseln.** 401 löst in der App eine neue Anmeldung aus; ein Nutzer ohne Recht landet dann in einer Schleife.
+  - **Fachlogik über HTTP testen.** Grenzfälle gehören in Service- und Repository-Tests. Über HTTP genügt ein Fall pro Antwortart.
+  - **Geteilter Zustand im Testclient.** Eine App-Instanz für alle Tests macht sie reihenfolgeabhängig. Erzeuge pro Test eine neue oder räume in der Fixture auf.
+
+  > [!INTERVIEW] „Wie testest du eine REST-API?“
+  > Ich trenne nach Schichten. Fachregeln teste ich als Unit-Tests im Service, SQL gegen eine echte Datenbank. Die HTTP-Schicht teste ich in-process mit dem Testclient des Frameworks: je Endpunkt Erfolg, Validierungsfehler im vereinbarten Format, 401 ohne Token, 403 ohne Recht, 404 für fremde Ressourcen, dazu Konflikte und Idempotenz, wo es sie gibt. Ich prüfe Status, relevante Header und die Felder, die Clients nutzen, nie den ganzen Body. Gegen die echte Umgebung laufen nur wenige Smoke Tests nach dem Deployment.
+
+  ## Zusammenfassung
+
+  - Eine API verspricht Statuscodes, Header, Body-Form und ein Fehlerformat. API-Tests halten genau das fest.
+  - Problem Details nach RFC 9457: `application/problem+json` mit `type`, `title`, `status`, `detail`, eigene Erweiterungen erlaubt. Tests prüfen `type`, `status` und Erweiterungen, nicht den Text.
+  - In-process mit Testclient ist schnell und deterministisch; gegen laufende Server nur wenige Smoke Tests.
+  - 401: wer bist du? 403: das darfst du nicht. 404 für fremde Ressourcen, damit niemand fremde IDs erkennt.
+  - `Idempotency-Key` macht `POST` wiederholbar: gleiche Anfrage, gleiche Antwort, keine zweite Buchung. Konflikte melden 409, veraltete `If-Match`-Versionen 412.
+  - Grenzfälle gehören in Service- und Repository-Tests, über HTTP genügt ein Test pro Antwortart.
+exercises:
+  - id: versprechen-brechen
+    type: choice
+    title: Was ältere App-Versionen bricht
+    prompt: |
+      Ältere Versionen der Radwerk-Android-App bleiben monatelang installiert. Welche Änderungen an `POST /reservierungen` brechen diese Clients?
+    options:
+      - text: Validierungsfehler kommen mit Status 400 statt 422.
+        correct: true
+        why: Die App verzweigt nach dem Statuscode. Wertet sie Feldfehler nur bei 422 aus, zeigt sie bei 400 einen allgemeinen Fehler.
+      - text: Das Feld `rad_id` heißt in der Antwort jetzt `radId`.
+        correct: true
+        why: Die App liest `rad_id` und findet nichts mehr. Umbenennen ist für bestehende Clients ein Entfernen.
+      - text: "`start` kommt als Unix-Zeitstempel statt als ISO-8601-Text."
+        correct: true
+        why: Der Typ ändert sich von Text zu Zahl. Der Parser der App scheitert oder zeigt ein falsches Datum.
+      - text: Die Antwort enthält zusätzlich das Feld `station`.
+        correct: false
+        why: Ein neues Feld ignoriert ein Client, der nur liest, was er kennt (Tolerant Reader). Additive Änderungen sind abwärtskompatibel.
+      - text: Der Text in `detail` ist neu formuliert.
+        correct: false
+        why: "`detail` ist für Menschen gedacht. RFC 9457 rät Clients ausdrücklich davon ab, ihn auszuwerten."
+    explanation: |
+      Zum Vertrag gehört alles, worauf ein Client sein Verhalten stützt: Statuscodes, Feldnamen, Typen und Formate. Entfernen, Umbenennen und Typwechsel brechen Clients, Hinzufügen nicht. Texte für Menschen wie `detail` gehören nicht dazu. Deshalb prüfen gute API-Tests genau diese Vertragsbestandteile – und vergleichen nicht den ganzen Body, sonst schlagen sie auch bei harmlosen, additiven Änderungen an.
+    resources:
+      - title: RFC 9457 · detail
+        url: https://www.rfc-editor.org/rfc/rfc9457.html#name-detail
+      - title: Martin Fowler · TolerantReader
+        url: https://martinfowler.com/bliki/TolerantReader.html
+
+  - id: fremde-reservierung
+    type: choice
+    title: Bens Blick auf Annas Reservierung
+    prompt: |
+      Ben ist mit gültigem Token angemeldet und ruft `GET /reservierungen/17` auf. Reservierung 17 gehört Anna. Radwerk will nicht verraten, welche Reservierungsnummern existieren. Welche Antwort ist richtig?
+    options:
+      - text: 404 Not Found, mit derselben Antwort wie für eine Nummer, die es nicht gibt.
+        correct: true
+        why: RFC 9110 erlaubt, ein verbotenes Ziel als „nicht gefunden“ zu verstecken. Ben kann fremd und unbekannt nicht unterscheiden.
+      - text: 403 Forbidden.
+        correct: false
+        why: Fachlich zutreffend, verrät aber, dass Reservierung 17 existiert. Durch Hochzählen könnte Ben herausfinden, welche Nummern vergeben sind.
+      - text: 401 Unauthorized.
+        correct: false
+        why: Ben ist angemeldet. 401 heißt „Anmeldung fehlt oder ist ungültig“, und die App würde ihn abmelden.
+      - text: 200 OK mit leerem Body.
+        correct: false
+        why: 200 meldet Erfolg. Die App kann nicht erkennen, dass etwas fehlt, und zeigt eine leere Reservierung.
+    explanation: |
+      403 und 404 sind beide nach RFC 9110 zulässig. Die Entscheidung hängt davon ab, ob die bloße Existenz einer Ressource schützenswert ist. Bei fortlaufenden Reservierungsnummern ist sie es. Dann müssen fremd und unbekannt exakt gleich aussehen: gleicher Status, gleiches `type`, kein Unterschied in der Antwortzeit, der sich messen ließe. Der Test dafür braucht zwei Nutzer: Anna legt an, Ben fragt ab und bekommt dieselbe Antwort wie für eine Nummer, die es nicht gibt.
+    resources:
+      - title: RFC 9110 · 404 Not Found
+        url: https://www.rfc-editor.org/rfc/rfc9110.html#name-404-not-found
+      - title: OWASP · API1:2023 Broken Object Level Authorization
+        url: https://owasp.org/API-Security/editions/2023/en/0xa1-broken-object-level-authorization/
+
+  - id: wsgi-aufruf
+    type: output
+    title: Wo ist der Content-Type geblieben?
+    prompt: |
+      Ein selbst gebauter Testclient ruft eine WSGI-App im selben Prozess auf. Was gibt das Programm aus?
+    lang: python
+    code: |
+      import json
+      from wsgiref.headers import Headers
+      from wsgiref.util import setup_testing_defaults
+
+
+      def app(environ, start_response):
+          if "HTTP_AUTHORIZATION" not in environ:
+              start_response("401 Unauthorized", [("WWW-Authenticate", "Bearer")])
+              return [b""]
+          body = {"pfad": environ["PATH_INFO"], "typ": environ.get("CONTENT_TYPE")}
+          start_response("200 OK", [("Content-Type", "application/json")])
+          return [json.dumps(body).encode()]
+
+
+      def aufruf(methode, pfad, headers):
+          environ = {"REQUEST_METHOD": methode, "PATH_INFO": pfad}
+          for name, wert in headers.items():
+              environ["HTTP_" + name.upper().replace("-", "_")] = wert
+          setup_testing_defaults(environ)
+          gesehen = {}
+
+          def start_response(status, kopf):
+              gesehen["status"], gesehen["kopf"] = status, Headers(kopf)
+
+          body = b"".join(app(environ, start_response))
+          return gesehen["status"], gesehen["kopf"], body
+
+
+      status, kopf, body = aufruf("GET", "/reservierungen/17", {})
+      print(status, kopf["www-authenticate"])
+      status, kopf, body = aufruf("POST", "/reservierungen", {"Authorization": "Bearer x", "Content-Type": "application/json"})
+      print(status, kopf["content-type"])
+      print(json.loads(body))
+    expected: |
+      401 Unauthorized Bearer
+      200 OK application/json
+      {'pfad': '/reservierungen', 'typ': None}
+    explanation: |
+      `Headers` aus `wsgiref` sucht Header ohne Rücksicht auf Groß- und Kleinschreibung, deshalb findet `kopf["www-authenticate"]` den Header `WWW-Authenticate`. Die Falle steckt im Client: Er macht aus jedem Header `HTTP_…`, also auch aus `Content-Type` den Schlüssel `HTTP_CONTENT_TYPE`. PEP 3333 legt aber fest, dass `Content-Type` und `Content-Length` als `CONTENT_TYPE` und `CONTENT_LENGTH` ohne Präfix im `environ` stehen. Die App findet den Medientyp deshalb nicht. Prüft eine App den `Content-Type`, scheitern mit diesem Testclient alle `POST`-Tests, obwohl die App korrekt ist und ein echter Server alles richtig übergeben würde. Der Fehler sitzt dann im Test, nicht im Produkt.
+    resources:
+      - title: PEP 3333 · environ Variables
+        url: https://peps.python.org/pep-3333/#environ-variables
+      - title: Python · wsgiref.headers.Headers
+        url: https://docs.python.org/3/library/wsgiref.html#wsgiref.headers.Headers
+
+  - id: idempotenz-vorhersagen
+    type: output
+    title: Vier Anfragen, ein Schlüssel
+    prompt: Was gibt das Programm aus?
+    lang: python
+    code: |
+      class Idempotenz:
+          def __init__(self):
+              self.gesehen = {}
+
+          def ausfuehren(self, kunde_id, schluessel, anfrage, aktion):
+              eintrag = self.gesehen.get((kunde_id, schluessel))
+              if eintrag is not None:
+                  fruehere_anfrage, ergebnis = eintrag
+                  if fruehere_anfrage != anfrage:
+                      return (422, "Schlüssel schon verwendet")
+                  return ergebnis
+              ergebnis = aktion()
+              self.gesehen[(kunde_id, schluessel)] = (anfrage, ergebnis)
+              return ergebnis
+
+
+      buchungen = []
+
+
+      def buchen():
+          buchungen.append("gebucht")
+          return (201, f"Reservierung {len(buchungen)}")
+
+
+      idempotenz = Idempotenz()
+      print(idempotenz.ausfuehren(1, "k1", {"rad_id": 7}, buchen))
+      print(idempotenz.ausfuehren(1, "k1", {"rad_id": 7}, buchen))
+      print(idempotenz.ausfuehren(1, "k1", {"rad_id": 8}, buchen))
+      print(idempotenz.ausfuehren(2, "k1", {"rad_id": 7}, buchen))
+      print(len(buchungen))
+    expected: |
+      (201, 'Reservierung 1')
+      (201, 'Reservierung 1')
+      (422, 'Schlüssel schon verwendet')
+      (201, 'Reservierung 2')
+      2
+    explanation: |
+      Die erste Anfrage bucht und speichert Anfrage und Ergebnis unter `(1, "k1")`. Die Wiederholung findet den Eintrag, der Body ist gleich, also kommt dieselbe Antwort zurück, ohne dass `buchen` noch einmal läuft. Derselbe Schlüssel mit anderem Body ist ein Fehler des Clients: 422, wie es der Internet-Draft empfiehlt. Kunde 2 benutzt zufällig auch `k1`, aber der Speicher ist nach Kunde getrennt, also bucht er neu. Am Ende wurde zweimal gebucht. Genau diese vier Fälle gehören in den Test der Idempotenz.
+    resources:
+      - title: IETF · The Idempotency-Key HTTP Header Field (Draft)
+        url: https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/
+
+  - id: problem-details-pruefen
+    type: gap
+    title: Ein Validierungsfehler nach Vertrag
+    prompt: |
+      Die Radwerk-API antwortet auf ungültige Felder mit Status 422 und Problem Details (`application/problem+json`). Im Body steht `status` (gleich dem HTTP-Status) und `fehler`, eine Liste von Objekten mit `feld` und `meldung`. Ergänze den Test so, dass er diesen Vertrag prüft – und nicht mehr.
+    lang: python
+    code: |
+      def test_ende_vor_start_ist_ungueltig(client):
+          antwort = client.post(
+              "/reservierungen",
+              json={"rad_id": 7, "start": "2026-10-05T11:00:00+02:00", "ende": "2026-10-05T10:00:00+02:00"},
+              headers={"Authorization": "Bearer token-anna"},
+          )
+          assert antwort.status_code == ⟦422⟧
+          assert antwort.headers["Content-Type"] == ⟦"application/problem+json"⟧
+          problem = antwort.json()
+          assert problem["status"] == ⟦422⟧
+          assert [f["feld"] for f in problem["fehler"]] == [⟦"ende"⟧]
+    gaps:
+      - label: Statuscode
+        hint: JSON war lesbar, aber ein Feld ist ungültig.
+      - label: Medientyp
+        hint: Der Medientyp für Problem Details nach RFC 9457.
+      - label: Status im Body
+        hint: Der Body wiederholt den HTTP-Status.
+        accept: ["antwort.status_code"]
+      - label: Fehlerhaftes Feld
+        hint: Welches Feld muss der Nutzer korrigieren?
+    explanation: |
+      Der Test prüft den Status, den Medientyp, die Übereinstimmung von `status` im Body mit dem HTTP-Status und das Feld, das der Nutzer korrigieren muss. `title`, `detail` und `meldung` sind Texte für Menschen und dürfen sich ändern, ohne dass ein Client bricht – deshalb kommen sie im Test nicht vor. Die Liste der Feldnamen mit `==` zu vergleichen ist hier richtig: Ein zusätzlich gemeldetes Feld wäre ein Fehler der Validierung.
+    resources:
+      - title: RFC 9457 · Members of a Problem Details Object
+        url: https://www.rfc-editor.org/rfc/rfc9457.html#name-members-of-a-problem-detail
+      - title: RFC 9110 · 422 Unprocessable Content
+        url: https://www.rfc-editor.org/rfc/rfc9110.html#name-422-unprocessable-content
+
+  - id: api-vertrag-tests
+    type: code
+    title: Tests, die einen Vertragsbruch bemerken
+    prompt: |
+      `buchung_api.py` enthält `BuchungsApi`, eine WSGI-App. `testclient.py` enthält einen `TestClient` im Stil von Flask und Starlette:
+
+      ```python
+      client = TestClient(BuchungsApi())  # jede BuchungsApi() beginnt leer
+      antwort = client.post("/reservierungen", json={...}, headers={"Authorization": "Bearer token-anna"})
+      antwort = client.post("/reservierungen", content=b"...", headers={...})  # roher Body, ohne Content-Type
+      antwort = client.get("/reservierungen/1", headers={...})
+      antwort.status_code            # int
+      antwort.headers["Content-Type"]  # Groß-/Kleinschreibung egal; fehlt der Header: None
+      antwort.json()
+      ```
+
+      Der Vertrag der API:
+
+      - Tokens im Header `Authorization: Bearer <token>`: `token-anna` (Kundin 1, darf lesen und buchen), `token-ben` (Kunde 2, lesen und buchen), `token-anna-lesen` (Kundin 1, darf nur lesen). Ohne gültiges Token: 401 mit `WWW-Authenticate: Bearer`.
+      - `POST /reservierungen` mit JSON `{"rad_id": 7, "start": "2026-10-05T10:00:00+02:00", "ende": "2026-10-05T11:00:00+02:00"}`: 201, Header `Location: /reservierungen/<id>`, Body `{"id", "rad_id", "start", "ende"}`. Ein Token ohne Buchungsrecht bekommt 403. Ist `Content-Type` nicht `application/json`: 415. Kein gültiges JSON: 400. Fehlt ein Feld, hat es den falschen Typ, fehlt die Zeitzone oder liegt `ende` nicht nach `start`: 422 mit einer Liste `fehler` (Objekte mit `feld` und `meldung`). Überschneidet sich der Zeitraum `[start, ende)` mit einer Reservierung desselben Rads: 409.
+      - Header `Idempotency-Key`: Schickt dieselbe Kundin denselben Schlüssel mit demselben Body noch einmal, kommt exakt die erste Antwort zurück (Status und Body), und es entsteht keine zweite Reservierung. Derselbe Schlüssel mit anderem Body: 422.
+      - `GET /reservierungen/<id>`: 200 mit dem Body wie oben für eigene Reservierungen. Unbekannte **und fremde** Reservierungen: 404.
+      - Jede Fehlerantwort hat `Content-Type: application/problem+json` und einen Body mit `type`, `title`, `status` (gleich dem HTTP-Status) und `detail`.
+
+      Schreibe pytest-Tests. Sie müssen mit der richtigen API grün sein und jede fehlerhafte Variante rot werden lassen.
+    lang: python
+    setup: |
+      from pathlib import Path
+
+      API = '''
+      import json
+      from datetime import datetime
+      from http import HTTPStatus
+
+      TOKENS = {
+          "token-anna": {"kunde_id": 1, "rechte": {"lesen", "buchen"}},
+          "token-ben": {"kunde_id": 2, "rechte": {"lesen", "buchen"}},
+          "token-anna-lesen": {"kunde_id": 1, "rechte": {"lesen"}},
+      }
+      PROBLEME = "https://api.radwerk.example/probleme/"
+
+
+      def problem(status, typ, titel, detail, **erweiterungen):
+          body = {"type": PROBLEME + typ, "title": titel, "status": status, "detail": detail, **erweiterungen}
+          return status, [("Content-Type", "application/problem+json")], body
+
+
+      def json_antwort(status, body, headers=()):
+          return status, [("Content-Type", "application/json"), *headers], body
+
+
+      def zeitpunkt(wert):
+          if not isinstance(wert, str):
+              return None
+          try:
+              ergebnis = datetime.fromisoformat(wert)
+          except ValueError:
+              return None
+          return ergebnis if ergebnis.tzinfo is not None else None
+
+
+      def pruefe(daten):
+          if not isinstance(daten, dict):
+              return [{"feld": "", "meldung": "Erwartet wird ein JSON-Objekt."}]
+          fehler = []
+          rad_id = daten.get("rad_id")
+          if not isinstance(rad_id, int) or isinstance(rad_id, bool) or rad_id < 1:
+              fehler.append({"feld": "rad_id", "meldung": "Erwartet wird eine positive ganze Zahl."})
+          start, ende = zeitpunkt(daten.get("start")), zeitpunkt(daten.get("ende"))
+          if start is None:
+              fehler.append({"feld": "start", "meldung": "Erwartet wird ein Zeitpunkt nach ISO 8601 mit Zeitzone."})
+          if ende is None:
+              fehler.append({"feld": "ende", "meldung": "Erwartet wird ein Zeitpunkt nach ISO 8601 mit Zeitzone."})
+          if start and ende and ende <= start:
+              fehler.append({"feld": "ende", "meldung": "Das Ende muss nach dem Start liegen."})
+          return fehler
+
+
+      def oeffentlich(reservierung):
+          return {
+              "id": reservierung["id"],
+              "rad_id": reservierung["rad_id"],
+              "start": reservierung["start"].isoformat(),
+              "ende": reservierung["ende"].isoformat(),
+          }
+
+
+      class BuchungsApi:
+          """WSGI-App: GET /reservierungen/<id> und POST /reservierungen. Jede Instanz beginnt leer."""
+
+          def __init__(self):
+              self.reservierungen = {}
+              self.idempotenz = {}
+              self.naechste_id = 1
+
+          def __call__(self, environ, start_response):
+              status, headers, body = self.verarbeite(environ)
+              daten = json.dumps(body).encode()
+              start_response(f"{status} {HTTPStatus(status).phrase}", [*headers, ("Content-Length", str(len(daten)))])
+              return [daten]
+
+          def verarbeite(self, environ):
+              token = environ.get("HTTP_AUTHORIZATION", "").removeprefix("Bearer ")
+              kunde = TOKENS.get(token)
+              if kunde is None:
+                  status, headers, body = problem(401, "nicht-angemeldet", "Nicht angemeldet", "Ein gültiges Bearer-Token fehlt.")
+                  return status, [*headers, ("WWW-Authenticate", "Bearer")], body
+              methode, pfad = environ["REQUEST_METHOD"], environ["PATH_INFO"]
+              if methode == "POST" and pfad == "/reservierungen":
+                  return self.anlegen(environ, kunde)
+              if methode == "GET" and pfad.startswith("/reservierungen/"):
+                  return self.lesen(pfad.removeprefix("/reservierungen/"), kunde)
+              return problem(404, "nicht-gefunden", "Nicht gefunden", f"{methode} {pfad} gibt es nicht.")
+
+          def lesen(self, kennung, kunde):
+              reservierung = self.reservierungen.get(int(kennung)) if kennung.isdigit() else None
+              if reservierung is None or reservierung["kunde_id"] != kunde["kunde_id"]:
+                  return problem(404, "nicht-gefunden", "Nicht gefunden", f"Es gibt keine Reservierung {kennung}.")
+              return json_antwort(200, oeffentlich(reservierung))
+
+          def anlegen(self, environ, kunde):
+              if "buchen" not in kunde["rechte"]:
+                  return problem(403, "keine-berechtigung", "Keine Berechtigung", "Dieses Token darf nur lesen.")
+              medientyp = environ.get("CONTENT_TYPE", "").split(";")[0].strip()
+              if medientyp != "application/json":
+                  return problem(415, "falscher-medientyp", "Falscher Medientyp", "Erwartet wird application/json.")
+              roh = environ["wsgi.input"].read(int(environ.get("CONTENT_LENGTH") or 0))
+              try:
+                  daten = json.loads(roh)
+              except ValueError:
+                  return problem(400, "kein-json", "Kein gültiges JSON", "Der Body ließ sich nicht als JSON lesen.")
+              schluessel = environ.get("HTTP_IDEMPOTENCY_KEY")
+              if schluessel is None:
+                  return self.neue_reservierung(daten, kunde)
+              gespeichert = self.idempotenz.get((kunde["kunde_id"], schluessel))
+              if gespeichert is not None:
+                  fruehere_daten, ergebnis = gespeichert
+                  if fruehere_daten != daten:
+                      return problem(422, "idempotency-key", "Idempotency-Key schon verwendet",
+                                     "Derselbe Schlüssel kam mit einem anderen Body.")
+                  return ergebnis
+              ergebnis = self.neue_reservierung(daten, kunde)
+              self.idempotenz[(kunde["kunde_id"], schluessel)] = (daten, ergebnis)
+              return ergebnis
+
+          def neue_reservierung(self, daten, kunde):
+              fehler = pruefe(daten)
+              if fehler:
+                  return problem(422, "ungueltige-reservierung", "Ungültige Reservierung",
+                                 "Mindestens ein Feld ist ungültig.", fehler=fehler)
+              rad_id, start, ende = daten["rad_id"], zeitpunkt(daten["start"]), zeitpunkt(daten["ende"])
+              for andere in self.reservierungen.values():
+                  if andere["rad_id"] == rad_id and andere["start"] < ende and start < andere["ende"]:
+                      return problem(409, "rad-belegt", "Rad belegt", f"Rad {rad_id} ist in diesem Zeitraum schon reserviert.")
+              reservierung = {"id": self.naechste_id, "kunde_id": kunde["kunde_id"], "rad_id": rad_id, "start": start, "ende": ende}
+              self.reservierungen[reservierung["id"]] = reservierung
+              self.naechste_id += 1
+              return json_antwort(201, oeffentlich(reservierung), [("Location", f"/reservierungen/{reservierung['id']}")])
+      '''
+      CLIENT = '''
+      import io
+      import json as jsonlib
+      from wsgiref.headers import Headers
+      from wsgiref.util import setup_testing_defaults
+
+
+      class Antwort:
+          def __init__(self, status, headers, content):
+              self.status_code = int(status.split()[0])
+              self.headers = Headers(headers)
+              self.content = content
+
+          def json(self):
+              return jsonlib.loads(self.content)
+
+
+      class TestClient:
+          """Ruft eine WSGI-App im selben Prozess auf: kein Server, kein Netzwerk."""
+
+          __test__ = False  # für pytest keine Testklasse, obwohl der Name mit Test beginnt
+
+          def __init__(self, app):
+              self.app = app
+
+          def request(self, methode, pfad, *, json=None, content=b"", headers=None):
+              headers = dict(headers or {})
+              if json is not None:
+                  content = jsonlib.dumps(json).encode()
+                  headers.setdefault("Content-Type", "application/json")
+              pfad, _, query = pfad.partition("?")
+              environ = {
+                  "REQUEST_METHOD": methode,
+                  "SCRIPT_NAME": "",
+                  "PATH_INFO": pfad,
+                  "QUERY_STRING": query,
+                  "CONTENT_LENGTH": str(len(content)),
+                  "wsgi.input": io.BytesIO(content),
+              }
+              for name, wert in headers.items():
+                  schluessel = name.upper().replace("-", "_")
+                  if schluessel not in ("CONTENT_TYPE", "CONTENT_LENGTH"):
+                      schluessel = "HTTP_" + schluessel
+                  environ[schluessel] = wert
+              setup_testing_defaults(environ)
+              gestartet = {}
+
+              def start_response(status, response_headers, exc_info=None):
+                  gestartet["status"], gestartet["headers"] = status, response_headers
+
+              ergebnis = self.app(environ, start_response)
+              try:
+                  content = b"".join(ergebnis)
+              finally:
+                  if hasattr(ergebnis, "close"):
+                      ergebnis.close()
+              return Antwort(gestartet["status"], gestartet["headers"], content)
+
+          def get(self, pfad, **optionen):
+              return self.request("GET", pfad, **optionen)
+
+          def post(self, pfad, **optionen):
+              return self.request("POST", pfad, **optionen)
+      '''
+      MUTANTEN = {
+          "validierung": API.replace('problem(422, "ungueltige-reservierung"', 'problem(400, "ungueltige-reservierung"'),
+          "fremde": API.replace('if reservierung is None or reservierung["kunde_id"] != kunde["kunde_id"]:', "if reservierung is None:"),
+          "idempotenz": API.replace('gespeichert = self.idempotenz.get((kunde["kunde_id"], schluessel))', "gespeichert = None"),
+          "content_type": API.replace('return status, [("Content-Type", "application/problem+json")], body', "return status, [], body"),
+      }
+      assert all(m != API for m in MUTANTEN.values()), "Ein Mutant ist identisch mit der richtigen Version."
+      Path("buchung_api.py").write_text(API)
+      Path("testclient.py").write_text(CLIENT)
+
+
+      def lauf(api):
+          return run_pytest({"buchung_api.py": api, "testclient.py": CLIENT})
+    starter: |
+      import pytest
+      from buchung_api import BuchungsApi
+      from testclient import TestClient
+
+      ANNA = {"Authorization": "Bearer token-anna"}
+      BEN = {"Authorization": "Bearer token-ben"}
+
+
+      @pytest.fixture
+      def client():
+          return TestClient(BuchungsApi())
+
+
+      def test_anlegen(client):
+          ...
+    solution: |
+      import pytest
+      from buchung_api import BuchungsApi
+      from testclient import TestClient
+
+      ANNA = {"Authorization": "Bearer token-anna"}
+      BEN = {"Authorization": "Bearer token-ben"}
+
+
+      def reservierung(**abweichungen):
+          return {"rad_id": 7, "start": "2026-10-05T10:00:00+02:00", "ende": "2026-10-05T11:00:00+02:00"} | abweichungen
+
+
+      @pytest.fixture
+      def client():
+          return TestClient(BuchungsApi())
+
+
+      def pruefe_problem(antwort, status):
+          assert antwort.status_code == status
+          assert antwort.headers["Content-Type"] == "application/problem+json"
+          assert antwort.json()["status"] == status
+
+
+      def test_anlegen(client):
+          antwort = client.post("/reservierungen", json=reservierung(), headers=ANNA)
+          assert antwort.status_code == 201
+          assert antwort.headers["Location"] == f"/reservierungen/{antwort.json()['id']}"
+
+
+      @pytest.mark.parametrize(
+          "daten",
+          [reservierung(ende="2026-10-05T09:00:00+02:00"), reservierung(rad_id="sieben"), {"rad_id": 7}],
+          ids=["ende-vor-start", "falscher-typ", "felder-fehlen"],
+      )
+      def test_ungueltige_felder(client, daten):
+          antwort = client.post("/reservierungen", json=daten, headers=ANNA)
+          pruefe_problem(antwort, 422)
+          assert antwort.json()["fehler"]
+
+
+      def test_ohne_token(client):
+          antwort = client.get("/reservierungen/1")
+          pruefe_problem(antwort, 401)
+          assert antwort.headers["WWW-Authenticate"] == "Bearer"
+
+
+      def test_fremde_reservierung_wie_unbekannte(client):
+          neu = client.post("/reservierungen", json=reservierung(), headers=ANNA).json()
+          pruefe_problem(client.get(f"/reservierungen/{neu['id']}", headers=BEN), 404)
+          assert client.get(f"/reservierungen/{neu['id']}", headers=ANNA).status_code == 200
+
+
+      def test_wiederholung_mit_idempotency_key(client):
+          kopf = ANNA | {"Idempotency-Key": "c1f9"}
+          erste = client.post("/reservierungen", json=reservierung(), headers=kopf)
+          zweite = client.post("/reservierungen", json=reservierung(), headers=kopf)
+          assert (zweite.status_code, zweite.json()) == (erste.status_code, erste.json())
+          assert erste.status_code == 201
+    tests:
+      - name: Grün gegen die richtige API
+        code: |
+          ergebnis = lauf(API)
+          assert ergebnis.ok, ergebnis.output
+      - name: Fängt einen falschen Status bei Validierungsfehlern
+        code: |
+          ergebnis = lauf(MUTANTEN["validierung"])
+          assert not ergebnis.ok, "Deine Tests bleiben grün, obwohl ungültige Felder jetzt mit 400 statt 422 beantwortet werden."
+      - name: Fängt ein Leck bei fremden Reservierungen
+        code: |
+          ergebnis = lauf(MUTANTEN["fremde"])
+          assert not ergebnis.ok, "Deine Tests bleiben grün, obwohl Ben jetzt Annas Reservierungen lesen kann."
+      - name: Fängt einen ignorierten Idempotency-Key
+        code: |
+          ergebnis = lauf(MUTANTEN["idempotenz"])
+          assert not ergebnis.ok, "Deine Tests bleiben grün, obwohl eine Wiederholung mit demselben Idempotency-Key nicht mehr die erste Antwort liefert."
+      - name: Fängt einen Fehler im Fehlerformat
+        code: |
+          ergebnis = lauf(MUTANTEN["content_type"])
+          assert not ergebnis.ok, "Deine Tests bleiben grün, obwohl Fehlerantworten keinen Content-Type mehr haben."
+    hints:
+      - Schreib eine kleine Hilfsfunktion, die für eine Fehlerantwort Status, `Content-Type` und `status` im Body prüft, und nutze sie in jedem Fehlertest.
+      - Für fremde Reservierungen brauchst du zwei Nutzer – Anna legt an, Ben fragt ab.
+      - Für die Idempotenz schickst du dieselbe Anfrage mit demselben Schlüssel zweimal und vergleichst Status und Body beider Antworten.
+    explanation: |
+      Jeder Mutant bricht einen anderen Teil des Vertrags, und jeder Teil braucht einen eigenen Test. Validierung mit 400 statt 422 fällt nur auf, wenn ein Test den Status eines Validierungsfehlers prüft. Das Leck bei fremden Reservierungen zeigt nur ein Test mit zwei Nutzern; Tests mit einem Nutzer sind gegen diese Variante blind. Die ignorierte Idempotenz bemerkt nur eine Wiederholung mit demselben Schlüssel – hier antwortet die kaputte Version beim zweiten Mal mit 409, weil das Rad schon belegt ist. Und das Fehlerformat sichert eine kleine Hilfsfunktion ab, die in jedem Fehlertest den `Content-Type` prüft. Alle diese Tests laufen in-process und brauchen zusammen Millisekunden.
+    resources:
+      - title: RFC 9110 · Status Codes
+        url: https://www.rfc-editor.org/rfc/rfc9110.html#name-status-codes
+      - title: RFC 9457 · Problem Details
+        url: https://www.rfc-editor.org/rfc/rfc9457.html#name-the-problem-details-json-ob
+
+  - id: problem-assertion
+    type: code
+    title: Eine Assertion für Fehlerantworten
+    prompt: |
+      Damit nicht jeder API-Test dieselben vier Zeilen für Fehlerantworten wiederholt, bekommt die Testsuite eine Hilfsfunktion. Schreibe `pruefe_problem(antwort, status)`. `antwort` hat `status_code`, `headers` (Groß-/Kleinschreibung egal, ein fehlender Header ergibt `None`) und `json()` (wirft `ValueError`, wenn der Body kein JSON ist).
+
+      `pruefe_problem` wirft einen `AssertionError` mit verständlicher Meldung, wenn
+
+      - `antwort.status_code` nicht `status` ist,
+      - der Medientyp in `Content-Type` nicht `application/problem+json` ist oder der Header fehlt – Parameter wie `; charset=utf-8` sind erlaubt,
+      - der Body kein JSON-Objekt ist oder `type`, `title` oder `status` fehlen,
+      - `status` im Body nicht dem HTTP-Status entspricht.
+
+      Sonst gibt sie den Body als `dict` zurück, damit der Test weitere Felder prüfen kann. Andere Exceptions als `AssertionError` dürfen nicht nach außen dringen.
+    lang: python
+    setup: |
+      import json
+      from wsgiref.headers import Headers
+
+
+      class Antwort:
+          def __init__(self, status_code, headers, content):
+              self.status_code = status_code
+              self.headers = Headers(headers)
+              self.content = content
+
+          def json(self):
+              return json.loads(self.content)
+
+
+      def antwort(status, typ="application/problem+json", ohne=None, body_status=None, content=None):
+          body = {"type": "https://api.radwerk.example/probleme/x", "title": "Titel", "status": body_status or status, "detail": "…"}
+          body.pop(ohne, None)
+          headers = [] if typ is None else [("Content-Type", typ)]
+          return Antwort(status, headers, content if content is not None else json.dumps(body).encode())
+
+
+      def scheitert(fake, status):
+          try:
+              pruefe_problem(fake, status)
+          except AssertionError:
+              return True
+          except Exception as fehler:
+              return f"{type(fehler).__name__} statt AssertionError"
+          return False
+    starter: |
+      def pruefe_problem(antwort, status):
+          ...
+    solution: |
+      def pruefe_problem(antwort, status):
+          assert antwort.status_code == status, f"Status {antwort.status_code}, erwartet {status}"
+          medientyp = (antwort.headers["Content-Type"] or "").split(";")[0].strip()
+          assert medientyp == "application/problem+json", f"Content-Type {antwort.headers['Content-Type']!r}, erwartet application/problem+json"
+          try:
+              body = antwort.json()
+          except ValueError:
+              raise AssertionError("Body ist kein JSON") from None
+          assert isinstance(body, dict), f"Body ist kein JSON-Objekt: {body!r}"
+          fehlend = [feld for feld in ("type", "title", "status") if feld not in body]
+          assert not fehlend, f"Pflichtfelder fehlen: {fehlend}"
+          assert body["status"] == status, f"status im Body ist {body['status']}, HTTP-Status ist {status}"
+          return body
+    tests:
+      - name: Gibt den Body einer korrekten Fehlerantwort zurück
+        code: |
+          body = pruefe_problem(antwort(422), 422)
+          assert isinstance(body, dict) and body["status"] == 422, f"Erwartet wird der Body als dict, bekommen {body!r}"
+          body = pruefe_problem(antwort(409, typ="application/problem+json; charset=utf-8"), 409)
+          assert body["status"] == 409
+      - name: Bemerkt einen falschen Statuscode
+        code: |
+          ergebnis = scheitert(antwort(400), 422)
+          assert ergebnis is True, f"Antwort mit 400 bei erwartetem 422: {ergebnis or 'kein Fehler'}"
+      - name: Bemerkt einen falschen oder fehlenden Content-Type
+        code: |
+          ergebnis = scheitert(antwort(422, typ="application/json"), 422)
+          assert ergebnis is True, f"Content-Type application/json: {ergebnis or 'kein Fehler'}"
+          ergebnis = scheitert(antwort(422, typ=None), 422)
+          assert ergebnis is True, f"Ohne Content-Type-Header: {ergebnis or 'kein Fehler'}"
+      - name: Bemerkt fehlende Pflichtfelder und kaputtes JSON
+        code: |
+          for feld in ("type", "title", "status"):
+              ergebnis = scheitert(antwort(422, ohne=feld), 422)
+              assert ergebnis is True, f"Body ohne {feld}: {ergebnis or 'kein Fehler'}"
+          ergebnis = scheitert(antwort(422, content=b"<html>Fehler</html>"), 422)
+          assert ergebnis is True, f"HTML statt JSON: {ergebnis or 'kein Fehler'}"
+          ergebnis = scheitert(antwort(422, content=b"[1, 2]"), 422)
+          assert ergebnis is True, f"JSON-Liste statt Objekt: {ergebnis or 'kein Fehler'}"
+      - name: Bemerkt einen Widerspruch zwischen Body und HTTP-Status
+        code: |
+          ergebnis = scheitert(antwort(422, body_status=400), 422)
+          assert ergebnis is True, f"HTTP 422, im Body 400: {ergebnis or 'kein Fehler'}"
+    hints:
+      - Ein fehlender Header ist `None`. `None.split(";")` wirft `AttributeError` – fang das vorher ab.
+      - "`json()` wirft bei HTML einen `ValueError`. Wandle ihn mit `raise AssertionError(…) from None` um."
+      - Gib am Ende den Body zurück, damit Tests wie `pruefe_problem(antwort, 422)["fehler"]` möglich sind.
+    explanation: |
+      Eine eigene Assertion bündelt den Vertrag für Fehlerantworten an einer Stelle. Ändert Radwerk das Format, änderst du eine Funktion statt fünfzig Tests. Wichtig sind die Meldungen: `Status 400, erwartet 422` sagt im roten Testlauf sofort, was los ist. Ebenso wichtig ist, dass jeder Verstoß als `AssertionError` endet. Ein `AttributeError` aus `None.split` oder ein `JSONDecodeError` sähe im Report wie ein Fehler im Test aus, nicht wie ein Fehler der API. Liegt die Funktion in einem eigenen Hilfsmodul statt in `conftest.py`, schreibt pytest dessen `assert`s nur um, wenn du das Modul mit `pytest.register_assert_rewrite` anmeldest – sonst fehlen im Report die ausführlichen Vergleiche.
+    resources:
+      - title: pytest · Assertion rewriting in Hilfsmodulen
+        url: https://docs.pytest.org/en/stable/how-to/writing_plugins.html#assertion-rewriting
+      - title: RFC 9457 · Members of a Problem Details Object
+        url: https://www.rfc-editor.org/rfc/rfc9457.html#name-members-of-a-problem-detail
+
+  - id: testclient-bauen
+    type: code
+    title: Ein Testclient von innen
+    prompt: |
+      Ein In-Process-Testclient übersetzt eine HTTP-Anfrage in das `environ`-Dictionary einer WSGI-App. Schreibe `environ_fuer(methode, pfad, headers=None, body=b"")`:
+
+      - `REQUEST_METHOD` ist `methode`, `SCRIPT_NAME` ist `""`.
+      - `pfad` kann eine Query enthalten: `"/reservierungen?seite=2"` ergibt `PATH_INFO` `"/reservierungen"` und `QUERY_STRING` `"seite=2"`. Ohne `?` ist `QUERY_STRING` leer.
+      - `wsgi.input` ist ein `io.BytesIO` mit `body`, `CONTENT_LENGTH` die Länge als Text (`"2"`).
+      - Header-Namen sind ohne Rücksicht auf Groß- und Kleinschreibung gemeint. `Content-Type` wird zu `CONTENT_TYPE` (ohne Präfix), jeder andere Header zu `HTTP_` plus Name in Großbuchstaben mit `_` statt `-`, etwa `Idempotency-Key` zu `HTTP_IDEMPOTENCY_KEY`. Einen `Content-Length`-Header übergibt niemand, die Länge kommt aus `body`.
+      - Den Rest (`SERVER_NAME`, `wsgi.errors` …) ergänzt `wsgiref.util.setup_testing_defaults`.
+    lang: python
+    setup: |
+      import warnings
+      from wsgiref.validate import validator
+
+
+      def echo(environ, start_response):
+          start_response("200 OK", [("Content-Type", "text/plain")])
+          return [environ["wsgi.input"].read(int(environ.get("CONTENT_LENGTH") or 0))]
+
+
+      def durch_validator(environ):
+          with warnings.catch_warnings():
+              warnings.simplefilter("error")
+              ergebnis = validator(echo)(environ, lambda status, headers, exc_info=None: None)
+              try:
+                  return b"".join(ergebnis)
+              finally:
+                  ergebnis.close()
+    starter: |
+      import io
+      from wsgiref.util import setup_testing_defaults
+
+
+      def environ_fuer(methode, pfad, headers=None, body=b""):
+          ...
+    solution: |
+      import io
+      from wsgiref.util import setup_testing_defaults
+
+
+      def environ_fuer(methode, pfad, headers=None, body=b""):
+          pfad, _, query = pfad.partition("?")
+          environ = {
+              "REQUEST_METHOD": methode,
+              "SCRIPT_NAME": "",
+              "PATH_INFO": pfad,
+              "QUERY_STRING": query,
+              "CONTENT_LENGTH": str(len(body)),
+              "wsgi.input": io.BytesIO(body),
+          }
+          for name, wert in (headers or {}).items():
+              schluessel = name.upper().replace("-", "_")
+              if schluessel != "CONTENT_TYPE":
+                  schluessel = "HTTP_" + schluessel
+              environ[schluessel] = wert
+          setup_testing_defaults(environ)
+          return environ
+    tests:
+      - name: Methode, Pfad und Query
+        code: |
+          environ = environ_fuer("GET", "/reservierungen?seite=2")
+          assert environ["REQUEST_METHOD"] == "GET"
+          assert environ["PATH_INFO"] == "/reservierungen", f"PATH_INFO ist {environ.get('PATH_INFO')!r}"
+          assert environ["QUERY_STRING"] == "seite=2", f"QUERY_STRING ist {environ.get('QUERY_STRING')!r}"
+          assert environ_fuer("GET", "/reservierungen/17")["QUERY_STRING"] == ""
+      - name: Header landen unter den richtigen Schlüsseln
+        code: |
+          environ = environ_fuer("POST", "/reservierungen", {"Authorization": "Bearer token-anna", "idempotency-key": "c1f9", "content-type": "application/json"})
+          assert environ.get("HTTP_AUTHORIZATION") == "Bearer token-anna"
+          assert environ.get("HTTP_IDEMPOTENCY_KEY") == "c1f9", "Idempotency-Key gehört nach HTTP_IDEMPOTENCY_KEY"
+          assert environ.get("CONTENT_TYPE") == "application/json", "Content-Type gehört nach CONTENT_TYPE"
+          assert "HTTP_CONTENT_TYPE" not in environ, "PEP 3333 verbietet HTTP_CONTENT_TYPE"
+      - name: Der Body ist lesbar und die Länge stimmt
+        code: |
+          environ = environ_fuer("POST", "/reservierungen", {"Content-Type": "application/json"}, b'{"rad_id": 7}')
+          assert environ["CONTENT_LENGTH"] == "13", f"CONTENT_LENGTH ist {environ.get('CONTENT_LENGTH')!r}"
+          assert environ["wsgi.input"].read() == b'{"rad_id": 7}'
+      - name: Das environ besteht wsgiref.validate
+        code: |
+          environ = environ_fuer("POST", "/reservierungen?x=1", {"Content-Type": "application/json", "Authorization": "Bearer t"}, b"{}")
+          assert durch_validator(environ) == b"{}"
+          assert durch_validator(environ_fuer("GET", "/reservierungen/17")) == b""
+    hints:
+      - "`str.partition(\"?\")` liefert Teil vor dem `?`, das `?` selbst und den Rest – auch dann, wenn es kein `?` gibt."
+      - Wandle den Namen erst in Großbuchstaben mit `_` um und entscheide dann, ob `HTTP_` davorkommt.
+      - "`setup_testing_defaults(environ)` ergänzt nur fehlende Schlüssel. Ruf es am Ende auf."
+    explanation: |
+      Genau das tun die Testclients von Flask und Starlette im Kern: Sie bauen aus einer Anfrage das, was sonst der Server aus dem Netzwerk liest, und rufen die App direkt auf. Deshalb sind In-Process-Tests schnell und deterministisch. Es zeigt auch ihre Grenze: Alles, was der echte Server tut – HTTP parsen, Header-Größen begrenzen, TLS, Proxy-Header –, kommt im Test nicht vor. `wsgiref.validate` prüft das `environ` gegen PEP 3333; es fängt zum Beispiel `HTTP_CONTENT_TYPE` und eine Zahl statt Text in `CONTENT_LENGTH`. Ein Testclient mit solchen Fehlern lässt Tests grün werden, die mit einem echten Server rot wären.
+    resources:
+      - title: PEP 3333 · environ Variables
+        url: https://peps.python.org/pep-3333/#environ-variables
+      - title: Python · wsgiref.validate
+        url: https://docs.python.org/3/library/wsgiref.html#module-wsgiref.validate
+
+  - id: idempotenz-schluessel
+    type: bug
+    title: Ben bekommt Annas Buchung
+    prompt: |
+      Ältere Versionen der Android-App erzeugen den `Idempotency-Key` aus einem Zähler, der bei jeder Installation bei `1` beginnt. Seit dem Release mit dieser Klasse melden Kunden zwei Dinge: Ben bucht mit Schlüssel `1` zufällig dasselbe Rad zur selben Zeit wie Anna gestern und bekommt 201 mit Annas Reservierung zurück. Mit anderen Daten bekommt er 422 „Schlüssel schon verwendet“, obwohl er den Schlüssel nie benutzt hat. Finde und korrigiere die fehlerhaften Zeilen.
+    lang: python
+    code: |
+      class Idempotenz:
+          def __init__(self):
+              self.gesehen = {}
+
+          def ausfuehren(self, kunde_id, schluessel, anfrage, aktion):
+              eintrag = self.gesehen.get(schluessel)
+              if eintrag is not None:
+                  fruehere_anfrage, ergebnis = eintrag
+                  if fruehere_anfrage != anfrage:
+                      return (422, "Schlüssel schon verwendet")
+                  return ergebnis
+              ergebnis = aktion()
+              self.gesehen[schluessel] = (anfrage, ergebnis)
+              return ergebnis
+    lines: [6, 13]
+    fix:
+      - line: 6
+        answers:
+          - "eintrag = self.gesehen.get((kunde_id, schluessel))"
+          - "eintrag = self.gesehen.get((schluessel, kunde_id))"
+      - line: 13
+        answers:
+          - "self.gesehen[(kunde_id, schluessel)] = (anfrage, ergebnis)"
+          - "self.gesehen[kunde_id, schluessel] = (anfrage, ergebnis)"
+          - "self.gesehen[(schluessel, kunde_id)] = (anfrage, ergebnis)"
+          - "self.gesehen[schluessel, kunde_id] = (anfrage, ergebnis)"
+    explanation: |
+      Der Speicher kennt nur den Schlüssel, nicht den Kunden. Zwei Kunden mit demselben Schlüssel teilen sich deshalb einen Eintrag: Bei gleichem Body bekommt Ben Annas gespeicherte Antwort – ein Datenleck –, bei anderem Body einen falschen 422. Laut Internet-Draft legt der Betreiber der API fest, in welchem Rahmen ein Schlüssel eindeutig sein muss, und empfiehlt UUIDs. Ein Zähler ab 1 hält sich nicht daran, aber darauf darf sich der Server nicht verlassen: Radwerk trennt die Schlüssel pro Kunde, und beide Zeilen müssen dasselbe Tupel nutzen. Der Test, der das gefunden hätte, braucht zwei Kunden mit demselben Schlüssel – derselbe Gedanke wie beim Test für fremde Ressourcen.
+    resources:
+      - title: IETF · Idempotency-Key, Uniqueness of Idempotency Key
+        url: https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/
+
+  - id: test-zu-streng
+    type: code
+    title: Ein Test, der jede Textänderung bestraft
+    prompt: |
+      Ein Kollege hat in `buchung_api.py` den `detail`-Text der Validierungsfehler umformuliert und ein Feld `instance` ergänzt. Clients sind davon nicht betroffen, trotzdem wurde der Test im Editor rot: Er vergleicht die komplette Antwort.
+
+      Was Radwerk für eine Reservierung mit `ende` vor `start` verspricht: Status 422, `Content-Type: application/problem+json`, im Body `status` gleich dem HTTP-Status und eine Liste `fehler`, deren einziger Eintrag `feld` = `"ende"` hat. `type` und `title` sind vorhanden. Texte (`title`, `detail`, `meldung`) gehören nicht zum Vertrag, neue Felder dürfen dazukommen.
+
+      `TestClient` und `BuchungsApi` funktionieren wie in der Übung „Tests, die einen Vertragsbruch bemerken“. Schreibe den Test so um, dass er bei harmlosen Änderungen grün bleibt und bei Vertragsbrüchen rot wird.
+    lang: python
+    setup: |
+      from pathlib import Path
+
+      API = '''
+      import json
+      from datetime import datetime
+      from http import HTTPStatus
+
+      TOKENS = {
+          "token-anna": {"kunde_id": 1, "rechte": {"lesen", "buchen"}},
+          "token-ben": {"kunde_id": 2, "rechte": {"lesen", "buchen"}},
+          "token-anna-lesen": {"kunde_id": 1, "rechte": {"lesen"}},
+      }
+      PROBLEME = "https://api.radwerk.example/probleme/"
+
+
+      def problem(status, typ, titel, detail, **erweiterungen):
+          body = {"type": PROBLEME + typ, "title": titel, "status": status, "detail": detail, **erweiterungen}
+          return status, [("Content-Type", "application/problem+json")], body
+
+
+      def json_antwort(status, body, headers=()):
+          return status, [("Content-Type", "application/json"), *headers], body
+
+
+      def zeitpunkt(wert):
+          if not isinstance(wert, str):
+              return None
+          try:
+              ergebnis = datetime.fromisoformat(wert)
+          except ValueError:
+              return None
+          return ergebnis if ergebnis.tzinfo is not None else None
+
+
+      def pruefe(daten):
+          if not isinstance(daten, dict):
+              return [{"feld": "", "meldung": "Erwartet wird ein JSON-Objekt."}]
+          fehler = []
+          rad_id = daten.get("rad_id")
+          if not isinstance(rad_id, int) or isinstance(rad_id, bool) or rad_id < 1:
+              fehler.append({"feld": "rad_id", "meldung": "Erwartet wird eine positive ganze Zahl."})
+          start, ende = zeitpunkt(daten.get("start")), zeitpunkt(daten.get("ende"))
+          if start is None:
+              fehler.append({"feld": "start", "meldung": "Erwartet wird ein Zeitpunkt nach ISO 8601 mit Zeitzone."})
+          if ende is None:
+              fehler.append({"feld": "ende", "meldung": "Erwartet wird ein Zeitpunkt nach ISO 8601 mit Zeitzone."})
+          if start and ende and ende <= start:
+              fehler.append({"feld": "ende", "meldung": "Das Ende muss nach dem Start liegen."})
+          return fehler
+
+
+      def oeffentlich(reservierung):
+          return {
+              "id": reservierung["id"],
+              "rad_id": reservierung["rad_id"],
+              "start": reservierung["start"].isoformat(),
+              "ende": reservierung["ende"].isoformat(),
+          }
+
+
+      class BuchungsApi:
+          """WSGI-App: GET /reservierungen/<id> und POST /reservierungen. Jede Instanz beginnt leer."""
+
+          def __init__(self):
+              self.reservierungen = {}
+              self.idempotenz = {}
+              self.naechste_id = 1
+
+          def __call__(self, environ, start_response):
+              status, headers, body = self.verarbeite(environ)
+              daten = json.dumps(body).encode()
+              start_response(f"{status} {HTTPStatus(status).phrase}", [*headers, ("Content-Length", str(len(daten)))])
+              return [daten]
+
+          def verarbeite(self, environ):
+              token = environ.get("HTTP_AUTHORIZATION", "").removeprefix("Bearer ")
+              kunde = TOKENS.get(token)
+              if kunde is None:
+                  status, headers, body = problem(401, "nicht-angemeldet", "Nicht angemeldet", "Ein gültiges Bearer-Token fehlt.")
+                  return status, [*headers, ("WWW-Authenticate", "Bearer")], body
+              methode, pfad = environ["REQUEST_METHOD"], environ["PATH_INFO"]
+              if methode == "POST" and pfad == "/reservierungen":
+                  return self.anlegen(environ, kunde)
+              if methode == "GET" and pfad.startswith("/reservierungen/"):
+                  return self.lesen(pfad.removeprefix("/reservierungen/"), kunde)
+              return problem(404, "nicht-gefunden", "Nicht gefunden", f"{methode} {pfad} gibt es nicht.")
+
+          def lesen(self, kennung, kunde):
+              reservierung = self.reservierungen.get(int(kennung)) if kennung.isdigit() else None
+              if reservierung is None or reservierung["kunde_id"] != kunde["kunde_id"]:
+                  return problem(404, "nicht-gefunden", "Nicht gefunden", f"Es gibt keine Reservierung {kennung}.")
+              return json_antwort(200, oeffentlich(reservierung))
+
+          def anlegen(self, environ, kunde):
+              if "buchen" not in kunde["rechte"]:
+                  return problem(403, "keine-berechtigung", "Keine Berechtigung", "Dieses Token darf nur lesen.")
+              medientyp = environ.get("CONTENT_TYPE", "").split(";")[0].strip()
+              if medientyp != "application/json":
+                  return problem(415, "falscher-medientyp", "Falscher Medientyp", "Erwartet wird application/json.")
+              roh = environ["wsgi.input"].read(int(environ.get("CONTENT_LENGTH") or 0))
+              try:
+                  daten = json.loads(roh)
+              except ValueError:
+                  return problem(400, "kein-json", "Kein gültiges JSON", "Der Body ließ sich nicht als JSON lesen.")
+              schluessel = environ.get("HTTP_IDEMPOTENCY_KEY")
+              if schluessel is None:
+                  return self.neue_reservierung(daten, kunde)
+              gespeichert = self.idempotenz.get((kunde["kunde_id"], schluessel))
+              if gespeichert is not None:
+                  fruehere_daten, ergebnis = gespeichert
+                  if fruehere_daten != daten:
+                      return problem(422, "idempotency-key", "Idempotency-Key schon verwendet",
+                                     "Derselbe Schlüssel kam mit einem anderen Body.")
+                  return ergebnis
+              ergebnis = self.neue_reservierung(daten, kunde)
+              self.idempotenz[(kunde["kunde_id"], schluessel)] = (daten, ergebnis)
+              return ergebnis
+
+          def neue_reservierung(self, daten, kunde):
+              fehler = pruefe(daten)
+              if fehler:
+                  return problem(422, "ungueltige-reservierung", "Ungültige Reservierung",
+                                 "Mindestens ein Feld ist ungültig.", fehler=fehler)
+              rad_id, start, ende = daten["rad_id"], zeitpunkt(daten["start"]), zeitpunkt(daten["ende"])
+              for andere in self.reservierungen.values():
+                  if andere["rad_id"] == rad_id and andere["start"] < ende and start < andere["ende"]:
+                      return problem(409, "rad-belegt", "Rad belegt", f"Rad {rad_id} ist in diesem Zeitraum schon reserviert.")
+              reservierung = {"id": self.naechste_id, "kunde_id": kunde["kunde_id"], "rad_id": rad_id, "start": start, "ende": ende}
+              self.reservierungen[reservierung["id"]] = reservierung
+              self.naechste_id += 1
+              return json_antwort(201, oeffentlich(reservierung), [("Location", f"/reservierungen/{reservierung['id']}")])
+      '''
+      CLIENT = '''
+      import io
+      import json as jsonlib
+      from wsgiref.headers import Headers
+      from wsgiref.util import setup_testing_defaults
+
+
+      class Antwort:
+          def __init__(self, status, headers, content):
+              self.status_code = int(status.split()[0])
+              self.headers = Headers(headers)
+              self.content = content
+
+          def json(self):
+              return jsonlib.loads(self.content)
+
+
+      class TestClient:
+          """Ruft eine WSGI-App im selben Prozess auf: kein Server, kein Netzwerk."""
+
+          __test__ = False  # für pytest keine Testklasse, obwohl der Name mit Test beginnt
+
+          def __init__(self, app):
+              self.app = app
+
+          def request(self, methode, pfad, *, json=None, content=b"", headers=None):
+              headers = dict(headers or {})
+              if json is not None:
+                  content = jsonlib.dumps(json).encode()
+                  headers.setdefault("Content-Type", "application/json")
+              pfad, _, query = pfad.partition("?")
+              environ = {
+                  "REQUEST_METHOD": methode,
+                  "SCRIPT_NAME": "",
+                  "PATH_INFO": pfad,
+                  "QUERY_STRING": query,
+                  "CONTENT_LENGTH": str(len(content)),
+                  "wsgi.input": io.BytesIO(content),
+              }
+              for name, wert in headers.items():
+                  schluessel = name.upper().replace("-", "_")
+                  if schluessel not in ("CONTENT_TYPE", "CONTENT_LENGTH"):
+                      schluessel = "HTTP_" + schluessel
+                  environ[schluessel] = wert
+              setup_testing_defaults(environ)
+              gestartet = {}
+
+              def start_response(status, response_headers, exc_info=None):
+                  gestartet["status"], gestartet["headers"] = status, response_headers
+
+              ergebnis = self.app(environ, start_response)
+              try:
+                  content = b"".join(ergebnis)
+              finally:
+                  if hasattr(ergebnis, "close"):
+                      ergebnis.close()
+              return Antwort(gestartet["status"], gestartet["headers"], content)
+
+          def get(self, pfad, **optionen):
+              return self.request("GET", pfad, **optionen)
+
+          def post(self, pfad, **optionen):
+              return self.request("POST", pfad, **optionen)
+      '''
+      HARMLOS = API.replace(
+          '"Mindestens ein Feld ist ungültig.", fehler=fehler)',
+          '"Bitte prüfe die markierten Felder.", instance="/reservierungen", fehler=fehler)',
+      )
+      MUTANTEN = {
+          "status": API.replace('problem(422, "ungueltige-reservierung"', 'problem(400, "ungueltige-reservierung"'),
+          "feld": API.replace('{"feld": "ende", "meldung": "Das Ende muss nach dem Start liegen."}', '{"feld": "start", "meldung": "Das Ende muss nach dem Start liegen."}'),
+          "medientyp": API.replace('[("Content-Type", "application/problem+json")]', '[("Content-Type", "application/json")]'),
+      }
+      assert HARMLOS != API, "Die harmlose Änderung hat nichts geändert."
+      assert all(m != API for m in MUTANTEN.values()), "Ein Mutant ist identisch mit der richtigen Version."
+      Path("buchung_api.py").write_text(API)
+      Path("testclient.py").write_text(CLIENT)
+
+
+      def lauf(api):
+          return run_pytest({"buchung_api.py": api, "testclient.py": CLIENT})
+    starter: |
+      from buchung_api import BuchungsApi
+      from testclient import TestClient
+
+      ANNA = {"Authorization": "Bearer token-anna"}
+
+
+      def test_ende_vor_start_wird_abgelehnt():
+          client = TestClient(BuchungsApi())
+          antwort = client.post(
+              "/reservierungen",
+              json={"rad_id": 7, "start": "2026-10-05T11:00:00+02:00", "ende": "2026-10-05T10:00:00+02:00"},
+              headers=ANNA,
+          )
+          assert antwort.status_code == 422
+          assert antwort.json() == {
+              "type": "https://api.radwerk.example/probleme/ungueltige-reservierung",
+              "title": "Ungültige Reservierung",
+              "status": 422,
+              "detail": "Mindestens ein Feld ist ungültig.",
+              "fehler": [{"feld": "ende", "meldung": "Das Ende muss nach dem Start liegen."}],
+          }
+    solution: |
+      from buchung_api import BuchungsApi
+      from testclient import TestClient
+
+      ANNA = {"Authorization": "Bearer token-anna"}
+
+
+      def test_ende_vor_start_wird_abgelehnt():
+          client = TestClient(BuchungsApi())
+          antwort = client.post(
+              "/reservierungen",
+              json={"rad_id": 7, "start": "2026-10-05T11:00:00+02:00", "ende": "2026-10-05T10:00:00+02:00"},
+              headers=ANNA,
+          )
+          assert antwort.status_code == 422
+          assert antwort.headers["Content-Type"] == "application/problem+json"
+          problem = antwort.json()
+          assert problem["status"] == 422
+          assert {"type", "title"} <= problem.keys()
+          assert [fehler["feld"] for fehler in problem["fehler"]] == ["ende"]
+    tests:
+      - name: Grün gegen die aktuelle API
+        code: |
+          ergebnis = lauf(API)
+          assert ergebnis.ok, ergebnis.output
+      - name: Grün nach der harmlosen Änderung
+        code: |
+          ergebnis = lauf(HARMLOS)
+          assert ergebnis.ok, "Dein Test schlägt bei einer Änderung an, die kein Client bemerkt (neuer detail-Text, zusätzliches Feld).\n" + ergebnis.output
+      - name: Fängt einen falschen Status
+        code: |
+          ergebnis = lauf(MUTANTEN["status"])
+          assert not ergebnis.ok, "Dein Test bleibt grün, obwohl die API jetzt 400 statt 422 liefert."
+      - name: Fängt ein falsch gemeldetes Feld
+        code: |
+          ergebnis = lauf(MUTANTEN["feld"])
+          assert not ergebnis.ok, "Dein Test bleibt grün, obwohl die API das falsche Feld als fehlerhaft meldet."
+      - name: Fängt einen falschen Medientyp
+        code: |
+          ergebnis = lauf(MUTANTEN["medientyp"])
+          assert not ergebnis.ok, "Dein Test bleibt grün, obwohl Fehler jetzt als application/json statt application/problem+json kommen."
+    hints:
+      - Ersetze den Vergleich des ganzen Bodys durch einzelne Prüfungen für die Teile, die zum Vertrag gehören.
+      - Für `fehler` reicht die Liste der Feldnamen. Die Meldung ist Text für Menschen.
+      - Der Medientyp steht im Header, nicht im Body.
+    explanation: |
+      Der alte Test vergleicht alles und prüft trotzdem zu wenig: Den Medientyp sieht er nicht, weil der im Header steht. Gleichzeitig schlägt er bei jeder Textänderung an. Der neue Test prüft genau den Vertrag: Status, Medientyp, `status` im Body, Pflichtfelder und das gemeldete Feld. Neue Felder wie `instance` und neue Texte lässt er durch. So ein Test bleibt grün, solange Clients nichts bemerken, und wird rot, sobald sie etwas bemerken würden. Das ist das Kriterium für jeden API-Test.
+    resources:
+      - title: Martin Fowler · TolerantReader
+        url: https://martinfowler.com/bliki/TolerantReader.html
+      - title: RFC 9457 · Extension Members
+        url: https://www.rfc-editor.org/rfc/rfc9457.html#name-extension-members
+
+  - id: overrides-erklaeren
+    type: explain
+    title: Was dieser FastAPI-Test beweist – und was nicht
+    prompt: |
+      Diese Fixture steht in den Handler-Tests des Radwerk-Backends. Erkläre, was ein Test mit ihr wirklich prüft, was er nicht prüft und warum `clear()` am Ende steht.
+    lang: python
+    code: |
+      import pytest
+      from fastapi.testclient import TestClient
+
+      from radwerk.api import Kunde, aktueller_kunde, app, get_repo
+      from radwerk.fakes import InMemoryReservierungen
+
+
+      @pytest.fixture
+      def client():
+          repo = InMemoryReservierungen()
+          app.dependency_overrides[get_repo] = lambda: repo
+          app.dependency_overrides[aktueller_kunde] = lambda: Kunde(id=1, rechte={"lesen", "buchen"})
+          with TestClient(app) as client:
+              yield client
+          app.dependency_overrides.clear()
+
+
+      def test_anlegen_liefert_location(client):
+          daten = {"rad_id": 7, "start": "2026-10-05T10:00:00+02:00", "ende": "2026-10-05T11:00:00+02:00"}
+          antwort = client.post("/reservierungen", json=daten)
+          assert antwort.status_code == 201
+          assert antwort.headers["location"] == f"/reservierungen/{antwort.json()['id']}"
+    points:
+      - Der echte Handler läuft – Routing, Validierung des Bodys, Statuscode, Header und Serialisierung werden geprüft; nur Repository und angemeldeter Kunde sind ersetzt.
+      - Das Fake-Repository macht den Test schnell und unabhängig von der Datenbank; SQL und Constraints prüft er nicht, die brauchen eigene Repository-Tests.
+      - Weil `aktueller_kunde` ersetzt ist, läuft keine Token-Prüfung; 401 und 403 brauchen Tests ohne diesen Override.
+      - "`dependency_overrides` hängt am App-Objekt und gilt global; ohne `clear()` sickern die Ersetzungen in andere Tests und machen sie reihenfolgeabhängig."
+    explanation: |
+      Der Test schickt einen echten Request durch die FastAPI-App. Routing, Pydantic-Validierung, Statuscode 201, `Location`-Header und JSON-Serialisierung sind echt. Ersetzt sind nur zwei Abhängigkeiten: Statt PostgreSQL liefert `get_repo` ein In-Memory-Fake, und statt das Token zu prüfen, liefert `aktueller_kunde` fest Kundin 1 mit allen Rechten. Das macht den Test schnell und fokussiert auf die HTTP-Schicht. Es heißt aber auch: Ob das SQL stimmt, zeigt dieser Test nicht, und ob ein Request ohne Token 401 bekommt, ebenso wenig. Für beides braucht es eigene Tests – Repository-Tests gegen die Datenbank und ein paar Handler-Tests ohne den Override für `aktueller_kunde`. `dependency_overrides` ist ein Dictionary am App-Objekt, das alle Tests teilen. Ohne `clear()` liefe der nächste Test, der die echte Authentifizierung prüfen will, mit Kundin 1 und wäre je nach Reihenfolge grün oder rot. `with TestClient(app)` sorgt zusätzlich dafür, dass Startup- und Shutdown-Code der App (Lifespan) läuft.
+    resources:
+      - title: FastAPI · Testing Dependencies with Overrides
+        url: https://fastapi.tiangolo.com/advanced/testing-dependencies/#use-the-app-dependency-overrides-attribute
+      - title: FastAPI · Testing Events (Lifespan)
+        url: https://fastapi.tiangolo.com/advanced/testing-events/
+
+  - id: ebene-waehlen
+    type: choice
+    title: Sieben Tage im Voraus – wo testest du das?
+    prompt: |
+      Neue Regel im Buchungsservice: Eine Reservierung darf höchstens 7 Tage im Voraus beginnen. Sonst antwortet `POST /reservierungen` mit 422 und `fehler` für das Feld `start`. Wie verteilst du die Tests?
+    options:
+      - text: Grenzfälle (genau 7 Tage, eine Sekunde mehr, Start in der Vergangenheit) als Unit-Tests des Services mit fester Uhr; dazu ein API-Test, dass die Ablehnung als 422 mit Problem Details ankommt.
+        correct: true
+        why: Die Grenzen sind Fachlogik und laufen ohne HTTP in Millisekunden. Die HTTP-Schicht braucht nur einen Fall, denn ihre Übersetzung in 422 ist für alle Grenzfälle dieselbe.
+      - text: Alle Grenzfälle als API-Tests mit dem Testclient, damit die HTTP-Schicht mitgetestet wird.
+        correct: false
+        why: Die HTTP-Schicht wird dadurch nicht besser getestet, nur öfter. Die Suite wird langsamer, und ein Fehler in der Regel zeigt sich in vielen Tests gleichzeitig.
+      - text: Ein einziger API-Test mit einer Reservierung 8 Tage im Voraus.
+        correct: false
+        why: Er findet keine Grenzfehler wie `>` statt `>=`. Genau dort entstehen die Fehler in Datumsregeln.
+      - text: Unit-Tests, die `datetime.now()` benutzen und daraus Starttermine berechnen, damit die Tests realistisch sind.
+        correct: false
+        why: Mit der echten Uhr wandert die Grenze während des Laufs; Tests genau an der Grenze werden flaky. Die Regel bekommt die Uhr als Parameter, der Test eine feste Zeit.
+    explanation: |
+      Teste jedes Risiko auf der niedrigsten Ebene, die es zuverlässig zeigt. Die 7-Tage-Regel ist eine Rechnung mit Zeitpunkten – das gehört in Unit-Tests mit fester Uhr, und zwar mit allen Grenzen. Die HTTP-Schicht hat ein anderes Risiko: dass der Fehler falsch übersetzt wird, etwa als 500 oder ohne `fehler`. Dafür reicht ein Test. Wie du die Uhr austauschbar machst, zeigt [Testbarkeit durch Design](/testing/testbares-design).
+    resources:
+      - title: Martin Fowler · The Practical Test Pyramid
+        url: https://martinfowler.com/articles/practical-test-pyramid.html
+
+  - id: teststrategie-stornieren
+    type: practice
+    title: Testplan für das Stornieren
+    prompt: |
+      Neuer Endpunkt `DELETE /reservierungen/<id>`. Regeln:
+
+      - Nur eigene Reservierungen; fremde und unbekannte ergeben 404.
+      - Stornieren geht nur vor Beginn der Reservierung (halboffen `[start, ende)`: ab `start` läuft sie). Sonst 409.
+      - Erfolg: 204 ohne Body. Der Service veranlasst dann über den Zahlungsdienst Paystream die Erstattung.
+      - Ein zweites `DELETE` auf dieselbe Reservierung ergibt 404.
+
+      Schreibe einen Testplan: welche Fälle, auf welcher Ebene (Service mit Fakes und fester Uhr, Repository gegen die Datenbank, HTTP mit Testclient) und warum dort. Notiere auch, was du bewusst **nicht** über HTTP testest.
+    lang: text
+    solution: |
+      Service (Unit-Tests, Fake-Repository, Fake-Paystream, feste Uhr)
+      - eine Sekunde vor start -> storniert, Erstattung genau einmal mit dem richtigen Betrag
+      - genau start -> abgelehnt ("läuft schon"), keine Erstattung
+      - fremde Reservierung -> "nicht gefunden", keine Erstattung
+      - Paystream wirft einen Fehler -> definiertes Verhalten (z. B. Storno bleibt, Erstattung wird erneut versucht)
+
+      Repository (gegen die Datenbank)
+      - löscht/markiert nur die eine Zeile, andere Reservierungen desselben Rads bleiben
+
+      HTTP (Testclient, je ein Fall pro Antwortart)
+      - eigene, zukünftige Reservierung -> 204, leerer Body
+      - fremde Reservierung -> 404, gleiche Antwort wie unbekannte ID
+      - ohne Token -> 401 mit WWW-Authenticate
+      - laufende Reservierung -> 409 mit Problem Details
+      - zweites DELETE -> 404
+
+      Nicht über HTTP: Zeitgrenzen, Erstattungsbetrag, Paystream-Fehlerfälle.
+      Ob Paystream unsere Anfrage versteht, sichert ein Contract Test ab.
+    checklist:
+      - Die Zeitgrenze testest du im Service mit fester Uhr, einschließlich „genau zum Start“ (dann läuft die Reservierung schon).
+      - Paystream ist im Service-Test ein Fake, und du prüfst, dass die Erstattung genau einmal und nur bei Erfolg ausgelöst wird.
+      - Über HTTP steht je Antwortart ein Test – 204 ohne Body, 404 für fremd wie für unbekannt, 401, 409 als Problem Details –, keine Wiederholung der Zeitgrenzen.
+      - Du testest das zweite `DELETE` und begründest, warum 404 dazu passt, dass `DELETE` idempotent ist.
+      - Du nennst, was Paystream-Tests auf dieser Ebene nicht zeigen (dass der echte Dienst die Anfrage akzeptiert) und wo das hingehört.
+    explanation: |
+      `DELETE` ist nach RFC 9110 idempotent, weil die *Wirkung* einer Wiederholung dieselbe ist: Die Reservierung ist weg. Der Statuscode darf sich unterscheiden, 204 beim ersten, 404 beim zweiten Mal. Die Erstattung ist der teure Nebeneffekt; ein Fake mit Aufrufliste zeigt, dass sie genau einmal passiert. Die Grenze „ab `start` läuft sie“ ist dieselbe halboffene Logik wie bei Überschneidungen und braucht einen Test genau auf dem Startzeitpunkt. Ob Paystream die Anfrage wirklich versteht, zeigt kein Fake – dafür gibt es [Contract Testing](/testing/contract-testing).
+    resources:
+      - title: RFC 9110 · DELETE
+        url: https://www.rfc-editor.org/rfc/rfc9110.html#name-delete
+      - title: RFC 9110 · 204 No Content
+        url: https://www.rfc-editor.org/rfc/rfc9110.html#name-204-no-content

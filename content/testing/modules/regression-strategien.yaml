@@ -1,0 +1,1063 @@
+id: regression-strategien
+title: Regressionsstrategien
+level: 3
+minutes: 150
+summary: Damit ein behobener Fehler behoben bleibt – reproduzierende Tests auf der richtigen Ebene, Golden Master vor dem Umbau, gezielte Testauswahl, Coverage und Mutation Testing als Prüfung der Tests und ein Sicherheitsnetz nach dem Release.
+goals:
+  - Du schreibst zu jedem Bug zuerst einen Test, der aus dem richtigen Grund rot wird, und wählst dafür die niedrigste Ebene, auf der der Fehler zuverlässig auftritt.
+  - Du hältst das Verhalten von Altcode mit Characterization Tests und einem Golden Master fest und kennst die Schwächen von Snapshot-Tests.
+  - Du entscheidest, welche Tests pro Pull Request, nach dem Merge und nachts laufen, und wählst Tests nach geänderten Dateien aus, ohne blinde Flecken zu übersehen.
+  - Du liest Line-, Branch- und Diff-Coverage richtig und nutzt Coverage als Lückenfinder statt als Ziel.
+  - Du deutest überlebende Mutanten aus mutmut und schreibst Tests, die sie töten.
+  - Du ordnest Smoke Tests, Canary Releases, Feature Flags und Monitoring als Sicherheitsnetz nach dem Release ein und machst aus einem Post-Mortem neue Tests.
+resources:
+  - title: coverage.py · Branch coverage measurement
+    url: https://coverage.readthedocs.io/en/latest/branch.html
+  - title: mutmut · Python mutation tester
+    url: https://mutmut.readthedocs.io/en/latest/
+  - title: pytest · Working with custom markers
+    url: https://docs.pytest.org/en/stable/example/markers.html
+  - title: Google SRE Workbook · Canarying Releases
+    url: https://sre.google/workbook/canarying-releases/
+lesson: |
+  Im März beschwert sich eine Kundin aus Leipzig über ihre Rechnung. Am 14. März ist sie um 0:30 Uhr losgefahren, vier Stunden durch die Nacht, mittags noch einmal fünf Stunden. Der Tageshöchstpreis für das City-Rad liegt bei 15 Euro, abgebucht wurden 27 Euro. Die Ursache ist schnell gefunden: Die Startzeiten kommen in UTC aus der Datenbank, und der Code ordnet die Nachtfahrt dem UTC-Kalendertag zu, dem 13. März. Der Fix ist eine Zeile. Ein halbes Jahr später baut jemand die Preisberechnung um, und derselbe Fehler ist wieder da, diesmal bei allen Nachtfahrten eines Wochenendes.
+
+  Niemand hat schlampig gearbeitet. Es gab nur keinen Test, der den Fehler vom März festhielt. Eine **Regression** ist genau das: Etwas hat funktioniert und geht durch eine Änderung kaputt. Dieses Modul behandelt die Werkzeuge dagegen: einen Test zu jedem Bug, das Festhalten von Altverhalten vor einem Umbau, die Auswahl der Tests für schnelle Rückmeldung, Coverage und Mutation Testing als Prüfung der Tests selbst und ein Sicherheitsnetz nach dem Release für alles, was trotzdem durchrutscht.
+
+  ## Vom Bug zum reproduzierenden Test
+
+  Ein gemeldeter Bug ist ein Testfall, den jemand anderes für dich gefunden hat. Die Reihenfolge ist deshalb fest: erst ein Test, der rot wird, dann der Fix. Wer zuerst repariert und danach testet, weiß nicht, ob der Test den Fehler überhaupt bemerkt hätte.
+
+  Die erste Entscheidung ist die Ebene. Es gilt die Regel aus [Testpyramide und Testgrenzen](/testing/testpyramide): Teste auf der niedrigsten Ebene, auf der der Fehler noch zuverlässig auftritt. Dafür musst du wissen, *wo* er entsteht, nicht wo er sichtbar wurde. Die Kundin hat ihn auf der Rechnung gesehen; entstanden ist er in der Funktion, die Fahrten Kalendertagen zuordnet. Ein Unit-Test dieser Funktion zeigt ihn in Millisekunden. Läge die Zuordnung in einer SQL-Abfrage, bräuchtest du einen [Integrationstest](/testing/integrationstests) gegen PostgreSQL, denn nur die echte Datenbank führt die Abfrage aus. Ein End-to-End-Test über Website und Zahlungsanbieter zeigt den Fehler auch, aber langsam, mit vielen möglichen Gründen für ein Rot und nur für den einen Fall, den er durchklickt.
+
+  ```python pytest fails
+  from datetime import UTC, date, datetime
+  from zoneinfo import ZoneInfo
+
+  BERLIN = ZoneInfo("Europe/Berlin")
+  TAGESHOECHSTPREIS = 1500  # City-Rad, Cent je Kalendertag in Berlin
+
+
+  def fahrpreis(minuten: int) -> int:
+      return 0 if minuten <= 5 else -(-minuten // 30) * 150
+
+
+  def tageskosten(fahrten: list[tuple[datetime, int]]) -> dict[date, int]:
+      summen: dict[date, int] = {}
+      for start, minuten in fahrten:
+          tag = start.date()  # Startzeit kommt in UTC aus der Datenbank
+          summen[tag] = summen.get(tag, 0) + fahrpreis(minuten)
+      return {tag: min(summe, TAGESHOECHSTPREIS) for tag, summe in summen.items()}
+
+
+  def test_rw412_fahrt_nach_mitternacht_zaehlt_zum_berliner_tag():
+      nachts = datetime(2026, 3, 13, 23, 30, tzinfo=UTC)  # 0:30 Uhr in Berlin, 14. März
+      mittags = datetime(2026, 3, 14, 11, 0, tzinfo=UTC)
+      kosten = tageskosten([(nachts, 240), (mittags, 300)])
+      assert kosten == {date(2026, 3, 14): 1500}
+  ```
+
+  Der Test scheitert aus dem richtigen Grund: pytest meldet einen zusätzlichen Eintrag `{datetime.date(2026, 3, 13): 1200}`, die Nachtfahrt ist beim Vortag gelandet. Ein Rot wegen eines Tippfehlers im Import würde nichts beweisen. Wichtig sind die Testdaten: Sie kommen in UTC, genau wie in Produktion. Mit `tzinfo=BERLIN` wäre der Test auch mit dem Fehler grün, weil `.date()` dann schon den Berliner Tag liefert. Danach folgt der Fix:
+
+  ```diff
+  -        tag = start.date()  # Startzeit kommt in UTC aus der Datenbank
+  +        tag = start.astimezone(BERLIN).date()
+  ```
+
+  Zwei Schritte gehören noch dazu. Der Testname beschreibt das Verhalten und nennt das Ticket; wer den Test in zwei Jahren löschen will, findet so den Grund. Und du suchst nach Geschwistern: Wo ruft der Code noch `.date()` auf einem UTC-Zeitpunkt auf? Ein Bug ist meist eine Fehlerklasse, kein Einzelfall. Wie du einen roten Test eingrenzt, wenn die Ursache nicht offensichtlich ist, zeigt [Fehlgeschlagene Tests debuggen](/testing/tests-debuggen).
+
+  > [!TIP] Rot sehen, auch wenn der Fix schon steht
+  > Hast du zuerst repariert, nimm den Fix für einen Lauf zurück (`git stash push src/`) und sieh den Test scheitern. Im Pull Request hilft die Reihenfolge der Commits: erst der Test, dann der Fix. Reviewer können dann den ersten Commit auschecken und das Rot selbst sehen.
+
+  ## Characterization Tests und Golden Master für Altcode
+
+  Anderer Fall: Die Preiszeilen der Rechnung erzeugt Code von 2019. Er hat keine Tests, und niemand weiß genau, welche Regeln er umsetzt. Er soll umgebaut werden. Eine Spezifikation, gegen die du testen könntest, gibt es nicht. Es gibt aber das heutige Verhalten, und darauf verlassen sich Kundschaft und Buchhaltung.
+
+  Ein **Characterization Test** (Begriff von Michael Feathers, [Characterization Testing](https://michaelfeathers.silvrback.com/characterization-testing)) hält fest, was Code *tut*, nicht was er tun *soll*. Du rufst ihn auf, trägst das Ergebnis als Erwartung ein und hast ein Netz für den Umbau: Jede Abweichung ist entweder beabsichtigt oder ein Fehler beim Refactoring. Für Code mit vielen Eingabekombinationen skaliert das als **Golden Master**. Du erzeugst systematisch viele Eingaben, speicherst die gesamte Ausgabe einmal als genehmigten Stand und vergleichst jeden Lauf damit. Wo du die Nahtstellen für solche Tests im Altcode findest, steht in [Testbarkeit durch Design](/testing/testbares-design).
+
+  ```python pytest
+  import itertools
+
+
+  def preis_text(minuten, rad, plus):
+      """Altcode aus der Rechnungsstellung von 2019: keine Tests, keine Doku."""
+      if minuten <= 5:
+          return "0,00 EUR (Fehlstart)"
+      takt = 300 if rad == "E-Bike" else 150
+      if plus and rad == "City-Rad":
+          minuten -= 30
+      cent = max(0, -(-minuten // 30) * takt)
+      return f"{cent // 100},{cent % 100:02d} EUR"
+
+
+  def golden_master():
+      faelle = itertools.product([5, 6, 31], ["City-Rad", "E-Bike"], [False, True])
+      return "\n".join(
+          f"{minuten:>2} min {rad:<8} {'Plus' if plus else '-   '} {preis_text(minuten, rad, plus)}"
+          for minuten, rad, plus in faelle
+      )
+
+
+  # Einmal erzeugt, Zeile für Zeile gelesen, dann genehmigt.
+  # RW-388: Plus wirkt bei E-Bikes nicht – bekannter Fehler, eigener Fix nach dem Umbau.
+  GENEHMIGT = """\
+   5 min City-Rad -    0,00 EUR (Fehlstart)
+   5 min City-Rad Plus 0,00 EUR (Fehlstart)
+   5 min E-Bike   -    0,00 EUR (Fehlstart)
+   5 min E-Bike   Plus 0,00 EUR (Fehlstart)
+   6 min City-Rad -    1,50 EUR
+   6 min City-Rad Plus 0,00 EUR
+   6 min E-Bike   -    3,00 EUR
+   6 min E-Bike   Plus 3,00 EUR
+  31 min City-Rad -    3,00 EUR
+  31 min City-Rad Plus 1,50 EUR
+  31 min E-Bike   -    6,00 EUR
+  31 min E-Bike   Plus 6,00 EUR"""
+
+
+  def test_preis_text_verhaelt_sich_wie_vor_dem_umbau():
+      # Zeilenweise vergleichen: pytest nennt dann die erste abweichende Zeile.
+      assert golden_master().splitlines() == GENEHMIGT.splitlines()
+  ```
+
+  Zwei Dinge fallen auf. Erstens bestimmen die Eingaben, was der Golden Master bemerkt. `itertools.product` erzeugt jede Kombination aus Grenzwerten (5 und 6 Minuten für den Fehlstart, 31 für die zweite halbe Stunde), Radtyp und Abo. Eine einzelne Beispielrechnung hätte die meisten Zweige nie erreicht. Ändere in `preis_text` den Vergleich `rad == "E-Bike"` in `rad == "E-bike"` und führe den Block aus: pytest meldet `At index 6 diff` mit der ersten verschobenen Zeile, alt und neu nebeneinander. Den vollständigen Diff zeigt `pytest -vv` auf deinem Rechner. Zweitens hält der Golden Master auch Fehler fest. Die Zeilen für E-Bike mit Plus zeigen, dass der Altcode die 30 Freiminuten nur beim City-Rad abzieht, obwohl Radwerk Plus für jede Fahrt gilt. Beim Umbau bleibt das so. Der Fehler bekommt ein eigenes Ticket und einen eigenen Pull Request; sonst mischt sich Refactoring mit Verhaltensänderung, und niemand kann den Diff mehr prüfen.
+
+  Werkzeuge nehmen dir die Dateiverwaltung ab. [ApprovalTests.Python](https://github.com/approvals/ApprovalTests.Python) schreibt die Ausgabe in eine `.received.txt`, vergleicht sie mit der `.approved.txt` und öffnet bei Abweichung ein Diff-Werkzeug; Genehmigen heißt, die empfangene Datei zur genehmigten zu machen. Snapshot-Tests mit [syrupy](https://syrupy-project.github.io/syrupy/#cli-options) speichern den erwarteten Wert unter `__snapshots__/`, `pytest --snapshot-update` schreibt ihn neu. inline-snapshot trägt den Wert direkt in den Testcode ein (`snapshot('…')`). Dasselbe gibt es für Komponenten in Vitest, siehe [Frontend-Tests](/testing/frontend-tests).
+
+  Die Schwächen sind überall gleich. Zeitstempel, IDs und die Reihenfolge von Mengen machen Snapshots instabil; dagegen helfen Scrubber, die solche Werte vor dem Vergleich ersetzen (syrupy nennt sie Matcher). Große Snapshots liest niemand. Und ein Snapshot sagt nur „anders als vorher“, nie „falsch“.
+
+  > [!WARNING] Blind genehmigte Snapshots
+  > Ein Pull Request ändert drei Zeilen Code und 400 Zeilen Snapshots. Die CI ist grün, weil der Autor `--snapshot-update` ausgeführt hat. Damit ist der Test gelöscht, nur unauffälliger. Snapshot-Diffs liest du wie Code. Sind sie dafür zu groß, sind die Snapshots zu groß: Teile sie in kleine, benannte Fälle, oder ersetze sie nach dem Umbau durch gezielte Assertions.
+
+  ## Testauswahl: welche Tests wann laufen
+
+  Eine Suite, die bei jedem Pull Request 25 Minuten braucht, wird umgangen. Entwickler bündeln Änderungen, damit sie seltener warten; Reviewer mergen, bevor die CI fertig ist. Schnelle Rückmeldung ist selbst eine Qualitätseigenschaft (mehr dazu in [Tests in der CI](/testing/ci-pipelines)). Tests zu löschen hilft nicht. Du entscheidest stattdessen, welche Tests wann laufen.
+
+  Das gröbste Werkzeug sind Marker. Langsame Tests und solche, die PostgreSQL brauchen, bekommen ein Etikett, und der Lauf filtert danach ([pytest · Registering markers](https://docs.pytest.org/en/stable/example/markers.html#registering-markers)):
+
+  ```toml title=pyproject.toml
+  [tool.pytest]  # seit pytest 9; ältere Versionen: [tool.pytest.ini_options]
+  strict_markers = true
+  markers = [
+      "slow: dauert länger als eine Sekunde, läuft nach dem Merge und nachts",
+      "integration: braucht PostgreSQL",
+  ]
+  ```
+
+  ```console
+  $ pytest -m "not slow and not integration"
+  ============================= test session starts ==============================
+  platform linux -- Python 3.14.7, pytest-9.0.2, pluggy-1.6.0
+  rootdir: /home/jana/radwerk
+  configfile: pyproject.toml
+  collected 5 items / 2 deselected / 3 selected
+
+  tests/test_buchung.py .                                                  [ 33%]
+  tests/test_tarif.py ..                                                   [100%]
+
+  ======================= 3 passed, 2 deselected in 0.08s ========================
+  ```
+
+  `strict_markers` macht einen Tippfehler wie `@pytest.mark.slwo` zum Fehler beim Sammeln. Ohne die Option gibt es nur eine Warnung, und der Test läuft still in jedem Pull Request mit.
+
+  Feiner ist die Auswahl nach geänderten Dateien. Pfadregeln ordnen `src/radwerk/tarif.py` den Tests in `tests/test_tarif.py` zu. Werkzeuge messen die Abhängigkeiten stattdessen: [pytest-testmon](https://testmon.org/) zeichnet mit coverage.py auf, welcher Test welchen Code ausführt, und wählt beim nächsten `pytest --testmon` nur die Tests aus, deren Code sich geändert hat. Lokal wiederholt `pytest --lf` nur die zuletzt fehlgeschlagenen Tests.
+
+  Jede Auswahl hat blinde Flecken. testmon kennt nur Python-Code, den die Tests ausgeführt haben: Eine geänderte Tariftabelle in JSON, eine SQL-Migration oder eine neue Umgebungsvariable in der CI sieht es nicht. Pfadregeln vergessen gern `conftest.py` und `pyproject.toml`. Zwei Regeln halten die Lücke klein: Was die Auswahl nicht zuordnen kann, löst den vollen Lauf aus. Und irgendwo läuft regelmäßig die ganze Suite.
+
+  | Wann | Was läuft | Ziel |
+  | --- | --- | --- |
+  | lokal beim Arbeiten | betroffene Tests, `--lf`, `-k` | Rückmeldung in Sekunden |
+  | jeder Pull Request | Unit- und Integrationstests ohne `slow`, Diff-Coverage | unter zehn Minuten |
+  | nach dem Merge auf `main` | die ganze Suite inklusive `slow` und Golden Master | nichts bleibt ungeprüft |
+  | nachts | lange Hypothesis-Läufe, Mutation Testing geänderter Module | Lücken finden, ohne den Tag zu bremsen |
+
+  > [!PRAXIS] So teilt Radwerk die Suite auf
+  > Der Pull-Request-Lauf dauert sechs Minuten: Unit-Tests, Integrationstests gegen PostgreSQL im Service-Container und Diff-Coverage über die geänderten Zeilen. Nach dem Merge läuft alles, 19 Minuten, inklusive Golden Master der Rechnungen. Nachts prüft mutmut die Module, die sich am Tag geändert haben. Ein roter Lauf nach dem Merge oder in der Nacht meldet sich im Team-Channel und hat am Morgen Vorrang vor neuen Features. Ohne diese Regel gewöhnt sich das Team an Rot.
+
+  ## Coverage richtig lesen: Line, Branch und Diff
+
+  Coverage misst, welcher Code beim Testlauf ausgeführt wurde. [coverage.py](https://coverage.readthedocs.io/en/latest/branch.html#how-to-measure-branch-coverage) kennt zwei Maße: **Line Coverage** zählt ausgeführte Zeilen, **Branch Coverage** zusätzlich, ob jede mögliche Verzweigung einmal genommen wurde. Der Unterschied zeigt sich an dieser Tariffunktion mit Abo:
+
+  ```python title=src/radwerk/tarif.py
+  def fahrpreis(minuten: int, plus: bool = False) -> int:
+      """City-Rad: 150 Cent je angefangene 30 Minuten, bis 5 Minuten gratis, mit Plus die ersten 30 Minuten frei."""
+      if minuten <= 5:
+          return 0
+      if plus:
+          minuten = max(0, minuten - 30)
+      return -(-minuten // 30) * 150
+  ```
+
+  Die Suite hat zwei Tests: `fahrpreis(5) == 0` und `fahrpreis(45, plus=True) == 150`. In der `pyproject.toml` steht `source = ["src"]` unter `[tool.coverage.run]`, deshalb fehlen die Testdateien im Bericht.
+
+  ```console
+  $ coverage run -m pytest -q
+  ..                                                                       [100%]
+  2 passed in 0.08s
+  $ coverage report -m
+  Name                      Stmts   Miss  Cover   Missing
+  -------------------------------------------------------
+  src/radwerk/__init__.py       0      0   100%
+  src/radwerk/tarif.py          6      0   100%
+  -------------------------------------------------------
+  TOTAL                         6      0   100%
+  $ coverage run --branch -m pytest -q
+  ..                                                                       [100%]
+  2 passed in 0.08s
+  $ coverage report -m
+  Name                      Stmts   Miss Branch BrPart  Cover   Missing
+  ---------------------------------------------------------------------
+  src/radwerk/__init__.py       0      0      0      0   100%
+  src/radwerk/tarif.py          6      0      4      1    90%   5->7
+  ---------------------------------------------------------------------
+  TOTAL                         6      0      4      1    90%
+  ```
+
+  Jede Zeile lief, Line Coverage meldet 100 %. Branch Coverage findet eine halbe Verzweigung (`BrPart`): `5->7` heißt, der Sprung von Zeile 5 (`if plus:`) direkt zu Zeile 7 (`return`) kam nie vor. Jeder Test, der am Fehlstart vorbeikam, hatte `plus=True`. Der häufigste Fall überhaupt, eine normale Fahrt ohne Abo, ist ungetestet. Line Coverage konnte das nicht zeigen, weil das `if` keinen `else`-Zweig mit eigener Zeile hat, die rot bleiben könnte. Die 90 % entstehen aus Anweisungen und Sprüngen zusammen: (6 + 4 − 1) / 10. Schalte Branch Coverage deshalb immer ein (`branch = true` unter `[tool.coverage.run]`).
+
+  Für einen Pull Request ist die Gesamtzahl kaum aussagekräftig. Ob 2 000 Zeilen zu 84 oder 85 % abgedeckt sind, sagt nichts über die 30 Zeilen, die gerade neu sind. **Diff-Coverage** misst nur die geänderten Zeilen. [diff-cover](https://github.com/Bachmann1234/diff_cover) vergleicht dafür den Coverage-Bericht mit `git diff`. Hier hat ein Branch den E-Bike-Tarif ergänzt (`if rad == "E-Bike": takt = 300`):
+
+  ```console
+  $ coverage xml -q
+  $ diff-cover coverage.xml --compare-branch=main
+  -------------
+  Diff Coverage
+  Diff: main...HEAD, staged and unstaged changes
+  -------------
+  src/radwerk/tarif.py (80.0%): Missing lines 8
+  -------------
+  Total:   5 lines
+  Missing: 1 line
+  Coverage: 80%
+  -------------
+  ```
+
+  Zeile 8 ist `takt = 300`: Kein Test fährt E-Bike. Mit `--fail-under=90` bricht der Job ab, und genau dieser Hinweis landet im Review. Der [Google Testing Blog](https://testing.googleblog.com/2020/08/code-coverage-best-practices.html) empfiehlt diese Richtung: keine Vorgabe von oben für das ganze Projekt, dafür eine Untergrenze für neuen Code und das Gespräch über konkrete ungetestete Zeilen im Review.
+
+  Coverage als Ziel scheitert an Goodharts Gesetz: Sobald eine Kennzahl zum Ziel wird, taugt sie nicht mehr als Messung. Ein Test ohne `assert` erhöht die Coverage genauso wie ein guter. Unter einer 90-%-Vorgabe entstehen Tests für Getter und Logzeilen, während die Tarifgrenze bei 31 Minuten ungeprüft bleibt. Ein `fail_under` in der Konfiguration ist als Untergrenze gegen schleichenden Verfall sinnvoll, nicht als Zahl, die jemand erreichen soll.
+
+  > [!MERKE]
+  > Coverage zeigt, was sicher ungetestet ist. Was getestet ist, zeigt sie nicht: Ausgeführt heißt nicht geprüft.
+
+  > [!INTERVIEW] „Was hältst du von 100 % Coverage als Ziel?“
+  > Ich nutze Coverage als Lückenfinder, nicht als Ziel. Eine nicht ausgeführte Zeile ist sicher ungetestet, das ist wertvoll. Eine ausgeführte Zeile kann trotzdem ungeprüft sein, weil kein Assert den Fehler bemerken würde. Wird die Zahl zum Ziel, entstehen genau solche Tests. Ich messe Branch Coverage, setze eine Untergrenze für geänderte Zeilen im Pull Request und schaue mir die ungetesteten Zeilen im Review an. Ob die Tests etwas taugen, prüfe ich für kritischen Code mit Mutation Testing.
+
+  ## Mutation Testing: Tests auf die Probe stellen
+
+  Mutation Testing beantwortet die Frage, die Coverage offenlässt: Würde die Suite einen Fehler in dieser Zeile bemerken? Ein Werkzeug erzeugt **Mutanten**, Kopien des Codes mit je einer kleinen Änderung: `<=` wird `<`, `30` wird `31`, `False` wird `True`. Gegen jeden Mutanten laufen die Tests. Wird einer rot, ist der Mutant **getötet**. Bleiben alle grün, hat er **überlebt**, und dir fehlt ein Test. Der Mutation Score ist der Anteil getöteter Mutanten. Das Prinzip passt in wenige Zeilen:
+
+  ```python run
+  TARIF = """
+  def fahrpreis(minuten):
+      if minuten <= 5:
+          return 0
+      return -(-minuten // 30) * 150
+  """
+
+  MUTANTEN = {
+      "<= wird <": TARIF.replace("<= 5", "< 5"),
+      "5 wird 6": TARIF.replace("<= 5", "<= 6"),
+      "30 wird 31": TARIF.replace("// 30", "// 31"),
+      "return 0 wird return 1": TARIF.replace("return 0", "return 1"),
+  }
+
+
+  def suite(fahrpreis):
+      assert fahrpreis(3) == 0
+      assert fahrpreis(45) == 300
+
+
+  for name, quelle in MUTANTEN.items():
+      namensraum = {}
+      exec(quelle, namensraum)
+      try:
+          suite(namensraum["fahrpreis"])
+          print(f"überlebt  {name}")
+      except AssertionError:
+          print(f"getötet   {name}")
+  ```
+
+  Die Suite prüft typische Werte und tötet nur den plumpen Mutanten. Die drei Überlebenden sagen dir genau, welche Tests fehlen: 5 Minuten, 6 Minuten, 31 Minuten. Ergänze die drei Asserts in `suite` und führe den Block erneut aus.
+
+  Für ein ganzes Projekt übernimmt [mutmut](https://mutmut.readthedocs.io/en/latest/#workflow) das. mutmut 3 braucht `fork`, läuft also unter Linux, macOS oder in WSL. Es führt pro Mutant nur die Tests aus, die die mutierte Funktion aufrufen. Für die Tariffunktion mit Abo und ihre zwei Tests von oben erzeugt es 18 Mutanten, 13 tötet die Suite:
+
+  ```console
+  $ mutmut run
+  …
+  $ mutmut results
+      radwerk.tarif.x_fahrpreis__mutmut_1: survived
+      radwerk.tarif.x_fahrpreis__mutmut_3: survived
+      radwerk.tarif.x_fahrpreis__mutmut_10: survived
+      radwerk.tarif.x_fahrpreis__mutmut_12: survived
+      radwerk.tarif.x_fahrpreis__mutmut_17: survived
+  $ mutmut show radwerk.tarif.x_fahrpreis__mutmut_3
+  # radwerk.tarif.x_fahrpreis__mutmut_3: survived
+  --- src/radwerk/tarif.py
+  +++ src/radwerk/tarif.py
+  @@ -1,6 +1,6 @@
+   def fahrpreis(minuten: int, plus: bool = False) -> int:
+       """City-Rad: 150 Cent je angefangene 30 Minuten, bis 5 Minuten gratis, mit Plus die ersten 30 Minuten frei."""
+  -    if minuten <= 5:
+  +    if minuten <= 6:
+           return 0
+       if plus:
+           minuten = max(0, minuten - 30)
+  ```
+
+  Die anderen vier Überlebenden ändern den Standardwert zu `plus: bool = True`, `max(0, …)` zu `max(1, …)`, `minuten - 30` zu `minuten - 31` und `// 30` zu `// 31`. Jeder ist eine Frage an die Suite. `plus=True` überlebt, weil kein Test eine normale Fahrt ohne Abo bezahlt – dieselbe Lücke, die Branch Coverage gefunden hat, nur deutlicher. `max(1, …)` überlebt, weil keine Plus-Fahrt unter 30 Minuten geprüft wird. Die übrigen drei, `<= 6`, `- 31` und `// 31`, sind fehlende Grenzwerte: 6 Minuten, 61 Minuten mit Abo, 31 Minuten ohne.
+
+  Nicht jeder Überlebende ist eine Lücke. Ein **äquivalenter Mutant** verhält sich wie das Original, etwa `summe < 1500` → `summe <= 1500` in `summe if summe < 1500 else 1500`: Bei genau 1500 liefern beide 1500. Kein Test kann ihn töten. Du markierst die Zeile mit `# pragma: no mutate` und gehst weiter. Auch der Mutation Score taugt deshalb nicht als Ziel.
+
+  Mutation Testing kostet Laufzeit: einen Testlauf pro Mutant. Lass es nachts laufen oder nur für geänderte Module (`mutmut run "radwerk.tarif*"`), und zwar dort, wo ein Fehler Geld kostet. Für TypeScript gibt es Stryker, für Kotlin und Java PIT.
+
+  > [!NOTE] Die Code-Übungen dieses Kurses
+  > Die Übungen, in denen du Tests schreibst, prüfen genau so: Deine Tests laufen gegen die richtige Implementierung und gegen ausgewählte Mutanten. Bleibt ein Mutant grün, fehlt dir ein Test.
+
+  ## Nach dem Release: Smoke Tests, Canary Releases, Feature Flags und Monitoring
+
+  Tests zeigen, dass Fehler da sind, nie, dass keine da sind. Was trotzdem in Produktion ankommt, soll früh auffallen und wenige Leute treffen. Dafür gibt es vier Werkzeuge, die zusammenarbeiten.
+
+  Ein **Smoke Test** prüft direkt nach dem Deployment, ob die neue Version überhaupt lebt: Antwortet die API, rechnet die Preisauskunft, kann sich ein Testkonto anmelden? Er ist bewusst klein und läuft gegen die echte Umgebung. Schlägt er fehl, rollt die Pipeline zurück.
+
+  ```python
+  import os
+
+  import httpx
+  import pytest
+
+  BASIS = os.environ["SMOKE_BASE_URL"]  # zum Beispiel https://api.radwerk.example
+
+  pytestmark = pytest.mark.smoke
+
+
+  def test_api_antwortet():
+      antwort = httpx.get(f"{BASIS}/health", timeout=5)
+      assert antwort.status_code == 200
+
+
+  def test_preisauskunft_rechnet_wie_vor_dem_release():
+      antwort = httpx.get(f"{BASIS}/tarife/city-rad/preis", params={"minuten": 31}, timeout=5)
+      assert antwort.status_code == 200
+      assert antwort.json()["preis_cent"] == 300
+  ```
+
+  Ein **Canary Release** gibt die neue Version zuerst einem kleinen Teil des Verkehrs, etwa 5 % der Buchungen oder einer Stadt. Das Team vergleicht Kennzahlen von Canary und alter Version: Fehlerrate, Latenz, bei Radwerk auch den Durchschnittspreis pro Fahrt. Weicht der Canary ab, wird er zurückgenommen, bevor alle betroffen sind ([SRE Workbook · Selecting and evaluating metrics](https://sre.google/workbook/canarying-releases/#selecting-and-evaluating-metrics)).
+
+  Ein **Feature Flag** trennt Deployment und Freischaltung. Die neue Preisberechnung geht ausgeschaltet in Produktion, wird für Mitarbeitende eingeschaltet, dann für 10 % der Kundschaft. Ein Fehler ist mit einem Schalter behoben, ohne neues Deployment. Der Preis: Jedes Flag verdoppelt die Zustände. Solange es existiert, testest du beide Pfade, und nach dem Rollout baust du es aus ([Feature Toggles · Validation Complexity](https://martinfowler.com/articles/feature-toggles.html#FeatureTogglesIntroduceValidationComplexity)).
+
+  **Monitoring und Alerting** sind das Netz für alles, was die drei anderen übersehen. Alarme auf Symptome, die Kundschaft spürt, sind wertvoller als auf Ursachen: Buchungen pro Stunde, Anteil fehlgeschlagener Zahlungen, 5xx-Rate. Ein Smoke Test, der alle fünf Minuten läuft, heißt synthetisches Monitoring.
+
+  Kommt doch ein Fehler durch, schreibt das Team ein **Post-Mortem**: Ablauf, Auswirkung, Ursachen, Maßnahmen, ohne Schuldzuweisung ([Google SRE · Postmortem Culture](https://sre.google/sre-book/postmortem-culture/#googles-postmortem-philosophy)). Jede Maßnahme muss überprüfbar sein. „Sorgfältiger testen“ ist keine Maßnahme. Ein reproduzierender Test auf der niedrigsten Ebene ist eine, ebenso ein Alarm, der den Fehler früher gemeldet hätte, oder eine Canary-Kennzahl, die ihn gestoppt hätte.
+
+  ## Häufige Fehler
+
+  - **Fix ohne Test oder Test nach dem Fix.** Der Test war nie rot und beweist nichts. Erst rot sehen, dann reparieren.
+  - **Testdaten, die den Fehler nicht auslösen.** Der Regressionstest nutzt Berliner Zeit, Produktion liefert UTC – grün mit und ohne Bug. Daten so aufbauen, wie sie in Produktion ankommen.
+  - **Regressionstest auf der falschen Ebene.** Ein Rechenfehler, abgesichert durch einen End-to-End-Test: langsam, unscharf, und nur ein einziger Fall. Die Ebene folgt dem Ort, an dem der Fehler entsteht.
+  - **Snapshots blind aktualisieren.** `--snapshot-update` ohne den Diff zu lesen löscht den Test. Snapshots klein halten und wie Code reviewen.
+  - **Golden Master mit schwachen Eingaben.** Ein einziger Beispielfall erreicht die meisten Zweige nicht. Eingaben systematisch aus Grenzwerten und Kombinationen erzeugen.
+  - **Testauswahl ohne vollen Lauf.** Eine geänderte JSON-Datei oder `conftest.py` löst keinen Test aus, und der Fehler fällt erst in Produktion auf. Unbekanntes löst alles aus, und nach dem Merge läuft die ganze Suite.
+  - **Coverage als Ziel.** Tests ohne Assertions für die Quote. Branch Coverage messen, Diff-Coverage im Pull Request, Lücken im Review besprechen.
+  - **Feature Flags, die bleiben.** Nach einem Jahr kennt niemand mehr alle Kombinationen. Flags mit Ablaufdatum anlegen und nach dem Rollout ausbauen.
+
+  ## Zusammenfassung
+
+  - Zu jedem Bug zuerst ein Test, der aus dem richtigen Grund rot wird, auf der niedrigsten Ebene, auf der der Fehler zuverlässig auftritt; danach nach derselben Fehlerklasse an anderen Stellen suchen.
+  - Characterization Tests und Golden Master halten Altverhalten vor einem Umbau fest, auch dessen Fehler. Ihre Stärke hängt an den Eingaben, ihre Schwäche ist das blinde Genehmigen.
+  - Marker, Auswahl nach geänderten Dateien und `--lf` machen Rückmeldung schnell. Was die Auswahl nicht zuordnen kann, löst den vollen Lauf aus, und nach dem Merge läuft alles.
+  - Branch Coverage findet Lücken, die Line Coverage verdeckt; Diff-Coverage bewertet die Zeilen eines Pull Requests. Coverage zeigt Ungetestetes, nicht Geprüftes.
+  - Mutation Testing prüft die Tests: Jeder überlebende Mutant ist ein fehlender Test oder ein äquivalenter Mutant.
+  - Nach dem Release begrenzen Smoke Tests, Canary Releases, Feature Flags und Monitoring den Schaden. Ein Post-Mortem endet mit überprüfbaren Maßnahmen, mindestens einem neuen Test.
+exercises:
+  - id: ebene-fuer-den-regressionstest
+    type: choice
+    title: Wo gehört der Test hin?
+    prompt: |
+      Ticket RW-430: Kundinnen mit Radwerk Plus zahlen bei E-Bike-Fahrten die ersten 30 Minuten mit. Die Ursache liegt in `fahrpreis(minuten, rad, plus)`, einer reinen Python-Funktion ohne Datenbankzugriff. Website und Android-App zeigen den Preis an, den die Buchungs-API liefert; die API ruft `fahrpreis` auf.
+
+      Auf welcher Ebene schreibst du den reproduzierenden Test?
+    options:
+      - text: Unit-Test für `fahrpreis` mit einer E-Bike-Fahrt mit Plus, etwa 45 Minuten
+        correct: true
+        why: Der Fehler entsteht vollständig in dieser Funktion. Ein Unit-Test zeigt ihn in Millisekunden, scheitert aus genau einem Grund und lässt sich für Grenzwerte (31, 60, 61 Minuten) parametrisieren.
+      - text: End-to-End-Test, der in der App eine E-Bike-Fahrt bucht und den angezeigten Preis prüft
+        correct: false
+        why: Er zeigt den Fehler auch, aber langsam und mit vielen anderen möglichen Gründen für ein Rot (Login, Netzwerk, UI). Für einen Rechenfehler ist das die teuerste Ebene, und sie prüft nur einen Fall.
+      - text: API-Test, der `GET /tarife/e-bike/preis?minuten=45&plus=true` aufruft
+        correct: false
+        why: Die API reicht den Wert nur durch. Ein API-Test lohnt sich für Validierung und Antwortformat, hier würde er dieselbe Rechnung über eine zusätzliche Schicht prüfen.
+      - text: Integrationstest gegen PostgreSQL mit einer gespeicherten Fahrt
+        correct: false
+        why: Die Datenbank spielt für diesen Fehler keine Rolle. Ein Integrationstest wäre nötig, wenn die Berechnung in SQL steckte.
+    explanation: |
+      Die Ebene folgt dem Ort, an dem der Fehler entsteht, nicht dem Ort, an dem er sichtbar wurde. Eine reine Funktion ohne Abhängigkeiten testest du direkt. Höhere Ebenen sind für Risiken da, die erst an einer Grenze entstehen: SQL in der Datenbank, das Antwortformat der API, das Zusammenspiel im Browser. Wer jeden Bug mit einem End-to-End-Test absichert, baut sich eine langsame und unzuverlässige Suite.
+    resources:
+      - title: Martin Fowler · The Practical Test Pyramid – Avoid Test Duplication
+        url: https://martinfowler.com/articles/practical-test-pyramid.html#AvoidTestDuplication
+
+  - id: netz-nach-dem-release
+    type: choice
+    title: Was hätte den Schaden begrenzt?
+    prompt: |
+      Release 2026.10.2 enthält eine neue Preisberechnung. In Produktion zeigt sich: Bei rund 2 % der Fahrten, nämlich E-Bike-Fahrten über Mitternacht, wird der doppelte Preis abgebucht. Die Suite war grün, der Smoke Test nach dem Deployment auch.
+
+      Welche Maßnahmen hätten den Schaden **begrenzt**? Mehrere Antworten sind richtig.
+    options:
+      - text: Ein Canary Release für eine Stadt, das den Durchschnittspreis pro Fahrt mit der alten Version vergleicht
+        correct: true
+        why: Eine Verdopplung bei 2 % der Fahrten verschiebt den Durchschnittspreis messbar. Der Canary wäre zurückgenommen worden, bevor alle Städte betroffen sind.
+      - text: Die neue Preisberechnung hinter einem Feature Flag, schrittweise für 10 % der Kundschaft eingeschaltet
+        correct: true
+        why: Weniger Betroffene, und das Abschalten dauert Sekunden statt eines Rollbacks.
+      - text: Ein Alarm, wenn der Anteil der Fahrten über dem Tageshöchstpreis plötzlich steigt
+        correct: true
+        why: Monitoring auf eine fachliche Kennzahl meldet den Fehler nach Minuten statt nach der ersten Kundenbeschwerde.
+      - text: Ein größerer Smoke Test mit 200 Preisfällen nach jedem Deployment
+        correct: false
+        why: Ein Smoke Test prüft, ob die Version überhaupt lebt. Seltene Kombinationen gehören in Unit-Tests; nach dem Deployment kostet jede Minute Smoke Test Zeit bis zur Freigabe.
+      - text: Eine Coverage-Vorgabe von 95 % für das Tarifmodul
+        correct: false
+        why: Die Zeilen liefen vermutlich alle. Der Fehler steckt in einer Kombination, die kein Test prüft, und das zeigt keine Coverage-Zahl.
+    explanation: |
+      Nach dem Release geht es nicht mehr ums Finden, sondern ums Begrenzen: Wie viele Leute trifft ein Fehler, und wie schnell fällt er auf? Canary und Feature Flag verkleinern den Kreis, Monitoring verkürzt die Zeit bis zur Entdeckung. Zusätzlich gehört nach dem Fix ein Unit-Test für E-Bike-Fahrten über Mitternacht in die Suite – das ist die Maßnahme aus dem Post-Mortem.
+    resources:
+      - title: Google SRE Workbook · What is canarying?
+        url: https://sre.google/workbook/canarying-releases/#what-is-canarying
+      - title: Martin Fowler · Feature Toggles – Release Toggles
+        url: https://martinfowler.com/articles/feature-toggles.html#ReleaseToggles
+
+  - id: vom-bug-zum-merge
+    type: order
+    title: Vom Ticket zum Merge
+    prompt: Bring die Schritte für einen gemeldeten Bug in die richtige Reihenfolge.
+    lang: text
+    lines: |
+      Fehlerbericht lesen und den Fall mit konkreten Daten nachstellen
+      Die niedrigste Ebene wählen, auf der der Fehler zuverlässig auftritt
+      Einen Test schreiben, der genau diesen Fehler beschreibt
+      Den Test laufen lassen und rot sehen, aus dem richtigen Grund
+      Den Code korrigieren, bis der Test grün ist
+      Dieselbe Fehlerklasse an anderen Stellen suchen und absichern
+      Pull Request mit Test und Fix öffnen, Ticketnummer im Testnamen
+    alternatives:
+      - [1, 2, 3, 4, 5, 7, 6]
+    explanation: |
+      Ohne nachgestellten Fall weißt du nicht, was der Test prüfen soll; ohne den Ort des Fehlers nicht, auf welcher Ebene. Der wichtigste Schritt ist das Rot vor dem Fix: Nur dann ist bewiesen, dass der Test den Fehler bemerkt. Die Suche nach Geschwistern kann im selben oder in einem eigenen Pull Request folgen. Beide Reihenfolgen am Ende gelten.
+
+  - id: coverage-vorgabe
+    type: choice
+    title: Die 90-%-Vorgabe
+    prompt: |
+      Die Teamleitung möchte, dass der CI-Lauf ab sofort scheitert, wenn die Line Coverage des Backends unter 90 % fällt. Heute liegt sie bei 71 %. Welche Aussagen treffen zu? Mehrere Antworten sind richtig.
+    options:
+      - text: Es werden Tests entstehen, die Code ausführen, ohne viel zu prüfen, weil die Zahl das belohnt.
+        correct: true
+        why: Goodharts Gesetz. Ein Test ohne `assert` zählt für die Coverage wie ein guter.
+      - text: Eine Untergrenze für die geänderten Zeilen jedes Pull Requests lenkt den Aufwand auf den Code, der sich gerade ändert.
+        correct: true
+        why: Diff-Coverage, zum Beispiel mit `diff-cover --fail-under`, verhindert, dass neuer Code ungetestet dazukommt, ohne alten Code mit Pflichttests zu überziehen.
+      - text: Bei 90 % Line Coverage sind mindestens 90 % der Fehler gefunden.
+        correct: false
+        why: Coverage misst Ausführung, nicht Prüfung. Die Tariffunktion aus der Lektion hatte 100 % Line Coverage und ließ die normale Fahrt ohne Abo ungeprüft.
+      - text: Branch Coverage zu messen kostet kaum etwas und zeigt Lücken, die Line Coverage verdeckt.
+        correct: true
+        why: "`coverage run --branch` misst zusätzlich jede Verzweigung. Ein `if` ohne `else` kann so nicht mehr unbemerkt nur in eine Richtung laufen."
+      - text: Ohne Vorgabe ist Coverage wertlos.
+        correct: false
+        why: Ihr größter Wert sind die ungetesteten Zeilen, die sie anzeigt. Die liest man im Review, dafür braucht es keine Quote.
+    explanation: |
+      Coverage ist ein guter Lückenfinder und ein schlechtes Ziel. Eine Vorgabe für das ganze Projekt erzeugt Pflichttests an der falschen Stelle. Branch Coverage, Diff-Coverage für neue Zeilen und das Gespräch über konkrete Lücken im Review bringen mehr. Ob die vorhandenen Tests etwas taugen, zeigt Mutation Testing.
+    resources:
+      - title: Google Testing Blog · Code Coverage Best Practices
+        url: https://testing.googleblog.com/2020/08/code-coverage-best-practices.html
+      - title: coverage.py · How to measure branch coverage
+        url: https://coverage.readthedocs.io/en/latest/branch.html#how-to-measure-branch-coverage
+
+  - id: mutanten-vorhersagen
+    type: output
+    title: Wer überlebt?
+    prompt: |
+      Ein Mutation-Testing-Lauf von Hand: Die Funktion `deckel` setzt den Tageshöchstpreis von 1 500 Cent durch. Was gibt das Programm aus?
+    lang: python
+    code: |
+      RICHTIG = """
+      def deckel(summe):
+          return summe if summe < 1500 else 1500
+      """
+
+      MUTANTEN = {
+          "< wird <=": RICHTIG.replace("<", "<="),
+          "Vergleich 2000": RICHTIG.replace("< 1500", "< 2000"),
+          "else 0": RICHTIG.replace("else 1500", "else 0"),
+          "1500 wird 1501": RICHTIG.replace("1500", "1501"),
+      }
+
+
+      def suite(deckel):
+          assert deckel(450) == 450
+          assert deckel(3000) == 1500
+
+
+      getoetet = 0
+      for name, quelle in MUTANTEN.items():
+          namensraum = {}
+          exec(quelle, namensraum)
+          try:
+              suite(namensraum["deckel"])
+          except AssertionError:
+              getoetet += 1
+              print("getötet:", name)
+          else:
+              print("überlebt:", name)
+      print(f"{getoetet}/{len(MUTANTEN)}")
+    expected: |
+      überlebt: < wird <=
+      überlebt: Vergleich 2000
+      getötet: else 0
+      getötet: 1500 wird 1501
+      2/4
+    explanation: |
+      `< wird <=` ist ein äquivalenter Mutant: Bei genau 1500 liefern `summe` und `1500` dasselbe, kein Test kann ihn töten. `Vergleich 2000` ist eine echte Lücke: Für Summen zwischen 1500 und 1999 gäbe der Mutant die volle Summe zurück, aber die Suite prüft nur 450 und 3000. Ein Test mit 1501 oder 1800 tötet ihn. `else 0` fällt bei 3000 auf. `replace("1500", "1501")` ersetzt **beide** Vorkommen; der Deckel liegt dann bei 1501, und `deckel(3000)` liefert 1501. Der Score von 2/4 klingt schlecht, doch nur ein Überlebender ist eine echte Lücke.
+    resources:
+      - title: mutmut · Skipping via code comments
+        url: https://mutmut.readthedocs.io/en/latest/#skipping-via-code-comments
+
+  - id: diff-coverage-rechnen
+    type: output
+    title: Datei gut, Diff schlecht
+    prompt: |
+      Das Skript rechnet nach, was diff-cover für eine Datei meldet. `ausfuehrbar` und `ausgefuehrt` stammen aus coverage.py, `geaendert` sind die Zeilennummern aus dem Diff des Pull Requests. Was gibt es aus?
+    lang: python
+    code: |
+      ausfuehrbar = set(range(1, 41)) - {20}       # Zeile 20 ist ein Kommentar
+      ausgefuehrt = ausfuehrbar - {14, 15, 31}
+      geaendert = {12, 13, 14, 15, 16, 20}
+
+      relevant = geaendert & ausfuehrbar
+      getroffen = relevant & ausgefuehrt
+      print(f"Datei: {len(ausgefuehrt) / len(ausfuehrbar):.0%}")
+      print(f"Diff: {len(getroffen)} von {len(relevant)} Zeilen, {len(getroffen) / len(relevant):.0%}")
+      print("fehlt:", sorted(relevant - getroffen))
+    expected: |
+      Datei: 92%
+      Diff: 3 von 5 Zeilen, 60%
+      fehlt: [14, 15]
+    explanation: |
+      Die Datei hat 39 ausführbare Zeilen, 36 davon liefen: 92 %. Vom Diff zählen nur Zeilen, die coverage.py als ausführbar kennt; der geänderte Kommentar in Zeile 20 fällt heraus. Von den fünf übrigen liefen 12, 13 und 16, also 60 %. Die Gesamtzahl der Datei sieht gut aus, obwohl zwei der fünf neuen Zeilen nie ausgeführt wurden. Deshalb ist Diff-Coverage das bessere Signal im Pull Request. Zeile 31 ist eine alte Lücke und betrifft diesen Diff nicht.
+    resources:
+      - title: diff-cover · README
+        url: https://github.com/Bachmann1234/diff_cover
+
+  - id: auswahl-konfigurieren
+    type: gap
+    title: Marker streng, Coverage mit Zweigen
+    prompt: |
+      Ergänze die Konfiguration: Unbekannte Marker sollen beim Sammeln zum Fehler führen, coverage.py soll Verzweigungen messen, und der Bericht soll den Lauf scheitern lassen, wenn die Gesamtabdeckung unter 80 % fällt.
+    lang: toml
+    code: |
+      [tool.pytest]
+      ⟦strict_markers⟧ = true
+      markers = [
+          "slow: dauert länger als eine Sekunde, läuft nach dem Merge",
+          "integration: braucht PostgreSQL",
+      ]
+
+      [tool.coverage.run]
+      ⟦branch⟧ = true
+      source = ["src"]
+
+      [tool.coverage.report]
+      show_missing = true
+      ⟦fail_under⟧ = 80
+    gaps:
+      - label: Unbekannte Marker
+        hint: Die Option beginnt mit `strict_`. Seit pytest 9 schaltet `strict` alle strengen Optionen auf einmal ein.
+        accept: ["strict"]
+      - label: Verzweigungen messen
+        hint: Dieselbe Option gibt es auf der Kommandozeile als `coverage run --…`.
+      - label: Untergrenze
+        hint: Der Name beschreibt, wann der Bericht scheitert, mit Unterstrich.
+    explanation: |
+      `strict_markers` verhindert, dass ein Tippfehler im Marker einen Test unbemerkt aus dem Nachtlauf in den Pull-Request-Lauf schiebt; `strict = true` schaltet seit pytest 9 zusätzlich weitere strenge Prüfungen ein. `branch = true` entspricht `coverage run --branch`. `fail_under = 80` lässt `coverage report` mit Exit-Code 2 enden, wenn die Abdeckung darunter liegt. Als Untergrenze gegen Verfall ist das sinnvoll; das eigentliche Signal im Pull Request ist die Diff-Coverage.
+    resources:
+      - title: pytest · Raising errors on unknown marks
+        url: https://docs.pytest.org/en/stable/how-to/mark.html#raising-errors-on-unknown-marks
+      - title: coverage.py · [report] fail_under
+        url: https://coverage.readthedocs.io/en/latest/config.html#report-fail-under
+
+  - id: golden-master-rechnung
+    type: code
+    title: Die Rechnung vor dem Umbau einfrieren
+    prompt: |
+      `rechnung(kunde, fahrten, plus=False)` in `rechnung.py` erzeugt seit 2019 den Text der Monatsrechnung. Eine Kollegin will den Code umbauen: Tarife in eine Tabelle, Beträge mit einer Formatierungsbibliothek. Vorher hältst du das **heutige** Verhalten mit einem Golden-Master-Test fest. Ob es fachlich richtig ist, spielt keine Rolle.
+
+      So sieht der Altcode aus. `fahrten` ist eine Liste von Tupeln `(datum, minuten, rad)`, `datum` als ISO-Text, `rad` ist `"City-Rad"` oder `"E-Bike"`:
+
+      ```python
+      def euro(cent: int) -> str:
+          return f"{cent // 100},{cent % 100:02d} EUR"
+
+
+      def rechnung(kunde: str, fahrten: list[tuple[str, int, str]], plus: bool = False) -> str:
+          zeilen = [f"Radwerk – Rechnung für {kunde}"]
+          summe = 0
+          for datum, minuten, rad in sorted(fahrten):
+              berechnet = max(0, minuten - 30) if plus else minuten
+              if minuten <= 5:
+                  preis, hinweis = 0, " Fehlstart"
+              else:
+                  takt = 300 if rad == "E-Bike" else 150
+                  preis, hinweis = -(-berechnet // 30) * takt, ""
+              summe += preis
+              zeilen.append(f"{datum} {rad:<8} {minuten:>3} min {euro(preis):>10}{hinweis}")
+          if plus:
+              zeilen.append("Radwerk Plus: 30 Minuten je Fahrt inklusive")
+          zeilen.append(f"Summe {euro(summe)}")
+          return "\n".join(zeilen)
+      ```
+
+      So gehst du vor:
+
+      1. Wähle Eingaben, mit denen jeder Zweig und jede Grenze dieses Codes mindestens einmal vorkommt. Du darfst `rechnung` mehrfach aufrufen.
+      2. Klick auf „Ausführen & testen“. Was dein Code mit `print` ausgibt, erscheint unter „Ausgabe“.
+      3. Lies die Ausgabe und trag sie als genehmigten Stand in deinen Test ein.
+
+      Die Prüfung lässt deine Tests gegen den Altcode laufen (grün) und gegen vier Varianten mit typischen Ausrutschern beim Umbau (rot).
+    lang: python
+    setup: |
+      from pathlib import Path
+
+      RICHTIG = '''
+      def euro(cent: int) -> str:
+          return f"{cent // 100},{cent % 100:02d} EUR"
+
+
+      def rechnung(kunde: str, fahrten: list[tuple[str, int, str]], plus: bool = False) -> str:
+          zeilen = [f"Radwerk – Rechnung für {kunde}"]
+          summe = 0
+          for datum, minuten, rad in sorted(fahrten):
+              berechnet = max(0, minuten - 30) if plus else minuten
+              if minuten <= 5:
+                  preis, hinweis = 0, " Fehlstart"
+              else:
+                  takt = 300 if rad == "E-Bike" else 150
+                  preis, hinweis = -(-berechnet // 30) * takt, ""
+              summe += preis
+              zeilen.append(f"{datum} {rad:<8} {minuten:>3} min {euro(preis):>10}{hinweis}")
+          if plus:
+              zeilen.append("Radwerk Plus: 30 Minuten je Fahrt inklusive")
+          zeilen.append(f"Summe {euro(summe)}")
+          return "\\n".join(zeilen)
+      '''
+      MUTANTEN = {
+          "fehlstart": RICHTIG.replace("if minuten <= 5:", "if minuten < 5:"),
+          "e-bike": RICHTIG.replace('rad == "E-Bike"', 'rad == "E-bike"'),
+          "plus": RICHTIG.replace("if minuten <= 5:", "if berechnet <= 5:"),
+          "sortierung": RICHTIG.replace("in sorted(fahrten):", "in fahrten:"),
+      }
+      assert all(m != RICHTIG for m in MUTANTEN.values()), "Ein Mutant ist identisch mit der richtigen Version."
+      Path("rechnung.py").write_text(RICHTIG, encoding="utf-8")
+    starter: |
+      from rechnung import rechnung
+
+      # 1. Eingaben wählen, die jeden Zweig und jede Grenze erreichen
+      FAHRTEN = [
+          ("2026-03-02", 12, "City-Rad"),
+      ]
+
+      # 2. Ausführen: Die heutige Ausgabe erscheint unter „Ausgabe“
+      print(rechnung("Jana Pohl", FAHRTEN))
+
+      # 3. Ausgabe lesen und hier als genehmigten Stand eintragen
+      GENEHMIGT = """\
+      """
+
+
+      def test_rechnung_bleibt_wie_sie_ist():
+          ...
+    solution: |
+      import pytest
+      from rechnung import rechnung
+
+      # absichtlich unsortiert; 5 und 6 Minuten für den Fehlstart, E-Bikes, mit und ohne Plus
+      FAHRTEN = [
+          ("2026-03-09", 45, "E-Bike"),
+          ("2026-03-02", 5, "City-Rad"),
+          ("2026-03-03", 6, "City-Rad"),
+          ("2026-03-05", 31, "E-Bike"),
+      ]
+
+      GENEHMIGT = {
+          False: """\
+      Radwerk – Rechnung für Jana Pohl
+      2026-03-02 City-Rad   5 min   0,00 EUR Fehlstart
+      2026-03-03 City-Rad   6 min   1,50 EUR
+      2026-03-05 E-Bike    31 min   6,00 EUR
+      2026-03-09 E-Bike    45 min   6,00 EUR
+      Summe 13,50 EUR""",
+          True: """\
+      Radwerk – Rechnung für Jana Pohl
+      2026-03-02 City-Rad   5 min   0,00 EUR Fehlstart
+      2026-03-03 City-Rad   6 min   0,00 EUR
+      2026-03-05 E-Bike    31 min   3,00 EUR
+      2026-03-09 E-Bike    45 min   3,00 EUR
+      Radwerk Plus: 30 Minuten je Fahrt inklusive
+      Summe 6,00 EUR""",
+      }
+
+
+      @pytest.mark.parametrize("plus", [False, True], ids=["ohne-plus", "mit-plus"])
+      def test_rechnung_bleibt_wie_sie_ist(plus):
+          assert rechnung("Jana Pohl", FAHRTEN, plus=plus) == GENEHMIGT[plus]
+    tests:
+      - name: Grün gegen den heutigen Altcode
+        code: |
+          lauf = run_pytest({"rechnung.py": RICHTIG})
+          assert lauf.ok, lauf.output
+      - name: Bemerkt Änderungen an der Fehlstart-Regel
+        code: |
+          lauf = run_pytest({"rechnung.py": MUTANTEN["fehlstart"]})
+          assert not lauf.ok, "Dein Golden Master bleibt grün, obwohl Fahrten von genau 5 Minuten jetzt etwas kosten. Kommt eine solche Fahrt in deinen Eingaben vor?"
+      - name: Bemerkt Änderungen am E-Bike-Tarif
+        code: |
+          lauf = run_pytest({"rechnung.py": MUTANTEN["e-bike"]})
+          assert not lauf.ok, "Dein Golden Master bleibt grün, obwohl E-Bikes jetzt zum City-Rad-Takt abgerechnet werden."
+      - name: Bemerkt Änderungen bei Radwerk Plus
+        code: |
+          lauf = run_pytest({"rechnung.py": MUTANTEN["plus"]})
+          assert not lauf.ok, "Dein Golden Master bleibt grün, obwohl Plus-Fahrten zwischen 6 und 35 Minuten jetzt als Fehlstart gelten. Rechnest du eine solche Fahrt mit plus=True ab?"
+      - name: Bemerkt Änderungen an der Reihenfolge
+        code: |
+          lauf = run_pytest({"rechnung.py": MUTANTEN["sortierung"]})
+          assert not lauf.ok, "Dein Golden Master bleibt grün, obwohl die Fahrten nicht mehr nach Datum sortiert werden. Übergibst du sie unsortiert?"
+    hints:
+      - "Geh den Altcode Zweig für Zweig durch: Fehlstart ja oder nein, E-Bike oder City-Rad, Plus oder nicht, und die Grenze bei genau 5 Minuten. Auch `sorted` ist Verhalten."
+      - "Zwei Aufrufe decken Plus ab: einmal `plus=False`, einmal `plus=True`, zum Beispiel per `@pytest.mark.parametrize`. Gib die Fahrten in falscher Datumsreihenfolge an."
+      - "Fahrten mit 5 und 6 Minuten (City-Rad) sowie E-Bikes mit 31 und 45 Minuten reichen. Druck beide Rechnungen aus, kopier sie in ein Dictionary `{False: …, True: …}` und vergleich mit `==`."
+    explanation: |
+      Ein Golden Master ist nur so gut wie seine Eingaben. Jede Variante der Prüfung entspricht einem Ausrutscher, der beim Umbau leicht passiert: eine verschobene Grenze (`<` statt `<=`), ein Tippfehler im Tarifnamen, eine geänderte Reihenfolge zweier Regeln (Plus vor dem Fehlstart) und ein vergessenes `sorted`. Eine einzige City-Rad-Fahrt von 12 Minuten hätte keinen davon bemerkt. Wer die Eingaben aus den Zweigen und Grenzen des Codes ableitet, fängt alle vier mit zwei Aufrufen. Der genehmigte Text ist keine Spezifikation: Er beschreibt den Stand vor dem Umbau, und jede Änderung daran muss jemand bewusst genehmigen.
+    resources:
+      - title: Michael Feathers · Characterization Testing
+        url: https://michaelfeathers.silvrback.com/characterization-testing
+      - title: Python · itertools.product
+        url: https://docs.python.org/3/library/itertools.html#itertools.product
+
+  - id: ueberlebende-mutanten
+    type: code
+    title: Vier Überlebende, wenige Tests
+    prompt: |
+      `fahrpreis(minuten, plus=False)` aus `tarif.py` berechnet den Preis einer City-Rad-Fahrt in Cent:
+
+      - Fahrten bis einschließlich 5 Minuten kosten 0 Cent (Fehlstart).
+      - Sonst kostet jede angefangene halbe Stunde 150 Cent.
+      - Mit `plus=True` (Abo „Radwerk Plus“) sind die ersten 30 Minuten jeder Fahrt kostenlos; berechnet werden nur die Minuten danach.
+
+      Die bisherige Suite steht im Editor. mutmut meldet unter anderem diese Überlebenden:
+
+      ```diff
+      -def fahrpreis(minuten: int, plus: bool = False) -> int:
+      +def fahrpreis(minuten: int, plus: bool = True) -> int:
+      ```
+
+      ```diff
+      -    if minuten <= 5:
+      +    if minuten <= 6:
+      ```
+
+      ```diff
+      -        minuten = max(0, minuten - 30)
+      +        minuten = max(1, minuten - 30)
+      ```
+
+      ```diff
+      -    return -(-minuten // 30) * 150
+      +    return -(-minuten // 31) * 150
+      ```
+
+      Ergänze die Suite so, dass sie gegen die richtige Implementierung grün bleibt und jeden dieser Mutanten tötet.
+    lang: python
+    setup: |
+      from pathlib import Path
+
+      RICHTIG = '''
+      def fahrpreis(minuten: int, plus: bool = False) -> int:
+          if minuten <= 5:
+              return 0
+          if plus:
+              minuten = max(0, minuten - 30)
+          return -(-minuten // 30) * 150
+      '''
+      MUTANTEN = {
+          "standardwert": RICHTIG.replace("plus: bool = False", "plus: bool = True"),
+          "fehlstart": RICHTIG.replace("minuten <= 5", "minuten <= 6"),
+          "plus-unter-30": RICHTIG.replace("max(0, minuten - 30)", "max(1, minuten - 30)"),
+          "halbe-stunde": RICHTIG.replace("// 30", "// 31"),
+      }
+      assert all(m != RICHTIG for m in MUTANTEN.values()), "Ein Mutant ist identisch mit der richtigen Version."
+      Path("tarif.py").write_text(RICHTIG, encoding="utf-8")
+    starter: |
+      from tarif import fahrpreis
+
+
+      def test_fehlstart_kostet_nichts():
+          assert fahrpreis(5) == 0
+
+
+      def test_plus_ist_die_erste_halbe_stunde_frei():
+          assert fahrpreis(45, plus=True) == 150
+    solution: |
+      import pytest
+      from tarif import fahrpreis
+
+
+      @pytest.mark.parametrize(
+          "minuten, cent",
+          [(5, 0), (6, 150), (30, 150), (31, 300)],
+          ids=["fehlstart-grenze", "erste-minute-danach", "volle-halbe-stunde", "angefangene-zweite"],
+      )
+      def test_normaltarif_ohne_abo(minuten, cent):
+          assert fahrpreis(minuten) == cent
+
+
+      @pytest.mark.parametrize(
+          "minuten, cent",
+          [(20, 0), (30, 0), (45, 150), (61, 300)],
+          ids=["unter-30-frei", "genau-30-frei", "danach-eine-einheit", "zweite-einheit"],
+      )
+      def test_plus_ist_die_erste_halbe_stunde_frei(minuten, cent):
+          assert fahrpreis(minuten, plus=True) == cent
+    tests:
+      - name: Grün gegen die richtige Implementierung
+        code: |
+          lauf = run_pytest({"tarif.py": RICHTIG})
+          assert lauf.ok, lauf.output
+      - name: Tötet den Mutanten am Standardwert
+        code: |
+          lauf = run_pytest({"tarif.py": MUTANTEN["standardwert"]})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl ohne Angabe jetzt der Plus-Tarif gilt. Ruft ein Test fahrpreis ohne plus auf und erwartet einen Preis über 0?"
+      - name: Tötet den Mutanten an der Fehlstart-Grenze
+        code: |
+          lauf = run_pytest({"tarif.py": MUTANTEN["fehlstart"]})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl 6-Minuten-Fahrten jetzt nichts kosten."
+      - name: Tötet den Mutanten bei kurzen Plus-Fahrten
+        code: |
+          lauf = run_pytest({"tarif.py": MUTANTEN["plus-unter-30"]})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl Plus-Fahrten unter 30 Minuten jetzt 150 Cent kosten."
+      - name: Tötet den Mutanten an der Halbstundengrenze
+        code: |
+          lauf = run_pytest({"tarif.py": MUTANTEN["halbe-stunde"]})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl eine 31-Minuten-Fahrt jetzt nur noch eine Einheit kostet."
+    hints:
+      - Frag dich bei jedem Mutanten, bei welcher Eingabe er ein anderes Ergebnis liefert als das Original. Diese Eingabe ist dein Test.
+      - "`plus: bool = True` fällt nur auf, wenn ein Test `fahrpreis` **ohne** `plus` aufruft und einen Preis über 0 erwartet. `max(1, …)` fällt nur bei einer Plus-Fahrt von höchstens 30 Minuten auf."
+      - "Ohne Abo: `fahrpreis(6) == 150` und `fahrpreis(31) == 300`. Mit Abo: `fahrpreis(20, plus=True) == 0`."
+    explanation: |
+      Jeder überlebende Mutant beschreibt eine Eingabe, bei der sich falscher und richtiger Code unterscheiden, und die kein Test prüft. Der Standardwert-Mutant überlebte, weil der einzige Test ohne `plus` eine Fehlstart-Fahrt war, die vor der Abo-Logik endet; dieselbe Lücke meldete Branch Coverage als `5->7`. `<= 6` braucht den Wert direkt hinter der Grenze, `// 31` die angefangene zweite halbe Stunde. `max(1, …)` zeigt, dass niemand geprüft hat, ob kurze Plus-Fahrten nichts kosten. Drei gezielte Werte töten alle vier: 6 und 31 Minuten ohne Abo, 20 Minuten mit Abo. Werte aus der Mitte der Bereiche, etwa 15 oder 45 Minuten, hätten höchstens den Standardwert-Mutanten getötet.
+    resources:
+      - title: mutmut · Workflow
+        url: https://mutmut.readthedocs.io/en/latest/#workflow
+      - title: pytest · Parametrizing tests
+        url: https://docs.pytest.org/en/stable/how-to/parametrize.html#pytest-mark-parametrize-parametrizing-test-functions
+
+  - id: tests-auswaehlen
+    type: code
+    title: Nur die betroffenen Tests
+    prompt: |
+      Für Pull Requests soll die CI nur die Tests ausführen, die eine Änderung betreffen. Schreibe `waehle_tests(geaendert, abhaengigkeiten)`.
+
+      - `geaendert` ist die Liste der geänderten Pfade aus `git diff --name-only`.
+      - `abhaengigkeiten` ordnet jeder Testdatei die Menge der Quelldateien zu, die sie beim letzten vollen Lauf ausgeführt hat (so wie testmon es misst), zum Beispiel `{"tests/test_tarif.py": {"src/radwerk/tarif.py", "src/radwerk/zeit.py"}}`.
+
+      Regeln für jeden geänderten Pfad:
+
+      1. Dokumentation (endet auf `.md` oder liegt unter `docs/`) löst keinen Test aus.
+      2. Eine geänderte Testdatei, die in `abhaengigkeiten` steht, wird selbst ausgeführt.
+      3. Eine geänderte Quelldatei löst jede Testdatei aus, die sie ausgeführt hat.
+      4. Alles andere kann die Auswahl nicht zuordnen – `conftest.py`, `pyproject.toml`, Daten, Migrationen, neue Module. Dann gibt die Funktion `None` zurück: Es läuft die ganze Suite.
+
+      Sonst gibt sie die ausgewählten Testdateien sortiert und ohne Duplikate als Liste zurück (leer, wenn nur Dokumentation geändert wurde).
+    lang: python
+    starter: |
+      def waehle_tests(geaendert: list[str], abhaengigkeiten: dict[str, set[str]]) -> list[str] | None:
+          auswahl = []
+          for pfad in geaendert:
+              for test, quellen in abhaengigkeiten.items():
+                  if pfad in quellen:
+                      auswahl.append(test)
+          return auswahl
+    solution: |
+      def waehle_tests(geaendert: list[str], abhaengigkeiten: dict[str, set[str]]) -> list[str] | None:
+          auswahl: set[str] = set()
+          for pfad in geaendert:
+              if pfad.endswith(".md") or pfad.startswith("docs/"):
+                  continue
+              if pfad in abhaengigkeiten:
+                  auswahl.add(pfad)
+                  continue
+              betroffen = {test for test, quellen in abhaengigkeiten.items() if pfad in quellen}
+              if not betroffen:
+                  return None
+              auswahl |= betroffen
+          return sorted(auswahl)
+    tests:
+      - name: Geänderte Quelldatei löst alle Tests aus, die sie ausführen
+        code: |
+          A = {
+              "tests/test_tarif.py": {"src/radwerk/tarif.py", "src/radwerk/zeit.py"},
+              "tests/test_rechnung.py": {"src/radwerk/rechnung.py", "src/radwerk/tarif.py"},
+              "tests/test_buchung.py": {"src/radwerk/buchung.py", "src/radwerk/zeit.py"},
+          }
+          ergebnis = waehle_tests(["src/radwerk/zeit.py"], A)
+          assert ergebnis == ["tests/test_buchung.py", "tests/test_tarif.py"], f"bekommen {ergebnis!r}"
+      - name: Geänderte Testdatei läuft selbst, sortiert und ohne Duplikate
+        code: |
+          A = {
+              "tests/test_tarif.py": {"src/radwerk/tarif.py"},
+              "tests/test_rechnung.py": {"src/radwerk/rechnung.py", "src/radwerk/tarif.py"},
+          }
+          ergebnis = waehle_tests(["src/radwerk/tarif.py", "tests/test_tarif.py", "src/radwerk/rechnung.py"], A)
+          assert ergebnis == ["tests/test_rechnung.py", "tests/test_tarif.py"], f"bekommen {ergebnis!r}"
+      - name: Nur Dokumentation geändert
+        code: |
+          A = {"tests/test_tarif.py": {"src/radwerk/tarif.py"}}
+          ergebnis = waehle_tests(["README.md", "docs/tarife.html"], A)
+          assert ergebnis == [], f"bekommen {ergebnis!r}"
+      - name: Konfiguration und conftest lösen die ganze Suite aus
+        code: |
+          A = {"tests/test_tarif.py": {"src/radwerk/tarif.py"}}
+          for pfad in ["tests/conftest.py", "pyproject.toml"]:
+              ergebnis = waehle_tests(["src/radwerk/tarif.py", pfad], A)
+              assert ergebnis is None, f"{pfad}: bekommen {ergebnis!r}, erwartet None (ganze Suite)"
+      - name: Unbekannte Dateien lösen die ganze Suite aus
+        code: |
+          A = {"tests/test_tarif.py": {"src/radwerk/tarif.py"}}
+          for pfad in ["data/feiertage.json", "migrations/0042_gutscheine.sql", "src/radwerk/gutschein.py"]:
+              ergebnis = waehle_tests([pfad], A)
+              assert ergebnis is None, f"{pfad}: bekommen {ergebnis!r}, erwartet None (ganze Suite)"
+    hints:
+      - Der Startcode übersieht drei Dinge – geänderte Testdateien, Dokumentation und Pfade, die keiner Testdatei zugeordnet sind. Für den letzten Fall gibt er eine leere Liste zurück, also „nichts testen“.
+      - Sammle in einer Menge und gib am Ende `sorted(menge)` zurück. Für jeden Pfad ermittelst du die betroffenen Tests; ist das Ergebnis leer und der Pfad weder Doku noch Testdatei, ist die Antwort sofort `None`.
+      - "`if pfad.endswith(\".md\") or pfad.startswith(\"docs/\"): continue`, dann `if pfad in abhaengigkeiten: …`, dann `betroffen = {test for test, quellen in abhaengigkeiten.items() if pfad in quellen}`."
+    explanation: |
+      Die wichtigste Regel ist die vierte: Was die Auswahl nicht zuordnen kann, löst alles aus. Der Startcode machte daraus „nichts“ – eine Änderung an `conftest.py`, einer Tariftabelle in JSON oder ein neues Modul wäre im Pull Request ohne einen einzigen Test durchgelaufen. Eine Testauswahl darf Zeit sparen, aber nie still Sicherheit kosten. Die Abhängigkeiten stammen aus dem letzten vollen Lauf und können veraltet sein; auch deshalb läuft nach dem Merge die ganze Suite.
+    resources:
+      - title: pytest-testmon
+        url: https://testmon.org/
+      - title: Python · Mengen
+        url: https://docs.python.org/3/tutorial/datastructures.html#sets
+
+  - id: regressionstest-ohne-wirkung
+    type: bug
+    title: Grün vor und nach dem Fix
+    prompt: |
+      Ticket RW-412: Fahrten, die zwischen 0 und 1 Uhr Berliner Zeit (Winterzeit, UTC+1) beginnen, werden dem Vortag zugerechnet. `tageskosten` bekommt die Startzeiten so, wie sie aus der Datenbank kommen: als zeitzonenbewusste Zeitpunkte in UTC. Der Fix ist gemergt, der Regressionstest auch.
+
+      Eine Kollegin checkt den Commit **vor** dem Fix aus und lässt den Test laufen: Er ist grün. Der Test soll eine Fahrt prüfen, die um 0:30 Uhr Berliner Zeit am 14. März beginnt. Finde die Zeile, die dafür sorgt, dass er den Fehler nicht bemerkt, und korrigiere sie.
+    lang: python
+    code: |
+      from datetime import date, datetime, timezone
+
+      from radwerk.tarif import tageskosten
+
+
+      def test_rw412_fahrt_nach_mitternacht_zaehlt_zum_neuen_tag():
+          # Startzeiten wie in Produktion: UTC aus der Datenbank
+          mittags = datetime(2026, 3, 13, 11, 0, tzinfo=timezone.utc)
+          nachts = datetime(2026, 3, 14, 0, 30, tzinfo=timezone.utc)
+          kosten = tageskosten([(mittags, 60), (nachts, 60)])
+          assert kosten == {date(2026, 3, 13): 300, date(2026, 3, 14): 300}
+    lines: [9]
+    fix:
+      - line: 9
+        answers:
+          - "nachts = datetime(2026, 3, 13, 23, 30, tzinfo=timezone.utc)"
+          - "nachts = datetime(2026, 3, 13, 23, 30, 0, tzinfo=timezone.utc)"
+          - "nachts = datetime.fromisoformat(\"2026-03-13T23:30+00:00\")"
+          - "nachts = datetime.fromisoformat(\"2026-03-13T23:30Z\")"
+    explanation: |
+      `datetime(2026, 3, 14, 0, 30, tzinfo=timezone.utc)` ist 0:30 Uhr UTC, in Berlin also 1:30 Uhr. Beide Zeitzonen liegen dann am 14. März, und die fehlerhafte Zuordnung nach UTC-Tag liefert dasselbe Ergebnis wie die richtige. 0:30 Uhr Berliner Winterzeit ist 23:30 Uhr UTC am **13.** März. Nur dieser Zeitpunkt liegt im Fenster, in dem sich UTC-Tag und Berliner Tag unterscheiden. Die Falle in die andere Richtung: `tzinfo=ZoneInfo("Europe/Berlin")` ohne Umrechnung nach UTC hätte den Test ebenfalls wirkungslos gemacht, weil `.date()` dann schon den Berliner Tag liefert. Deshalb gehört zu jedem Regressionstest der Lauf gegen den alten Code.
+    resources:
+      - title: Python · zoneinfo
+        url: https://docs.python.org/3/library/zoneinfo.html#zoneinfo.ZoneInfo
+      - title: Python · datetime.astimezone
+        url: https://docs.python.org/3/library/datetime.html#datetime.datetime.astimezone
+
+  - id: snapshot-review
+    type: explain
+    title: 214 geänderte Snapshot-Zeilen
+    prompt: |
+      Pull Request „Beträge mit Babel formatieren“: In `rechnung.py` ändern sich drei Zeilen, in `__snapshots__/test_rechnung.ambr` 214. Die CI ist grün, denn der Autor hat `pytest --snapshot-update` ausgeführt. Der Ausschnitt zeigt zwei der Snapshot-Änderungen.
+
+      Erkläre in deinem Review-Kommentar, was dieser Diff bedeutet, was du vom Autor verlangst und was das Team künftig anders machen sollte.
+    lang: diff
+    code: |
+      @@ -12,8 +12,8 @@
+       # name: test_monatsrechnung[ohne-plus]
+         '''
+         Radwerk – Rechnung für Jana Pohl
+      -  2026-03-03 City-Rad   6 min   1,50 EUR
+      -  2026-03-05 E-Bike    31 min   6,00 EUR
+      -  Summe 7,50 EUR
+      +  2026-03-03 City-Rad   6 min   1.50 EUR
+      +  2026-03-05 E-Bike    31 min   6.00 EUR
+      +  Summe 7.50 EUR
+         '''
+       # ---
+    points:
+      - Die grüne CI sagt nichts, weil die Snapshots neu geschrieben wurden. Der Snapshot-Diff ist die eigentliche Verhaltensänderung und muss gelesen werden wie Code.
+      - Der Diff zeigt eine unbeabsichtigte Änderung, die Kundschaft sieht – Dezimalpunkt statt Komma auf jeder Rechnung, vermutlich eine fehlende deutsche Locale.
+      - Der Autor nimmt das Snapshot-Update zurück, korrigiert die Formatierung und erzeugt die Snapshots neu, bis nur beabsichtigte Änderungen übrig sind.
+      - Künftig Snapshots klein und benannt halten, Snapshot-Updates in einem eigenen Commit mit Begründung, und wichtige Formatregeln (Komma, zwei Nachkommastellen) zusätzlich mit gezielten Assertions prüfen.
+    explanation: |
+      Ich würde den Pull Request so nicht freigeben. Die CI ist grün, weil `--snapshot-update` die erwarteten Werte durch die neuen ersetzt hat – der Test hat also nichts geprüft. Was sich geändert hat, steht nur im Snapshot-Diff, und der zeigt in jeder Betragszeile einen Punkt statt eines Kommas. Das sieht jede Kundin auf ihrer Rechnung. Vermutlich formatiert Babel ohne `locale="de_DE"`. Bitte das Snapshot-Update zurücknehmen, die Locale setzen und neu erzeugen; danach sollte der Snapshot-Diff leer sein, denn das Ziel des Pull Requests war ein Umbau ohne sichtbare Änderung. Für die Zukunft schlage ich vor, Snapshot-Updates in einen eigenen Commit mit Begründung zu legen und das Betragsformat mit zwei, drei expliziten Asserts zu prüfen, die nicht per Update verschwinden können. 214 Zeilen liest niemand gründlich; kleinere Snapshots pro Fall machen den Diff reviewbar.
+    resources:
+      - title: syrupy · CLI options (--snapshot-update)
+        url: https://syrupy-project.github.io/syrupy/#cli-options
+
+  - id: post-mortem-massnahmen
+    type: practice
+    title: Vom Post-Mortem zu Tests
+    prompt: |
+      Vorfall RW-INC-17 bei Radwerk, Release 2026.10.1:
+
+      - 09:40 Deployment der neuen Preisberechnung, Smoke Test grün.
+      - 13:15 Erste Support-Anfrage: Plus-Kundin zahlt für 40 Minuten E-Bike 600 statt 300 Cent.
+      - 15:50 Ursache gefunden: Beim Umbau wird der Plus-Abzug nur noch bei `rad == "City-Rad"` angewendet. Die Unit-Tests prüfen Plus ausschließlich mit City-Rädern.
+      - 16:20 Rollback. Betroffen: 1 260 Fahrten, Erstattung je 300 Cent, zusammen 3 780 Euro.
+
+      Schreibe den Abschnitt „Maßnahmen“ des Post-Mortems. Jede Maßnahme ist konkret und überprüfbar: Was wird getestet oder gemessen, auf welcher Ebene, und warum dort? Begründe auch, was du bewusst **nicht** vorschlägst.
+    lang: text
+    solution: |
+      Maßnahmen RW-INC-17
+
+      1. Regressionstest (Unit, tarif.py): parametrisierter Test für Plus über alle Radtypen
+         und Grenzwerte (20, 30, 31, 45, 61 Minuten). Er muss gegen den fehlerhaften Commit rot sein.
+         Unit-Ebene, weil der Fehler vollständig in fahrpreis entsteht.
+      2. Kombinationen systematisch: ein Golden Master über Minuten-Grenzwerte × Radtyp × Plus
+         für die Preisberechnung, als Netz für weitere Umbauten. Läuft nach dem Merge.
+      3. Mutation Testing nachts für radwerk/tarif.py; überlebende Mutanten landen als Ticket
+         beim Team. Der Fehler war eine fehlende Kombination – genau das zeigt mutmut.
+      4. Canary-Kennzahl: Durchschnittspreis pro Fahrt je Radtyp und Abo, Canary gegen alte
+         Version, automatischer Rollback bei mehr als 5 % Abweichung. Hätte den Fehler nach
+         Minuten statt nach 3,5 Stunden gestoppt.
+      5. Alarm: Anteil Plus-Fahrten mit Preis > 0 bei Fahrten unter 31 Minuten pro Stunde.
+      6. Neue Preisberechnung künftig hinter einem Feature Flag, zuerst für Mitarbeitende.
+
+      Bewusst nicht:
+      - Kein E2E-Test pro Preiskombination: langsam, und der Fehler entsteht nicht im Browser.
+      - Kein größerer Smoke Test: Er soll schnell zeigen, ob die Version lebt.
+      - Keine Coverage-Vorgabe: Die fehlerhaften Zeilen waren ausgeführt, nur nicht geprüft.
+    checklist:
+      - Es gibt einen reproduzierenden Test auf Unit-Ebene, der ausdrücklich gegen den fehlerhaften Stand rot sein muss.
+      - Der Test deckt die fehlende Kombination systematisch ab (alle Radtypen mit Plus, Grenzwerte), nicht nur den gemeldeten Einzelfall.
+      - Mindestens eine Maßnahme verkürzt die Zeit bis zur Entdeckung (Canary-Kennzahl oder Alarm auf eine fachliche Größe).
+      - Mindestens eine Maßnahme verkleinert den Kreis der Betroffenen (Canary oder Feature Flag).
+      - Jede Maßnahme ist überprüfbar formuliert – kein „sorgfältiger testen“ oder „mehr Reviews“.
+      - Du begründest, was du bewusst nicht vorschlägst, etwa E2E-Tests pro Kombination oder eine Coverage-Quote.
+    explanation: |
+      Ein gutes Post-Mortem verbessert drei Dinge: Der Fehler kommt nicht wieder (Regressionstest an der Entstehungsstelle, dazu die Fehlerklasse über Kombinationen und Mutation Testing), er fällt schneller auf (fachliche Kennzahlen im Canary und im Monitoring), und er trifft weniger Leute (Canary, Feature Flag). Maßnahmen, die sich nicht überprüfen lassen, ändern nichts. Ebenso wichtig ist die Begründung, was nicht kommt: Ein E2E-Test pro Preiskombination würde die Suite verlangsamen, ohne den Fehler besser zu zeigen als ein Unit-Test.
+    resources:
+      - title: Google SRE · Postmortem Culture
+        url: https://sre.google/sre-book/postmortem-culture/
+      - title: Google SRE Workbook · Selecting and evaluating metrics
+        url: https://sre.google/workbook/canarying-releases/#selecting-and-evaluating-metrics

@@ -1,0 +1,1081 @@
+id: frontend-tests
+title: Frontend-Tests
+level: 2
+minutes: 150
+summary: Komponenten so testen, wie Kundinnen sie bedienen – mit Vitest, Testing Library, user-event und MSW –, Logik in reine Funktionen ziehen und für jedes Risiko im Browser die günstigste Ebene wählen.
+goals:
+  - Du entscheidest für ein Risiko im Frontend, ob eine reine Funktion, ein Komponententest in jsdom, ein Test im echten Browser oder ein E2E-Test es am günstigsten zeigt.
+  - Du findest Elemente mit Testing Library über Rolle, Namen und Label und begründest, warum `getByTestId` die letzte Wahl ist.
+  - Du simulierst Eingaben mit `user-event` und wartest mit `findBy*` und `waitFor` auf asynchrone Änderungen statt auf feste Zeiten.
+  - Du ersetzt das Backend im Test mit MSW auf Netzwerkebene, statt `fetch` zu mocken, und steuerst Zeit mit Fake-Timern und `act`.
+  - Du ordnest axe-Prüfungen, Snapshot-Tests und visuelle Regressionstests ein und kennst ihre Grenzen.
+resources:
+  - title: Testing Library · Guiding Principles
+    url: https://testing-library.com/docs/guiding-principles
+  - title: Testing Library · Queries, Priority
+    url: https://testing-library.com/docs/queries/about#priority
+  - title: Vitest · Why Browser Mode
+    url: https://vitest.dev/guide/browser/why
+  - title: MSW · Node.js-Integration
+    url: https://mswjs.io/docs/integrations/node
+lesson: |
+  Das Buchungsformular auf radwerk.de hatte 140 Tests. Sie prüften `wrapper.state('minuten')`, die CSS-Klasse `btn-primary` und einen Snapshot mit 300 Zeilen HTML. Dann baute das Team das Formular von einer Klassenkomponente auf Hooks um. 90 Tests wurden rot, obwohl keine Kundin einen Unterschied sah. Zwei Wochen später ging ein echter Fehler live: Der Knopf „Reservieren“ war ein `<div>` mit `onClick` geworden. Mit der Tastatur kam niemand mehr hin, ein Screenreader las ihn nicht als Knopf vor. Kein Test schlug an.
+
+  Beide Pannen haben dieselbe Ursache. Die Tests prüften, *wie* die Komponente gebaut ist, und nicht, *was* eine Kundin damit tun kann. Dieses Modul zeigt Frontend-Tests aus Sicht der Nutzerin und klärt, welches Risiko auf welche Ebene gehört. Werkzeuge: Vitest als Test-Runner, Testing Library für Abfragen und Eingaben, MSW für das Netzwerk. Die Beispiele nutzen React; Testing Library gibt es mit fast derselben API für Vue, Svelte und Angular. Ganze Abläufe im echten Browser behandelt das nächste Modul, [End-to-End-Tests mit Playwright](/testing/e2e-tests).
+
+  ## Frontend-Risiken: welche Ebene welches Risiko zeigt
+
+  Ein Formular kann auf vier Arten kaputtgehen. Jede zeigt sich auf einer anderen Ebene am günstigsten:
+
+  | Risiko | Beispiel bei Radwerk | Günstigste Ebene | Kosten pro Test |
+  | --- | --- | --- | --- |
+  | Rechenregel falsch | 61 Minuten City-Rad kosten 300 statt 450 Cent | reine Funktion, Unit-Test | unter einer Millisekunde |
+  | Komponente reagiert falsch | Antwort 409 erscheint nicht als Fehlermeldung | Komponententest in jsdom mit MSW | einige zehn Millisekunden |
+  | Browser verhält sich anders als die Simulation | Kalender-Overlay verdeckt „Reservieren“, Fokus springt falsch | Vitest Browser Mode, visuelle Regression | Browserstart plus 100 ms und mehr |
+  | Teile passen nicht zusammen | Website schickt `minuten`, die API erwartet `dauer` | E2E-Test, Contract Test | Sekunden, echte Umgebung |
+
+  Die Regel aus [Testpyramide und Testgrenzen](/testing/testpyramide) gilt auch hier: Prüfe jedes Risiko auf der niedrigsten Ebene, die es zuverlässig zeigt. Im Frontend heißt das vor allem: Zieh Logik aus der Komponente heraus. Preisberechnung und Formatprüfung haben nichts mit React zu tun. Als reine Funktionen bekommen sie Werte und liefern Werte, ohne DOM, Netz oder Uhr; die Komponente ruft sie nur auf.
+
+  Der Tarif hier ist vereinfacht: 150 Cent (City-Rad) bzw. 300 Cent (E-Bike) je angefangene 30 Minuten, ohne Fehlstart und Tageshöchstpreis, denn das Formular zeigt nur den Preis einer geplanten Fahrt.
+
+  ```ts title=src/buchung/regeln.ts
+  export type Radtyp = 'city' | 'ebike'
+
+  const TARIF: Record<Radtyp, number> = { city: 150, ebike: 300 }
+
+  /** Preis einer geplanten Fahrt in Cent: je angefangene 30 Minuten. */
+  export function mietpreis(minuten: number, radtyp: Radtyp): number {
+    return Math.ceil(minuten / 30) * TARIF[radtyp]
+  }
+
+  /** null, wenn der Code leer oder gültig ist, sonst die Fehlermeldung. */
+  export function pruefeGutscheincode(code: string): string | null {
+    if (code === '') return null
+    return /^RW-[A-Z0-9]{6}$/.test(code)
+      ? null
+      : 'Gutscheincodes bestehen aus RW- und sechs Großbuchstaben oder Ziffern.'
+  }
+  ```
+
+  Der Test dazu sieht aus wie pytest mit anderer Syntax. `describe` gruppiert, `it` (oder gleichbedeutend `test`) ist ein Testfall, `expect(…).toBe(…)` vergleicht mit `Object.is`, `toEqual` vergleicht tief. `it.each` ist das Gegenstück zu `@pytest.mark.parametrize`; Platzhalter wie `%i` und `%j` landen im Testnamen. `vitest run` läuft einmal durch. `vitest` beobachtet lokal die Dateien und startet bei jeder Änderung neu; in der CI läuft es nur einmal.
+
+  ```ts title=src/buchung/regeln.test.ts
+  import { describe, expect, it } from 'vitest'
+  import { mietpreis, pruefeGutscheincode } from './regeln'
+
+  describe('mietpreis', () => {
+    it.each([
+      [30, 'city', 150],
+      [31, 'city', 300],
+      [60, 'ebike', 600],
+    ] as const)('%i Minuten %s kosten %i Cent', (minuten, radtyp, cent) => {
+      expect(mietpreis(minuten, radtyp)).toBe(cent)
+    })
+  })
+
+  describe('pruefeGutscheincode', () => {
+    it.each(['', 'RW-AB12CD', 'RW-000000'])('akzeptiert %j', (code) => {
+      expect(pruefeGutscheincode(code)).toBeNull()
+    })
+
+    it.each(['RW-ab12cd', 'RW-AB12C', 'RW-AB12CDE', 'XX-AB12CD', ' RW-AB12CD'])('lehnt %j ab', (code) => {
+      expect(pruefeGutscheincode(code)).toMatch(/RW- und sechs/)
+    })
+  })
+  ```
+
+  Elf Fälle in wenigen Millisekunden. Über das gerenderte Formular kostet jeder Fall Rendern, Tippen und Klicken und sagt nichts zusätzlich über die Regel.
+
+  ## Testing Library: Abfragen aus Sicht der Nutzerin
+
+  Testing Library beruht auf einem Satz: „The more your tests resemble the way your software is used, the more confidence they can give you.“ ([Guiding Principles](https://testing-library.com/docs/guiding-principles)). Tests sehen deshalb DOM-Knoten, keine Komponenteninstanzen und keinen State. Sie finden Elemente so, wie Menschen es tun: über Rolle und Namen, über das Label eines Felds, über sichtbaren Text. Die empfohlene Reihenfolge ([Queries · Priority](https://testing-library.com/docs/queries/about#priority)):
+
+  1. `getByRole('button', { name: 'Reservieren' })` – die Rolle im Accessibility Tree plus der zugängliche Name. Erste Wahl für fast alles.
+  2. `getByLabelText('Gutscheincode')` – Formularfelder über ihr Label.
+  3. `getByPlaceholderText`, `getByText`, `getByDisplayValue` – wenn es kein Label gibt oder für Texte außerhalb von Formularen.
+  4. `getByAltText`, `getByTitle` – semantische Attribute.
+  5. `getByTestId` – nur, wenn nichts davon passt, etwa bei rein dynamischem Text.
+
+  Warum die Rolle zuerst? Ein Screenreader liest „Reservieren, Schaltfläche“ vor, weil der Accessibility Tree diese Rolle und diesen Namen enthält. Genau darauf fragt `getByRole` ab. Das `<div onClick>` aus der Einleitung hat keine Rolle `button`; ein Test mit `getByRole('button', { name: 'Reservieren' })` wäre rot geworden. Findet `getByRole` nichts, listet die Fehlermeldung alle Rollen mit ihren Namen auf. Oft siehst du dort sofort, dass ein Label fehlt.
+
+  > [!MERKE]
+  > Findet dein Test ein Element nicht über Rolle und Namen, findet es ein Screenreader meist auch nicht. Repariere dann die Komponente, nicht die Abfrage.
+
+  Jede Abfrage gibt es in drei Varianten:
+
+  | Variante | kein Treffer | mehrere Treffer | wofür |
+  | --- | --- | --- | --- |
+  | `getBy…` | wirft einen Fehler | wirft einen Fehler | Das Element ist jetzt da. |
+  | `queryBy…` | liefert `null` | wirft einen Fehler | Prüfen, dass etwas *nicht* da ist. |
+  | `findBy…` | Promise lehnt nach dem Timeout ab | lehnt ab | Das Element erscheint gleich. |
+
+  Dazu kommen `getAllBy…`, `queryAllBy…` und `findAllBy…` für Listen. Das Formular, um das es ab jetzt geht, bündelt Dauer, Preisvorschau, Gutscheincode und das Absenden (Importe und der Typ `Props` gekürzt):
+
+  ```tsx title=src/buchung/Buchungsformular.tsx
+  export function Buchungsformular({ radId, radtyp, onReserviert }: Props) {
+    const [minuten, setMinuten] = useState(30)
+    const [gutschein, setGutschein] = useState('')
+    const [fehler, setFehler] = useState<string | null>(null)
+    const [nummer, setNummer] = useState<string | null>(null)
+    const [sendet, setSendet] = useState(false)
+
+    async function absenden(event: FormEvent) {
+      event.preventDefault()
+      const problem = pruefeGutscheincode(gutschein)
+      setFehler(problem)
+      if (problem) return
+      setSendet(true)
+      const antwort = await fetch('/api/reservierungen', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ radId, minuten, gutschein: gutschein || null }),
+      })
+      setSendet(false)
+      if (antwort.status === 409) return setFehler('Dieses Rad ist in dem Zeitraum schon reserviert.')
+      if (!antwort.ok) return setFehler('Die Reservierung hat nicht geklappt. Versuch es gleich noch einmal.')
+      const daten: { nummer: string } = await antwort.json()
+      setNummer(daten.nummer)
+      onReserviert?.(daten.nummer)
+    }
+
+    return (
+      <form aria-label="Rad reservieren" onSubmit={absenden}>
+        <label htmlFor="dauer">Dauer</label>
+        <select id="dauer" value={minuten} onChange={(e) => setMinuten(Number(e.target.value))}>
+          <option value={30}>30 Minuten</option>
+          <option value={60}>1 Stunde</option>
+          <option value={120}>2 Stunden</option>
+        </select>
+        <p>Voraussichtlich {euro(mietpreis(minuten, radtyp))}</p>
+        <label htmlFor="gutschein">Gutscheincode</label>
+        <input id="gutschein" value={gutschein} onChange={(e) => setGutschein(e.target.value)} />
+        {fehler && <p role="alert">{fehler}</p>}
+        <button type="submit" disabled={sendet}>Reservieren</button>
+        {nummer && <p role="status">Reserviert: {nummer}</p>}
+      </form>
+    )
+  }
+  ```
+
+  Damit Komponenten ein DOM haben, läuft Vitest in der Umgebung `jsdom`. Die Setup-Datei lädt die DOM-Matcher von jest-dom (`toBeInTheDocument`, `toHaveTextContent`, `toBeDisabled` …) und räumt nach jedem Test das gerenderte DOM ab. Das Aufräumen musst du selbst eintragen: React Testing Library räumt nur von allein auf, wenn `afterEach` global existiert, in Vitest also nur mit `globals: true` ([React Testing Library · cleanup](https://testing-library.com/docs/react-testing-library/api#cleanup)).
+
+  ```ts title=vitest.config.ts
+  import { defineConfig } from 'vitest/config'
+  import react from '@vitejs/plugin-react'
+
+  export default defineConfig({
+    plugins: [react()],
+    test: {
+      environment: 'jsdom',
+      setupFiles: ['./src/test/setup.ts'],
+    },
+  })
+  ```
+
+  ## Eingaben mit user-event statt fireEvent
+
+  `fireEvent` löst genau ein DOM-Ereignis aus. `fireEvent.change(feld, { target: { value: 'RW-AB12CD' } })` setzt den Wert in einem Schritt, ohne Fokus und ohne Tastenereignisse. `user-event` beschreibt dagegen eine Interaktion: `user.type` klickt in das Feld und löst pro Zeichen die Tastenereignisse und `input` aus. Dabei berücksichtigt es, dass ein Browser keinen Klick auf ein verstecktes Element und keine Eingabe in ein gesperrtes Feld zulässt ([user-event · Differences from fireEvent](https://testing-library.com/docs/user-event/intro#differences-from-fireevent)). Bei einem `disabled`-Feld setzt `fireEvent.change` den Wert trotzdem, `user.type` lässt es leer. Und eine Prüfung im `onBlur`-Handler läuft mit `user-event`, sobald der Test woanders hinklickt; `fireEvent.change` fokussiert nie und löst sie nie aus. Seit Version 14 erzeugst du zuerst eine Sitzung mit `userEvent.setup()`, am besten vor `render`. Alle Methoden liefern Promises, also immer `await`.
+
+  ```tsx title=src/buchung/Buchungsformular.test.tsx
+  import { render, screen } from '@testing-library/react'
+  import userEvent from '@testing-library/user-event'
+  import { describe, expect, it } from 'vitest'
+  import { Buchungsformular } from './Buchungsformular'
+
+  describe('Buchungsformular', () => {
+    it('zeigt den Preis für die gewählte Dauer', async () => {
+      const user = userEvent.setup()
+      render(<Buchungsformular radId="R-17" radtyp="ebike" />)
+
+      await user.selectOptions(screen.getByLabelText('Dauer'), '1 Stunde')
+
+      expect(screen.getByText('Voraussichtlich 6,00 €')).toBeInTheDocument()
+    })
+
+    it('lehnt einen falsch geformten Gutscheincode ab', async () => {
+      const user = userEvent.setup()
+      render(<Buchungsformular radId="R-17" radtyp="city" />)
+
+      await user.type(screen.getByLabelText('Gutscheincode'), 'rw-ab12cd')
+      await user.click(screen.getByRole('button', { name: 'Reservieren' }))
+
+      expect(screen.getByRole('alert')).toHaveTextContent('sechs Großbuchstaben oder Ziffern')
+    })
+  })
+  ```
+
+  Beide Tests kennen weder `useState` noch Handler-Namen. Ein Umbau auf eine Formularbibliothek lässt sie grün, solange Kundinnen dasselbe sehen. Im zweiten Test reicht `getByRole` nach dem Klick, weil die Formatprüfung vor dem ersten `await` in `absenden` läuft. Mit Netz stimmt das nicht mehr.
+
+  Für Callbacks wie `onReserviert` nimmst du eine Spy-Funktion: `vi.fn()` merkt sich jeden Aufruf mit seinen Argumenten. Seit Vitest 5 ist `clearMocks` Standard, die Aufrufliste beginnt in jedem Test leer.
+
+  ## Netzwerk mit MSW und asynchrones Warten
+
+  Naheliegend wäre, `fetch` zu ersetzen: `vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(…))`. Damit hängt der Test an der Implementierung. Wechselt das Team die HTTP-Bibliothek, wird er rot, obwohl die Seite dieselbe Anfrage schickt. Und ein Spy, den niemand zurücksetzt, bleibt für die folgenden Tests der Datei aktiv – `clearMocks` löscht nur die Aufrufliste, nicht die Ersatzimplementierung.
+
+  Mock Service Worker (MSW) setzt tiefer an. Er fängt Anfragen auf Netzwerkebene ab und beantwortet sie mit Handlern; der Code der Komponente läuft unverändert, mit URL, Methode, Headern, Statusbehandlung und JSON-Parsing. Die Standard-Handler beschreiben den Normalfall, `server.use` überschreibt ihn für einen Test, `resetHandlers` stellt danach den Normalfall wieder her.
+
+  ```ts title=src/test/server.ts_und_setup.ts
+  // src/test/server.ts
+  import { http, HttpResponse } from 'msw/http'
+  import { setupServer } from 'msw/node'
+
+  export const server = setupServer(
+    http.post('/api/reservierungen', () => HttpResponse.json({ nummer: 'R-1042' }, { status: 201 })),
+  )
+
+  // src/test/setup.ts
+  import '@testing-library/jest-dom/vitest'
+  import { cleanup } from '@testing-library/react'
+  import { afterAll, afterEach, beforeAll } from 'vitest'
+  import { server } from './server'
+
+  beforeAll(() => server.listen({ onUnhandledFrame: 'error' }))
+  afterEach(() => {
+    cleanup()
+    server.resetHandlers()
+  })
+  afterAll(() => server.close())
+  ```
+
+  `onUnhandledFrame: 'error'` lässt jede Anfrage ohne passenden Handler scheitern. So fällt eine Anfrage an einen Endpunkt auf, an den beim Schreiben der Tests niemand gedacht hat. Fängt die Komponente den Fehler nicht ab, meldet Vitest ihn als „Unhandled Rejection“, und der Lauf wird rot, auch wenn der Test selbst durchläuft.
+
+  > [!NOTE] MSW 3
+  > Seit MSW 3.0 (September 2026) kommen `http` und `HttpResponse` aus `msw/http`, und die Option `onUnhandledRequest` heißt `onUnhandledFrame` ([MSW · Migration 2.x → 3.x](https://mswjs.io/docs/migrations/2.x-to-3.x#imports)). Viele Anleitungen zeigen noch die Schreibweise von MSW 2.
+
+  Jetzt die beiden Fälle mit Netz:
+
+  ```tsx
+  it('bestätigt die Reservierung mit ihrer Nummer', async () => {
+    const onReserviert = vi.fn()
+    const user = userEvent.setup()
+    render(<Buchungsformular radId="R-17" radtyp="city" onReserviert={onReserviert} />)
+
+    await user.click(screen.getByRole('button', { name: 'Reservieren' }))
+
+    expect(await screen.findByRole('status')).toHaveTextContent('Reserviert: R-1042')
+    expect(onReserviert).toHaveBeenCalledExactlyOnceWith('R-1042')
+  })
+
+  it('meldet, wenn das Rad schon reserviert ist', async () => {
+    server.use(
+      http.post('/api/reservierungen', () =>
+        HttpResponse.json({ title: 'Zeitraum belegt' }, { status: 409 }),
+      ),
+    )
+    const user = userEvent.setup()
+    render(<Buchungsformular radId="R-17" radtyp="city" />)
+
+    await user.click(screen.getByRole('button', { name: 'Reservieren' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('schon reserviert')
+    expect(screen.queryByRole('status')).not.toBeInTheDocument()
+  })
+  ```
+
+  `findByRole` ist `getByRole` plus `waitFor`: Es prüft sofort, dann alle 50 ms und bei jeder Änderung im DOM, höchstens 1 000 ms lang ([Async Methods · findBy](https://testing-library.com/docs/dom-testing-library/api-async#findby-queries)). Ein `getByRole('status')` direkt nach dem Klick ist ein Wettrennen gegen die Antwort. Mit dem sofort antwortenden Handler oben gewinnt der Test es meistens. Bekommt der Handler eine realistische Verzögerung von 50 ms, verliert er es: Der Test ist rot, die Seite funktioniert. Ein Test, der zufällig grün ist, zeigt nichts.
+
+  Für Dinge, die nicht im DOM stehen, gibt es `waitFor(() => expect(onReserviert).toHaveBeenCalledWith('R-1042'))`. Der Callback wird wiederholt, bis er nicht mehr wirft. Darum gehört genau eine Erwartung hinein und keine Aktion: Ein `user.click` im Callback klickt bei jedem Versuch erneut ([Common mistakes · Side effects in waitFor](https://kentcdodds.com/blog/common-mistakes-with-react-testing-library#performing-side-effects-in-waitfor)). Dass etwas *nicht* erscheint, prüfst du mit `queryBy…` und `not.toBeInTheDocument()`.
+
+  Prüfe die Reaktion der Oberfläche, nicht die Anfrage. Ob der Body stimmt, beschreibt der Handler: Er antwortet mit 400, wenn `radId` fehlt, und dann wird die Assertion auf die Bestätigung rot ([MSW · Avoid request assertions](https://mswjs.io/docs/best-practices/avoid-request-assertions)). Eine Grenze bleibt: MSW-Handler beschreiben, was das Frontend über die API *annimmt*. Benennt das Backend ein Feld um, antwortet MSW weiter wie früher, und alle Tests bleiben grün. Diese Lücke schließen [Contract Tests](/testing/contract-testing) oder Handler, die aus der OpenAPI-Beschreibung erzeugt werden.
+
+  ## Zeit, jsdom und der echte Browser
+
+  Nach dem Reservieren hält Radwerk das Rad 15 Minuten. Die Komponente `Haltefrist` zählt mit `setInterval` herunter, zeigt die Restzeit in einem Element mit der Rolle `timer` und am Ende „Reservierung abgelaufen“ mit der Rolle `status`. 15 Minuten wartet kein Test. Fake-Timer ersetzen `setTimeout`, `setInterval` und `Date` durch eine Uhr, die nur weiterläuft, wenn der Test es sagt:
+
+  ```tsx title=src/buchung/Haltefrist.test.tsx
+  import { act, render, screen } from '@testing-library/react'
+  import { afterEach, beforeEach, expect, it, vi } from 'vitest'
+  import { Haltefrist } from './Haltefrist'
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-10-03T10:00:00+02:00'))
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('läuft nach 15 Minuten ab', () => {
+    render(<Haltefrist bis={new Date('2026-10-03T10:15:00+02:00')} />)
+    expect(screen.getByRole('timer')).toHaveTextContent('Noch 15:00 Minuten')
+
+    act(() => vi.advanceTimersByTime(14 * 60_000 + 59_000))
+    expect(screen.getByRole('timer')).toHaveTextContent('Noch 0:01 Minuten')
+
+    act(() => vi.advanceTimersByTime(1000))
+    expect(screen.getByRole('status')).toHaveTextContent('Reservierung abgelaufen')
+  })
+  ```
+
+  `act` sorgt dafür, dass React die State-Änderungen aus den Timern verarbeitet, bevor der Test das DOM liest. Ohne `act` steht nach dem Vorspulen noch „Noch 15:00 Minuten“ da. `render` und `user-event` wickeln ihre Arbeit selbst in `act`; beim direkten Vorspulen musst du es tun.
+
+  > [!WARNING] Vitest-Fake-Timer und Testing Library
+  > Testing Library erkennt nur die Fake-Timer von Jest: Sie prüft, ob es ein globales `jest` gibt. Mit `vi.useFakeTimers()` hängen deshalb `user-event`-Aufrufe und jedes `findBy*` oder `waitFor`, das nicht sofort fündig wird, bis der Test nach 5 Sekunden abbricht – ihre internen `setTimeout` laufen nie ab. Brauchst du Fake-Zeit und Interaktion zusammen, nimm `vi.useFakeTimers({ shouldAdvanceTime: true })` ([Vitest · shouldAdvanceTime](https://vitest.dev/config/faketimers#faketimers-shouldadvancetime)) und `userEvent.setup({ advanceTimers: vi.advanceTimersByTime })`.
+
+  jsdom ist eine DOM-Implementierung in JavaScript, kein Browser. Es hat keine Layout-Engine: `getBoundingClientRect()` liefert Nullen, und ob ein Overlay einen Knopf verdeckt, weiß es nicht. happy-dom ist schneller, kennt aber weniger Browser-APIs ([Vitest · Test Environment](https://vitest.dev/guide/environment)). Für Komponenten, deren Risiko im Browser liegt – Layout, Fokusfallen in Dialogen, Drag-and-drop, `IntersectionObserver` –, gibt es den Vitest Browser Mode. Er führt Tests in echtem Chromium, Firefox oder WebKit aus, gesteuert über Playwright oder WebdriverIO. Das kostet den Browserstart und Zeit pro Test, und die Vitest-Doku nennt ihn ausdrücklich keinen Ersatz für E2E-Tests ([Vitest · Why Browser Mode](https://vitest.dev/guide/browser/why#drawbacks)).
+
+  ```tsx title=src/buchung/Buchungsformular.browser.test.tsx
+  import { expect, test } from 'vitest'
+  import { render } from 'vitest-browser-react'
+  import { Buchungsformular } from './Buchungsformular'
+
+  test('lehnt einen falsch geformten Gutscheincode ab', async () => {
+    const screen = await render(<Buchungsformular radId="R-17" radtyp="city" />)
+
+    await screen.getByLabelText('Gutscheincode').fill('rw-ab12cd')
+    await screen.getByRole('button', { name: 'Reservieren' }).click()
+
+    await expect.element(screen.getByRole('alert')).toMatchTextContent('sechs Großbuchstaben')
+  })
+  ```
+
+  Die Abfragen heißen gleich, liefern aber Locators, und `expect.element` wiederholt die Prüfung, bis sie besteht. Achtung beim Umstieg: In Vitest 5 vergleicht `toHaveTextContent` im Browser Mode den ganzen Text exakt, Teiltreffer prüft `toMatchTextContent` ([Vitest 5 · toHaveTextContent](https://vitest.dev/guide/migration#tohavetextcontent-now-performs-strict-equality)). jest-dom in jsdom vergleicht weiter Teiltexte. Ein guter Standard: jsdom für das Verhalten von Komponenten, Browser Mode für die wenigen, bei denen der Browser selbst das Risiko ist.
+
+  ## Barrierefreiheit, Snapshots und visuelle Regression
+
+  Abfragen über Rollen prüfen Barrierefreiheit nebenbei. axe-core prüft sie gezielt: fehlende Labels, Knöpfe ohne Namen, Bilder ohne Alternativtext, ungültige ARIA-Attribute. Das Paket jest-axe läuft auch unter Vitest und schaltet die Kontrastprüfung ab, weil jsdom keine Farben berechnet.
+
+  ```tsx
+  import { render } from '@testing-library/react'
+  import { axe } from 'jest-axe'
+  import { expect, it } from 'vitest'
+  import { Buchungsformular } from './Buchungsformular'
+
+  it('hat keine automatisch erkennbaren Barrieren', async () => {
+    const { container } = render(<Buchungsformular radId="R-17" radtyp="city" />)
+
+    const ergebnis = await axe(container)
+
+    expect(ergebnis.violations).toEqual([])
+  })
+  ```
+
+  Ein grüner axe-Test heißt nicht „barrierefrei“. Der britische Government Digital Service baute 2017 eine Seite mit 143 Barrieren und ließ zehn Werkzeuge darauf los: Das beste fand 41 %, 29 % fand keines ([GDS · What we found](https://accessibility.blog.gov.uk/2017/02/24/what-we-found-when-we-tested-tools-on-the-worlds-least-accessible-webpage/)). Bedienung per Tastatur und mit Screenreader prüft weiter ein Mensch.
+
+  **Snapshot-Tests** speichern eine Ausgabe beim ersten Lauf und vergleichen jeden weiteren Lauf damit. `expect(container).toMatchSnapshot()` über das ganze Formular macht aus jeder Markup-Änderung einen roten Test. Nach dem zehnten Fehlalarm aktualisiert das Team mit `vitest -u`, ohne den Diff zu lesen, und der Test prüft nichts mehr. Snapshots helfen bei kleiner, strukturierter Ausgabe, die sich selten ändert, etwa einer Fehlermeldung als Inline-Snapshot. Wo nur zwei Felder zählen, ist eine gezielte Assertion klarer. Für die Zugänglichkeitsstruktur gibt es ARIA-Snapshots (im Vitest Browser Mode seit 4.1.4 und noch experimentell, in Playwright `toMatchAriaSnapshot`): Sie halten Rollen und Namen fest statt HTML und überstehen Umbauten des Markups.
+
+  **Visuelle Regressionstests** vergleichen Screenshots mit Referenzbildern (`toMatchScreenshot` im Vitest Browser Mode, `toHaveScreenshot` in Playwright). Sie finden, was keine Assertion sieht: einen pinken Knopf, ein Layout, das auf dem Handy umbricht. Dafür reagieren sie auf Schriftart, Betriebssystem und Grafikkarte; die Referenzbilder entstehen deshalb in einer festen Umgebung, meist einem Container in der CI ([Vitest · Visual Regression Testing](https://vitest.dev/guide/browser/visual-regression-testing#environmental-stability)). Halte sie getrennt von den Verhaltenstests, damit jede Suite aus dem richtigen Grund rot wird.
+
+  > [!PRAXIS] Radwerk nach dem Umbau
+  > Heute hat das Buchungsformular 60 Tests für Preis- und Formatregeln (unter einer Sekunde), 14 Komponententests mit MSW (zwei Sekunden), drei Tests im Browser Mode für das Kalender-Overlay und einen axe-Test pro Seite. Was davon E2E läuft, steht im nächsten Modul. Im Review gilt: kein `getByTestId` ohne Begründung im Kommentar, kein Snapshot über eine ganze Seite. `eslint-plugin-testing-library` und `eslint-plugin-jest-dom` finden die häufigsten Fehler automatisch.
+
+  ## Häufige Fehler
+
+  - **Implementierungsdetails prüfen.** State, CSS-Klassen, Namen von Handlern. Symptom: Ein Refactoring ohne sichtbare Änderung macht Dutzende Tests rot. Abfragen über Rolle, Label und Text.
+  - **`getByTestId` als Standard.** Der Test findet das `<div onClick>` weiter, der Screenreader nicht. Zuerst `getByRole` mit `name`.
+  - **`fireEvent` zum Tippen.** Fokus, Tastenereignisse und gesperrte Felder fehlen. `user-event` mit `userEvent.setup()`.
+  - **`await` vergessen.** `user.click(…)` ohne `await` lässt die Assertion vor dem Klick laufen. `expect(screen.findByText('…')).toBeTruthy()` ist immer grün, weil ein Promise wahr ist. Vitest 5 lässt nicht abgewartete `.resolves`/`.rejects` scheitern, diese beiden Fälle nicht.
+  - **`getBy` nach einer Netzanfrage.** Mal grün, mal rot. `findBy…` oder `waitFor`.
+  - **Aktionen in `waitFor`.** Der Klick wiederholt sich bei jedem Versuch. Erst handeln, dann warten.
+  - **`fetch` mocken statt MSW.** Der Test hängt an der HTTP-Bibliothek, der Spy wirkt in Folgetests weiter.
+  - **`server.resetHandlers()` vergessen.** Die 409 aus einem Test gilt für alle folgenden, das Ergebnis hängt von der Reihenfolge ab. Mehr zu solchen Ursachen in [Flaky Tests](/testing/flaky-tests).
+
+  > [!INTERVIEW] „Wie testest du ein React-Formular?“
+  > Die Regeln – Preis, Format, Grenzen – ziehe ich in reine Funktionen und teste sie mit vielen Fällen als Unit-Tests. Das Formular teste ich mit Testing Library so, wie eine Kundin es bedient: Felder über Label, Knöpfe über Rolle und Namen, Eingaben mit `user-event`. Das Backend ersetze ich mit MSW auf Netzwerkebene, je ein Test für Erfolg, Konflikt und Fehler, und warte mit `findBy` statt mit Pausen. Dazu ein axe-Check. Nur den ganzen Buchungsablauf mit Zahlung teste ich E2E – einmal, nicht für jede Variante.
+
+  ## Zusammenfassung
+
+  - Jedes Frontend-Risiko auf der günstigsten Ebene prüfen: Regeln als reine Funktionen, Verhalten als Komponententest in jsdom, Browser-Eigenheiten im Browser Mode, das Zusammenspiel E2E.
+  - Testing Library fragt wie Nutzer: `getByRole` mit Namen zuerst, dann `getByLabelText`, `getByTestId` zuletzt. `queryBy` für Abwesenheit, `findBy` für Erscheinen.
+  - `user-event` (v14, `userEvent.setup()` vor `render`) simuliert ganze Interaktionen; jede Methode braucht `await`.
+  - MSW beantwortet Anfragen auf Netzwerkebene: Standard-Handler, `server.use` je Test, `resetHandlers` danach, `onUnhandledFrame: 'error'`. Assertions prüfen die Oberfläche, nicht die Anfrage.
+  - `findBy*` und `waitFor` warten auf Zustände; in `waitFor` gehört genau eine Erwartung und keine Aktion.
+  - Fake-Timer mit `act` vorspulen; mit Testing Library zusammen `shouldAdvanceTime: true` und `advanceTimers`.
+  - axe findet einen Teil der Barrieren, keinen Beweis für Barrierefreiheit. Snapshots nur für kleine, stabile Ausgaben; visuelle Regression in fester Umgebung und getrennt von Verhaltenstests.
+exercises:
+  - id: ebene-waehlen
+    type: choice
+    title: Was gehört in den Komponententest?
+    prompt: |
+      Für welche dieser Risiken am Buchungsformular ist ein Komponententest mit Testing Library und MSW in jsdom die günstigste Ebene, die das Risiko zuverlässig zeigt?
+    options:
+      - text: Bei Antwort 409 erscheint „Dieses Rad ist in dem Zeitraum schon reserviert.“ und keine Bestätigung.
+        correct: true
+        why: Das ist die Reaktion einer Komponente auf eine Serverantwort. MSW liefert die 409 in Millisekunden, ein echtes Backend braucht es dafür nicht.
+      - text: Während die Anfrage läuft, ist „Reservieren“ gesperrt, damit niemand doppelt bucht.
+        correct: true
+        why: Ein Zustand der Komponente, im DOM als `disabled` sichtbar. Mit einem verzögerten MSW-Handler prüfst du ihn mit `toBeDisabled()`.
+      - text: 120 Minuten E-Bike kosten 1 200 Cent.
+        correct: false
+        why: Eine reine Rechenregel. Als Unit-Test von `mietpreis` ist sie schneller, und weitere Grenzfälle kosten fast nichts. Über das Formular prüfst du dieselbe Regel nur teurer.
+      - text: Das Kalender-Overlay verdeckt auf schmalen Bildschirmen den Knopf „Reservieren“.
+        correct: false
+        why: jsdom hat keine Layout-Engine und weiß nicht, was verdeckt ist. Das ist ein Fall für den Vitest Browser Mode oder einen visuellen Regressionstest.
+      - text: Nach dem Bezahlen bei Paystream steht die Reservierung unter „Meine Fahrten“.
+        correct: false
+        why: Das betrifft Website, API, Datenbank und Zahlungsanbieter zusammen. Das zeigt nur ein E2E-Test einer kritischen Journey.
+    explanation: |
+      Ein Komponententest in jsdom ist die richtige Ebene, wenn das Risiko im Verhalten der Komponente liegt: was sie bei welcher Eingabe oder Antwort anzeigt, sperrt oder meldet. Rechenregeln gehören tiefer, in reine Funktionen. Layout und echtes Browserverhalten gehören höher, in den Browser Mode. Das Zusammenspiel mehrerer Systeme gehört in wenige E2E-Tests. Wer alles auf eine Ebene legt, zahlt entweder mit Laufzeit oder mit Lücken.
+    resources:
+      - title: Vitest · The Simulation Caveat
+        url: https://vitest.dev/guide/browser/why#the-simulation-caveat
+
+  - id: abfrage-waehlen
+    type: choice
+    title: Wie findet der Test das Feld?
+    prompt: |
+      Das Formular rendert dieses Feld. Welche Abfragen empfiehlt Testing Library dafür?
+    lang: tsx
+    code: |
+      <label htmlFor="gutschein">Gutscheincode</label>
+      <input
+        id="gutschein"
+        className="rw-input"
+        placeholder="RW-XXXXXX"
+        data-testid="gutschein-input"
+      />
+    options:
+      - text: "`screen.getByRole('textbox', { name: 'Gutscheincode' })`"
+        correct: true
+        why: Rolle plus zugänglicher Name, die oberste Stufe der Priorität. Der Name kommt hier aus dem verknüpften Label.
+      - text: "`screen.getByLabelText('Gutscheincode')`"
+        correct: true
+        why: Für Formularfelder genauso gut – so finden Menschen ein Feld. Fehlt die Verknüpfung über `htmlFor`, schlägt die Abfrage fehl und zeigt damit einen echten Fehler.
+      - text: "`screen.getByPlaceholderText('RW-XXXXXX')`"
+        correct: false
+        why: Funktioniert, steht aber tiefer in der Priorität. Ein Platzhalter ersetzt kein Label; wenn es ein Label gibt, frag danach.
+      - text: "`screen.getByTestId('gutschein-input')`"
+        correct: false
+        why: Die letzte Wahl. Nutzer sehen `data-testid` nicht, der Test bliebe grün, wenn das Label fehlte.
+      - text: "`container.querySelector('.rw-input')`"
+        correct: false
+        why: Eine CSS-Klasse ist ein Implementierungsdetail. Ein Umbau des Stylings macht den Test rot, ohne dass sich für Kundinnen etwas ändert.
+    explanation: |
+      Testing Library ordnet Abfragen danach, wie nah sie am Erleben der Nutzer sind. Rolle und Label prüfen nebenbei, dass das Feld zugänglich ist: Ein Screenreader liest „Gutscheincode, Eingabefeld“ aus genau diesen Informationen. Platzhalter, Test-IDs und CSS-Selektoren finden das Feld auch dann, wenn diese Information fehlt, und übersehen damit den Fehler.
+    resources:
+      - title: Testing Library · Queries, Priority
+        url: https://testing-library.com/docs/queries/about#priority
+      - title: Testing Library · ByRole
+        url: https://testing-library.com/docs/queries/byrole
+
+  - id: await-vergessen
+    type: output
+    title: Grün aus dem falschen Grund
+    prompt: |
+      Ein Mini-Test-Runner zeigt, was passiert, wenn ein Test ein Promise nicht abwartet. Node meldet eine Promise-Ablehnung, die niemand behandelt, über das Ereignis `unhandledRejection` – und zwar erst, wenn kein anderer Code mehr ansteht. Was gibt das Programm aus?
+    lang: typescript
+    code: |
+      // Ein Test gilt als bestanden, wenn seine Funktion ohne Fehler endet.
+      async function test(name: string, fn: () => unknown): Promise<void> {
+        try {
+          await fn()
+          console.log(`✓ ${name}`)
+        } catch (fehler) {
+          console.log(`✗ ${name}: ${(fehler as Error).message}`)
+        }
+      }
+
+      function erwarteGleich(ist: unknown, soll: unknown): void {
+        if (ist !== soll) throw new Error(`erwartet ${soll}, bekommen ${ist}`)
+      }
+
+      function erwarteWahr(wert: unknown): void {
+        if (!wert) throw new Error(`${wert} ist nicht wahr`)
+      }
+
+      // Der Server meldet: Das Rad ist im gewünschten Zeitraum belegt.
+      async function reservieren(): Promise<string> {
+        return 'belegt'
+      }
+
+      process.on('unhandledRejection', (grund) => {
+        console.log(`Unhandled Rejection: ${(grund as Error).message}`)
+      })
+
+      await test('then ohne await', () => {
+        reservieren().then((status) => erwarteGleich(status, 'reserviert'))
+      })
+      await test('mit await', async () => {
+        erwarteGleich(await reservieren(), 'reserviert')
+      })
+      await test('Promise statt Wert', () => {
+        erwarteWahr(reservieren())
+      })
+    expected: |
+      ✓ then ohne await
+      ✗ mit await: erwartet reserviert, bekommen belegt
+      ✓ Promise statt Wert
+      Unhandled Rejection: erwartet reserviert, bekommen belegt
+    hints:
+      - Der erste Test gibt `undefined` zurück, bevor der `.then`-Callback läuft. Was wartet `await fn()` dann ab?
+      - "`erwarteWahr` bekommt im dritten Test kein `'belegt'`, sondern ein Promise-Objekt."
+    explanation: |
+      Der erste Test startet das Promise, gibt es aber nicht zurück. `await fn()` wartet auf `undefined`, der Runner meldet ✓. Die Erwartung scheitert erst danach im `.then`-Callback, und den Fehler fängt niemand: Er taucht losgelöst vom Test als „Unhandled Rejection“ am Ende auf. Vitest zeigt so etwas als „Unhandled Errors“ nach dem Lauf, oft einem anderen Test zugeordnet. Der dritte Test prüft ein Promise auf Wahrheit, und jedes Objekt ist wahr – genau wie `expect(screen.findByText('…')).toBeTruthy()`. Nur der zweite Test wartet ab und scheitert dort, wo der Fehler liegt.
+    resources:
+      - title: Vitest 5 · Unawaited asynchronous assertions
+        url: https://vitest.dev/guide/migration#unawaited-asynchronous-assertions-fail-the-test
+      - title: Node.js · Event 'unhandledRejection'
+        url: https://nodejs.org/api/process.html#event-unhandledrejection
+
+  - id: fake-uhr
+    type: output
+    title: Wie oft fragt das Gutscheinfeld?
+    prompt: |
+      Das Gutscheinfeld fragt den Server erst, wenn 300 ms lang nichts getippt wurde (Debounce). Der Test steuert die Zeit mit einer selbst gebauten Fake-Uhr. Wie bei `vi.advanceTimersByTime` laufen beim Vorspulen alle Timer, die bis einschließlich zum neuen Zeitpunkt fällig sind. Was gibt das Programm aus?
+    lang: typescript
+    code: |
+      type Timer = { id: number; faellig: number; fn: () => void }
+      let jetzt = 0
+      let naechsteId = 1
+      let timer: Timer[] = []
+
+      function setzeTimeout(fn: () => void, ms: number): number {
+        timer.push({ id: naechsteId, faellig: jetzt + ms, fn })
+        return naechsteId++
+      }
+
+      function loescheTimeout(id: number): void {
+        timer = timer.filter((t) => t.id !== id)
+      }
+
+      function vorspulen(ms: number): void {
+        const ende = jetzt + ms
+        timer.sort((a, b) => a.faellig - b.faellig)
+        while (timer.length > 0 && timer[0].faellig <= ende) {
+          const t = timer.shift()!
+          jetzt = t.faellig
+          t.fn()
+        }
+        jetzt = ende
+      }
+
+      let wartend: number | undefined
+      let anfragen = 0
+      function tippe(code: string): void {
+        if (wartend !== undefined) loescheTimeout(wartend)
+        wartend = setzeTimeout(() => {
+          anfragen++
+          console.log(`${jetzt} ms: prüfe ${code}`)
+        }, 300)
+      }
+
+      tippe('RW-S')
+      vorspulen(300)
+      tippe('RW-SO')
+      vorspulen(150)
+      tippe('RW-SOM')
+      vorspulen(299)
+      console.log(`${jetzt} ms: ${anfragen} Anfrage(n)`)
+      vorspulen(1)
+      console.log(`${jetzt} ms: ${anfragen} Anfrage(n)`)
+    expected: |
+      300 ms: prüfe RW-S
+      749 ms: 1 Anfrage(n)
+      750 ms: prüfe RW-SOM
+      750 ms: 2 Anfrage(n)
+    hints:
+      - Rechne für jeden Timer den Zeitpunkt `faellig` aus. Der erste ist bei 300 ms fällig, und `vorspulen(300)` erreicht genau 300.
+      - "`tippe('RW-SOM')` löscht den Timer von `RW-SO`. Wann ist der neue fällig?"
+    explanation: |
+      `tippe('RW-S')` stellt einen Timer auf 300 ms; `vorspulen(300)` erreicht genau diesen Zeitpunkt, also läuft er – fällig heißt „kleiner oder gleich“. `RW-SO` bekommt einen Timer auf 600 ms, aber 150 ms später löscht `RW-SOM` ihn und stellt einen neuen auf 750 ms. Bei 749 ms ist er noch nicht dran, erst der letzte Schritt um 1 ms löst ihn aus. So arbeiten Fake-Timer im Kern: Sie führen eine Liste fälliger Funktionen und rufen sie beim Vorspulen der Reihe nach auf, ohne echte Zeit zu verbrauchen. Ein Test für einen Debounce prüft deshalb genau diese Grenzen: knapp davor nichts, genau am Ende eine Anfrage, und keine für den überholten Zwischenstand.
+    resources:
+      - title: Vitest · vi.advanceTimersByTime
+        url: https://vitest.dev/api/vi#vi-advancetimersbytime
+
+  - id: erster-komponententest
+    type: gap
+    title: Ein Test, der wie eine Kundin tippt
+    prompt: |
+      Vervollständige den Test: user-event einrichten, den Code Zeichen für Zeichen in das Feld tippen, das Feld über sein Label finden, den Knopf über seine Rolle finden und den Textinhalt der Fehlermeldung prüfen.
+    lang: tsx
+    code: |
+      it('lehnt einen falsch geformten Gutscheincode ab', async () => {
+        const user = ⟦userEvent.setup()⟧
+        render(<Buchungsformular radId="R-17" radtyp="city" />)
+
+        await user.⟦type⟧(screen.⟦getByLabelText⟧('Gutscheincode'), 'rw-ab12cd')
+        await user.click(screen.getByRole(⟦'button'⟧, { name: 'Reservieren' }))
+
+        expect(screen.getByRole('alert')).⟦toHaveTextContent⟧('sechs Großbuchstaben oder Ziffern')
+      })
+    gaps:
+      - label: user-event-Sitzung
+        hint: Seit Version 14 beginnt jeder Test mit einer Sitzung, die du vor `render` erzeugst.
+      - label: Zeichen für Zeichen eingeben
+        hint: Die Methode heißt wie die Tätigkeit auf der Tastatur.
+      - label: Abfrage über das Label
+        hint: Formularfelder findest du über den Text ihres `<label>`.
+      - label: Rolle des Knopfs
+        hint: Ein `<button>` hat im Accessibility Tree diese Rolle.
+      - label: jest-dom-Matcher für Text
+        hint: Er prüft, ob der Text des Elements den erwarteten Teiltext enthält.
+    explanation: |
+      `userEvent.setup()` erzeugt eine Sitzung mit eigenem Tastatur- und Zeigerzustand. `user.type` fokussiert das Feld und tippt jedes Zeichen mit allen Tastenereignissen, anders als `fireEvent.change`. `getByLabelText` und `getByRole('button', { name })` finden die Elemente wie ein Mensch oder ein Screenreader. `toHaveTextContent` aus jest-dom prüft in jsdom einen Teiltext; so bleibt der Test grün, wenn die Meldung vorne umformuliert wird, und rot, wenn sie den Kern nicht mehr nennt.
+    resources:
+      - title: user-event · Writing tests with userEvent
+        url: https://testing-library.com/docs/user-event/intro#writing-tests-with-userevent
+      - title: jest-dom · toHaveTextContent
+        url: https://github.com/testing-library/jest-dom#tohavetextcontent
+
+  - id: msw-konflikt
+    type: gap
+    title: Ein Konflikt aus dem Netz
+    prompt: |
+      Oben steht die Setup-Datei, darunter ein Test. Ergänze:
+
+      1. die Strategie für Anfragen ohne Handler (sie sollen scheitern),
+      2. das Zurücksetzen der Handler nach jedem Test,
+      3. das Überschreiben der Handler für diesen einen Test,
+      4. den Handler für `POST` (MSW 3),
+      5. den Status für „Konflikt“,
+      6. das Warten auf die Fehlermeldung mit der Rolle `alert`,
+      7. die Abfrage, die bei keinem Treffer `null` liefert.
+    lang: tsx
+    code: |
+      // src/test/setup.ts
+      beforeAll(() => server.listen({ onUnhandledFrame: ⟦'error'⟧ }))
+      afterEach(() => server.⟦resetHandlers()⟧)
+      afterAll(() => server.close())
+
+      // src/buchung/Buchungsformular.test.tsx
+      it('meldet, wenn das Rad schon reserviert ist', async () => {
+        server.⟦use⟧(
+          ⟦http.post⟧('/api/reservierungen', () =>
+            HttpResponse.json({ title: 'Zeitraum belegt' }, { ⟦status: 409⟧ }),
+          ),
+        )
+        const user = userEvent.setup()
+        render(<Buchungsformular radId="R-17" radtyp="city" />)
+
+        await user.click(screen.getByRole('button', { name: 'Reservieren' }))
+
+        expect(⟦await screen.findByRole('alert')⟧).toHaveTextContent('schon reserviert')
+        expect(screen.⟦queryByRole⟧('status')).not.toBeInTheDocument()
+      })
+    gaps:
+      - label: Strategie für unbekannte Anfragen
+        hint: Eine der drei Strategien `bypass`, `warn` und …
+      - label: Handler zurücksetzen
+        hint: Entfernt alles, was ein Test mit `server.use` hinzugefügt hat.
+      - label: Handler für einen Test überschreiben
+        hint: Ein kurzes Verb; die Methode stellt neue Handler vor die bestehenden.
+      - label: POST-Handler
+        hint: Der Namensraum heißt wie das Protokoll, die Methode wie das HTTP-Verb in Kleinbuchstaben.
+      - label: Status 409
+        hint: Die Option im zweiten Argument von `HttpResponse.json`.
+      - label: Auf die Meldung warten
+        hint: Eine `findBy`-Abfrage liefert ein Promise.
+      - label: Abfrage für Abwesenheit
+        hint: "`getBy` würde werfen, `findBy` würde warten."
+    explanation: |
+      `onUnhandledFrame: 'error'` macht jede Anfrage ohne Handler zum Fehler – ein Tippfehler in der URL fällt sofort auf. `server.use` legt Handler vor die Standard-Handler, `resetHandlers` entfernt sie nach dem Test wieder; fehlt das, gilt die 409 auch für alle folgenden Tests, und das Ergebnis hängt von der Reihenfolge ab. `http.post` aus `msw/http` beschreibt den Endpunkt, `HttpResponse.json(…, { status: 409 })` die Antwort. `await screen.findByRole('alert')` wartet, bis die Meldung nach der Antwort erscheint; `queryByRole` liefert `null`, wenn keine Bestätigung da ist, und `not.toBeInTheDocument()` bestätigt das.
+    resources:
+      - title: MSW · Network behavior overrides
+        url: https://mswjs.io/docs/best-practices/network-behavior-overrides
+      - title: MSW · Avoid request assertions, unhandled requests
+        url: https://mswjs.io/docs/best-practices/avoid-request-assertions#unhandled-requests
+
+  - id: gutscheincode-tests
+    type: code
+    title: Tests, die kaputte Gutscheinregeln bemerken
+    prompt: |
+      Das Backend von Radwerk prüft Gutscheincodes mit derselben Regel wie das Formular, als reine Funktion in Python. `gutscheincode_gueltig(code: str) -> bool` aus `gutschein.py` liefert `True`, wenn der Code **genau** aus `RW-` und sechs Zeichen besteht, die Großbuchstaben `A`–`Z` oder Ziffern `0`–`9` sind. Nichts davor, nichts dahinter, keine Kleinbuchstaben, auch nicht im Präfix.
+
+      Schreibe pytest-Tests. Sie müssen gegen die richtige Implementierung grün sein und jede fehlerhafte Variante, die die Prüfung bereithält, rot werden lassen. Das ist dieselbe Arbeit wie für `pruefeGutscheincode` im Frontend – Grenzen finden, die eine Regex leicht falsch macht.
+    lang: python
+    setup: |
+      from pathlib import Path
+
+      RICHTIG = '''
+      import re
+
+
+      def gutscheincode_gueltig(code: str) -> bool:
+          return re.fullmatch(r"RW-[A-Z0-9]{6}", code) is not None
+      '''
+      MUTANTEN = {
+          "nur_anfang": RICHTIG.replace("re.fullmatch", "re.match"),
+          "kleinbuchstaben": RICHTIG.replace("[A-Z0-9]", "[A-Za-z0-9]"),
+          "laenge": RICHTIG.replace("{6}", "{5,6}"),
+          "ohne_ziffern": RICHTIG.replace("[A-Z0-9]", "[A-Z]"),
+      }
+      assert all(m != RICHTIG for m in MUTANTEN.values()), "Ein Mutant ist identisch mit der richtigen Version."
+      Path("gutschein.py").write_text(RICHTIG)
+    starter: |
+      from gutschein import gutscheincode_gueltig
+
+
+      def test_gueltiger_code():
+          ...
+    solution: |
+      import pytest
+      from gutschein import gutscheincode_gueltig
+
+
+      @pytest.mark.parametrize("code", ["RW-AB12CD", "RW-000000", "RW-ZZZZZZ"])
+      def test_gueltige_codes(code):
+          assert gutscheincode_gueltig(code)
+
+
+      @pytest.mark.parametrize(
+          "code",
+          ["RW-ab12cd", "rw-AB12CD", "RW-AB12C", "RW-AB12CDE", "RW-AB12CD ", "XX-AB12CD", ""],
+      )
+      def test_ungueltige_codes(code):
+          assert not gutscheincode_gueltig(code)
+    tests:
+      - name: Grün gegen die richtige Implementierung
+        code: |
+          lauf = run_pytest({"gutschein.py": RICHTIG})
+          assert lauf.ok, lauf.output
+      - name: Fängt Codes mit Anhängsel
+        code: |
+          lauf = run_pytest({"gutschein.py": MUTANTEN["nur_anfang"]})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl die Regel nur noch den Anfang des Codes prüft – was steht hinter den sechs Zeichen?"
+      - name: Fängt Kleinbuchstaben
+        code: |
+          lauf = run_pytest({"gutschein.py": MUTANTEN["kleinbuchstaben"]})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl die Regel jetzt Kleinbuchstaben akzeptiert."
+      - name: Fängt eine falsche Länge
+        code: |
+          lauf = run_pytest({"gutschein.py": MUTANTEN["laenge"]})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl die Regel jetzt auch kürzere Codes akzeptiert."
+      - name: Fängt fehlende Ziffern
+        code: |
+          lauf = run_pytest({"gutschein.py": MUTANTEN["ohne_ziffern"]})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl die Regel jetzt nur noch Buchstaben akzeptiert."
+    hints:
+      - Teile die Eingaben in Klassen ein – gültig, zu kurz, zu lang, falsche Zeichen, falsches Präfix – und nimm aus jeder einen Vertreter.
+      - "Eine Regex scheitert gern an den Rändern: genau 5 und genau 7 Zeichen nach `RW-`, ein Zeichen hinter dem Code, ein gültiger Code mit Ziffern."
+      - "`@pytest.mark.parametrize` mit zwei Listen: eine für gültige Codes (`assert gutscheincode_gueltig(code)`), eine für ungültige (`assert not …`)."
+    explanation: |
+      Die vier fehlerhaften Varianten sind typische Regex-Fehler. `re.match` verankert nur am Anfang und akzeptiert `RW-AB12CDE` – im Frontend entspricht das einem vergessenen `$`. `[A-Za-z0-9]` lässt Kleinbuchstaben durch, `{5,6}` zu kurze Codes, `[A-Z]` lehnt gültige Codes mit Ziffern ab. Jeder Fehler fällt nur mit einem Testfall an genau seiner Grenze auf: ein Code mit sieben Zeichen, einer mit fünf, einer mit Kleinbuchstaben, einer mit Ziffern. Weil die Regel eine reine Funktion ist, kosten diese zehn Fälle Millisekunden; über das gerenderte Formular wären es zehn Komponententests.
+    resources:
+      - title: Python · re.fullmatch
+        url: https://docs.python.org/3/library/re.html#re.fullmatch
+      - title: pytest · Parametrizing tests
+        url: https://docs.pytest.org/en/stable/how-to/parametrize.html
+
+  - id: zu-frueh-geprueft
+    type: bug
+    title: Rot, obwohl die Seite funktioniert
+    prompt: |
+      Ein Kollege hat dem Handler eine realistische Verzögerung von 50 ms gegeben. Seitdem scheitert der Test:
+
+      ```text
+      TestingLibraryElementError: Unable to find an accessible element with the role "status"
+      ```
+
+      Im Browser erscheint „Reserviert: R-1042“ nach dem Klick zuverlässig. Die Verzögerung soll bleiben. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: tsx
+    code: |
+      import { delay } from 'msw/utils/delay'
+
+      it('bestätigt die Reservierung mit ihrer Nummer', async () => {
+        server.use(
+          http.post('/api/reservierungen', async () => {
+            await delay(50)
+            return HttpResponse.json({ nummer: 'R-1042' }, { status: 201 })
+          }),
+        )
+        const user = userEvent.setup()
+        render(<Buchungsformular radId="R-17" radtyp="city" />)
+
+        await user.click(screen.getByRole('button', { name: 'Reservieren' }))
+
+        expect(screen.getByRole('status')).toHaveTextContent('Reserviert: R-1042')
+      })
+    lines: [15]
+    fix:
+      - line: 15
+        answers:
+          - "expect(await screen.findByRole('status')).toHaveTextContent('Reserviert: R-1042')"
+          - "await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Reserviert: R-1042'))"
+          - "await waitFor(() => { expect(screen.getByRole('status')).toHaveTextContent('Reserviert: R-1042') })"
+          - "await waitFor(() => { expect(screen.getByRole('status')).toHaveTextContent('Reserviert: R-1042'); })"
+          - "expect(await screen.findByText('Reserviert: R-1042')).toBeInTheDocument()"
+          - "await expect(screen.findByRole('status')).resolves.toHaveTextContent('Reserviert: R-1042')"
+    hints:
+      - "`await user.click` wartet auf den Klick, nicht auf die Antwort des Servers."
+      - Welche Abfrage-Variante liefert ein Promise und versucht es mehrmals?
+    explanation: |
+      `getByRole` prüft genau einmal. Nach dem Klick läuft die Anfrage noch, die Bestätigung gibt es erst 50 ms später. Ohne Verzögerung war der Test nur zufällig grün, weil die Antwort schneller kam als die nächste Zeile. `await screen.findByRole('status')` prüft wiederholt, bis das Element erscheint oder 1 000 ms vergangen sind. Eine längere Pause vor der Assertion wäre keine Lösung: Sie macht jeden Lauf langsamer und bleibt eine Wette auf die Zeit.
+    resources:
+      - title: Testing Library · findBy Queries
+        url: https://testing-library.com/docs/dom-testing-library/api-async#findby-queries
+
+  - id: haltefrist-ohne-act
+    type: bug
+    title: Die Uhr läuft, die Anzeige nicht
+    prompt: |
+      `Haltefrist` zeigt die Restzeit einer Reservierung. Die Komponente setzt mit `setInterval` jede Sekunde einen State auf `Date.now()` und berechnet daraus die Anzeige. Der Test scheitert:
+
+      ```text
+      Expected element to have text content:
+        Noch 14:00 Minuten
+      Received:
+        Noch 15:00 Minuten
+      ```
+
+      Die Fake-Uhr ist richtig eingerichtet. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: tsx
+    code: |
+      beforeEach(() => {
+        vi.useFakeTimers()
+        vi.setSystemTime(new Date('2026-10-03T10:00:00+02:00'))
+      })
+      afterEach(() => {
+        vi.useRealTimers()
+      })
+
+      it('zählt die Haltefrist herunter', () => {
+        render(<Haltefrist bis={new Date('2026-10-03T10:15:00+02:00')} />)
+
+        vi.advanceTimersByTime(60_000)
+
+        expect(screen.getByRole('timer')).toHaveTextContent('Noch 14:00 Minuten')
+      })
+    lines: [12]
+    fix:
+      - line: 12
+        answers:
+          - "act(() => vi.advanceTimersByTime(60_000))"
+          - "act(() => { vi.advanceTimersByTime(60_000) })"
+          - "act(() => { vi.advanceTimersByTime(60_000); })"
+          - "act(() => vi.advanceTimersByTime(60000))"
+          - "act(() => { vi.advanceTimersByTime(60000) })"
+          - "act(() => { vi.advanceTimersByTime(60000); })"
+          - "act(() => vi.advanceTimersByTime(60 * 1000))"
+          - "act(() => { vi.advanceTimersByTime(60 * 1000) })"
+          - "act(() => vi.advanceTimersByTime(1000 * 60))"
+          - "act(() => { vi.advanceTimersByTime(1000 * 60) })"
+    hints:
+      - Die Timer laufen; das Intervall ruft den State-Setter 60-mal auf. Wann schreibt React das Ergebnis ins DOM?
+      - "`render` und `user-event` wickeln ihre Arbeit in eine Funktion aus `@testing-library/react`. Hier fehlt sie."
+    explanation: |
+      `vi.advanceTimersByTime` ruft den Intervall-Callback 60-mal auf, und jeder Aufruf plant ein State-Update. Außerhalb von `act` rendert React diese Updates erst später, nach dem synchronen Testcode. Der Test liest das DOM also vor dem Rendern und sieht noch „Noch 15:00 Minuten“. Innerhalb von `act` arbeitet React alle Updates ab, bevor `act` zurückkehrt. `act(() => vi.advanceTimersByTime(60_000))` spult vor und rendert danach. Die Testfunktion ist synchron, deshalb passt hier die synchrone Form; mit `async` ginge auch `await act(() => vi.advanceTimersByTimeAsync(60_000))`.
+    resources:
+      - title: React Testing Library · act
+        url: https://testing-library.com/docs/react-testing-library/api#act
+      - title: React · act
+        url: https://react.dev/reference/react/act
+
+  - id: fetch-mock-erklaeren
+    type: explain
+    title: Review eines fetch-Mocks
+    prompt: |
+      Dieser Test steht in einem Pull Request und ist grün. Erkläre im Review, was er absichert, was er nicht absichert, welche Nebenwirkung er auf andere Tests hat und wie du ihn umbauen würdest.
+    lang: tsx
+    code: |
+      it('reserviert das Rad', async () => {
+        const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+          new Response(JSON.stringify({ nummer: 'R-1042' }), { status: 201 }),
+        )
+        const user = userEvent.setup()
+        render(<Buchungsformular radId="R-17" radtyp="city" />)
+
+        await user.click(screen.getByRole('button', { name: 'Reservieren' }))
+
+        expect(fetchMock).toHaveBeenCalledWith('/api/reservierungen', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ radId: 'R-17', minuten: 30, gutschein: null }),
+        })
+      })
+    points:
+      - Er prüft nur, dass `fetch` mit genau diesen Argumenten aufgerufen wurde – ein Implementierungsdetail. Andere HTTP-Bibliothek, ein `Request`-Objekt oder eine andere Schlüsselreihenfolge im JSON machen ihn rot, ohne dass sich für Kundinnen etwas ändert.
+      - "Er prüft nicht, was die Kundin sieht. Zeigt das Formular die Bestätigung „Reserviert: R-1042“ nicht an, bleibt er grün."
+      - Der Spy wird nicht zurückgesetzt. `clearMocks` löscht in Vitest 5 nur die Aufrufliste; `fetch` bleibt für die folgenden Tests der Datei gemockt und umgeht dort auch MSW.
+      - "Umbau: Handler in MSW, der die Anfrage beschreibt (und bei falschem Body mit 400 antwortet), und eine Assertion auf die Oberfläche, etwa `await screen.findByRole('status')`."
+    explanation: |
+      „Der Test ist grün, aber er testet die falsche Seite des Formulars. `toHaveBeenCalledWith` friert die heutige Implementierung der Anfrage ein: Wechseln wir auf `ky`, übergeben ein `Request`-Objekt oder ändert sich die Reihenfolge der Felder im Body, wird er rot, obwohl die Seite dieselbe Anfrage schickt. Gleichzeitig prüft er nicht, ob die Bestätigung erscheint – ein Fehler beim Anzeigen fiele nicht auf. Dazu kommt eine Nebenwirkung: `vi.spyOn` ohne `mockRestore` lässt `fetch` für alle folgenden Tests der Datei gemockt. Ihre MSW-Handler greifen nicht mehr, sie bekommen dasselbe `Response`-Objekt mit Status 201, dessen Body schon gelesen ist, und scheitern mit Meldungen, die nichts mit ihnen zu tun haben. Mein Vorschlag: den Endpunkt als MSW-Handler beschreiben, der bei fehlender `radId` mit 400 antwortet, und im Test `expect(await screen.findByRole('status')).toHaveTextContent('Reserviert: R-1042')` prüfen. Dann sagt der Test, was die Kundin erlebt, und überlebt einen Wechsel der HTTP-Bibliothek.“
+    resources:
+      - title: MSW · Avoid request assertions
+        url: https://mswjs.io/docs/best-practices/avoid-request-assertions
+      - title: Vitest · clearMocks ist Standard
+        url: https://vitest.dev/guide/migration#clearmocks-is-enabled-by-default
+
+  - id: snapshot-review
+    type: choice
+    title: Ein Snapshot über das ganze Formular
+    prompt: |
+      Ein Pull Request ergänzt `expect(asFragment()).toMatchSnapshot()` für das gerenderte Buchungsformular. Die Snapshot-Datei hat 280 Zeilen HTML. Welche Review-Kommentare sind berechtigt?
+    options:
+      - text: Jede Änderung an Markup oder Klassen macht den Test rot, auch wenn sich für Kundinnen nichts ändert. Wer ihn dann mit `-u` aktualisiert, ohne den Diff zu lesen, prüft nichts mehr.
+        correct: true
+        why: Das ist der typische Verlauf großer Snapshots. Fehlalarme trainieren das Team, Updates durchzuwinken.
+      - text: Der Snapshot sagt nicht, welches Verhalten wichtig ist. Gezielte Assertions auf Preisanzeige und Fehlermeldung zeigen die Absicht.
+        correct: true
+        why: Ein Snapshot schützt gegen *jede* Änderung. Wenn nur zwei Dinge zählen, beschreibt eine gezielte Assertion genau diese zwei.
+      - text: Für die Zugänglichkeitsstruktur passt ein ARIA-Snapshot besser. Er hält Rollen und Namen fest und übersteht Umbauten des Markups.
+        correct: true
+        why: ARIA-Snapshots (Vitest Browser Mode, Playwright) vergleichen den Accessibility Tree statt HTML. Ein fehlender Name an einem Knopf fällt auf, eine neue Wrapper-`div` nicht.
+      - text: Snapshots laufen in der CI nicht, weil Vitest dort keine Snapshot-Dateien schreibt.
+        correct: false
+        why: Vitest schreibt in der CI keine *neuen* Snapshots, vergleicht aber mit den vorhandenen. Abweichungen und fehlende Snapshots lassen den Lauf scheitern.
+      - text: Der Snapshot ersetzt einen visuellen Regressionstest, weil er das ganze HTML enthält.
+        correct: false
+        why: HTML sagt nichts darüber, wie die Seite aussieht. CSS, Layout und Schriften sieht nur ein Screenshot-Vergleich.
+    explanation: |
+      Große Snapshots sind billig zu schreiben und teuer zu pflegen. Sie melden jede Änderung, auch gewollte, und verlieren dadurch ihre Aussagekraft. Gut sind kleine, strukturierte Snapshots mit seltenen Änderungen und gezielte Assertions für das Verhalten. Für Barrierefreiheit gibt es ARIA-Snapshots, für das Aussehen Screenshot-Vergleiche in fester Umgebung.
+    resources:
+      - title: Vitest · When to use snapshots
+        url: https://vitest.dev/guide/learn/snapshots#when-to-use-snapshots
+      - title: Vitest · Snapshot, CI behavior
+        url: https://vitest.dev/guide/snapshot#ci-behavior
+
+  - id: gutschein-testen
+    type: practice
+    title: Tests für das Gutscheinfeld
+    prompt: |
+      Radwerk bekommt ein Gutscheinfeld im Bezahlschritt. Die Buchung existiert dann schon, und das Feld löst den Code über denselben Endpunkt ein wie die Android-App (siehe [Teststrategie für ein Feature](/testing/teststrategie)). Regeln:
+
+      - Ein Gutscheincode besteht aus `RW-` und sechs Großbuchstaben oder Ziffern. Bei falschem Format zeigt das Feld die Meldung von `pruefeGutscheincode`, ohne den Server zu fragen.
+      - `POST /api/buchungen/:id/gutschein` mit dem Body `{ "code": "RW-SOMMER" }` antwortet mit `200` und `{ "rabatt_cent": 90, "preis_cent": 510 }`. Den Rabatt berechnet der Server.
+      - Abgelehnte Codes (unbekannt, abgelaufen, schon eingelöst) beantwortet der Server mit `422` und Problem Details (`application/problem+json`) mit `type`, `title` und `detail`. Das Feld zeigt `title` und `detail` an. Andere Fehler ergeben eine allgemeine Meldung.
+
+      ```tsx
+      // src/gutschein/Gutscheinfeld.tsx (Importe gekürzt)
+      type Einloesung = { rabatt_cent: number; preis_cent: number }
+      type Problem = { type: string; title: string; detail?: string }
+
+      export function Gutscheinfeld({ buchungId }: { buchungId: string }) {
+        const [code, setCode] = useState('')
+        const [ergebnis, setErgebnis] = useState<Einloesung | null>(null)
+        const [fehler, setFehler] = useState<string | null>(null)
+
+        async function einloesen() {
+          setFehler(null)
+          setErgebnis(null)
+          const formatfehler = pruefeGutscheincode(code)
+          if (formatfehler) return setFehler(formatfehler)
+          const antwort = await fetch(`/api/buchungen/${buchungId}/gutschein`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ code }),
+          })
+          if (antwort.status === 422) {
+            const problem: Problem = await antwort.json()
+            return setFehler(problem.detail ? `${problem.title}: ${problem.detail}` : problem.title)
+          }
+          if (!antwort.ok) return setFehler('Das Einlösen hat nicht geklappt. Versuch es gleich noch einmal.')
+          setErgebnis(await antwort.json())
+        }
+
+        return (
+          <section aria-label="Gutschein">
+            <label htmlFor="code">Gutscheincode</label>
+            <input id="code" value={code} onChange={(e) => setCode(e.target.value)} />
+            <button type="button" onClick={einloesen}>Einlösen</button>
+            {fehler && <p role="alert">{fehler}</p>}
+            {ergebnis && (
+              <p role="status">
+                Rabatt {euro(ergebnis.rabatt_cent)}, neuer Preis {euro(ergebnis.preis_cent)}
+              </p>
+            )}
+          </section>
+        )
+      }
+      ```
+
+      Schreibe die Testdatei `src/gutschein/Gutscheinfeld.test.tsx` mit Vitest, Testing Library, user-event und MSW 3. Die Setup-Datei aus der Lektion (jest-dom, `cleanup`, `onUnhandledFrame: 'error'`, `resetHandlers`) ist vorhanden; `server` exportiert `src/test/server.ts`, ohne Handler für Gutscheine. Entscheide für jede Regel, auf welcher Ebene sie geprüft wird, und schreib die Begründung als Kommentar dazu – auch für das, was du hier bewusst nicht testest. Sag am Ende in einem Kommentar, ob und welcher E2E-Test für das Feature nötig ist.
+    lang: tsx
+    starter: |
+      import { render, screen } from '@testing-library/react'
+      import userEvent from '@testing-library/user-event'
+      import { http, HttpResponse } from 'msw/http'
+      import { describe, expect, it } from 'vitest'
+      import { server } from '../test/server'
+      import { Gutscheinfeld } from './Gutscheinfeld'
+
+      // Deine Tests
+    solution: |
+      import { render, screen } from '@testing-library/react'
+      import userEvent from '@testing-library/user-event'
+      import { http, HttpResponse } from 'msw/http'
+      import { describe, expect, it } from 'vitest'
+      import { server } from '../test/server'
+      import { Gutscheinfeld } from './Gutscheinfeld'
+
+      // Ebenen:
+      // - Rabattrechnung und Ablehnungsgründe entscheidet das Backend; sie stehen in dessen Unit- und
+      //   API-Tests. Das Feld rechnet nichts nach, es zeigt die Antwort an.
+      // - Die Formatregel prüfen die Unit-Tests von pruefeGutscheincode (regeln.test.ts).
+      // - Hier: wie die Komponente auf jede Art von Antwort reagiert. MSW ersetzt das Backend.
+
+      const ENDPUNKT = '/api/buchungen/:id/gutschein'
+
+      async function einloesen(code: string) {
+        const user = userEvent.setup()
+        render(<Gutscheinfeld buchungId="8812" />)
+        await user.type(screen.getByLabelText('Gutscheincode'), code)
+        await user.click(screen.getByRole('button', { name: 'Einlösen' }))
+      }
+
+      describe('Gutscheinfeld', () => {
+        it('zeigt Rabatt und neuen Preis aus der Antwort', async () => {
+          // Der Handler beschreibt die erwartete Anfrage; passt sie nicht, gibt es 400 und keine Bestätigung.
+          server.use(
+            http.post(ENDPUNKT, async ({ params, request }) => {
+              const body = (await request.json()) as { code?: string }
+              if (params.id !== '8812' || body.code !== 'RW-SOMMER') return new HttpResponse(null, { status: 400 })
+              return HttpResponse.json({ rabatt_cent: 90, preis_cent: 510 })
+            }),
+          )
+
+          await einloesen('RW-SOMMER')
+
+          expect(await screen.findByRole('status')).toHaveTextContent('Rabatt 0,90 €, neuer Preis 5,10 €')
+        })
+
+        it('zeigt title und detail einer Ablehnung', async () => {
+          // Ein Test für alle Ablehnungsgründe: Die Komponente behandelt jede 422 gleich.
+          server.use(
+            http.post(ENDPUNKT, () =>
+              HttpResponse.json(
+                {
+                  type: 'https://api.radwerk.example/probleme/gutschein-abgelaufen',
+                  title: 'Gutschein abgelaufen',
+                  status: 422,
+                  detail: 'RW-WINTER war bis zum 28.02.2026 gültig.',
+                },
+                { status: 422, headers: { 'Content-Type': 'application/problem+json' } },
+              ),
+            ),
+          )
+
+          await einloesen('RW-WINTER')
+
+          expect(await screen.findByRole('alert')).toHaveTextContent(
+            'Gutschein abgelaufen: RW-WINTER war bis zum 28.02.2026 gültig.',
+          )
+          expect(screen.queryByRole('status')).not.toBeInTheDocument()
+        })
+
+        it('meldet einen Serverfehler', async () => {
+          server.use(http.post(ENDPUNKT, () => new HttpResponse(null, { status: 503 })))
+
+          await einloesen('RW-SOMMER')
+
+          expect(await screen.findByRole('alert')).toHaveTextContent('hat nicht geklappt')
+        })
+
+        it('lehnt ein falsches Format ab, ohne den Server zu fragen', async () => {
+          // Kein Handler: Fragt die Komponente trotzdem, wird der Lauf über onUnhandledFrame: 'error' rot.
+          await einloesen('rw-sommer')
+
+          expect(screen.getByRole('alert')).toHaveTextContent('sechs Großbuchstaben oder Ziffern')
+        })
+      })
+
+      // E2E: kein Test pro Fall. Ein Durchstich „Code eingeben, buchen, Bestätigung sehen“ zeigt,
+      // dass Website, API und Datenbank zusammenarbeiten; Ablehnungsgründe prüft er nicht.
+    checklist:
+      - "Je ein Komponententest für Erfolg, Ablehnung mit 422 und einen anderen Serverfehler; die Antwort setzt `server.use` im Test, nicht ein Mock von `fetch`."
+      - "Der Erfolgs-Handler prüft Buchungsnummer und Body und antwortet sonst mit 400 – der Test prüft die Anfrage nicht selbst."
+      - "Der 422-Test liefert echte Problem Details (`type`, `title`, `detail`, Content-Type `application/problem+json`) und prüft, dass `title` und `detail` erscheinen."
+      - "Kein Komponententest pro Ablehnungsgrund und keine Nachrechnung des Rabatts; ein Kommentar verweist dafür auf die Tests des Backends."
+      - "Elemente werden über Label und Rolle gefunden (`getByLabelText`, `getByRole`, `findByRole`), nach dem Klick wartet der Test mit `await screen.findBy…`."
+      - "Der Formatfehler ist ohne Handler getestet; eine unerwartete Anfrage ließe den Lauf über `onUnhandledFrame: 'error'` scheitern."
+      - "Ein Kommentar begründet, warum es keinen E2E-Test pro Fall gibt und warum ein Durchstich reicht."
+    hints:
+      - Frag zuerst, was die Komponente selbst entscheidet und was sie nur vom Server übernimmt. Nur das Erste testest du hier.
+      - "Eine kleine Hilfsfunktion `einloesen(code)` mit `render`, `user.type` und `user.click` hält die Komponententests kurz."
+      - "Problem Details mit MSW: `HttpResponse.json({ type, title, status: 422, detail }, { status: 422, headers: { 'Content-Type': 'application/problem+json' } })`."
+    explanation: |
+      Die Musterlösung trennt nach Ebenen. Der Rabatt und die Gründe für eine Ablehnung entstehen im Backend; dort prüfen Unit- und API-Tests jede Regel und jeden Problem-Typ. Das Feld bekommt vier Tests, einen pro Verhaltenszweig: Erfolg, Ablehnung, Serverfehler, falsches Format. Weil die Komponente jede 422 gleich behandelt, reicht ein Ablehnungstest; drei weitere für „unbekannt“, „abgelaufen“ und „schon eingelöst“ prüften denselben Zweig. Jeder Test setzt seine Serverantwort selbst und prüft, was die Kundin sieht. Der Test für das falsche Format nutzt `onUnhandledFrame: 'error'` als Netz: Fragt die Komponente doch beim Server, scheitert die Anfrage, und Vitest meldet eine „Unhandled Rejection“, die den Lauf rot macht. Ein E2E-Test pro Gutscheinfall würde dieselben Zweige mit echter Datenbank und Sekunden pro Lauf prüfen und bei einem roten Lauf nicht sagen, welcher Teil schuld ist.
+    resources:
+      - title: MSW · HttpResponse
+        url: https://mswjs.io/docs/api/http-response
+      - title: RFC 9457 · Problem Details
+        url: https://www.rfc-editor.org/rfc/rfc9457#section-3

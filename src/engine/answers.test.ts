@@ -54,6 +54,13 @@ describe('Answer checking per language', () => {
     expect(tokens(`print('a')`, 'python')).not.toEqual(tokens(`print('b')`, 'python'));
     expect(tokens(`f'{x}'`, 'python')).toEqual(tokens(`f"{x}"`, 'python'));
   });
+  it('treats TypeScript quote styles and line-final semicolons as equal', () => {
+    const answer = `await user.click(screen.getByRole('button', { name: 'Buchen' }));`;
+    expect(tokens(answer, 'typescript')).toEqual(tokens(`await user.click(screen.getByRole("button", { name: \`Buchen\` }))`, 'typescript'));
+    expect(tokens(answer, 'ts')).not.toEqual(tokens(`await user.click(screen.getByRole('button', { name: 'Stornieren' }));`, 'ts'));
+    expect(tokens('`Preis: ${preis}`', 'javascript')).not.toEqual(tokens(`'Preis: \${preis}'`, 'javascript'));
+    expect(tokens('a?.b ?? c => d === e', 'tsx')).toEqual(['a', '?.', 'b', '??', 'c', '=>', 'd', '===', 'e']);
+  });
   it('tokenises Rust lifetimes and char literals', () => {
     expect(tokens(`fn f<'a>(x: &'a str) -> char { 'x' }`, 'rust')).toContain(`'a`);
     expect(tokens(`'x'`, 'rust')).toEqual([`'x'`]);

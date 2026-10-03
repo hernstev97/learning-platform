@@ -1,0 +1,1266 @@
+id: property-based-testing
+title: Property-based Testing
+level: 3
+minutes: 150
+summary: Eigenschaften statt einzelner Beispiele – Hypothesis erzeugt Hunderte Eingaben, findet Grenzfälle wie Mitternacht und Zeitumstellung und verkleinert jeden Fehler auf das kleinste Gegenbeispiel.
+goals:
+  - Du formulierst für eine Funktion Eigenschaften nach den Mustern Round Trip, Invariante, Idempotenz, Orakel, metamorphe Relation und „stürzt nicht ab“.
+  - Du baust Strategien mit `sampled_from`, `builds`, `@st.composite` und `datetimes` mit Zeitzone und entscheidest zwischen `assume` und `.filter`.
+  - Du liest ein geschrumpftes Gegenbeispiel und hältst es mit `@example` als Regression fest.
+  - Du schreibst Eigenschaften, die Fehler an Stellen fangen, die du von Hand selten prüfst – über Mitternacht, an der Zeitumstellung, oberhalb des Tageshöchstpreises.
+  - Du erklärst, wie Hypothesis lokal, in der CI und auf dieser Plattform deterministisch oder zufällig läuft, und wann sich Property-based Testing lohnt.
+resources:
+  - title: Hypothesis · Introduction
+    url: https://hypothesis.readthedocs.io/en/latest/tutorial/introduction.html
+  - title: Hypothesis · Strategies Reference
+    url: https://hypothesis.readthedocs.io/en/latest/reference/strategies.html
+  - title: Hypothesis · Settings und Profile
+    url: https://hypothesis.readthedocs.io/en/latest/reference/api.html#settings
+  - title: Hypothesis · Stateful tests
+    url: https://hypothesis.readthedocs.io/en/latest/stateful.html
+lesson: |
+  Die Preisberechnung von Radwerk hat zwölf Beispieltests, alle grün: 5 Minuten kosten nichts, 6 Minuten 150 Cent, 31 Minuten 300 Cent. Ende März meldet sich ein Kunde. Er ist in der Nacht der Zeitumstellung von 1:00 bis 3:00 Uhr gefahren, also eine Stunde lang, denn um 2:00 Uhr sprang die Uhr auf 3:00. Berechnet wurden ihm 600 statt 300 Cent. Der Code zog zwei Uhrzeiten in `Europe/Berlin` voneinander ab und bekam zwei Stunden. Kein Beispieltest hat diese Nacht gewählt, weil niemand an sie gedacht hat.
+
+  Property-based Testing (PBT) dreht die Arbeit um. Du schreibst nicht einzelne Eingaben mit ihren Ergebnissen auf, sondern eine Eigenschaft, die für alle gültigen Eingaben gelten muss: „Die berechnete Fahrzeit entspricht der echten Zeit zwischen Start und Ende.“ Die Bibliothek [Hypothesis](https://hypothesis.readthedocs.io/en/latest/tutorial/introduction.html) erzeugt dazu Hunderte Eingaben, sucht gezielt nach Grenzfällen wie der Zeitumstellung und verkleinert ein gefundenes Gegenbeispiel, bis es sich lesen lässt. Hypothesis 6.168 und pytest 9 laufen hier im Browser: Jeden `pytest`-Block dieser Lektion kannst du bearbeiten und ausführen.
+
+  ## Beispiele gegen Eigenschaften
+
+  Ein Beispieltest legt eine Eingabe und das erwartete Ergebnis fest. Du rechnest das Ergebnis selbst aus, der Test prüft diesen einen Punkt. Eine Eigenschaft (englisch *Property*) ist eine Aussage über alle Eingaben eines Bereichs, für die du kein einzelnes Ergebnis kennen musst: „Der Preis liegt zwischen 0 und dem Tageshöchstpreis“, „Wer länger fährt, zahlt nie weniger“.
+
+  Die Beispiele dieser Lektion nutzen eine vereinfachte Tarifregel: City-Rad, 150 Cent je angefangene 30 Minuten, Fahrten bis einschließlich 5 Minuten kostenlos, höchstens 1 500 Cent je Fahrt. Eine Fahrt dauert höchstens einen Tag.
+
+  ```python pytest
+  from hypothesis import given, strategies as st
+
+  DECKEL = 1500
+
+
+  def preis(minuten: int) -> int:
+      """City-Rad: 150 Cent je angefangene 30 Minuten, bis 5 Minuten kostenlos, höchstens 1 500 Cent."""
+      if minuten <= 5:
+          return 0
+      return min(-(-minuten // 30) * 150, DECKEL)
+
+
+  def test_beispiele():
+      assert preis(5) == 0
+      assert preis(31) == 300
+
+
+  @given(st.integers(min_value=0, max_value=24 * 60))
+  def test_preis_zwischen_null_und_deckel(minuten):
+      assert 0 <= preis(minuten) <= DECKEL
+
+
+  @given(st.integers(min_value=0, max_value=24 * 60), st.integers(min_value=0, max_value=24 * 60))
+  def test_laenger_fahren_wird_nie_billiger(a, b):
+      kurz, lang = sorted((a, b))
+      assert preis(kurz) <= preis(lang)
+  ```
+
+  [`@given`](https://hypothesis.readthedocs.io/en/latest/reference/api.html#hypothesis.given) macht aus der Testfunktion eine Eigenschaft. Hypothesis ruft sie mit Werten aus den *Strategien* auf, hier `st.integers(...)`, standardmäßig mit bis zu 100 Testfällen, und hört beim ersten Fehlschlag auf. Die Werte sind absichtlich nicht gleichverteilt: `integers()` zieht die Bereichsgrenzen häufiger, Hypothesis setzt in mehrere Argumente gern denselben Wert und nimmt Konstanten aus deinem Quellcode als Startwerte ([Domain and distribution](https://hypothesis.readthedocs.io/en/latest/explanation/domain.html#okay-but-what-is-the-distribution)). Die Verteilung bestimmt Hypothesis, den Bereich bestimmst du.
+
+  Der Beispieltest bleibt stehen: Er zeigt Lesern konkrete Fälle und hält die Grenzen der Spezifikation fest. Die Eigenschaften decken den Raum dazwischen ab.
+
+  > [!MERKE]
+  > Ein Beispiel prüft einen Punkt, den du ausgesucht hast. Eine Eigenschaft beschreibt, was für alle Eingaben gilt, und Hypothesis sucht die Punkte aus – auch die, an die du nicht denkst.
+
+  ## Shrinking: vom Zufallsfund zum kleinsten Gegenbeispiel
+
+  Fehlt im Code der Tageshöchstpreis, scheitert die erste Eigenschaft. Hypothesis findet zuerst irgendeine zu teure Fahrt, etwa 1 100 Minuten, und verkleinert sie dann Schritt für Schritt, solange der Test weiter scheitert. Dieses *Shrinking* endet bei der kürzesten Fahrt, die mehr als 1 500 Cent kostet:
+
+  ```python pytest fails
+  from hypothesis import given, strategies as st
+
+
+  def preis(minuten: int) -> int:
+      """Hier fehlt der Tageshöchstpreis."""
+      if minuten <= 5:
+          return 0
+      return -(-minuten // 30) * 150
+
+
+  @given(st.integers(min_value=0, max_value=24 * 60))
+  def test_preis_zwischen_null_und_deckel(minuten):
+      assert 0 <= preis(minuten) <= 1500
+  ```
+
+  `Failing test case` nennt `minuten=301`, genau die Grenze: 300 Minuten kosten 1 500 Cent, 301 Minuten 1 650. Ein Zufallsfund wie 1 100 sagt dir, *dass* etwas falsch ist, 301 sagt dir, *wo*. Ältere Versionen und viele Blogartikel schreiben dort `Falsifying example`.
+
+  Shrinking funktioniert für jede Strategie: Listen werden kürzer, Zahlen kleiner, Texte kürzer und einfacher, Zeitpunkte wandern zu glatten Uhrzeiten wie Mitternacht.
+
+  > [!DEEP] Was beim Shrinking kleiner wird
+  > Hypothesis verkleinert nicht den Wert, sondern die Folge von Zufallsentscheidungen, aus der die Strategie ihn gebaut hat, die [Choice Sequence](https://hypothesis.readthedocs.io/en/latest/glossary.html#term-choice-sequence). Die Liste `[2, 42]` ist intern `[True, 2, True, 42, False]`: noch ein Element? ja, 2, noch eins? ja, 42, noch eins? nein. Eine kürzere Folge gilt als kleiner, bei gleicher Länge zählen die vorderen Entscheidungen zuerst. Deshalb werden Listen erst kürzer und dann vorne kleiner, und deshalb schrumpfen auch Werte aus eigenen Strategien ohne zusätzlichen Code.
+
+  Ist der Fehler behoben, hältst du das Gegenbeispiel mit [`@example`](https://hypothesis.readthedocs.io/en/latest/reference/api.html#hypothesis.example) fest: `@example(minuten=301)` über `@given`. Explizite Beispiele laufen bei jedem Lauf zuerst, unabhängig vom Zufall, und Hypothesis verändert sie nicht. So bleibt die Regression geschützt, auch wenn Hypothesis den Wert später nicht mehr erzeugt.
+
+  Lokal speichert Hypothesis jeden Fehlschlag zusätzlich in einer Beispieldatenbank unter `.hypothesis/examples` und spielt ihn beim nächsten Lauf zuerst ab ([Replaying failed tests](https://hypothesis.readthedocs.io/en/latest/tutorial/replaying-failures.html#prefer-example-over-the-database-for-correctness)). Diese Datenbank ist ein Cache auf deinem Rechner, Kolleginnen und die CI sehen sie nicht. Regressionen gehören deshalb als `@example` in den Code.
+
+  ## Muster für Eigenschaften: Round Trip, Invariante, Orakel und Co.
+
+  Die schwierigste Frage beim PBT ist: Was gilt für alle Eingaben? Sechs Muster decken die meisten Fälle ab:
+
+  | Muster | Idee | Radwerk |
+  | --- | --- | --- |
+  | Round Trip | Hin und zurück ergibt das Original | `parse(formatiere(kern)) == kern` für Gutscheincodes |
+  | Invariante | Gilt für jedes Ergebnis | Preis zwischen 0 und Tageshöchstpreis; zusammengefasste Zeitfenster sind sortiert |
+  | Idempotenz | Zweimal anwenden ändert nichts mehr | `zusammenfassen(zusammenfassen(f)) == zusammenfassen(f)` |
+  | Orakel | Eine einfache, langsame Referenz liefert dasselbe | Zeitfenster gegen die Menge der belegten Minuten; neue gegen alte Implementierung |
+  | Metamorphe Relation | Eine bekannte Änderung der Eingabe ändert die Ausgabe vorhersagbar | E-Bike kostet genau das Doppelte; die Reihenfolge der Eingabe ist egal |
+  | Stürzt nicht ab | Jede Eingabe endet im erwarteten Ergebnis oder im erwarteten Fehler | `parse(text)` liefert einen Kern oder wirft `ValueError`, nie `IndexError` |
+
+  Ein Round Trip findet Fehler, die typische Beispiele übersehen. Der Gutscheinparser unten nutzt `lstrip("RW-")`. Das sieht aus wie „Präfix entfernen“, entfernt aber *alle* führenden Zeichen aus der Menge `R`, `W` und `-` ([str.lstrip](https://docs.python.org/3/library/stdtypes.html#str.lstrip)). Mit `RW-AB12CD` aus dem Beispieltest geht das gut:
+
+  ```python pytest fails
+  import re
+
+  from hypothesis import given, strategies as st
+
+  ZEICHEN = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+
+  def formatiere(kern: str) -> str:
+      return f"RW-{kern}"
+
+
+  def parse(text: str) -> str:
+      """Liefert die sechs Zeichen nach „RW-“. Kleinbuchstaben und Leerzeichen außen sind erlaubt."""
+      code = text.strip().upper()
+      if not re.fullmatch(r"RW-[A-Z0-9]{6}", code):
+          raise ValueError(f"kein Gutscheincode: {text!r}")
+      return code.lstrip("RW-")
+
+
+  def test_beispiel():
+      assert parse(" rw-ab12cd ") == "AB12CD"
+
+
+  @given(st.text(alphabet=ZEICHEN, min_size=6, max_size=6))
+  def test_round_trip(kern):
+      assert parse(formatiere(kern)) == kern
+
+
+  @given(st.text())
+  def test_parse_wirft_hoechstens_valueerror(text):
+      try:
+          parse(text)
+      except ValueError:
+          pass
+  ```
+
+  Das geschrumpfte Gegenbeispiel `kern='R00000'` zeigt die Ursache auf einen Blick. Der dritte Test ist das Muster „stürzt nicht ab“: `st.text()` erzeugt beliebigen Unicode-Text, und jede andere Exception als `ValueError` ließe ihn scheitern. Repariert ist der Parser mit `code[3:]` oder `code.removeprefix("RW-")`.
+
+  Kannst du ein Ergebnis nicht vorhersagen, helfen Orakel und metamorphe Relationen. Für Zeitfenster ist die Menge der belegten Minuten ein einfaches Orakel:
+
+  ```python pytest
+  from hypothesis import given, strategies as st
+
+
+  def zusammenfassen(fenster):
+      """Fasst überlappende und angrenzende Zeitfenster [start, ende) zusammen, Minuten ab Mitternacht."""
+      ergebnis = []
+      for start, ende in sorted(fenster):
+          if ergebnis and start <= ergebnis[-1][1]:
+              ergebnis[-1] = (ergebnis[-1][0], max(ergebnis[-1][1], ende))
+          else:
+              ergebnis.append((start, ende))
+      return ergebnis
+
+
+  def minuten(fenster):
+      """Orakel: die Menge aller belegten Minuten – langsam, aber offensichtlich richtig."""
+      return {m for start, ende in fenster for m in range(start, ende)}
+
+
+  @st.composite
+  def zeitfenster(draw):
+      start = draw(st.integers(min_value=0, max_value=24 * 60 - 1))
+      dauer = draw(st.integers(min_value=1, max_value=4 * 60))
+      return (start, min(start + dauer, 24 * 60))
+
+
+  listen = st.lists(zeitfenster(), max_size=8)
+
+
+  @given(listen)
+  def test_idempotent(fenster):
+      einmal = zusammenfassen(fenster)
+      assert zusammenfassen(einmal) == einmal
+
+
+  @given(listen)
+  def test_dieselben_minuten_wie_das_orakel(fenster):
+      assert minuten(zusammenfassen(fenster)) == minuten(fenster)
+
+
+  @given(listen)
+  def test_sortiert_und_mit_luecken(fenster):
+      ergebnis = zusammenfassen(fenster)
+      for (_, ende), (start, _) in zip(ergebnis, ergebnis[1:]):
+          assert ende < start
+
+
+  @given(listen, st.data())
+  def test_reihenfolge_der_eingabe_egal(fenster, data):
+      gemischt = data.draw(st.permutations(fenster))
+      assert zusammenfassen(gemischt) == zusammenfassen(fenster)
+  ```
+
+  Jede Eigenschaft allein ist schwach: Eine Funktion, die immer `[]` liefert, ist idempotent und sortiert. Zusammen mit dem Orakel bleibt für eine falsche Implementierung kaum Platz. Eine Eigenschaft, die die Implementierung nachbaut, prüft dagegen nichts, denn sie übernimmt deren Fehler.
+
+  ## Strategien: Eingaben aus der richtigen Domäne
+
+  Eine Strategie beschreibt, welche Werte möglich sind. Die wichtigsten Bausteine:
+
+  - `st.sampled_from([...])` wählt aus einer festen Liste.
+  - `st.builds(Reservierung, rad=…, start=…, ende=…)` ruft einen Konstruktor mit Werten aus Strategien auf. Die Felder sind unabhängig, `ende` kann also vor `start` liegen.
+  - `@st.composite` baut abhängige Werte: erst den Start ziehen, dann das Ende daraus berechnen. Gültige Daten entstehen so ohne Filter.
+  - `.map(f)` wandelt Werte um, `st.data()` zieht Werte mitten im Test.
+  - `st.datetimes(..., timezones=st.just(BERLIN))` erzeugt Zeitpunkte mit Zeitzone; die Grenzen sind naive Datumswerte.
+
+  ```python pytest
+  from dataclasses import dataclass
+  from datetime import datetime, timedelta
+  from zoneinfo import ZoneInfo
+
+  from hypothesis import assume, given, strategies as st
+
+  BERLIN = ZoneInfo("Europe/Berlin")
+
+
+  @dataclass(frozen=True)
+  class Reservierung:
+      rad: str
+      start: datetime
+      ende: datetime  # nicht mehr enthalten: [start, ende)
+
+
+  def ueberlappt(a: Reservierung, b: Reservierung) -> bool:
+      return a.rad == b.rad and a.start < b.ende and b.start < a.ende
+
+
+  raeder = st.sampled_from(["CR-0417", "CR-0418", "EB-0032"])
+  zeitpunkte = st.datetimes(
+      min_value=datetime(2026, 10, 1), max_value=datetime(2026, 10, 8), timezones=st.just(BERLIN)
+  )
+  halbe_stunden = st.integers(min_value=1, max_value=16).map(lambda n: timedelta(minutes=30 * n))
+
+
+  @st.composite
+  def reservierungen(draw, rad=raeder):
+      start = draw(zeitpunkte)
+      return Reservierung(draw(rad), start, start + draw(halbe_stunden))
+
+
+  @given(reservierungen(), reservierungen())
+  def test_ueberlappung_ist_symmetrisch(a, b):
+      assert ueberlappt(a, b) == ueberlappt(b, a)
+
+
+  @given(reservierungen(), halbe_stunden)
+  def test_angrenzende_reservierungen_ueberlappen_nicht(a, dauer):
+      danach = Reservierung(a.rad, a.ende, a.ende + dauer)
+      assert not ueberlappt(a, danach)
+
+
+  @given(reservierungen(), reservierungen())
+  def test_verschiedene_raeder_ueberlappen_nie(a, b):
+      assume(a.rad != b.rad)
+      assert not ueberlappt(a, b)
+  ```
+
+  `datetimes` mit Zeitzone erzeugt absichtlich Zeitpunkte an und neben Zeitumstellungen ([datetimes](https://hypothesis.readthedocs.io/en/latest/reference/strategies.html#hypothesis.strategies.datetimes)). Das findet den Fehler vom Anfang. In Python ergibt die Differenz zweier Zeitpunkte mit derselben `tzinfo` die Differenz der Uhrzeiten, nicht die vergangene Zeit ([datetime-Objekte](https://docs.python.org/3/library/datetime.html#datetime-objects)):
+
+  ```python pytest fails
+  from datetime import datetime, timedelta, timezone
+  from zoneinfo import ZoneInfo
+
+  from hypothesis import given, settings, strategies as st
+
+  BERLIN = ZoneInfo("Europe/Berlin")
+
+
+  def fahrtminuten(start: datetime, ende: datetime) -> int:
+      return int((ende - start).total_seconds() // 60)
+
+
+  zeitpunkte = st.datetimes(
+      min_value=datetime(2026, 3, 1),
+      max_value=datetime(2026, 11, 30),
+      timezones=st.just(BERLIN),
+      allow_imaginary=False,
+  )
+
+
+  @settings(max_examples=500)
+  @given(zeitpunkte, st.integers(min_value=1, max_value=4 * 60))
+  def test_fahrtminuten_entsprechen_der_echten_dauer(start, minuten):
+      ende = (start.astimezone(timezone.utc) + timedelta(minutes=minuten)).astimezone(BERLIN)
+      assert fahrtminuten(start, ende) == minuten
+  ```
+
+  Aus neun Monaten wählt Hypothesis den 29. März 2026, 0:00 Uhr, und eine Fahrt von 120 Minuten. In dieser Nacht springt die Uhr um 2:00 auf 3:00 vor; am Ende der Fahrt zeigt sie 3:00, und die Differenz der Uhrzeiten ergibt 180 Minuten – der Fehler des Kunden vom Anfang. Im Oktober ist es umgekehrt: Eine Fahrt durch die doppelte Stunde wird zu kurz berechnet. Zwei Nächte in neun Monaten trifft Hypothesis mit den üblichen 100 Testfällen nicht in jedem Lauf, deshalb bekommt dieser Test `@settings(max_examples=500)`. `allow_imaginary=False` schließt Uhrzeiten aus, die es in Berlin nie gab, etwa 2:30 Uhr in der Märznacht. Die Reparatur rechnet in UTC: `ende.astimezone(timezone.utc) - start.astimezone(timezone.utc)`.
+
+  Unpassende Eingaben verwirft `.filter(f)` auf einer einzelnen Strategie, [`assume(bedingung)`](https://hypothesis.readthedocs.io/en/latest/tutorial/adapting-strategies.html#assume-vs-filter) verwirft den ganzen Testfall und drückt Beziehungen zwischen Werten aus wie `a.rad != b.rad` oben. Jeder verworfene Fall ist ein Lauf ohne Prüfung. Am billigsten ist eine Strategie, die nur gültige Werte erzeugt. Wie viel ein `assume` wegwirft, zeigt `--hypothesis-show-statistics`, hier für einen Monotonietest mit `assume(a <= b)` statt `sorted`:
+
+  ```console
+  $ pytest tests/test_preis.py --hypothesis-show-statistics
+  …
+  tests/test_preis.py .                                                    [100%]
+  ============================ Hypothesis Statistics =============================
+
+  tests/test_preis.py::test_laenger_fahren_wird_nie_billiger:
+
+    - during generate phase (0.07 seconds):
+      - Typical runtimes: < 1ms, of which < 1ms in data generation
+      - 100 passing, 0 failing, and 58 invalid test cases
+      - Events:
+        * 36.71%, gave up because: failed to satisfy assume() in test_laenger_fahren_wird_nie_billiger (line 10)
+
+    - Stopped because settings.max_examples=100
+  ```
+
+  > [!WARNING] `return` statt `assume`
+  > `if a > b: return` sieht aus wie `assume(a <= b)`, zählt aber als bestandener Testfall, obwohl nichts geprüft wurde. `assume` meldet den Fall als ungültig, Hypothesis erzeugt Ersatz und warnt mit dem Health Check `filter_too_much`, wenn fast alles verworfen wird.
+
+  ## Abläufe testen mit RuleBasedStateMachine
+
+  Manche Fehler stecken nicht in einem Funktionsaufruf, sondern in einer Folge: reservieren, reservieren, stornieren, reservieren. Ein [`RuleBasedStateMachine`](https://hypothesis.readthedocs.io/en/latest/stateful.html#rule-based-state-machines) beschreibt Regeln (mögliche Schritte) und Invarianten (was nach jedem Schritt gilt). Hypothesis erzeugt daraus zufällige Abläufe und schrumpft einen gescheiterten Ablauf auf die kürzeste Schrittfolge. Der Kalender unten vergleicht neue Reservierungen nur mit der zuletzt angelegten:
+
+  ```python pytest fails
+  from hypothesis import settings, strategies as st
+  from hypothesis.stateful import RuleBasedStateMachine, invariant, precondition, rule
+
+
+  class Kalender:
+      """Reservierungen eines Rads als halboffene Intervalle [start, ende), in halben Stunden ab 6 Uhr."""
+
+      def __init__(self):
+          self._reservierungen = {}
+          self._letzte = None
+          self._naechste_nummer = 1
+
+      def reservieren(self, start, ende):
+          """Liefert eine Reservierungsnummer oder None, wenn das Rad in der Zeit schon reserviert ist."""
+          if self._letzte and start < self._letzte[1] and self._letzte[0] < ende:
+              return None
+          nummer = self._naechste_nummer
+          self._naechste_nummer += 1
+          self._reservierungen[nummer] = (start, ende)
+          self._letzte = (start, ende)
+          return nummer
+
+      def stornieren(self, nummer):
+          del self._reservierungen[nummer]
+
+      def belegt(self):
+          return sorted(self._reservierungen.values())
+
+
+  class KalenderMaschine(RuleBasedStateMachine):
+      def __init__(self):
+          super().__init__()
+          self.kalender = Kalender()
+          self.nummern = []
+
+      @rule(start=st.integers(min_value=0, max_value=31), dauer=st.integers(min_value=1, max_value=4))
+      def reservieren(self, start, dauer):
+          nummer = self.kalender.reservieren(start, start + dauer)
+          if nummer is not None:
+              self.nummern.append(nummer)
+
+      @precondition(lambda self: self.nummern)
+      @rule(data=st.data())
+      def stornieren(self, data):
+          nummer = data.draw(st.sampled_from(self.nummern))
+          self.nummern.remove(nummer)
+          self.kalender.stornieren(nummer)
+
+      @invariant()
+      def keine_ueberlappung(self):
+          belegt = self.kalender.belegt()
+          for (_, ende), (start, _) in zip(belegt, belegt[1:]):
+              assert ende <= start
+
+
+  KalenderMaschine.TestCase.settings = settings(max_examples=50, stateful_step_count=10)
+  TestKalender = KalenderMaschine.TestCase
+  ```
+
+  Die Ausgabe ist ein kleines Programm: drei Reservierungen, die dritte überschneidet die erste und wird trotzdem angenommen. Von Hand schreibt man diesen Test selten, weil der Fehler erst mit einer Reservierung *dazwischen* auftritt. Stateful Testing lohnt sich für Objekte mit Zustand und wenigen Operationen wie Kalender, Warenkorb oder Cache. Oft läuft ein einfaches Modell mit, etwa ein Dictionary, und jede Regel prüft, ob System und Modell dieselbe Entscheidung treffen.
+
+  ## Property-based Testing in der CI: Determinismus und Kosten
+
+  Hypothesis kennt zwei eingebaute Profile ([Built-in profiles](https://hypothesis.readthedocs.io/en/latest/reference/api.html#built-in-profiles)). Lokal gilt `default`: neue Zufallswerte bei jedem Lauf, eine Beispieldatenbank unter `.hypothesis/`, eine Deadline von 200 ms je Testfall. Ist die Umgebungsvariable `CI` gesetzt, wie in GitHub Actions, gilt `ci`: `derandomize=True`, keine Datenbank, keine Deadline, und bei einem Fehlschlag druckt Hypothesis einen `@reproduce_failure`-Dekorator, mit dem du den Fall lokal nachspielst.
+
+  `derandomize=True` leitet den Zufall aus dem Test selbst ab. Jeder Lauf prüft dieselben Testfälle, bis sich Test, Hypothesis-Version oder Python ändern. Das ist gut für die CI: Ein roter Build hängt am Code, nicht am Würfel. Der Preis: Die CI sucht nie weiter, als sie beim ersten Lauf gesucht hat. Neue Fehler findet Hypothesis lokal oder in einem nächtlichen Job mit mehr Testfällen und echtem Zufall:
+
+  ```python
+  # conftest.py
+  from hypothesis import settings
+
+  # Ohne derandomize=False erbt das Profil in der CI die Einstellungen von „ci“.
+  settings.register_profile("nightly", max_examples=2_000, derandomize=False)
+  ```
+
+  Der nächtliche Job ruft `pytest --hypothesis-profile=nightly` auf. Findet er etwas, wird daraus ein `@example` im normalen Test.
+
+  Diese Plattform lässt Hypothesis wie das `ci`-Profil laufen: `derandomize=True`, `database=None`, `deadline=None`. Führst du einen Block zweimal aus, siehst du dieselben Testfälle und dasselbe Gegenbeispiel. Fängt deine Eigenschaft in einer Übung einen Fehler, dann jedes Mal. Fängt sie ihn nicht, hilft erneutes Ausführen nicht, nur eine bessere Eigenschaft oder eine breitere Strategie.
+
+  Wann lohnt sich PBT? Bei Code mit großem Eingaberaum und klaren Regeln: Preise und Rabatte, Zeitrechnung, Parser und Serialisierung, Algorithmen mit einfacher Referenz, Refactorings mit der alten Implementierung als Orakel. Wenig bringt es bei Glue Code, Oberflächen und langsamen Tests mit Datenbank oder Netz: 100 Testfälle mal 50 ms sind fünf Sekunden für einen einzigen Test. Und wenn dir nur eine Eigenschaft einfällt, die die Implementierung wiederholt, ist ein gut gewähltes Beispiel ehrlicher.
+
+  > [!PRAXIS] Radwerk: zwei Eigenschaften, ein Vorfall weniger
+  > Nach dem Vorfall schrieb das Team zwei Eigenschaften: Fahrtminuten entsprechen der Zeit in UTC, und ein Kalendertag kostet nie mehr als der Tageshöchstpreis. Die zweite fand sofort einen weiteren Fehler: Zwei Fahrten am selben Tag kosteten zusammen 1 650 Cent, weil der Deckel je Fahrt galt. Beide Gegenbeispiele stehen als `@example` im Test. In der CI laufen die Eigenschaften deterministisch, nachts mit 2 000 Testfällen und echtem Zufall.
+
+  > [!INTERVIEW] „Was ist Property-based Testing, und wann setzt du es ein?“
+  > „Ich beschreibe Eigenschaften, die für alle gültigen Eingaben gelten, und Hypothesis erzeugt die Eingaben und schrumpft Fehler auf ein minimales Gegenbeispiel. Das lohnt sich bei Logik mit großem Eingaberaum: Preise, Zeitzonen, Parser, Serialisierung im Round Trip, oder eine neue Implementierung gegen die alte. Für Glue Code und langsame Integrationstests nehme ich Beispiele. Gegenbeispiele halte ich mit `@example` fest, und in der CI läuft Hypothesis deterministisch, damit ein roter Build reproduzierbar ist.“
+
+  ## Häufige Fehler
+
+  - **Die Eigenschaft wiederholt die Implementierung.** Derselbe Ausdruck im Test und im Code ist immer grün. Suche eine Beziehung (Round Trip, Orakel, Relation) statt einer zweiten Formel.
+  - **Zu enge Strategie.** `st.integers(0, 120)` für eine Preisregel mit Deckel ab 300 Minuten kann den Deckel nie verletzen. Nimm den ganzen gültigen Bereich; die Hypothesis-Doku empfiehlt die allgemeinste Strategie, für die der Test gelten soll.
+  - **Filtern statt bauen.** `.filter(lambda r: r.ende > r.start)` verwirft die Hälfte der Fälle; `@st.composite` mit Start plus Dauer verwirft keinen. Und `return` statt `assume` zählt den Fall als bestanden, ohne dass etwas geprüft wurde.
+  - **Gegenbeispiel nur reparieren.** Ohne `@example` merkt sich nur die lokale Datenbank den Fall, die CI nicht.
+  - **Nichtdeterministischer Code unter Test.** Liest die Funktion `datetime.now()` oder Zufall, liefert derselbe Testfall zweimal verschiedene Ergebnisse, und Hypothesis meldet einen `Flaky`-Fehler. Übergib Zeit und Zufall als Parameter.
+  - **Zeitpunkte ohne Zeitzone.** Naive `datetime`-Werte kennen keine Zeitumstellung. Rechnet dein Code in `Europe/Berlin`, braucht die Strategie `timezones=`.
+
+  ## Zusammenfassung
+
+  - Eine Eigenschaft beschreibt, was für alle gültigen Eingaben gilt; Hypothesis erzeugt die Eingaben und bevorzugt Grenzwerte, Wiederholungen und Konstanten aus deinem Code.
+  - Shrinking verkleinert einen Fehlschlag auf ein minimales Gegenbeispiel, das oft genau die Grenze zeigt. Mit `@example` wird es zur dauerhaften Regression.
+  - Muster für Eigenschaften: Round Trip, Invariante, Idempotenz, Orakel, metamorphe Relation, „stürzt nicht ab“. Mehrere schwache Eigenschaften zusammen sind stark.
+  - Strategien legen den Bereich fest: `sampled_from`, `builds`, `@st.composite` für abhängige Werte, `datetimes` mit `timezones` für Zeitzonenfehler. Gültige Werte bauen ist besser als filtern, `assume` ist besser als `return`.
+  - `RuleBasedStateMachine` testet Abfolgen von Operationen und schrumpft sie auf die kürzeste scheiternde Schrittfolge.
+  - In der CI läuft Hypothesis deterministisch (`ci`-Profil, wie auf dieser Plattform); neue Fehler finden lokale Läufe und nächtliche Jobs mit mehr Testfällen.
+  - PBT lohnt sich für Logik mit großem Eingaberaum und klaren Regeln, nicht für Glue Code und langsame I/O-Tests.
+exercises:
+  - id: eigenschaft-oder-beispiel
+    type: choice
+    title: Was ist eine brauchbare Eigenschaft?
+    prompt: |
+      `parse(text)` liest Radwerk-Gutscheincodes: `RW-` und sechs Großbuchstaben oder Ziffern. Kleinbuchstaben und Leerzeichen außen sind erlaubt. `parse` liefert die sechs Zeichen nach `RW-` und wirft sonst `ValueError`. `formatiere(kern)` baut aus sechs Zeichen den Code.
+
+      Welche Tests sind brauchbare Eigenschaften für `@given`?
+    options:
+      - text: Für jeden gültigen Kern `k` gilt `parse(formatiere(k)) == k`.
+        correct: true
+        why: Ein Round Trip. Er gilt für alle sechs Zeichen langen Kerne und findet etwa einen Parser, der zu viel abschneidet.
+      - text: Für jeden Text `t` liefert `parse(t)` sechs Zeichen aus A–Z und 0–9 oder wirft `ValueError`.
+        correct: true
+        why: Eine Kombination aus Invariante und „stürzt nicht ab“. Jede andere Exception und jedes andere Ergebnis ist ein Fehler, egal welchen Text Hypothesis erzeugt.
+      - text: Für jeden gültigen Code `c` gilt `parse(c.lower()) == parse(c)`.
+        correct: true
+        why: Eine metamorphe Relation. Du kennst das Ergebnis nicht, aber du weißt, dass Kleinschreibung es nicht ändern darf.
+      - text: "`parse(\" rw-ab12cd \") == \"AB12CD\"`"
+        correct: false
+        why: Ein guter Beispieltest, aber keine Eigenschaft. Er hat keine Eingabe, die Hypothesis variieren könnte.
+      - text: Für jeden Text `t` gilt `parse(t) == t.strip().upper()[3:]`.
+        correct: false
+        why: Der Test baut die Implementierung nach und übernimmt ihre Fehler. Er ist außerdem falsch für ungültige Texte, bei denen `parse` `ValueError` wirft.
+    explanation: |
+      Eine Eigenschaft gilt für alle Eingaben eines Bereichs, ohne dass du jedes Ergebnis kennst. Round Trip, Invariante und metamorphe Relation sind solche Aussagen. Eine Eigenschaft, die die Implementierung wiederholt, ist immer grün, solange beide denselben Fehler haben. Ein konkretes Beispiel bleibt trotzdem nützlich, als Dokumentation und als `@example`.
+    resources:
+      - title: Hypothesis · Introduction
+        url: https://hypothesis.readthedocs.io/en/latest/tutorial/introduction.html
+
+  - id: hypothesis-ablauf
+    type: order
+    title: Was passiert bei einem Lauf mit @given?
+    prompt: |
+      Ein Test mit `@given` und einem `@example` läuft lokal mit dem Profil `default`. In der Beispieldatenbank liegt ein Fehlschlag vom letzten Lauf, der inzwischen behoben ist; diesmal scheitert der Test an einem neuen Fehler. Bring die Schritte in die Reihenfolge, in der Hypothesis sie ausführt.
+    lang: text
+    lines: |
+      Die Fälle aus @example laufen, jeder genau einmal
+      Fehlschläge aus der Beispieldatenbank laufen erneut
+      Hypothesis erzeugt neue Testfälle, bis max_examples erreicht ist oder einer scheitert
+      Shrinking verkleinert den gescheiterten Testfall, solange er weiter scheitert
+      Der kleinste gescheiterte Testfall läuft noch einmal und erscheint als „Failing test case“
+    explanation: |
+      Die Phasen heißen `explicit`, `reuse`, `generate`, `shrink` (dazu `target` und `explain`). Explizite Beispiele kommen zuerst und werden nicht geschrumpft; scheitert eines, erzeugt Hypothesis gar keine Zufallswerte mehr. Danach spielt Hypothesis gespeicherte Fehlschläge ab, damit ein gerade gefundener Fehler beim nächsten Lauf sofort wieder auftaucht. Erst dann kommen neue Testfälle. Am Ende läuft das minimale Gegenbeispiel noch einmal, damit du die echte Fehlermeldung dazu siehst.
+    resources:
+      - title: Hypothesis · Phase
+        url: https://hypothesis.readthedocs.io/en/latest/reference/api.html#hypothesis.Phase
+
+  - id: shrinking-vorhersagen
+    type: output
+    title: Welches Gegenbeispiel bleibt übrig?
+    prompt: |
+      Der Tageshöchstpreis greift hier nur je Fahrt, nicht je Tag. Die Eigenschaft prüft eine Liste von Fahrten eines Tages. `gegenbeispiele` sammelt jede Liste, an der der Test scheitert; der letzte Eintrag ist das Gegenbeispiel, das Hypothesis am Ende meldet.
+
+      Hypothesis meldet das kleinste Gegenbeispiel, das es findet: so wenige Elemente wie möglich, dann so kleine Werte wie möglich, vorne zuerst. Was gibt das Programm aus?
+    lang: python
+    code: |
+      from hypothesis import given, settings, strategies as st
+
+
+      def preis(minuten):
+          if minuten <= 5:
+              return 0
+          return min(-(-minuten // 30) * 150, 1500)
+
+
+      def tagespreis(fahrten):
+          return sum(preis(m) for m in fahrten)
+
+
+      gegenbeispiele = []
+
+
+      @settings(derandomize=True, database=None)
+      @given(st.lists(st.integers(min_value=0, max_value=24 * 60)))
+      def test_tagespreis_hoechstens_1500(fahrten):
+          if tagespreis(fahrten) > 1500:
+              gegenbeispiele.append(fahrten)
+              raise AssertionError
+
+
+      try:
+          test_tagespreis_hoechstens_1500()
+      except AssertionError:
+          print(gegenbeispiele[0] != gegenbeispiele[-1])
+          print(gegenbeispiele[-1])
+          print(tagespreis(gegenbeispiele[-1]))
+    expected: |
+      True
+      [6, 271]
+      1650
+    hints:
+      - Eine einzelne Fahrt kostet höchstens 1 500 Cent. Wie viele Fahrten braucht es mindestens, damit der Tag mehr kostet?
+      - Die erste Fahrt soll so kurz wie möglich sein und trotzdem etwas kosten. Die zweite muss den Rest bis über 1 500 Cent bringen.
+    explanation: |
+      Eine Fahrt allein überschreitet 1 500 Cent nie, das kleinste Gegenbeispiel hat also zwei Elemente. Vorne zuerst: Die erste Fahrt wird so klein wie möglich, ohne dass der Test grün wird – 6 Minuten, die kürzeste Fahrt, die etwas kostet (150 Cent). Die zweite muss dann 1 500 Cent kosten; die kürzeste Fahrt dafür ist 271 Minuten (zehn angefangene halbe Stunden). Zusammen 1 650 Cent. Der erste gefundene Fehlschlag war eine längere, zufällige Liste, deshalb ist die erste Zeile `True`. `[6, 271]` zeigt den Fehler genauer als jede Zufallsliste: Zwei Fahrten an einem Tag reichen, um den Deckel zu umgehen.
+    resources:
+      - title: Hypothesis · Glossar (minimal failing test case)
+        url: https://hypothesis.readthedocs.io/en/latest/glossary.html#term-minimal-failing-test-case
+
+  - id: idempotenz-vorhersagen
+    type: output
+    title: Zweimal zusammengefasst
+    prompt: |
+      `zusammenfassen` soll überlappende und angrenzende Zeitfenster eines Rads verschmelzen (Stunden, halboffen). Eine Eigenschaft dafür ist Idempotenz: Ein zweiter Aufruf ändert nichts mehr. Was gibt das Programm aus?
+    lang: python
+    code: |
+      def zusammenfassen(fenster):
+          fenster = sorted(fenster)
+          ergebnis = []
+          i = 0
+          while i < len(fenster):
+              start, ende = fenster[i]
+              if i + 1 < len(fenster) and fenster[i + 1][0] <= ende:
+                  ende = max(ende, fenster[i + 1][1])
+                  i += 2
+              else:
+                  i += 1
+              ergebnis.append((start, ende))
+          return ergebnis
+
+
+      frei = [(14, 15), (9, 10), (11, 12), (10, 11)]
+      einmal = zusammenfassen(frei)
+      zweimal = zusammenfassen(einmal)
+      print(einmal)
+      print(zweimal)
+      print(einmal == zweimal)
+    expected: |
+      [(9, 11), (11, 12), (14, 15)]
+      [(9, 12), (14, 15)]
+      False
+    explanation: |
+      Sortiert ergibt sich `[(9, 10), (10, 11), (11, 12), (14, 15)]`. Die Schleife verschmilzt (9, 10) mit (10, 11) zu (9, 11) und springt dann zwei Plätze weiter, ohne zu prüfen, ob (11, 12) auch noch angrenzt. Erst der zweite Aufruf verschmilzt (9, 11) mit (11, 12). Weil das Ergebnis beim zweiten Mal anders aussieht, ist die Funktion nicht idempotent – die Eigenschaft hätte den Fehler gefunden, sobald Hypothesis drei aneinandergrenzende Fenster erzeugt. Mit zwei Fenstern, wie man sie von Hand testet, bleibt er unsichtbar.
+
+  - id: strategien-luecken
+    type: gap
+    title: Fahrten erzeugen
+    prompt: |
+      `tarif.py` enthält die Dataclass `Fahrt(rad, minuten)`, `DECKEL = {"city": 1500, "e-bike": 3000}` und `preis(fahrt)`. Ergänze die Strategie und die Dekoratoren: eine eigene Strategie für Fahrten, ein festes Regressionsbeispiel, 500 Testfälle für die erste Eigenschaft und eine Annahme über zwei Werte in der zweiten.
+    lang: python
+    code: |
+      from hypothesis import assume, example, given, settings, strategies as st
+
+      from tarif import DECKEL, Fahrt, preis
+
+      minuten = st.integers(min_value=0, max_value=24 * 60)
+
+
+      @st.⟦composite⟧
+      def fahrten(draw):
+          rad = draw(st.⟦sampled_from⟧(["city", "e-bike"]))
+          return Fahrt(rad=rad, minuten=⟦draw⟧(minuten))
+
+
+      @⟦example⟧(Fahrt(rad="e-bike", minuten=301))
+      @⟦settings⟧(max_examples=500)
+      @given(fahrten())
+      def test_preis_im_rahmen(fahrt):
+          assert 0 <= preis(fahrt) <= DECKEL[fahrt.rad]
+
+
+      @given(fahrten(), st.integers(min_value=0, max_value=120))
+      def test_laenger_ist_nie_billiger(fahrt, mehr):
+          ⟦assume⟧(fahrt.minuten + mehr <= 24 * 60)
+          laenger = Fahrt(rad=fahrt.rad, minuten=fahrt.minuten + mehr)
+          assert preis(laenger) >= preis(fahrt)
+    gaps:
+      - label: Dekorator für eigene Strategien
+        hint: Eine Funktion, die mit `draw` Werte zieht, wird mit `@st.…` zur Strategie.
+      - label: Auswahl aus einer Liste
+        hint: Die Strategie wählt eines der Elemente einer festen Liste.
+      - label: Wert ziehen
+        hint: Innerhalb der eigenen Strategie holst du Werte aus anderen Strategien mit der Funktion, die als erster Parameter übergeben wird.
+      - label: festes Beispiel
+        hint: Dieser Dekorator nimmt einen Wert, keine Strategie, und läuft vor allen Zufallswerten.
+      - label: Einstellungen
+        hint: Der Dekorator, der `max_examples` und `deadline` setzt.
+      - label: Bedingung über mehrere Werte
+        hint: Verwirft den Testfall, wenn die Bedingung nicht gilt – ohne ihn als bestanden zu zählen.
+    explanation: |
+      `@st.composite` macht aus einer Funktion mit `draw` eine Strategie; abhängige Werte lassen sich so direkt bauen. `sampled_from` wählt aus einer Liste, `@example` erzwingt einen festen Fall vor allen Zufallswerten, `@settings` ändert die Anzahl der Testfälle für diesen Test. `assume` verwirft Fälle, bei denen die Summe zweier gezogener Werte den Tag sprengt. Das ist eine Beziehung zwischen zwei Werten, die ein `.filter` auf einer einzelnen Strategie nicht ausdrücken kann. Für eine Bedingung an einen einzelnen Wert wäre `.filter` oder gleich ein passender Bereich besser.
+    resources:
+      - title: Hypothesis · Custom strategies
+        url: https://hypothesis.readthedocs.io/en/latest/tutorial/custom-strategies.html#writing-your-own-strategy
+      - title: Hypothesis · assume() vs .filter()
+        url: https://hypothesis.readthedocs.io/en/latest/tutorial/adapting-strategies.html#assume-vs-filter
+
+  - id: preis-eigenschaften
+    type: code
+    title: Eigenschaften für den Fahrpreis
+    prompt: |
+      `preis(minuten: int, rad: str) -> int` aus `tarif.py` berechnet den Preis einer Fahrt in Cent. Es gilt:
+
+      - `rad` ist `"city"` oder `"e-bike"`; `minuten` liegt zwischen 0 und 1 440 (eine Fahrt dauert höchstens einen Tag).
+      - City-Rad: 150 Cent je angefangene 30 Minuten. E-Bike: 300 Cent je angefangene 30 Minuten.
+      - Fahrten bis einschließlich 5 Minuten kosten 0 Cent.
+      - Höchstpreis je Fahrt: City-Rad 1 500 Cent, E-Bike 3 000 Cent.
+
+      Schreibe **Eigenschaften** mit `@given`. Sie müssen gegen die richtige Implementierung grün sein und jede fehlerhafte Variante, die die Prüfung bereithält, rot werden lassen. Die Fehler stecken an Stellen, die man von Hand selten prüft. Denk an die Muster aus der Lektion: Invariante, metamorphe Relation, Orakel.
+    lang: python
+    setup: |
+      from pathlib import Path
+
+      from hypothesis import Phase, settings
+
+      RICHTIG = '''
+      TAKT = {"city": 150, "e-bike": 300}
+      DECKEL = {"city": 1500, "e-bike": 3000}
+
+
+      def preis(minuten: int, rad: str) -> int:
+          if minuten <= 5:
+              return 0
+          halbe_stunden = -(-minuten // 30)
+          return min(halbe_stunden * TAKT[rad], DECKEL[rad])
+      '''
+      MUTANTEN = {
+          "deckel_ab_10h": RICHTIG.replace(
+              "    return min(halbe_stunden * TAKT[rad], DECKEL[rad])",
+              "    if minuten >= 600:\n        return DECKEL[rad]\n    return halbe_stunden * TAKT[rad]",
+          ),
+          "ebike_deckel": RICHTIG.replace('DECKEL = {"city": 1500, "e-bike": 3000}', 'DECKEL = {"city": 1500, "e-bike": 1500}'),
+          "rundung": RICHTIG.replace("-(-minuten // 30)", "minuten // 30 + 1"),
+      }
+      assert all(m != RICHTIG for m in MUTANTEN.values()), "Ein Mutant ist identisch mit der richtigen Version."
+      Path("tarif.py").write_text(RICHTIG)
+      # Für die Mutanten zählt nur rot oder grün: ohne Shrinking ist die Prüfung schneller fertig. 200 statt 100 Testfälle,
+      # damit eine richtige Eigenschaft seltene Fälle (etwa volle halbe Stunden) sicher trifft; das kostet nur, wenn ein Mutant überlebt.
+      settings.register_profile("mutanten", derandomize=True, deadline=None, database=None, phases=[Phase.explicit, Phase.generate], max_examples=200)
+      SCHNELL = ["-x", "--hypothesis-profile=mutanten"]
+    starter: |
+      from hypothesis import given, strategies as st
+
+      from tarif import preis
+
+
+      def test_eigenschaft():
+          ...
+    solution: |
+      import math
+
+      from hypothesis import given, strategies as st
+
+      from tarif import preis
+
+      TAKT = {"city": 150, "e-bike": 300}
+      DECKEL = {"city": 1500, "e-bike": 3000}
+      minuten = st.integers(min_value=0, max_value=24 * 60)
+      raeder = st.sampled_from(["city", "e-bike"])
+
+
+      @given(minuten, raeder)
+      def test_preis_zwischen_null_und_deckel(m, rad):
+          assert 0 <= preis(m, rad) <= DECKEL[rad]
+
+
+      @given(minuten, minuten, raeder)
+      def test_laenger_fahren_wird_nie_billiger(a, b, rad):
+          kurz, lang = sorted((a, b))
+          assert preis(kurz, rad) <= preis(lang, rad)
+
+
+      @given(minuten)
+      def test_e_bike_kostet_das_doppelte(m):
+          assert preis(m, "e-bike") == 2 * preis(m, "city")
+
+
+      @given(minuten, raeder)
+      def test_preis_wie_die_referenz(m, rad):
+          erwartet = 0 if m <= 5 else min(math.ceil(m / 30) * TAKT[rad], DECKEL[rad])
+          assert preis(m, rad) == erwartet
+    tests:
+      - name: Mindestens eine Eigenschaft mit @given
+        code: |
+          from hypothesis import is_hypothesis_test
+
+          eigenschaften = [n for n, f in dict(globals()).items() if n.startswith("test") and callable(f) and is_hypothesis_test(f)]
+          assert eigenschaften, "Schreibe mindestens einen Test mit @given – gesucht sind Eigenschaften, nicht nur Beispiele."
+      - name: Grün gegen die richtige Implementierung
+        code: |
+          lauf = run_pytest({"tarif.py": RICHTIG})
+          assert lauf.ok, lauf.output
+      - name: Fängt einen Fehler beim Tageshöchstpreis
+        code: |
+          lauf = run_pytest({"tarif.py": MUTANTEN["deckel_ab_10h"]}, args=SCHNELL)
+          assert lauf.failed, "Deine Tests bleiben grün, obwohl Fahrten zwischen 5 und 10 Stunden mehr als den Höchstpreis kosten."
+      - name: Fängt einen Fehler beim E-Bike-Tarif
+        code: |
+          lauf = run_pytest({"tarif.py": MUTANTEN["ebike_deckel"]}, args=SCHNELL)
+          assert lauf.failed, "Deine Tests bleiben grün, obwohl das E-Bike schon bei 1 500 Cent gedeckelt wird. Wie hängen die beiden Tarife zusammen?"
+      - name: Fängt einen Fehler beim Aufrunden
+        code: |
+          lauf = run_pytest({"tarif.py": MUTANTEN["rundung"]}, args=SCHNELL)
+          assert lauf.failed, "Deine Tests bleiben grün, obwohl volle halbe Stunden eine halbe Stunde zu viel kosten (30 Minuten City-Rad: 300 statt 150 Cent)."
+    hints:
+      - Eine Eigenschaft „0 ≤ Preis ≤ Höchstpreis“ über alle 1 441 möglichen Minuten findet Fehler, die nur bei langen Fahrten auftreten.
+      - Das E-Bike kostet in jedem Fall genau das Doppelte des City-Rads, auch beim Höchstpreis und beim Fehlstart. Das ist eine metamorphe Relation.
+      - Für die Rundung brauchst du ein Orakel – zum Beispiel `math.ceil(m / 30)` – oder eine Eigenschaft wie „k volle halbe Stunden kosten k · 150 Cent, solange der Deckel nicht greift“.
+    explanation: |
+      Drei Muster fangen drei Fehler. Die Invariante „0 ≤ Preis ≤ Höchstpreis“ über den ganzen Bereich trifft Fahrten zwischen 301 und 599 Minuten, die beim Fehler „Deckel erst ab 10 Stunden“ zu viel kosten. Die metamorphe Relation „E-Bike = 2 × City“ fängt den falschen E-Bike-Deckel, den die Invariante nicht sieht, weil 1 500 unter 3 000 liegt. Der Rundungsfehler trifft nur volle halbe Stunden (30, 60, 90 … Minuten), bleibt monoton und unter dem Deckel; nur ein Orakel oder eine genaue Aussage über volle halbe Stunden zeigt ihn. Die Monotonie-Eigenschaft fängt hier keinen der Fehler – sie ist trotzdem eine gute Regel, nur nicht für diese Mutanten.
+    resources:
+      - title: Hypothesis · Introduction (Multiple Arguments)
+        url: https://hypothesis.readthedocs.io/en/latest/tutorial/introduction.html#tests-with-multiple-arguments
+
+  - id: ueberlappung-eigenschaften
+    type: code
+    title: Eigenschaften für überlappende Reservierungen
+    prompt: |
+      `reservierung.py` enthält:
+
+      ```python
+      @dataclass(frozen=True)
+      class Reservierung:
+          start: datetime
+          ende: datetime  # nicht mehr enthalten: [start, ende)
+
+      def ueberlappt(a: Reservierung, b: Reservierung) -> bool: ...
+      ```
+
+      Reservierungen sind halboffene Intervalle `[start, ende)` mit `start < ende` und können über Mitternacht und über mehrere Tage reichen. Zwei Reservierungen überlappen, wenn es einen Zeitpunkt gibt, der in beiden liegt. Eine Reservierung, die endet, wenn die nächste beginnt, überlappt nicht.
+
+      Schreibe Eigenschaften mit `@given`, die gegen die richtige Implementierung grün sind und jede fehlerhafte Variante rot werden lassen. Naive `datetime`-Werte ohne Zeitzone genügen.
+    lang: python
+    setup: |
+      from pathlib import Path
+
+      from hypothesis import Phase, settings
+
+      RICHTIG = '''
+      from dataclasses import dataclass
+      from datetime import datetime
+
+
+      @dataclass(frozen=True)
+      class Reservierung:
+          start: datetime
+          ende: datetime  # nicht mehr enthalten: [start, ende)
+
+
+      def ueberlappt(a: Reservierung, b: Reservierung) -> bool:
+          return a.start < b.ende and b.start < a.ende
+      '''
+      MUTANTEN = {
+          "beruehrung": RICHTIG.replace("a.start < b.ende and b.start < a.ende", "a.start <= b.ende and b.start <= a.ende"),
+          "einseitig": RICHTIG.replace("a.start < b.ende and b.start < a.ende", "a.start <= b.start < a.ende"),
+          "uhrzeit": RICHTIG.replace(
+              "a.start < b.ende and b.start < a.ende",
+              "a.start.time() < b.ende.time() and b.start.time() < a.ende.time()",
+          ),
+      }
+      assert all(m != RICHTIG for m in MUTANTEN.values()), "Ein Mutant ist identisch mit der richtigen Version."
+      Path("reservierung.py").write_text(RICHTIG)
+      # Für die Mutanten zählt nur rot oder grün: ohne Shrinking ist die Prüfung schneller fertig.
+      settings.register_profile("mutanten", derandomize=True, deadline=None, database=None, phases=[Phase.explicit, Phase.generate])
+      SCHNELL = ["-x", "--hypothesis-profile=mutanten"]
+    starter: |
+      from datetime import datetime, timedelta
+
+      from hypothesis import given, strategies as st
+
+      from reservierung import Reservierung, ueberlappt
+
+
+      def test_eigenschaft():
+          ...
+    solution: |
+      from datetime import datetime, timedelta
+
+      from hypothesis import given, strategies as st
+
+      from reservierung import Reservierung, ueberlappt
+
+      zeitpunkte = st.datetimes(min_value=datetime(2026, 10, 1), max_value=datetime(2026, 10, 8))
+      dauern = st.integers(min_value=1, max_value=48 * 60).map(lambda m: timedelta(minutes=m))
+
+
+      @st.composite
+      def reservierungen(draw):
+          start = draw(zeitpunkte)
+          return Reservierung(start, start + draw(dauern))
+
+
+      @given(reservierungen(), reservierungen())
+      def test_ueberlappung_ist_symmetrisch(a, b):
+          assert ueberlappt(a, b) == ueberlappt(b, a)
+
+
+      @given(reservierungen())
+      def test_reservierung_ueberlappt_sich_selbst(a):
+          assert ueberlappt(a, a)
+
+
+      @given(reservierungen(), dauern)
+      def test_angrenzende_reservierungen_ueberlappen_nicht(a, dauer):
+          danach = Reservierung(a.ende, a.ende + dauer)
+          assert not ueberlappt(a, danach)
+          assert not ueberlappt(danach, a)
+
+
+      @given(reservierungen(), st.data())
+      def test_beginn_innerhalb_ist_ueberlappung(a, data):
+          minuten = int((a.ende - a.start).total_seconds() // 60)
+          versatz = timedelta(minutes=data.draw(st.integers(min_value=0, max_value=minuten - 1)))
+          b = Reservierung(a.start + versatz, a.ende + timedelta(hours=1))
+          assert ueberlappt(a, b)
+          assert ueberlappt(b, a)
+    tests:
+      - name: Mindestens eine Eigenschaft mit @given
+        code: |
+          from hypothesis import is_hypothesis_test
+
+          eigenschaften = [n for n, f in dict(globals()).items() if n.startswith("test") and callable(f) and is_hypothesis_test(f)]
+          assert eigenschaften, "Schreibe mindestens einen Test mit @given – gesucht sind Eigenschaften, nicht nur Beispiele."
+      - name: Grün gegen die richtige Implementierung
+        code: |
+          lauf = run_pytest({"reservierung.py": RICHTIG})
+          assert lauf.ok, lauf.output
+      - name: Fängt einen Fehler an der Intervallgrenze
+        code: |
+          lauf = run_pytest({"reservierung.py": MUTANTEN["beruehrung"]}, args=SCHNELL)
+          assert lauf.failed, "Deine Tests bleiben grün, obwohl eine Reservierung, die um 10:00 endet, jetzt eine überlappt, die um 10:00 beginnt."
+      - name: Fängt einen Fehler bei der Reihenfolge der Argumente
+        code: |
+          lauf = run_pytest({"reservierung.py": MUTANTEN["einseitig"]}, args=SCHNELL)
+          assert lauf.failed, "Deine Tests bleiben grün, obwohl die Variante nur Überlappungen erkennt, bei denen b nach a beginnt."
+      - name: Fängt einen Fehler über Tagesgrenzen
+        code: |
+          lauf = run_pytest({"reservierung.py": MUTANTEN["uhrzeit"]}, args=SCHNELL)
+          assert lauf.failed, "Deine Tests bleiben grün, obwohl die Variante nur Uhrzeiten vergleicht und das Datum ignoriert – falsch über Mitternacht und an verschiedenen Tagen."
+    hints:
+      - Baue Reservierungen mit `@st.composite` aus Start und Dauer, dann gilt `start < ende` ohne Filter. Erlaube Dauern über Mitternacht hinaus.
+      - Zufällige Paare überlappen selten. Konstruiere Paare gezielt – etwa eine Reservierung, die genau am Ende der anderen beginnt, oder eine, die innerhalb der anderen beginnt.
+      - Symmetrie (`ueberlappt(a, b) == ueberlappt(b, a)`) und „jede Reservierung überlappt sich selbst“ sind zwei Eigenschaften, die kein Ergebnis vorausberechnen.
+    explanation: |
+      Jede Variante bricht eine andere Eigenschaft. `<=` statt `<` verletzt „angrenzende Reservierungen überlappen nicht“ – halboffene Intervalle dürfen sich an der Grenze berühren. Die einseitige Prüfung ist nicht symmetrisch, und eine Reservierung, die vor der anderen beginnt und in sie hineinreicht, wird übersehen. Der Uhrzeitvergleich ist für Reservierungen innerhalb eines Tages richtig, deshalb fällt er bei Beispielen wie 10:00–11:00 gegen 10:30–12:00 nicht auf. Eine Reservierung von 22:00 bis 2:00 Uhr überlappt sich nach dieser Variante nicht einmal selbst, und Reservierungen an verschiedenen Tagen zur selben Uhrzeit gelten als Konflikt. Hypothesis erzeugt solche Fälle, sobald die Strategie Dauern über Mitternacht erlaubt.
+    resources:
+      - title: Hypothesis · datetimes
+        url: https://hypothesis.readthedocs.io/en/latest/reference/strategies.html#hypothesis.strategies.datetimes
+      - title: Hypothesis · data()
+        url: https://hypothesis.readthedocs.io/en/latest/reference/strategies.html#hypothesis.strategies.data
+
+  - id: gutschein-round-trip
+    type: code
+    title: Eigenschaften für Gutscheincodes
+    prompt: |
+      `gutschein.py` enthält zwei Funktionen:
+
+      - `formatiere(kern: str) -> str` baut aus sechs Großbuchstaben oder Ziffern den Code `RW-` + Kern.
+      - `parse(text: str) -> str` liest einen Code und liefert den Kern. Leerzeichen am Anfang und Ende sowie Kleinbuchstaben sind erlaubt (`" rw-ab12cd "` ergibt `"AB12CD"`). Alles, was danach nicht genau `RW-` plus sechs Zeichen aus `A–Z` und `0–9` ist, führt zu `ValueError`. Andere Exceptions sind ein Fehler.
+
+      Schreibe Eigenschaften mit `@given`, die gegen die richtige Implementierung grün sind und jede fehlerhafte Variante rot werden lassen.
+    lang: python
+    setup: |
+      from pathlib import Path
+
+      from hypothesis import Phase, settings
+
+      RICHTIG = '''
+      import re
+
+      MUSTER = re.compile(r"RW-[A-Z0-9]{6}")
+
+
+      def formatiere(kern: str) -> str:
+          return f"RW-{kern}"
+
+
+      def parse(text: str) -> str:
+          code = text.strip().upper()
+          if not MUSTER.fullmatch(code):
+              raise ValueError(f"kein Gutscheincode: {text!r}")
+          return code[3:]
+      '''
+      MUTANTEN = {
+          "lstrip": RICHTIG.replace("return code[3:]", 'return code.lstrip("RW-")'),
+          "null_statt_o": RICHTIG.replace("code = text.strip().upper()", 'code = text.strip().upper().replace("O", "0")'),
+          "match": RICHTIG.replace("MUSTER.fullmatch(code)", "MUSTER.match(code)"),
+          "vorpruefung": RICHTIG.replace(
+              "    code = text.strip().upper()\n",
+              '    code = text.strip().upper()\n    if code[2] != "-":\n        raise ValueError(f"kein Gutscheincode: {text!r}")\n',
+          ),
+      }
+      assert all(m != RICHTIG for m in MUTANTEN.values()), "Ein Mutant ist identisch mit der richtigen Version."
+      Path("gutschein.py").write_text(RICHTIG)
+      # Für die Mutanten zählt nur rot oder grün: ohne Shrinking ist die Prüfung schneller fertig. 200 statt 100 Testfälle,
+      # damit eine richtige Eigenschaft seltene Fälle (etwa Kerne, die mit R oder W beginnen) sicher trifft; das kostet nur, wenn ein Mutant überlebt.
+      settings.register_profile("mutanten", derandomize=True, deadline=None, database=None, phases=[Phase.explicit, Phase.generate], max_examples=200)
+      SCHNELL = ["-x", "--hypothesis-profile=mutanten"]
+    starter: |
+      import pytest
+      from hypothesis import given, strategies as st
+
+      from gutschein import formatiere, parse
+
+      ZEICHEN = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+
+      def test_eigenschaft():
+          ...
+    solution: |
+      import pytest
+      from hypothesis import given, strategies as st
+
+      from gutschein import formatiere, parse
+
+      ZEICHEN = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+      kerne = st.text(alphabet=ZEICHEN, min_size=6, max_size=6)
+
+
+      @given(kerne)
+      def test_round_trip(kern):
+          assert parse(formatiere(kern)) == kern
+
+
+      @given(kerne, st.sampled_from(["", " ", "  ", "\t"]), st.booleans())
+      def test_leerzeichen_und_kleinschreibung_egal(kern, rand, klein):
+          code = formatiere(kern)
+          if klein:
+              code = code.lower()
+          assert parse(rand + code + rand) == kern
+
+
+      @given(kerne, st.text(alphabet=ZEICHEN, min_size=1, max_size=3))
+      def test_zu_lange_codes_werden_abgelehnt(kern, rest):
+          with pytest.raises(ValueError):
+              parse(formatiere(kern) + rest)
+
+
+      @given(st.text(max_size=12))
+      def test_parse_wirft_hoechstens_valueerror(text):
+          try:
+              parse(text)
+          except ValueError:
+              pass
+    tests:
+      - name: Mindestens eine Eigenschaft mit @given
+        code: |
+          from hypothesis import is_hypothesis_test
+
+          eigenschaften = [n for n, f in dict(globals()).items() if n.startswith("test") and callable(f) and is_hypothesis_test(f)]
+          assert eigenschaften, "Schreibe mindestens einen Test mit @given – gesucht sind Eigenschaften, nicht nur Beispiele."
+      - name: Grün gegen die richtige Implementierung
+        code: |
+          lauf = run_pytest({"gutschein.py": RICHTIG})
+          assert lauf.ok, lauf.output
+      - name: Fängt einen Fehler beim Abschneiden des Präfixes
+        code: |
+          lauf = run_pytest({"gutschein.py": MUTANTEN["lstrip"]}, args=SCHNELL)
+          assert lauf.failed, "Deine Tests bleiben grün, obwohl die Variante bei manchen Kernen zu viele Zeichen abschneidet."
+      - name: Fängt einen Fehler bei der Normalisierung
+        code: |
+          lauf = run_pytest({"gutschein.py": MUTANTEN["null_statt_o"]}, args=SCHNELL)
+          assert lauf.failed, "Deine Tests bleiben grün, obwohl die Variante jedes O im Code durch eine Null ersetzt."
+      - name: Fängt einen Fehler beim Prüfen der Länge
+        code: |
+          lauf = run_pytest({"gutschein.py": MUTANTEN["match"]}, args=SCHNELL)
+          assert lauf.failed, "Deine Tests bleiben grün, obwohl die Variante Codes mit mehr als sechs Zeichen nach RW- annimmt."
+      - name: Fängt einen Absturz bei kaputter Eingabe
+        code: |
+          lauf = run_pytest({"gutschein.py": MUTANTEN["vorpruefung"]}, args=SCHNELL)
+          assert lauf.failed, "Deine Tests bleiben grün, obwohl die Variante bei kurzen Texten mit IndexError abstürzt."
+    hints:
+      - Der Round Trip `parse(formatiere(kern)) == kern` mit `st.text(alphabet=ZEICHEN, min_size=6, max_size=6)` deckt schon zwei Fehler ab.
+      - Für „stürzt nicht ab“ reicht `@given(st.text())` mit `try`/`except ValueError` – jede andere Exception lässt den Test scheitern.
+      - Ein zu langer Code entsteht, wenn du an einen gültigen Code noch Zeichen anhängst. Mit `pytest.raises(ValueError)` prüfst du die Ablehnung.
+    explanation: |
+      Der Round Trip findet zwei Fehler, die mit `RW-AB12CD` unsichtbar bleiben: `lstrip("RW-")` entfernt bei Kernen wie `R00000` oder `WR1234` zu viel, und das „hilfsbereite“ Ersetzen von `O` durch `0` ändert Kerne mit O. `match` statt `fullmatch` prüft nur den Anfang; das findet eine Eigenschaft, die an gültige Codes Zeichen anhängt und `ValueError` verlangt. Die Vorprüfung mit `code[2]` stürzt bei Texten unter drei Zeichen mit `IndexError` ab, und genau das deckt das Muster „stürzt nicht ab“ mit beliebigem Text auf. Vier Muster, vier Fehler – keine der Eigenschaften braucht ein vorausberechnetes Ergebnis.
+    resources:
+      - title: Hypothesis · text()
+        url: https://hypothesis.readthedocs.io/en/latest/reference/strategies.html#hypothesis.strategies.text
+      - title: pytest · pytest.raises
+        url: https://docs.pytest.org/en/stable/reference/reference.html#pytest-raises
+
+  - id: zu-enger-bereich
+    type: bug
+    title: Grün, obwohl der Deckel fehlt
+    prompt: |
+      Im letzten Release fehlte der Tageshöchstpreis: Eine Fahrt von sechs Stunden kostete 1 800 statt 1 500 Cent. Die Tarifregel lautet: 150 Cent je angefangene 30 Minuten, bis 5 Minuten kostenlos, höchstens 1 500 Cent, Fahrten bis 1 440 Minuten. Alle drei Eigenschaften unten waren grün, auch in einer Woche nächtlicher Läufe mit zufälligem Seed. Finde die Zeile, die den Fehler versteckt, und korrigiere sie.
+    lang: python
+    code: |
+      from hypothesis import given, strategies as st
+
+      from tarif import preis
+
+      DECKEL = 1500
+
+
+      @given(st.integers(min_value=0, max_value=24 * 60), st.integers(min_value=0, max_value=24 * 60))
+      def test_laenger_fahren_wird_nie_billiger(a, b):
+          kurz, lang = sorted((a, b))
+          assert preis(kurz) <= preis(lang)
+
+
+      @given(st.integers(min_value=0, max_value=240))
+      def test_preis_hoechstens_deckel(minuten):
+          assert 0 <= preis(minuten) <= DECKEL
+
+
+      @given(st.integers(min_value=0, max_value=5))
+      def test_fehlstart_kostet_nichts(minuten):
+          assert preis(minuten) == 0
+    lines: [14]
+    fix:
+      - line: 14
+        answers:
+          - "@given(st.integers(min_value=0, max_value=24 * 60))"
+          - "@given(st.integers(min_value=0, max_value=1440))"
+          - "@given(st.integers(0, 24 * 60))"
+          - "@given(st.integers(0, 1440))"
+          - "@given(st.integers(min_value=0, max_value=60 * 24))"
+          - "@given(st.integers(min_value=0, max_value=1_440))"
+          - "@given(st.integers(max_value=24 * 60, min_value=0))"
+          - "@given(minuten=st.integers(min_value=0, max_value=24 * 60))"
+          - "@given(minuten=st.integers(min_value=0, max_value=1440))"
+    explanation: |
+      Die Strategie bestimmt, was Hypothesis überhaupt prüfen kann. Bis 240 Minuten kostet eine Fahrt höchstens 1 200 Cent, der Deckel kann dort nie verletzt werden – egal wie viele Testfälle und welcher Seed. Der Bereich muss alle gültigen Eingaben abdecken, hier 0 bis 1 440 Minuten. Die Monotonie-Eigenschaft deckt den ganzen Bereich ab, fängt den fehlenden Deckel aber nicht, weil ein Preis ohne Deckel weiter steigt. Der Fehlstart-Test ist mit 0 bis 5 Minuten richtig eingegrenzt, weil die Regel nur dort gilt.
+    resources:
+      - title: Hypothesis · How should I choose a domain for my test?
+        url: https://hypothesis.readthedocs.io/en/latest/explanation/domain.html#how-should-i-choose-a-domain-for-my-test
+
+  - id: zustandsmaschine-erklaeren
+    type: explain
+    title: Ein Kalender gegen sein Modell
+    prompt: |
+      Erkläre, was dieser Test prüft, wie Hypothesis ihn ausführt und was du bei einem Fehlschlag zu sehen bekommst. Warum ist das stärker als ein paar Beispieltests für `reservieren` und `stornieren`?
+    lang: python
+    code: |
+      class KalenderMaschine(RuleBasedStateMachine):
+          def __init__(self):
+              super().__init__()
+              self.kalender = Kalender()
+              self.modell = {}  # Nummer -> (start, ende), so einfach wie möglich
+
+          @rule(start=st.integers(min_value=0, max_value=31), dauer=st.integers(min_value=1, max_value=4))
+          def reservieren(self, start, dauer):
+              ende = start + dauer
+              frei = all(ende <= s or e <= start for s, e in self.modell.values())
+              nummer = self.kalender.reservieren(start, ende)
+              assert (nummer is not None) == frei
+              if nummer is not None:
+                  self.modell[nummer] = (start, ende)
+
+          @precondition(lambda self: self.modell)
+          @rule(data=st.data())
+          def stornieren(self, data):
+              nummer = data.draw(st.sampled_from(sorted(self.modell)))
+              self.kalender.stornieren(nummer)
+              del self.modell[nummer]
+
+          @invariant()
+          def wie_das_modell(self):
+              assert self.kalender.belegt() == sorted(self.modell.values())
+
+
+      KalenderMaschine.TestCase.settings = settings(max_examples=50, stateful_step_count=20)
+      TestKalender = KalenderMaschine.TestCase
+    points:
+      - Hypothesis erzeugt Folgen von Schritten (reservieren, stornieren) mit zufälligen Argumenten, bis zu 50 Folgen mit je bis zu 20 Schritten.
+      - Ein einfaches Modell (ein Dictionary) läuft mit; jede Reservierung muss genau dann angenommen werden, wenn sie laut Modell frei ist.
+      - "`@precondition` verhindert Stornieren ohne Reservierung, die Invariante vergleicht nach jedem Schritt den ganzen Kalender mit dem Modell."
+      - Bei einem Fehler schrumpft Hypothesis die Folge auf die kürzeste, die noch scheitert, und gibt sie als kleines Programm aus.
+      - Fehler, die erst nach einer bestimmten Abfolge auftreten (etwa nach einem Storno oder mit einer Reservierung dazwischen), schreibt man von Hand selten als Beispiel.
+    explanation: |
+      Der Test beschreibt den Kalender als Zustandsautomaten mit zwei Regeln. Hypothesis wählt bei jedem Schritt eine Regel, deren Vorbedingung erfüllt ist, zieht die Argumente und führt sie aus – bis zu 20 Schritte, 50 Folgen lang. Daneben führt der Test ein Modell, das so einfach ist, dass es offensichtlich stimmt: ein Dictionary und eine Überlappungsprüfung gegen alle Einträge. Nach jeder Reservierung muss der Kalender dieselbe Entscheidung treffen wie das Modell, und die Invariante prüft nach jedem Schritt, dass beide dieselben Belegungen haben. Scheitert etwas, kürzt Hypothesis die Schrittfolge und druckt sie als Programm aus `state.reservieren(...)`-Zeilen, das du als Regressionstest übernehmen kannst. Beispieltests prüfen die Abläufe, die dir einfallen; die Maschine prüft auch „reservieren, stornieren, wieder reservieren, an der Grenze reservieren“.
+    resources:
+      - title: Hypothesis · Rule-based state machines
+        url: https://hypothesis.readthedocs.io/en/latest/stateful.html#rule-based-state-machines
+      - title: Hypothesis · invariant und precondition
+        url: https://hypothesis.readthedocs.io/en/latest/reference/api.html#hypothesis.stateful.invariant
+
+  - id: wo-pbt-lohnt
+    type: choice
+    title: Wo lohnt sich Hypothesis?
+    prompt: |
+      Radwerk plant für das nächste Quartal neue Tests an fünf Stellen. Für welche lohnt sich Property-based Testing mit Hypothesis besonders? Für die anderen gibt es eine bessere Ebene oder Technik.
+    options:
+      - text: "`tagesabrechnung(fahrten)` ordnet jede Fahrt dem Berliner Kalendertag zu, an dem sie beginnt, und deckelt je Tag."
+        correct: true
+        why: Großer Eingaberaum, schwer vorhersehbare Grenzfälle (Starts kurz vor und nach Mitternacht, die Tage der Zeitumstellung mit 23 und 25 Stunden) und klare Eigenschaften – jeder Tagesbetrag ≤ Deckel, jede Fahrt zählt zu genau einem Tag, die Summe der Tage ist nie höher als die Summe der Einzelpreise.
+      - text: Die Serialisierung von Buchungen für die App (`to_json` und `from_json`).
+        correct: true
+        why: Ein klassischer Round Trip. `from_json(to_json(b)) == b` für beliebige Buchungen findet vergessene Felder, Rundungen und Zeitzonenverluste.
+      - text: Ein neuer, schnellerer Algorithmus für freie Zeitfenster, der den alten ersetzen soll.
+        correct: true
+        why: Die alte Implementierung ist ein Orakel. Beide müssen für jede Eingabe dasselbe liefern – der stärkste Schutz für ein Refactoring.
+      - text: Der Handler `POST /buchungen`, der den Service aufruft und `201` mit `Location`-Header zurückgibt.
+        correct: false
+        why: Glue Code mit wenigen Zweigen. Zwei, drei API-Tests mit festen Beispielen für 201, 409 und 422 geben mehr Vertrauen; eine Eigenschaft würde den Handler nur nachbauen.
+      - text: Die Anbindung des SMS-Dienstes, die nach `fahrt_beendet` eine Nachricht verschickt.
+        correct: false
+        why: Hier geht es um einen Seiteneffekt an einer Systemgrenze. Ein Test mit einem Fake des Adapters und ein Vertrag mit dem Dienst passen besser; hundert Testfälle mit echtem Versand wären langsam und ohne neue Erkenntnis.
+    explanation: |
+      PBT lohnt sich, wo viele Eingaben möglich sind, wo du Eigenschaften formulieren kannst, ohne jedes Ergebnis zu kennen, und wo jeder Testfall Millisekunden kostet: Zeitrechnung, Serialisierung, Algorithmen mit Referenz. Bei Handlern und Integrationen mit Seiteneffekten sind die Fragen andere – stimmt die Verdrahtung, stimmt der Vertrag – und dafür sind Beispiele auf der passenden Ebene billiger und aussagekräftiger.
+    resources:
+      - title: Hypothesis · When to use property-based testing
+        url: https://hypothesis.readthedocs.io/en/latest/tutorial/introduction.html#when-to-use-hypothesis-and-property-based-testing
+
+  - id: freie-fenster-eigenschaften
+    type: practice
+    title: Eine Teststrategie für freie Zeitfenster
+    prompt: |
+      Radwerk zeigt in der App die freien Zeitfenster eines Rads. `freie_fenster(reservierungen, tag)` aus `fenster.py` liefert sie für einen Kalendertag als sortierte Liste von Paaren `(start, ende)` mit Zeitzone `Europe/Berlin`. Regeln:
+
+      - Ausleihbar ist zwischen 6:00 und 22:00 Uhr Ortszeit.
+      - Reservierungen sind halboffene Intervalle `[start, ende)` mit Zeitzone und können über Mitternacht reichen.
+      - Freie Fenster überlappen keine Reservierung, sind nicht leer und grenzen nicht aneinander (zwei angrenzende freie Fenster wären eines).
+
+      Schreibe in `test_fenster.py` eine Test-Suite mit Hypothesis:
+
+      1. eine Strategie für einen Tag mit bis zu sechs Reservierungen, die auch Tage mit Zeitumstellung (29. März und 25. Oktober 2026) und Reservierungen über Mitternacht erzeugt,
+      2. mindestens vier Eigenschaften nach verschiedenen Mustern,
+      3. ein `@example` für eine Reservierung von 23:00 bis 7:00 Uhr in der Nacht zum 25. Oktober,
+      4. ein Profil für einen nächtlichen Lauf.
+
+      Notiere außerdem in zwei, drei Sätzen, was du für den Endpunkt `GET /raeder/{id}/frei` *nicht* mit Hypothesis testest und auf welcher Ebene stattdessen.
+    lang: python
+    solution: |
+      # conftest.py
+      from hypothesis import settings
+
+      settings.register_profile("nightly", max_examples=2_000, derandomize=False)
+      # nachts: pytest --hypothesis-profile=nightly; in der CI gilt automatisch das Profil "ci"
+
+
+      # test_fenster.py
+      from datetime import date, datetime, time, timedelta, timezone
+      from zoneinfo import ZoneInfo
+
+      from hypothesis import example, given, strategies as st
+
+      from fenster import Reservierung, freie_fenster
+
+      BERLIN = ZoneInfo("Europe/Berlin")
+      # Die Tage der Zeitumstellung gezielt, dazu jeder andere Tag des Jahres.
+      TAGE = st.one_of(
+          st.sampled_from([date(2026, 3, 29), date(2026, 10, 25)]),
+          st.dates(min_value=date(2026, 1, 1), max_value=date(2026, 12, 31)),
+      )
+
+
+      def utc(zeitpunkt):
+          return zeitpunkt.astimezone(timezone.utc)
+
+
+      @st.composite
+      def reservierungen(draw, tag):
+          # Start relativ zu Mitternacht in UTC rechnen: Dauern bleiben echt, auch an der Zeitumstellung.
+          beginn = utc(datetime.combine(tag, time(0), BERLIN))
+          start = beginn + timedelta(minutes=draw(st.integers(min_value=-6 * 60, max_value=26 * 60)))
+          dauer = timedelta(minutes=draw(st.integers(min_value=15, max_value=10 * 60)))
+          return Reservierung(start.astimezone(BERLIN), (start + dauer).astimezone(BERLIN))
+
+
+      @st.composite
+      def tag_mit_reservierungen(draw):
+          tag = draw(TAGE)
+          return tag, draw(st.lists(reservierungen(tag), max_size=6))
+
+
+      def oeffnungszeit(tag):
+          return utc(datetime.combine(tag, time(6), BERLIN)), utc(datetime.combine(tag, time(22), BERLIN))
+
+
+      def minuten(intervalle, von, bis):
+          """Orakel: alle Minuten zwischen von und bis, die in einem der Intervalle liegen (in UTC)."""
+          ergebnis = set()
+          for s, e in intervalle:
+              s, e = max(utc(s), von), min(utc(e), bis)
+              while s < e:
+                  ergebnis.add(s)
+                  s += timedelta(minutes=1)
+          return ergebnis
+
+
+      @given(tag_mit_reservierungen())
+      def test_fenster_liegen_in_der_oeffnungszeit(fall):  # Invariante
+          tag, rs = fall
+          von, bis = oeffnungszeit(tag)
+          for s, e in freie_fenster(rs, tag):
+              assert von <= utc(s) < utc(e) <= bis
+
+
+      @given(tag_mit_reservierungen())
+      def test_kein_fenster_ueberlappt_eine_reservierung(fall):  # Invariante
+          tag, rs = fall
+          for s, e in freie_fenster(rs, tag):
+              for r in rs:
+                  assert not (utc(s) < utc(r.ende) and utc(r.start) < utc(e))
+
+
+      @example((date(2026, 10, 25), [Reservierung(datetime(2026, 10, 24, 23, 0, tzinfo=BERLIN), datetime(2026, 10, 25, 7, 0, tzinfo=BERLIN))]))
+      @given(tag_mit_reservierungen())
+      def test_frei_und_belegt_ergeben_die_oeffnungszeit(fall):  # Orakel
+          tag, rs = fall
+          von, bis = oeffnungszeit(tag)
+          frei = minuten(freie_fenster(rs, tag), von, bis)
+          belegt = minuten([(r.start, r.ende) for r in rs], von, bis)
+          assert frei.isdisjoint(belegt)
+          assert len(frei | belegt) == (bis - von) // timedelta(minutes=1)
+
+
+      @given(tag_mit_reservierungen())
+      def test_fenster_sortiert_und_getrennt(fall):  # Invariante
+          tag, rs = fall
+          fenster = freie_fenster(rs, tag)
+          for (_, ende), (start, _) in zip(fenster, fenster[1:]):
+              assert utc(ende) < utc(start)
+
+
+      @given(tag_mit_reservierungen(), st.data())
+      def test_reihenfolge_der_reservierungen_egal(fall, data):  # metamorphe Relation
+          tag, rs = fall
+          assert freie_fenster(data.draw(st.permutations(rs)), tag) == freie_fenster(rs, tag)
+
+      # Nicht mit Hypothesis: GET /raeder/{id}/frei bekommt zwei, drei API-Tests mit festen Beispielen
+      # (200 mit Fenstern, 404 für ein unbekanntes Rad, Format der Zeitstempel). Die Logik steckt in
+      # freie_fenster und ist oben abgedeckt; hundert HTTP-Aufrufe je Eigenschaft prüfen nur die Verdrahtung.
+    checklist:
+      - Die Strategie baut Reservierungen aus Start und Dauer (`@st.composite`), sodass `start < ende` ohne Filter gilt, und rechnet Dauern in UTC statt mit Uhrzeiten.
+      - Die Tage enthalten den 29. März und den 25. Oktober 2026, und Reservierungen beginnen auch am Vortag oder enden am Folgetag.
+      - Mindestens vier Eigenschaften mit verschiedenen Mustern, zum Beispiel Invariante (Öffnungszeit, keine Überlappung, sortiert), Orakel (Minutenmengen) und metamorphe Relation (Reihenfolge egal).
+      - Vergleiche zwischen Zeitpunkten laufen in UTC; gleiche Uhrzeiten in der doppelten Stunde am 25. Oktober werden nicht verwechselt.
+      - Ein `@example` hält die Reservierung über Mitternacht in die Nacht der Zeitumstellung fest.
+      - Ein Profil für nächtliche Läufe setzt `derandomize=False` und mehr `max_examples`; die CI nutzt das deterministische Profil `ci`.
+      - Der HTTP-Endpunkt bekommt wenige API-Tests mit festen Beispielen statt Eigenschaften, mit Begründung.
+    explanation: |
+      Die Musterlösung trennt Logik und Verdrahtung: Die Eigenschaften prüfen `freie_fenster` direkt, der Endpunkt bekommt wenige Beispiele auf API-Ebene. Das Orakel mit Minutenmengen ist langsam, aber offensichtlich richtig, und zusammen mit den Invarianten bleibt einer falschen Implementierung kaum Spielraum. Die Strategie zielt auf die bekannten Risiken – Mitternacht und Zeitumstellung –, ohne sich darauf zu beschränken. Alle Vergleiche laufen in UTC, weil Python Zeitpunkte mit derselben Zeitzone nach Uhrzeit vergleicht: 2:30 Uhr vor und nach der Rückstellung gelten sonst als gleich.
+    resources:
+      - title: Hypothesis · Configuring test settings
+        url: https://hypothesis.readthedocs.io/en/latest/tutorial/settings.html#changing-settings-across-your-test-suite

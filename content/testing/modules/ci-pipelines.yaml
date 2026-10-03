@@ -1,0 +1,1061 @@
+id: ci-pipelines
+title: Tests in der CI
+level: 2
+minutes: 150
+summary: Eine Pipeline, deren Rot etwas bedeutet und deren Grün schnell kommt – Jobs von schnell nach langsam, Postgres als Service, JUnit-Berichte, Playwright-Shards, ein robuster Pflicht-Check, Flaky Tests und sichere Workflows für das Radwerk-Projekt.
+goals:
+  - Du entscheidest begründet, welche Prüfung im Pull Request, in der Merge Queue und im Nachtlauf läuft.
+  - Du entwirfst eine Pipeline von schnell nach langsam mit `needs`, Matrix, `concurrency`, Timeouts und Pfadfiltern auf Job-Ebene.
+  - Du schreibst GitHub-Actions-Jobs für pytest mit Postgres-Service, JUnit-XML und Coverage-Artefakt sowie für Playwright mit Shards und zusammengeführtem Bericht.
+  - Du machst den Pflicht-Check robust gegen übersprungene Jobs und gehst mit Flaky Tests in der CI um, statt Läufe blind neu zu starten.
+  - Du sicherst Workflows ab – minimale `permissions`, keine Secrets für Fork-Code, kein `pull_request_target` mit fremdem Code, gepinnte Actions.
+resources:
+  - title: GitHub Docs · Workflow syntax
+    url: https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax
+  - title: GitHub Docs · Creating PostgreSQL service containers
+    url: https://docs.github.com/en/actions/tutorials/use-containerized-services/create-postgresql-service-containers
+  - title: Playwright · Sharding
+    url: https://playwright.dev/docs/test-sharding
+  - title: GitHub Docs · Secure use reference
+    url: https://docs.github.com/en/actions/reference/security/secure-use
+  - title: GitHub Docs · Troubleshooting required status checks
+    url: https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks
+lesson: |
+  Montag im Radwerk-Team. Die CI braucht für einen Pull Request 38 Minuten. Der Playwright-Job ist jeden fünften Lauf rot und nach „Re-run failed jobs“ grün. Inzwischen klickt jeder sofort auf Re-run – auch am Freitag, als der Job wegen eines echten Fehlers im Gutscheinformular rot war. Der Fehler ging in Produktion. Die Pipeline lief, aber ihr Signal war wertlos geworden: zu langsam, um darauf zu warten, zu unzuverlässig, um ihm zu glauben.
+
+  Die Git-Seite von GitHub Actions – Hooks, der Merge-Commit `refs/pull/<n>/merge`, flache Klone, der Trigger `merge_group` – steht in [CI/CD rund um Git](/git/ci-cd), Rechte, Artefakte und Releases allgemein in [Deployment & Continuous Integration](/automation/deployment-ci). Dieses Modul geht tiefer bei den Tests: wie eine Pipeline aussieht, deren Rot etwas bedeutet und deren Grün schnell kommt.
+
+  ## Was eine Test-Pipeline leisten muss
+
+  Eine Pipeline liefert für jeden Pull Request ein Signal: mergen oder nicht. Zwei Eigenschaften zählen. **Schnell:** Wer länger als etwa zehn Minuten wartet, wechselt die Aufgabe, und ein Rot trifft ihn mitten in etwas anderem. **Vertrauenswürdig:** Rot heißt, es gibt einen Fehler; Grün heißt, die geprüften Risiken sind abgedeckt.
+
+  Beides geht auf zwei Arten kaputt. **Falsch rot** sind Flaky Tests und wacklige Infrastruktur; nach dem dritten grundlosen Rot klickt jeder auf Re-run, irgendwann auch beim echten Fehler. **Falsch grün** ist heimtückischer: ein Schritt, der den Exit-Code verschluckt (`… | tee log` ohne `pipefail`, `|| true`, `continue-on-error: true`), ein Pflicht-Job, der übersprungen wurde, ein Testlauf, der nur die Hälfte der Tests auswählt.
+
+  Nicht jede Prüfung gehört in jeden Lauf:
+
+  | Lauf | Was | Warum dort |
+  | --- | --- | --- |
+  | Pull Request | Format, Lint, Typen, pytest gegen Postgres, Vitest, E2E-Kernabläufe in Chromium | schnell genug, um auf jeden PR zu warten; Rot blockiert den Merge |
+  | Merge Queue (`merge_group`) | dieselben Pflicht-Checks auf dem Stand nach dem Merge | `main` bleibt grün, auch wenn zwei PRs nur zusammen brechen |
+  | Push auf `main` | dieselben Jobs auf dem gemergten Stand | Grundlage für das Deployment |
+  | Nachts (`schedule`) | Firefox und WebKit, Hypothesis mit mehr Beispielen, pip-audit und `npm audit`, Mutationstests, Tests in Quarantäne | breit statt schnell; ein Rot braucht trotzdem einen Besitzer |
+
+  Die Entscheidungsregel: Eine Prüfung gehört in den PR, wenn sie schnell genug ist und ihr Rot den Merge verhindern soll. Was lange dauert und selten anschlägt, läuft nachts – aber nur, wenn jemand das Ergebnis am Morgen liest.
+
+  ```yaml title=.github/workflows/nightly.yml
+  on:
+    schedule:
+      - cron: "17 2 * * *"          # nicht zur vollen Stunde, dann ist die Last am höchsten
+        timezone: "Europe/Berlin"
+    workflow_dispatch:              # zum Nachprüfen auch von Hand
+  ```
+
+  Geplante Läufe starten auf dem neuesten Commit des Default-Branches, können sich zu Stoßzeiten verzögern, und in öffentlichen Repositories schaltet GitHub sie nach 60 Tagen ohne Aktivität ab ([schedule](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)).
+
+  ## Pipeline-Design: schnell vor langsam, fail fast, parallel
+
+  Der Workflow des Radwerk-Monorepos (`backend/` in Python, `frontend/` in TypeScript), gekürzt auf die Struktur:
+
+  ```yaml title=.github/workflows/ci.yml
+  name: CI
+  on:
+    pull_request:
+    merge_group:
+    push:
+      branches: [main]
+
+  permissions:
+    contents: read
+
+  concurrency:
+    group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+    cancel-in-progress: true
+
+  defaults:
+    run:
+      shell: bash
+
+  jobs:
+    changes:            # welche Teile hat der PR berührt? (dorny/paths-filter)
+      …
+    backend-checks:     # ruff format --check, ruff check, mypy · 1 min
+      needs: changes
+      if: needs.changes.outputs.backend == 'true'
+      …
+    backend-tests:      # pytest gegen Postgres · 4 min
+      needs: changes
+      if: needs.changes.outputs.backend == 'true'
+      …
+    frontend-checks:    # tsc, ESLint, Vitest · 3 min
+      needs: changes
+      if: needs.changes.outputs.frontend == 'true'
+      …
+    e2e:                # Playwright in 4 Shards · je 6 min
+      needs: frontend-checks
+      …
+    ci-ok:              # der einzige Pflicht-Check
+      if: always()
+      needs: [changes, backend-checks, backend-tests, frontend-checks, e2e]
+      runs-on: ubuntu-latest
+      steps:
+        - if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+          run: exit 1
+  ```
+
+  Jobs ohne `needs` laufen parallel, `needs` macht daraus einen Graphen. Fünf Entscheidungen stecken darin:
+
+  - **`needs` spart Runner-Minuten und kostet Wartezeit.** `e2e` wartet auf `frontend-checks`: Ist Vitest rot, starten die vier Shards gar nicht. Ist alles grün, kommt das E2E-Ergebnis drei Minuten später. `backend-tests` läuft dagegen parallel zu `backend-checks` – ein Runner für vier Minuten ist billig, und wer einen Typfehler behebt, will gleich wissen, ob auch die Tests stimmen. Verkette, wenn der spätere Job teuer ist und der frühere oft scheitert.
+  - **Überholte Läufe abbrechen.** Ein neuer Push auf denselben PR bricht den alten Lauf ab. `github.head_ref` gibt es nur bei `pull_request`; Läufe auf `main` und in der Merge Queue bekommen die eindeutige `run_id` als Gruppe und werden nie abgebrochen ([concurrency](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#concurrency)).
+  - **Timeouts.** Ohne `timeout-minutes` darf ein Job 360 Minuten laufen. Ein hängender Test blockiert dann sechs Stunden lang einen Runner.
+  - **Pfadfilter auf Job-Ebene.** Ein Workflow, den `paths` überspringt, meldet seine Checks nie, und ein Pflicht-Check bleibt „Pending“. Deshalb läuft `ci.yml` immer, und der Job `changes` entscheidet, welche Jobs nötig sind. Die Gefahr ist ein zu enger Filter: Ändert ein PR nur `api/openapi.yaml`, betrifft das Backend und Frontend, also steht die Datei in beiden Filtern. Auch `e2e` hängt hier am Frontend-Filter, weil es auf `frontend-checks` wartet: Ein reiner Backend-PR startet keine Browser-Tests. Radwerk nimmt das bewusst hin, weil API- und Contract-Tests die Schnittstelle im PR prüfen und der Nachtlauf ohnehin alles prüft.
+  - **Ein Gate-Job als einziger Pflicht-Check.** Ein Job, dessen `needs` gescheitert ist, wird übersprungen und blockiert den Merge dann womöglich nicht ([Handling skipped but required checks](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks#handling-skipped-but-required-checks)). `if: always()` lässt `ci-ok` trotzdem laufen, und der Schritt scheitert, sobald ein Job rot oder abgebrochen ist. Vom Pfadfilter übersprungene Jobs sind in Ordnung. Auch `changes` gehört in die `needs`-Liste: Scheitert der Filter-Job, werden alle Jobs dahinter übersprungen, und ohne ihn sähe `ci-ok` nur „skipped“ und wäre grün. In den Branch-Regeln steht nur `ci-ok` – ein fünfter Shard oder ein neuer Job ändert daran nichts.
+
+  > [!TIP] `shell: bash` gegen falsches Grün
+  > Ohne Angabe startet GitHub `run`-Schritte unter Linux mit `bash -e {0}`, mit `shell: bash` dagegen mit `bash --noprofile --norc -eo pipefail {0}` ([defaults.run.shell](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#defaultsrunshell)). Nur mit `pipefail` scheitert `uv run pytest | tee pytest.log`, wenn pytest scheitert. `defaults.run.shell: bash` setzt das für alle Schritte des Workflows.
+
+  > [!INTERVIEW] „Unsere CI braucht 40 Minuten. Was tust du?“
+  > Erst messen: Welcher Job liegt auf dem kritischen Pfad, wie lange dauert er im Median und an schlechten Tagen, wie oft wird neu gestartet? Dann der Reihe nach: überholte Läufe abbrechen, unabhängige Jobs parallelisieren, Abhängigkeiten cachen, lange Suiten nach gemessener Dauer auf Shards verteilen, breite Suiten in den Nachtlauf verschieben und Flaky Tests reparieren, denn jeder Re-run kostet die volle Laufzeit noch einmal. Was ich nicht tue: Pflicht-Checks streichen, ohne zu sagen, welches Risiko dann niemand mehr prüft.
+
+  ## Backend: pytest gegen Postgres, JUnit-Bericht und Coverage
+
+  ```yaml
+    backend-tests:
+      needs: changes
+      if: needs.changes.outputs.backend == 'true'
+      runs-on: ubuntu-latest
+      timeout-minutes: 15
+      services:
+        postgres:
+          image: postgres:18
+          env:
+            POSTGRES_USER: radwerk
+            POSTGRES_PASSWORD: radwerk
+            POSTGRES_DB: radwerk_test
+          ports:
+            - 5432:5432
+          options: >-
+            --health-cmd pg_isready
+            --health-interval 5s
+            --health-timeout 5s
+            --health-retries 10
+      env:
+        DATABASE_URL: postgresql://radwerk:radwerk@localhost:5432/radwerk_test
+      defaults:
+        run:
+          working-directory: backend
+      steps:
+        - uses: actions/checkout@v7
+          with:
+            persist-credentials: false
+        - uses: astral-sh/setup-uv@v10.2.0
+          with:
+            working-directory: backend
+        - run: uv sync --locked
+        - run: >-
+            uv run pytest -m "not quarantaene"
+            --junitxml=reports/junit.xml
+            --cov=radwerk --cov-branch --cov-report=xml:reports/coverage.xml
+        - uses: actions/upload-artifact@v7
+          if: ${{ !cancelled() }}
+          with:
+            name: backend-reports
+            path: backend/reports/
+            retention-days: 14
+  ```
+
+  - **Service-Container.** Der Runner startet `postgres:18`, bevor der erste Schritt läuft. Die Health-Check-Optionen lassen den Job warten, bis `pg_isready` Erfolg meldet. Ohne sie scheitern die ersten Tests mit „connection refused“ – und zwar nicht jedes Mal, also flaky. Weil die Schritte direkt auf dem Runner laufen, braucht es `ports` und `localhost` ([PostgreSQL service containers](https://docs.github.com/en/actions/tutorials/use-containerized-services/create-postgresql-service-containers#running-jobs-directly-on-the-runner-machine)). Warum echtes Postgres statt SQLite, zeigt [Integrationstests](/testing/integrationstests).
+  - **setup-uv.** Seit Version 8 veröffentlicht `astral-sh/setup-uv` nur noch unveränderliche Versions-Tags: `@v10` gibt es nicht, `@v10.2.0` schon ([setup-uv](https://github.com/astral-sh/setup-uv)). Auf GitHub-Runnern schaltet die Action den uv-Cache automatisch ein. `uv sync --locked` scheitert, wenn `uv.lock` nicht zu `pyproject.toml` passt, statt die Datei im Runner still zu aktualisieren.
+  - **JUnit-XML.** `--junitxml` schreibt jedes Testergebnis maschinenlesbar: Test, Dauer, Fehlermeldung. Eine Testübersicht im Lauf bekommst du über eine Reporter-Action oder einen Schritt, der nach `$GITHUB_STEP_SUMMARY` schreibt. Wichtiger ist die Statistik: Über viele Läufe gesammelt, zeigen die Berichte, welche Tests flaky sind und welche immer langsamer werden.
+  - **Berichte auch bei Rot.** `if: ${{ !cancelled() }}` lädt die Berichte hoch, wenn pytest scheitert – genau dann brauchst du sie. `always()` liefe auch nach einem Abbruch. Der Pfad lautet `backend/reports/`, denn `working-directory` gilt nur für `run`-Schritte, nicht für Actions.
+
+  ## Frontend: Vitest und Playwright mit Sharding
+
+  `frontend-checks` installiert mit `actions/setup-node@v7` und `cache: npm`. Gecacht wird der npm-Download-Cache, nicht `node_modules`; `npm ci` baut `node_modules` jedes Mal exakt nach `package-lock.json` auf. Liegt die Lockdatei im Unterordner, nennt `cache-dependency-path: frontend/package-lock.json` sie. Danach laufen `tsc --noEmit`, `eslint .` und `vitest run --reporter=default --reporter=junit --outputFile=reports/vitest.xml --coverage`.
+
+  E2E-Tests sind der teuerste Teil. Playwright empfiehlt in der CI einen Worker pro Maschine und Parallelität über Shards, also über mehrere Jobs ([Workers](https://playwright.dev/docs/ci#workers)):
+
+  ```typescript title=frontend/playwright.config.ts
+  import { defineConfig, devices } from "@playwright/test";
+
+  const ci = !!process.env.CI;
+
+  export default defineConfig({
+    testDir: "./e2e",
+    fullyParallel: true,                 // Shards verteilen einzelne Tests statt ganzer Dateien
+    forbidOnly: ci,                      // ein vergessenes test.only bricht die CI
+    retries: ci ? 2 : 0,
+    workers: ci ? 1 : undefined,
+    reporter: ci ? [["blob"], ["github"]] : "html",
+    use: {
+      baseURL: "http://localhost:4173",
+      trace: "retain-on-first-failure",  // Trace des ersten Fehlschlags, auch wenn der Retry grün wird
+    },
+    projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
+    webServer: {
+      command: "npm run preview -- --port 4173",
+      url: "http://localhost:4173",
+      reuseExistingServer: !ci,
+    },
+  });
+  ```
+
+  ```yaml
+    e2e:
+      needs: frontend-checks
+      runs-on: ubuntu-latest
+      timeout-minutes: 20
+      strategy:
+        fail-fast: false
+        matrix:
+          shard: [1, 2, 3, 4]
+      defaults:
+        run:
+          working-directory: frontend
+      steps:
+        - …                               # checkout, setup-node, npm ci wie oben
+        - run: npx playwright install --with-deps chromium
+        - run: npm run build
+        - run: npx playwright test --shard=${{ matrix.shard }}/4
+        - uses: actions/upload-artifact@v7
+          if: ${{ !cancelled() }}
+          with:
+            name: blob-report-${{ matrix.shard }}
+            path: frontend/blob-report
+            retention-days: 1
+
+    e2e-report:
+      needs: e2e
+      if: ${{ !cancelled() && needs.e2e.result != 'skipped' }}
+      runs-on: ubuntu-latest
+      defaults:
+        run:
+          working-directory: frontend
+      steps:
+        - …                               # checkout, setup-node, npm ci
+        - uses: actions/download-artifact@v8
+          with:
+            path: frontend/all-blob-reports
+            pattern: blob-report-*
+            merge-multiple: true
+        - run: npx playwright merge-reports --reporter html ./all-blob-reports
+        - uses: actions/upload-artifact@v7
+          with:
+            name: playwright-report-attempt-${{ github.run_attempt }}
+            path: frontend/playwright-report
+            retention-days: 14
+  ```
+
+  Jeder Shard schreibt einen Blob-Bericht und lädt ihn unter eigenem Namen hoch. Seit `upload-artifact` v4 sind Artefakte unveränderlich; ein zweiter Upload mit demselben Namen scheitert. `fail-fast: false` ist Pflicht, sonst bricht der erste rote Shard die anderen ab, und du siehst nur einen Teil der Fehler. `e2e-report` holt alle Blobs in ein Verzeichnis und baut daraus einen HTML-Bericht samt der Traces aller fehlgeschlagenen Erstläufe ([Merging reports](https://playwright.dev/docs/test-sharding#merging-reports-from-multiple-shards)). Den Browser-Download zu cachen lohnt laut Playwright-Doku kaum, weil das Wiederherstellen ähnlich lange dauert und die Systempakete ohnehin installiert werden müssen.
+
+  `--shard` verteilt Testdateien oder mit `fullyParallel` einzelne Tests gleichmäßig nach **Anzahl**, nicht nach Dauer. Ein Shard mit dem langen Checkout-Test bestimmt dann die Wartezeit. Für pytest verteilt das Plugin pytest-split nach gespeicherten Laufzeiten; wie das funktioniert, baust du in den Übungen selbst.
+
+  ## Pflicht-Checks, Merge Queue und Flaky Tests
+
+  Ein Pflicht-Check ist ein Check-Name, den die Branch-Regeln verlangen – bei GitHub Actions der Name des Jobs, bei einer Matrix ergänzt um die Werte, etwa `e2e (3)`. Eintragen lässt er sich in klassischer Branch Protection oder in einem Ruleset. Rulesets lassen sich schichten: Gelten mehrere für denselben Branch, greifen alle Regeln, bei Widersprüchen die strengere ([About rule layering](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/about-rulesets#about-rule-layering)). Die Merge Queue testet jeden PR zusammen mit den PRs vor ihm auf dem neuesten `main`; dafür braucht der Workflow den Trigger `merge_group`.
+
+  Mit Merge Queue werden Flaky Tests teurer: Ein grundloses Rot wirft den PR aus der Schlange, und die PRs dahinter starten neu. Deshalb gehört zum Pflicht-Check eine Regel für Flaky Tests:
+
+  1. **Messen statt raten.** Die JUnit-Berichte vieler Läufe zeigen, welcher Test mal rot, mal grün ist. Playwright markiert Tests, die erst im Retry bestehen, im Bericht als „flaky“; `failOnFlakyTests` macht daraus auf Wunsch ein Rot.
+  2. **Retries sind ein Pflaster.** `retries: 2` in Playwright oder `--reruns` mit pytest-rerunfailures machen aus Rot Grün, beheben aber nichts. Sie sind vertretbar, solange die Flaky-Markierung sichtbar bleibt und jemand sie abarbeitet. Die Trace des ersten Fehlschlags ist dafür das wichtigste Artefakt; `trace: "retain-on-first-failure"` behält sie, auch wenn der Retry grün wird ([Trace modes](https://playwright.dev/docs/test-use-options#trace-modes)).
+  3. **Quarantäne mit Frist.** Ein Test, der nachweislich flackert, bekommt einen Marker, ein Ticket und ein Datum. Im PR läuft er nicht mehr, nachts dafür wiederholt und nicht blockierend – so siehst du, ob die Reparatur hält. Das Risiko, das er abdeckt, sichert solange ein Test auf niedrigerer Ebene ab.
+
+  ```toml title=backend/pyproject.toml
+  [tool.pytest]
+  strict = true          # ein vertippter Marker ist ein Fehler, statt still falsch auszuwählen
+  markers = [
+    "quarantaene: bekannt flaky; Ticket und Frist stehen am Test",
+  ]
+  ```
+
+  `strict = true` gibt es seit pytest 9.0 und schaltet unter anderem `strict_markers` ein: Steht an einem Test `@pytest.mark.quarantane`, bricht pytest beim Sammeln ab, statt den Test mit `-m "not quarantaene"` still im Pflicht-Job laufen zu lassen ([strict](https://docs.pytest.org/en/stable/reference/reference.html#confval-strict)). Im Nachtlauf startet ein eigener Job `uv run pytest -m quarantaene --count=20` (`--count` kommt aus pytest-repeat) mit `continue-on-error: true` – nur dort, nie im Pflicht-Job. Ursachen und Reparaturmuster behandelt [Flaky Tests](/testing/flaky-tests).
+
+  > [!PRAXIS] Die Radwerk-Pipeline nach dem Umbau
+  > PR-Rückmeldung in acht Minuten statt 38: überholte Läufe werden abgebrochen, Backend und Frontend laufen parallel, E2E in vier Shards, Firefox und WebKit nachts. Pflicht ist nur `ci-ok`, gemergt wird über die Merge Queue. Ein Bot sammelt die JUnit-Berichte. Jeder Test mit mehr als 1 % Flaky-Rate in den letzten 14 Tagen landet mit Ticket in Quarantäne, und die Quarantäne-Liste steht jeden Montag im Team-Meeting auf der Tagesordnung.
+
+  ## Sicherheit: Secrets, Forks und pull_request_target
+
+  CI führt Code aus, der noch nicht reviewt ist. Daraus folgen vier Regeln.
+
+  **Minimale Rechte.** `permissions: contents: read` oben im Workflow; ein Job bekommt nur dazu, was er braucht (der Job `changes` etwa `pull-requests: read`). Sobald du eine Berechtigung angibst, stehen alle nicht genannten auf `none` ([permissions](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#permissions)).
+
+  **Tests ohne Secrets.** Bei `pull_request` aus einem Fork bekommt der Lauf außer dem `GITHUB_TOKEN` keine Secrets, und das Token darf nur lesen; PRs von Dependabot werden genauso behandelt ([Workflows in forked repositories](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflows-in-forked-repositories)). Eine Testsuite, die einen Paystream-Schlüssel braucht, ist für jeden externen PR und jedes Dependabot-Update rot. Postgres kommt deshalb als Service, Paystream als Fake.
+
+  **Kein fremder Code unter `pull_request_target`.** Dieser Trigger läuft im Kontext des Base-Repositorys: mit Secrets und einem Token mit Schreibrechten, auch für Forks. Sicher ist das nur, solange kein Code aus dem PR ausgeführt wird:
+
+  ```yaml
+  # UNSICHER – nur zur Anschauung
+  on: pull_request_target
+  jobs:
+    test:
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v7
+          with:
+            ref: ${{ github.event.pull_request.head.sha }}
+            allow-unsafe-pr-checkout: true
+        - run: npm ci && npm test
+          env:
+            PAYSTREAM_SANDBOX_KEY: ${{ secrets.PAYSTREAM_SANDBOX_KEY }}
+  ```
+
+  `npm ci` führt Install-Skripte aus der `package.json` des Angreifers aus, `npm test` seine Tests – beide mit dem Schlüssel in der Umgebung und dem schreibenden Token. GitHub nennt das Muster „pwn request“ ([Securely using pull_request_target](https://docs.github.com/en/actions/reference/security/securely-using-pull_request_target#risks-of-pull_request_target)). `actions/checkout` v7 verweigert den Checkout von Fork-Code unter diesem Trigger, bis jemand `allow-unsafe-pr-checkout: true` setzt. Für öffentliche Repositories blockiert zusätzlich eine Standard-Richtlinie von GitHub den Trigger; sie läuft derzeit im Evaluate-Modus und soll laut Doku ab dem 2. November 2026 für betroffene Repositories greifen. Tests gehören unter `pull_request`.
+
+  > [!WARNING] Ausdrücke in `run` sind Code
+  > `run: echo "${{ github.event.pull_request.title }}"` setzt den PR-Titel vor dem Start in das Skript ein. Ein Titel wie `"; curl … | sh; "` wird ausgeführt. Übergib solche Werte über `env:` und nutze die Variable im Skript. actionlint, ein Linter für Workflows, meldet diese Stellen: `"github.event.pull_request.title" is potentially untrusted`.
+
+  **Actions pinnen.** Ein Tag wie `v7` kann verschoben werden; ein vollständiger Commit-SHA ist laut GitHub die einzige unveränderliche Referenz ([Using third-party actions](https://docs.github.com/en/actions/reference/security/secure-use#using-third-party-actions)). Üblich ist der SHA mit Version als Kommentar: `uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1`. Dependabot hält solche Pins aktuell und passt den Kommentar an:
+
+  ```yaml title=.github/dependabot.yml
+  version: 2
+  updates:
+    - package-ecosystem: github-actions
+      directory: /
+      schedule:
+        interval: weekly
+    - package-ecosystem: uv
+      directory: /backend
+      schedule:
+        interval: weekly
+    - package-ecosystem: npm
+      directory: /frontend
+      schedule:
+        interval: weekly
+  ```
+
+  ## Häufige Fehler
+
+  - **`… | tee log` ohne `pipefail`.** Der Schritt ist grün, obwohl pytest scheitert. `shell: bash` setzen.
+  - **Pfadfilter mit `paths` auf einem Pflicht-Workflow.** Der Check bleibt „Pending“, der PR hängt. Filtern auf Job-Ebene.
+  - **Einzelne Jobs als Pflicht-Checks.** Ein Job, dessen `needs` rot ist, wird übersprungen und blockiert womöglich nicht. Werden aus sechs Shards vier, warten alle PRs auf `e2e (5)`, den es nie mehr gibt. Ein Gate-Job mit `if: always()`, der auf alle Jobs wartet, ist robuster.
+  - **`fail-fast` bei Shards.** Der erste rote Shard bricht die anderen ab; du reparierst Fehler in Raten.
+  - **Berichte nur bei Erfolg hochladen.** Ohne `if: ${{ !cancelled() }}` fehlen JUnit-Bericht und Traces genau dann, wenn Tests rot sind.
+  - **Gleicher Artefaktname in einer Matrix.** Der zweite Upload scheitert. Den Matrix-Wert in den Namen nehmen.
+  - **Service ohne Health-Check.** Die ersten Tests laufen gegen eine Datenbank, die noch startet: flaky.
+  - **Re-run als Routine.** Jeder Neustart kostet die volle Laufzeit und gewöhnt das Team daran, Rot zu ignorieren.
+  - **`pull_request_target` mit Checkout des PR-Codes.** Fremder Code läuft mit Secrets und Schreibrechten.
+
+  ## Zusammenfassung
+
+  - Eine Pipeline muss schnell (Rückmeldung in Minuten) und vertrauenswürdig (kein falsches Rot, kein falsches Grün) sein; beides misst du.
+  - PR: schnelle Pflicht-Checks. Merge Queue: dieselben auf dem Stand nach dem Merge. Nachts: breite, langsame Suiten mit Besitzer.
+  - `needs` spart Runner-Minuten und kostet Wartezeit; `concurrency` bricht überholte PR-Läufe ab; jeder Job hat ein Timeout.
+  - Pfadfilter gehören auf Job-Ebene, Pflicht ist ein Gate-Job mit `if: always()`, der `needs.*.result` aller Jobs prüft, auch des Filter-Jobs.
+  - Postgres läuft als Service mit Health-Check; JUnit-XML, Coverage und Traces werden mit `!cancelled()` als Artefakte gesichert.
+  - Playwright-Shards brauchen `fail-fast: false`, eigene Artefaktnamen und einen Job, der die Blob-Berichte zusammenführt.
+  - Flaky Tests: messen, Retries nur mit sichtbarer Markierung, Quarantäne mit Ticket und Frist, nie Re-run als Routine.
+  - Sicherheit: minimale `permissions`, Tests ohne Secrets, kein PR-Code unter `pull_request_target`, Actions per SHA pinnen und von Dependabot pflegen lassen.
+exercises:
+  - id: wo-laeuft-was
+    type: choice
+    title: PR, Merge Queue oder Nachtlauf?
+    prompt: |
+      Das Radwerk-Team sortiert seine Prüfungen neu. Ziel: PR-Rückmeldung unter zehn Minuten, `main` immer grün, nichts Wichtiges bleibt ungeprüft. Welche Zuordnungen sind sinnvoll?
+    options:
+      - text: "`ruff check`, `mypy` und pytest gegen den Postgres-Service laufen in jedem PR als Pflicht."
+        correct: true
+        why: Sie dauern zusammen wenige Minuten und finden die meisten Fehler. Ihr Rot soll den Merge verhindern – also gehören sie in den Pflicht-Check.
+      - text: Die Playwright-Kernabläufe laufen im PR in Chromium, Firefox und WebKit kommen nachts dazu.
+        correct: true
+        why: Browserunterschiede sind selten, die volle Matrix verdreifacht die E2E-Kosten. Nachts ist sie gut aufgehoben, solange jemand das Ergebnis morgens liest.
+      - text: pip-audit läuft nur im PR, weil sich Abhängigkeiten nur per PR ändern.
+        correct: false
+        why: Neue Advisories erscheinen ohne Codeänderung. Ein Scan nur im PR sieht sie erst beim nächsten PR; er gehört zusätzlich in den Nachtlauf.
+      - text: Mutationstests über das ganze Backend laufen in jedem PR als Pflicht-Check.
+        correct: false
+        why: Mutationstests führen die Suite pro Mutant aus und dauern ein Vielfaches der normalen Tests. Sie laufen nachts oder nur für geänderte Module, nicht als blockierender PR-Check.
+      - text: Die Merge Queue führt dieselben Pflicht-Checks aus wie der PR, auf dem Stand nach dem Merge.
+        correct: true
+        why: Genau dafür gibt es sie. Zwei PRs, die einzeln grün sind, können zusammen brechen; die Queue prüft die Kombination, bevor `main` sie bekommt.
+      - text: Tests mit dem Marker `quarantaene` laufen im PR als Pflicht-Check, damit sie niemand vergisst.
+        correct: false
+        why: Ein bekannt flaky Test im Pflicht-Check erzeugt grundloses Rot und trainiert Re-run-Klicks. Quarantäne heißt nachts, wiederholt und nicht blockierend – mit Ticket und Frist gegen das Vergessen.
+    explanation: |
+      Die Frage ist bei jeder Prüfung dieselbe: Wie lange dauert sie, wie oft findet sie etwas, und soll ihr Rot den Merge verhindern? Schnelle Prüfungen mit hoher Trefferquote gehören in den PR, die Merge Queue wiederholt sie für die Kombination. Langsame oder selten anschlagende Prüfungen laufen nachts, ebenso alles, was sich ohne Codeänderung ändert (Advisories). Ein Nachtlauf ohne jemanden, der ihn liest, ist allerdings nur ein Protokoll.
+    resources:
+      - title: GitHub Docs · Events that trigger workflows – schedule
+        url: https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule
+      - title: GitHub Docs · Managing a merge queue
+        url: https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue#about-merge-queues
+
+  - id: blob-berichte-ordnen
+    type: order
+    title: Vier Shards, ein Bericht
+    prompt: Bring die Schritte eines geshardeten Playwright-Laufs bis zum gemeinsamen HTML-Bericht in die richtige Reihenfolge.
+    lang: text
+    lines: |
+      Die Matrix startet vier Jobs mit shard 1 bis 4 und fail-fast: false
+      Jeder Job führt npx playwright test --shard=N/4 mit dem Reporter blob aus
+      Jeder Job lädt seinen Ordner blob-report als Artefakt blob-report-N hoch, auch wenn Tests rot sind
+      Der Job e2e-report startet, wenn alle Shards fertig sind (needs: e2e, if: !cancelled())
+      download-artifact holt alle Artefakte blob-report-* mit merge-multiple in ein Verzeichnis
+      npx playwright merge-reports --reporter html baut daraus einen Bericht
+      Der HTML-Bericht wird als Artefakt playwright-report-attempt-N hochgeladen
+    explanation: |
+      Jeder Shard ist ein eigener Job auf eigener Maschine; was er weitergeben will, muss als Artefakt raus, und zwar unter eindeutigem Namen und auch bei Rot. Der Bericht-Job wartet per `needs` auf alle Shards und läuft dank `!cancelled()` auch, wenn einer rot war. `merge-multiple` legt die Blob-Dateien in einen Ordner, aus dem `merge-reports` einen gemeinsamen Bericht baut – mit den Traces aller Shards. Die Laufnummer im Namen trennt den Bericht eines Re-runs vom ersten.
+    resources:
+      - title: Playwright · Merging reports from multiple shards
+        url: https://playwright.dev/docs/test-sharding#merging-reports-from-multiple-shards
+
+  - id: pipefail-vorhersagen
+    type: output
+    title: Grün trotz roter Tests?
+    prompt: |
+      Das Skript bildet zwei CI-Schritte nach. `fake-pytest.sh` meldet zwei rote Tests und endet mit Exit-Code 1. `schritt.sh` ist der Inhalt eines `run:`-Schritts. GitHub startet ihn ohne `shell:`-Angabe mit `bash -e`, mit `shell: bash` mit `bash --noprofile --norc -eo pipefail`. Was gibt das Skript aus?
+    lang: bash
+    code: |
+      printf 'echo "2 failed, 41 passed"\nexit 1\n' > fake-pytest.sh
+      printf 'bash fake-pytest.sh | tee pytest.log\necho "Schritt läuft weiter"\n' > schritt.sh
+      bash -e schritt.sh
+      echo "Standard-Shell: Exit $?"
+      bash --noprofile --norc -eo pipefail schritt.sh
+      echo "shell: bash: Exit $?"
+    expected: |
+      2 failed, 41 passed
+      Schritt läuft weiter
+      Standard-Shell: Exit 0
+      2 failed, 41 passed
+      shell: bash: Exit 1
+    verify: true
+    explanation: |
+      Der Exit-Code einer Pipeline ist ohne `pipefail` der des letzten Befehls – hier `tee`, und `tee` hat erfolgreich geschrieben. `-e` sieht also keinen Fehler, das Skript läuft weiter und endet mit 0: Der CI-Schritt wäre grün, obwohl zwei Tests rot sind. Mit `pipefail` ist der Exit-Code der Pipeline der des letzten Befehls, der scheitert; `-e` bricht sofort ab, und „Schritt läuft weiter“ erscheint nicht. In GitHub Actions bekommst du `pipefail` mit `shell: bash`, am bequemsten über `defaults.run.shell` für den ganzen Workflow.
+    resources:
+      - title: GitHub Docs · defaults.run.shell
+        url: https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#defaultsrunshell
+      - title: Bash Reference Manual · The Set Builtin (pipefail)
+        url: https://www.gnu.org/software/bash/manual/html_node/The-Set-Builtin.html
+
+  - id: shards-nach-namen
+    type: output
+    title: Gleich viele Dateien, ungleich lange Wartezeit
+    prompt: |
+      Ein naiver Shard-Plan verteilt die Testdateien nach Namen reihum auf drei Jobs. Die Dauern in Sekunden stammen aus dem letzten Lauf. Was gibt das Programm aus?
+    lang: python
+    code: |
+      dauern = {
+          "test_api.py": 40,
+          "test_buchung.py": 310,
+          "test_e2e_kasse.py": 290,
+          "test_preise.py": 12,
+          "test_tarif.py": 8,
+          "test_webhooks.py": 95,
+      }
+
+
+      def nach_namen(dateien: list[str], anzahl: int) -> list[list[str]]:
+          sortiert = sorted(dateien)
+          return [sortiert[i::anzahl] for i in range(anzahl)]
+
+
+      shards = nach_namen(list(dauern), 3)
+      for nummer, shard in enumerate(shards, start=1):
+          print(nummer, shard, sum(dauern[d] for d in shard))
+      print("Wartezeit:", max(sum(dauern[d] for d in shard) for shard in shards))
+    expected: |
+      1 ['test_api.py', 'test_preise.py'] 52
+      2 ['test_buchung.py', 'test_tarif.py'] 318
+      3 ['test_e2e_kasse.py', 'test_webhooks.py'] 385
+      Wartezeit: 385
+    explanation: |
+      `sortiert[i::3]` nimmt jede dritte Datei ab Position `i`: Shard 1 bekommt Position 0 und 3, Shard 2 Position 1 und 4, Shard 3 Position 2 und 5. Jeder Shard hat zwei Dateien, aber Shard 3 braucht 385 Sekunden, Shard 1 nur 52. Die Pipeline wartet auf den langsamsten Shard; zwei der drei Runner stehen die meiste Zeit herum. Die untere Grenze wäre hier 310 Sekunden, denn `test_buchung.py` lässt sich nicht teilen. Nach gemessener Dauer zu verteilen, holt diese Grenze – das ist die nächste Übung.
+    resources:
+      - title: Python · Common sequence operations (Slicing)
+        url: https://docs.python.org/3/builtins/stdtypes.html#common-sequence-operations
+
+  - id: postgres-service
+    type: gap
+    title: Eine echte Datenbank für die Tests
+    prompt: |
+      Ergänze den Job. Anforderungen:
+
+      - PostgreSQL 18 läuft als Service-Container und ist vom Runner aus über Port 5432 erreichbar.
+      - Der Job wartet mit den Tests, bis die Datenbank Verbindungen annimmt.
+      - Die Tests finden die Datenbank über `DATABASE_URL`; die Schritte laufen direkt auf dem Runner, nicht in einem Container.
+      - Die CI testet genau die Versionen aus `uv.lock`. Passt die Lockdatei nicht mehr zu `pyproject.toml`, bricht `uv sync` ab, statt sie im Runner still neu aufzulösen.
+      - Der Testbericht wird auch hochgeladen, wenn Tests scheitern – aber nicht, wenn der Lauf abgebrochen wurde.
+    lang: yaml
+    code: |
+      jobs:
+        backend-tests:
+          runs-on: ubuntu-latest
+          timeout-minutes: 15
+          ⟦services⟧:
+            postgres:
+              image: postgres:18
+              env:
+                POSTGRES_USER: radwerk
+                POSTGRES_PASSWORD: radwerk
+                POSTGRES_DB: radwerk_test
+              ports:
+                - ⟦5432:5432⟧
+              options: >-
+                --health-cmd ⟦pg_isready⟧
+                --health-interval 5s
+                --health-timeout 5s
+                --health-retries 10
+          env:
+            DATABASE_URL: postgresql://radwerk:radwerk@⟦localhost⟧:5432/radwerk_test
+          steps:
+            - uses: actions/checkout@v7
+            - uses: astral-sh/setup-uv@v10.2.0
+            - run: uv sync ⟦--locked⟧
+            - run: uv run pytest --junitxml=reports/junit.xml
+            - uses: actions/upload-artifact@v7
+              if: ${{ ⟦!cancelled()⟧ }}
+              with:
+                name: backend-reports
+                path: reports/
+    gaps:
+      - label: Schlüssel für Begleit-Container
+        hint: Der Schlüssel heißt wie die Container, die neben dem Job laufen.
+      - label: Portzuordnung
+        hint: Host-Port und Container-Port, durch einen Doppelpunkt getrennt.
+        accept: ["\"5432:5432\"", "'5432:5432'"]
+      - label: Health-Check
+        hint: Das Postgres-Werkzeug, das prüft, ob der Server Verbindungen annimmt.
+        accept: ["\"pg_isready -U radwerk\"", "\"pg_isready -U radwerk -d radwerk_test\""]
+      - label: Host der Datenbank
+        hint: Die Schritte laufen auf dem Runner, der Port ist dorthin weitergeleitet.
+        accept: ["127.0.0.1"]
+      - label: Lockdatei erzwingen
+        hint: Gesucht ist die Option, die abbricht, wenn `uv.lock` veraltet ist. `--frozen` prüft das nicht.
+      - label: Bedingung für den Upload
+        hint: Eine Statusfunktion, verneint.
+    explanation: |
+      `services` startet Begleit-Container, bevor der erste Schritt läuft. Weil die Schritte direkt auf dem Runner laufen, muss der Port auf den Host weitergeleitet werden (`5432:5432`), und die Tests verbinden sich mit `localhost`. Liefe der Job selbst in einem Container, wäre der Service-Name `postgres` der Host und `ports` unnötig. `--health-cmd pg_isready` lässt GitHub warten, bis der Service gesund ist; ohne Health-Check starten die Tests zu früh. `uv sync --locked` scheitert, wenn `uv.lock` nicht mehr zu `pyproject.toml` passt. `--frozen` installiert dagegen ohne Prüfung, was in der Lockdatei steht: Eine neu eingetragene Abhängigkeit fehlt dann in der CI, und die Tests prüfen einen anderen Stand als den, den der PR beschreibt. `!cancelled()` ist wahr bei Erfolg und bei Fehlschlag, aber nicht nach einem Abbruch; `always()` würde auch dann hochladen.
+    resources:
+      - title: GitHub Docs · Creating PostgreSQL service containers
+        url: https://docs.github.com/en/actions/tutorials/use-containerized-services/create-postgresql-service-containers#running-jobs-directly-on-the-runner-machine
+      - title: uv · Automatic lock and sync (--locked, --frozen)
+        url: https://docs.astral.sh/uv/concepts/projects/sync/#automatic-lock-and-sync
+      - title: GitHub Docs · Status check functions
+        url: https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#status-check-functions
+
+  - id: gate-und-concurrency
+    type: gap
+    title: Ein Pflicht-Check, der nicht lügt
+    prompt: |
+      Ergänze den Workflow:
+
+      - Ein neuer Push auf einen PR bricht dessen laufenden CI-Lauf ab. Läufe auf `main` und in der Merge Queue werden nie abgebrochen.
+      - Scheitert ein E2E-Shard, laufen die anderen Shards weiter.
+      - `ci-ok` ist der einzige Pflicht-Check. Er läuft immer, wenn die fünf Jobs fertig sind (einschließlich des Filter-Jobs `changes`), auch wenn einer davon rot ist, und scheitert, wenn einer rot oder abgebrochen ist. Vom Pfadfilter übersprungene Jobs sind in Ordnung.
+    lang: yaml
+    code: |
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.⟦head_ref⟧ || github.run_id }}
+        ⟦cancel-in-progress⟧: true
+
+      jobs:
+        e2e:
+          needs: frontend-checks
+          runs-on: ubuntu-latest
+          strategy:
+            ⟦fail-fast⟧: false
+            matrix:
+              shard: [1, 2, 3, 4]
+          steps:
+            - run: npx playwright test --shard=${{ matrix.shard }}/4
+
+        ci-ok:
+          if: ⟦always()⟧
+          ⟦needs⟧: [changes, backend-checks, backend-tests, frontend-checks, e2e]
+          runs-on: ubuntu-latest
+          steps:
+            - if: contains(needs.*.result, 'failure') || contains(needs.*.result, '⟦cancelled⟧')
+              run: exit 1
+    gaps:
+      - label: Kontextwert nur bei Pull Requests
+        hint: Der Name des PR-Branches; bei anderen Ereignissen ist er leer.
+      - label: Laufende Läufe abbrechen
+        hint: Ohne diese Option werden nur wartende Läufe ersetzt.
+      - label: Matrix nicht abbrechen
+        hint: Die Strategie-Option, deren Standardwert `true` ist.
+      - label: Bedingung für den Gate-Job
+        hint: Die Statusfunktion, die auch nach Fehlschlägen und Abbrüchen wahr ist.
+        accept: ["${{ always() }}"]
+      - label: Abhängigkeiten
+        hint: Ohne dieses Feld wüsste `ci-ok` nichts von den Ergebnissen der anderen Jobs.
+      - label: Zweites schlechtes Ergebnis
+        hint: Neben `failure` kann ein Job auch so enden.
+    explanation: |
+      `github.head_ref` ist nur bei `pull_request` gesetzt; sonst greift `github.run_id`, die für jeden Lauf eindeutig ist – Läufe auf `main` und in der Merge Queue teilen sich also nie eine Gruppe. `cancel-in-progress: true` bricht laufende Läufe derselben Gruppe ab. `fail-fast: false` lässt alle Shards zu Ende laufen. Der Gate-Job braucht `always()`, weil ein Job, dessen `needs` gescheitert ist, sonst übersprungen würde – und ein übersprungener Pflicht-Check blockiert den Merge womöglich nicht. `needs.*.result` liefert für jeden Job `success`, `failure`, `cancelled` oder `skipped`; nur `failure` und `cancelled` lassen `ci-ok` scheitern. Deshalb steht auch `changes` in der Liste: Scheitert der Filter-Job, werden alle anderen übersprungen, und `ci-ok` sähe nur `skipped`.
+    resources:
+      - title: GitHub Docs · Handling skipped but required checks
+        url: https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks#handling-skipped-but-required-checks
+      - title: GitHub Docs · needs context
+        url: https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#needs-context
+
+  - id: shard-lokal
+    type: command
+    title: Nur den roten Shard nachstellen
+    prompt: In der CI ist Shard 2 von 4 rot. Führe lokal genau die Tests dieses Shards aus.
+    context: Du bist im Ordner `frontend/` des Radwerk-Repositorys, Playwright ist installiert. Die Konfiguration ist dieselbe wie in der CI.
+    answers:
+      - npx playwright test --shard=2/4
+      - npx playwright test --shard 2/4
+      - CI=1 npx playwright test --shard=2/4
+      - CI=1 npx playwright test --shard 2/4
+      - CI=true npx playwright test --shard=2/4
+      - CI=true npx playwright test --shard 2/4
+    output: |
+      Running 2 tests using 2 workers, shard 2 of 4
+
+      [1/2] e2e/gutschein.spec.ts:2:1 › gutschein: Kernablauf
+      [2/2] e2e/gutschein.spec.ts:3:1 › gutschein: Fehlerfall
+        2 passed (330ms)
+    explanation: |
+      Die Aufteilung ist deterministisch: Mit denselben Testdateien und derselben Konfiguration landen dieselben Tests im selben Shard. Mit `CI=1` davor gelten auch lokal die CI-Werte der Konfiguration: ein Worker, zwei Retries, Blob-Bericht. Lokal grün heißt hier: Der Fehler hängt an der CI-Umgebung (langsamere Maschine, frische Datenbank, andere Zeitzone) oder ist flaky. Dann hilft die Trace aus dem HTML-Bericht der CI mehr als ein weiterer lokaler Lauf.
+    resources:
+      - title: Playwright · Sharding tests between multiple machines
+        url: https://playwright.dev/docs/test-sharding
+
+  - id: shards-nach-dauer
+    type: code
+    title: Shards nach gemessener Dauer
+    prompt: |
+      Schreibe `verteile(dateien, dauern, anzahl)`, die Testdateien auf `anzahl` Shards verteilt, sodass der langsamste Shard möglichst schnell fertig ist:
+
+      - Verteilt werden genau die Dateien aus `dateien`. Einträge in `dauern` für Dateien, die es nicht mehr gibt, ignorierst du.
+      - Eine Datei ohne Messwert bekommt als Dauer den Durchschnitt der bekannten Dauern **der Dateien aus `dateien`**; gibt es keine, 1.0.
+      - Sortiere die Dateien nach Dauer absteigend, bei gleicher Dauer nach Namen aufsteigend. Lege jede Datei in den Shard mit der bisher kleinsten Summe; bei Gleichstand in den mit dem kleinsten Index.
+      - Rückgabe: genau `anzahl` Listen, jede nach Dateinamen sortiert (leere Shards sind erlaubt).
+
+      Der Startcode verteilt reihum nach Namen – wie in der vorigen Übung.
+    lang: python
+    starter: |
+      def verteile(dateien: list[str], dauern: dict[str, float], anzahl: int) -> list[list[str]]:
+          sortiert = sorted(dateien)
+          return [sortiert[i::anzahl] for i in range(anzahl)]
+    solution: |
+      def verteile(dateien: list[str], dauern: dict[str, float], anzahl: int) -> list[list[str]]:
+          bekannt = [dauern[d] for d in dateien if d in dauern]
+          schaetzung = sum(bekannt) / len(bekannt) if bekannt else 1.0
+          dauer = {d: dauern.get(d, schaetzung) for d in dateien}
+          shards: list[list[str]] = [[] for _ in range(anzahl)]
+          summen = [0.0] * anzahl
+          for datei in sorted(dateien, key=lambda d: (-dauer[d], d)):
+              ziel = min(range(anzahl), key=lambda i: (summen[i], i))
+              shards[ziel].append(datei)
+              summen[ziel] += dauer[datei]
+          return [sorted(shard) for shard in shards]
+    setup: |
+      DAUERN = {
+          "test_api.py": 40,
+          "test_buchung.py": 310,
+          "test_e2e_kasse.py": 290,
+          "test_preise.py": 12,
+          "test_tarif.py": 8,
+          "test_webhooks.py": 95,
+      }
+    tests:
+      - name: Lange Dateien bekommen eigene Shards
+        code: |
+          ergebnis = verteile(list(DAUERN), DAUERN, 3)
+          erwartet = [["test_buchung.py"], ["test_e2e_kasse.py"], ["test_api.py", "test_preise.py", "test_tarif.py", "test_webhooks.py"]]
+          assert ergebnis == erwartet, f"bekommen {ergebnis}"
+      - name: Neue Dateien bekommen den Durchschnitt, gelöschte fallen weg
+        code: |
+          ergebnis = verteile(["a.py", "b.py", "neu.py"], {"a.py": 100, "b.py": 20, "alt.py": 500}, 2)
+          assert ergebnis == [["a.py"], ["b.py", "neu.py"]], (
+              f"neu.py sollte 60 Sekunden bekommen (Durchschnitt aus 100 und 20), alt.py gar nicht vorkommen – bekommen {ergebnis}"
+          )
+      - name: Gleichstand nach Name und Index
+        code: |
+          ergebnis = verteile(["c.py", "a.py", "b.py"], {"a.py": 10, "b.py": 10, "c.py": 10}, 2)
+          assert ergebnis == [["a.py", "c.py"], ["b.py"]], f"bekommen {ergebnis}"
+      - name: Mehr Shards als Dateien, keine Messwerte
+        code: |
+          assert verteile(["a.py"], {"a.py": 3}, 3) == [["a.py"], [], []], verteile(["a.py"], {"a.py": 3}, 3)
+          ergebnis = verteile(["y.py", "x.py"], {}, 2)
+          assert ergebnis == [["x.py"], ["y.py"]], f"ohne Messwerte zählt jede Datei 1.0 – bekommen {ergebnis}"
+    hints:
+      - "`sorted(dateien, key=lambda d: (-dauer[d], d))` sortiert nach Dauer absteigend und bei Gleichstand nach Namen."
+      - "Den Shard mit der kleinsten Summe findest du mit `min(range(anzahl), key=lambda i: (summen[i], i))`."
+    explanation: |
+      Das ist der Greedy-Algorithmus „längste zuerst“: Die großen Brocken verteilst du, solange noch Platz ist, die kleinen füllen die Lücken. Er ist nicht immer optimal, aber nah dran und in Millisekunden fertig; hier erreicht er mit 310 Sekunden die untere Grenze, weil `test_buchung.py` allein so lange dauert. pytest-split verteilt mit dem Algorithmus `least_duration` nach demselben Prinzip und schätzt neue Tests ebenfalls mit dem Durchschnitt. Die Messwerte stammen aus den JUnit-Berichten früherer Läufe; veralten sie, verliert die Verteilung ihre Balance, aber nie Tests.
+    resources:
+      - title: pytest-split · Splitting algorithms
+        url: https://github.com/jerry-git/pytest-split#splitting-algorithms
+
+  - id: junit-auswerten
+    type: code
+    title: Rot oder flaky?
+    prompt: |
+      Ein Bot sammelt die JUnit-Berichte mehrerer CI-Läufe auf demselben Commit. Schreibe `auswerten(berichte: list[str]) -> dict[str, list[str]]`:
+
+      - Jeder Bericht ist JUnit-XML, wie pytest es mit `--junitxml` schreibt (Ausschnitt unten). Die ID eines Tests ist `"<classname>::<name>"`.
+      - In einem Bericht ist ein Test **rot**, wenn sein `<testcase>` ein Kindelement `<failure>` oder `<error>` hat, **übersprungen** bei `<skipped>`, sonst **grün**.
+      - Rückgabe: `{"rot": [...], "flaky": [...]}`. `rot` enthält Tests, die mindestens einmal rot und nie grün waren, `flaky` Tests, die mindestens einmal rot und mindestens einmal grün waren. Übersprungene Läufe zählen nicht. Beide Listen sind sortiert.
+
+      ```xml
+      <?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="1" skipped="1" tests="3">
+        <testcase classname="tests.test_tarif" name="test_fehlstart_grenze" time="0.000"><failure message="assert 150 == 0">…</failure></testcase>
+        <testcase classname="tests.test_tarif" name="test_halbe_stunde" time="0.000"/>
+        <testcase classname="tests.test_tarif" name="test_tagesdeckel" time="0.000"><skipped type="pytest.skip" message="folgt in #412">…</skipped></testcase>
+      </testsuite></testsuites>
+      ```
+
+      `xml.etree.ElementTree` ist verfügbar.
+    lang: python
+    starter: |
+      import xml.etree.ElementTree as ET
+
+
+      def auswerten(berichte: list[str]) -> dict[str, list[str]]:
+          rot: list[str] = []
+          flaky: list[str] = []
+          ...
+          return {"rot": rot, "flaky": flaky}
+    solution: |
+      import xml.etree.ElementTree as ET
+
+
+      def auswerten(berichte: list[str]) -> dict[str, list[str]]:
+          gruen: set[str] = set()
+          rot: set[str] = set()
+          for bericht in berichte:
+              for fall in ET.fromstring(bericht).iter("testcase"):
+                  test_id = f"{fall.get('classname')}::{fall.get('name')}"
+                  if fall.find("failure") is not None or fall.find("error") is not None:
+                      rot.add(test_id)
+                  elif fall.find("skipped") is None:
+                      gruen.add(test_id)
+          return {"rot": sorted(rot - gruen), "flaky": sorted(rot & gruen)}
+    setup: |
+      def bericht(*faelle):
+          zeilen = []
+          for klasse, name, ergebnis in faelle:
+              if ergebnis == "ok":
+                  zeilen.append(f'<testcase classname="{klasse}" name="{name}" time="0.012"/>')
+              elif ergebnis == "skip":
+                  zeilen.append(
+                      f'<testcase classname="{klasse}" name="{name}" time="0.000">'
+                      '<skipped type="pytest.skip" message="folgt in #412">übersprungen</skipped></testcase>'
+                  )
+              else:
+                  zeilen.append(
+                      f'<testcase classname="{klasse}" name="{name}" time="0.031">'
+                      f'<{ergebnis} message="assert 150 == 0">E   assert 150 == 0</{ergebnis}></testcase>'
+                  )
+          return (
+              '<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests">'
+              f'<testsuite name="pytest" tests="{len(faelle)}">' + "".join(zeilen) + "</testsuite></testsuites>"
+          )
+
+
+      LAUF_1 = bericht(
+          ("tests.test_tarif", "test_fehlstart_grenze", "failure"),
+          ("tests.test_tarif", "test_halbe_stunde", "ok"),
+          ("tests.test_tarif", "test_tagesdeckel", "skip"),
+          ("tests.test_paystream", "test_webhook_signatur", "failure"),
+          ("tests.test_buchung", "test_reservierung_ueberlappend", "ok"),
+      )
+      LAUF_2 = bericht(
+          ("tests.test_tarif", "test_fehlstart_grenze", "failure"),
+          ("tests.test_tarif", "test_halbe_stunde", "ok"),
+          ("tests.test_tarif", "test_tagesdeckel", "skip"),
+          ("tests.test_paystream", "test_webhook_signatur", "ok"),
+          ("tests.test_buchung", "test_reservierung_ueberlappend", "error"),
+      )
+    tests:
+      - name: Ein einzelner Bericht
+        code: |
+          ergebnis = auswerten([LAUF_1])
+          erwartet = {"rot": ["tests.test_paystream::test_webhook_signatur", "tests.test_tarif::test_fehlstart_grenze"], "flaky": []}
+          assert ergebnis == erwartet, f"bekommen {ergebnis}"
+      - name: Rot und flaky über zwei Läufe
+        code: |
+          ergebnis = auswerten([LAUF_1, LAUF_2])
+          erwartet = {
+              "rot": ["tests.test_tarif::test_fehlstart_grenze"],
+              "flaky": ["tests.test_buchung::test_reservierung_ueberlappend", "tests.test_paystream::test_webhook_signatur"],
+          }
+          assert ergebnis == erwartet, f"<error> zählt wie <failure> – bekommen {ergebnis}"
+      - name: Übersprungen zählt nicht, gleiche Namen in verschiedenen Klassen
+        code: |
+          lauf = bericht(
+              ("tests.test_api", "test_status", "ok"),
+              ("tests.test_admin", "test_status", "failure"),
+              ("tests.test_tarif", "test_tagesdeckel", "skip"),
+          )
+          ergebnis = auswerten([lauf, bericht(("tests.test_tarif", "test_tagesdeckel", "failure"))])
+          erwartet = {"rot": ["tests.test_admin::test_status", "tests.test_tarif::test_tagesdeckel"], "flaky": []}
+          assert ergebnis == erwartet, f"bekommen {ergebnis}"
+      - name: Keine Berichte
+        code: |
+          ergebnis = auswerten([])
+          assert ergebnis == {"rot": [], "flaky": []}, f"bekommen {ergebnis}"
+    hints:
+      - "`ET.fromstring(text).iter(\"testcase\")` liefert alle Testfälle, egal wie tief sie stehen; `fall.find(\"failure\")` ist `None`, wenn es das Kind nicht gibt."
+      - Sammle je Test, ob er irgendwann rot und ob er irgendwann grün war. Zwei Mengen und ihre Schnitt- und Differenzmenge reichen.
+    explanation: |
+      Ein einzelner Lauf kann nur „rot“ sagen; „flaky“ entsteht erst aus mehreren Läufen auf demselben Code. Deshalb sammeln Teams JUnit-Berichte über Tage und berechnen je Test eine Flaky-Rate – die Grundlage für Quarantäne-Entscheidungen statt Bauchgefühl. `<error>` meldet pytest bei Fehlern außerhalb des Testkörpers, etwa in einer Fixture; für die Statistik ist es so rot wie `<failure>`. Die Test-ID braucht die Klasse, sonst verschmelzen gleichnamige Tests aus verschiedenen Dateien. Ruff würde `ET.fromstring` mit S314 markieren: Für XML aus fremder Quelle nimmst du `defusedxml`; Berichte aus der eigenen CI sind hier vertrauenswürdig.
+    resources:
+      - title: Python · xml.etree.ElementTree
+        url: https://docs.python.org/3/library/xml.etree.elementtree.html
+      - title: pytest · Creating JUnitXML format files
+        url: https://docs.pytest.org/en/stable/how-to/output.html#creating-junitxml-format-files
+
+  - id: artefakt-kollision
+    type: bug
+    title: Der Bericht kennt nur ein Viertel
+    prompt: |
+      Seit der Umstellung auf vier Shards enthält der zusammengeführte Playwright-Bericht nur noch die Tests eines Shards. In drei der vier Shard-Jobs scheitert der Upload-Schritt, weil es im Lauf schon ein Artefakt dieses Namens gibt. Der Job `e2e-report` holt die Blobs mit `pattern: blob-report-*`. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: yaml
+    code: |
+      e2e:
+        needs: frontend-checks
+        runs-on: ubuntu-latest
+        strategy:
+          fail-fast: false
+          matrix:
+            shard: [1, 2, 3, 4]
+        steps:
+          - uses: actions/checkout@v7
+          - uses: actions/setup-node@v7
+            with:
+              node-version: 24
+              cache: npm
+          - run: npm ci
+          - run: npx playwright install --with-deps chromium
+          - run: npx playwright test --shard=${{ matrix.shard }}/4
+          - uses: actions/upload-artifact@v7
+            if: ${{ !cancelled() }}
+            with:
+              name: blob-report
+              path: blob-report
+              retention-days: 1
+    lines: [20]
+    fix:
+      - line: 20
+        answers:
+          - "name: blob-report-${{ matrix.shard }}"
+          - "name: \"blob-report-${{ matrix.shard }}\""
+          - "name: 'blob-report-${{ matrix.shard }}'"
+          - "name: blob-report-${{ strategy.job-index }}"
+          - "name: blob-report-shard-${{ matrix.shard }}"
+    explanation: |
+      Seit `upload-artifact` v4 ist ein Artefakt unveränderlich, und sein Name muss im Lauf eindeutig sein. Alle vier Shards wollen `blob-report` anlegen; der schnellste gewinnt, die anderen scheitern (mit `overwrite: true` würde der letzte die anderen ersetzen – auch falsch). Der Matrix-Wert im Namen macht die Artefakte eindeutig, und das Muster `blob-report-*` im Bericht-Job findet alle vier. Die Zeile `path: blob-report` ist richtig: Jeder Shard läuft auf eigener Maschine und schreibt in seinen eigenen Ordner.
+    resources:
+      - title: actions/upload-artifact · (Not) Uploading to the same artifact
+        url: https://github.com/actions/upload-artifact#not-uploading-to-the-same-artifact
+
+  - id: pr-target-erklaeren
+    type: explain
+    title: Eine Vorschau für jeden PR
+    prompt: |
+      Ein Kollege hat diesen Workflow gebaut, damit auch PRs aus Forks eine Vorschau-Seite bekommen. Mit `pull_request` fehlte das Secret, deshalb hat er auf `pull_request_target` umgestellt, und als `actions/checkout` den Checkout verweigerte, `allow-unsafe-pr-checkout: true` ergänzt. Erkläre im Review, welche Risiken der Workflow hat und wie du ihn umbauen würdest.
+    lang: yaml
+    code: |
+      name: PR-Vorschau
+      on:
+        pull_request_target:
+          types: [opened, synchronize]
+
+      permissions:
+        contents: write
+        pull-requests: write
+
+      jobs:
+        vorschau:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v7
+              with:
+                ref: ${{ github.event.pull_request.head.sha }}
+                allow-unsafe-pr-checkout: true
+            - run: npm ci && npm run build
+            - run: ./scripts/vorschau-hochladen.sh "${{ github.event.pull_request.title }}"
+              env:
+                VORSCHAU_TOKEN: ${{ secrets.VORSCHAU_TOKEN }}
+    points:
+      - "`pull_request_target` läuft im Kontext des Base-Repositorys: mit Secrets und einem schreibenden `GITHUB_TOKEN`, auch für PRs aus Forks."
+      - "Der Checkout des PR-Heads plus `npm ci && npm run build` führt Code des PR-Autors aus (Install-Skripte, Build-Konfiguration, `vorschau-hochladen.sh`) – ein „pwn request“: Er kann `VORSCHAU_TOKEN` stehlen und mit `contents: write` ins Repository schreiben."
+      - "`allow-unsafe-pr-checkout: true` schaltet genau den Schutz von `actions/checkout` v7 ab, der das verhindern sollte."
+      - "Der PR-Titel wird per `${{ }}` in das Skript eingesetzt: Skript-Injection. Werte aus dem Event gehören in `env:`."
+      - "Umbau: Bauen unter `pull_request` ohne Secrets und mit `contents: read`, das Ergebnis als Artefakt; ein getrennter Workflow mit Secrets lädt nur das Artefakt hoch, führt keinen PR-Code aus und behandelt den Inhalt als nicht vertrauenswürdig."
+    explanation: |
+      Der Workflow kombiniert die drei gefährlichsten Muster. Erstens `pull_request_target`: Der Lauf hat Secrets und Schreibrechte, weil GitHub davon ausgeht, dass nur Code vom Default-Branch läuft. Zweitens bricht der Checkout des PR-Heads diese Annahme. `npm ci` führt `preinstall`- und `postinstall`-Skripte aus der `package.json` des Forks aus, der Build lädt dessen Konfiguration, und das Upload-Skript stammt ebenfalls aus dem PR – jede dieser Stellen kann `VORSCHAU_TOKEN` an einen fremden Server schicken oder mit dem Token Commits pushen. `allow-unsafe-pr-checkout: true` ist der Schalter, mit dem `actions/checkout` v7 genau davor warnt. Drittens die Skript-Injection über den Titel, die actionlint als `potentially untrusted` meldet. Der Umbau trennt Ausführen und Vertrauen: Gebaut wird unter `pull_request` ohne Secrets, hochgeladen in einem zweiten, privilegierten Workflow, der nur das fertige Artefakt anfasst. Rechte so knapp wie möglich, für Forks eventuell zusätzlich eine Freigabe per Umgebung oder Label.
+    resources:
+      - title: GitHub Docs · Securely using pull_request_target
+        url: https://docs.github.com/en/actions/reference/security/securely-using-pull_request_target#risks-of-pull_request_target
+      - title: GitHub Docs · Mitigating script injection attacks
+        url: https://docs.github.com/en/actions/reference/security/secure-use#good-practices-for-mitigating-script-injection-attacks
+
+  - id: pipeline-abwaegungen
+    type: choice
+    title: Schneller, ohne blind zu werden
+    prompt: |
+      Die Radwerk-PR-Pipeline braucht 18 Minuten. Welche Änderungen machen sie schneller oder billiger, **ohne** das Signal zu verschlechtern? Die Pipeline nutzt die Merge Queue, `ci-ok` ist der einzige Pflicht-Check.
+    options:
+      - text: "`e2e` bekommt `needs: frontend-checks`, damit die Shards nicht starten, wenn Vitest schon rot ist."
+        correct: true
+        why: Bei Rot spart das vier Runner; bei Grün kommt das E2E-Ergebnis ein paar Minuten später. Das Signal bleibt dasselbe, nur die Reihenfolge ändert sich.
+      - text: "`concurrency` mit `cancel-in-progress: true` und der Gruppe `${{ github.workflow }}-${{ github.head_ref || github.run_id }}`."
+        correct: true
+        why: Überholte PR-Läufe testen einen Stand, den niemand mehr mergen will. `main` und Merge Queue bekommen die eindeutige `run_id` und werden nicht abgebrochen.
+      - text: "`ci.yml` bekommt `on.pull_request.paths: ['frontend/**', 'backend/**']`, damit reine Doku-PRs gar keine CI starten."
+        correct: false
+        why: Ein Workflow, den ein Pfadfilter überspringt, meldet `ci-ok` nie; der Pflicht-Check bleibt „Pending“, und der Doku-PR lässt sich nicht mergen. Filtern gehört auf Job-Ebene.
+      - text: "Der E2E-Job bekommt `continue-on-error: true`, weil er der langsamste und wackligste ist."
+        correct: false
+        why: Damit ist E2E nie mehr rot, auch nicht bei echten Fehlern. Schneller wird nichts, nur das Signal verschwindet. Wacklige Tests gehören repariert oder in Quarantäne.
+      - text: Die Playwright-Browser werden mit `actions/cache` zwischengespeichert.
+        correct: false
+        why: Laut Playwright-Doku dauert das Wiederherstellen etwa so lange wie der Download, und die Systempakete müssen ohnehin installiert werden. Das Signal leidet nicht, aber die Zeit auch kaum.
+    explanation: |
+      Schneller wird eine Pipeline, wenn sie weniger überflüssige Arbeit macht (überholte Läufe abbrechen, teure Jobs nach billigen Vorprüfungen starten) oder Arbeit besser verteilt (Shards nach Dauer, parallele Jobs). Sie wird scheinbar schneller, wenn sie weniger prüft – `continue-on-error` und Workflow-Pfadfilter sparen Zeit auf Kosten des Signals oder blockieren den Merge ganz. Optimierungen, die wenig bringen, sind kein Schaden, aber Wartungsaufwand ohne Gegenwert; vor jeder Änderung steht deshalb die Messung, welcher Job auf dem kritischen Pfad liegt.
+    resources:
+      - title: GitHub Docs · Workflow syntax – concurrency
+        url: https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#concurrency
+      - title: Playwright · Caching browsers
+        url: https://playwright.dev/docs/ci#caching-browsers
+
+  - id: flaky-entscheidung
+    type: choice
+    title: Rot in 3 von 50 Läufen
+    prompt: |
+      Der E2E-Test „Gutschein im Checkout einlösen“ war in den letzten 50 PR-Läufen dreimal rot und nach dem automatischen Retry jedes Mal grün. In der Merge Queue hat er diese Woche zwei PRs herausgeworfen. Welche Schritte sind sinnvoll?
+    options:
+      - text: Den Test mit Marker, Ticket und Frist in Quarantäne nehmen; er läuft nachts wiederholt und nicht blockierend weiter.
+        correct: true
+        why: Das stoppt das grundlose Rot in PR und Queue, ohne den Test zu verlieren. Ticket und Frist sorgen dafür, dass die Quarantäne kein Friedhof wird.
+      - text: Solange er in Quarantäne ist, das Kernrisiko – Rabatt korrekt verrechnen, Preis nie unter 0 – zusätzlich mit einem API- oder Integrationstest absichern.
+        correct: true
+        why: Die Quarantäne nimmt den Test aus dem Pflicht-Check; das Risiko bleibt. Ein Test auf niedrigerer Ebene deckt die Regel deterministisch ab, der E2E-Test prüft danach nur noch den Ablauf.
+      - text: Mit der Trace des ersten Fehlschlags aus dem HTML-Bericht nach der Ursache suchen.
+        correct: true
+        why: Die Trace zeigt DOM, Netzwerk und Konsole zum Zeitpunkt des Fehlers. Ohne Ursache ist jede Reparatur geraten.
+      - text: "`retries` in der Playwright-Konfiguration global von 2 auf 5 erhöhen."
+        correct: false
+        why: Mehr Retries verstecken das Problem besser und verlängern jeden roten Lauf. Andere Tests, die bald flackern, fallen dann noch später auf.
+      - text: Den Test löschen; drei Fehlschläge in 50 Läufen zeigen, dass er nichts taugt.
+        correct: false
+        why: Der Test deckt einen Kernablauf mit Geldbezug ab. Ohne Ersatz bleibt das Risiko ungeprüft; die Flakiness sagt etwas über den Test oder die App, nicht über die Wichtigkeit des Ablaufs.
+    explanation: |
+      Eine Flaky-Rate von 6 % klingt klein, kostet aber mit Merge Queue jede Woche Merges und erzieht das Team zum Re-run-Klick. Die richtige Reaktion trennt drei Dinge: das Signal schützen (Quarantäne), das Risiko weiter abdecken (Test auf niedrigerer Ebene) und die Ursache finden (Trace, dann die Muster aus dem Modul Flaky Tests: Wartebedingungen, Testdaten, Zeit). Mehr Retries und Löschen sparen kurzfristig Ärger und verschieben die Kosten in die Produktion.
+    resources:
+      - title: Playwright · Retries
+        url: https://playwright.dev/docs/test-retries#retries
+      - title: Playwright · Trace viewer
+        url: https://playwright.dev/docs/trace-viewer-intro
+
+  - id: backend-workflow-schreiben
+    type: practice
+    title: Der Backend-Workflow von Grund auf
+    prompt: |
+      Das Radwerk-Backend liegt in einem eigenen Repository (Python 3.14, uv, `pyproject.toml` und `uv.lock` im Wurzelverzeichnis). Schreibe `.github/workflows/backend.yml`:
+
+      - Trigger: jeder Pull Request, die Merge Queue und Pushes auf `main`.
+      - Das `GITHUB_TOKEN` darf nur den Repository-Inhalt lesen.
+      - Ein neuer Push auf einen PR bricht dessen laufenden Lauf ab; `main` und Merge Queue nie.
+      - Alle `run`-Schritte laufen mit `pipefail`.
+      - Job `checks`: `ruff format --check`, `ruff check` mit Anmerkungen im PR, `mypy`.
+      - Job `tests` parallel dazu: PostgreSQL 18 als Service mit Health-Check, `DATABASE_URL` für die Tests, pytest ohne Tests in Quarantäne, JUnit-XML und Coverage-XML in `reports/`, die Berichte werden auch bei roten Tests hochgeladen und 14 Tage aufbewahrt.
+      - Jeder Job hat ein Timeout, der Checkout speichert keine Zugangsdaten, setup-uv ist auf eine unveränderliche Version gepinnt.
+    lang: yaml
+    starter: |
+      name: Backend
+
+      on:
+        # …
+
+      jobs:
+        checks:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v7
+            # …
+
+        tests:
+          runs-on: ubuntu-latest
+          steps:
+            # …
+    solution: |
+      name: Backend
+
+      on:
+        pull_request:
+        merge_group:
+        push:
+          branches: [main]
+
+      permissions:
+        contents: read
+
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+        cancel-in-progress: true
+
+      defaults:
+        run:
+          shell: bash
+
+      jobs:
+        checks:
+          runs-on: ubuntu-latest
+          timeout-minutes: 10
+          steps:
+            - uses: actions/checkout@v7
+              with:
+                persist-credentials: false
+            - uses: astral-sh/setup-uv@v10.2.0
+            - run: uv sync --locked
+            - run: uv run ruff format --check
+            - run: uv run ruff check --output-format github
+            - run: uv run mypy .
+
+        tests:
+          runs-on: ubuntu-latest
+          timeout-minutes: 15
+          services:
+            postgres:
+              image: postgres:18
+              env:
+                POSTGRES_USER: radwerk
+                POSTGRES_PASSWORD: radwerk
+                POSTGRES_DB: radwerk_test
+              ports:
+                - 5432:5432
+              options: >-
+                --health-cmd pg_isready
+                --health-interval 5s
+                --health-timeout 5s
+                --health-retries 10
+          env:
+            DATABASE_URL: postgresql://radwerk:radwerk@localhost:5432/radwerk_test
+          steps:
+            - uses: actions/checkout@v7
+              with:
+                persist-credentials: false
+            - uses: astral-sh/setup-uv@v10.2.0
+            - run: uv sync --locked
+            - run: >-
+                uv run pytest -m "not quarantaene"
+                --junitxml=reports/junit.xml
+                --cov=radwerk --cov-branch --cov-report=xml:reports/coverage.xml
+            - uses: actions/upload-artifact@v7
+              if: ${{ !cancelled() }}
+              with:
+                name: backend-reports
+                path: reports/
+                retention-days: 14
+    checklist:
+      - "Trigger `pull_request`, `merge_group` und `push` mit `branches: [main]`; ohne `merge_group` meldet die Merge Queue nie einen Check."
+      - "`permissions: contents: read` steht auf Workflow-Ebene."
+      - "`concurrency` nutzt `github.head_ref || github.run_id` und `cancel-in-progress: true`."
+      - "`defaults.run.shell: bash` sorgt für `-eo pipefail`."
+      - "`checks` und `tests` haben kein `needs` aufeinander, beide ein `timeout-minutes`."
+      - "Der Postgres-Service leitet Port `5432:5432` weiter und hat `--health-cmd pg_isready`; `DATABASE_URL` zeigt auf `localhost`."
+      - "pytest schreibt `--junitxml` und `--cov-report=xml` nach `reports/`, der Upload hat `if: ${{ !cancelled() }}` und `retention-days: 14`."
+      - "`actions/checkout` mit `persist-credentials: false`, `astral-sh/setup-uv` mit vollständiger Version wie `v10.2.0` oder einem Commit-SHA."
+      - Du hast die Datei mit actionlint geprüft (`uvx --from actionlint-py actionlint`) und kannst jede Zeile begründen.
+    explanation: |
+      Die Musterlösung ist eine von mehreren richtigen. `checks` und `tests` laufen parallel, weil beide billig sind und der Entwickler beide Signale gleichzeitig will; bei einer teuren Suite wäre `needs: checks` vertretbar. `--output-format github` lässt Ruff Anmerkungen schreiben, die GitHub im Diff des PR anzeigt. `mypy` braucht ein Ziel, entweder als Argument wie `.` oder als `files` in `[tool.mypy]`; ohne beides bricht es mit „Missing target module, package, files, or command“ ab. `uv sync --locked` verhindert, dass die CI eine veraltete Lockdatei still repariert. Der Upload mit `!cancelled()` liefert Berichte gerade dann, wenn Tests rot sind. Als Pflicht-Checks trägst du `checks` und `tests` ein – oder ergänzt einen Gate-Job wie `ci-ok`, sobald es mehr Jobs werden. actionlint prüft Syntax, Ausdrücke und bekannte Fallen wie Skript-Injection, bevor der Workflow zum ersten Mal läuft.
+    resources:
+      - title: uv · Using uv in GitHub Actions
+        url: https://docs.astral.sh/uv/guides/integration/github/
+      - title: GitHub Docs · jobs.<job_id>.services
+        url: https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#jobsjob_idservices
+      - title: actionlint
+        url: https://github.com/rhysd/actionlint

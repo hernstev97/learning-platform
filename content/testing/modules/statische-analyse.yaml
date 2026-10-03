@@ -1,0 +1,1063 @@
+id: statische-analyse
+title: Linting, Typechecking und statische Analyse
+level: 2
+minutes: 150
+summary: Welche Fehlerklasse Formatter, Linter, Typchecker, Sicherheitsscanner und Tests jeweils am billigsten finden – und wie du Ruff, mypy, tsc und ESLint so einführst, dass das Team ihren Meldungen glaubt.
+goals:
+  - Du ordnest einen Fehler der Prüfschicht zu, die ihn am frühesten und billigsten findet, und begründest, wann trotzdem ein Test nötig ist.
+  - Du konfigurierst Ruff und mypy in `pyproject.toml` (Regelauswahl, Ausnahmen pro Datei, Strenge pro Modul) und liest ihre Meldungen.
+  - Du erklärst, welche Tests ein strenger Typchecker erspart und welche nicht – mit `Any`, `cast` und Daten von außen, in Python und mit `tsc --strict`.
+  - Du setzt SAST- und Abhängigkeitsscanner (Ruff-`S`-Regeln, Semgrep, CodeQL, pip-audit, npm audit, Dependabot) gezielt ein und bewertest ihre Befunde.
+  - Du führst statische Analyse in gewachsenen Code ein – mit Baseline, Ratchet, begründeten Ausnahmen und klarer Arbeitsteilung zwischen pre-commit und CI.
+  - Du schreibst eine eigene kleine Lint-Regel mit `ast`.
+resources:
+  - title: Ruff · The Ruff Linter
+    url: https://docs.astral.sh/ruff/linter/
+  - title: mypy · Using mypy with an existing codebase
+    url: https://mypy.readthedocs.io/en/stable/existing_code.html
+  - title: typescript-eslint · Linting with Type Information
+    url: https://typescript-eslint.io/getting-started/typed-linting/
+  - title: GitHub Docs · About CodeQL code scanning
+    url: https://docs.github.com/en/code-security/concepts/code-scanning/codeql/codeql-code-scanning
+  - title: Python · ast – Abstract Syntax Trees
+    url: https://docs.python.org/3/library/ast.html
+lesson: |
+  Samstag, 0:40 Uhr. Die Nachtabrechnung von Radwerk ordnet 214 Fahrten dem falschen Kalendertag zu, der Tageshöchstpreis greift nicht, und manche Kundinnen zahlen mehr als 15 Euro für einen Tag City-Rad. Die Ursache steht in einer Zeile: `stichtag = datetime.now().date()`. Der Server läuft in UTC, dort ist es noch Freitag, 22:40 Uhr. Alle 380 Tests waren grün, denn sie liefen tagsüber auf Laptops in Berlin. Ruff hätte die Zeile mit der Regel DTZ005 markiert – im Editor, beim Speichern, ohne einen einzigen Test.
+
+  Statische Analyse prüft Code, ohne ihn auszuführen. Sie sieht jeden Pfad, kennt aber weder Werte zur Laufzeit noch Fachregeln. Dieses Modul zeigt, welche Fehlerklasse welche Prüfschicht am billigsten findet, wie du Ruff, mypy, `tsc` und ESLint einstellst und wie du sie in gewachsenen Code bringst, ohne das Team mit 4 000 Meldungen zu lähmen. Die Verdrahtung in der Pipeline folgt in [Tests in der CI](/testing/ci-pipelines).
+
+  ## Prüfschichten: welcher Fehler wo am billigsten auffällt
+
+  Jede Prüfung kostet etwas: Zeit bis zur Rückmeldung, Pflege, Fehlalarme. Und jede hat einen blinden Fleck. Die Tabelle ordnet die Schichten danach, wann sie anschlagen.
+
+  | Schicht | Rückmeldung | Findet am billigsten | Sieht nicht |
+  | --- | --- | --- | --- |
+  | Formatter (`ruff format`, Prettier) | beim Speichern | Stilfragen, Rauschen im Diff | Fehler jeder Art |
+  | Linter (Ruff, ESLint) | Sekunden | verdächtige Muster: nacktes `except:`, Funktionsaufruf als Default, `now()` ohne Zeitzone, nicht abgewartete Promises | ob die Logik stimmt |
+  | Typchecker (mypy, pyright, `tsc`) | Sekunden bis Minuten | `None`-Zugriffe, falsche oder vertauschte Argumente verschiedener Typen, Tippfehler in Attributen | Werte: `<` statt `<=`, Rundung, Daten von außen |
+  | SAST (Ruff `S`, Semgrep, CodeQL) | Sekunden bis Minuten | bekannte Sicherheitsmuster: SQL aus f-Strings, `shell=True`, Secrets im Code | Lücken in der Fachlogik, etwa fremde Buchungen lesen |
+  | Abhängigkeitsscan (pip-audit, npm audit, Dependabot) | Sekunden, auch nachts | veröffentlichte Schwachstellen in benutzten Versionen | eigenen Code, Lücken ohne Advisory |
+  | Tests | Sekunden bis Minuten | Fachregeln, Grenzwerte, Zusammenspiel von Teilen | Pfade, die kein Test betritt |
+  | Review, Monitoring | Stunden bis Tage | Absicht, Design, Verhalten in Produktion | – |
+
+  Daraus folgt die Regel dieses Moduls: **Prüfe jede Fehlerklasse in der frühesten Schicht, die sie zuverlässig findet.** Vertauschte Argumente wie `fahrtpreis(fahrt.e_bike, fahrt.minuten)` meldet mypy an jeder Aufrufstelle, auch an der, die nächste Woche jemand neu schreibt. Ein Test findet den Fehler nur dort, wo er selbst aufruft. Umgekehrt ist `if minuten < 5` statt `<= 5` für jeden Typchecker korrekt, `int` bleibt `int`. Diesen Fehler zeigt nur ein Grenzwerttest mit genau 5 Minuten.
+
+  Statische Analyse findet nie alles. Ob ein Programm eine nicht triviale Eigenschaft hat, ist im Allgemeinen nicht entscheidbar (Satz von Rice). Jedes Werkzeug nähert sich an und irrt in eine von zwei Richtungen: Es meldet Code, der in Ordnung ist, oder es übersieht echte Fehler. Eine Regel, die oft falsch alarmiert, wird ignoriert oder abgeschaltet – und findet dann auch die echten Fehler nicht mehr.
+
+  > [!MERKE]
+  > Statische Analyse sieht alle Pfade, aber keine Werte. Tests sehen Werte, aber nur ihre Pfade.
+
+  ## Linting und Formatierung mit Ruff
+
+  Ruff ist Linter und Formatter in einem Programm. Seit Version 0.16 (Juli 2026) aktiviert Ruff ohne Konfiguration 413 statt 59 Regeln, darunter Pyflakes (`F`), Bugbear (`B`), pyupgrade (`UP`), Zeitzonen (`DTZ`), pytest-Stil (`PT`) und drei Regeln aus dem Sicherheitsset `S` ([Default Rules](https://docs.astral.sh/ruff/default-rules/)). Projekte mit eigener `select`-Liste behalten ihre Auswahl. Die Funktion aus dem Einstieg:
+
+  ```python
+  import json
+  from datetime import datetime
+
+
+  def tagesumsatz(fahrten, stichtag=datetime.now().date()):
+      summe = 0
+      for fahrt in fahrten:
+          if fahrt["start"].date() == stichtag:
+              try:
+                  summe += fahrt["preis_cent"]
+              except:
+                  pass
+      return summe
+  ```
+
+  ```console
+  $ uv run ruff check --output-format concise src/radwerk/abrechnung.py
+  src/radwerk/abrechnung.py:1:8: F401 [*] `json` imported but unused
+  src/radwerk/abrechnung.py:5:35: DTZ005 `datetime.datetime.now()` called without a `tz` argument
+  src/radwerk/abrechnung.py:5:35: B008 Do not perform function call in argument defaults; instead, perform the call within the function, or read the default from a module-level singleton variable
+  src/radwerk/abrechnung.py:5:35: B008 Do not perform function call `datetime.now` in argument defaults; instead, perform the call within the function, or read the default from a module-level singleton variable
+  src/radwerk/abrechnung.py:11:13: E722 Do not use bare `except`
+  src/radwerk/abrechnung.py:11:13: S110 `try`-`except`-`pass` detected, consider logging the exception
+  Found 6 errors.
+  [*] 1 fixable with the `--fix` option.
+  ```
+
+  Nur F401 ist Kosmetik. DTZ005 ist der Abrechnungsfehler. B008 ist ein zweiter, schlimmerer: Der Default wird einmal beim Import berechnet, ein Prozess, der seit Montag läuft, rechnet für immer mit Montag. E722 und S110 zusammen heißen: Jeder Fehler beim Addieren verschwindet spurlos, auch ein Tippfehler im Schlüssel. Der Umsatz ist dann zu niedrig, und kein Log verrät es. Ein Test mit gültigen Fahrten vom selben Tag sieht keinen davon.
+
+  `[*]` markiert Befunde mit automatischer Korrektur. `ruff check --fix` wendet nur **sichere** Korrekturen an, die das Verhalten nicht ändern. **Unsichere** brauchen `--unsafe-fixes` und einen Blick in den Diff ([Fix safety](https://docs.astral.sh/ruff/linter/#fix-safety)). `ruff format` formatiert, `ruff format --check` ändert nichts und endet mit Exit-Code 1, wenn eine Datei anders aussehen müsste; seit 0.16 zeigt es dabei den Diff. Ein Formatter findet keinen einzigen Bug. Er beendet Stildiskussionen im Review und hält Diffs klein, damit die inhaltlichen Änderungen sichtbar bleiben.
+
+  > [!TIP] `extend-select` statt `select`
+  > Weitere Regeln nimmst du mit `extend-select = ["S"]` dazu. Eine eigene `select`-Liste ersetzt die Defaults vollständig – wer `select = ["S"]` schreibt, prüft danach nur noch Sicherheitsregeln.
+
+  ### Eine eigene Regel mit `ast`
+
+  Trifft euch eine Fehlerklasse immer wieder und passt keine fertige Regel, schreibst du sie selbst. Linter arbeiten auf dem abstrakten Syntaxbaum, den Python mit dem Modul [`ast`](https://docs.python.org/3/library/ast.html#ast.NodeVisitor) liefert. Ein `NodeVisitor` ruft für jeden Knotentyp die passende Methode `visit_<Typ>` auf. Diese Regel findet nackte `except:`-Blöcke:
+
+  ```python run
+  import ast
+
+  QUELLE = '''
+  def buche(fahrt, speicher):
+      try:
+          speicher.speichere(fahrt)
+      except:
+          pass
+
+
+  def storniere(fahrt, speicher):
+      try:
+          speicher.loesche(fahrt.id)
+      except KeyError:
+          return False
+      return True
+  '''
+
+
+  class NacktesExcept(ast.NodeVisitor):
+      def __init__(self) -> None:
+          self.befunde: list[int] = []
+
+      def visit_ExceptHandler(self, knoten: ast.ExceptHandler) -> None:
+          if knoten.type is None:
+              self.befunde.append(knoten.lineno)
+          self.generic_visit(knoten)
+
+
+  pruefer = NacktesExcept()
+  pruefer.visit(ast.parse(QUELLE))
+  print(pruefer.befunde)
+  print(ast.dump(ast.parse("datetime.now(tz=UTC)", mode="eval").body))
+  ```
+
+  Die letzte Zeile zeigt, wie ein Aufruf im Baum aussieht: ein `Call` mit `func` (hier ein `Attribute` auf dem Namen `datetime`), Positionsargumenten in `args` und benannten in `keywords`. Mehr braucht eine Regel für `now()` ohne Zeitzone nicht – du schreibst sie in den Übungen. Im Projekt läuft so ein Skript als eigener CI-Schritt, oder du formulierst die Regel in Semgrep (siehe unten).
+
+  ## Typechecking: graduelle Typisierung, `strict` und Löcher im Netz
+
+  Type Hints und das Lesen von mypy-Meldungen behandelt [Typisierung mit Type Hints](/python/typisierung). Hier geht es um die Rolle des Typcheckers als Prüfschicht. Ein Ausschnitt aus dem Radwerk-Backend:
+
+  ```python
+  from dataclasses import dataclass
+  from datetime import datetime
+
+
+  @dataclass
+  class Fahrt:
+      start: datetime
+      ende: datetime | None  # None, solange die Fahrt läuft
+      e_bike: bool
+
+
+  def minuten(fahrt: Fahrt) -> int:
+      return int((fahrt.ende - fahrt.start).total_seconds() // 60)
+
+
+  def tarif(fahrt):
+      return 300 if fahrt.e_bike else "150"
+  ```
+
+  ```console
+  $ uv run mypy src/radwerk/fahrten.py
+  src/radwerk/fahrten.py:13: error: Unsupported left operand type for - ("None")  [operator]
+  src/radwerk/fahrten.py:13: note: Left operand is of type "datetime | None"
+  Found 1 error in 1 file (checked 1 source file)
+  $ uv run mypy --strict src/radwerk/fahrten.py
+  src/radwerk/fahrten.py:13: error: Unsupported left operand type for - ("None")  [operator]
+  src/radwerk/fahrten.py:13: note: Left operand is of type "datetime | None"
+  src/radwerk/fahrten.py:16: error: Function is missing a type annotation  [no-untyped-def]
+  Found 2 errors in 1 file (checked 1 source file)
+  ```
+
+  Der erste Lauf findet den `None`-Fehler: Für eine laufende Fahrt stürzt `minuten` ab. Ein Test findet ihn nur, wenn jemand an laufende Fahrten gedacht hat. Den String `"150"` in `tarif` sieht mypy nicht. Die Funktion hat keine Annotationen, also gelten Parameter und Rückgabe als `Any`, und der Rumpf wird ohne Optionen gar nicht geprüft ([No errors reported for obviously wrong code](https://mypy.readthedocs.io/en/stable/common_issues.html#no-errors-reported-for-obviously-wrong-code)). Das ist graduelle Typisierung: Unannotierter Code fällt durch das Netz, und die CI ist trotzdem grün. `--strict` verlangt Annotationen – mit `-> int` an `tarif` fiele der String sofort auf –, meldet überflüssige `# type: ignore` und `Any`, das aus typisierten Funktionen zurückfließt ([Liste der Flags](https://mypy.readthedocs.io/en/stable/command_line.html#cmdoption-mypy-strict)).
+
+  Drei Löcher bleiben auch unter `strict`:
+
+  - **`Any` von außen.** `json.loads` liefert `Any`. Was daraus folgt, prüft niemand, bis es eine annotierte Variable erreicht – und dort wird geglaubt, nicht geprüft.
+  - **`cast(T, wert)`** behauptet einen Typ und prüft zur Laufzeit nichts.
+  - **`# type: ignore`** schaltet eine Zeile ab. Mit Fehlercode (`# type: ignore[arg-type]`) wenigstens nur eine Fehlerart.
+
+  Die Gegenmaßnahme ist eine **typisierte Grenze**: Daten von außen – HTTP-Requests, Paystream-Webhooks, Dateien, Umgebungsvariablen – werden an genau einer Stelle zur Laufzeit geprüft und in eigene Typen übersetzt. Dahinter stimmen die Typen, und der Checker trägt die Garantie durch den Rest des Codes.
+
+  mypy ist nicht der einzige Checker. pyright steckt in Pylance (VS Code), sein Fork basedpyright bringt eine Baseline mit. Neu sind zwei in Rust geschriebene Checker: ty von Astral (Version 0.0.x, laut PyPI Beta) und Pyrefly von Meta (seit Mai 2026 Version 1.x). Sie unterscheiden sich in Details der Inferenz, deshalb legt sich ein Projekt in der CI auf einen fest.
+
+  ### Was Typen in Tests sparen – und was nicht
+
+  Ein strenger Typchecker macht eine Gruppe von Tests überflüssig:
+
+  - Tests, die nur prüfen, dass eine Funktion ein `str` statt `int` ablehnt – sofern alle Aufrufer typisiert sind.
+  - Tests, die vergessene `None`-Fälle aufspüren sollen. Der Checker zwingt jede Aufrufstelle, `None` zu behandeln; ob die Behandlung fachlich stimmt, zeigt weiterhin ein Test.
+  - Ein Teil der Absicherung beim Umbenennen: Ein umbenanntes Feld meldet der Checker an jeder Stelle, die es noch benutzt.
+
+  Nicht ersetzen kann er Tests für Werte und Grenzen (`<` statt `<=`), für Fachregeln (Tageshöchstpreis je Kalendertag in `Europe/Berlin`), für Daten von außen, für das Zusammenspiel mit Datenbank und Netz und für Nebenläufigkeit.
+
+  > [!INTERVIEW] „Wir haben mypy im strict-Modus – brauchen wir noch Unit-Tests?“
+  > Ja, aber andere. Der Typchecker zeigt, dass Werte überall die richtige Form haben, an allen Aufrufstellen gleichzeitig. Ob ein Wert stimmt, sagt er nicht: `minuten < 5` statt `<= 5` ist typkorrekt. Ich streiche Tests, die nur Typen prüfen, und stecke die Zeit in Grenzwerte und Fachregeln. Daten von außen validiere ich an der Grenze und teste den Parser mit echten Beispielnachrichten.
+
+  ## TypeScript: tsc --strict und ESLint mit typescript-eslint
+
+  In TypeScript ist der Compiler der Typchecker. Seit TypeScript 6.0 ist `strict` standardmäßig eingeschaltet ([Release Notes 6.0](https://www.typescriptlang.org/docs/handbook/release-notes/typescript-6-0.html#simple-default-changes)); ältere Projekte setzen es in `tsconfig.json` ausdrücklich. `strict` bündelt unter anderem `strictNullChecks` und `noImplicitAny`. Nicht dazu gehört [`noUncheckedIndexedAccess`](https://www.typescriptlang.org/tsconfig/#noUncheckedIndexedAccess): Erst damit hat ein Zugriff auf ein `Record<string, number>` den Typ `number | undefined`.
+
+  ```typescript
+  type Station = { id: string; name: string };
+
+  const stationen: Station[] = [
+    { id: "ms-hbf", name: "Hauptbahnhof" },
+    { id: "ms-aasee", name: "Aasee" },
+  ];
+
+  export function stationsname(id: string): string {
+    const station = stationen.find((s) => s.id === id);
+    return station.name;
+  }
+
+  const preisJeTyp: Record<string, number> = { city: 150, "e-bike": 300 };
+
+  export function grundpreis(typ: string): number {
+    return preisJeTyp[typ] * 2;
+  }
+  ```
+
+  `npx tsc --noEmit` meldet für Zeile 10 `error TS18048: 'station' is possibly 'undefined'.` (das ist `strictNullChecks`) und für Zeile 16 `error TS2532: Object is possibly 'undefined'.` – Letzteres nur mit `noUncheckedIndexedAccess`. Ohne die Option wäre `grundpreis("lastenrad")` typkorrekt und lieferte `NaN`. Die Löcher entsprechen denen in Python: `any` (etwa aus `JSON.parse`) schaltet die Prüfung ab, `as Typ` behauptet, statt zu prüfen.
+
+  ESLint findet Muster, die der Compiler erlaubt. Seit ESLint 10 gibt es nur noch die Flat Config (`eslint.config.js`, `.mjs` oder `.ts`). Mit typescript-eslint und `projectService` bekommen Regeln Zugriff auf die Typinformation des Compilers ([Typed Linting](https://typescript-eslint.io/getting-started/typed-linting/)):
+
+  ```javascript title=eslint.config.mjs
+  import js from "@eslint/js";
+  import { defineConfig } from "eslint/config";
+  import tseslint from "typescript-eslint";
+
+  export default defineConfig(
+    { ignores: ["dist/", "playwright-report/"] },
+    {
+      files: ["**/*.{ts,tsx}"],
+      extends: [js.configs.recommended, tseslint.configs.recommendedTypeChecked],
+      languageOptions: {
+        parserOptions: { projectService: true, tsconfigRootDir: import.meta.dirname },
+      },
+    },
+  );
+  ```
+
+  In der Buchungsfunktion des Frontends fehlt vor `speicher.speichere(b);` ein `await`. Für den Compiler ist das erlaubt, ein Promise darf man liegen lassen. Die Regel `no-floating-promises` braucht Typinformation, um zu wissen, dass `speichere` ein Promise liefert:
+
+  ```console
+  $ npx eslint src
+  /tmp/radwerk-web/src/buchung.ts
+    12:3  error  Promises must be awaited, end with a call to .catch, end with a call to .then with a rejection handler or be explicitly marked as ignored with the `void` operator  @typescript-eslint/no-floating-promises
+
+  ✖ 1 problem (1 error, 0 warnings)
+  ```
+
+  Ein Unit-Test mit einem Fake-Speicher, der sofort erfolgreich auflöst, bleibt grün. In Produktion geht die Bestätigungsmail raus, auch wenn das Speichern scheitert, und der Fehler landet als unbehandelte Ablehnung im Log.
+
+  > [!NOTE] TypeScript 7 und das Linting
+  > TypeScript 7.0 (Juli 2026) ist der in Go neu geschriebene Compiler, laut Ankündigung bei vollen Builds 8- bis 12-mal schneller ([Announcing TypeScript 7.0](https://devblogs.microsoft.com/typescript/announcing-typescript-7-0/)). Eine programmatische API bringt er noch nicht mit, und typescript-eslint 8.71 unterstützt nur TypeScript `>=4.8.4 <6.1.0`. Teams nutzen deshalb TypeScript 7 für `tsc` und halten für das Linting TypeScript 6 parallel; Microsoft stellt dafür das Paket `@typescript/typescript6` bereit.
+
+  ## Sicherheitsanalyse: SAST und verwundbare Abhängigkeiten
+
+  SAST (Static Application Security Testing) sucht im eigenen Code nach Mustern, die zu Sicherheitslücken führen. Die Werkzeuge unterscheiden sich darin, wie weit sie sehen:
+
+  - **Muster in einer Datei.** Ruffs `S`-Regeln sind eine Neuimplementierung von Bandit. Schnell, aber ohne Wissen, woher ein Wert kommt.
+  - **Semgrep.** Regeln sehen aus wie der Code, den sie suchen, für viele Sprachen. Eigene Regeln schreibst du in YAML, etwa „kein `requests.get` ohne `timeout`“ ([Semgrep Docs](https://docs.semgrep.dev/)).
+  - **CodeQL.** Übersetzt den Code in eine Datenbank und verfolgt Datenflüsse über Funktionsgrenzen, etwa von einem HTTP-Parameter (Quelle) bis zu `cursor.execute` (Senke). Auf GitHub läuft es als Code Scanning ([About CodeQL](https://docs.github.com/en/code-security/concepts/code-scanning/codeql/codeql-code-scanning)).
+
+  ```python
+  import sqlite3
+  import subprocess
+
+
+  def fahrten_von(conn: sqlite3.Connection, kunde_id: str) -> list[tuple[object, ...]]:
+      sql = f"SELECT id, minuten FROM fahrten WHERE kunde_id = '{kunde_id}'"
+      return conn.execute(sql).fetchall()
+
+
+  def beleg_drucken(datei: str) -> None:
+      subprocess.run(f"lp {datei}", shell=True, check=True)
+
+
+  PAYSTREAM_SECRET = "sk_live_51HxR4nW"
+  ```
+
+  ```console
+  $ uv run ruff check --extend-select S --output-format concise src/radwerk/repo.py
+  src/radwerk/repo.py:6:11: S608 Possible SQL injection vector through string-based query construction
+  src/radwerk/repo.py:11:5: S602 `subprocess` call with `shell=True` identified, security issue
+  src/radwerk/repo.py:14:20: S105 Possible hardcoded password assigned to: "PAYSTREAM_SECRET"
+  Found 3 errors.
+  ```
+
+  Alle drei Befunde sind echt. S608 behebst du mit einem Parameter statt des f-Strings (`conn.execute("… WHERE kunde_id = ?", (kunde_id,))`), S602 mit einer Argumentliste ohne Shell, S105 mit einem Secret aus der Umgebung. Wie heuristisch die Regeln sind, zeigt S105: Hieße die Konstante `PAYSTREAM_KEY`, bliebe Ruff still, denn die Regel rät anhand des Variablennamens. „Keine Befunde“ heißt also nicht „sicher“. Jeder Befund verlangt eine Entscheidung: beheben, wenn er echt ist; mit Begründung unterdrücken, wenn nicht.
+
+  Ein großer Teil des Codes, den Radwerk ausliefert, stammt aus Abhängigkeiten. [pip-audit](https://github.com/pypa/pip-audit) gleicht Python-Pakete mit Datenbanken veröffentlichter Schwachstellen ab, `npm audit` fragt die npm-Registry nach bekannten Lücken in den JavaScript-Paketen. `uvx pip-audit -r requirements.txt` listet etwa für `requests 2.31.0` Advisories samt der Versionen, die sie beheben (2.32.0, 2.32.4, 2.33.0), und endet mit Exit-Code 1 – der CI-Schritt wird rot.
+
+  Eine neue Schwachstelle taucht auf, ohne dass sich euer Code ändert. Ein Scan nur im Pull Request sieht sie erst beim nächsten PR. Abhängigkeitsscans laufen deshalb zusätzlich nachts, und [Dependabot](https://docs.github.com/en/code-security/concepts/supply-chain-security/dependabot-alerts) meldet betroffene Abhängigkeiten und öffnet Update-PRs. Mit diesen PRs fängt die Arbeit an: Ohne eine schnelle, verlässliche Testsuite merged sie niemand mit gutem Gefühl, und die Lücke bleibt offen.
+
+  ## Statische Analyse in gewachsenen Code einführen
+
+  Ruff mit `extend-select = ["S"]` und `mypy --strict` auf einer acht Jahre alten Codebasis: 4 000 Meldungen. Wer die CI jetzt darauf verpflichtet, blockiert jeden PR. Wer die Meldungen nur als Warnung ausgibt, gewöhnt das Team ans Wegsehen. Der Weg dazwischen hat vier Teile.
+
+  1. **Formatter zuerst, in einem eigenen Commit.** Seinen Hash trägst du in `.git-blame-ignore-revs` ein, damit `git blame` an ihm vorbeischaut (`--ignore-revs-file` bzw. `blame.ignoreRevsFile`).
+  2. **Baseline einfrieren.** Bestehende Befunde werden markiert, neue lassen die CI scheitern. `ruff check --add-noqa` schreibt an jede betroffene Zeile ein `# noqa: CODE`. basedpyright speichert mit `--writebaseline` eine Datei `.basedpyright/baseline.json`. In mypy nimmst du Module per Override aus.
+  3. **Ratchet: Die Zahl darf nur sinken.** basedpyright verkleinert seine Baseline automatisch, wenn Fehler verschwinden. Für andere Werkzeuge zählt ein kleines Skript in der CI die Befunde je Datei und vergleicht mit der gespeicherten Baseline: mehr als erlaubt heißt rot, weniger heißt, die Baseline wird verschärft.
+  4. **Ausnahmen mit Begründung.** `per-file-ignores` für ganze Bereiche, in denen eine Regel fachlich nicht passt – `assert` in Tests ist das Prüfwerkzeug von pytest. Einzelne Zeilen mit Code und Grund: `# noqa: S608  # Spaltenname aus fester Zuordnung, kein Nutzereingang`. Die Regel RUF100 (in den Defaults) meldet Unterdrückungen, die nichts mehr unterdrücken.
+
+  ```toml title=pyproject.toml
+  [tool.ruff.lint]
+  extend-select = ["S"]
+
+  [tool.ruff.lint.per-file-ignores]
+  "tests/**" = ["S101"]                # assert ist in pytest das Prüfwerkzeug
+
+  [tool.mypy]
+  files = ["src"]
+  check_untyped_defs = true            # auch Rümpfe ohne Annotationen prüfen
+  warn_unused_ignores = true
+
+  [[tool.mypy.overrides]]              # neue und überarbeitete Module: streng
+  module = ["radwerk.tarif.*", "radwerk.buchung.*"]
+  disallow_untyped_defs = true
+  disallow_any_generics = true
+  warn_return_any = true
+  ```
+
+  Die Liste unter `module` wächst mit jedem überarbeiteten Paket, bis `strict = true` global gilt. Die umgekehrte Richtung – `strict` global, Altlasten mit `ignore_errors = true` ausnehmen – beschreibt die [mypy-Doku](https://mypy.readthedocs.io/en/stable/existing_code.html#ignoring-errors-from-certain-modules). Beide Wege funktionieren, solange die Ausnahmeliste nur schrumpft.
+
+  ### pre-commit oder CI
+
+  [pre-commit](https://pre-commit.com/#usage) installiert Git-Hooks, die vor jedem Commit laufen, und pinnt die Versionen der Werkzeuge:
+
+  ```yaml title=.pre-commit-config.yaml
+  repos:
+    - repo: https://github.com/astral-sh/ruff-pre-commit
+      rev: v0.16.10
+      hooks:
+        - id: ruff-check
+          args: [--fix]
+        - id: ruff-format
+  ```
+
+  Lokal laufen nur Werkzeuge, die in unter einer Sekunde fertig sind und jede Datei für sich prüfen können: Formatter und Linter. pre-commit übergibt nur die geänderten Dateien. Für einen Typchecker ist das zu wenig, denn ein Typfehler entsteht oft in der Datei, die eine geänderte Funktion aufruft. Dazu läuft der mypy-Hook in einer eigenen Umgebung ohne die Abhängigkeiten des Projekts. Typchecker, SAST und Abhängigkeitsscan gehören deshalb in die CI, als Pflicht-Check. Weil Hooks per `--no-verify` übersprungen werden (siehe [CI/CD rund um Git](/git/ci-cd)), wiederholt die CI auch Formatter und Linter. Die Versionen müssen übereinstimmen: `rev: v0.16.10` im Hook und `ruff==0.16.10` in den Dev-Abhängigkeiten, sonst meldet die CI, was lokal grün war.
+
+  > [!PRAXIS] So arbeitet das Radwerk-Team
+  > Lokal: pre-commit mit `ruff-check --fix` und `ruff-format`, zusammen unter einer Sekunde. In jedem PR: `ruff format --check`, `ruff check --output-format github` (Befunde erscheinen als Anmerkungen im Diff), `mypy`, danach die Tests. Nachts: pip-audit und `npm audit` gegen den aktuellen Stand von `main`. Neue Regeln kommen per PR mit Baseline; wer eine Datei anfasst, baut ihre `noqa`-Kommentare ab. Ein Update von Ruff ist ein eigener PR, denn eine neue Version kann neue Regeln mitbringen.
+
+  ## Häufige Fehler
+
+  - **`select` statt `extend-select`.** Die Defaults sind weg, und niemand merkt es, weil die CI grün ist.
+  - **Alle Regeln auf einmal** (`select = ["ALL"]`) in gewachsenem Code. Tausende Meldungen, und das Werkzeug wird abgeschaltet.
+  - **Pauschales `# noqa` oder `# type: ignore` ohne Code.** Es verschluckt auch jeden künftigen Fehler in derselben Zeile. Immer mit Code, bei Zweifeln mit Begründung.
+  - **mypy grün, weil nichts annotiert ist.** Ohne `check_untyped_defs` oder `strict` bleiben unannotierte Funktionen ungeprüft.
+  - **`cast` und `as` für Daten von außen.** Sie behaupten, statt zu prüfen. Validiere an der Grenze.
+  - **Werkzeugversionen nicht gepinnt.** Eine neue Ruff-Version mit hunderten neuen Default-Regeln macht über Nacht jeden PR rot – oder, schlimmer, die lokale und die CI-Version melden Verschiedenes.
+  - **„Keine SAST-Befunde“ als Sicherheitsnachweis.** Heuristiken übersehen echte Lücken. Autorisierung (fremde Buchungen lesen) findet kein Muster-Scanner; dafür braucht es Tests.
+  - **Abhängigkeitsscan nur im PR.** Neue Schwachstellen erscheinen ohne Codeänderung; der Scan gehört auch in einen Nachtlauf.
+
+  ## Zusammenfassung
+
+  - Jede Fehlerklasse gehört in die früheste Schicht, die sie zuverlässig findet: Formatter, Linter, Typchecker, SAST, Abhängigkeitsscan, Tests, Review.
+  - Statische Analyse sieht alle Pfade, aber keine Werte; Grenzwerte und Fachregeln brauchen Tests.
+  - Ruff 0.16 prüft ohne Konfiguration 413 Regeln; `extend-select` ergänzt, `select` ersetzt. `--fix` wendet nur sichere Korrekturen an.
+  - mypy prüft unannotierte Funktionen nicht; `strict` schließt die Lücke, `Any`, `cast` und `# type: ignore` bleiben Löcher. Daten von außen prüfst du an einer typisierten Grenze.
+  - `tsc --strict` ist seit TypeScript 6.0 Standard; `noUncheckedIndexedAccess` kommt dazu. typescript-eslint findet mit Typinformation Fehler wie vergessene `await`.
+  - SAST arbeitet mit Mustern (Ruff `S`, Semgrep) oder Datenflüssen (CodeQL); Abhängigkeitsscans laufen auch nachts.
+  - In gewachsenem Code: Formatter-Commit, Baseline, Ratchet, Ausnahmen nur mit Code und Begründung.
+  - pre-commit gibt schnelles Feedback, die CI setzt durch – mit denselben Werkzeugversionen.
+exercises:
+  - id: schicht-waehlen
+    type: choice
+    title: Wer findet es am billigsten?
+    prompt: |
+      Im Radwerk-Backend laufen Ruff (Defaults plus `S`), `mypy --strict` und pytest. Bei welchen dieser Fehler ist ein **Test** die billigste Prüfung, die den Fehler zuverlässig findet – weil Linter und Typchecker ihn nicht sehen? Regeln: Fahrten bis einschließlich 5 Minuten kosten 0 Cent, der Tageshöchstpreis gilt je Kalendertag in `Europe/Berlin`.
+    options:
+      - text: "`if minuten < 5:` statt `if minuten <= 5:` in der Fehlstart-Regel"
+        correct: true
+        why: Beide Varianten sind typkorrekt und folgen keinem verdächtigen Muster. Nur ein Grenzwerttest mit genau 5 Minuten zeigt den Unterschied.
+      - text: "`fahrtpreis(fahrt.e_bike, fahrt.minuten)` bei der Signatur `fahrtpreis(minuten: int, e_bike: bool)`"
+        correct: false
+        why: mypy meldet `arg-type` für das zweite Argument, an jeder Aufrufstelle und ohne Test. Ein Test fände den Fehler nur an den Stellen, die er aufruft.
+      - text: "`datetime.now()` ohne Zeitzone in der Abrechnung"
+        correct: false
+        why: Ruff meldet das mit DTZ005 schon in den Defaults. Ein Test fände es nur, wenn er zufällig um Mitternacht läuft oder die Uhr steuert.
+      - text: Der Tageshöchstpreis wird je Kalendertag in UTC gedeckelt, weil jemand `ZoneInfo("UTC")` statt `ZoneInfo("Europe/Berlin")` übergibt.
+        correct: true
+        why: Für Ruff ist die Zeile in Ordnung – es wird eine Zeitzone übergeben, nur die falsche. Welche Zeitzone fachlich richtig ist, weiß nur ein Test mit einer Fahrt kurz nach Mitternacht.
+      - text: Eine SQL-Abfrage wird per f-String aus der Kunden-ID zusammengesetzt.
+        correct: false
+        why: Ruff meldet S608, sobald `S` aktiv ist. Der Linter findet das Muster billiger als jeder Test, der eine bösartige Eingabe konstruieren müsste.
+      - text: Der Paystream-Webhook liefert `betrag_cent` als String, der Code nutzt `cast` und rechnet weiter.
+        correct: true
+        why: Typen sehen keine Daten von außen, `cast` prüft nichts. Den Fehler zeigt ein Test des Parsers mit einer echten Beispielnachricht – oder ein Contract Test.
+    explanation: |
+      Linter finden Muster, Typchecker finden Widersprüche zwischen Typen. Beides geschieht an allen Stellen gleichzeitig und kostet fast nichts, deshalb gehören vertauschte Argumente, naive Zeitstempel und SQL aus f-Strings dorthin. Werte, Fachregeln und Daten von außen sehen beide nicht: Eine falsche Grenze, eine falsche Zeitzone als Argument oder ein String aus einem Webhook sind für sie korrekter Code. Dafür brauchst du Tests – und an der Systemgrenze eine Validierung, die der Test absichert.
+    resources:
+      - title: Ruff · call-datetime-now-without-tzinfo (DTZ005)
+        url: https://docs.astral.sh/ruff/rules/call-datetime-now-without-tzinfo/
+      - title: Ruff · hardcoded-sql-expression (S608)
+        url: https://docs.astral.sh/ruff/rules/hardcoded-sql-expression/
+
+  - id: legacy-einfuehren
+    type: order
+    title: Ruff in acht Jahre alten Code bringen
+    prompt: |
+      Das Radwerk-Backend hatte bisher keinen Linter. Bring die Schritte der Einführung in eine sinnvolle Reihenfolge. Randbedingungen: Der Formatierungs-Commit soll nur Formatierung enthalten und vor allen inhaltlichen Änderungen kommen, und die CI darf ab dem Tag, an dem sie Ruff verlangt, nicht rot sein.
+    lang: text
+    lines: |
+      Ruff mit fester Version als Dev-Abhängigkeit aufnehmen und die Regelauswahl in pyproject.toml festlegen
+      ruff format . über das ganze Repository laufen lassen, nur das committen und den Hash in .git-blame-ignore-revs eintragen
+      ruff check --fix . und danach ruff format . ausführen, den Diff reviewen und committen
+      Verbleibende Befunde mit ruff check --add-noqa . als Baseline einfrieren
+      ruff check und ruff format --check als Pflicht-Check in die CI aufnehmen
+      Bei jeder Änderung an einer Datei ihre noqa-Kommentare abbauen; die Zahl darf nur sinken
+    explanation: |
+      Ohne gepinnte Version und Regelauswahl melden Laptop und CI Verschiedenes. Der reine Formatierungs-Commit kommt zuerst, damit `git blame` ihn überspringen kann und Reviewer ihn nicht lesen müssen. Danach die sicheren Autofixes; ein zweites `ruff format` glättet, was die Korrekturen verschoben haben. Erst dann die Baseline: Hättest du `--add-noqa` vor `--fix` ausgeführt, stünden Kommentare an Zeilen, die Ruff selbst reparieren kann. Die CI verlangt Ruff erst, wenn der Stand grün ist, sonst blockiert sie jeden PR. Der letzte Schritt ist der Ratchet, der die Baseline Datei für Datei abbaut.
+    resources:
+      - title: Ruff · Inserting necessary suppression comments
+        url: https://docs.astral.sh/ruff/linter/#inserting-necessary-suppression-comments
+      - title: git-blame · --ignore-revs-file
+        url: https://git-scm.com/docs/git-blame#Documentation/git-blame.txt---ignore-revs-filefile
+
+  - id: cast-glaubt
+    type: output
+    title: mypy ist zufrieden
+    prompt: |
+      Dieses Programm besteht `mypy --strict` ohne einen einzigen Befund. Was gibt es aus?
+    lang: python
+    code: |
+      import json
+      from typing import TypedDict, cast
+
+
+      class Zahlung(TypedDict):
+          id: str
+          betrag_cent: int
+
+
+      def summe_cent(antwort: str) -> int:
+          zahlungen = cast(list[Zahlung], json.loads(antwort))
+          return sum(z["betrag_cent"] for z in zahlungen)
+
+
+      print(summe_cent('[{"id": "p-1", "betrag_cent": 300}, {"id": "p-2", "betrag_cent": 150}]'))
+      print(summe_cent('[{"id": "p-3", "betrag_cent": 299.5}]'))
+      try:
+          print(summe_cent('[{"id": "p-4", "betrag_cent": "450"}]'))
+      except TypeError as fehler:
+          print("TypeError:", fehler)
+    expected: |
+      450
+      299.5
+      TypeError: unsupported operand type(s) for +: 'int' and 'str'
+    explanation: |
+      `cast` ändert zur Laufzeit nichts, es sagt mypy nur: „Glaub mir, das ist eine Liste von Zahlungen.“ mypy glaubt und prüft ab dort die Verwendung, nicht die Daten. Ein `TypedDict` ist zur Laufzeit ein gewöhnliches `dict`. Der zweite Aufruf ist der gefährliche: `299.5` wird ohne Fehler addiert, die Funktion mit der Rückgabe `int` liefert einen `float`, und halbe Cent wandern weiter in die Abrechnung. Erst der String im dritten Aufruf knallt, weil `sum` mit `0` beginnt und `0 + "450"` nicht definiert ist. Daten von außen gehören an der Grenze zur Laufzeit geprüft; dahinter dürfen Typen gelten.
+    resources:
+      - title: Python · typing.cast
+        url: https://docs.python.org/3/library/typing.html#typing.cast
+      - title: mypy · Casts
+        url: https://mypy.readthedocs.io/en/stable/type_narrowing.html#casts
+
+  - id: as-glaubt
+    type: output
+    title: tsc ist auch zufrieden
+    prompt: |
+      `tsc --strict` meldet für dieses Programm keinen Fehler. Was gibt es aus, wenn es in Node läuft?
+    lang: typescript
+    code: |
+      type Fahrt = { id: string; minuten: number };
+
+      function gesamtMinuten(fahrten: Fahrt[]): number {
+        return fahrten.reduce((summe, fahrt) => summe + fahrt.minuten, 0);
+      }
+
+      const antwort = '[{"id": "f-1", "minuten": 12}, {"id": "f-2", "minuten": "30"}, {"id": "f-3", "minuten": 5}]';
+      const fahrten = JSON.parse(antwort) as Fahrt[];
+
+      const gesamt = gesamtMinuten(fahrten);
+      console.log(gesamt);
+      console.log(typeof gesamt);
+      console.log(gesamt > 60 ? "Vielfahrer" : "Gelegenheitsfahrer");
+    expected: |
+      12305
+      string
+      Vielfahrer
+    explanation: |
+      `JSON.parse` liefert `any`, und `as Fahrt[]` behauptet den Rest. Zur Laufzeit gibt es keine Typen: `12 + "30"` ist in JavaScript String-Verkettung und ergibt `"1230"`, danach `"1230" + 5` = `"12305"`. Für TypeScript ist `gesamt` weiterhin eine `number`. Der Vergleich `"12305" > 60` wandelt den String in eine Zahl um und ist wahr – aus 47 Minuten wird ein Vielfahrer. Das ist dasselbe Loch wie `cast` in Python; die Abhilfe ist dieselbe: Antworten an der Grenze prüfen, etwa mit einem Schema-Validator, und die Prüfung testen.
+    resources:
+      - title: TypeScript Handbook · Type Assertions
+        url: https://www.typescriptlang.org/docs/handbook/2/everyday-types.html#type-assertions
+
+  - id: pyproject-luecken
+    type: gap
+    title: Die Werkzeuge einstellen
+    prompt: |
+      Ergänze die `pyproject.toml` des Radwerk-Backends:
+
+      - Ruff prüft **zusätzlich zu den Standardregeln** alle Bandit-Regeln (`S`).
+      - In Testdateien unter `tests/` ist `assert` erlaubt (Regel `S101`).
+      - mypy läuft im strengen Modus.
+      - Fehler aus dem Paket `radwerk.legacy` und allen Untermodulen werden vorerst nicht gemeldet.
+    lang: toml
+    code: |
+      [tool.ruff]
+      line-length = 100
+
+      [tool.ruff.⟦lint⟧]
+      ⟦extend-select⟧ = ["S"]
+
+      [tool.ruff.lint.per-file-ignores]
+      "tests/**" = ["⟦S101⟧"]
+
+      [tool.mypy]
+      ⟦strict⟧ = true
+
+      [[tool.mypy.⟦overrides⟧]]
+      module = ["radwerk.legacy.*"]
+      ⟦ignore_errors⟧ = true
+    gaps:
+      - label: Abschnitt für Lint-Regeln
+        hint: Ruff trennt Formatter- und Linter-Einstellungen; die Regeln stehen in einem Unterabschnitt.
+      - label: Regeln ergänzen
+        hint: "`select` würde die Defaults ersetzen. Gesucht ist die Variante, die ergänzt."
+      - label: Regelcode für assert
+        hint: Die erste Regel im Bandit-Set.
+      - label: Strenger Modus
+        hint: Dieselbe Option wie `--strict` auf der Kommandozeile.
+      - label: Tabelle für Ausnahmen pro Modul
+        hint: Eine Liste von Tabellen unter `tool.mypy`.
+      - label: Fehler eines Moduls unterdrücken
+        hint: Die Option prüft das Modul weiter, meldet aber nichts.
+    explanation: |
+      Lint-Regeln stehen unter `[tool.ruff.lint]`, getrennt von Formatter-Einstellungen. `extend-select` nimmt `S` zu den 413 Standardregeln dazu; `select = ["S"]` hätte alle anderen abgeschaltet. `per-file-ignores` erlaubt `assert` nur in Tests – im Produktionscode verschwindet `assert` unter `python -O`, deshalb meldet S101 es dort zu Recht. `strict = true` entspricht `mypy --strict`. `[[tool.mypy.overrides]]` ist eine Liste von Tabellen; `ignore_errors = true` lässt mypy das Legacy-Paket weiter analysieren (seine Typen gelten für Aufrufer), unterdrückt aber dessen eigene Fehler. Die Liste der Legacy-Module darf nur schrumpfen.
+    resources:
+      - title: Ruff · lint.per-file-ignores
+        url: https://docs.astral.sh/ruff/settings/#lint_per-file-ignores
+      - title: mypy · Using a pyproject.toml file
+        url: https://mypy.readthedocs.io/en/stable/config_file.html#using-a-pyproject-toml-file
+
+  - id: ruff-fix
+    type: command
+    title: Was sich gefahrlos reparieren lässt
+    prompt: Wende alle **sicheren** automatischen Korrekturen von Ruff auf das ganze Projekt an.
+    context: Du bist im Wurzelverzeichnis des Radwerk-Backends, einem uv-Projekt. Ruff ist als Dev-Abhängigkeit mit fester Version installiert.
+    answers:
+      - uv run ruff check --fix
+      - uv run ruff check --fix .
+      - uv run ruff check . --fix
+      - ruff check --fix
+      - ruff check --fix .
+      - ruff check . --fix
+    output: |
+      DTZ005 `datetime.datetime.now()` called without a `tz` argument
+       --> src/radwerk/abrechnung.py:4:35
+        |
+      4 | def tagesumsatz(fahrten, stichtag=datetime.now().date()):
+        |                                   ^^^^^^^^^^^^^^
+      …
+      Found 6 errors (1 fixed, 5 remaining).
+    explanation: |
+      `ruff check --fix` wendet die sicheren Korrekturen an – hier das Entfernen des ungenutzten Imports – und meldet, was übrig bleibt. Der Exit-Code ist weiter 1, weil fünf Befunde bleiben. Unsichere Korrekturen, die das Verhalten ändern könnten, brauchen zusätzlich `--unsafe-fixes`. `uv run` nimmt die im Projekt gepinnte Ruff-Version; `uvx ruff` würde die neueste laden und womöglich andere Regeln prüfen als die CI. Lies den Diff nach jedem `--fix`, bevor du committest.
+    resources:
+      - title: Ruff · Fix safety
+        url: https://docs.astral.sh/ruff/linter/#fix-safety
+
+  - id: format-check
+    type: command
+    title: Formatiert oder nicht?
+    prompt: Der CI-Schritt soll prüfen, ob alle Dateien formatiert sind, **ohne** Dateien zu verändern, und mit Exit-Code 1 scheitern, wenn eine Datei anders formatiert werden müsste.
+    context: Ruff ist als Dev-Abhängigkeit im uv-Projekt installiert, der Schritt läuft im Wurzelverzeichnis.
+    answers:
+      - uv run ruff format --check
+      - uv run ruff format --check .
+      - uv run ruff format . --check
+      - ruff format --check
+      - ruff format --check .
+      - ruff format . --check
+      - uv run ruff format --diff
+      - uv run ruff format --diff .
+      - ruff format --diff
+      - ruff format --diff .
+    output: |
+      unformatted: File would be reformatted
+       --> src/radwerk/tarif.py:1:18
+        |
+        - TARIFE = {"city":150,
+        -   "e-bike" : 300}
+      1 + TARIFE = {"city": 150, "e-bike": 300}
+      2 +
+      3 |
+      4 | def grundpreis(typ):
+        -     return TARIFE[ typ ]
+      5 +     return TARIFE[typ]
+        |
+
+      1 file would be reformatted, 3 files already formatted
+    explanation: |
+      `ruff format --check` schreibt nichts und endet mit Exit-Code 1, sobald eine Datei anders aussähe. Seit Ruff 0.16 zeigt es dabei den Diff; `--diff` tut dasselbe mit Diff-Ausgabe. Ein `ruff format` ohne `--check` in der CI wäre wertlos: Es formatiert im Wegwerf-Runner, der Schritt ist grün, und der unformatierte Code bleibt im Repository.
+    resources:
+      - title: Ruff · The Ruff Formatter
+        url: https://docs.astral.sh/ruff/formatter/
+
+  - id: mypy-strict
+    type: command
+    title: Einmal streng hinschauen
+    prompt: Prüfe das Paket unter `src/radwerk` **einmalig** im strengen Modus von mypy, ohne die Konfiguration zu ändern.
+    context: mypy ist als Dev-Abhängigkeit im uv-Projekt installiert. Die `pyproject.toml` enthält bisher nur `[tool.mypy]` ohne Optionen.
+    answers:
+      - uv run mypy --strict src/radwerk
+      - uv run mypy --strict src/radwerk/
+      - uv run mypy src/radwerk --strict
+      - uv run mypy src/radwerk/ --strict
+      - mypy --strict src/radwerk
+      - mypy --strict src/radwerk/
+      - mypy src/radwerk --strict
+      - mypy src/radwerk/ --strict
+    output: |
+      src/radwerk/tarif.py:4: error: Function is missing a type annotation  [no-untyped-def]
+      src/radwerk/fahrten.py:13: error: Unsupported left operand type for - ("None")  [operator]
+      src/radwerk/fahrten.py:13: note: Left operand is of type "datetime | None"
+      src/radwerk/fahrten.py:16: error: Function is missing a type annotation  [no-untyped-def]
+      src/radwerk/abrechnung.py:4: error: Function is missing a type annotation  [no-untyped-def]
+      Found 4 errors in 3 files (checked 4 source files)
+    explanation: |
+      `--strict` schaltet eine Reihe von Prüfungen ein, darunter `disallow_untyped_defs`, `check_untyped_defs`, `warn_unused_ignores` und `warn_return_any`. Die drei `no-untyped-def`-Meldungen sind der typische erste Eindruck in gewachsenem Code: Ohne Annotationen hat mypy diese Funktionen bisher gar nicht geprüft. Ein einmaliger Lauf zeigt, wie weit der Weg zu `strict = true` ist; danach entscheidest du, welche Module zuerst streng werden.
+    resources:
+      - title: mypy · --strict
+        url: https://mypy.readthedocs.io/en/stable/command_line.html#cmdoption-mypy-strict
+
+  - id: naive-zeit-regel
+    type: code
+    title: Eine Lint-Regel gegen naive Zeitpunkte
+    prompt: |
+      Nach dem Abrechnungsfehler will das Radwerk-Team eine eigene Prüfung, die auch in Skripten außerhalb des Ruff-Laufs greift. Schreibe `naive_zeitpunkte(quelltext: str) -> list[int]`. Sie gibt die Zeilennummern aller Aufrufe zurück, die einen Zeitpunkt ohne Zeitzone erzeugen:
+
+      - `….now()` auf `datetime` oder `datetime.datetime`, wenn **kein** Zeitzonen-Argument übergeben wird oder das Argument die Konstante `None` ist. Das Zeitzonen-Argument ist das erste Positionsargument oder das Schlüsselwort `tz`.
+      - `….utcnow()` und `….today()` auf `datetime` oder `datetime.datetime` – immer, denn beide liefern naive Zeitpunkte.
+      - Aufrufe auf anderen Objekten (`uhr.now()`, `date.today()`, `self.datetime.now()`) werden nicht gemeldet. Importe unter anderem Namen musst du nicht auflösen.
+      - Die Liste ist aufsteigend sortiert; zwei Treffer in einer Zeile ergeben die Zeile zweimal.
+
+      Nutze `ast.parse` und `ast.walk` oder einen `ast.NodeVisitor`.
+    lang: python
+    starter: |
+      import ast
+
+
+      def naive_zeitpunkte(quelltext: str) -> list[int]:
+          zeilen: list[int] = []
+          for knoten in ast.walk(ast.parse(quelltext)):
+              ...
+          return sorted(zeilen)
+    solution: |
+      import ast
+
+
+      def _ist_datetime_klasse(knoten: ast.expr) -> bool:
+          if isinstance(knoten, ast.Name):
+              return knoten.id == "datetime"
+          return (
+              isinstance(knoten, ast.Attribute)
+              and knoten.attr == "datetime"
+              and isinstance(knoten.value, ast.Name)
+              and knoten.value.id == "datetime"
+          )
+
+
+      def _zeitzone(aufruf: ast.Call) -> ast.expr | None:
+          if aufruf.args:
+              return aufruf.args[0]
+          for argument in aufruf.keywords:
+              if argument.arg == "tz":
+                  return argument.value
+          return None
+
+
+      def naive_zeitpunkte(quelltext: str) -> list[int]:
+          zeilen: list[int] = []
+          for knoten in ast.walk(ast.parse(quelltext)):
+              if not isinstance(knoten, ast.Call) or not isinstance(knoten.func, ast.Attribute):
+                  continue
+              if not _ist_datetime_klasse(knoten.func.value):
+                  continue
+              methode = knoten.func.attr
+              if methode in ("utcnow", "today"):
+                  zeilen.append(knoten.lineno)
+              elif methode == "now":
+                  zeitzone = _zeitzone(knoten)
+                  if zeitzone is None or (isinstance(zeitzone, ast.Constant) and zeitzone.value is None):
+                      zeilen.append(knoten.lineno)
+          return sorted(zeilen)
+    tests:
+      - name: now() ohne Argument wird gemeldet
+        code: |
+          ergebnis = naive_zeitpunkte("from datetime import datetime\njetzt = datetime.now()\n")
+          assert ergebnis == [2], f"erwartet [2], bekommen {ergebnis}"
+      - name: Mit Zeitzone bleibt es still
+        code: |
+          quelle = "from datetime import datetime, UTC\na = datetime.now(UTC)\nb = datetime.now(tz=UTC)\n"
+          ergebnis = naive_zeitpunkte(quelle)
+          assert ergebnis == [], f"Aufrufe mit Zeitzone sind in Ordnung, bekommen {ergebnis}"
+      - name: Voll qualifiziert und tz=None
+        code: |
+          quelle = (
+              "import datetime\n"
+              "a = datetime.datetime.now()\n"
+              "b = datetime.datetime.now(datetime.UTC)\n"
+              "c = datetime.datetime.now(tz=None)\n"
+              "d = datetime.datetime.now(None)\n"
+          )
+          ergebnis = naive_zeitpunkte(quelle)
+          assert ergebnis == [2, 4, 5], f"erwartet [2, 4, 5], bekommen {ergebnis}"
+      - name: utcnow und today zählen, andere Objekte nicht
+        code: |
+          quelle = (
+              "a = datetime.utcnow()\n"
+              "b = datetime.today()\n"
+              "c = date.today()\n"
+              "d = uhr.now()\n"
+              "e = self.datetime.now()\n"
+          )
+          ergebnis = naive_zeitpunkte(quelle)
+          assert ergebnis == [1, 2], f"erwartet [1, 2], bekommen {ergebnis}"
+      - name: Zwei Treffer in einer Zeile, Treffer in Funktionen
+        code: |
+          quelle = '''from datetime import datetime
+          from zoneinfo import ZoneInfo
+
+          BERLIN = ZoneInfo("Europe/Berlin")
+
+
+          def stichtag():
+              return datetime.now(BERLIN).date()
+
+
+          def protokoll(text):
+              print(datetime.now(), text)
+              start, ende = datetime.now(), datetime.utcnow()
+          '''
+          ergebnis = naive_zeitpunkte(quelle)
+          assert ergebnis == [12, 13, 13], f"erwartet [12, 13, 13], bekommen {ergebnis}"
+    hints:
+      - "Ein Aufruf ist ein `ast.Call`. Bei `datetime.now()` ist `func` ein `ast.Attribute` mit `attr == \"now\"` und `value` = `ast.Name(id=\"datetime\")`."
+      - "Für `datetime.datetime.now()` ist `func.value` selbst ein `ast.Attribute` mit `attr == \"datetime\"`, dessen `value` der Name `datetime` ist."
+      - "Das Zeitzonen-Argument steht in `aufruf.args[0]` oder in einem Element von `aufruf.keywords` mit `arg == \"tz\"`. `None` im Code ist ein `ast.Constant` mit `value is None`."
+    explanation: |
+      Eine Lint-Regel ist eine Funktion über dem Syntaxbaum: Knotentyp prüfen, Struktur vergleichen, Zeile melden. `ast.walk` besucht jeden Knoten, auch in Funktionen und Ausdrücken; die Reihenfolge ist nicht die des Quelltexts, deshalb das `sorted`. Die Regel arbeitet nur mit der Struktur, nicht mit Werten: `datetime.now(BERLIN)` gilt als in Ordnung, egal was `BERLIN` ist. Diese Grenze hat auch Ruffs DTZ005. `import datetime as dt` übersieht deine Regel dagegen; Ruff löst solche Importe über sein semantisches Modell auf und meldet auch `dt.datetime.now()`. Für so etwas lohnt sich eine eigene Regel, wenn eine Fehlerklasse euch wiederholt trifft und kein fertiges Werkzeug sie abdeckt.
+    resources:
+      - title: Python · ast.walk
+        url: https://docs.python.org/3/library/ast.html#ast.walk
+      - title: Python · datetime.datetime.now
+        url: https://docs.python.org/3/library/datetime.html#datetime.datetime.now
+
+  - id: zahlung-an-der-grenze
+    type: code
+    title: Repariere die Grenze zu Paystream
+    prompt: |
+      Der Webhook-Handler übergibt das geparste JSON einer Paystream-Zahlung an `parse_zahlung(daten: object) -> Zahlung`. Die aktuelle Version benutzt `cast` und glaubt alles. Repariere sie, sodass hinter der Funktion die Typen stimmen:
+
+      - `daten` muss ein `dict` sein.
+      - Pflichtfelder: `id` (nicht leerer `str`), `betrag_cent` (`int`, **kein** `bool`, nicht negativ), `status` (`"bezahlt"` oder `"abgelehnt"`).
+      - Bei jedem Verstoß wirfst du `UngueltigeZahlung` (eine Unterklasse von `ValueError`) – auch bei fehlenden Feldern, nicht `KeyError`. Die Meldung nennt das betroffene Feld.
+      - Zusätzliche Felder werden ignoriert, denn Paystream darf neue Felder ergänzen.
+    lang: python
+    starter: |
+      from dataclasses import dataclass
+      from typing import Any, Literal, cast
+
+      Status = Literal["bezahlt", "abgelehnt"]
+
+
+      class UngueltigeZahlung(ValueError):
+          """Die Nachricht von Paystream passt nicht zum vereinbarten Format."""
+
+
+      @dataclass(frozen=True)
+      class Zahlung:
+          id: str
+          betrag_cent: int
+          status: Status
+
+
+      def parse_zahlung(daten: object) -> Zahlung:
+          roh = cast(dict[str, Any], daten)
+          return Zahlung(id=roh["id"], betrag_cent=roh["betrag_cent"], status=roh["status"])
+    solution: |
+      from dataclasses import dataclass
+      from typing import Literal
+
+      Status = Literal["bezahlt", "abgelehnt"]
+
+
+      class UngueltigeZahlung(ValueError):
+          """Die Nachricht von Paystream passt nicht zum vereinbarten Format."""
+
+
+      @dataclass(frozen=True)
+      class Zahlung:
+          id: str
+          betrag_cent: int
+          status: Status
+
+
+      def parse_zahlung(daten: object) -> Zahlung:
+          if not isinstance(daten, dict):
+              raise UngueltigeZahlung(f"Zahlung muss ein Objekt sein, nicht {type(daten).__name__}")
+          for feld in ("id", "betrag_cent", "status"):
+              if feld not in daten:
+                  raise UngueltigeZahlung(f"Feld fehlt: {feld}")
+          zahlungs_id = daten["id"]
+          if not isinstance(zahlungs_id, str) or not zahlungs_id:
+              raise UngueltigeZahlung("id muss ein nicht leerer Text sein")
+          betrag = daten["betrag_cent"]
+          if isinstance(betrag, bool) or not isinstance(betrag, int):
+              raise UngueltigeZahlung(f"betrag_cent muss eine ganze Zahl sein, nicht {betrag!r}")
+          if betrag < 0:
+              raise UngueltigeZahlung(f"betrag_cent darf nicht negativ sein: {betrag}")
+          status = daten["status"]
+          if status == "bezahlt" or status == "abgelehnt":
+              return Zahlung(zahlungs_id, betrag, status)
+          raise UngueltigeZahlung(f"unbekannter status: {status!r}")
+    tests:
+      - name: Gültige Zahlung mit Zusatzfeld
+        code: |
+          ergebnis = parse_zahlung({"id": "p-1", "betrag_cent": 300, "status": "bezahlt", "waehrung": "EUR"})
+          assert ergebnis == Zahlung("p-1", 300, "bezahlt"), f"bekommen {ergebnis!r}"
+      - name: Betrag als Text, Kommazahl oder bool wird abgelehnt
+        code: |
+          for falsch in ["300", 299.5, True]:
+              try:
+                  parse_zahlung({"id": "p-2", "betrag_cent": falsch, "status": "bezahlt"})
+              except UngueltigeZahlung as fehler:
+                  assert "betrag_cent" in str(fehler), f"Die Meldung sollte das Feld nennen: {fehler}"
+              else:
+                  raise AssertionError(f"betrag_cent={falsch!r} wurde akzeptiert – erwartet war UngueltigeZahlung.")
+      - name: Negativer Betrag und unbekannter Status
+        code: |
+          for daten, feld in [
+              ({"id": "p-3", "betrag_cent": -150, "status": "bezahlt"}, "betrag_cent"),
+              ({"id": "p-4", "betrag_cent": 150, "status": "offen"}, "status"),
+              ({"id": "", "betrag_cent": 150, "status": "bezahlt"}, "id"),
+          ]:
+              try:
+                  parse_zahlung(daten)
+              except UngueltigeZahlung as fehler:
+                  assert feld in str(fehler), f"Die Meldung sollte {feld} nennen: {fehler}"
+              else:
+                  raise AssertionError(f"{daten} wurde akzeptiert – erwartet war UngueltigeZahlung.")
+      - name: Fehlendes Feld ist kein KeyError
+        code: |
+          try:
+              parse_zahlung({"betrag_cent": 150, "status": "bezahlt"})
+          except UngueltigeZahlung as fehler:
+              assert "id" in str(fehler), f"Die Meldung sollte das fehlende Feld nennen: {fehler}"
+          except KeyError:
+              raise AssertionError("KeyError statt UngueltigeZahlung – der Handler könnte das nicht von einem Programmfehler unterscheiden.")
+          else:
+              raise AssertionError("Eine Zahlung ohne id wurde akzeptiert.")
+      - name: Kein Objekt
+        code: |
+          try:
+              parse_zahlung([{"id": "p-5"}])
+          except UngueltigeZahlung:
+              pass
+          else:
+              raise AssertionError("Eine Liste wurde als Zahlung akzeptiert.")
+    hints:
+      - "`isinstance(daten, dict)` grenzt `object` für mypy auf ein `dict` ein; danach darfst du indexieren."
+      - "`isinstance(True, int)` ist `True`, weil `bool` eine Unterklasse von `int` ist. Prüfe `bool` zuerst."
+      - Prüfe `status` gegen beide erlaubten Werte, bevor du `Zahlung` erzeugst. Werte aus dem geprüften `dict` sind für mypy `Any` – ohne eigene Prüfung ginge jeder Status durch.
+    explanation: |
+      Das ist die typisierte Grenze aus der Lektion: einmal zur Laufzeit prüfen, danach gelten die Typen, und mypy trägt sie weiter. `cast` hätte jeden der Testfälle durchgelassen – auch `299.5`, das sonst als halber Cent in der Abrechnung landet. Der `bool`-Fall ist die klassische Falle: `True` besteht `isinstance(x, int)`. Eine eigene Ausnahmeklasse lässt den Handler gezielt mit 400 antworten, statt jeden `KeyError` wie einen Programmfehler zu behandeln; nebenbei bleibt Ruff still, denn TRY004 meldet `raise ValueError` direkt nach einer `isinstance`-Prüfung. In echten Projekten übernimmt oft pydantic diese Arbeit – den Test mit echten Beispielnachrichten brauchst du trotzdem.
+    resources:
+      - title: mypy · Type narrowing
+        url: https://mypy.readthedocs.io/en/stable/type_narrowing.html
+      - title: Ruff · type-check-without-type-error (TRY004)
+        url: https://docs.astral.sh/ruff/rules/type-check-without-type-error/
+
+  - id: vertauschte-argumente
+    type: bug
+    title: Alle Fahrten gratis
+    prompt: |
+      Die Monatsrechnung zeigt für jeden Kunden 0 Cent. Die Unit-Tests für `fahrtpreis` sind grün, für `monatsrechnung` gibt es noch keine. `mypy --strict` meldet für diese Datei einen Fehler mit dem Code `arg-type`. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: python
+    code: |
+      from dataclasses import dataclass
+
+
+      @dataclass
+      class Fahrt:
+          kunde_id: str
+          minuten: int
+          e_bike: bool
+
+
+      def fahrtpreis(minuten: int, e_bike: bool) -> int:
+          if minuten <= 5:
+              return 0
+          return -(-minuten // 30) * (300 if e_bike else 150)
+
+
+      def monatsrechnung(fahrten: list[Fahrt]) -> dict[str, int]:
+          summen: dict[str, int] = {}
+          for fahrt in fahrten:
+              preis = fahrtpreis(fahrt.e_bike, fahrt.minuten)
+              summen[fahrt.kunde_id] = summen.get(fahrt.kunde_id, 0) + preis
+          return summen
+    lines: [20]
+    fix:
+      - line: 20
+        answers:
+          - preis = fahrtpreis(fahrt.minuten, fahrt.e_bike)
+          - preis = fahrtpreis(minuten=fahrt.minuten, e_bike=fahrt.e_bike)
+          - preis = fahrtpreis(e_bike=fahrt.e_bike, minuten=fahrt.minuten)
+          - preis = fahrtpreis(fahrt.minuten, e_bike=fahrt.e_bike)
+    explanation: |
+      mypy meldet `Argument 2 to "fahrtpreis" has incompatible type "int"; expected "bool"`. Das erste Argument meldet es nicht: `bool` ist in Python eine Unterklasse von `int`, `False` ist also ein gültiges `minuten`. Zur Laufzeit gilt `False <= 5`, und jede Fahrt kostet 0 Cent. Ein Test hätte den Fehler nur gefunden, wenn er `monatsrechnung` aufruft; mypy findet ihn an dieser und jeder künftigen Aufrufstelle. Schlüsselwortargumente (`e_bike=fahrt.e_bike`) machen solche Vertauschungen auch für Leser sichtbar; Ruff kann mit den `FBT`-Regeln sogar verlangen, dass `bool`-Parameter nur per Schlüsselwort übergeben werden.
+    resources:
+      - title: mypy · Error codes (arg-type)
+        url: https://mypy.readthedocs.io/en/stable/error_code_list.html#check-argument-types-arg-type
+      - title: Ruff · flake8-boolean-trap (FBT)
+        url: https://docs.astral.sh/ruff/rules/#flake8-boolean-trap-fbt
+
+  - id: vergessenes-await
+    type: bug
+    title: Bestätigt, aber nie gespeichert
+    prompt: |
+      Im Radwerk-Frontend bekommen Kundinnen manchmal eine Buchungsbestätigung für eine Buchung, die nicht existiert. Im Log steht dann eine unbehandelte Promise-Ablehnung aus der Datenbankschicht. Die Unit-Tests mit Fake-Speicher und Fake-Mailer sind grün, `tsc --strict` meldet nichts. ESLint mit `tseslint.configs.recommendedTypeChecked` meldet einen Fehler in dieser Datei. Finde die Zeile und korrigiere sie.
+    lang: typescript
+    code: |
+      export type Buchung = { id: string; radId: string; kundeId: string };
+
+      export interface Speicher {
+        speichere(buchung: Buchung): Promise<void>;
+      }
+
+      export interface Mailer {
+        sendeBestaetigung(kundeId: string, buchungId: string): Promise<void>;
+      }
+
+      export async function buchen(b: Buchung, speicher: Speicher, mailer: Mailer): Promise<string> {
+        speicher.speichere(b);
+        await mailer.sendeBestaetigung(b.kundeId, b.id);
+        return b.id;
+      }
+    lines: [12]
+    fix:
+      - line: 12
+        answers:
+          - await speicher.speichere(b);
+    explanation: |
+      Ohne `await` startet `speichere` und `buchen` läuft sofort weiter: Die Mail geht raus, bevor feststeht, ob gespeichert wurde. Scheitert das Speichern, lehnt ein Promise ab, auf das niemand wartet – `buchen` meldet trotzdem Erfolg. Der Compiler erlaubt das, denn ein unbenutzter Rückgabewert ist kein Typfehler. `@typescript-eslint/no-floating-promises` braucht die Typinformation, um zu erkennen, dass hier ein Promise liegen bleibt. Ein `void` davor würde die Meldung zum Schweigen bringen, den Fehler aber behalten. Der Fake-Speicher im Test löst sofort erfolgreich auf, deshalb fällt die Reihenfolge dort nie auf.
+    resources:
+      - title: typescript-eslint · no-floating-promises
+        url: https://typescript-eslint.io/rules/no-floating-promises/
+
+  - id: review-ausnahmen
+    type: explain
+    title: Die CI ist wieder grün
+    prompt: |
+      Ein Kollege will mit diesem Pull Request die rote CI nach dem Einschalten von `extend-select = ["S"]` und strengeren mypy-Regeln wieder grün bekommen. Erkläre im Review, was jede der vier Änderungen bewirkt, welche du akzeptierst und was du bei den anderen stattdessen vorschlägst. `kunde_id` kommt aus dem Pfad der HTTP-Anfrage.
+    lang: diff
+    code: |2
+       [tool.ruff.lint.per-file-ignores]
+      -"tests/**" = []
+      +"tests/**" = ["S101"]
+      +"src/radwerk/**" = ["DTZ"]
+
+       [[tool.mypy.overrides]]
+      -module = ["radwerk.legacy.*"]
+      +module = ["radwerk.legacy.*", "radwerk.abrechnung"]
+       ignore_errors = true
+
+       # src/radwerk/repo.py
+      -    sql = f"SELECT id, minuten FROM fahrten WHERE kunde_id = '{kunde_id}'"
+      +    sql = f"SELECT id, minuten FROM fahrten WHERE kunde_id = '{kunde_id}'"  # noqa: S608
+    points:
+      - "`S101` für `tests/**` ist in Ordnung: `assert` ist in pytest das Prüfwerkzeug; die Ausnahme gilt nur dort, wo die Regel fachlich nicht passt."
+      - "`DTZ` für das ganze Paket schaltet genau die Regel ab, die den Abrechnungsfehler mit der Zeitzone gefunden hätte. Stattdessen die Aufrufe mit `ZoneInfo(\"Europe/Berlin\")` reparieren oder einzelne Zeilen mit Begründung ausnehmen."
+      - "`radwerk.abrechnung` in `ignore_errors` nimmt das geschäftskritischste Modul aus der Typprüfung. Die Ausnahmeliste darf nur schrumpfen; neue Fehler beheben oder einzeln mit `# type: ignore[code]` und Grund markieren."
+      - "`# noqa: S608` ohne Begründung versteckt eine echte SQL-Injection, weil `kunde_id` aus der Anfrage kommt. Die Abfrage braucht einen Parameter (`… WHERE kunde_id = ?`); `noqa` nur bei Fehlalarmen und mit Grund."
+      - Der PR misst Erfolg an der grünen CI statt an behobenen Problemen; eine Baseline mit Ratchet wäre der ehrliche Weg, bestehende Befunde vorübergehend zu dulden.
+    explanation: |
+      Ich würde nur die erste Änderung annehmen. `assert` in Tests ist kein Sicherheitsproblem; S101 soll verhindern, dass Produktionscode sich auf `assert` verlässt, das unter `python -O` verschwindet. Die zweite Änderung schaltet DTZ für den ganzen Produktionscode ab – also genau die Regel, die den Fehler mit den falschen Kalendertagen gefunden hätte. Die dritte nimmt die Abrechnung, das Modul mit dem meisten Geld, aus der Typprüfung; die Liste der Ausnahmen soll schrumpfen, nicht wachsen. Die vierte ist die gefährlichste: `kunde_id` kommt aus der URL, die Zeile ist eine echte SQL-Injection, und der Kommentar sorgt dafür, dass kein Werkzeug sie je wieder meldet. Hier gehört ein Parameter hin. Wenn die Menge der Befunde zu groß für einen PR ist, ist der ehrliche Weg eine Baseline (`ruff check --add-noqa` für Bestand) plus Ratchet – sichtbar, zählbar und mit dem Ziel, sie abzubauen.
+    resources:
+      - title: Ruff · Error suppression
+        url: https://docs.astral.sh/ruff/linter/#error-suppression
+      - title: mypy · Silencing errors based on error codes
+        url: https://mypy.readthedocs.io/en/stable/error_codes.html#silencing-errors-based-on-error-codes
+
+  - id: ratchet-pruefen
+    type: code
+    title: Die Zahl darf nur sinken
+    prompt: |
+      Das Radwerk-Team hat für den Bestand eine Baseline gespeichert: wie viele Ruff-Befunde jede Datei haben darf. Schreibe den CI-Schritt dazu als Funktion `pruefe_ratchet(befunde, baseline)`:
+
+      - `befunde` sind Ausgabezeilen von `ruff check --output-format concise`, etwa `src/radwerk/repo.py:6:11: S608 Possible SQL injection …`. Zeilen, die nicht mit `Pfad:Zeile:Spalte: ` beginnen (`Found 3 errors.`, `All checks passed!`), ignorierst du.
+      - `baseline` ordnet Dateien die erlaubte Zahl zu. Fehlt eine Datei, ist 0 erlaubt.
+      - Rückgabe ist ein Tupel `(verstoesse, neue_baseline)`.
+      - `verstoesse`: für jede Datei mit mehr Befunden als erlaubt ein Text `"<datei>: <anzahl> statt höchstens <erlaubt>"`, nach Dateiname sortiert.
+      - `neue_baseline`: für jede Datei der alten Baseline das Minimum aus erlaubt und aktuell. Einträge mit 0 fallen weg, neue Dateien kommen nicht hinzu. Die Baseline wird also nie lockerer.
+    lang: python
+    starter: |
+      def pruefe_ratchet(befunde: list[str], baseline: dict[str, int]) -> tuple[list[str], dict[str, int]]:
+          verstoesse: list[str] = []
+          neue_baseline = dict(baseline)
+          return verstoesse, neue_baseline
+    solution: |
+      import re
+      from collections import Counter
+
+      BEFUND = re.compile(r"^(?P<datei>.+?):\d+:\d+: ")
+
+
+      def pruefe_ratchet(befunde: list[str], baseline: dict[str, int]) -> tuple[list[str], dict[str, int]]:
+          aktuell = Counter(
+              treffer["datei"] for zeile in befunde if (treffer := BEFUND.match(zeile))
+          )
+          verstoesse = [
+              f"{datei}: {anzahl} statt höchstens {baseline.get(datei, 0)}"
+              for datei, anzahl in sorted(aktuell.items())
+              if anzahl > baseline.get(datei, 0)
+          ]
+          neue_baseline = {
+              datei: min(erlaubt, aktuell[datei])
+              for datei, erlaubt in baseline.items()
+              if min(erlaubt, aktuell[datei]) > 0
+          }
+          return verstoesse, neue_baseline
+    setup: |
+      BEFUNDE = [
+          "src/radwerk/abrechnung.py:4:35: DTZ005 `datetime.datetime.now()` called without a `tz` argument",
+          "src/radwerk/abrechnung.py:10:13: E722 Do not use bare `except`",
+          "src/radwerk/repo.py:6:11: S608 Possible SQL injection vector through string-based query construction",
+          "Found 3 errors.",
+      ]
+    tests:
+      - name: Unverändert bleibt alles grün
+        code: |
+          baseline = {"src/radwerk/abrechnung.py": 2, "src/radwerk/repo.py": 1}
+          ergebnis = pruefe_ratchet(BEFUNDE, baseline)
+          assert ergebnis == ([], baseline), f"bekommen {ergebnis}"
+      - name: Weniger Befunde verschärfen die Baseline
+        code: |
+          baseline = {"src/radwerk/abrechnung.py": 5, "src/radwerk/repo.py": 1, "src/radwerk/alt.py": 4}
+          verstoesse, neu = pruefe_ratchet(BEFUNDE, baseline)
+          assert verstoesse == [], f"Keine Datei hat mehr Befunde als erlaubt, bekommen {verstoesse}"
+          assert neu == {"src/radwerk/abrechnung.py": 2, "src/radwerk/repo.py": 1}, (
+              f"abrechnung.py hat nur noch 2 Befunde, alt.py keinen mehr – bekommen {neu}"
+          )
+      - name: Mehr Befunde und neue Dateien sind Verstöße
+        code: |
+          verstoesse, neu = pruefe_ratchet(BEFUNDE, {"src/radwerk/abrechnung.py": 1})
+          assert verstoesse == [
+              "src/radwerk/abrechnung.py: 2 statt höchstens 1",
+              "src/radwerk/repo.py: 1 statt höchstens 0",
+          ], f"bekommen {verstoesse}"
+          assert neu == {"src/radwerk/abrechnung.py": 1}, f"Die Baseline darf nicht lockerer werden, bekommen {neu}"
+      - name: Zusammenfassungszeilen zählen nicht
+        code: |
+          ergebnis = pruefe_ratchet(["All checks passed!"], {"src/radwerk/repo.py": 3})
+          assert ergebnis == ([], {}), f"bekommen {ergebnis}"
+    hints:
+      - "Mit `re.match(r\"^(.+?):\\d+:\\d+: \", zeile)` bekommst du den Dateinamen als erste Gruppe; `collections.Counter` zählt je Datei."
+      - Für die neue Baseline gehst du über die **alte** Baseline, nicht über die aktuellen Befunde – sonst kämen neue Dateien hinzu.
+    explanation: |
+      Ein Ratchet macht aus einer Baseline ein Ziel: Bestehende Befunde sind geduldet, neue nicht, und jede Verbesserung wird sofort festgeschrieben. Deshalb geht die neue Baseline nur über die alten Einträge und nimmt das Minimum – sie wird nie lockerer. Pro Datei zu zählen ist ein Kompromiss: Wer einen Befund innerhalb einer Datei verschiebt, fällt nicht auf, wer Code zwischen Dateien verschiebt, muss die Baseline bewusst anpassen. Die CI schreibt die neue Baseline zurück, zum Beispiel als Commit eines Bots oder als Hinweis im PR.
+    resources:
+      - title: basedpyright · Baseline
+        url: https://docs.basedpyright.com/latest/benefits-over-pyright/baseline/
+      - title: Python · collections.Counter
+        url: https://docs.python.org/3/library/collections.html#collections.Counter

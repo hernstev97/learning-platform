@@ -1,0 +1,1080 @@
+id: tests-debuggen
+title: Fehlgeschlagene Tests debuggen
+level: 2
+minutes: 120
+summary: Ein roter Test ist ein Messergebnis, kein Urteil – du liest den Bericht, reproduzierst lokal, prüfst Hypothesen über Test, Code und Umgebung, grenzt mit einem minimalen Test und git bisect run ein und behebst erst dann.
+goals:
+  - Du liest Assertion-Diff, Traceback und Kurzfassung eines pytest-Berichts und unterscheidest einen fehlgeschlagenen Test von einem Fehler in der Vorbereitung.
+  - Du reproduzierst einen roten Test gezielt mit Node-ID, `-k`, `--lf` und `-x` und untersuchst ihn mit `-vv`, `-l`, `--pdb`, `caplog` und `capsys`.
+  - Du entscheidest begründet, ob Test, Code oder Umgebung falsch ist, und prüfst je Experiment genau eine Hypothese.
+  - Du stellst Fehler, die nur in der CI auftreten, lokal nach – Zeitzone, Locale, Reihenfolge, Parallelität, Versionen, Umgebungsvariablen, Dateisystem.
+  - Du machst aus einem Fehlerbericht zuerst einen minimalen roten Test und findest den verursachenden Commit mit `git bisect run`.
+resources:
+  - title: pytest · How to handle test failures
+    url: https://docs.pytest.org/en/stable/how-to/failures.html
+  - title: pytest · How to re-run failed tests
+    url: https://docs.pytest.org/en/stable/how-to/cache.html
+  - title: pytest · Managing pytest’s output
+    url: https://docs.pytest.org/en/stable/how-to/output.html
+  - title: git-bisect
+    url: https://git-scm.com/docs/git-bisect
+  - title: The Debugging Book · Reducing Failure-Inducing Inputs
+    url: https://www.debuggingbook.org/html/DeltaDebugger.html
+lesson: |
+  Freitag, 16:40 Uhr. Lenas Pull Request „Tageshöchstpreis für E-Bikes“ hat sein Approval, nur die CI ist rot: `test_tageshoechstpreis_gilt_je_kalendertag` schlägt fehl. Auf ihrem Laptop ist derselbe Test grün. Drei Reaktionen liegen nahe, und alle drei vernichten Information: den Lauf neu starten, bis er grün wird; den Test mit `@pytest.mark.skip` abschalten; die erwartete Zahl an die Ausgabe anpassen. Danach ist die CI grün, der Fehler bleibt, und kein Test zeigt ihn mehr.
+
+  Dieses Modul zeigt ein Vorgehen, das bei jedem roten Test gleich bleibt, und für jeden Schritt das passende Werkzeug aus pytest und Git. Tests, die ohne Codeänderung mal rot und mal grün sind, behandelt das Modul [Flaky Tests](/testing/flaky-tests).
+
+  ## Die Methode: vom roten CI-Lauf zum Fix
+
+  Ein fehlschlagender Test sagt: „Ich habe X erwartet und Y beobachtet.“ Drei Beteiligte kommen als Ursache in Frage:
+
+  - **Der Test** erwartet etwas Falsches: eine falsch gerechnete Zahl, eine Annahme ohne Grundlage in der Anforderung, Zustand aus einem anderen Test.
+  - **Der Code** verhält sich falsch – der Fall, für den der Test existiert.
+  - **Die Umgebung** ist anders als gedacht: Zeitzone, Sprache, Python-Version, Reihenfolge, fehlende Variablen.
+
+  Wer sofort den Code ändert, hat sich auf die zweite Möglichkeit festgelegt, ohne die anderen zu prüfen. Das Vorgehen hat fünf Schritte:
+
+  | Schritt | Frage | Werkzeuge |
+  | --- | --- | --- |
+  | 1. Lesen | Welcher Test, welche Zeile, welcher Wert gegen welchen? | Assertion-Diff, Traceback, `-vv`, `-l` |
+  | 2. Reproduzieren | Sehe ich denselben Fehler lokal, schnell und jedes Mal? | Node-ID, `-k`, `--lf`, `-x`, Umgebung der CI nachstellen |
+  | 3. Hypothesen prüfen | Test, Code oder Umgebung? Was müsste ich sehen, wenn meine Vermutung stimmt? | `--pdb`, `breakpoint()`, `caplog`, `capsys` |
+  | 4. Eingrenzen | Welche kleinste Eingabe, welcher Commit zeigt den Fehler? | minimaler Test, `git bisect run` |
+  | 5. Beheben | Ist der Test vor der Änderung rot und danach grün? | erst der rote Test, dann der Fix, dann die ganze Suite |
+
+  Eine Hypothese taugt nur, wenn sie eine Beobachtung vorhersagt, die du in einer Minute prüfen kannst. „Irgendwas mit Zeitzonen“ sagt nichts vorher. „Die Fahrt um 0:30 Uhr landet in UTC auf dem Vortag, also enthält das Ergebnis einen Eintrag für den 2. Oktober“ schon. Prüfe pro Experiment eine Vermutung und ändere zwischen zwei Läufen nur eine Sache, sonst weißt du hinterher nicht, was geholfen hat.
+
+  > [!MERKE]
+  > Ein roter Test ist ein Messergebnis, kein Urteil über den Code. Erst lesen und reproduzieren, dann vermuten, dann eine Vermutung nach der anderen prüfen. Geändert wird erst, wenn du die Ursache zeigen kannst.
+
+  ## Den Fehlerbericht lesen: Assertion-Diff und Traceback
+
+  So steht der Fehler im Log der CI. GitHub Actions setzt `CI=true`, und pytest kürzt Vergleiche dann nicht, sondern hängt den vollständigen Diff an ([pytest · CI Pipelines](https://docs.pytest.org/en/stable/explanation/ci.html)):
+
+  ```console
+  $ pytest
+  ============================= test session starts ==============================
+  …
+  collected 6 items
+
+  tests/test_abrechnung.py ....F.                                          [100%]
+
+  =================================== FAILURES ===================================
+  __________________ test_tageshoechstpreis_gilt_je_kalendertag __________________
+
+      def test_tageshoechstpreis_gilt_je_kalendertag():
+          fahrten = [
+              {"start": ts("2026-10-03T00:30+02:00"), "rad": "ebike", "minuten": 180},
+              {"start": ts("2026-10-03T19:00+02:00"), "rad": "ebike", "minuten": 180},
+              {"start": ts("2026-10-04T09:00+02:00"), "rad": "ebike", "minuten": 40},
+          ]
+  >       assert tageskosten(fahrten) == {date(2026, 10, 3): 3000, date(2026, 10, 4): 600}
+  E       assert {datetime.dat..., 10, 4): 600} == {datetime.dat..., 10, 4): 600}
+  E
+  E         Omitting 1 identical items, use -vv to show
+  E         Differing items:
+  E         {datetime.date(2026, 10, 3): 1800} != {datetime.date(2026, 10, 3): 3000}
+  E         Left contains 1 more item:
+  E         {datetime.date(2026, 10, 2): 1800}
+  E
+  E         Full diff:
+  E           {
+  E         -     datetime.date(2026, 10, 3): 3000,
+  E         ?                             ^   ^^
+  E         +     datetime.date(2026, 10, 2): 1800,
+  E         ?                             ^   ^^
+  E         +     datetime.date(2026, 10, 3): 1800,
+  E               datetime.date(2026, 10, 4): 600,
+  E           }
+
+  tests/test_abrechnung.py:27: AssertionError
+  =========================== short test summary info ============================
+  FAILED tests/test_abrechnung.py::test_tageshoechstpreis_gilt_je_kalendertag - assert …
+  ========================= 1 failed, 5 passed in 0.10s ==========================
+  ```
+
+  Fang unten an: ein Test rot, fünf grün, darüber die Node-ID, mit der du ihn gleich reproduzierst. Im Abschnitt `FAILURES` markiert `>` die gescheiterte Zeile, die `E`-Zeilen erklären den Vergleich. Links vom `==` steht hier das Ergebnis, rechts die Erwartung; im `Full diff` steht `-` für die rechte Seite, `+` für die linke.
+
+  Den entscheidenden Hinweis gibt „Left contains 1 more item“: Das Ergebnis enthält einen 2. Oktober, obwohl alle Fahrten am 3. und 4. Oktober deutscher Zeit stattfanden. Es geht also um die Zuordnung von Fahrten zu Kalendertagen, nicht um den Preis.
+
+  > [!WARNING] Die Erwartung nicht an die Ausgabe anpassen
+  > `{date(2026, 10, 2): 1800, …}` als neue Erwartung einzutragen, macht die CI grün und den Test zu einer Beschreibung des Fehlers. Ändere eine Erwartung nur, wenn du an der Anforderung zeigen kannst, dass sie falsch war.
+
+  Nicht jeder rote Test scheitert an einer Assertion. `FAILED` heißt, der Test selbst ist gescheitert – an einem `assert` oder an einer Exception im getesteten Code. `ERROR` heißt, schon die Vorbereitung ist gescheitert, meist eine Fixture; der Test hat nie begonnen. Führe den Block aus und vergleiche die beiden Abschnitte im Bericht:
+
+  ```python pytest fails
+  import json
+
+  import pytest
+
+
+  def rabatt_cent(preis_cent: int, code: str, gutscheine: dict) -> int:
+      gutschein = gutscheine[code]
+      if gutschein["art"] == "prozent":
+          return preis_cent * gutschein["wert"] // 100
+      return min(gutschein["wert"], preis_cent)
+
+
+  @pytest.fixture
+  def gutscheine():
+      return json.loads('{"RW-HERBST": {"art": "prozent", "wert": 10},}')
+
+
+  def test_fester_betrag_hoechstens_preis():
+      gutscheine = {"RW-500EUR": {"art": "betrag", "wert": 50000}}
+      assert rabatt_cent(1500, "RW-500EUR", gutscheine) == 1500
+
+
+  def test_prozent_rabatt():
+      gutscheine = {"RW-HERBST": {"art": "prozent", "wert": 10}}
+      assert rabatt_cent(1500, "rw-herbst", gutscheine) == 150
+
+
+  def test_gutscheine_aus_datei(gutscheine):
+      assert rabatt_cent(1500, "RW-HERBST", gutscheine) == 150
+  ```
+
+  Bei `test_prozent_rabatt` führt der Traceback vom Test in `rabatt_cent`, wo `KeyError: 'rw-herbst'` entsteht. Die unterste Zeile nennt die Exception, die Ebene darüber den Ort. Wo es knallt, liegt aber nicht automatisch der Fehler: Ob Gutscheincodes auch kleingeschrieben gelten, entscheidet die Anforderung, und der Test kann genauso falsch sein wie der Code. `test_gutscheine_aus_datei` ist dagegen nie gelaufen: `ERROR at setup` zeigt, dass die Fixture an einem Komma im JSON scheitert. Bei `ERROR` suchst du in Fixtures, `conftest.py` und Testdaten.
+
+  Die Menge an Details steuerst du mit `--tb=auto|long|short|line|native|no`, mit `-l` (`--showlocals`, lokale Variablen je Frame) und `-vv` (Vergleiche ungekürzt) ([Traceback-Ausgabe](https://docs.pytest.org/en/stable/how-to/output.html#modifying-python-traceback-printing)).
+
+  ## Reproduzieren: denselben Test schnell wieder rot sehen
+
+  Kopiere die Node-ID aus dem Bericht und führe genau diesen Test aus. Sie besteht aus Pfad, `::` und Testname, bei parametrisierten Tests gefolgt von der ID in eckigen Klammern:
+
+  ```console
+  $ pytest tests/test_abrechnung.py::test_tageshoechstpreis_gilt_je_kalendertag -q
+  .                                                                        [100%]
+  1 passed in 0.09s
+  $ TZ=UTC pytest -q --tb=line
+  ....F.                                                                   [100%]
+  =================================== FAILURES ===================================
+  E   assert {datetime.dat..., 10, 4): 600} == {datetime.dat..., 10, 4): 600}
+  …
+  FAILED tests/test_abrechnung.py::test_tageshoechstpreis_gilt_je_kalendertag
+  1 failed, 5 passed in 0.09s
+  ```
+
+  Lokal grün, in der CI rot, bei gleichem Code: Also unterscheidet sich die Umgebung. Lenas Laptop läuft in `Europe/Berlin`, der Runner in UTC. Mit `TZ=UTC` vor dem Befehl ist der Fehler lokal da. Erst jetzt lohnt die Suche nach der Ursache: Einen Fehler, den du nicht auslösen kannst, kannst du auch nicht als behoben nachweisen.
+
+  Dann folgt die Schleife aus Ändern und Ausführen ([Fehlgeschlagene Tests erneut ausführen](https://docs.pytest.org/en/stable/how-to/cache.html#rerunning-only-failures-or-failures-first)):
+
+  | Option | Wirkung |
+  | --- | --- |
+  | `--lf` (`--last-failed`) | nur die Tests, die im letzten Lauf rot waren |
+  | `--ff` (`--failed-first`) | alle Tests, die zuletzt roten zuerst |
+  | `-x` (`--exitfirst`) | beim ersten Fehler aufhören |
+  | `-k "ausdruck"` | nur Tests, deren Name passt; mit `and`, `or`, `not` |
+  | `-s` | `print`-Ausgaben sofort zeigen statt mitschneiden |
+  | `--sw` (`--stepwise`) | beim ersten Fehler aufhören und im nächsten Lauf dort weitermachen |
+
+  ```console
+  $ TZ=UTC pytest --lf -x --tb=no
+  …
+  collected 1 item
+  run-last-failure: rerun previous 1 failure
+
+  tests/test_abrechnung.py F
+
+  =========================== short test summary info ============================
+  FAILED tests/test_abrechnung.py::test_tageshoechstpreis_gilt_je_kalendertag
+  !!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+  ============================== 1 failed in 0.09s ===============================
+  ```
+
+  > [!TIP] Woher `--lf` die roten Tests kennt
+  > pytest merkt sich die Ergebnisse in `.pytest_cache`. In einer frischen CI-Umgebung fehlt es, und `--lf` führt alle Tests aus.
+
+  ## Nur in der CI rot: die Umgebung als Verdächtige
+
+  Ist ein Test lokal grün und in der CI rot, liegt der Unterschied fast immer in der Umgebung. Stelle eine Größe nach der anderen lokal nach:
+
+  | Ursache | Typisches Symptom | Lokal nachstellen |
+  | --- | --- | --- |
+  | Zeitzone | Datumsgrenzen verschieben sich; `date.today()`, `datetime.now()` oder `fromtimestamp()` ohne `tz` nutzen die Zeit des Rechners | `TZ=UTC pytest …` |
+  | Locale | Sortierung mit Umlauten, Zahlen- und Datumsformate, Standard-Encoding von `open()` unter Windows | `LC_ALL=C.UTF-8 pytest …` |
+  | Reihenfolge | Test allein grün, in der ganzen Suite rot | dieselbe Testauswahl wie die CI, bei zufälliger Reihenfolge derselbe Seed |
+  | Parallelität | Tests teilen Dateien, Ports oder Datenbankzeilen; nur die CI läuft mit `pytest -n auto` (pytest-xdist) | mit denselben Worker-Optionen ausführen |
+  | Versionen | anderes Python, Abhängigkeiten ohne Lockfile, anderes Betriebssystem | Versionen aus dem Log vergleichen, `uv sync --locked` |
+  | Umgebungsvariablen | Secrets fehlen bei Pull Requests aus Forks; Code verhält sich mit `CI=true` anders | Variablen aus dem Log setzen oder entfernen |
+  | Dateisystem | `daten/Tarife.json` gegen `daten/tarife.json`: macOS und Windows unterscheiden Groß- und Kleinschreibung standardmäßig nicht, Linux schon | `git ls-files` mit dem Pfad im Code vergleichen |
+
+  Bei Dateinamen schützt dich Python nur beim Import: `import Tarif` findet `tarif.py` auch auf macOS nicht, solange `PYTHONCASEOK` nicht gesetzt ist ([PYTHONCASEOK](https://docs.python.org/3/using/cmdline.html#envvar-PYTHONCASEOK)). Pfade in Strings und Testdaten prüft niemand.
+
+  > [!PRAXIS] Eine CI, die beim Debuggen hilft
+  > Radwerks Pipeline schreibt vor den Tests `python -VV`, `uv pip freeze`, `date` und `locale` ins Log; der Vergleich mit dem Laptop dauert dann Sekunden. pytest läuft mit `-ra` (Kurzfassung aller nicht bestandenen und übersprungenen Tests mit Grund) und `--junitxml`, dessen Bericht die CI als Artefakt aufbewahrt. `-l` nur, wenn in lokalen Variablen keine Secrets stehen können – sonst landen sie im Log.
+
+  ## Hypothesen prüfen: Debugger, Logs und mitgeschnittene Ausgaben
+
+  Für Lenas Test prüfst du die Verdächtigen der Reihe nach. **Test falsch?** Der Tageshöchstpreis gilt je Kalendertag in `Europe/Berlin`; eine Fahrt um 0:30 Uhr am 3. Oktober gehört zum 3. Oktober. Die Erwartung stimmt. **Umgebung?** In UTC rot, in Berlin grün – das erklärt, *wann* der Fehler auftritt, nicht *warum*. **Code?** Vermutung: `tageskosten` rechnet in die lokale Zeit des Rechners um statt nach Berlin. Vorhersage: In UTC hat die erste Fahrt das Datum 2. Oktober.
+
+  `--pdb` öffnet bei einem Fehler den Debugger an der Stelle, an der der Test scheiterte. `p` gibt einen Ausdruck aus, `q` beendet die Sitzung ([--pdb und breakpoint()](https://docs.pytest.org/en/stable/how-to/failures.html#pdb-option)):
+
+  ```console
+  $ TZ=UTC pytest --lf --pdb -q
+  F
+  >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> traceback >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+  …
+  >>>>>>>>>>>>>>>>>> PDB post_mortem (IO-capturing turned off) >>>>>>>>>>>>>>>>>>>
+  > …/tests/test_abrechnung.py(27)test_tageshoechstpreis_gilt_je_kalendertag()
+  -> assert tageskosten(fahrten) == {date(2026, 10, 3): 3000, date(2026, 10, 4): 600}
+  (Pdb) p [datetime.fromtimestamp(f["start"]) for f in fahrten]
+  [datetime.datetime(2026, 10, 2, 22, 30), datetime.datetime(2026, 10, 3, 17, 0), datetime.datetime(2026, 10, 4, 7, 0)]
+  (Pdb) q
+  =========================== short test summary info ============================
+  FAILED tests/test_abrechnung.py::test_tageshoechstpreis_gilt_je_kalendertag
+  !!!!!!!!!!!!!!!!!!! _pytest.outcomes.Exit: Quitting debugger !!!!!!!!!!!!!!!!!!!
+  1 failed in 0.24s
+  ```
+
+  Die erste Fahrt beginnt um 22:30 Uhr am 2. Oktober – die Vorhersage trifft zu. Im Code steht `datetime.fromtimestamp(fahrt["start"]).date()`, und ohne `tz` liefert `fromtimestamp` die lokale Zeit des Rechners ([datetime.fromtimestamp](https://docs.python.org/3/library/datetime.html#datetime.datetime.fromtimestamp)). Willst du schon im getesteten Code anhalten, schreib dort `breakpoint()`; pytest schaltet dann das Mitschneiden ab und öffnet seinen Debugger. In der CI gibt es keinen Debugger; dort zeigt `-l` die lokalen Variablen direkt im Bericht.
+
+  Oft steckt der Beweis in Ausgaben, die pytest ohnehin mitschneidet: Logmeldungen, `stdout` und `stderr` jedes Tests erscheinen bei einem Fehler unter dem Traceback. Mit den Fixtures `caplog` und `capsys` machst du eine solche Beobachtung zur Assertion ([caplog](https://docs.pytest.org/en/stable/how-to/logging.html#caplog-fixture)):
+
+  ```python pytest fails
+  import logging
+
+  log = logging.getLogger("radwerk.webhooks")
+
+
+  def verarbeite(ereignis: dict, zahlungen: dict) -> None:
+      zahlung = ereignis["data"]["id"]
+      if zahlung not in zahlungen:
+          log.warning("Webhook für unbekannte Zahlung %s ignoriert", zahlung)
+          return
+      print(f"{zahlung}: {zahlungen[zahlung]} -> {ereignis['type']}")
+      zahlungen[zahlung] = ereignis["type"].removeprefix("payment.")
+
+
+  def test_unbekannte_zahlung_wird_gemeldet(caplog):
+      verarbeite({"type": "payment.succeeded", "data": {"id": "pay_0000"}}, {})
+      assert "unbekannte Zahlung pay_0000" in caplog.text
+
+
+  def test_erfolgreiche_zahlung(capsys):
+      zahlungen = {"pay_7f3a": "offen"}
+      verarbeite({"type": "payment.succeeded", "data": {"id": "pay_7f3a"}}, zahlungen)
+      assert capsys.readouterr().out == "pay_7f3a: offen -> payment.succeeded\n"
+      assert zahlungen == {"pay_7f3a": "succeeded"}
+
+
+  def test_webhook_aus_dem_ci_log():
+      zahlungen = {"pay_7f3a": "offen"}
+      verarbeite({"type": "payment.succeeded", "data": {"id": "pay_7F3A"}}, zahlungen)
+      assert zahlungen == {"pay_7f3a": "succeeded"}
+  ```
+
+  Die Assertion des dritten Tests sagt nur, dass der Status `offen` blieb. Wer allein sie liest, sucht in der Statuslogik. Den Grund nennt `Captured log call`: Der Webhook kam mit `pay_7F3A`, gespeichert ist `pay_7f3a`. Standardmäßig erscheinen nur Meldungen ab `WARNING`; für `DEBUG` und `INFO` brauchst du `--log-level=DEBUG` oder `caplog.set_level(logging.DEBUG)`.
+
+  ## Eingrenzen: minimaler Test und git bisect run
+
+  Entferne die drei Fahrten aus Lenas Test einzeln und prüfe jedes Mal, ob der Fehler bleibt. Übrig bleibt eine Fahrt um 0:30 Uhr, für die `tageskosten` in UTC `{date(2026, 10, 2): 1800}` liefert. Der Tageshöchstpreis spielte nie eine Rolle. Dieses systematische Weglassen heißt Delta Debugging ([Reducing Failure-Inducing Inputs](https://www.debuggingbook.org/html/DeltaDebugger.html)); Hypothesis erledigt es beim Shrinking automatisch (siehe [Property-based Testing](/testing/property-based-testing)).
+
+  Der minimale Test soll auf jedem Rechner rot sein, nicht nur in UTC. Deshalb stellt eine Fixture die Zeitzone des Prozesses um; `time.tzset()` übernimmt die geänderte Variable `TZ` und existiert nur unter Unix ([time.tzset](https://docs.python.org/3/library/time.html#time.tzset)):
+
+  ```python
+  import time
+  from datetime import date, datetime
+
+  import pytest
+
+  from radwerk.abrechnung import tageskosten
+
+
+  @pytest.fixture(params=["UTC", "Europe/Berlin", "America/New_York"])
+  def rechner_zeitzone(request):
+      with pytest.MonkeyPatch.context() as mp:
+          mp.setenv("TZ", request.param)
+          time.tzset()
+          yield request.param
+      time.tzset()
+
+
+  def test_fahrt_kurz_nach_mitternacht_zaehlt_zum_neuen_tag(rechner_zeitzone):
+      start = datetime.fromisoformat("2026-10-03T00:30+02:00").timestamp()
+      fahrten = [{"start": start, "rad": "ebike", "minuten": 180}]
+      assert tageskosten(fahrten) == {date(2026, 10, 3): 1800}
+  ```
+
+  Der zweite `tzset()` stellt den Prozess nach dem `with`-Block zurück. Auf dem Laptop in Berlin ist der Test jetzt zweimal rot:
+
+  ```console
+  $ pytest tests/test_zeitzone.py -q --tb=no
+  F.F                                                                      [100%]
+  =========================== short test summary info ============================
+  FAILED tests/test_zeitzone.py::test_fahrt_kurz_nach_mitternacht_zaehlt_zum_neuen_tag[UTC]
+  FAILED tests/test_zeitzone.py::test_fahrt_kurz_nach_mitternacht_zaehlt_zum_neuen_tag[America/New_York]
+  2 failed, 1 passed in 0.09s
+  ```
+
+  Seit wann gibt es den Fehler? Release `v1.4.0` hat richtig abgerechnet. `git bisect run` sucht binär zwischen einem guten und einem schlechten Commit und führt bei jedem Schritt einen Befehl aus: Exit-Code 0 heißt gut, 125 überspringen, 1 bis 127 sonst schlecht. Ab 128, etwa wenn ein Signal den Befehl beendet, bricht Git die ganze Suche ab ([git-bisect · bisect run](https://git-scm.com/docs/git-bisect#_bisect_run), Grundlagen im Modul [Bisect und Historie](/git/bisect-historie)). pytest endet mit 0, wenn alles grün ist, und mit 1 bei roten Tests – aber auch mit 2 bei Fehlern beim Sammeln, 3 bei internen Fehlern, 4 bei Bedienfehlern wie einer fehlenden Datei und 5, wenn kein Test gefunden wurde ([Exit codes](https://docs.pytest.org/en/stable/reference/exit-codes.html)). Für Bisect ist all das „schlecht“.
+
+  ```console
+  $ cp tests/test_zeitzone.py ..
+  $ git bisect start HEAD v1.4.0
+  Bisecting: 3 revisions left to test after this (roughly 2 steps)
+  [9b19311261615009c697967dc8f6c486877c39c2] Abrechnung: Tag in Hilfsfunktion auslagern
+  $ git bisect run python -m pytest -q --tb=no ../test_zeitzone.py
+  running 'python' '-m' 'pytest' '-q' '--tb=no' '../test_zeitzone.py'
+  F.F                                                                      [100%]
+  …
+  Bisecting: 0 revisions left to test after this (roughly 1 step)
+  [8d326a0c327a4883a7b355be710bd4d9ac60e3cb] Gutscheincodes prüfen
+  running 'python' '-m' 'pytest' '-q' '--tb=no' '../test_zeitzone.py'
+  ...                                                                      [100%]
+  3 passed in 0.09s
+  9b19311261615009c697967dc8f6c486877c39c2 is the first 'bad' commit
+  commit 9b19311261615009c697967dc8f6c486877c39c2
+  …
+      Abrechnung: Tag in Hilfsfunktion auslagern
+  …
+  bisect found first 'bad' commit
+  $ git bisect reset
+  ```
+
+  Zwei Details entscheiden über das Ergebnis. Der Test liegt als Kopie außerhalb des Repositorys, denn er steckt nur im neuesten Commit; mit `tests/test_zeitzone.py` endet pytest in älteren Commits mit Exit-Code 4. Und es heißt `python -m pytest`. Im Projekt macht `pythonpath = ["."]` in der `pyproject.toml` das Paket `radwerk` importierbar. Für eine Testdatei außerhalb des Repositorys sucht pytest seine Konfiguration aber von `..` aus nach oben und findet diese Datei nicht. Mit `pytest` allein scheitert `import radwerk` deshalb beim Sammeln, Exit-Code 2. `python -m` setzt dagegen das aktuelle Verzeichnis auf `sys.path` ([python -m pytest](https://docs.pytest.org/en/stable/how-to/usage.html#invoke-python)). Beide Fehler führen zum selben falschen Ergebnis: Bisect beschuldigt „README ergänzt“, den ersten Commit nach `v1.4.0`.
+
+  Der gefundene Commit hat die Tagesberechnung in `_tag()` ausgelagert und dabei die Zeitzone verloren. Erst jetzt kommt der Fix, mit einem Test, der vorher rot war:
+
+  ```diff
+   def _tag(zeitstempel: float) -> date:
+  -    return datetime.fromtimestamp(zeitstempel).date()
+  +    return datetime.fromtimestamp(zeitstempel, BERLIN).date()
+  ```
+
+  Danach läuft die ganze Suite, auch in UTC: `TZ=UTC pytest -q` meldet `9 passed`. Der Regressionstest bleibt. Er beschreibt eine Regel („eine Fahrt zählt zum Kalendertag in Berlin“) und schlägt auf jedem Rechner an, sobald jemand die Zeitzone wieder vergisst.
+
+  > [!INTERVIEW] „Ein Test ist in der CI rot und lokal grün. Wie gehst du vor?“
+  > Ich lese den vollständigen Bericht und führe lokal den Befehl der CI mit den Versionen aus dem Lockfile aus. Ist er grün, variiere ich eine Größe nach der anderen – Zeitzone, Locale, Testauswahl, Parallelität, Umgebungsvariablen –, bis ich den Fehler sehe. Dann prüfe ich Hypothesen mit je einem Experiment. Vor dem Fix schreibe ich einen minimalen Test, der auf jedem Rechner rot ist; bei einer Regression finde ich den Commit mit `git bisect run`. Zum Schluss schreibt die CI ihre Umgebung ins Log.
+
+  ## Häufige Fehler
+
+  - **Neu starten, bis die CI grün ist.** Ein grüner zweiter Lauf beweist nichts, wenn der Fehler von Uhrzeit, Reihenfolge oder Last abhängt.
+  - **Die Erwartung an die Ausgabe anpassen.** Der Test beschreibt danach den Fehler. Eine Erwartung ändert sich nur mit einem Beleg aus der Anforderung.
+  - **Nur den einzelnen Test ausführen.** Ein Test, der in der Suite rot ist, kann allein grün sein, weil ein anderer Test Zustand hinterlässt. Reproduziere mit der Testauswahl der CI.
+  - **Beim ersten Frame des Tracebacks stehen bleiben.** Die Ursache steht meist im letzten Frame deines eigenen Codes – oder gar nicht im Traceback, sondern in einer Fixture (`ERROR at setup`) oder in den mitgeschnittenen Logs.
+  - **`git bisect run pytest` ohne Blick auf die Exit-Codes.** Fehlt der Test in alten Commits oder scheitert der Import, meldet pytest 2 bis 5, und Bisect beschuldigt einen unschuldigen Commit.
+  - **Fix ohne roten Test.** Wer den Test nie rot gesehen hat, weiß nicht, ob er den Fehler überhaupt zeigt.
+
+  ## Zusammenfassung
+
+  - Ein roter Test meldet eine Abweichung zwischen Erwartung und Verhalten. Verdächtig sind Test, Code und Umgebung; prüfe alle drei, bevor du etwas änderst.
+  - Den Bericht von unten lesen; die `E`-Zeilen zeigen beide Seiten des Vergleichs. `FAILED` heißt Test gescheitert, `ERROR` Vorbereitung gescheitert.
+  - Reproduzieren mit Node-ID, `-k`, `--lf`, `--ff` und `-x`; untersuchen mit `-vv`, `-l`, `--tb=…`, `-s`, `--pdb`, `breakpoint()`, `caplog` und `capsys`.
+  - Lokal grün, CI rot: Zeitzone, Locale, Reihenfolge, Parallelität, Versionen, Umgebungsvariablen und Groß-/Kleinschreibung einzeln nachstellen.
+  - Eine Hypothese sagt eine Beobachtung vorher. Minimiere durch Weglassen; der minimale Test ist auf jedem Rechner rot.
+  - `git bisect run python -m pytest ../test.py` findet den verursachenden Commit. Endet pytest mit 2 bis 5, zählt Bisect den Commit als „schlecht“; ein kleines Skript übersetzt diese Codes in 125 (überspringen).
+  - Erst der rote Test, dann der Fix, dann die ganze Suite. Der Test bleibt.
+exercises:
+  - id: erster-schritt
+    type: choice
+    title: Rot in der CI, grün auf dem Laptop
+    prompt: |
+      Freitagnachmittag. In der CI ist `test_gutschein_gilt_bis_einschliesslich_ablaufdatum` rot, auf deinem Laptop grün. Der Pull Request soll heute noch gemergt werden. Welche Schritte sind jetzt sinnvoll?
+    options:
+      - text: Den vollständigen Bericht im CI-Log lesen – welche Werte verglichen wurden und in welcher Zeile.
+        correct: true
+        why: Der Bericht enthält die Node-ID, den Vergleich und oft schon den entscheidenden Hinweis. Alles Weitere baut darauf auf.
+      - text: Lokal mit dem Befehl, der Python-Version und den Abhängigkeiten der CI ausführen und dann Unterschiede wie Zeitzone oder Locale einzeln nachstellen.
+        correct: true
+        why: Lokal grün bei gleichem Code heißt, dass sich die Umgebung unterscheidet. Bei einem Ablaufdatum ist eine Datumsgrenze in UTC ein naheliegender Kandidat.
+      - text: Den Job neu starten. Ist er dann grün, war es ein Ausreißer.
+        correct: false
+        why: Ein zweiter grüner Lauf beweist nichts. Ein Datumsfehler ist nach Mitternacht UTC wieder da – dann vielleicht schon in Produktion.
+      - text: Die erwartete Zahl im Test durch den Wert aus dem CI-Log ersetzen.
+        correct: false
+        why: Dann beschreibt der Test den Fehler, und auf deinem Laptop wird er rot. Eine Erwartung ändert sich nur mit einem Beleg aus der Anforderung.
+      - text: Den Test mit `skipif` überspringen, sobald die Umgebungsvariable `CI` gesetzt ist.
+        correct: false
+        why: Die CI läuft wie die Server in Produktion unter Linux und meist in UTC. Wer den Test dort abschaltet, versteckt den Fehler genau in der Umgebung, die zählt.
+    explanation: |
+      Der rote Lauf in der CI ist die wertvollste Information, die du gerade hast. Neu starten, Erwartung anpassen und Überspringen löschen sie. Lesen und Reproduzieren kosten ein paar Minuten und sagen dir, ob Test, Code oder Umgebung schuld ist. Gerade bei Datumsregeln wie „gültig bis einschließlich Ablaufdatum“ liegt die Ursache oft in der Zeitzone: Auf dem Laptop läuft Europe/Berlin, in der CI UTC.
+    resources:
+      - title: pytest · CI Pipelines
+        url: https://docs.pytest.org/en/stable/explanation/ci.html
+
+  - id: ebene-fuer-den-repro-test
+    type: choice
+    title: Wo gehört der rote Test hin?
+    prompt: |
+      Die Buchhaltung meldet: Eine Fahrt mit dem City-Rad am 25. Oktober 2026 (Ende der Sommerzeit) dauerte laut Server-Log von `2026-10-25T01:50+02:00` bis `2026-10-25T02:20+01:00`, also 90 Minuten. Berechnet wurden 150 Cent. Regel: 150 Cent je angefangene 30 Minuten.
+
+      Du hast schon herausgefunden: Die App schickt beide Zeitpunkte korrekt mit Offset, die API speichert sie korrekt. Die Funktion `fahrtdauer_minuten(start, ende)` wandelt beide nach `Europe/Berlin` um und zieht sie voneinander ab. Welchen Test schreibst du zuerst?
+    options:
+      - text: Einen Unit-Test für `fahrtdauer_minuten` mit genau diesen beiden Zeitpunkten, Erwartung 90.
+        correct: true
+        why: Die Ursache liegt in einer reinen Funktion. Der Test läuft in Millisekunden, ist deterministisch, zeigt im Fehlerfall genau die Regel und läuft in jedem Pull Request.
+      - text: Einen API-Test, der die Fahrt per HTTP anlegt und den Preis in der Antwort prüft.
+        correct: false
+        why: Er würde den Fehler auch zeigen, bringt aber Datenbank, Authentifizierung und Serialisierung mit, die nachweislich funktionieren. Er lohnt sich, wenn der Offset an der API-Grenze verloren gehen kann – das hast du schon ausgeschlossen.
+      - text: Einen End-to-End-Test auf einem Android-Emulator mit Gerätezeit am 25. Oktober.
+        correct: false
+        why: Teuer, langsam und anfällig. Er prüft dasselbe Risiko mit viel mehr beweglichen Teilen, und wenn er rot wird, weißt du nicht, wo.
+      - text: Keinen neuen Test – die Ursache ist bekannt, der Fix ist eine Zeile.
+        correct: false
+        why: Ohne roten Test weißt du nicht, ob der Fix wirkt, und nichts hält die nächste Änderung davon ab, den Fehler zurückzubringen.
+    explanation: |
+      Teste ein Risiko auf der niedrigsten Ebene, die es zuverlässig zeigt. Die Eingrenzung hat ergeben, dass die Zeitpunkte richtig ankommen und der Fehler in der Rechnung steckt. Python rechnet die Differenz zweier `datetime`-Werte mit **derselben** `tzinfo` als Wanduhrzeit: 02:20 minus 01:50 ergibt 30 Minuten, obwohl dazwischen die Uhr zurückgestellt wurde. Ein Unit-Test mit den beiden Zeitpunkten aus dem Log ist rot, bis die Funktion in UTC rechnet, und bleibt als Regressionstest für jede Zeitumstellung stehen.
+    resources:
+      - title: Python · datetime-Objekte (Arithmetik)
+        url: https://docs.python.org/3/library/datetime.html#datetime-objects
+
+  - id: utc-oder-berlin
+    type: output
+    title: Welcher Tag ist es?
+    prompt: |
+      Fahrten werden in UTC gespeichert, der Tageshöchstpreis gilt je Kalendertag in Berlin. Was gibt das Programm aus?
+    lang: python
+    code: |
+      from datetime import datetime, timezone
+      from zoneinfo import ZoneInfo
+
+      BERLIN = ZoneInfo("Europe/Berlin")
+      for start in [
+          datetime(2026, 10, 2, 22, 30, tzinfo=timezone.utc),
+          datetime(2026, 12, 2, 22, 30, tzinfo=timezone.utc),
+          datetime(2026, 12, 2, 23, 30, tzinfo=timezone.utc),
+      ]:
+          print(start.date(), start.astimezone(BERLIN).date())
+    expected: |
+      2026-10-02 2026-10-03
+      2026-12-02 2026-12-02
+      2026-12-02 2026-12-03
+    explanation: |
+      `start.date()` liefert das Datum in der Zeitzone des Objekts, hier UTC. Erst `astimezone(BERLIN)` rechnet um. Anfang Oktober gilt in Berlin Sommerzeit (UTC+2), 22:30 UTC ist also 0:30 Uhr am nächsten Tag. Im Dezember gilt Winterzeit (UTC+1): 22:30 UTC ist 23:30 Uhr am selben Tag, erst 23:30 UTC rutscht über Mitternacht. Ein Test, der eine Fahrt um 22:30 UTC am heutigen Tag anlegt, zeigt einen Fehler bei der Tageszuordnung deshalb nur im Sommerhalbjahr. Solche Fehler fallen auf, wenn ein Test zufällig zur „richtigen“ Jahreszeit läuft, und verschwinden dann wieder. Feste Daten aus beiden Hälften des Jahres zeigen sie jedes Mal.
+    resources:
+      - title: Python · datetime.astimezone
+        url: https://docs.python.org/3/library/datetime.html#datetime.datetime.astimezone
+      - title: Python · zoneinfo
+        url: https://docs.python.org/3/library/zoneinfo.html#using-zoneinfo
+
+  - id: geteilte-standardliste
+    type: output
+    title: Allein grün, zusammen rot
+    prompt: |
+      Die beiden Funktionen `test_…` stehen für zwei Tests derselben Suite, die nacheinander im selben Prozess laufen. Was gibt das Programm aus?
+    lang: python
+    code: |
+      def neue_buchung(kunde, gutscheine=[]):
+          return {"kunde": kunde, "gutscheine": gutscheine}
+
+
+      def test_ohne_gutschein():
+          buchung = neue_buchung("tom")
+          return buchung["gutscheine"] == []
+
+
+      def test_mit_gutschein():
+          buchung = neue_buchung("lena")
+          buchung["gutscheine"].append("RW-HERBST")
+          return buchung["gutscheine"] == ["RW-HERBST"]
+
+
+      print(test_ohne_gutschein(), test_mit_gutschein())
+      print(test_mit_gutschein(), test_ohne_gutschein())
+      print(neue_buchung("mia"))
+    expected: |
+      True True
+      False False
+      {'kunde': 'mia', 'gutscheine': ['RW-HERBST', 'RW-HERBST']}
+    explanation: |
+      Der Standardwert `[]` entsteht einmal beim Definieren der Funktion, nicht bei jedem Aufruf; alle Buchungen ohne eigene Liste teilen sich dieselbe. In der ersten Zeile ist sie noch leer, `test_mit_gutschein` hängt `RW-HERBST` an. In der zweiten Zeile hängt derselbe Test einen zweiten Code an, und `test_ohne_gutschein` sieht zwei Einträge. Rot wird also `test_ohne_gutschein`, obwohl er nichts verändert, und einzeln ist jeder Test grün – deshalb reproduzierst du mit der Testauswahl der CI. Der Fix: `gutscheine=None` und im Rumpf `gutscheine = [] if gutscheine is None else gutscheine`.
+    resources:
+      - title: Python-Tutorial · Standardwerte von Argumenten
+        url: https://docs.python.org/3/tutorial/controlflow.html#default-argument-values
+
+  - id: nur-die-roten
+    type: command
+    title: Nur die Roten, und schnell
+    prompt: |
+      Du arbeitest an einem Fix. Führe nur die Tests aus, die im letzten Lauf fehlgeschlagen sind, und brich beim ersten Fehler ab.
+    context: Du bist im Projektverzeichnis. Der letzte Lauf von `pytest` hatte drei rote Tests, `.pytest_cache` existiert.
+    answers: ["pytest --lf -x", "pytest -x --lf", "pytest --lf --exitfirst", "pytest --exitfirst --lf", "pytest --lf --maxfail=1", "pytest --maxfail=1 --lf", "pytest --last-failed -x", "pytest -x --last-failed", "pytest --last-failed --exitfirst", "pytest --exitfirst --last-failed", "pytest --last-failed --maxfail=1", "pytest --maxfail=1 --last-failed", "python -m pytest --lf -x", "python -m pytest -x --lf", "python -m pytest --lf --exitfirst", "python -m pytest --exitfirst --lf", "python -m pytest --lf --maxfail=1", "python -m pytest --maxfail=1 --lf", "python -m pytest --last-failed -x", "python -m pytest -x --last-failed", "python -m pytest --last-failed --exitfirst", "python -m pytest --exitfirst --last-failed", "python -m pytest --last-failed --maxfail=1", "python -m pytest --maxfail=1 --last-failed", "python3 -m pytest --lf -x", "python3 -m pytest -x --lf", "python3 -m pytest --lf --exitfirst", "python3 -m pytest --exitfirst --lf", "python3 -m pytest --lf --maxfail=1", "python3 -m pytest --maxfail=1 --lf", "python3 -m pytest --last-failed -x", "python3 -m pytest -x --last-failed", "python3 -m pytest --last-failed --exitfirst", "python3 -m pytest --exitfirst --last-failed", "python3 -m pytest --last-failed --maxfail=1", "python3 -m pytest --maxfail=1 --last-failed", "uv run pytest --lf -x", "uv run pytest -x --lf", "uv run pytest --lf --exitfirst", "uv run pytest --exitfirst --lf", "uv run pytest --lf --maxfail=1", "uv run pytest --maxfail=1 --lf", "uv run pytest --last-failed -x", "uv run pytest -x --last-failed", "uv run pytest --last-failed --exitfirst", "uv run pytest --exitfirst --last-failed", "uv run pytest --last-failed --maxfail=1", "uv run pytest --maxfail=1 --last-failed"]
+    explanation: |
+      `--lf` (`--last-failed`) liest aus `.pytest_cache`, welche Tests zuletzt rot waren, und führt nur diese aus. `-x` (`--exitfirst`, gleichwertig `--maxfail=1`) hört beim ersten Fehler auf. Zusammen ergibt das die kürzeste Schleife beim Beheben: ändern, `pytest --lf -x`, wieder ändern. Sind alle Roten grün, führt `--lf` beim nächsten Mal wieder alle Tests aus – dann läuft die ganze Suite, und du siehst, ob der Fix etwas anderes kaputt gemacht hat.
+    resources:
+      - title: pytest · Rerunning only failures
+        url: https://docs.pytest.org/en/stable/how-to/cache.html#rerunning-only-failures-or-failures-first
+      - title: pytest · Stopping after the first failure
+        url: https://docs.pytest.org/en/stable/how-to/failures.html#maxfail
+
+  - id: einen-fall-genau
+    type: command
+    title: Ein einziger Fall, ganz ausführlich
+    prompt: |
+      Von den sechs Fällen des parametrisierten Tests `test_ebike_preis` in `tests/test_tarif.py` interessiert dich nur der mit der ID `33-True-300`. Führe genau diesen Fall über seine Node-ID aus, mit doppelt erhöhter Ausführlichkeit, damit nichts gekürzt wird.
+    context: Du bist im Projektverzeichnis.
+    answers: ["pytest \"tests/test_tarif.py::test_ebike_preis[33-True-300]\" -vv", "pytest -vv \"tests/test_tarif.py::test_ebike_preis[33-True-300]\"", "pytest tests/test_tarif.py::test_ebike_preis[33-True-300] -vv", "pytest -vv tests/test_tarif.py::test_ebike_preis[33-True-300]", "python -m pytest \"tests/test_tarif.py::test_ebike_preis[33-True-300]\" -vv", "python -m pytest -vv \"tests/test_tarif.py::test_ebike_preis[33-True-300]\"", "python -m pytest tests/test_tarif.py::test_ebike_preis[33-True-300] -vv", "python -m pytest -vv tests/test_tarif.py::test_ebike_preis[33-True-300]", "python3 -m pytest \"tests/test_tarif.py::test_ebike_preis[33-True-300]\" -vv", "python3 -m pytest -vv \"tests/test_tarif.py::test_ebike_preis[33-True-300]\"", "python3 -m pytest tests/test_tarif.py::test_ebike_preis[33-True-300] -vv", "python3 -m pytest -vv tests/test_tarif.py::test_ebike_preis[33-True-300]", "uv run pytest \"tests/test_tarif.py::test_ebike_preis[33-True-300]\" -vv", "uv run pytest -vv \"tests/test_tarif.py::test_ebike_preis[33-True-300]\"", "uv run pytest tests/test_tarif.py::test_ebike_preis[33-True-300] -vv", "uv run pytest -vv tests/test_tarif.py::test_ebike_preis[33-True-300]"]
+    output: |
+      ============================= test session starts ==============================
+      platform linux -- Python 3.14.7, pytest-9.0.2, pluggy-1.6.0 -- …/python
+      …
+      collecting ... collected 1 item
+
+      tests/test_tarif.py::test_ebike_preis[33-True-300] FAILED                [100%]
+
+      =================================== FAILURES ===================================
+      ________________________ test_ebike_preis[33-True-300] _________________________
+
+      minuten = 33, plus = True, cent = 300
+      …
+          def test_ebike_preis(minuten, plus, cent):
+      >       assert ebike_preis(minuten, plus) == cent
+      E       assert 0 == 300
+      E        +  where 0 = ebike_preis(33, True)
+
+      tests/test_tarif.py:18: AssertionError
+      =========================== short test summary info ============================
+      FAILED tests/test_tarif.py::test_ebike_preis[33-True-300] - assert 0 == 300
+       +  where 0 = ebike_preis(33, True)
+      ============================== 1 failed in 0.09s ===============================
+    explanation: |
+      Die Node-ID eines parametrisierten Falls ist Pfad, `::`, Testname und die ID in eckigen Klammern; pytest bildet sie aus den Parametern oder aus `ids=`. Eckige Klammern sind für bash und zsh ein Muster für Dateinamen. bash reicht ein Muster ohne Treffer unverändert weiter, zsh bricht mit „no matches found“ ab. Mit Anführungszeichen bist du in jeder Shell sicher. `-vv` zeigt Vergleiche ungekürzt; bei `-v` wird ab einer gewissen Länge abgeschnitten. Die Argumente `minuten`, `plus` und `cent` zeigt der lange Traceback ohnehin über dem Code; `-l` würde alle übrigen lokalen Variablen ergänzen.
+    resources:
+      - title: pytest · Specifying which tests to run
+        url: https://docs.pytest.org/en/stable/how-to/usage.html#select-tests
+      - title: pytest · Verbosity
+        url: https://docs.pytest.org/en/stable/how-to/output.html#verbosity
+
+  - id: bisect-mit-pytest
+    type: command
+    title: Git sucht, pytest urteilt
+    prompt: |
+      Lass Git die Suche nach dem Commit, der die Tagesgrenze kaputt gemacht hat, selbst zu Ende führen: Bei jedem Schritt soll pytest den Regressionstest ausführen. Das Paket `radwerk` liegt im Repository und muss importierbar sein, obwohl der Test außerhalb liegt. Optional darfst du `-q` oder `-x` ergänzen, sonst keine Optionen.
+    context: |
+      Du bist im Repository `radwerk-backend`. Den Regressionstest hast du nach `../test_zeitzone.py` kopiert, die Suche läuft schon (`git bisect start HEAD v1.4.0`). Im Repository macht `pythonpath = ["."]` in der `pyproject.toml` das Paket importierbar. Außerhalb des Repositorys gibt es keine `pytest.ini`, `pyproject.toml` oder `conftest.py`.
+    answers: ["git bisect run python -m pytest ../test_zeitzone.py", "git bisect run python -m pytest -q ../test_zeitzone.py", "git bisect run python -m pytest ../test_zeitzone.py -q", "git bisect run python -m pytest -x ../test_zeitzone.py", "git bisect run python -m pytest ../test_zeitzone.py -x", "git bisect run python -m pytest -q -x ../test_zeitzone.py", "git bisect run python -m pytest ../test_zeitzone.py -q -x", "git bisect run python3 -m pytest ../test_zeitzone.py", "git bisect run python3 -m pytest -q ../test_zeitzone.py", "git bisect run python3 -m pytest ../test_zeitzone.py -q", "git bisect run python3 -m pytest -x ../test_zeitzone.py", "git bisect run python3 -m pytest ../test_zeitzone.py -x", "git bisect run python3 -m pytest -q -x ../test_zeitzone.py", "git bisect run python3 -m pytest ../test_zeitzone.py -q -x", "git bisect run uv run python -m pytest ../test_zeitzone.py", "git bisect run uv run python -m pytest -q ../test_zeitzone.py", "git bisect run uv run python -m pytest ../test_zeitzone.py -q", "git bisect run uv run python -m pytest -x ../test_zeitzone.py", "git bisect run uv run python -m pytest ../test_zeitzone.py -x", "git bisect run uv run python -m pytest -q -x ../test_zeitzone.py", "git bisect run uv run python -m pytest ../test_zeitzone.py -q -x"]
+    output: |
+      running 'python' '-m' 'pytest' '../test_zeitzone.py'
+      …
+      9b19311261615009c697967dc8f6c486877c39c2 is the first 'bad' commit
+      commit 9b19311261615009c697967dc8f6c486877c39c2
+      Author: Lena Wolf <lena@radwerk.example>
+      Date:   Tue Sep 15 10:00:00 2026 +0200
+
+          Abrechnung: Tag in Hilfsfunktion auslagern
+      …
+      bisect found first 'bad' commit
+    explanation: |
+      `git bisect run` führt den Befehl nach jedem Checkout aus und wertet den Exit-Code aus: 0 gut, 1 schlecht – das sind genau die Codes, mit denen pytest „alles grün“ und „Tests rot“ meldet. `python -m pytest` setzt das aktuelle Verzeichnis, also das Repository, auf `sys.path`. Mit `pytest` allein sucht pytest die Konfiguration von `..` aus nach oben, `pythonpath = ["."]` aus der `pyproject.toml` des Repositorys gilt also nicht. `import radwerk` scheitert beim Sammeln, pytest endet mit 2, und Bisect hält jeden Commit für schlecht. Der Test liegt außerhalb, weil ältere Commits ihn nicht enthalten. Danach `git bisect reset`.
+    resources:
+      - title: git-bisect · bisect run
+        url: https://git-scm.com/docs/git-bisect#_bisect_run
+      - title: pytest · Calling pytest through python -m pytest
+        url: https://docs.pytest.org/en/stable/how-to/usage.html#invoke-python
+
+  - id: bugreport-zu-test
+    type: code
+    title: Vom Bugreport zum roten Test
+    prompt: |
+      Ein Ticket aus dem Support:
+
+      > Kundennummer 48213, App 4.12 auf Android 15, Zahlung per PayPal. Am Samstag, 3. Oktober: 9:12 Uhr E-Bike ab Hauptbahnhof, 8 Minuten. 10:05 Uhr City-Rad ab Altstadt, 4 Stunden 10 Minuten. 16:40 Uhr City-Rad ab Uni-Campus, 3 Stunden. Abgebucht wurden 25,50 €. Laut Preisliste kostet das City-Rad höchstens 15 € am Tag, und E-Bike bin ich nur 8 Minuten gefahren.
+
+      `tagespreis(fahrten)` aus `abrechnung.py` berechnet den Preis eines Kalendertags in Cent. `fahrten` ist eine Liste von Paaren `(rad, minuten)` in der Reihenfolge der Fahrten, `rad` ist `"city"` oder `"ebike"`. Die Regeln:
+
+      - City-Rad 150 Cent, E-Bike 300 Cent je angefangene 30 Minuten.
+      - Fahrten bis einschließlich 5 Minuten kosten 0 Cent.
+      - Tageshöchstpreis je Radtyp: Die City-Rad-Fahrten eines Tages kosten zusammen höchstens 1 500 Cent, die E-Bike-Fahrten höchstens 3 000 Cent.
+
+      Bevor jemand den Code anfasst, schreibst du einen **minimalen** pytest-Test, der den Fehler aus dem Ticket zeigt: rot gegen den aktuellen Code, grün gegen eine korrigierte Fassung. Lass weg, was für den Fehler keine Rolle spielt. Die Prüfung führt deinen Test gegen beide Fassungen aus.
+    lang: python
+    setup: |
+      from pathlib import Path
+
+      RICHTIG = '''
+      TAKT_CENT = {"city": 150, "ebike": 300}
+      DECKEL_CENT = {"city": 1500, "ebike": 3000}
+
+
+      def fahrtpreis(rad, minuten):
+          if minuten <= 5:
+              return 0
+          return -(-minuten // 30) * TAKT_CENT[rad]
+
+
+      def tagespreis(fahrten):
+          gesamt = 0
+          for rad, deckel in DECKEL_CENT.items():
+              summe = sum(fahrtpreis(r, minuten) for r, minuten in fahrten if r == rad)
+              gesamt += min(summe, deckel)
+          return gesamt
+      '''
+      AKTUELL = RICHTIG.replace(
+          '''    gesamt = 0
+          for rad, deckel in DECKEL_CENT.items():
+              summe = sum(fahrtpreis(r, minuten) for r, minuten in fahrten if r == rad)
+              gesamt += min(summe, deckel)
+          return gesamt''',
+          '''    summe = sum(fahrtpreis(rad, minuten) for rad, minuten in fahrten)
+          deckel = DECKEL_CENT[fahrten[0][0]] if fahrten else 0
+          return min(summe, deckel)''',
+      )
+      assert AKTUELL != RICHTIG, "Die fehlerhafte Fassung ist identisch mit der richtigen."
+      Path("abrechnung.py").write_text(RICHTIG)
+    starter: |
+      from abrechnung import tagespreis
+
+
+      def test_tageshoechstpreis_city_rad():
+          ...
+    solution: |
+      from abrechnung import tagespreis
+
+
+      def test_city_deckel_gilt_auch_nach_einer_ebike_fahrt():
+          # E-Bike zuerst: 300 Cent. City-Rad 330 Minuten: 11 Takte = 1650, gedeckelt auf 1500.
+          assert tagespreis([("ebike", 10), ("city", 330)]) == 1800
+    tests:
+      - name: Grün gegen die korrigierte Abrechnung
+        code: |
+          lauf = run_pytest({"abrechnung.py": RICHTIG})
+          assert lauf.ok, lauf.output
+      - name: Rot gegen den Code aus dem Ticket
+        code: |
+          lauf = run_pytest({"abrechnung.py": AKTUELL})
+          assert not lauf.ok, "Dein Test bleibt gegen den aktuellen Code grün. Er zeigt den Fehler aus dem Ticket also nicht. Welche Angabe aus dem Ticket hast du weggelassen, die doch eine Rolle spielt?"
+    hints:
+      - Rechne das Ticket nach den Regeln nach. Was hätte die Kundin zahlen müssen, und wie kommt man auf 25,50 €?
+      - 25,50 € ist die Summe aller drei Fahrten ohne jeden Deckel – und sie liegt unter 30 €, dem Deckel des E-Bikes. Welche Fahrt war die erste des Tages?
+      - Zwei Fahrten genügen, eine E-Bike-Fahrt zuerst, dann eine City-Rad-Fahrt über 1 500 Cent, etwa `[("ebike", 10), ("city", 330)]` → 300 + 1 500 = 1 800.
+    explanation: |
+      Nach den Regeln kostet der Tag 300 Cent für das E-Bike und 1 500 Cent für das City-Rad (1 350 + 900, gedeckelt), zusammen 18,00 €. 25,50 € ist die ungedeckelte Summe: Der aktuelle Code nimmt den Deckel des **ersten** Rads des Tages für alle Fahrten. Weil die Kundin mit dem E-Bike begann, galten 3 000 Cent, und die lagen über der Summe. Für den Test unwichtig sind Kundennummer, App-Version, Zahlungsart, Stationen und Uhrzeiten; wichtig sind die Reihenfolge der Radtypen und eine City-Summe über dem Deckel. Ein Test nur mit City-Fahrten bleibt grün, weil dann der richtige Deckel zufällig der erste ist. Der Name des Tests beschreibt die Regel, nicht das Ticket – so versteht ihn auch, wer das Ticket nie gesehen hat.
+    resources:
+      - title: The Debugging Book · Reducing Failure-Inducing Inputs
+        url: https://www.debuggingbook.org/html/DeltaDebugger.html
+
+  - id: test-oder-code
+    type: code
+    title: Test falsch oder Code falsch?
+    prompt: |
+      Nach einem Refactoring der E-Bike-Preise meldet die CI zwei rote Fälle:
+
+      ```console
+      $ pytest tests/test_tarif.py -q --tb=short
+      .F..F.                                                                   [100%]
+      =================================== FAILURES ===================================
+      _________________________ test_ebike_preis[6-False-0] __________________________
+      tests/test_tarif.py:18: in test_ebike_preis
+          assert ebike_preis(minuten, plus) == cent
+      E   assert 300 == 0
+      E    +  where 300 = ebike_preis(6, False)
+      ________________________ test_ebike_preis[33-True-300] _________________________
+      tests/test_tarif.py:18: in test_ebike_preis
+          assert ebike_preis(minuten, plus) == cent
+      E   assert 0 == 300
+      E    +  where 0 = ebike_preis(33, True)
+      =========================== short test summary info ============================
+      FAILED tests/test_tarif.py::test_ebike_preis[6-False-0] - assert 300 == 0
+      FAILED tests/test_tarif.py::test_ebike_preis[33-True-300] - assert 0 == 300
+      2 failed, 4 passed in 0.10s
+      ```
+
+      Die Regeln für `ebike_preis(minuten, plus)` aus `tarif.py`:
+
+      - 300 Cent je angefangene 30 Minuten.
+      - Fehlstart: Fahrten bis einschließlich 5 Minuten kosten 0 Cent. Gemeint ist die Dauer der ganzen Fahrt.
+      - Mit dem Abo „Radwerk Plus“ (`plus=True`) sind die ersten 30 Minuten jeder Fahrt kostenlos; berechnet werden die angefangenen 30 Minuten danach.
+
+      Entscheide für jeden roten Fall, ob der Test oder der Code falsch ist. Korrigiere den Test dort, wo **er** falsch ist. Einen Fall, der einen echten Fehler im Code zeigt, lässt du rot – den Code behebt eine Kollegin in einem eigenen Commit. Die Prüfung führt deinen Test gegen den aktuellen Code, gegen die korrigierte Fassung und gegen weitere fehlerhafte Varianten aus.
+    lang: python
+    setup: |
+      from pathlib import Path
+
+      RICHTIG = '''
+      def ebike_preis(minuten: int, plus: bool = False) -> int:
+          if minuten <= 5:
+              return 0
+          abrechenbar = max(0, minuten - 30) if plus else minuten
+          return -(-abrechenbar // 30) * 300
+      '''
+      AKTUELL = '''
+      def ebike_preis(minuten: int, plus: bool = False) -> int:
+          abrechenbar = max(0, minuten - 30) if plus else minuten
+          if abrechenbar <= 5:
+              return 0
+          return -(-abrechenbar // 30) * 300
+      '''
+      FEHLSTART_6 = RICHTIG.replace("minuten <= 5", "minuten <= 6")
+      OHNE_PLUS = RICHTIG.replace("max(0, minuten - 30) if plus else minuten", "minuten")
+      for variante in (AKTUELL, FEHLSTART_6, OHNE_PLUS):
+          assert variante != RICHTIG, "Eine Variante ist identisch mit der richtigen Fassung."
+      Path("tarif.py").write_text(RICHTIG)
+    starter: |
+      import pytest
+
+      from tarif import ebike_preis
+
+
+      @pytest.mark.parametrize(
+          "minuten, plus, cent",
+          [
+              (5, False, 0),
+              (6, False, 0),
+              (31, False, 600),
+              (30, True, 0),
+              (33, True, 300),
+              (65, True, 600),
+          ],
+      )
+      def test_ebike_preis(minuten, plus, cent):
+          assert ebike_preis(minuten, plus) == cent
+    solution: |
+      import pytest
+
+      from tarif import ebike_preis
+
+
+      @pytest.mark.parametrize(
+          "minuten, plus, cent",
+          [
+              (5, False, 0),
+              (6, False, 300),
+              (31, False, 600),
+              (30, True, 0),
+              (33, True, 300),
+              (65, True, 600),
+          ],
+      )
+      def test_ebike_preis(minuten, plus, cent):
+          assert ebike_preis(minuten, plus) == cent
+    tests:
+      - name: Grün gegen die korrigierte Fassung
+        code: |
+          lauf = run_pytest({"tarif.py": RICHTIG})
+          assert lauf.ok, lauf.output
+      - name: Zeigt den echten Fehler im aktuellen Code weiterhin
+        code: |
+          lauf = run_pytest({"tarif.py": AKTUELL})
+          assert not lauf.ok, "Gegen den aktuellen Code ist dein Test grün. Einer der beiden roten Fälle hat einen echten Fehler gezeigt – den darfst du nicht wegkorrigieren."
+      - name: Prüft die Fehlstart-Grenze weiterhin
+        code: |
+          lauf = run_pytest({"tarif.py": FEHLSTART_6})
+          assert not lauf.ok, "Eine Variante, in der Fahrten bis 6 Minuten kostenlos sind, bleibt grün. Hast du den Fall an der Fehlstart-Grenze gelöscht statt korrigiert?"
+      - name: Prüft das Abo weiterhin
+        code: |
+          lauf = run_pytest({"tarif.py": OHNE_PLUS})
+          assert not lauf.ok, "Eine Variante, die Radwerk Plus ignoriert, bleibt grün."
+    hints:
+      - Rechne beide roten Fälle nach den Regeln im Auftrag nach, nicht nach dem Code und nicht nach dem Test.
+      - 6 Minuten sind mehr als 5 – kein Fehlstart. 33 Minuten mit Plus sind ebenfalls kein Fehlstart; berechnet werden 3 Minuten, also eine angefangene halbe Stunde.
+      - Nur `(6, False, 0)` ist falsch; richtig ist `(6, False, 300)`. `(33, True, 300)` bleibt, wie er ist.
+    explanation: |
+      Der Fall `6-False-0` ist ein Fehler im Test: Sechs Minuten sind kein Fehlstart, der Code liefert zu Recht 300 Cent. Der Fall `33-True-300` zeigt einen Fehler im Code: Er zieht erst die 30 freien Minuten ab und wendet dann die Fehlstart-Regel auf den Rest an. Laut Regel zählt aber die Dauer der ganzen Fahrt, also kosten die 3 Minuten nach der Freizeit eine angefangene halbe Stunde. Ein Test, der jetzt im aktuellen Code noch rot ist, ist genau richtig: Er ist der rote Test, mit dem der Fix beginnt. Wer stattdessen beide Fälle löscht oder `33-True-300` auf 0 setzt, macht die CI grün und versteckt den Fehler. Die Entscheidung „Test oder Code“ fällt an der Anforderung, nie an der Frage, welche Seite sich leichter ändern lässt.
+    resources:
+      - title: pytest · Parametrizing tests
+        url: https://docs.pytest.org/en/stable/how-to/parametrize.html
+
+  - id: falsches-objekt
+    type: bug
+    title: Der Rabatt, der nicht ankommt
+    prompt: |
+      Ein Test aus dem Buchungsmodul ist rot:
+
+      ```text
+      >       assert buchung.preis_cent == 1350
+      E       AssertionError: assert 1500 == 1350
+      E        +  where 1500 = Buchung(kunde='lena', preis_cent=1500, gutschein=None).preis_cent
+      ```
+
+      Ein Kollege hat schon eine Stunde in `gutschein_anwenden` nach dem Fehler gesucht, weil „der Rabatt nicht abgezogen wird“. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: python
+    code: |
+      from dataclasses import dataclass, replace
+
+
+      @dataclass(frozen=True)
+      class Buchung:
+          kunde: str
+          preis_cent: int
+          gutschein: str | None = None
+
+
+      def gutschein_anwenden(buchung: Buchung, code: str, prozent: int) -> Buchung:
+          rabatt = buchung.preis_cent * prozent // 100
+          return replace(buchung, preis_cent=buchung.preis_cent - rabatt, gutschein=code)
+
+
+      def test_gutschein_senkt_den_preis():
+          buchung = Buchung(kunde="lena", preis_cent=1500)
+          neu = gutschein_anwenden(buchung, "RW-HERBST", prozent=10)
+          assert neu.gutschein == "RW-HERBST"
+          assert buchung.preis_cent == 1350
+    lines: [20]
+    fix:
+      - line: 20
+        answers: ["assert neu.preis_cent == 1350", "assert 1350 == neu.preis_cent"]
+    hints:
+      - Lies den `where`-Teil genau. Von welchem Objekt stammt die 1500, und welchen Gutschein hat es?
+      - "`replace` erzeugt bei einer `frozen` Dataclass ein neues Objekt. Das alte bleibt unverändert."
+    explanation: |
+      Der Code ist richtig, der Test vergleicht das falsche Objekt. `Buchung` ist unveränderlich (`frozen=True`), `gutschein_anwenden` liefert mit `dataclasses.replace` eine neue Buchung zurück. Der Test prüft danach das alte Objekt, und das kostet weiter 1 500 Cent. Die Meldung „1500 == 1350“ klingt nach „Rabatt nicht abgezogen“, der `where`-Teil verrät den Fehler aber: Das geprüfte Objekt hat `gutschein=None`, während die vorige Zeile `neu.gutschein == "RW-HERBST"` bestanden hat. Bei jeder Meldung, die unmöglich wirkt, lohnt die Frage, ob der Test überhaupt das Ergebnis des Aufrufs ansieht.
+    resources:
+      - title: Python · dataclasses.replace
+        url: https://docs.python.org/3/library/dataclasses.html#dataclasses.replace
+      - title: pytest · Assertion introspection
+        url: https://docs.pytest.org/en/stable/how-to/assert.html#assert-details
+
+  - id: verschluckte-datei
+    type: bug
+    title: Auf dem Mac grün, in der CI 0 Cent
+    prompt: |
+      Auf Lenas Mac ist der Test grün. In der CI (Ubuntu) ist er rot:
+
+      ```text
+      tests/test_tarif.py:19: in test_angefangene_halbe_stunde_zaehlt_voll
+          assert fahrtpreis(tarif, "city", 31) == 300
+      E   AssertionError: assert 0 == 300
+      E    +  where 0 = fahrtpreis(Tarif(city_cent=0, ebike_cent=0), 'city', 31)
+      ```
+
+      `git ls-files tests/daten` zeigt `tests/daten/Tarife.json`. Den Dateinamen korrigiert Lena gleich danach mit `git mv`. Deine Aufgabe ist eine andere: Die Meldung „0 == 300“ hat das Team auf die falsche Fährte gelockt. Finde die beiden Zeilen, die Fehler in den Testdaten verschleiern, und ändere sie so, dass der Test an der wirklichen Ursache scheitert.
+    lang: python
+    code: |
+      import json
+      from pathlib import Path
+
+      import pytest
+
+      from radwerk.tarif import Tarif, fahrtpreis
+
+      DATEN = Path(__file__).parent / "daten"
+
+
+      @pytest.fixture
+      def tarif():
+          pfad = DATEN / "tarife.json"
+          werte = json.loads(pfad.read_text(encoding="utf-8")) if pfad.exists() else {}
+          return Tarif(city_cent=werte.get("city", 0), ebike_cent=werte.get("ebike", 0))
+
+
+      def test_angefangene_halbe_stunde_zaehlt_voll(tarif):
+          assert fahrtpreis(tarif, "city", 31) == 300
+    lines: [14, 15]
+    fix:
+      - line: 14
+        answers: ["werte = json.loads(pfad.read_text(encoding=\"utf-8\"))", "werte = json.loads(pfad.read_text())", "werte = json.loads(pfad.read_text(\"utf-8\"))", "werte = json.loads(pfad.read_bytes())", "werte = json.load(pfad.open(encoding=\"utf-8\"))"]
+      - line: 15
+        answers: ["return Tarif(city_cent=werte[\"city\"], ebike_cent=werte[\"ebike\"])", "return Tarif(ebike_cent=werte[\"ebike\"], city_cent=werte[\"city\"])"]
+    hints:
+      - Was passiert in der Fixture, wenn die Datei unter genau diesem Namen nicht existiert? Und was, wenn ein Schlüssel fehlt?
+      - "Zwei Zeilen ersetzen einen Fehler durch einen Standardwert: `if pfad.exists() else {}` und `.get(…, 0)`."
+    explanation: |
+      macOS unterscheidet im Dateisystem standardmäßig nicht zwischen `tarife.json` und `Tarife.json`, Linux schon. In der CI existiert der Pfad also nicht, und Zeile 14 macht daraus still ein leeres Dictionary. Zeile 15 macht aus jedem fehlenden Schlüssel einen Tarif von 0 Cent. Der Test scheitert dann an einer Rechnung, die nie das Problem war. Ohne die Ausweichwerte endet die Fixture mit `FileNotFoundError: … tests/daten/tarife.json` – als `ERROR at setup`, also eindeutig als Problem der Vorbereitung, mit dem Pfad in der Meldung. Fixtures und Testdaten sollen laut scheitern: Ein Standardwert, der einen Fehler ersetzt, verlegt die Fehlermeldung an eine Stelle, die nichts damit zu tun hat.
+    resources:
+      - title: pytest · Fixtures – errors during setup
+        url: https://docs.pytest.org/en/stable/how-to/fixtures.html
+      - title: git-config · core.ignoreCase
+        url: https://git-scm.com/docs/git-config#Documentation/git-config.txt-coreignoreCase
+
+  - id: bisect-skript
+    type: explain
+    title: Ein Prüfskript für Bisect
+    prompt: |
+      Für eine Bisect-Suche über 300 Commits hat Lena dieses Skript geschrieben und mit `git bisect run ../pruefe_tagesgrenze.sh` gestartet. Erkläre einem Kollegen, was jede Zeile bewirkt und warum sie so dasteht. Nenne auch eine Schwachstelle.
+    lang: bash
+    code: |
+      #!/bin/sh
+      # ../pruefe_tagesgrenze.sh – Aufruf: git bisect run ../pruefe_tagesgrenze.sh
+      uv sync --quiet --frozen || exit 125
+      uv run python -m pytest -q ../test_zeitzone.py
+      status=$?
+      if [ "$status" -le 1 ]; then
+          exit "$status"
+      fi
+      exit 125
+    points:
+      - Skript und Test liegen außerhalb des Repositorys, weil Bisect alte Commits auscheckt, in denen beide nicht existieren.
+      - "`uv sync … || exit 125` installiert die Abhängigkeiten des jeweiligen Commits; klappt das nicht, wird der Commit übersprungen statt als schlecht gezählt."
+      - "`python -m pytest` setzt das Repository auf `sys.path`, damit der Test außerhalb `radwerk` importieren kann."
+      - "pytest-Exit-Codes 0 (grün) und 1 (rote Tests) gehen unverändert an Bisect; 2 bis 5 (Sammelfehler, interner Fehler, Bedienfehler, keine Tests) werden zu 125, damit sie nicht als „schlecht“ zählen."
+      - "Schwachstelle: Verursacht der gesuchte Fehler selbst einen Sammelfehler, etwa einen kaputten Import, wird der schuldige Commit übersprungen statt gefunden."
+    explanation: |
+      Das Skript übersetzt zwischen pytest und Bisect. Bisect kennt drei Antworten: 0 gut, 125 überspringen, 1 bis 127 sonst schlecht. pytest kennt mehr Exit-Codes, und nur 0 und 1 sagen etwas über den Fehler aus. Fehler beim Sammeln (2), interne Fehler (3), Bedienfehler wie eine fehlende Datei (4) und „keine Tests gefunden“ (5) heißen nur „konnte nicht prüfen“ – dafür ist 125 da. Dasselbe gilt für Commits, deren Abhängigkeiten sich nicht installieren lassen. Codes ab 128 darf das Skript nie weiterreichen: Damit bricht Bisect die ganze Suche ab. `--frozen` installiert genau das, was im `uv.lock` des Commits steht, ohne es zu aktualisieren. Die Schwachstelle: Wenn der gesuchte Fehler den Import selbst bricht, überspringt das Skript ihn. Bisect meldet dann am Ende mehrere Kandidaten statt eines Commits – das ist ehrlicher als ein falscher Schuldiger, aber du musst die Kandidaten von Hand ansehen.
+    resources:
+      - title: git-bisect · bisect run
+        url: https://git-scm.com/docs/git-bisect#_bisect_run
+      - title: pytest · Exit codes
+        url: https://docs.pytest.org/en/stable/reference/exit-codes.html
+
+  - id: eingabe-minimieren
+    type: code
+    title: Weglassen, bis nur der Fehler übrig ist
+    prompt: |
+      Schreibe `minimiere(eingabe, scheitert)`. `eingabe` ist eine Liste, `scheitert(liste)` eine Funktion, die `True` liefert, wenn der Fehler mit dieser Liste auftritt.
+
+      - Gilt `scheitert(eingabe)` nicht, wirft die Funktion `ValueError`.
+      - Sonst liefert sie eine Teilliste von `eingabe` – die Reihenfolge der übrigen Elemente bleibt erhalten –, für die `scheitert` weiterhin `True` liefert und aus der sich **kein einzelnes Element** mehr entfernen lässt, ohne dass der Fehler verschwindet.
+      - `eingabe` selbst bleibt unverändert.
+
+      Mit dieser Funktion schrumpft ein Bugreport mit vielen Fahrten automatisch auf die Fahrten, die den Fehler auslösen. Die Prüfung verwendet dafür zum Beispiel `scheitert = lambda f: tagespreis_alt(f) != tagespreis_neu(f)`.
+    lang: python
+    setup: |
+      TAKT = {"city": 150, "ebike": 300}
+      DECKEL = {"city": 1500, "ebike": 3000}
+
+
+      def fahrtpreis(rad, minuten):
+          return 0 if minuten <= 5 else -(-minuten // 30) * TAKT[rad]
+
+
+      def tagespreis_neu(fahrten):
+          return sum(min(sum(fahrtpreis(r, m) for r, m in fahrten if r == rad), DECKEL[rad]) for rad in DECKEL)
+
+
+      def tagespreis_alt(fahrten):
+          summe = sum(fahrtpreis(r, m) for r, m in fahrten)
+          return min(summe, DECKEL[fahrten[0][0]]) if fahrten else 0
+
+
+      def ist_1_minimal(ergebnis, scheitert):
+          return all(not scheitert(ergebnis[:i] + ergebnis[i + 1:]) for i in range(len(ergebnis)))
+    starter: |
+      def minimiere(eingabe: list, scheitert) -> list:
+          if not scheitert(eingabe):
+              raise ValueError("Die Eingabe zeigt den Fehler nicht.")
+          return eingabe
+    solution: |
+      def minimiere(eingabe: list, scheitert) -> list:
+          aktuell = list(eingabe)
+          if not scheitert(aktuell):
+              raise ValueError("Die Eingabe zeigt den Fehler nicht.")
+          geaendert = True
+          while geaendert:
+              geaendert = False
+              i = 0
+              while i < len(aktuell):
+                  kandidat = aktuell[:i] + aktuell[i + 1:]
+                  if scheitert(kandidat):
+                      aktuell = kandidat
+                      geaendert = True
+                  else:
+                      i += 1
+          return aktuell
+    tests:
+      - name: Zwei nötige Elemente bleiben in ihrer Reihenfolge übrig
+        code: |
+          raeder = ["R-101", "R-117", "R-150", "R-204", "R-233"]
+          ergebnis = minimiere(raeder, lambda l: "R-117" in l and "R-204" in l)
+          assert ergebnis == ["R-117", "R-204"], f"erwartet ['R-117', 'R-204'], bekommen {ergebnis!r}"
+      - name: Ein Fahrtenprotokoll schrumpft auf die auslösenden Fahrten
+        code: |
+          fahrten = [("ebike", 8), ("city", 20), ("city", 250), ("ebike", 4), ("city", 180), ("city", 12), ("ebike", 45)]
+          scheitert = lambda f: tagespreis_alt(f) != tagespreis_neu(f)
+          ergebnis = minimiere(fahrten, scheitert)
+          assert scheitert(ergebnis), f"Mit {ergebnis!r} tritt der Fehler nicht mehr auf."
+          assert ist_1_minimal(ergebnis, scheitert), f"Aus {ergebnis!r} lässt sich noch eine Fahrt entfernen, ohne dass der Fehler verschwindet."
+          assert all(f in fahrten for f in ergebnis), f"{ergebnis!r} enthält Fahrten, die nicht in der Eingabe standen."
+      - name: Ergebnis ist eine Teilliste mit erhaltener Reihenfolge
+        code: |
+          zahlen = [9, 4, 7, 1, 8, 3, 6]
+          ergebnis = minimiere(zahlen, lambda l: sum(l) >= 20)
+          it = iter(zahlen)
+          assert all(z in it for z in ergebnis), f"{ergebnis!r} ist keine Teilliste von {zahlen!r} in derselben Reihenfolge."
+          assert sum(ergebnis) >= 20 and ist_1_minimal(ergebnis, lambda l: sum(l) >= 20), f"{ergebnis!r} ist nicht minimal."
+      - name: Eingabe bleibt unverändert
+        code: |
+          raeder = ["R-101", "R-117", "R-150"]
+          minimiere(raeder, lambda l: "R-117" in l)
+          assert raeder == ["R-101", "R-117", "R-150"], f"Die Eingabe wurde verändert: {raeder!r}"
+      - name: ValueError, wenn die Eingabe den Fehler nicht zeigt
+        code: |
+          try:
+              minimiere([("city", 10)], lambda l: False)
+          except ValueError:
+              pass
+          else:
+              raise AssertionError("Erwartet war ValueError, wenn scheitert(eingabe) False ist.")
+    hints:
+      - Versuche nacheinander, jedes Element einzeln wegzulassen. Bleibt der Fehler, behältst du die kürzere Liste.
+      - "Nach dem Entfernen von Element `i` rückt das nächste auf Position `i` nach – erhöhe den Index dann nicht. Arbeite auf einer Kopie: `aktuell = list(eingabe)`."
+      - "Wiederhole den ganzen Durchlauf, bis er nichts mehr entfernt hat. Erst dann ist garantiert, dass kein einzelnes Element mehr wegkann."
+    explanation: |
+      Das ist die Grundform von Delta Debugging: Element für Element weglassen und behalten, was den Fehler weiter auslöst. Das Ergebnis ist „1-minimal“ – kein einzelnes Element lässt sich mehr entfernen –, aber nicht unbedingt die kürzeste mögliche Liste; die zu finden kostet im schlimmsten Fall exponentiell viele Versuche. Andreas Zellers `ddmin` entfernt zuerst große Blöcke und halbiert dann, das spart bei langen Eingaben viele Aufrufe. Der Durchlauf wird wiederholt, weil das Weglassen eines späteren Elements ein früheres überflüssig machen kann. Aus dem Fahrtenprotokoll bleibt mit der Musterlösung `[("city", 250), ("ebike", 45)]` übrig, eine zweite Erscheinungsform desselben Fehlers: Beginnt der Tag mit dem City-Rad, deckelt der alte Code auch die E-Bike-Fahrt bei 1 500 Cent, und Radwerk berechnet zu wenig. Wer zwei Fassungen vergleicht und minimiert, findet so Fälle, die in keinem Ticket standen.
+    resources:
+      - title: The Debugging Book · Reducing Failure-Inducing Inputs
+        url: https://www.debuggingbook.org/html/DeltaDebugger.html
+
+  - id: nur-in-der-ci-rot
+    type: practice
+    title: Umlaute in der CI
+    prompt: |
+      Radwerks Stationsübersicht sortiert Stationen nach Namen. Der Test ist auf allen Laptops des Teams grün, in der CI rot:
+
+      ```text
+      >       assert stationen_sortiert(namen) == ["Altstadt", "Ärztehaus", "Bahnhof", "Uni-Campus"]
+      E       AssertionError: assert ['Altstadt', 'Bahnhof', 'Uni-Campus', 'Ärztehaus'] == ['Altstadt', 'Ärztehaus', 'Bahnhof', 'Uni-Campus']
+      ```
+
+      Der Code:
+
+      ```python
+      import locale
+
+      locale.setlocale(locale.LC_ALL, "")
+
+
+      def stationen_sortiert(namen: list[str]) -> list[str]:
+          return sorted(namen, key=locale.strxfrm)
+      ```
+
+      Schreibe ein kurzes Debugging-Protokoll, wie es in ein Ticket gehört: Hypothesen zu Test, Code und Umgebung, das Experiment, mit dem du den Fehler lokal siehst, einen Test, der auf jedem Rechner rot ist, solange der Fehler besteht, und einen Vorschlag für den Fix mit Begründung. Sag auch, auf welcher Ebene du den Test schreibst und warum.
+    lang: text
+    solution: |
+      Beobachtung
+        CI: ['Altstadt', 'Bahnhof', 'Uni-Campus', 'Ärztehaus'], Laptops: Ä nach A.
+        Gleicher Code, gleicher Test – die Umgebung unterscheidet sich.
+
+      Hypothesen
+        Test falsch?  Nein: Nutzer erwarten „Ärztehaus“ zwischen „Altstadt“ und „Bahnhof“ (DIN 5007).
+        Code falsch?  Ja, mittelbar: Die Sortierung hängt über setlocale(LC_ALL, "") von der
+                      Umgebung des Prozesses ab statt von einer Produktentscheidung.
+        Umgebung?     Vermutung: Laptops de_DE.UTF-8, CI C.UTF-8. Vorhersage: Mit
+                      LC_ALL=C.UTF-8 ist der Test auch lokal rot.
+
+      Experiment
+        $ LC_ALL=C.UTF-8 pytest tests/test_stationen.py -q   -> rot, Hypothese bestätigt
+        $ LC_ALL=de_DE.UTF-8 pytest tests/test_stationen.py -q -> grün
+        Zusätzlich: Die CI schreibt ab jetzt `locale` ins Log.
+
+      Roter Test (Unit-Ebene, reine Funktion; stellt die Sortierregeln des Prozesses auf "C")
+        @pytest.fixture
+        def c_locale():
+            alt = locale.setlocale(locale.LC_COLLATE)
+            locale.setlocale(locale.LC_COLLATE, "C")
+            yield
+            locale.setlocale(locale.LC_COLLATE, alt)
+
+        def test_umlaute_sortieren_wie_ihr_grundbuchstabe(c_locale):
+            assert stationen_sortiert(["Bahnhof", "Ärztehaus", "Altstadt", "Uni-Campus"]) == [
+                "Altstadt", "Ärztehaus", "Bahnhof", "Uni-Campus"]
+        Mit dem alten Code auf jedem Rechner rot, mit dem Fix überall grün.
+
+      Fix
+        Kein setlocale beim Import. Sortierschlüssel explizit und unabhängig von der Umgebung,
+        z. B. Umlaute auf den Grundbuchstaben abbilden und casefold():
+            def sortierschluessel(name):
+                zerlegt = unicodedata.normalize("NFD", name.casefold())
+                return "".join(z for z in zerlegt if not unicodedata.combining(z)), name
+        Alternative: PyICU mit Collator „de“, falls mehr Sprachen dazukommen.
+        Nicht als Fix: de_DE in der CI installieren – dann hängt das Ergebnis weiter am Server.
+
+      Ebene
+        Unit-Test der Sortierfunktion: Die Regel steckt in einer reinen Funktion, der Test
+        läuft in Millisekunden und zeigt im Fehlerfall genau die Sortierung. Ein UI-Test der
+        Stationsliste würde dasselbe Risiko teurer und langsamer prüfen.
+    checklist:
+      - Du nennst für Test, Code und Umgebung je eine Hypothese und begründest, warum die Erwartung des Tests stimmt.
+      - Die Umgebungshypothese sagt eine Beobachtung vorher, und du nennst das Experiment dazu (`LC_ALL=C.UTF-8` oder eine andere Locale vor dem Befehl).
+      - Dein roter Test hängt nicht davon ab, welche Locale auf dem Rechner eingestellt ist.
+      - Dein Fix macht die Sortierung zu einer Entscheidung im Code, statt sie der Umgebung zu überlassen – und du begründest, warum „Locale in der CI installieren“ nicht reicht.
+      - Du wählst die Testebene und begründest sie mit Kosten und Aussagekraft.
+      - Du schlägst vor, dass die CI künftig Locale und Zeitzone ins Log schreibt.
+    explanation: |
+      `locale.setlocale(locale.LC_ALL, "")` übernimmt die Locale aus den Umgebungsvariablen des Prozesses. `locale.strxfrm` sortiert dann nach deren Regeln: Unter `de_DE.UTF-8` steht „Ä“ bei „A“, unter `C.UTF-8` nach Codepunkt, also hinter „Z“. Der Test hat recht, der Code überlässt eine fachliche Regel der Umgebung. Ein Fix, der nur die CI anpasst, macht den Fehler unsichtbar, bis ein Server mit anderer Locale startet. Die bessere Lösung legt die Sortierung im Code fest und testet sie als reine Funktion. Der rote Test im Musterprotokoll stellt die Sortierregeln des Prozesses für seine Dauer auf `C` – wie die Zeitzonen-Fixture in der Lektion: Mit dem alten Code ist er dann auf jedem Rechner rot, mit dem Fix überall grün.
+    resources:
+      - title: Python · locale.strxfrm
+        url: https://docs.python.org/3/library/locale.html#locale.strxfrm
+      - title: Python · unicodedata.normalize
+        url: https://docs.python.org/3/library/unicodedata.html#unicodedata.normalize

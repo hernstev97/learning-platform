@@ -1,0 +1,1430 @@
+id: test-doubles
+title: Test Doubles und Mocks
+level: 2
+minutes: 150
+summary: Test Doubles ersetzen Zahlungsanbieter, SMS-Versand und Datenbank im Test. Richtig gewählt machen sie Tests schnell und genau, falsch eingesetzt bleiben Tests grün, obwohl der Code doppelt abbucht.
+goals:
+  - Du unterscheidest Dummy, Stub, Spy, Mock und Fake nach Meszaros und wählst für jede Abhängigkeit den passenden.
+  - Du entscheidest begründet zwischen Zustands- und Verhaltensprüfung und prüfst Aufrufe nur dort, wo sie das sichtbare Ergebnis sind.
+  - Du setzt `unittest.mock` und `monkeypatch` gezielt ein – `return_value`, `side_effect`, `call_args_list`, `patch` am Ort des Nachschlagens – und bindest Mocks mit `create_autospec` an die echte Schnittstelle.
+  - Du schreibst Fakes wie ein In-Memory-Repository von Hand und weißt, wann sie einem Mock überlegen sind.
+  - Du erkennst Over-Mocking und baust Tests so um, dass sie Refactorings überstehen und echte Fehler weiter finden.
+resources:
+  - title: Python · unittest.mock
+    url: https://docs.python.org/3/library/unittest.mock.html
+  - title: pytest · How to monkeypatch/mock modules and environments
+    url: https://docs.pytest.org/en/stable/how-to/monkeypatch.html
+  - title: Martin Fowler · Mocks Aren't Stubs
+    url: https://martinfowler.com/articles/mocksArentStubs.html
+  - title: Martin Fowler · Test Double
+    url: https://martinfowler.com/bliki/TestDouble.html
+lesson: |
+  Freitag, 23:40 Uhr, Station Hauptbahnhof: Eine Kundin stellt ihr City-Rad nach 47 Minuten ab. `schliesse_fahrt_ab` berechnet 300 Cent, belastet ihre Karte bei Paystream, speichert die Fahrt und schickt eine SMS. Im Test soll keine echte Karte belastet werden und keine SMS an eine echte Nummer gehen, und niemand will auf PostgreSQL warten. Du ersetzt diese Abhängigkeiten durch **Test Doubles**: Objekte, die im Test die Rolle der echten Abhängigkeit übernehmen, wie ein Stuntdouble im Film.
+
+  Die Werkzeuge sind schnell gelernt. Schwer ist die Entscheidung, welche Abhängigkeit du ersetzt, durch welche Art Double, und was du danach prüfst. Falsch gewählt, brechen Tests bei jedem Refactoring, oder sie bleiben grün, obwohl der Code doppelt abbucht. Wie du Code so schneidest, dass sich Abhängigkeiten überhaupt hereinreichen lassen, zeigt [Testbarkeit durch Design](/testing/testbares-design).
+
+  ## Fünf Test Doubles nach Meszaros: Dummy, Stub, Spy, Mock, Fake
+
+  Gerard Meszaros hat die Begriffe in *xUnit Test Patterns* (2007) geordnet, Martin Fowler fasst sie in [Test Double](https://martinfowler.com/bliki/TestDouble.html) zusammen. Die Einteilung folgt der Richtung der Daten. Eine **indirekte Eingabe** bekommt der Code unter Test nicht als Argument, sondern von einer Abhängigkeit: die Antwort von Paystream, Zeilen aus der Datenbank. Eine **indirekte Ausgabe** gibt er nicht zurück, sondern schickt sie an eine Abhängigkeit: die Belastung, die SMS. Ein `assert` auf den Rückgabewert sieht beides nicht.
+
+  | Double | Was es tut | Wozu im Test | Radwerk-Beispiel |
+  | --- | --- | --- | --- |
+  | Dummy | wird übergeben, aber nie benutzt | füllt eine Parameterliste | `None` für `zahlungen` bei einer Fahrt, die 0 Cent kostet |
+  | Stub | liefert vorbereitete Antworten | steuert indirekte Eingaben | ein Paystream, das jede Belastung ablehnt |
+  | Spy | zeichnet Aufrufe auf, der Test prüft danach | macht indirekte Ausgaben sichtbar | ein SMS-Versand, der Texte in einer Liste sammelt |
+  | Mock | kennt die erwarteten Aufrufe vorab und schlägt bei einer Abweichung selbst an | prüft indirekte Ausgaben während des Laufs | ein Paystream-Double, das bei einer zweiten Belastung sofort scheitert |
+  | Fake | funktionierende, vereinfachte Implementierung | ersetzt eine schwere Abhängigkeit durch eine leichte | ein Repository, das Reservierungen in einer Liste statt in PostgreSQL hält |
+
+  Für Dummy, Stub und Spy brauchst du keine Bibliothek:
+
+  ```python pytest
+  from dataclasses import dataclass
+
+
+  @dataclass
+  class Fahrt:
+      fahrt_id: str
+      kunde_id: str
+      telefon: str
+      minuten: int
+
+
+  class ZahlungAbgelehnt(Exception):
+      pass
+
+
+  def mietpreis(minuten: int) -> int:
+      if minuten <= 5:
+          return 0
+      return -(-minuten // 30) * 150
+
+
+  def schliesse_fahrt_ab(fahrt, zahlungen, sms):
+      betrag = mietpreis(fahrt.minuten)
+      if betrag > 0:
+          try:
+              zahlungen.belaste(fahrt.kunde_id, betrag, schluessel=fahrt.fahrt_id)
+          except ZahlungAbgelehnt:
+              sms.sende(fahrt.telefon, "Zahlung abgelehnt, bitte Karte prüfen.")
+              return "offen"
+      sms.sende(fahrt.telefon, f"Danke für deine Fahrt: {betrag} Cent")
+      return "bezahlt"
+
+
+  class AbgelehnteZahlung:  # Stub: liefert die indirekte Eingabe „abgelehnt“
+      def belaste(self, kunde_id, betrag_cent, schluessel):
+          raise ZahlungAbgelehnt("Karte gesperrt")
+
+
+  class SmsSpy:  # Spy: zeichnet die indirekten Ausgaben auf
+      def __init__(self):
+          self.gesendet = []
+
+      def sende(self, telefon, text):
+          self.gesendet.append((telefon, text))
+
+
+  def test_abgelehnte_zahlung_laesst_fahrt_offen():
+      sms = SmsSpy()
+      fahrt = Fahrt("F-1042", "K-7", "+4917012345", minuten=47)
+
+      status = schliesse_fahrt_ab(fahrt, AbgelehnteZahlung(), sms)
+
+      assert status == "offen"
+      assert sms.gesendet == [("+4917012345", "Zahlung abgelehnt, bitte Karte prüfen.")]
+
+
+  def test_fehlstart_kostet_nichts():
+      sms = SmsSpy()
+      fahrt = Fahrt("F-1043", "K-7", "+4917012345", minuten=4)
+
+      status = schliesse_fahrt_ab(fahrt, None, sms)  # None als Dummy: wird nie benutzt
+
+      assert status == "bezahlt"
+      assert sms.gesendet == [("+4917012345", "Danke für deine Fahrt: 0 Cent")]
+  ```
+
+  `AbgelehnteZahlung` steuert, was Paystream *antwortet*; der Test prüft danach Status und SMS, nicht den Aufruf von `belaste`. `SmsSpy` hält fest, was der Code *hinausschickt*. Im zweiten Test reicht `None` als Dummy, weil eine Fahrt von vier Minuten unter die Fehlstartregel fällt und `zahlungen` nie berührt wird.
+
+  > [!NOTE] Pythons `Mock` ist meist ein Spy
+  > Bei Meszaros legt ein Mock seine Erwartungen *vor* dem Lauf fest und prüft jeden Aufruf, während er passiert. `unittest.mock.Mock` zeichnet auf, und du prüfst *danach*: ein Spy, mit `return_value` zugleich ein Stub. Im Alltag heißt trotzdem jedes Double „Mock“.
+
+  ## Zustand oder Verhalten prüfen: wann Aufrufe zählen
+
+  Nach dem Lauf prüfst du auf eine von zwei Arten, ob der Code richtig gearbeitet hat ([Fowler: Mocks Aren't Stubs](https://martinfowler.com/articles/mocksArentStubs.html)). Bei der **Zustandsprüfung** (*state verification*) schaust du auf das Ergebnis: Rückgabewert, Inhalt des Repositorys. Wie der Code dorthin kam, ist egal. Bei der **Verhaltensprüfung** (*behavior verification*) prüfst du die Aufrufe an die Abhängigkeiten: `belaste("K-7", 300, …)`, genau einmal.
+
+  Jede Verhaltensprüfung ist eine Behauptung über das *Wie*. Sie kann bei einem Refactoring brechen, obwohl sich für Kundinnen nichts ändert. Drei Regeln halten das im Rahmen:
+
+  1. **Abfragen stubben, nicht prüfen.** Holt der Code Daten (eine Fahrt, einen Tarif, die Konfiguration), lieferst du die Antwort per Stub oder Fake und prüfst das Ergebnis. Ob er dafür einmal oder zweimal gelesen hat, ist ein Implementierungsdetail.
+  2. **Befehle an der Systemgrenze prüfen.** Löst der Code eine Wirkung außerhalb deines Systems aus – Geld wird abgebucht, eine SMS geht raus, eine Nachricht landet in einer Queue –, dann *ist* der Aufruf das beobachtbare Ergebnis. Hier prüfst du Verhalten, mit genauen Argumenten und genauer Anzahl.
+  3. **Eigene Logik nicht ersetzen.** `mietpreis` ist eine reine Funktion aus deinem Code. Ersetzt du sie, testest du nur noch die Verdrahtung.
+
+  Wie stark ein Team auf Mocks setzt, unterscheidet die klassische Schule (Detroit) von der mockistischen (London), siehe [Testpyramide und Testgrenzen](/testing/testpyramide).
+
+  ## unittest.mock: return_value, side_effect und Aufrufprotokolle
+
+  Für viele Tests mit wechselnden Antworten greifst du zu [`unittest.mock.Mock`](https://docs.python.org/3/library/unittest.mock.html#unittest.mock.Mock). Jedes Attribut, das du abrufst, ist wieder ein `Mock`, jeder Aufruf wird protokolliert. Diese Teile brauchst du ständig:
+
+  - `return_value` legt fest, was ein Aufruf zurückgibt (Stub).
+  - [`side_effect`](https://docs.python.org/3/library/unittest.mock.html#unittest.mock.Mock.side_effect) ist eine Exception, die geworfen wird, eine Folge, deren Elemente nacheinander zurückkommen (Exceptions darin werden geworfen), oder eine Funktion, die anstelle des Mocks läuft.
+  - `call_count`, `call_args` und `call_args_list` zeigen, was aufgezeichnet wurde (Spy).
+  - `assert_called_once_with(…)` und `assert_not_called()` prüfen mit lesbarer Fehlermeldung.
+
+  `MagicMock` beherrscht zusätzlich Magic Methods wie `__len__` oder `__enter__`; `patch` erzeugt standardmäßig einen. Der folgende Code soll nach einem Timeout genau einmal wiederholen. Ihm fehlt ein `return`:
+
+  ```python pytest fails
+  from unittest.mock import Mock, call
+
+
+  class PaystreamTimeout(Exception):
+      pass
+
+
+  def belaste_mit_wiederholung(zahlungen, kunde_id, betrag_cent, schluessel):
+      for versuch in range(2):
+          try:
+              quittung = zahlungen.belaste(kunde_id, betrag_cent, schluessel=schluessel)
+          except PaystreamTimeout:
+              continue
+          # Fehler: Hier fehlt `return quittung`.
+      return quittung
+
+
+  def test_belastet_genau_einmal():
+      zahlungen = Mock()
+      zahlungen.belaste.return_value = "tx-81"
+
+      quittung = belaste_mit_wiederholung(zahlungen, "K-7", 300, schluessel="F-1042")
+
+      assert quittung == "tx-81"
+      zahlungen.belaste.assert_called_once_with("K-7", 300, schluessel="F-1042")
+
+
+  def test_letzter_aufruf_stimmt():
+      zahlungen = Mock()
+      zahlungen.belaste.return_value = "tx-81"
+
+      belaste_mit_wiederholung(zahlungen, "K-7", 300, schluessel="F-1042")
+
+      zahlungen.belaste.assert_called_with("K-7", 300, schluessel="F-1042")  # grün trotz Doppelbelastung
+
+
+  def test_wiederholt_nach_timeout_mit_gleichem_schluessel():
+      zahlungen = Mock()
+      zahlungen.belaste.side_effect = [PaystreamTimeout(), "tx-82"]
+
+      quittung = belaste_mit_wiederholung(zahlungen, "K-7", 300, schluessel="F-1042")
+
+      assert quittung == "tx-82"
+      assert zahlungen.belaste.call_args_list == [call("K-7", 300, schluessel="F-1042")] * 2
+  ```
+
+  Der erste Test fängt den Fehler, und die Meldung listet beide Aufrufe auf. Der zweite ist grün, obwohl Kundin K-7 doppelt zahlt: [`assert_called_with`](https://docs.python.org/3/library/unittest.mock.html#unittest.mock.Mock.assert_called_with) vergleicht nur den **letzten** Aufruf. Der dritte zeigt `side_effect` als Folge – erst ein Timeout, dann eine Quittung – und belegt mit `call_args_list`, dass beide Versuche denselben Idempotenzschlüssel tragen. Nur daran erkennt Paystream, dass der zweite Versuch eine Wiederholung ist und keine neue Zahlung.
+
+  > [!WARNING] `assert_called_with` zählt nicht
+  > Für Befehle an Zahlungs- oder Versanddienste willst du fast immer die Anzahl mitprüfen: `assert_called_once_with`, `assert_not_called` oder ein Vergleich der ganzen `call_args_list`.
+
+  ### Die Fallen von Mock: alles wird akzeptiert
+
+  Ein `Mock` sagt zu allem Ja. Das macht ihn bequem und gefährlich:
+
+  - **Jedes Attribut existiert.** Vertippt sich der Produktionscode (`zahlungen.belatse(…)`), läuft der Test trotzdem durch. Eine Quittung, die selbst ein `Mock` ist, hat jedes Attribut, und jedes ist wahr: `if quittung.abgelehnt:` nimmt im Test immer denselben Zweig.
+  - **Jede Signatur passt.** Ändert Paystream eine Methode, ruft dein Code sie weiter mit den alten Argumenten auf, und der Mock nimmt sie an.
+  - **Vertippte Prüfungen prüfen nichts.** Attribute, die mit `assert` oder `assret` beginnen, lösen seit Python 3.5 einen `AttributeError` aus, seit 3.10 auch `asert`, `aseert` und `assrt` ([Parameter `unsafe`](https://docs.python.org/3/library/unittest.mock.html#unittest.mock.Mock)), seit 3.12 auch Prüfnamen ohne Präfix wie `called_once_with`. `asssert_called_once()` mit drei s, `has_been_called()` oder `assert_called_once` ohne Klammern laufen dagegen stillschweigend durch.
+
+  Gegen die ersten beiden Fallen hilft ein Mock nach dem Vorbild der echten Klasse:
+
+  ```python pytest fails
+  from unittest.mock import Mock, create_autospec
+
+
+  class PaystreamClient:
+      """Nachbau des Paystream-SDK ab Version 3: idempotency_key ist Pflicht."""
+
+      def charge(self, customer_id: str, amount_cent: int, *, idempotency_key: str) -> str:
+          raise RuntimeError("Echte HTTP-Anfrage – im Test verboten")
+
+
+  def kassiere(client, kunde_id, betrag_cent):
+      return client.charge(kunde_id, betrag_cent)  # geschrieben gegen SDK 2.x
+
+
+  def test_mit_mock():
+      client = Mock()
+      kassiere(client, "K-7", 300)
+      client.charge.assert_called_once()
+
+
+  def test_mit_autospec():
+      client = create_autospec(PaystreamClient, instance=True)
+      kassiere(client, "K-7", 300)
+      client.charge.assert_called_once()
+
+
+  def test_vertippte_pruefung():
+      client = Mock()
+      client.charge.asssert_called_once()  # drei s – prüft nichts
+  ```
+
+  [`create_autospec`](https://docs.python.org/3/library/unittest.mock.html#unittest.mock.create_autospec) übernimmt Attribute und Signaturen der echten Klasse. Der zweite Test meldet die Signaturdrift, die der erste übersieht. Auch `client.charge.asssert_called_once()` scheitert mit Autospec, weil es dieses Attribut an der echten Methode nicht gibt. Und `assert_called_once_with` vergleicht dann nach Signatur: `charge("K-7", 300, …)` und `charge(customer_id="K-7", amount_cent=300, …)` gelten als derselbe Aufruf. Beim Patchen erreichst du dasselbe mit `patch(…, autospec=True)` ([Autospeccing](https://docs.python.org/3/library/unittest.mock.html#autospeccing)).
+
+  ## patch und monkeypatch: ersetzen, wo der Name nachgeschlagen wird
+
+  Bisher kamen die Abhängigkeiten als Parameter herein. Oft holt sich Code sie aber selbst, etwa mit `from radwerk.sms import sende_sms`. Dann ersetzt du den Namen für die Dauer eines Tests mit [`patch`](https://docs.python.org/3/library/unittest.mock.html#unittest.mock.patch) oder mit pytests `monkeypatch`. Die Regel, an der fast jeder einmal scheitert: **Patche dort, wo der Name nachgeschlagen wird, nicht dort, wo er definiert ist** ([Where to patch](https://docs.python.org/3/library/unittest.mock.html#where-to-patch)).
+
+  ```python title=radwerk/sms.py_und_radwerk/abschluss.py
+  # radwerk/sms.py
+  import json
+  import os
+  import urllib.request
+
+
+  def sende_sms(telefon: str, text: str) -> None:
+      anfrage = urllib.request.Request(
+          os.environ["SMS_GATEWAY_URL"],
+          data=json.dumps({"an": telefon, "text": text}).encode(),
+          method="POST",
+      )
+      urllib.request.urlopen(anfrage, timeout=5)
+
+  # radwerk/abschluss.py
+  from radwerk.sms import sende_sms
+
+
+  def bestaetige_fahrt(telefon: str, betrag_cent: int) -> None:
+      sende_sms(telefon, f"Danke für deine Fahrt: {betrag_cent} Cent")
+  ```
+
+  Drei Tests in `tests/test_abschluss.py` ersetzen die SMS auf drei Arten:
+
+  ```python
+  from unittest.mock import patch
+
+  from radwerk import abschluss
+
+
+  def test_patch_am_ort_der_definition():
+      with patch("radwerk.sms.sende_sms") as sende_sms:
+          abschluss.bestaetige_fahrt("+4917012345", 300)
+      sende_sms.assert_called_once()
+
+
+  def test_patch_am_ort_des_nachschlagens():
+      with patch("radwerk.abschluss.sende_sms") as sende_sms:
+          abschluss.bestaetige_fahrt("+4917012345", 300)
+      sende_sms.assert_called_once_with("+4917012345", "Danke für deine Fahrt: 300 Cent")
+
+
+  def test_mit_monkeypatch(monkeypatch):
+      gesendet = []
+      monkeypatch.setattr(abschluss, "sende_sms", lambda telefon, text: gesendet.append(telefon))
+      abschluss.bestaetige_fahrt("+4917012345", 300)
+      assert gesendet == ["+4917012345"]
+  ```
+
+  ```console
+  $ pytest -q --tb=short
+  F..                                                                      [100%]
+  =================================== FAILURES ===================================
+  _______________________ test_patch_am_ort_der_definition _______________________
+  tests/test_abschluss.py:8: in test_patch_am_ort_der_definition
+      abschluss.bestaetige_fahrt("+4917012345", 300)
+  radwerk/abschluss.py:5: in bestaetige_fahrt
+      sende_sms(telefon, f"Danke für deine Fahrt: {betrag_cent} Cent")
+  radwerk/sms.py:8: in sende_sms
+      os.environ["SMS_GATEWAY_URL"],
+      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  …
+  E   KeyError: 'SMS_GATEWAY_URL'
+  =========================== short test summary info ============================
+  FAILED tests/test_abschluss.py::test_patch_am_ort_der_definition - KeyError: ...
+  1 failed, 2 passed in 0.10s
+  ```
+
+  `from radwerk.sms import sende_sms` legt in `radwerk.abschluss` einen eigenen Namen an, der beim Import auf die Funktion zeigt. `patch("radwerk.sms.sende_sms")` tauscht nur den Namen in `radwerk.sms` aus, `abschluss` ruft weiter das Original auf. Auf einem Rechner mit gesetzter `SMS_GATEWAY_URL` hätte der Test eine echte SMS verschickt. Schriebe `abschluss.py` dagegen `from radwerk import sms` und riefe `sms.sende_sms(…)` auf, schlüge Python den Namen bei jedem Aufruf in `radwerk.sms` nach – dann wäre genau dieser Patch richtig.
+
+  > [!MERKE]
+  > Ein Patch ersetzt ein Attribut eines Objekts, keinen Funktionskörper. Frag dich: In welchem Modul steht der Name, den der Code beim Aufruf auflöst? Dieses Modul patchst du.
+
+  [`monkeypatch`](https://docs.pytest.org/en/stable/how-to/monkeypatch.html) folgt derselben Regel (`monkeypatch.setattr(abschluss, "sende_sms", …)` im dritten Test) und nimmt jede Änderung nach dem Test zurück. Seine Stärke sind Umgebungsvariablen und Konfiguration:
+
+  ```python pytest
+  import os
+
+  import pytest
+
+
+  def paystream_konfiguration() -> dict:
+      schluessel = os.environ.get("PAYSTREAM_API_KEY")
+      if not schluessel:
+          raise RuntimeError("PAYSTREAM_API_KEY fehlt")
+      sandbox = os.environ.get("PAYSTREAM_SANDBOX") == "1"
+      url = "https://sandbox.paystream.example" if sandbox else "https://api.paystream.example"
+      return {"url": url, "schluessel": schluessel}
+
+
+  def test_sandbox_per_umgebungsvariable(monkeypatch):
+      monkeypatch.setenv("PAYSTREAM_API_KEY", "test-123")
+      monkeypatch.setenv("PAYSTREAM_SANDBOX", "1")
+
+      assert paystream_konfiguration()["url"] == "https://sandbox.paystream.example"
+
+
+  def test_ohne_schluessel_kein_start(monkeypatch):
+      monkeypatch.delenv("PAYSTREAM_API_KEY", raising=False)
+
+      with pytest.raises(RuntimeError, match="PAYSTREAM_API_KEY fehlt"):
+          paystream_konfiguration()
+  ```
+
+  `patch` bringt die Mock-Werkzeuge mit (`autospec=True`, Aufrufprotokoll), `monkeypatch` ist schlanker und kennt Umgebungsvariablen, Dictionaries und `sys.path`. Musst du für einen Test drei Namen patchen, sind das drei versteckte Abhängigkeiten, die du besser als Parameter hereinreichst.
+
+  ## Fakes von Hand: das In-Memory-Repository
+
+  Ein Fake ist eine echte, aber vereinfachte Implementierung. Das klassische Beispiel ist ein Repository, das Daten in einer Liste statt in PostgreSQL hält. Bei Radwerk darf sich keine Reservierung eines Rads mit einer anderen desselben Rads überschneiden. Intervalle sind halboffen `[start, ende)`: Eine Reservierung bis 11:00 und eine ab 11:00 vertragen sich.
+
+  ```python pytest
+  from dataclasses import dataclass
+  from datetime import datetime
+  from zoneinfo import ZoneInfo
+
+  import pytest
+
+  BERLIN = ZoneInfo("Europe/Berlin")
+
+
+  @dataclass(frozen=True)
+  class Reservierung:
+      rad_id: str
+      start: datetime
+      ende: datetime
+
+
+  class Belegt(Exception):
+      pass
+
+
+  class InMemoryReservierungen:  # Fake: echtes Verhalten, nur ohne Datenbank
+      def __init__(self):
+          self._alle = []
+
+      def speichere(self, reservierung):
+          self._alle.append(reservierung)
+
+      def fuer_rad(self, rad_id):
+          return sorted((r for r in self._alle if r.rad_id == rad_id), key=lambda r: r.start)
+
+
+  def reserviere(repo, rad_id, start, ende):
+      for vorhandene in repo.fuer_rad(rad_id):
+          if start < vorhandene.ende and vorhandene.start < ende:  # [start, ende) überlappen
+              raise Belegt(f"{rad_id} ist ab {vorhandene.start:%H:%M} reserviert")
+      reservierung = Reservierung(rad_id, start, ende)
+      repo.speichere(reservierung)
+      return reservierung
+
+
+  def um(stunde, minute=0):
+      return datetime(2026, 10, 3, stunde, minute, tzinfo=BERLIN)
+
+
+  def test_anschlussreservierung_ist_erlaubt():
+      repo = InMemoryReservierungen()
+      reserviere(repo, "R-12", um(11), um(12))
+      reserviere(repo, "R-12", um(10), um(11))
+
+      assert [r.start for r in repo.fuer_rad("R-12")] == [um(10), um(11)]
+
+
+  def test_ueberschneidung_wird_abgelehnt():
+      repo = InMemoryReservierungen()
+      reserviere(repo, "R-12", um(10), um(11))
+
+      with pytest.raises(Belegt, match="ab 10:00"):
+          reserviere(repo, "R-12", um(10, 30), um(11, 30))
+      assert len(repo.fuer_rad("R-12")) == 1
+  ```
+
+  Mit Mocks müsstest du für jeden Schritt festlegen, was `fuer_rad` zurückgibt, und der Test wüsste, wie oft `reserviere` das Repository befragt. Der Fake verhält sich wie ein Repository: Was du speicherst, kommt wieder heraus, und der Test prüft den Zustand am Ende. Ein Fake schlägt einen Mock, wenn
+
+  - der Code mehrere zusammenhängende Aufrufe macht, etwa speichern und danach suchen,
+  - viele Tests dieselbe Abhängigkeit brauchen – den Fake schreibst du einmal, Mock-Konfigurationen in jedem Test neu,
+  - die Tests Refactorings überstehen sollen: Liest `reserviere` künftig über eine andere Methode, änderst du den Fake an einer Stelle statt in zwanzig Tests.
+
+  Ein Fake kann aber vom Original abweichen. In PostgreSQL sichert zusätzlich ein Exclusion Constraint die Regel ab, dieser Fake speichert alles. Speichert ein anderer Codepfad direkt, testest du gegen eine Welt, die es so nicht gibt. Deshalb laufen dieselben Repository-Tests gegen Fake und echte Datenbank, etwa über eine [parametrisierte Fixture](https://docs.pytest.org/en/stable/how-to/fixtures.html#parametrizing-fixtures); mehr in [Integrationstests](/testing/integrationstests).
+
+  ## Was du nicht mocken solltest: fremde APIs und eigene Logik
+
+  ### Don't mock what you don't own: ein Adapter für Paystream
+
+  Rufst du das Paystream-SDK direkt aus der Fachlogik auf und mockst es im Test, beschreibt dein Mock, wie Paystream sich nach *deiner* Vorstellung verhält. Ändert Paystream das SDK, bleibt dein Mock beim alten Stand, und die Tests bleiben grün. Steve Freeman und Nat Pryce formulieren in *Growing Object-Oriented Software, Guided by Tests* deshalb die Regel „Only mock types that you own“: Fremde APIs bekommen einen dünnen Adapter mit deinem eigenen Vokabular.
+
+  ```python title=radwerk/zahlungen.py
+  import paystream  # SDK des Anbieters
+
+
+  class ZahlungAbgelehnt(Exception):
+      pass
+
+
+  class PaystreamZahlungen:
+      """Adapter: übersetzt zwischen Radwerks Sprache und dem Paystream-SDK."""
+
+      def __init__(self, client: paystream.PaystreamClient):
+          self._client = client
+
+      def belaste(self, kunde_id: str, betrag_cent: int, schluessel: str) -> str:
+          try:
+              charge = self._client.charge(kunde_id, betrag_cent, idempotency_key=schluessel)
+          except paystream.CardDeclined as fehler:
+              raise ZahlungAbgelehnt(fehler.reason) from fehler
+          return charge.id
+  ```
+
+  Die Fachlogik kennt nur `belaste` und `ZahlungAbgelehnt`. In ihren Unit-Tests ersetzt du den Adapter – dein Typ, dein Vertrag. Den Adapter selbst testest du mit wenigen Integrationstests gegen die Sandbox von Paystream oder gegen aufgezeichnete Antworten. Ein SDK-Update bricht dann genau diese Tests und genau eine Datei. Verträge zwischen Diensten behandelt [Contract Testing](/testing/contract-testing).
+
+  > [!PRAXIS] Ein Adapter je externem Dienst
+  > Bei Radwerk hat jeder externe Dienst genau einen Adapter: `PaystreamZahlungen`, `SmsGateway`, `PostgresFahrten`. Die Unit-Tests der Fachlogik laufen mit Fakes und brauchen zusammen unter einer Sekunde. Die Adaptertests laufen in einem eigenen CI-Job gegen die Paystream-Sandbox und einen PostgreSQL-Container. Ein `patch("paystream…")` außerhalb der Adaptertests bekommt im Code-Review einen Kommentar.
+
+  ### Over-Mocking: Tests, die jedes Refactoring verbieten
+
+  In einer späteren Fassung bekommt `schliesse_fahrt_ab(fahrt_id, fahrten, zahlungen, sms)` nur noch die ID. Sie lädt die Fahrt aus dem Repository, setzt nach der Zahlung den Status und speichert die Fahrt wieder. Dieser Test dafür ist grün und sieht gründlich aus:
+
+  ```python
+  def test_schliesse_fahrt_ab():
+      repo, zahlungen, sms = Mock(), Mock(), Mock()
+      repo.hole.return_value = Fahrt("F-1042", "K-7", "+4917012345", minuten=47)
+
+      with patch("radwerk.abschluss.mietpreis", return_value=300) as mietpreis:
+          schliesse_fahrt_ab("F-1042", repo, zahlungen, sms)
+
+      mietpreis.assert_called_once_with(47)
+      assert repo.mock_calls == [call.hole("F-1042"), call.speichere(ANY)]
+      zahlungen.belaste.assert_called_once_with("K-7", 300, schluessel="F-1042")
+      sms.sende.assert_called_once_with("+4917012345", ANY)
+  ```
+
+  Er ersetzt `mietpreis`, also eigene Logik: Rechnet `mietpreis` falsch, bleibt er grün. `repo.mock_calls` schreibt Reihenfolge und Anzahl jedes Repository-Aufrufs vor: Lädt der Code die Fahrt künftig über `hole_offene(…)`, ist der Test rot, ohne dass sich für Kundinnen etwas ändert. Und der reine `Mock` vergleicht Argumente wörtlich: Ruft der Code `belaste(kunde_id="K-7", betrag_cent=300, …)` mit Schlüsselwörtern auf, ist der Test rot, obwohl der Aufruf derselbe ist. Der Test bremst also jede Änderung und schützt trotzdem nicht.
+
+  Der Umbau folgt den Regeln von oben – Fake für das eigene Repository, echte `mietpreis`, ein autospezifiziertes Double nur für Paystream, ein Spy für die SMS:
+
+  ```python
+  def test_bezahlte_fahrt_wird_gespeichert_und_bestaetigt():
+      fahrten = InMemoryFahrten([Fahrt("F-1042", "K-7", "+4917012345", minuten=47)])
+      zahlungen = create_autospec(PaystreamZahlungen, instance=True)
+      sms = SmsSpy()
+
+      schliesse_fahrt_ab("F-1042", fahrten, zahlungen, sms)
+
+      assert fahrten.hole("F-1042").status == "bezahlt"
+      zahlungen.belaste.assert_called_once_with("K-7", 300, schluessel="F-1042")
+      assert sms.gesendet == [("+4917012345", "Danke für deine Fahrt: 300 Cent")]
+  ```
+
+  > [!INTERVIEW] „Was ist der Unterschied zwischen einem Mock und einem Stub?“
+  > Ein Stub liefert dem Code vorbereitete Antworten. Er steuert, was hineingeht, und der Test prüft danach das Ergebnis. Ein Mock prüft, was hinausgeht: welche Aufrufe der Code an eine Abhängigkeit macht. Bei Meszaros kennt er die Erwartungen vorab, Pythons `Mock` zeichnet auf, und man prüft danach. Ich stubbe Abfragen und prüfe Aufrufe nur, wo sie das sichtbare Ergebnis sind, etwa die Belastung bei Paystream. Für eigenen Code nehme ich echte Objekte oder Fakes, damit Tests Refactorings überstehen.
+
+  > [!TIP] Jeden Test einmal rot sehen
+  > Ein Test mit vertippter oder unvollständiger Prüfung ist immer grün. Bau den Fehler, den der Test fangen soll, kurz absichtlich ein – etwa ein zweites `belaste` – und sieh nach, ob er rot wird.
+
+  ## Häufige Fehler
+
+  - **Am Ort der Definition patchen.** Der Patch wirkt nicht, der echte Dienst läuft (`KeyError`, Timeout, echte SMS). Patche das Modul, in dem der Code den Namen nachschlägt.
+  - **`assert_called_with` statt `assert_called_once_with`.** Doppelte Belastungen bleiben unentdeckt. Prüfe die Anzahl mit.
+  - **`Mock()` ohne Spec.** Tippfehler im Produktionscode, geänderte Signaturen und vertippte Prüfungen wie `asssert_…` bleiben grün. Nimm `create_autospec(Klasse, instance=True)` oder `patch(…, autospec=True)`.
+  - **Prüfung ohne Klammern.** `sms.sende.assert_called_once` ohne `()` prüft nichts. Sieh jeden neuen Test einmal rot.
+  - **Eigene Logik mocken.** Rechenfehler bleiben grün, Refactorings werden rot. Reine Funktionen und eigene Objekte laufen echt.
+  - **Ein fremdes SDK mocken.** Der Mock friert ein veraltetes Bild der API ein. Schreib einen Adapter, ersetze im Unit-Test den Adapter und teste ihn gegen die Sandbox.
+  - **Fake ohne eigene Tests.** Weicht er von PostgreSQL ab, prüfen alle Tests eine Fantasie. Lass dieselben Repository-Tests gegen beide laufen.
+
+  ## Zusammenfassung
+
+  - Ein Stub steuert indirekte Eingaben, Spy und Mock prüfen indirekte Ausgaben, ein Fake ist eine leichte echte Implementierung, ein Dummy füllt nur Parameter.
+  - Abfragen stubbst du, Befehle an der Systemgrenze prüfst du mit genauen Argumenten und genauer Anzahl, eigene Logik ersetzt du nicht.
+  - `side_effect` liefert Exceptions und Folgen von Antworten, `call_args_list` zeigt alle Aufrufe; `assert_called_with` sieht nur den letzten.
+  - Ein `Mock` akzeptiert jedes Attribut und jede Signatur. `create_autospec` und `autospec=True` binden ihn an die echte Klasse.
+  - Patche dort, wo der Name nachgeschlagen wird. `monkeypatch` räumt nach dem Test auf und ist die erste Wahl für Umgebungsvariablen.
+  - Ein Fake schlägt Mocks, wenn Aufrufe zusammenhängen und viele Tests dieselbe Abhängigkeit brauchen. Er braucht eigene Tests gegen das Original.
+  - Mocke nur Typen, die dir gehören: Fremde APIs bekommen einen Adapter. Prüfe Ergebnisse und Befehle an der Grenze, nicht den Weg dorthin.
+exercises:
+  - id: double-bestimmen
+    type: choice
+    title: Was für ein Double ist das?
+    prompt: |
+      Ein Test für den Tageshöchstpreis übergibt `tagesabrechnung` dieses Objekt als Fahrten-Repository und prüft danach nur den Rückgabewert. Welche Art Test Double ist `FahrtenVonHeute` nach Meszaros?
+    lang: python
+    code: |
+      class FahrtenVonHeute:
+          def fuer_kunde_am(self, kunde_id, tag):
+              return [47, 200, 200]
+    options:
+      - text: Stub
+        correct: true
+        why: Das Objekt liefert vorbereitete Antworten – die indirekte Eingabe „drei Fahrten“. Der Test prüft danach das Ergebnis, nicht die Aufrufe.
+      - text: Fake
+        correct: false
+        why: Ein Fake hat echtes, vereinfachtes Verhalten, etwa speichern und wiederfinden. Dieses Objekt gibt für jeden Kunden und jeden Tag dieselbe Liste zurück.
+      - text: Spy
+        correct: false
+        why: Ein Spy zeichnet Aufrufe auf, damit der Test sie danach prüfen kann. `FahrtenVonHeute` merkt sich nichts.
+      - text: Mock
+        correct: false
+        why: Ein Mock kennt erwartete Aufrufe und schlägt bei Abweichungen an. Dieses Objekt prüft gar nichts.
+      - text: Dummy
+        correct: false
+        why: Ein Dummy wird nie benutzt. `tagesabrechnung` ruft `fuer_kunde_am` auf und rechnet mit dem Ergebnis.
+    explanation: |
+      Die Frage für die Einordnung lautet: Steuert das Double, was hineinkommt, oder beobachtet es, was hinausgeht? `FahrtenVonHeute` steuert die indirekte Eingabe – ein klassischer Stub. Würde es zusätzlich `self.anfragen.append((kunde_id, tag))` ausführen und der Test diese Liste prüfen, wäre es ein Spy. Würde es Fahrten pro Kunde und Tag speichern und wieder herausgeben, wäre es ein Fake.
+    resources:
+      - title: Martin Fowler · Test Double
+        url: https://martinfowler.com/bliki/TestDouble.html
+
+  - id: was-pruefen
+    type: choice
+    title: Was gehört in den Test?
+    prompt: |
+      `schliesse_fahrt_ab(fahrt_id, fahrten, zahlungen, sms)` lädt eine Fahrt aus dem Repository, berechnet mit der eigenen reinen Funktion `mietpreis` den Preis, belastet die Kundin bei Paystream, setzt den Status auf `bezahlt` und schickt eine SMS. Du schreibst den Unit-Test für eine Fahrt von 47 Minuten (300 Cent) mit einem In-Memory-Fake für `fahrten`. Welche Prüfungen gehören hinein?
+    options:
+      - text: Paystream wurde genau einmal mit `("K-7", 300, schluessel="F-1042")` belastet.
+        correct: true
+        why: Ein Befehl an der Systemgrenze. Die Belastung ist das Ergebnis, das die Kundin auf ihrer Abrechnung sieht. „Genau einmal“, weil eine Doppelbelastung der teuerste Fehler dieser Funktion ist.
+      - text: Im Fake hat die Fahrt danach den Status `bezahlt`.
+        correct: true
+        why: Zustandsprüfung über den Fake. Sie gilt unabhängig davon, wie oft und womit der Code das Repository befragt hat.
+      - text: Die SMS ging an die Nummer der Fahrt und nennt 300 Cent.
+        correct: true
+        why: Eine indirekte Ausgabe an einen externen Dienst, die die Kundin sieht. Der Betrag in der SMS zeigt nebenbei, dass `mietpreis` richtig rechnet.
+      - text: "`fahrten.hole` wurde vor `fahrten.speichere` aufgerufen."
+        correct: false
+        why: Die Reihenfolge interner Aufrufe ist ein Implementierungsdetail. Die Zustandsprüfung zeigt schon, ob am Ende das Richtige gespeichert ist.
+      - text: "`mietpreis` wurde mit 47 aufgerufen."
+        correct: false
+        why: "`mietpreis` ist eigene Logik. Prüfe ihr Ergebnis (300 Cent in Belastung und SMS), nicht ihren Aufruf. Wird sie dafür gemockt, bleibt ein Rechenfehler unentdeckt."
+    explanation: |
+      Die Regel: Abfragen stubben oder faken und das Ergebnis prüfen, Befehle an der Systemgrenze mit Argumenten und Anzahl prüfen, eigene Logik echt laufen lassen. So bleibt der Test grün, wenn jemand das Laden der Fahrt umbaut, und wird rot, wenn Geld falsch fließt oder die Kundin eine falsche SMS bekommt.
+    resources:
+      - title: Martin Fowler · Mocks Aren't Stubs
+        url: https://martinfowler.com/articles/mocksArentStubs.html
+
+  - id: fake-oder-mock
+    type: choice
+    title: Wo lohnt sich ein Fake?
+    prompt: Für welche Abhängigkeit ist ein handgeschriebener Fake die bessere Wahl als ein `Mock`?
+    options:
+      - text: Das Reservierungs-Repository in 40 Tests, in denen `reserviere`, `verschiebe` und `storniere` speichern und danach wieder suchen.
+        correct: true
+        why: Viele Tests, zusammenhängende Aufrufe, Prüfung auf Zustand. Der Fake wird einmal geschrieben, und die Tests überstehen Umbauten an der Art, wie gelesen wird.
+      - text: Paystream in einem einzigen Test, der prüft, dass nach einer Ablehnung eine SMS kommt.
+        correct: false
+        why: Ein Stub mit `side_effect = ZahlungAbgelehnt(…)` reicht. Ein Fake wäre mehr Code als der Test.
+      - text: "`mietpreis` im Test von `schliesse_fahrt_ab`."
+        correct: false
+        why: Eine eigene reine Funktion wird weder gefakt noch gemockt. Sie läuft echt mit.
+      - text: Das Paystream-SDK selbst, mit allen Fehlercodes nachgebaut.
+        correct: false
+        why: Ein fremder Typ – du würdest Paystreams Verhalten raten. Fake oder Mock gehören vor deinen Adapter, das SDK bekommt Integrationstests gegen die Sandbox.
+    explanation: |
+      Ein Fake kostet Code und muss gepflegt werden. Er zahlt sich aus, wenn viele Tests eine Abhängigkeit mit Zustand brauchen: Was gespeichert wird, soll wiederkommen. Für eine einzelne vorbereitete Antwort genügt ein Stub, und eigene reine Logik wird nie ersetzt.
+    resources:
+      - title: pytest · Parametrizing fixtures
+        url: https://docs.pytest.org/en/stable/how-to/fixtures.html#parametrizing-fixtures
+
+  - id: side-effect-folge
+    type: output
+    title: Erst Timeout, dann Quittung
+    prompt: Was gibt dieses Programm aus?
+    lang: python
+    code: |
+      from unittest.mock import Mock
+
+
+      class PaystreamTimeout(Exception):
+          pass
+
+
+      zahlungen = Mock()
+      zahlungen.belaste.side_effect = [PaystreamTimeout(), "tx-81", "tx-82"]
+
+      for versuch in range(3):
+          try:
+              quittung = zahlungen.belaste("K-7", 300, schluessel=f"F-1042-{versuch}")
+          except PaystreamTimeout:
+              print("Timeout")
+              continue
+          print(quittung)
+          break
+
+      print(zahlungen.belaste.call_count)
+      print(zahlungen.belaste.call_args)
+      print(zahlungen.belaste.call_args_list[0].kwargs["schluessel"])
+    expected: |
+      Timeout
+      tx-81
+      2
+      call('K-7', 300, schluessel='F-1042-1')
+      F-1042-0
+    explanation: |
+      Ist `side_effect` eine Liste, liefert jeder Aufruf das nächste Element; ist das Element eine Exception, wird sie geworfen. Der erste Aufruf wirft also `PaystreamTimeout`, der zweite gibt `"tx-81"` zurück, danach beendet `break` die Schleife – `"tx-82"` kommt nie dran. `call_count` zählt auch den gescheiterten Aufruf mit, `call_args` ist nur der letzte, `call_args_list` enthält alle. Fachlich zeigt die Ausgabe einen Fehler: Jeder Versuch bekommt einen neuen Idempotenzschlüssel. Kam die erste Belastung bei Paystream trotz Timeout an, wird die Kundin doppelt belastet.
+    resources:
+      - title: Python · Mock.side_effect
+        url: https://docs.python.org/3/library/unittest.mock.html#unittest.mock.Mock.side_effect
+      - title: Python · Mock.call_args_list
+        url: https://docs.python.org/3/library/unittest.mock.html#unittest.mock.Mock.call_args_list
+
+  - id: stille-mocks
+    type: output
+    title: Ein Mock sagt zu allem Ja
+    prompt: Was gibt dieses Programm unter Python 3.14 aus?
+    lang: python
+    code: |
+      from unittest.mock import Mock
+
+      sms = Mock()
+      zahlungen = Mock()
+
+      sms.sende("+4917012345", "Danke für deine Fahrt: 300 Cent")
+      quittung = zahlungen.belaste("K-7", 300, schluessel="F-1042")
+
+      print(sms.sende.call_count)
+      print(sms.sened.call_count)
+      print("abgelehnt" if quittung.abgelehnt else "bezahlt")
+
+      sms.sende.assert_called_once
+      sms.sende.asssert_called_twice()
+      print("keine Prüfung schlägt an")
+
+      try:
+          sms.sende.called_once_with("+4917012345")
+      except AttributeError:
+          print("AttributeError")
+    expected: |
+      1
+      0
+      abgelehnt
+      keine Prüfung schlägt an
+      AttributeError
+    explanation: |
+      `sms.sened` (vertippt) ist ein neuer Kind-Mock, der nie aufgerufen wurde – kein Fehler, nur eine 0. `quittung` ist der automatische Rückgabewert, ein `Mock`; jedes seiner Attribute ist wieder ein `Mock` und damit wahr, also „abgelehnt“. `sms.sende.assert_called_once` ohne Klammern ruft die Prüfung nie auf. `asssert_called_twice` mit drei s fällt nicht unter die geschützten Präfixe (`assert`, `assret`, `asert`, `aseert`, `assrt`) und läuft durch, obwohl `sende` nur einmal aufgerufen wurde. `called_once_with` dagegen erkennt Python seit 3.12 als Prüfnamen ohne `assert_` und wirft `AttributeError`. Mit `create_autospec` wären `sened`, `abgelehnt` und `asssert_called_twice` sofort aufgefallen.
+    resources:
+      - title: Python · Mock (Parameter unsafe)
+        url: https://docs.python.org/3/library/unittest.mock.html#unittest.mock.Mock
+      - title: Python · Autospeccing
+        url: https://docs.python.org/3/library/unittest.mock.html#autospeccing
+
+  - id: patch-ort
+    type: output
+    title: Welche SMS ist echt?
+    prompt: |
+      Das Programm legt zwei kleine Module an und importiert sie. Was gibt es aus?
+    lang: python
+    code: |
+      import importlib
+      from pathlib import Path
+      from unittest.mock import patch
+
+      Path("sms.py").write_text("def sende(telefon, text):\n    return 'echte SMS'\n")
+      Path("abschluss.py").write_text(
+          "import sms\n"
+          "from sms import sende\n"
+          "\n"
+          "def bestaetige(telefon):\n"
+          "    return sende(telefon, 'Danke'), sms.sende(telefon, 'Danke')\n"
+      )
+      importlib.invalidate_caches()  # neu angelegte Module für den Import sichtbar machen
+
+      import abschluss
+
+      with patch("sms.sende", return_value="Fake"):
+          print(abschluss.bestaetige("+4917012345"))
+
+      with patch("abschluss.sende", return_value="Fake"):
+          print(abschluss.bestaetige("+4917012345"))
+
+      print(abschluss.bestaetige("+4917012345"))
+    expected: |
+      ('echte SMS', 'Fake')
+      ('Fake', 'echte SMS')
+      ('echte SMS', 'echte SMS')
+    explanation: |
+      `from sms import sende` legt in `abschluss` einen eigenen Namen `sende` an, der beim Import auf die Funktion zeigt. `sms.sende(…)` dagegen schlägt bei jedem Aufruf im Modul `sms` nach. `patch("sms.sende")` ersetzt nur den Namen in `sms` – das trifft den zweiten Aufruf, nicht den ersten. `patch("abschluss.sende")` trifft genau den ersten. Nach dem `with`-Block stellt `patch` beide Namen wieder her. Deshalb lautet die Regel: dort patchen, wo der Name nachgeschlagen wird.
+    resources:
+      - title: Python · Where to patch
+        url: https://docs.python.org/3/library/unittest.mock.html#where-to-patch
+
+  - id: autospec-und-patch
+    type: gap
+    title: Ein Test für die Wiederholung
+    prompt: |
+      `radwerk/abschluss.py` beginnt mit `from radwerk.sms import sende_sms`. `schliesse_fahrt_ab(fahrt, zahlungen)` bekommt die Zahlungsschnittstelle als Parameter und versucht es nach einem `PaystreamTimeout` genau einmal erneut, mit demselben Schlüssel.
+
+      Ergänze den Test: Das Double für `zahlungen` soll Tippfehler und falsche Signaturen bemerken. Der erste Aufruf von `belaste` scheitert mit einem Timeout, der zweite liefert eine Quittung. Die SMS darf nicht wirklich verschickt werden. Am Ende prüft der Test beide Belastungsversuche und **genau eine** SMS.
+    lang: python
+    code: |
+      from unittest.mock import call, create_autospec, patch
+
+      from radwerk.abschluss import Fahrt, schliesse_fahrt_ab
+      from radwerk.zahlungen import PaystreamTimeout, Zahlungen
+
+
+      def test_wiederholung_nach_timeout_mit_demselben_schluessel():
+          zahlungen = ⟦create_autospec⟧(Zahlungen, instance=True)
+          zahlungen.belaste.⟦side_effect⟧ = [PaystreamTimeout(), "tx-81"]
+          fahrt = Fahrt("F-1042", "K-7", "+4917012345", minuten=47)
+
+          with patch(⟦"radwerk.abschluss.sende_sms"⟧) as sende_sms:
+              status = schliesse_fahrt_ab(fahrt, zahlungen)
+
+          assert status == "bezahlt"
+          assert zahlungen.belaste.⟦call_args_list⟧ == [call("K-7", 300, schluessel="F-1042")] * 2
+          sende_sms.⟦assert_called_once_with⟧("+4917012345", "Danke für deine Fahrt: 300 Cent")
+    gaps:
+      - label: Double nach Vorbild der Klasse
+        hint: Die Funktion aus `unittest.mock`, die Attribute und Signaturen der echten Klasse übernimmt, ist schon importiert.
+      - label: Antworten nacheinander
+        hint: Das Attribut, das Exceptions wirft oder eine Folge von Rückgabewerten liefert.
+      - label: Ziel des Patches
+        hint: In welchem Modul schlägt `schliesse_fahrt_ab` den Namen `sende_sms` nach?
+      - label: Alle Aufrufe
+        hint: Eine Liste aller aufgezeichneten Aufrufe, vergleichbar mit `call(…)`-Objekten.
+        accept: ["mock_calls"]
+      - label: Genau einmal mit Argumenten
+        hint: Die Prüfung, die Anzahl und Argumente zugleich vergleicht.
+    explanation: |
+      `create_autospec(Zahlungen, instance=True)` baut den Mock nach der echten Klasse: Ein Aufruf mit falscher Signatur wirft `TypeError`, ein vertipptes Attribut `AttributeError`. `side_effect` mit einer Liste wirft zuerst die Exception und liefert dann `"tx-81"`. Gepatcht wird `radwerk.abschluss.sende_sms`, weil `abschluss` den Namen per `from … import` in sein eigenes Modul geholt hat. `call_args_list` (oder hier gleichwertig `mock_calls`) zeigt beide Versuche mit demselben Schlüssel. `assert_called_once_with` prüft Anzahl und Argumente – `assert_called_with` würde eine doppelte SMS übersehen.
+    resources:
+      - title: Python · create_autospec
+        url: https://docs.python.org/3/library/unittest.mock.html#unittest.mock.create_autospec
+      - title: Python · patch
+        url: https://docs.python.org/3/library/unittest.mock.html#unittest.mock.patch
+
+  - id: doppelt-belastet
+    type: code
+    title: Tests, die Doppelbelastungen bemerken
+    prompt: |
+      `schliesse_fahrt_ab(fahrt, zahlungen, sms)` aus `abschluss.py` schließt eine Fahrt mit dem City-Rad ab. Die Abhängigkeiten kommen als Parameter herein. Der Vertrag:
+
+      - **Preis:** 150 Cent je angefangene 30 Minuten; Fahrten bis einschließlich 5 Minuten kosten 0 Cent.
+      - **Belastung:** Kostet die Fahrt mehr als 0 Cent, ruft die Funktion `zahlungen.belaste(kunde_id, betrag_cent, schluessel=fahrt_id)` auf – bei Erfolg genau einmal. Bei 0 Cent ruft sie `belaste` nicht auf.
+      - **Timeout:** Wirft `belaste` einen `PaystreamTimeout`, versucht sie es genau ein zweites Mal mit denselben Argumenten, auch demselben `schluessel`. Scheitert auch der zweite Versuch, gibt sie die Exception weiter.
+      - **Ablehnung:** Wirft `belaste` `ZahlungAbgelehnt`, sendet sie genau eine SMS `"Zahlung abgelehnt, bitte Karte prüfen."` an `fahrt.telefon` und gibt `"offen"` zurück.
+      - **Bestätigung:** Sonst sendet sie genau eine SMS `f"Danke für deine Fahrt: {betrag} Cent"` an `fahrt.telefon` – auch bei 0 Cent – und gibt `"bezahlt"` zurück.
+
+      `sms.sende(telefon, text)` verschickt eine SMS. `Fahrt(fahrt_id, kunde_id, telefon, minuten)`, `PaystreamTimeout` und `ZahlungAbgelehnt` kommen ebenfalls aus `abschluss.py`.
+
+      Schreibe pytest-Tests mit Test Doubles für `zahlungen` und `sms` – aus `unittest.mock` oder von Hand. Sie müssen gegen die richtige Implementierung grün sein und jede fehlerhafte Variante, die die Prüfung bereithält, rot werden lassen.
+    lang: python
+    setup: |
+      from pathlib import Path
+
+      RICHTIG = '''
+      from dataclasses import dataclass
+
+
+      @dataclass
+      class Fahrt:
+          fahrt_id: str
+          kunde_id: str
+          telefon: str
+          minuten: int
+
+
+      class PaystreamTimeout(Exception):
+          pass
+
+
+      class ZahlungAbgelehnt(Exception):
+          pass
+
+
+      def mietpreis(minuten):
+          if minuten <= 5:
+              return 0
+          return -(-minuten // 30) * 150
+
+
+      def _belaste(zahlungen, fahrt, betrag):
+          for versuch in range(2):
+              try:
+                  return zahlungen.belaste(fahrt.kunde_id, betrag, schluessel=fahrt.fahrt_id)
+              except PaystreamTimeout:
+                  if versuch == 1:
+                      raise
+
+
+      def schliesse_fahrt_ab(fahrt, zahlungen, sms):
+          betrag = mietpreis(fahrt.minuten)
+          if betrag > 0:
+              try:
+                  _belaste(zahlungen, fahrt, betrag)
+              except ZahlungAbgelehnt:
+                  sms.sende(fahrt.telefon, "Zahlung abgelehnt, bitte Karte prüfen.")
+                  return "offen"
+          sms.sende(fahrt.telefon, f"Danke für deine Fahrt: {betrag} Cent")
+          return "bezahlt"
+      '''
+      MUTANTEN = {
+          "doppelt": RICHTIG.replace("return zahlungen.belaste(", "quittung = zahlungen.belaste("),
+          "neuer_schluessel": RICHTIG.replace(
+              "schluessel=fahrt.fahrt_id)",
+              'schluessel=fahrt.fahrt_id if versuch == 0 else f"{fahrt.fahrt_id}-wdh")',
+          ),
+          "keine_bestaetigung": RICHTIG.replace(
+              '            return "offen"\n    sms.sende(',
+              '            return "offen"\n        sms.sende(',
+          ),
+          "danke_nach_ablehnung": RICHTIG.replace('            return "offen"\n', ""),
+      }
+      assert all(m != RICHTIG for m in MUTANTEN.values()), "Ein Mutant ist identisch mit der richtigen Version."
+      Path("abschluss.py").write_text(RICHTIG, encoding="utf-8")
+    starter: |
+      from unittest.mock import Mock, call
+
+      from abschluss import Fahrt, PaystreamTimeout, ZahlungAbgelehnt, schliesse_fahrt_ab
+
+
+      def fahrt(minuten):
+          return Fahrt("F-1042", "K-7", "+4917012345", minuten)
+
+
+      def test_bezahlte_fahrt():
+          zahlungen, sms = Mock(), Mock()
+          ...
+    solution: |
+      from unittest.mock import Mock, call
+
+      from abschluss import Fahrt, PaystreamTimeout, ZahlungAbgelehnt, schliesse_fahrt_ab
+
+
+      def fahrt(minuten):
+          return Fahrt("F-1042", "K-7", "+4917012345", minuten)
+
+
+      def test_bezahlte_fahrt_wird_genau_einmal_belastet_und_bestaetigt():
+          zahlungen, sms = Mock(), Mock()
+
+          assert schliesse_fahrt_ab(fahrt(47), zahlungen, sms) == "bezahlt"
+
+          zahlungen.belaste.assert_called_once_with("K-7", 300, schluessel="F-1042")
+          sms.sende.assert_called_once_with("+4917012345", "Danke für deine Fahrt: 300 Cent")
+
+
+      def test_fehlstart_ohne_belastung_aber_mit_bestaetigung():
+          zahlungen, sms = Mock(), Mock()
+
+          assert schliesse_fahrt_ab(fahrt(5), zahlungen, sms) == "bezahlt"
+
+          zahlungen.belaste.assert_not_called()
+          sms.sende.assert_called_once_with("+4917012345", "Danke für deine Fahrt: 0 Cent")
+
+
+      def test_abgelehnte_zahlung_bleibt_offen():
+          zahlungen, sms = Mock(), Mock()
+          zahlungen.belaste.side_effect = ZahlungAbgelehnt("Karte gesperrt")
+
+          assert schliesse_fahrt_ab(fahrt(47), zahlungen, sms) == "offen"
+
+          sms.sende.assert_called_once_with("+4917012345", "Zahlung abgelehnt, bitte Karte prüfen.")
+
+
+      def test_timeout_wird_mit_demselben_schluessel_wiederholt():
+          zahlungen, sms = Mock(), Mock()
+          zahlungen.belaste.side_effect = [PaystreamTimeout(), "tx-81"]
+
+          assert schliesse_fahrt_ab(fahrt(47), zahlungen, sms) == "bezahlt"
+
+          assert zahlungen.belaste.call_args_list == [call("K-7", 300, schluessel="F-1042")] * 2
+    tests:
+      - name: Grün gegen die richtige Implementierung
+        code: |
+          lauf = run_pytest({"abschluss.py": RICHTIG})
+          assert lauf.ok, lauf.output
+      - name: Fängt einen Fehler bei der Belastung
+        code: |
+          lauf = run_pytest({"abschluss.py": MUTANTEN["doppelt"]})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl eine erfolgreiche Belastung ein zweites Mal ausgelöst wird."
+      - name: Fängt einen Fehler bei der Wiederholung nach Timeout
+        code: |
+          lauf = run_pytest({"abschluss.py": MUTANTEN["neuer_schluessel"]})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl der zweite Versuch einen anderen Idempotenzschlüssel schickt."
+      - name: Fängt einen Fehler bei der Bestätigungs-SMS
+        code: |
+          lauf = run_pytest({"abschluss.py": MUTANTEN["keine_bestaetigung"]})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl nach einer kostenlosen Fahrt keine SMS mehr kommt."
+      - name: Fängt einen Fehler bei abgelehnter Zahlung
+        code: |
+          lauf = run_pytest({"abschluss.py": MUTANTEN["danke_nach_ablehnung"]})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl nach einer Ablehnung zusätzlich „Danke“ gesendet und `bezahlt` zurückgegeben wird."
+    hints:
+      - Jede fehlerhafte Variante bricht genau eine Regel des Vertrags. Geh die fünf Regeln durch und schreib zu jeder mindestens einen Test.
+      - "Für die Ablehnung braucht `zahlungen.belaste` ein `side_effect = ZahlungAbgelehnt(\"Karte gesperrt\")`, für den Timeout eine Folge: `side_effect = [PaystreamTimeout(), \"tx-81\"]`."
+      - "Prüfe Anzahl und Argumente zusammen: `assert_called_once_with(…)`, `assert_not_called()` und `call_args_list == [call(…)] * 2`. Vergiss die Fahrt mit 5 Minuten nicht."
+    explanation: |
+      Jede Variante entspricht einem Fehler, der in echten Zahlungsabläufen vorkommt. Ein vergessenes `return` in der Wiederholungsschleife belastet nach Erfolg ein zweites Mal – nur `assert_called_once_with` oder `call_count == 1` sieht das, `assert_called_with` nicht. Ein neuer Idempotenzschlüssel pro Versuch fällt nur auf, wenn der Test mit `side_effect` einen Timeout erzeugt und beide Aufrufe vergleicht. Die fehlende SMS nach einem Fehlstart findet nur ein Test an der Grenze von 5 Minuten. Die zusätzliche Danke-SMS nach einer Ablehnung zeigt ein Stub, der `ZahlungAbgelehnt` wirft, zusammen mit `assert_called_once_with` auf `sms.sende` oder einer Prüfung des Rückgabewerts. Alle Prüfungen betreffen Befehle an der Systemgrenze: Geld und SMS.
+    resources:
+      - title: Python · Mock.assert_called_once_with
+        url: https://docs.python.org/3/library/unittest.mock.html#unittest.mock.Mock.assert_called_once_with
+      - title: Python · Mock.side_effect
+        url: https://docs.python.org/3/library/unittest.mock.html#unittest.mock.Mock.side_effect
+
+  - id: fake-reservierungen
+    type: code
+    title: Ein Fake mit denselben Regeln wie PostgreSQL
+    prompt: |
+      In Produktion speichert `PostgresReservierungen` die Reservierungen in PostgreSQL. Ein Exclusion Constraint verhindert dort, dass sich zwei Reservierungen desselben Rads überschneiden. Für schnelle Unit-Tests brauchst du einen Fake mit demselben Verhalten. Schreibe die Klasse `InMemoryReservierungen`:
+
+      - `speichere(reservierung)` legt eine `Reservierung` ab. Überschneidet sie sich mit einer gespeicherten Reservierung **desselben Rads**, wirft die Methode `Ueberschneidung` und speichert nichts. Intervalle sind halboffen `[start, ende)`: Endet eine Reservierung um 11:00, darf die nächste um 11:00 beginnen.
+      - `fuer_rad(rad_id)` gibt die Reservierungen dieses Rads nach `start` sortiert als **neue** Liste zurück. Wer diese Liste verändert, verändert den Fake nicht.
+      - `storniere(reservierung_id)` entfernt die Reservierung. Eine unbekannte ID wirft `KeyError`.
+
+      `Reservierung` und `Ueberschneidung` stehen schon im Editor.
+    lang: python
+    setup: |
+      from datetime import datetime
+      from zoneinfo import ZoneInfo
+
+      BERLIN = ZoneInfo("Europe/Berlin")
+
+
+      def um(stunde, minute=0, tag=3):
+          return datetime(2026, 10, tag, stunde, minute, tzinfo=BERLIN)
+    starter: |
+      from dataclasses import dataclass
+      from datetime import datetime
+
+
+      @dataclass(frozen=True)
+      class Reservierung:
+          reservierung_id: str
+          rad_id: str
+          start: datetime
+          ende: datetime
+
+
+      class Ueberschneidung(Exception):
+          pass
+
+
+      class InMemoryReservierungen:
+          def __init__(self):
+              self._alle = []
+
+          def speichere(self, reservierung):
+              self._alle.append(reservierung)
+
+          def fuer_rad(self, rad_id):
+              return [r for r in self._alle if r.rad_id == rad_id]
+
+          def storniere(self, reservierung_id):
+              ...
+    solution: |
+      from dataclasses import dataclass
+      from datetime import datetime
+
+
+      @dataclass(frozen=True)
+      class Reservierung:
+          reservierung_id: str
+          rad_id: str
+          start: datetime
+          ende: datetime
+
+
+      class Ueberschneidung(Exception):
+          pass
+
+
+      class InMemoryReservierungen:
+          def __init__(self):
+              self._alle: dict[str, Reservierung] = {}
+
+          def speichere(self, reservierung):
+              for vorhandene in self._alle.values():
+                  if (
+                      vorhandene.rad_id == reservierung.rad_id
+                      and reservierung.start < vorhandene.ende
+                      and vorhandene.start < reservierung.ende
+                  ):
+                      raise Ueberschneidung(f"{reservierung.rad_id} ist ab {vorhandene.start:%H:%M} belegt")
+              self._alle[reservierung.reservierung_id] = reservierung
+
+          def fuer_rad(self, rad_id):
+              return sorted((r for r in self._alle.values() if r.rad_id == rad_id), key=lambda r: r.start)
+
+          def storniere(self, reservierung_id):
+              del self._alle[reservierung_id]
+    tests:
+      - name: Speichert und liefert die Reservierungen eines Rads sortiert
+        code: |
+          repo = InMemoryReservierungen()
+          repo.speichere(Reservierung("A", "R-12", um(14), um(15)))
+          repo.speichere(Reservierung("B", "R-7", um(9), um(10)))
+          repo.speichere(Reservierung("C", "R-12", um(9), um(10)))
+          ids = [r.reservierung_id for r in repo.fuer_rad("R-12")]
+          assert ids == ["C", "A"], f"erwartet ['C', 'A'] (nur R-12, nach Start sortiert), bekommen {ids}"
+      - name: Lehnt Überschneidungen desselben Rads ab
+        code: |
+          repo = InMemoryReservierungen()
+          repo.speichere(Reservierung("A", "R-12", um(10), um(12)))
+          for neu in [Reservierung("B", "R-12", um(11), um(13)), Reservierung("C", "R-12", um(10, 30), um(11))]:
+              try:
+                  repo.speichere(neu)
+              except Ueberschneidung:
+                  pass
+              else:
+                  raise AssertionError(f"{neu.reservierung_id} überschneidet sich mit A, wurde aber gespeichert.")
+          ids = [r.reservierung_id for r in repo.fuer_rad("R-12")]
+          assert ids == ["A"], f"Nach den abgelehnten Versuchen darf nur A gespeichert sein, gespeichert ist {ids}"
+      - name: Halboffene Intervalle und andere Räder sind kein Konflikt
+        code: |
+          repo = InMemoryReservierungen()
+          repo.speichere(Reservierung("A", "R-12", um(10), um(11)))
+          repo.speichere(Reservierung("B", "R-12", um(11), um(12)))
+          repo.speichere(Reservierung("C", "R-12", um(9), um(10)))
+          repo.speichere(Reservierung("D", "R-7", um(10), um(11)))
+          assert len(repo.fuer_rad("R-12")) == 3, "Anschlussreservierungen um 10:00 und 11:00 sind erlaubt: [start, ende) ist halboffen."
+      - name: Die zurückgegebene Liste ist eine Kopie
+        code: |
+          repo = InMemoryReservierungen()
+          repo.speichere(Reservierung("A", "R-12", um(10), um(11)))
+          repo.fuer_rad("R-12").clear()
+          assert len(repo.fuer_rad("R-12")) == 1, "Wer die Rückgabe von fuer_rad leert, darf den Fake nicht verändern."
+      - name: Stornieren gibt den Zeitraum frei
+        code: |
+          repo = InMemoryReservierungen()
+          repo.speichere(Reservierung("A", "R-12", um(10), um(11)))
+          repo.storniere("A")
+          repo.speichere(Reservierung("B", "R-12", um(10), um(11)))
+          ids = [r.reservierung_id for r in repo.fuer_rad("R-12")]
+          assert ids == ["B"], f"Nach dem Stornieren von A und dem Speichern von B erwartet ['B'], bekommen {ids}"
+          try:
+              repo.storniere("gibt-es-nicht")
+          except KeyError:
+              pass
+          else:
+              raise AssertionError("Eine unbekannte ID muss KeyError werfen.")
+    hints:
+      - Zwei halboffene Intervalle `[a, b)` und `[c, d)` überschneiden sich genau dann, wenn `a < d and c < b`.
+      - "Ein Dictionary `reservierung_id → Reservierung` macht `storniere` zu einem `del` und liefert `KeyError` gratis."
+      - "`sorted(...)` erzeugt immer eine neue Liste. Prüfe vor dem Speichern alle vorhandenen Reservierungen desselben Rads."
+    explanation: |
+      Ein Fake ist nur so viel wert wie seine Treue zum Original. Hätte er die Überschneidungsprüfung nicht, würden Tests grün laufen, die in Produktion an der Datenbank scheitern. Die Bedingung `neu.start < alt.ende and alt.start < neu.ende` deckt alle Fälle ab – teilweise Überlappung, eine Reservierung innerhalb einer anderen – und lässt Anschlüsse wie 10–11 und 11–12 zu, weil `11 < 11` falsch ist. Die Kopie in `fuer_rad` verhindert einen typischen Fake-Fehler: Ein Test, der die zurückgegebene Liste verändert, würde sonst den Zustand für alle folgenden Schritte verfälschen – das kann die echte Datenbank nicht. Damit Fake und PostgreSQL gleich bleiben, laufen dieselben Tests in einer parametrisierten Fixture gegen beide.
+    resources:
+      - title: pytest · Parametrizing fixtures
+        url: https://docs.pytest.org/en/stable/how-to/fixtures.html#parametrizing-fixtures
+      - title: Python · dataclasses (frozen)
+        url: https://docs.python.org/3/library/dataclasses.html#frozen-instances
+
+  - id: patch-ziel
+    type: bug
+    title: Die SMS geht trotzdem raus
+    prompt: |
+      `radwerk/abschluss.py` beginnt so und ruft später `zahlung.belaste(…)` und `sende_sms(…)` auf:
+
+      ```python
+      from radwerk import zahlung
+      from radwerk.sms import sende_sms
+      ```
+
+      Der Test unten soll weder Paystream noch das SMS-Gateway erreichen. In der CI scheitert er mit `KeyError: 'SMS_GATEWAY_URL'` aus `radwerk/sms.py`. Auf einem Entwicklerrechner, auf dem die Variable gesetzt war, hat er eine echte SMS verschickt. Paystream wurde nie erreicht. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: python
+    code: |
+      from unittest.mock import patch
+
+      from radwerk.abschluss import Fahrt, schliesse_fahrt_ab
+
+
+      @patch("radwerk.sms.sende_sms")
+      @patch("radwerk.zahlung.belaste", return_value="tx-81")
+      def test_bezahlte_fahrt_wird_bestaetigt(belaste, sende_sms):
+          fahrt = Fahrt("F-1042", "K-7", "+4917012345", minuten=47)
+
+          status = schliesse_fahrt_ab(fahrt)
+
+          assert status == "bezahlt"
+          belaste.assert_called_once_with("K-7", 300, schluessel="F-1042")
+          sende_sms.assert_called_once_with("+4917012345", "Danke für deine Fahrt: 300 Cent")
+    lines: [6]
+    fix:
+      - line: 6
+        answers:
+          - '@patch("radwerk.abschluss.sende_sms")'
+          - '@patch("radwerk.abschluss.sende_sms", autospec=True)'
+    hints:
+      - Die beiden Importe in `abschluss.py` sehen verschieden aus. Welcher Name wird bei jedem Aufruf in einem fremden Modul nachgeschlagen, welcher liegt in `abschluss` selbst?
+      - "`from radwerk.sms import sende_sms` bindet den Namen `sende_sms` im Modul `radwerk.abschluss`."
+    explanation: |
+      `from radwerk.sms import sende_sms` erzeugt beim Import einen eigenen Namen in `radwerk.abschluss`. Der Patch auf `radwerk.sms.sende_sms` ersetzt nur das Original in `radwerk.sms`, `abschluss` ruft weiter die echte Funktion. Richtig ist `@patch("radwerk.abschluss.sende_sms")`. Der zweite Patch dagegen stimmt: `abschluss` importiert das Modul `zahlung` und schlägt `zahlung.belaste` bei jedem Aufruf dort nach. Auch die Reihenfolge der Parameter passt – der unterste Dekorator liefert das erste Argument (`belaste`).
+    resources:
+      - title: Python · Where to patch
+        url: https://docs.python.org/3/library/unittest.mock.html#where-to-patch
+      - title: Python · patch als Dekorator
+        url: https://docs.python.org/3/library/unittest.mock.html#unittest.mock.patch
+
+  - id: ueberspezifiziert
+    type: code
+    title: Repariere den überspezifizierten Test
+    prompt: |
+      `tagesabrechnung(kunde_id, tag, fahrten, zahlungen)` aus `abrechnung.py` rechnet am Ende eines Tages alle Fahrten einer Kundin mit dem City-Rad ab:
+
+      - Preis je Fahrt: 150 Cent je angefangene 30 Minuten, Fahrten bis einschließlich 5 Minuten kosten 0 Cent.
+      - Die Summe des Tages ist auf den Tageshöchstpreis von 1 500 Cent gedeckelt.
+      - Ist der Betrag größer als 0, belastet die Funktion ihn **genau einmal** über `zahlungen.belaste(kunde_id, betrag_cent, schluessel)` mit `schluessel = f"{kunde_id}-{tag.isoformat()}"`. Sie gibt den Betrag zurück.
+      - `fahrten.fuer_kunde_am(kunde_id, tag)` liefert die Fahrtdauern des Tages in Minuten als Liste von `int`.
+
+      `abrechnung.py` enthält außerdem die Klasse `Zahlungen`, die die Schnittstelle von `belaste` beschreibt. Alles andere – Hilfsfunktionen, Konstanten, ob Argumente positionell oder per Schlüsselwort übergeben werden – darf sich ändern.
+
+      Eine Kollegin hat `abrechnung.py` so umgebaut, ohne das Verhalten zu ändern:
+
+      ```python
+      def _fahrpreis(minuten):
+          angefangene = (minuten + 29) // 30
+          return 0 if minuten <= 5 else angefangene * CENT_JE_HALBE_STUNDE
+
+
+      def tagesabrechnung(kunde_id, tag, fahrten, zahlungen):
+          minuten = fahrten.fuer_kunde_am(kunde_id=kunde_id, tag=tag)
+          betrag = min(sum(map(_fahrpreis, minuten)), TAGESHOECHSTPREIS)
+          if betrag > 0:
+              zahlungen.belaste(kunde_id=kunde_id, betrag_cent=betrag, schluessel=f"{kunde_id}-{tag.isoformat()}")
+          return betrag
+      ```
+
+      Seitdem ist der Test im Editor rot. Gleichzeitig übersieht er echte Rechenfehler. Schreibe ihn so um, dass er gegen die alte und die umgebaute Version grün ist und fehlerhafte Varianten, die die Prüfung bereithält, rot werden lässt. Paystream bleibt hinter einem Double.
+    lang: python
+    setup: |
+      from pathlib import Path
+
+      RICHTIG = '''
+      from typing import Protocol
+
+      TAGESHOECHSTPREIS = 1500
+
+
+      class Zahlungen(Protocol):
+          def belaste(self, kunde_id: str, betrag_cent: int, schluessel: str) -> str: ...
+
+
+      def mietpreis(minuten):
+          if minuten <= 5:
+              return 0
+          return -(-minuten // 30) * 150
+
+
+      def tagesabrechnung(kunde_id, tag, fahrten, zahlungen):
+          summe = 0
+          for minuten in fahrten.fuer_kunde_am(kunde_id, tag):
+              summe += mietpreis(minuten)
+          betrag = min(summe, TAGESHOECHSTPREIS)
+          if betrag > 0:
+              zahlungen.belaste(kunde_id, betrag, f"{kunde_id}-{tag.isoformat()}")
+          return betrag
+      '''
+      UMGEBAUT = '''
+      from typing import Protocol
+
+      CENT_JE_HALBE_STUNDE = 150
+      TAGESHOECHSTPREIS = 1500
+
+
+      class Zahlungen(Protocol):
+          def belaste(self, kunde_id: str, betrag_cent: int, schluessel: str) -> str: ...
+
+
+      def _fahrpreis(minuten):
+          angefangene = (minuten + 29) // 30
+          return 0 if minuten <= 5 else angefangene * CENT_JE_HALBE_STUNDE
+
+
+      def tagesabrechnung(kunde_id, tag, fahrten, zahlungen):
+          minuten = fahrten.fuer_kunde_am(kunde_id=kunde_id, tag=tag)
+          betrag = min(sum(map(_fahrpreis, minuten)), TAGESHOECHSTPREIS)
+          if betrag > 0:
+              zahlungen.belaste(kunde_id=kunde_id, betrag_cent=betrag, schluessel=f"{kunde_id}-{tag.isoformat()}")
+          return betrag
+      '''
+      MUTANTEN = {
+          "ohne_deckel": RICHTIG.replace("min(summe, TAGESHOECHSTPREIS)", "summe"),
+          "abgerundet": RICHTIG.replace("-(-minuten // 30)", "(minuten // 30)"),
+      }
+      assert all(m != RICHTIG for m in MUTANTEN.values()), "Ein Mutant ist identisch mit der richtigen Version."
+      Path("abrechnung.py").write_text(RICHTIG, encoding="utf-8")
+    starter: |
+      from datetime import date
+      from unittest.mock import Mock, call, patch
+
+      import abrechnung
+
+      TAG = date(2026, 10, 3)
+
+
+      def test_tagesabrechnung():
+          fahrten = Mock()
+          fahrten.fuer_kunde_am.return_value = [47, 20]
+          zahlungen = Mock()
+
+          with patch("abrechnung.mietpreis", side_effect=[300, 150]) as mietpreis:
+              betrag = abrechnung.tagesabrechnung("K-7", TAG, fahrten, zahlungen)
+
+          assert betrag == 450
+          assert mietpreis.call_args_list == [call(47), call(20)]
+          assert fahrten.mock_calls == [call.fuer_kunde_am("K-7", TAG)]
+          zahlungen.belaste.assert_called_once_with("K-7", 450, "K-7-2026-10-03")
+    solution: |
+      from datetime import date
+      from unittest.mock import create_autospec
+
+      from abrechnung import Zahlungen, tagesabrechnung
+
+      TAG = date(2026, 10, 3)
+
+
+      class FakeFahrten:
+          def __init__(self, minuten_je_tag):
+              self._daten = minuten_je_tag
+
+          def fuer_kunde_am(self, kunde_id, tag):
+              return list(self._daten.get((kunde_id, tag), []))
+
+
+      def rechne_ab(minuten):
+          fahrten = FakeFahrten({("K-7", TAG): minuten})
+          zahlungen = create_autospec(Zahlungen, instance=True)
+          betrag = tagesabrechnung("K-7", TAG, fahrten, zahlungen)
+          return betrag, zahlungen.belaste
+
+
+      def test_summe_der_fahrten_wird_einmal_belastet():
+          betrag, belaste = rechne_ab([47, 20])
+
+          assert betrag == 450
+          belaste.assert_called_once_with("K-7", 450, "K-7-2026-10-03")
+
+
+      def test_tageshoechstpreis_deckelt_die_summe():
+          betrag, belaste = rechne_ab([200, 200])
+
+          assert betrag == 1500
+          belaste.assert_called_once_with("K-7", 1500, "K-7-2026-10-03")
+    tests:
+      - name: Grün gegen die heutige Version
+        code: |
+          lauf = run_pytest({"abrechnung.py": RICHTIG})
+          assert lauf.ok, lauf.output
+      - name: Grün nach dem harmlosen Umbau
+        code: |
+          lauf = run_pytest({"abrechnung.py": UMGEBAUT})
+          assert lauf.ok, "Dein Test ist nach einem Umbau ohne Verhaltensänderung rot. Hängt er an internen Namen oder an der Form der Aufrufe?\n\n" + lauf.output
+      - name: Fängt einen Fehler beim Tageshöchstpreis
+        code: |
+          lauf = run_pytest({"abrechnung.py": MUTANTEN["ohne_deckel"]})
+          assert not lauf.ok, "Dein Test bleibt grün, obwohl der Tageshöchstpreis nicht mehr greift."
+      - name: Fängt einen Fehler im Fahrpreis
+        code: |
+          lauf = run_pytest({"abrechnung.py": MUTANTEN["abgerundet"]})
+          assert not lauf.ok, "Dein Test bleibt grün, obwohl angefangene halbe Stunden nicht mehr voll berechnet werden."
+    hints:
+      - Welche Zeilen des Tests hängen an Dingen, die sich laut Aufgabe ändern dürfen? `mietpreis` gibt es nach dem Umbau nicht mehr, und Argumente kommen dort per Schlüsselwort.
+      - "Lass die Preisberechnung echt laufen. Für `fahrten` genügt ein kleiner Fake oder Stub mit der Methode `fuer_kunde_am(self, kunde_id, tag)`."
+      - "`create_autospec(Zahlungen, instance=True)` vergleicht `assert_called_once_with` nach Signatur – positionell und per Schlüsselwort übergebene Argumente gelten dann als gleich. Für den Deckel brauchst du einen Tag über 1 500 Cent, etwa zwei Fahrten à 200 Minuten."
+    explanation: |
+      Der alte Test war an drei Implementierungsdetails gekoppelt: den Namen der internen Hilfsfunktion (`patch("abrechnung.mietpreis")`), die genaue Form des Repository-Aufrufs (`mock_calls`) und die positionelle Übergabe an `belaste`. Gleichzeitig ersetzte er die Preisberechnung durch feste Werte und prüfte den Deckel nie – Rechenfehler blieben grün. Der reparierte Test lässt die eigene Logik echt laufen, stellt die Fahrten über einen Fake bereit und prüft nur, was außerhalb sichtbar ist: Rückgabewert und genau eine Belastung. `create_autospec` bindet das Double an die Signatur von `Zahlungen.belaste`. Damit gilt `belaste(kunde_id="K-7", betrag_cent=450, …)` als derselbe Aufruf wie `belaste("K-7", 450, …)`, und der Umbau bleibt grün.
+    resources:
+      - title: Python · Autospeccing
+        url: https://docs.python.org/3/library/unittest.mock.html#autospeccing
+      - title: Martin Fowler · Mocks Aren't Stubs
+        url: https://martinfowler.com/articles/mocksArentStubs.html
+
+  - id: doubles-im-test
+    type: explain
+    title: Drei Doubles, drei Gründe
+    prompt: |
+      Du reviewst diesen Test. Erkläre, welche Art Test Double jedes der drei Objekte ist und warum es so gewählt wurde. Sag auch, was der Test bewusst *nicht* prüft, und nenne eine Lücke, die andere Tests schließen müssen.
+    lang: python
+    code: |
+      def test_abgelehnte_karte_laesst_fahrt_offen():
+          fahrten = InMemoryFahrten([Fahrt("F-1042", "K-7", "+4917012345", minuten=47)])
+          zahlungen = create_autospec(PaystreamZahlungen, instance=True)
+          zahlungen.belaste.side_effect = ZahlungAbgelehnt("Karte gesperrt")
+          sms = SmsSpy()
+
+          schliesse_fahrt_ab("F-1042", fahrten, zahlungen, sms)
+
+          assert fahrten.hole("F-1042").status == "offen"
+          assert sms.gesendet == [("+4917012345", "Zahlung abgelehnt, bitte Karte prüfen.")]
+    points:
+      - "`InMemoryFahrten` ist ein Fake für das eigene Repository: Der Test prüft den Zustand (`status == \"offen\"`) statt einzelner Repository-Aufrufe."
+      - "`zahlungen` ist hier ein Stub für die indirekte Eingabe „abgelehnt“ (`side_effect`); `create_autospec` stellt sicher, dass Name und Signatur von `belaste` zur echten Klasse passen."
+      - "`SmsSpy` zeichnet die indirekte Ausgabe auf; die SMS an die Kundin ist das sichtbare Ergebnis und wird deshalb genau geprüft."
+      - Der Preis wird echt berechnet, und es gibt keine Prüfung, wie oft oder in welcher Reihenfolge das Repository befragt wird – der Test übersteht Refactorings.
+      - "Lücke: Ob `PaystreamZahlungen` eine echte Ablehnung von Paystream in `ZahlungAbgelehnt` übersetzt und ob `InMemoryFahrten` sich wie PostgreSQL verhält, zeigen nur Adapter- und Repository-Tests gegen Sandbox und echte Datenbank."
+    explanation: |
+      Jedes Double hat hier eine eigene Aufgabe. Das Repository gehört uns und hat Zustand, deshalb ein Fake: Der Test liest am Ende den Status der Fahrt, egal wie `schliesse_fahrt_ab` intern lädt und speichert. Für Paystream braucht der Test nur eine Antwort – die Ablehnung –, also wird der autospezifizierte Adapter als Stub benutzt. Autospec sorgt dafür, dass ein Tippfehler oder eine geänderte Signatur von `belaste` den Test rot macht statt grün. Die SMS ist eine Wirkung nach außen, deshalb ein Spy und eine genaue Prüfung des Texts. Was fehlt, ist die Treue der Doubles: Übersetzt der echte Adapter Paystreams Fehler wirklich so, und verhält sich PostgreSQL wie der Fake? Das klären Integrationstests mit der Paystream-Sandbox und der echten Datenbank, die viel seltener laufen.
+    resources:
+      - title: Python · create_autospec
+        url: https://docs.python.org/3/library/unittest.mock.html#unittest.mock.create_autospec
+
+  - id: paystream-adapter
+    type: practice
+    title: Paystream hinter einem Adapter
+    prompt: |
+      Radwerk ruft das Paystream-SDK heute direkt aus `schliesse_fahrt_ab` auf, und die Unit-Tests patchen `paystream.PaystreamClient.charge`. Mit SDK 3.0 wird `idempotency_key` Pflicht, und `CardDeclined` heißt künftig `PaymentDeclined`. Die Tests sind trotzdem grün geblieben.
+
+      Das SDK 3.0: `PaystreamClient(api_key, base_url)`, `charge(customer_id, amount_cent, *, idempotency_key) -> Charge` (mit `.id`), wirft `paystream.PaymentDeclined` (mit `.reason`).
+
+      Baue die Grenze um:
+
+      1. Einen Port `Zahlungen` (`typing.Protocol`) mit `belaste(kunde_id, betrag_cent, schluessel) -> str` und eine eigene Exception `ZahlungAbgelehnt`.
+      2. Einen Adapter `PaystreamZahlungen`, der das SDK aufruft und `PaymentDeclined` in `ZahlungAbgelehnt` übersetzt.
+      3. Einen Fake `FakeZahlungen` für Unit-Tests: Er merkt sich Belastungen, lehnt für vorgegebene Kunden ab und belastet bei einem schon bekannten `schluessel` nicht ein zweites Mal – so wie Paystream.
+      4. Einen kurzen Testplan als Kommentar: Was testest du mit dem Fake, was gegen die Paystream-Sandbox, was gar nicht, und warum?
+    lang: python
+    starter: |
+      from typing import Protocol
+
+      import paystream
+
+
+      class ZahlungAbgelehnt(Exception):
+          pass
+
+
+      class Zahlungen(Protocol):
+          ...
+
+
+      class PaystreamZahlungen:
+          ...
+
+
+      class FakeZahlungen:
+          ...
+
+
+      # Testplan:
+    solution: |
+      from typing import Protocol
+
+      import paystream
+
+
+      class ZahlungAbgelehnt(Exception):
+          pass
+
+
+      class Zahlungen(Protocol):
+          def belaste(self, kunde_id: str, betrag_cent: int, schluessel: str) -> str: ...
+
+
+      class PaystreamZahlungen:
+          """Einziger Ort, der das SDK kennt."""
+
+          def __init__(self, client: paystream.PaystreamClient):
+              self._client = client
+
+          def belaste(self, kunde_id: str, betrag_cent: int, schluessel: str) -> str:
+              try:
+                  charge = self._client.charge(kunde_id, betrag_cent, idempotency_key=schluessel)
+              except paystream.PaymentDeclined as fehler:
+                  raise ZahlungAbgelehnt(fehler.reason) from fehler
+              return charge.id
+
+
+      class FakeZahlungen:
+          def __init__(self, ablehnen_fuer: frozenset[str] = frozenset()):
+              self._ablehnen_fuer = set(ablehnen_fuer)
+              self.belastungen: dict[str, tuple[str, int]] = {}  # schluessel -> (kunde_id, betrag)
+
+          def belaste(self, kunde_id: str, betrag_cent: int, schluessel: str) -> str:
+              if kunde_id in self._ablehnen_fuer:
+                  raise ZahlungAbgelehnt("Karte gesperrt")
+              self.belastungen.setdefault(schluessel, (kunde_id, betrag_cent))
+              return f"tx-{schluessel}"
+
+          def summe(self, kunde_id: str) -> int:
+              return sum(betrag for kunde, betrag in self.belastungen.values() if kunde == kunde_id)
+
+
+      # Testplan:
+      # - Unit-Tests der Fachlogik (schliesse_fahrt_ab, tagesabrechnung) mit FakeZahlungen:
+      #   Betrag, Ablehnung, Wiederholung mit demselben Schlüssel. Laufen in jedem Commit.
+      # - Adapter-Tests für PaystreamZahlungen gegen die Paystream-Sandbox (eigener CI-Job):
+      #   erfolgreiche Belastung, abgelehnte Testkarte -> ZahlungAbgelehnt, gleicher
+      #   idempotency_key -> keine zweite Belastung. Fallen bei SDK-Updates zuerst um.
+      # - Ein Test, der dieselben Erwartungen an FakeZahlungen und die Sandbox stellt,
+      #   damit der Fake nicht vom Original wegdriftet.
+      # - Nicht getestet: Paystreams eigene Betrugsprüfung und Kartenvalidierung –
+      #   das ist Paystreams Code, nicht unserer.
+    checklist:
+      - Die Fachlogik importiert nichts aus `paystream`; nur `PaystreamZahlungen` kennt das SDK.
+      - "`ZahlungAbgelehnt` entsteht mit `raise … from fehler` aus `PaymentDeclined`, die Ursache bleibt erhalten."
+      - Der Fake belastet bei einem bekannten `schluessel` nicht erneut und gibt eine Quittung zurück.
+      - Unit-Tests der Fachlogik nutzen den Fake oder `create_autospec(PaystreamZahlungen, instance=True)`, kein `patch("paystream…")`.
+      - Der Adapter hat eigene Tests gegen die Sandbox oder aufgezeichnete Antworten, getrennt von den Unit-Tests.
+      - Der Testplan nennt, was bewusst nicht getestet wird, und begründet es.
+    explanation: |
+      Die Tests blieben grün, weil sie ein Bild von Paystream mockten, das es seit SDK 3.0 nicht mehr gibt. Mit dem Adapter gehört die Schnittstelle, gegen die die Fachlogik getestet wird, Radwerk selbst: `belaste` und `ZahlungAbgelehnt` ändern sich nur, wenn Radwerk es will. Ein SDK-Update betrifft genau eine Klasse, und deren Sandbox-Tests schlagen sofort an. Der Fake bildet das Verhalten nach, auf das sich die Fachlogik verlässt – vor allem die Idempotenz. Damit er nicht vom Original abweicht, stellen ein paar Tests dieselben Erwartungen an Fake und Sandbox. Paystreams interne Prüfungen testest du nicht: Für sie bist du nicht verantwortlich, und du kannst sie nicht ändern.
+    resources:
+      - title: Python · typing.Protocol
+        url: https://docs.python.org/3/library/typing.html#typing.Protocol
+      - title: Python · Exception chaining (raise … from)
+        url: https://docs.python.org/3/tutorial/errors.html#exception-chaining

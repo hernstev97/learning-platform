@@ -111,13 +111,15 @@ function run<T>(job: NewJob, imports: string): Promise<T> {
 export const runExercise = (setup: string, code: string, tests: { name: string; code: string }[]) =>
   run<ExerciseResult>({ kind: 'exercise', setup, code, tests }, [setup, code, ...tests.map((test) => test.code)].join('\n'));
 export const runSnippet = (code: string) => run<SnippetResult>({ kind: 'snippet', code }, code);
+/** A lesson block that is a test file; `stdout` is pytest's report. */
+export const runPytest = (code: string) => run<SnippetResult & { exit_code: number }>({ kind: 'pytest', code }, `${code}\nimport pytest`);
 export const runSql = (schema: string, query: string, solution: string) => run<{ actual: SqlResult; expected: SqlResult }>({ kind: 'sql', schema, query, solution }, 'import sqlite3');
 export const runSqlScript = (code: string) => run<SqlScriptResult>({ kind: 'sql-script', code }, 'import sqlite3');
 
 /** The runner's state as a short notice for the learner. */
 export function runnerNotice(state: RunnerState, idle: string): string {
   if (state === 'loading') return 'Python wird geladen (einmalig ca. 12 MB) …';
-  if (state === 'packages') return 'Bibliotheken wie pandas werden geladen (einmalig einige MB) …';
+  if (state === 'packages') return 'Bibliotheken wie pandas oder pytest werden geladen (einmalig einige MB) …';
   if (state === 'running') return 'Läuft …';
   return idle;
 }

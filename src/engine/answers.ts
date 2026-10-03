@@ -7,6 +7,7 @@ const KOTLIN = /"""[\s\S]*?"""|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`[^`]*`|[A-Za
 const RUST = /r(#*)"[\s\S]*?"\1|b?"(?:\\.|[^"\\])*"|b?'(?:\\u\{[0-9a-fA-F]+\}|\\.|[^'\\])'|'[A-Za-z_]\w*|[A-Za-z_]\w*!?|\d[\d_]*(?:\.\d[\d_]*)?(?:[eE][+-]?\d+)?(?:[iu](?:8|16|32|64|128|size)|f32|f64)?|::|->|=>|\.\.=|\.\.|==|!=|<=|>=|&&|\|\||\+=|-=|\*=|\/=|%=|<<|>>|[^\s]/g;
 const PYTHON = /[rRbBfFuU]{0,2}(?:"""[\s\S]*?"""|'''[\s\S]*?'''|"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*')|[A-Za-z_]\w*|\d[\d_]*(?:\.\d[\d_]*)?(?:[eE][+-]?\d+)?j?|\*\*=|\/\/=|\*\*|\/\/|:=|->|==|!=|<=|>=|\+=|-=|\*=|\/=|%=|<<|>>|\.\.\.|[^\s]/g;
 const SQL = /'(?:[^']|'')*'|"(?:[^"]|"")*"|`[^`]*`|\[[^\]\n]*\]|[A-Za-z_][\w$]*|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|<>|!=|<=|>=|\|\||::|->>|->|[^\s]/g;
+const SCRIPT = /`(?:\\.|[^`\\])*`|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[A-Za-z_$][\w$]*|\d[\d_]*(?:\.\d[\d_]*)?(?:[eE][+-]?\d+)?n?|\.\.\.|\?\?=|\?\.|\?\?|=>|===|!==|==|!=|<=|>=|&&|\|\||\+\+|--|\+=|-=|\*\*|[^\s]/g;
 const SHELL = /'[^']*'|"(?:\\.|[^"\\])*"|\$\(|\$\{|&&|\|\||>>|<<-?|[0-9]?>&[0-9]|&>|[0-9]>|[^\s'"|&;<>()]+|[^\s]/g;
 
 export type Lang = string;
@@ -18,6 +19,7 @@ const family = (lang: Lang) => {
   if (['bash', 'sh', 'shell', 'zsh', 'fish', 'console', 'terminal'].includes(l)) return 'shell';
   if (['excel', 'xlsx', 'formula'].includes(l)) return 'excel';
   if (['sql', 'sqlite', 'postgresql', 'postgres'].includes(l)) return 'sql';
+  if (['typescript', 'ts', 'tsx', 'mts', 'cts', 'javascript', 'js', 'jsx', 'mjs', 'cjs'].includes(l)) return 'script';
   return 'generic';
 };
 
@@ -38,6 +40,7 @@ export function tokens(value: string, lang: Lang = 'kotlin'): string[] {
     // German and English Excel: SUMMEWENNS(…;…) = SUMIFS(…,…), function names and references in any case.
     case 'excel': return excelTokens(value);
     case 'sql': return sqlTokens(value);
+    case 'script': return scriptTokens(value);
     default: return value.match(KOTLIN) ?? [];
   }
 }
@@ -50,6 +53,15 @@ function sqlTokens(value: string): string[] {
   const out = (value.match(SQL) ?? []).map((token) => /^[A-Za-z_]/.test(token) ? token.toLowerCase() : token === '!=' ? '<>' : token);
   while (out.at(-1) === ';') out.pop();
   return out;
+}
+
+/**
+ * TypeScript and JavaScript: 'a', "a" and `a` are the same string as long as nothing inside needs escaping or
+ * interpolates, and a semicolon at the end of a line is optional (automatic semicolon insertion).
+ */
+function scriptTokens(value: string): string[] {
+  const source = value.split('\n').map((line) => line.replace(/;\s*$/, '')).join('\n');
+  return (source.match(SCRIPT) ?? []).map((token) => /^(["'`])([^"'`\\$]*)\1$/.test(token) ? `⟨str⟩${token.slice(1, -1)}` : token);
 }
 
 const plainWord = /^[\w./:@%+=,~-]+$/;

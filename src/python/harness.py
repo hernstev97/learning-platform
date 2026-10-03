@@ -2,6 +2,7 @@
 import ast
 import asyncio
 import contextlib
+import fnmatch
 import io
 import linecache
 import os
@@ -47,14 +48,155 @@ async def _exec(name, code, namespace):
         await result
 
 
+_workspace = None
+
+
 def _fresh_directory():
-    os.chdir(tempfile.mkdtemp(prefix="uebung-"))
+    """A fresh, empty working directory that is also importable, so `setup` can write modules the code imports.
+
+    Modules imported from the previous one are forgotten: the browser reuses one interpreter for every run.
+    """
+    global _workspace
+    if _workspace:
+        with contextlib.suppress(ValueError):
+            sys.path.remove(_workspace)
+        _forget_modules(_workspace)
+    _workspace = tempfile.mkdtemp(prefix="uebung-")
+    os.chdir(_workspace)
+    sys.path.insert(0, _workspace)
+
+
+def _forget_modules(directory):
+    """Drops modules loaded from `directory` from the import cache, so the next import reads the file again."""
+    prefix = os.path.join(os.path.realpath(directory), "")
+    for name, module in list(sys.modules.items()):
+        file = getattr(module, "__file__", None)
+        if file and os.path.realpath(file).startswith(prefix):
+            del sys.modules[name]
+
+
+# The harness imports Hypothesis before pytest starts (for its settings profile, and the browser keeps modules between
+# runs), so pytest could not rewrite the asserts in its plugin and would warn about that in every report. Other rewrite
+# warnings, such as the one for `assert (x, "…")`, stay visible.
+PYTEST_ARGS = ["-p", "no:cacheprovider", "-p", "no:faulthandler", "--capture=sys", "--no-header", "--color=no",
+               "-W", "ignore:Module already imported so cannot be rewritten:pytest.PytestAssertRewriteWarning"]
+
+
+class PytestRun:
+    """What one pytest run reported: `ok`, the names of passed, failed and skipped tests, and the terminal output."""
+
+    def __init__(self, exit_code, outcomes, output):
+        self.exit_code = exit_code
+        self.outcomes = outcomes
+        self.output = output
+
+    def _named(self, *outcomes):
+        return [name for name, outcome in self.outcomes.items() if outcome in outcomes]
+
+    @property
+    def passed(self):
+        return self._named("passed")
+
+    @property
+    def failed(self):
+        """Failed tests and errors (in fixtures or while collecting)."""
+        return self._named("failed", "error")
+
+    @property
+    def skipped(self):
+        return self._named("skipped", "xfailed")
+
+    @property
+    def ok(self):
+        """pytest exited with 0 and at least one test passed."""
+        return self.exit_code == 0 and bool(self.passed)
+
+    def __repr__(self):
+        return f"PytestRun(exit_code={self.exit_code}, passed={len(self.passed)}, failed={len(self.failed)})"
+
+
+class _Outcomes:
+    """pytest plugin: one outcome per test (passed, failed, error, skipped, xfailed, xpassed)."""
+
+    def __init__(self):
+        self.outcomes = {}
+
+    def pytest_runtest_logreport(self, report):
+        name = report.nodeid.split("::", 1)[-1]
+        if report.when == "call":
+            if hasattr(report, "wasxfail"):
+                self.outcomes[name] = "xfailed" if report.skipped else "xpassed"
+            else:
+                self.outcomes[name] = report.outcome
+        elif report.failed:
+            self.outcomes[name] = "error"
+        elif report.skipped:
+            self.outcomes.setdefault(name, "skipped")
+
+    def pytest_collectreport(self, report):
+        if report.failed:
+            self.outcomes[report.nodeid or "<Sammeln>"] = "error"
+
+
+def _hypothesis_profile():
+    """The same examples on every run, no deadline (Pyodide is slower than CPython) and no example database."""
+    from hypothesis import settings
+
+    settings.register_profile("lernplattform", derandomize=True, deadline=None, database=None, print_blob=False)
+    settings.load_profile("lernplattform")
+
+
+def _run_pytest(source, files=None, *, args=(), name="test_loesung.py", style=("-q", "--tb=short")):
+    """Runs pytest on `source` (saved as `name`) next to `files` ({path: text}) in a new directory and returns a PytestRun."""
+    import pytest
+
+    files = files or {}
+    if "hypothesis" in source or any("hypothesis" in text for text in files.values()):
+        _hypothesis_profile()
+    directory = tempfile.mkdtemp(prefix="pytest-", dir=_workspace)
+    # An empty pytest.ini makes the directory the rootdir: no configuration from further up applies.
+    for path, text in {"pytest.ini": "[pytest]\n", **files, name: source}.items():
+        target = os.path.join(directory, path)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write(text)
+    # A module under test that `setup` or a previous run already imported must be read again (e.g. a broken variant).
+    _forget_modules(_workspace or directory)
+    saved_path, saved_cwd, saved_columns = sys.path[:], os.getcwd(), os.environ.get("COLUMNS")
+    sys.path.insert(0, directory)
+    os.chdir(directory)
+    # pytest fills separator lines to the terminal width; 64 columns fit the lesson column and test messages.
+    os.environ["COLUMNS"] = "64"
+    # A test file is run on its own; anything else (e.g. a conftest.py with fixtures) applies to the test files in
+    # `files`, so pytest collects the directory unless `args` names paths.
+    targets = [name] if fnmatch.fnmatch(os.path.basename(name), "test_*.py") or name.endswith("_test.py") else []
+    collector, out = _Outcomes(), io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            exit_code = int(pytest.main([*PYTEST_ARGS, *style, *args, *targets], plugins=[collector]))
+    finally:
+        os.chdir(saved_cwd)
+        sys.path[:] = saved_path
+        if saved_columns is None:
+            os.environ.pop("COLUMNS", None)
+        else:
+            os.environ["COLUMNS"] = saved_columns
+        _forget_modules(_workspace or directory)
+    output = out.getvalue().strip()
+    if exit_code == 5:
+        output = f"Keine Tests gefunden: Testfunktionen beginnen mit test_.\n{output}"
+    return PytestRun(exit_code, collector.outcomes, output)
 
 
 async def run_exercise(setup, code, tests):
     """Returns {stdout, error, tests: [{name, ok, message}]}."""
     _fresh_directory()
-    namespace = {"__name__": "loesung", "capture": capture, "input": _no_input}
+
+    def run_pytest(files=None, *, args=(), name="test_loesung.py"):
+        """Runs pytest on the learner's code, saved as `name` next to `files` ({path: text}). Returns a PytestRun."""
+        return _run_pytest(code, files, args=args, name=name)
+
+    namespace = {"__name__": "loesung", "capture": capture, "input": _no_input, "run_pytest": run_pytest}
     out = io.StringIO()
     result = {"stdout": "", "error": None, "tests": []}
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
@@ -94,6 +236,14 @@ async def run_snippet(code):
         except BaseException as exc:  # noqa: BLE001
             error = _format(exc)
     return {"stdout": out.getvalue(), "error": error}
+
+
+def run_pytest_snippet(code):
+    """Lesson blocks marked `pytest`: the block is a test file. Returns {stdout: pytest's report, error, exit_code}."""
+    _fresh_directory()
+    run = _run_pytest(code, name="test_beispiel.py", style=("-v", "--tb=short"))
+    # 0: all passed, 1: some failed. Anything else (collection error, no tests) is a problem with the block itself.
+    return {"stdout": run.output, "error": None if run.exit_code in (0, 1) else f"pytest endete mit Exit-Code {run.exit_code}.", "exit_code": run.exit_code}
 
 
 SQL_LIMIT = 1000
@@ -243,5 +393,7 @@ if __name__ == "__main__":
             print(json.dumps({"error": None}))
         except SyntaxError as exc:
             print(json.dumps({"error": _format(exc)}))
+    elif job["kind"] == "pytest":
+        print(json.dumps(run_pytest_snippet(job["code"])))
     else:
         print(json.dumps(asyncio.run(run_snippet(job["code"]))))

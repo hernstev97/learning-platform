@@ -71,7 +71,7 @@ Eine vollständige, minimale Vorlage mit jeder Übungsart liegt in [`tooling/fix
 
 1. **Lehrplan entwerfen.** Schreibe zuerst die Liste der Module auf: 10–16 Module in 2–4 Tracks, vom Einstieg bis zum Profi-Niveau. Frage dich bei jedem Modul: *Was kann ich danach, was ich vorher nicht konnte?* Und: *Würde ein Arbeitgeber das erwarten?*
 2. **Ordner anlegen:** `content/<bereich>/` mit `area.yaml` (Abschnitt 4). Die Ordner-ID ist kurz, klein und kebab-case, zum Beispiel `go`, `typescript`, `devops`.
-3. **Farbe wählen.** Eine kräftige Farbe, auf der schwarzer Text gut lesbar ist (Kontrast ≥ 4,5 : 1 zu `#0B0B0B`). Vorhandene Farben nicht wiederholen: `#A98BFF` Kotlin, `#FF6A3D` Rust, `#FFD400` Linux, `#4D8BFF` Python, `#2BD97C` Automation, `#FF5CA8` Git, `#22D3EE` Data Analysis. Gute freie Kandidaten: `#C6F432` (Limette), `#FF9F1C` (Orange-Gelb).
+3. **Farbe wählen.** Eine kräftige Farbe, auf der schwarzer Text gut lesbar ist (Kontrast ≥ 4,5 : 1 zu `#0B0B0B`). Vorhandene Farben nicht wiederholen: `#A98BFF` Kotlin, `#FF6A3D` Rust, `#FFD400` Linux, `#4D8BFF` Python, `#2BD97C` Automation, `#FF5CA8` Git, `#22D3EE` Data Analysis, `#C6F432` Testing. Guter freier Kandidat: `#FF9F1C` (Orange-Gelb).
 4. **Module schreiben** (Abschnitte 5–7). Ein Modul pro Datei, Dateiname = Modul-ID.
 5. **Karten, Projekte, Glossar, Spickzettel, Berufsseite** ergänzen (Abschnitt 8).
 6. **Prüfen:** `pnpm content:check <bereich>`, dann `pnpm verify <bereich>`, dann `pnpm test` und `pnpm build`.
@@ -176,12 +176,13 @@ Richtwert: 3–6 Callouts pro Lektion, davon mindestens ein `INTERVIEW` und ein 
 
 ### Codeblöcke
 
-Codeblöcke immer mit Sprache angeben. Unterstützt werden `kotlin`, `rust`, `python`, `bash`/`sh`, `console`, `yaml`, `toml`, `json`, `sql`, `xml`, `dockerfile`, `ini` (auch für systemd-Units), `diff`, `excel` (Formeln), `powerquery` (Power Query M, auch `m`), `csv` und `text`.
+Codeblöcke immer mit Sprache angeben. Unterstützt werden `kotlin`, `rust`, `python`, `bash`/`sh`, `console`, `yaml`, `toml`, `json`, `sql`, `xml`, `dockerfile`, `ini` (auch für systemd-Units), `diff`, `excel` (Formeln), `powerquery` (Power Query M, auch `m`), `csv`, `typescript` (auch `ts`, `tsx`), `javascript` (auch `js`, `jsx`) und `text`.
 
 | Info-String | Wirkung |
 | --- | --- |
 | ` ```python run ` | Block wird im Browser editierbar und mit Pyodide ausführbar. `pnpm verify` führt ihn aus; er darf keinen Fehler werfen. |
 | ` ```python run fails ` | Ausführbar, soll aber absichtlich eine Exception zeigen. `pnpm verify` prüft, dass er fehlschlägt. |
+| ` ```python pytest ` | Der Block ist eine Testdatei: editierbar, „Ausführen“ startet pytest (`-v --tb=short`) und zeigt dessen echten Bericht. Den getesteten Code definiert der Block selbst. `pnpm verify` verlangt, dass alle Tests bestehen; mit `pytest fails` muss mindestens einer scheitern – gut, um echte Fehlermeldungen zu zeigen. |
 | ` ```sql run ` | Block wird editierbar und läuft Anweisung für Anweisung gegen eine frische SQLite-Datenbank im Browser; jede Ergebnismenge erscheint als Tabelle. Der Block legt seine Tabellen selbst an (`CREATE TABLE`, `INSERT`). `pnpm verify` führt ihn aus; `sql run fails` erwartet einen Fehler. |
 | ` ```rust ` mit `fn main` | Bekommt einen Link zum Rust Playground. `pnpm verify` kompiliert ihn. |
 | ` ```rust nocheck ` | Absichtlich nicht kompilierender Code (etwa um einen Borrow-Checker-Fehler zu zeigen). Kein Playground-Link, keine Prüfung. |
@@ -292,6 +293,7 @@ Python- und Automation-Module haben mindestens drei `code`-Übungen, davon gern 
 - Mehrzeilige Lücken sind möglich (Einrückung ist für die Prüfung egal).
 - Rust-Code mit `fn main` wird nach dem Einsetzen der Musterantworten kompiliert.
 - **SQL** (`lang: sql`): Schlüsselwörter, Funktionen und Namen ohne Groß-/Kleinschreibung (`count(*)` = `COUNT(*)`), `!=` = `<>`, ein `;` am Ende ist optional. Text in Anführungszeichen bleibt exakt.
+- **TypeScript und JavaScript** (`lang: typescript`, `javascript`): `'a'`, `"a"` und `` `a` `` sind gleich, solange darin nichts escaped oder mit `${…}` eingesetzt wird. Ein Semikolon am Zeilenende ist optional. Vitest-, Testing-Library- und Playwright-Code läuft nirgends; prüfe ihn gegen die offizielle Dokumentation und probiere ihn außerhalb des Repositorys aus.
 - **Excel-Formeln** (`lang: excel`): Deutsche und englische Schreibweise sind gleichwertig. `=SUMMEWENNS(B:B;A:A;"Nord")` = `=SUMIFS(B:B,A:A,"Nord")`: Funktionsnamen werden übersetzt, Groß-/Kleinschreibung von Funktionen, Bezügen und strukturierten Verweisen ist egal, `;` gilt als `,`, das Dezimalkomma als Punkt, das führende `=` ist optional. `$A$1` und `A1` bleiben verschieden, Text in Anführungszeichen ebenso. Die Übersetzungstabelle steht in `src/engine/excel.ts`; neue Funktionen dort ergänzen. Das gilt auch für `bug`-Korrekturen. Excel selbst läuft nicht – Formeln werden verglichen, nicht berechnet.
 
 ### `choice` – Auswahl
@@ -359,7 +361,7 @@ Die Plattform mischt die Zeilen deterministisch. 4–10 Zeilen sind ideal. Zeile
   explanation: …
 ```
 
-Verglichen wird zeilenweise ohne Leerraum am Zeilenende und ohne Leerzeilen am Anfang oder Ende. SQL (`lang: sql`) führt `pnpm verify` immer aus: Der Code legt seine Tabellen selbst an, erwartet wird die Ausgabe der `sqlite3`-Kommandozeile im Standardmodus – Werte durch `|` getrennt, keine Kopfzeile, `NULL` als leerer Wert, Kommazahlen mit Punkt (`3.0`, `12.5`). Sag das im Prompt. Für Shell-Code (`lang: bash`) kann `verify: true` gesetzt werden; dann führt `pnpm verify` ihn in einem leeren Wegwerf-Verzeichnis aus. Ausgaben mit Zeitstempeln, PIDs, Commit-Hashes oder Zufall sind ungeeignet.
+Verglichen wird zeilenweise ohne Leerraum am Zeilenende und ohne Leerzeilen am Anfang oder Ende. TypeScript und JavaScript (`lang: typescript`, `javascript`) führt `pnpm verify` mit Node 24 aus: nur eigenständiger Code ohne Imports aus npm-Paketen (`node:`-Module gehen) und nur TypeScript, das Node durch Entfernen der Typen ausführen kann (kein `enum`, kein `namespace`, keine Parameter-Properties). SQL (`lang: sql`) führt `pnpm verify` immer aus: Der Code legt seine Tabellen selbst an, erwartet wird die Ausgabe der `sqlite3`-Kommandozeile im Standardmodus – Werte durch `|` getrennt, keine Kopfzeile, `NULL` als leerer Wert, Kommazahlen mit Punkt (`3.0`, `12.5`). Sag das im Prompt. Für Shell-Code (`lang: bash`) kann `verify: true` gesetzt werden; dann führt `pnpm verify` ihn in einem leeren Wegwerf-Verzeichnis aus. Ausgaben mit Zeitstempeln, PIDs, Commit-Hashes oder Zufall sind ungeeignet.
 
 Git läuft dabei ohne System- und globale Konfiguration, mit fester Identität, `init.defaultBranch=main`, ohne Editor und Pager und mit englischen Meldungen (`GIT_ENV` in `tooling/verify-code.ts`). Verglichen wird nur stdout; viele Git-Meldungen landen auf stderr.
 
@@ -415,17 +417,55 @@ Alles andere (Langoptionen wie `--all`, `sudo`, andere Pfade, Reihenfolge von Ar
 
 Laufzeitumgebung (Browser und `pnpm verify` identisch, siehe `src/python/harness.py`):
 
-- Pyodide mit **Python 3.14** und der Standardbibliothek (inklusive `sqlite3`, `json`, `csv`, `re`, `pathlib`, `shutil`, `zipfile`, `hashlib`, `email`, `html.parser`, `xml.etree`, `tomllib`, `unittest.mock`). Zusätzlich verfügbar: `bs4` (BeautifulSoup), `yaml` (PyYAML), `zoneinfo` mit Zeitzonendaten sowie **pandas 3.0 mit numpy 2.4**. Beim ersten `import pandas` lädt der Browser einmalig etwa 8 MB; das zählt nicht zum Zeitlimit. pandas 3 hat Copy-on-Write und einen eigenen `str`-Datentyp für Text – Beispiele und erwartete Ausgaben müssen dazu passen. `pnpm verify` führt pandas-Code in einer virtuellen Umgebung mit denselben Versionen aus (angelegt mit `uv`). Nicht verfügbar: matplotlib, openpyxl, pyarrow – Code dafür als `python` ohne `run` oder als `practice`.
+- Pyodide mit **Python 3.14** und der Standardbibliothek (inklusive `sqlite3`, `json`, `csv`, `re`, `pathlib`, `shutil`, `zipfile`, `hashlib`, `email`, `html.parser`, `xml.etree`, `tomllib`, `unittest.mock`). Zusätzlich verfügbar: `bs4` (BeautifulSoup), `yaml` (PyYAML), `zoneinfo` mit Zeitzonendaten, **pandas 3.0 mit numpy 2.4** sowie **pytest 9.0 und Hypothesis 6.168** (siehe unten). Beim ersten `import pandas` lädt der Browser einmalig etwa 8 MB; das zählt nicht zum Zeitlimit. pandas 3 hat Copy-on-Write und einen eigenen `str`-Datentyp für Text – Beispiele und erwartete Ausgaben müssen dazu passen. `pnpm verify` führt pandas-Code in einer virtuellen Umgebung mit denselben Versionen aus (angelegt mit `uv`). Nicht verfügbar: matplotlib, openpyxl, pyarrow – Code dafür als `python` ohne `run` oder als `practice`.
 - **Nicht verfügbar:** Netzwerk, `subprocess`, Threads (`threading`, `ThreadPoolExecutor`), `multiprocessing`-Prozesse, `input()`. Für diese Themen `explain`, `output` (nur deterministisch), `bug` oder `practice` verwenden – oder die Aufgabe so schneiden, dass die Logik als reine Funktion testbar ist (zum Beispiel eine Funktion, die die Befehlsliste für `subprocess.run` *baut*, oder ein Abrufer, der als Parameter übergeben wird).
 - **Async:** Tests dürfen `await` auf oberster Ebene verwenden (`assert await hole(1) == …`). `asyncio.gather`, `TaskGroup`, `asyncio.timeout` und `asyncio.sleep` funktionieren. Niemals `asyncio.run()` im Lernenden-Code oder in Tests aufrufen – im Browser läuft bereits eine Event-Loop.
-- Jeder Lauf startet in einem frischen, leeren Arbeitsverzeichnis. `setup` kann dort Dateien anlegen.
+- Jeder Lauf startet in einem frischen, leeren Arbeitsverzeichnis. `setup` kann dort Dateien anlegen, auch Module: Das Verzeichnis ist importierbar, `from tarif import mietpreis` findet also eine Datei `tarif.py` aus `setup`.
 - Der Code läuft mit `__name__ == "loesung"`; ein `if __name__ == "__main__":`-Block wird also nicht ausgeführt.
 - Tests laufen nacheinander im selben Namensraum wie der Code. Die Hilfsfunktion `capture(fn, *args)` liefert, was `fn` auf stdout schreibt.
 - Zeitlimit im Browser: 10 Sekunden.
 - Assertion-Meldungen (`assert x == y, "…"`) erscheinen beim Lernenden – formuliere sie hilfreich.
-- **Tests selbst schreiben lassen:** Der Lernende kann auch eine Testfunktion schreiben, die die Tests gegen eine richtige und eine fehlerhafte Implementierung aus `setup` laufen lassen („Schreibe einen Test, der den Bug fängt“). Das trainiert Testdenken besser als jede Theorie.
+- **Tests selbst schreiben lassen:** Der Lernende schreibt pytest-Tests, und die Prüfung lässt sie mit echtem pytest gegen eine richtige und mehrere fehlerhafte Implementierungen laufen („Schreibe Tests, die den Bug fangen“). Das trainiert Testdenken besser als jede Theorie. Dafür gibt es in den Tests `run_pytest` (siehe unten).
 
 3–6 Tests pro Aufgabe: Normalfall, Randfälle (leer, eins, viele), Fehlerfall. Für Automation-Aufgaben externe Dienste mit einfachen Fake-Objekten simulieren (zum Beispiel eine Funktion `hole_seite(url)` als Parameter übergeben), statt echte HTTP-Aufrufe zu machen.
+
+#### Tests mit pytest prüfen: `run_pytest`
+
+In den `tests` einer `code`-Übung führt `run_pytest(files=None, *, args=(), name="test_loesung.py")` pytest auf dem Code des Lernenden aus. Er wird als `name` in ein neues Verzeichnis gespeichert, daneben die Dateien aus `files` (`{pfad: quelltext}`). Module werden für jeden Lauf neu importiert; so lässt sich dieselbe Testdatei gegen verschiedene Fassungen eines Moduls laufen lassen. pytest läuft nur auf dieser Datei. Ist `name` keine Testdatei, etwa eine `conftest.py` mit Fixtures, sammelt pytest stattdessen alle Testdateien des Verzeichnisses; `args` kann weitere Pfade oder Optionen wie `-k` nennen. Das Ergebnis ist ein `PytestRun`:
+
+| Attribut | Inhalt |
+| --- | --- |
+| `ok` | Exit-Code 0 und mindestens ein bestandener Test |
+| `passed`, `failed`, `skipped` | Namen der Tests, etwa `test_preis[5-0]`; `failed` enthält auch Fehler in Fixtures und beim Sammeln |
+| `outcomes` | `{name: "passed" \| "failed" \| "error" \| "skipped" \| "xfailed" \| "xpassed"}` |
+| `exit_code`, `output` | Exit-Code und Bericht von pytest (`-q --tb=short`), gut als Meldung für den Lernenden |
+
+```yaml
+setup: |
+  from pathlib import Path
+
+  RICHTIG = '''
+  def brutto(netto):
+      return round(netto * 1.19, 2)
+  '''
+  OHNE_RUNDUNG = RICHTIG.replace("round(netto * 1.19, 2)", "netto * 1.19")
+  Path("preise.py").write_text(RICHTIG)   # der Code des Lernenden wird vorher einmal importiert
+tests:
+  - name: Grün gegen die richtige Implementierung
+    code: |
+      lauf = run_pytest({"preise.py": RICHTIG})
+      assert lauf.ok, lauf.output
+  - name: Fängt einen Fehler beim Runden
+    code: |
+      lauf = run_pytest({"preise.py": OHNE_RUNDUNG})
+      assert not lauf.ok, "Deine Tests bleiben grün, obwohl nicht mehr gerundet wird."
+```
+
+- Der erste Test prüft, dass die Tests gegen die richtige Fassung grün sind, jeder weitere einen Mutanten. Die Namen nennen den Regelbereich, nicht den Fall, der scheitert – sie sind vor dem Lösen sichtbar.
+- Mutanten sind realistische Fehler (Grenze um eins verschoben, `<` statt `<=`, fehlende Rundung, vergessener Fall), die sich aus der Beschreibung im Prompt finden lassen. Der Prompt nennt deshalb den vollständigen Vertrag.
+- Höchstens etwa fünf Läufe je Übung: Jeder dauert im Browser 0,1 bis 0,5 Sekunden, mit Hypothesis länger. pytest selbst wird vor dem Zeitlimit geladen.
+- Hypothesis läuft mit `derandomize=True`, `deadline=None` und ohne Beispieldatenbank: dieselben Beispiele bei jedem Lauf, im Browser wie in `pnpm verify`.
+- Ein Starter mit einer leeren Testfunktion (`...`) fängt keinen Mutanten und erfüllt so die Regel, dass er mindestens einen Test nicht besteht.
 
 ### `sql` – SQL-Abfrage (läuft im Browser)
 
@@ -679,7 +719,7 @@ pnpm test:e2e                  # Browser-Tests (Playwright)
 pnpm build                     # TypeScript + Produktionsbuild
 ```
 
-`pnpm verify` braucht lokal `python3` und `rustc` (Edition 2024), für pandas-Code zusätzlich `uv`: Beim ersten Lauf entsteht unter `node_modules/.cache/verify-python/` eine virtuelle Umgebung mit genau den pandas- und numpy-Versionen des Browsers (aus `pyodide-lock.json`). SQL prüft `verify` in Pyodide unter Node, also mit derselben SQLite wie im Browser. Kotlin wird nicht kompiliert; Kotlin-Aufgaben daher besonders sorgfältig gegen die offizielle Dokumentation prüfen. Excel-Formeln und Power-Query-Code laufen nirgends; sie brauchen besonders sorgfältige Prüfung gegen die Microsoft-Dokumentation.
+`pnpm verify` braucht lokal `python3` und `rustc` (Edition 2024), für pandas- und pytest-Code zusätzlich `uv`: Beim ersten Lauf entsteht unter `node_modules/.cache/verify-python/` eine virtuelle Umgebung mit genau den pandas- und numpy-Versionen des Browsers (aus `pyodide-lock.json`) und den pytest- und Hypothesis-Versionen aus `src/python/packages.ts`. TypeScript- und JavaScript-`output` laufen mit dem Node, das auch `pnpm verify` ausführt. SQL prüft `verify` in Pyodide unter Node, also mit derselben SQLite wie im Browser. Kotlin wird nicht kompiliert; Kotlin-Aufgaben daher besonders sorgfältig gegen die offizielle Dokumentation prüfen. Excel-Formeln und Power-Query-Code laufen nirgends; sie brauchen besonders sorgfältige Prüfung gegen die Microsoft-Dokumentation.
 
 `content:check` und `verify` nehmen auch einzelne Module: `pnpm verify data/sql-joins`. Dann zählen nur Fehler dieses Moduls und der `area.yaml` – praktisch, solange andere Module desselben Bereichs noch entstehen.
 

@@ -1,0 +1,1095 @@
+id: flaky-tests
+title: Flaky Tests
+level: 3
+minutes: 150
+summary: Ein Flaky Test ist ein Test mit einer versteckten Eingabe – Uhr, Reihenfolge, Zufall, Hash-Salt, Scheduler, Netz. Du machst sie sichtbar, reparierst den Test oder den Code und sorgst mit Statistik, Quarantäne und ehrlichen Retries dafür, dass Rot wieder etwas bedeutet.
+goals:
+  - Du erklärst, was einen Flaky Test ausmacht, was er ein Team kostet und warum er manchmal einen echten Fehler im Produkt zeigt.
+  - Du erkennst die häufigsten Ursachen – Zeit und Sommerzeit, geteilter Zustand, Zufall, Hash- und Iterationsreihenfolge, Gleitkomma, Nebenläufigkeit, Netz, geteilte Ressourcen – und stellst sie gezielt nach.
+  - Du reparierst Flaky Tests mit festen Zeitpunkten, übergebenen Uhren und Zufallsgeneratoren, Isolation, explizitem Warten und eindeutigen Testdaten, ohne dass der Test seine Aussagekraft verliert.
+  - Du findest Flaky Tests mit Wiederholungen, zufälliger Reihenfolge und CI-Statistik und reproduzierst sie mit Seed und Umgebung.
+  - Du begründest eine Quarantäne-Regel und erklärst, warum automatische Retries echte Race Conditions verdecken.
+resources:
+  - title: pytest · Flaky tests
+    url: https://docs.pytest.org/en/stable/explanation/flaky.html
+  - title: Google Testing Blog · Flaky Tests at Google and How We Mitigate Them
+    url: https://testing.googleblog.com/2016/05/flaky-tests-at-google-and-how-we.html
+  - title: Google Testing Blog · Where do our flaky tests come from?
+    url: https://testing.googleblog.com/2017/04/where-do-our-flaky-tests-come-from.html
+  - title: Playwright · Retries
+    url: https://playwright.dev/docs/test-retries
+  - title: Martin Fowler · Eradicating Non-Determinism in Tests
+    url: https://martinfowler.com/articles/nonDeterminism.html
+lesson: |
+  Seit drei Wochen ist `test_tageshoechstpreis_deckelt_zwei_lange_fahrten` im Nightly-Lauf von Radwerk ab und zu rot, in Pull Requests nie. Wer die Meldung sieht, klickt auf „Re-run“, der Lauf wird grün, im Team-Chat steht „flaky, nochmal“. Zwei Wochen später zeigt ein anderer Test gelegentlich eine Doppelbuchung, und auch er bekommt seinen Re-run.
+
+  Ein Flaky Test liefert bei unverändertem Code und unverändertem Test mal Grün und mal Rot. Dieses Modul zeigt die häufigsten Ursachen an je einem Beispiel. Danach geht es darum, wie du Flaky Tests findest und reproduzierst und welche Regeln für Retries und Quarantäne verhindern, dass sie echte Fehler verdecken. Das allgemeine Vorgehen bei roten Tests steht in [Fehlgeschlagene Tests debuggen](/testing/tests-debuggen).
+
+  ## Flaky Tests: Definition, Kosten und Denkmodell
+
+  Google nennt ein Ergebnis flaky, wenn ein Test „mit demselben Code sowohl bestanden als auch fehlgeschlagen ist“ ([Google Testing Blog, 2016](https://testing.googleblog.com/2016/05/flaky-tests-at-google-and-how-we.html)). Der Beitrag nennt Zahlen: Rund 1,5 % aller Testläufe lieferten ein Flaky-Ergebnis, fast 16 % der Tests waren zumindest gelegentlich flaky, und 84 % der Übergänge von Grün nach Rot in der CI betrafen einen Flaky Test. Eine Auswertung ein Jahr später zeigte, dass die Größe zählt: Innerhalb einer Woche waren 0,5 % der kleinen, 1,6 % der mittleren und 14 % der großen Tests flaky ([Where do our flaky tests come from?](https://testing.googleblog.com/2017/04/where-do-our-flaky-tests-come-from.html)).
+
+  Teurer als die Rechenzeit ist der Vertrauensverlust. Wer gelernt hat, dass Rot oft nichts bedeutet, startet neu, statt zu lesen – auch wenn diesmal ein echter Fehler dahintersteht ([pytest · Flaky tests](https://docs.pytest.org/en/stable/explanation/flaky.html#why-flaky-tests-are-a-problem)). Und manchmal ist gar nicht der Test kaputt: Liegt der Nichtdeterminismus im Produktcode, ignorierst du mit dem Test einen Fehler, den auch Kunden treffen.
+
+  > [!MERKE]
+  > Ein Flaky Test ist fast immer ein deterministischer Test mit einer **versteckten Eingabe**: Er liest etwas, das nicht in seinem Code steht. Mach diese Eingabe sichtbar, dann wird der Test reproduzierbar und meist auch reparierbar.
+
+  Die häufigsten versteckten Eingaben und ihre Reparatur:
+
+  | Versteckte Eingabe | Beispiel bei Radwerk | Reparatur |
+  | --- | --- | --- |
+  | Uhrzeit, Datum, Zeitzone | Tageshöchstpreis um 22 Uhr, Zeitumstellung | Zeit übergeben, feste Zeitpunkte, Grenzen ausdrücklich testen |
+  | Zustand anderer Tests | Aktionspreis in einer Modulvariable | jeder Test baut seinen Zustand selbst, `monkeypatch`, Fixtures mit Aufräumen |
+  | Zufall ohne Seed | zufällige Radvergabe | Zufallsgenerator übergeben, Eigenschaften statt Einzelwerte prüfen |
+  | Hash- und Iterationsreihenfolge | `set` von Stationsnamen, Abfrage ohne `ORDER BY` | sortieren oder als Menge vergleichen |
+  | Gleitkomma und Reihenfolge | Euro-Beträge als `float` | Cent als `int`, `math.fsum`, `pytest.approx` |
+  | Scheduler von Threads und Tasks | `sleep` statt Warten, Doppelbuchung | auf das Ereignis warten, Ablauf im Test erzwingen |
+  | Netz und fremde Dienste | Paystream-Sandbox | Fake am Adapter, Contract Test, Sandbox-Tests getrennt |
+  | Ports, Dateien, Datenbank | fester Port, feste Datei, gleiche Testkundin | Port 0, `tmp_path`, eindeutige Testdaten |
+
+  ## Zeit als Ursache: Mitternacht, Zeitzonen und Sommerzeit
+
+  Der Test aus dem Nightly-Lauf legt zwei lange E-Bike-Fahrten im Abstand von drei Stunden an, beginnend „jetzt“. Der Tageshöchstpreis von 3 000 Cent gilt je Kalendertag in Berlin. Ab 21 Uhr fällt die zweite Fahrt auf den nächsten Tag, und der Deckel greift nicht. Im Block ist „jetzt“ ein Parameter, also siehst du denselben Test zu vier Uhrzeiten:
+
+  ```python pytest fails
+  from datetime import datetime, timedelta
+  from zoneinfo import ZoneInfo
+
+  import pytest
+
+  BERLIN = ZoneInfo("Europe/Berlin")
+  DECKEL_EBIKE = 3000
+
+
+  def tageskosten(fahrten):
+      """Cent je Kalendertag in Europe/Berlin, höchstens der Tageshöchstpreis."""
+      summen = {}
+      for start, cent in fahrten:
+          tag = start.astimezone(BERLIN).date()
+          summen[tag] = summen.get(tag, 0) + cent
+      return {tag: min(summe, DECKEL_EBIKE) for tag, summe in summen.items()}
+
+
+  @pytest.mark.parametrize("uhrzeit", ["09:00", "20:59", "21:00", "23:30"])
+  def test_zwei_lange_fahrten_ab_jetzt(uhrzeit):
+      # Im Repository stand hier: jetzt = datetime.now(BERLIN)
+      jetzt = datetime.fromisoformat(f"2026-10-03T{uhrzeit}").replace(tzinfo=BERLIN)
+      fahrten = [(jetzt, 1800), (jetzt + timedelta(hours=3), 1800)]
+      assert tageskosten(fahrten) == {jetzt.date(): 3000}
+  ```
+
+  Tagsüber grün, ab 21 Uhr rot. Pull Requests laufen fast nie so spät. Der Nightly-Lauf startet um 20:30 Uhr und erreicht den Test je nach Warteschlange der Runner kurz vor oder kurz nach 21 Uhr – daher „ab und zu“. Zufällig war an dem Test nichts; er hatte eine Eingabe, die niemand sah.
+
+  Die zweite Falle ist die Sommerzeit. Am 25. Oktober 2026 springt die Uhr in Berlin um 3 Uhr auf 2 Uhr zurück, der Tag hat 25 Stunden. Python rechnet die Differenz zweier `datetime`-Werte mit **derselben** `tzinfo` als Wanduhrzeit und ignoriert dabei die Offsets ([datetime-Objekte](https://docs.python.org/3/library/datetime.html#datetime-objects)):
+
+  ```python run
+  from datetime import datetime, timezone
+  from zoneinfo import ZoneInfo
+
+  BERLIN = ZoneInfo("Europe/Berlin")
+  start = datetime(2026, 10, 25, 1, 30, tzinfo=BERLIN)
+  ende = datetime(2026, 10, 25, 3, 10, tzinfo=BERLIN)
+  print(ende - start)
+  print(ende.astimezone(timezone.utc) - start.astimezone(timezone.utc))
+  print(start.utcoffset(), ende.utcoffset())
+  ```
+
+  Wanduhr 1:40 Stunden, tatsächlich 2:40. Eine Fahrt über die Zeitumstellung wäre zwei Takte zu billig. Ein Test mit `datetime.now()` trifft eine Zeitumstellung höchstens an zwei Tagen im Jahr, und dann nur zur passenden Uhrzeit.
+
+  Die Reparatur hat zwei Teile. Im Code übergibst du die Zeit oder eine Uhr, statt `datetime.now()` aufzurufen, und rechnest Dauern in UTC (siehe [Testbarkeit durch Design](/testing/testbares-design)). Im Test nimmst du feste Zeitpunkte und machst die Grenzen, die der alte Test nur zufällig traf, zu eigenen Fällen:
+
+  ```python pytest
+  from datetime import datetime, timezone
+  from zoneinfo import ZoneInfo
+
+  import pytest
+
+  BERLIN = ZoneInfo("Europe/Berlin")
+
+
+  def fahrtdauer_minuten(start: datetime, ende: datetime) -> int:
+      dauer = ende.astimezone(timezone.utc) - start.astimezone(timezone.utc)
+      return int(dauer.total_seconds() // 60)
+
+
+  @pytest.mark.parametrize(
+      "start, ende, minuten",
+      [
+          ("2026-10-03T23:50+02:00", "2026-10-04T00:20+02:00", 30),
+          ("2026-10-25T01:50+02:00", "2026-10-25T02:20+01:00", 90),
+          ("2026-03-29T01:50+01:00", "2026-03-29T03:20+02:00", 30),
+      ],
+      ids=["ueber-mitternacht", "ende-sommerzeit", "beginn-sommerzeit"],
+  )
+  def test_fahrtdauer(start, ende, minuten):
+      start = datetime.fromisoformat(start).astimezone(BERLIN)
+      ende = datetime.fromisoformat(ende).astimezone(BERLIN)
+      assert fahrtdauer_minuten(start, ende) == minuten
+  ```
+
+  Wo du die Uhr nicht übergeben kannst, etwa in altem Code, frieren Bibliotheken wie time-machine oder freezegun die Systemzeit für einen Test ein. Das ist ein Notbehelf: Der Test hängt weiter an einer globalen Uhr, nur an einer, die er kontrolliert.
+
+  ## Reihenfolge und geteilter Zustand
+
+  pytest führt Tests in der Reihenfolge der Dateien und Funktionen aus. Ein Test, der Zustand hinterlässt, und einer, der sauberen Zustand voraussetzt, vertragen sich deshalb wochenlang – bis jemand eine Datei umbenennt, einen Test einzeln startet oder die CI parallel testet. Hier verändert der Aktionstag-Test einen Tarif auf Modulebene:
+
+  ```python pytest fails
+  TAKT_CENT = {"city": 150, "ebike": 300}
+
+
+  def setze_aktionspreis(rad: str, cent: int) -> None:
+      TAKT_CENT[rad] = cent
+
+
+  def mietpreis(rad: str, minuten: int) -> int:
+      if minuten <= 5:
+          return 0
+      return -(-minuten // 30) * TAKT_CENT[rad]
+
+
+  def test_aktionstag_senkt_den_ebike_takt():
+      setze_aktionspreis("ebike", 200)
+      assert mietpreis("ebike", 31) == 400
+
+
+  def test_ebike_kostet_300_cent_je_takt():
+      assert mietpreis("ebike", 31) == 600
+  ```
+
+  Rot wird der zweite Test, obwohl der erste den Schaden anrichtet. Geteilter Zustand steckt in Modulvariablen, Klassenattributen, Caches wie `functools.cache`, Singletons, Umgebungsvariablen, dem Arbeitsverzeichnis, Dateien an festen Pfaden und Zeilen einer gemeinsamen Testdatenbank. Die Reparatur: Jeder Test baut den Zustand, den er braucht, selbst auf und hinterlässt nichts. `monkeypatch` macht Änderungen an Attributen, Dictionaries und Umgebungsvariablen nach dem Test rückgängig ([monkeypatch](https://docs.pytest.org/en/stable/how-to/monkeypatch.html#monkeypatching-environment-variables)), `tmp_path` gibt jedem Test ein eigenes Verzeichnis, Datenbanktests laufen in einer Transaktion, die am Ende zurückgerollt wird.
+
+  Solche Abhängigkeiten findest du, indem du die Reihenfolge absichtlich änderst. Das Plugin [pytest-randomly](https://github.com/pytest-dev/pytest-randomly) mischt bei jedem Lauf erst die Module, dann Klassen und Funktionen, schreibt den Seed in den Kopf des Berichts und setzt vor jedem Test `random.seed()` auf einen daraus abgeleiteten Wert. Im Projekt liegt der Aktionstag-Test in `tests/test_wochenendaktion.py`, der Tarif-Test in `tests/test_tarife.py`:
+
+  ```console
+  $ pytest -p no:randomly -q
+  ...                                                                      [100%]
+  3 passed in 0.09s
+  $ pytest --tb=line
+  ============================= test session starts ==============================
+  platform linux -- Python 3.14.7, pytest-9.0.2, pluggy-1.6.0
+  Using --randomly-seed=3953809260
+  …
+  tests/test_wochenendaktion.py .                                          [ 33%]
+  tests/test_tarife.py .F                                                  [100%]
+  …
+  FAILED tests/test_tarife.py::test_ebike_kostet_300_cent_je_takt - AssertionEr...
+  ========================= 1 failed, 2 passed in 0.09s ==========================
+  $ pytest --randomly-seed=3953809260 -q --tb=no tests/test_tarife.py
+  ..                                                                       [100%]
+  2 passed in 0.10s
+  $ pytest -p no:randomly -q --tb=no tests/test_wochenendaktion.py tests/test_tarife.py
+  ..F                                                                      [100%]
+  =========================== short test summary info ============================
+  FAILED tests/test_tarife.py::test_ebike_kostet_300_cent_je_takt - AssertionEr...
+  1 failed, 2 passed in 0.09s
+  ```
+
+  In der festen Reihenfolge ist alles grün, weil `test_tarife.py` alphabetisch zuerst läuft. Gemischt wird es rot. Derselbe Seed nur mit `tests/test_tarife.py` ist grün, also steckt der Verursacher in einer anderen Datei. Das Paar in fester Reihenfolge, Verursacher zuerst, zeigt den Fehler jedes Mal. `--randomly-seed=last` nimmt den Seed des vorigen Laufs.
+
+  ## Zufall, Hash-Reihenfolge und Gleitkommazahlen
+
+  Zufall ohne festen Seed macht aus einem Test eine Stichprobe. Steckt er im Produktcode – Radwerk vergibt bei mehreren geeigneten Rädern zufällig eins, damit sich die Abnutzung verteilt –, gehört der Zufallsgenerator als Parameter in die Funktion. Der Test übergibt dann `random.Random(7)` oder prüft nur, was immer gilt: „Das Rad hat genug Akku.“ Steckt der Zufall in den Testdaten, sind feste Daten fast immer besser. Willst du absichtlich viele zufällige Eingaben, nimm Hypothesis: Es verkleinert ein fehlschlagendes Beispiel, zeigt es an und spielt es beim nächsten Lauf zuerst ab (siehe [Property-based Testing](/testing/property-based-testing)).
+
+  Weniger offensichtlich ist die Reihenfolge von Mengen. Python versieht die Hashes von `str` und `bytes` in jedem Prozess mit einem zufälligen Salt ([PYTHONHASHSEED](https://docs.python.org/3/using/cmdline.html#envvar-PYTHONHASHSEED)). Innerhalb eines Laufs ist die Reihenfolge eines `set` von Stationsnamen stabil, zwischen zwei Läufen nicht. Kommen Beträge als `float` dazu, ändert sich mit der Reihenfolge auch die Summe:
+
+  ```console
+  $ cat summe.py
+  stationen = {"Hauptbahnhof", "Altstadt", "Uni-Campus"}
+  fahrten = {("Hauptbahnhof", 0.1), ("Altstadt", 0.2), ("Uni-Campus", 0.3)}
+
+  gesamt = 0.0
+  for _, euro in fahrten:
+      gesamt += euro
+  print(list(stationen), gesamt)
+  $ python summe.py
+  ['Hauptbahnhof', 'Altstadt', 'Uni-Campus'] 0.6000000000000001
+  $ python summe.py
+  ['Uni-Campus', 'Altstadt', 'Hauptbahnhof'] 0.6000000000000001
+  $ PYTHONHASHSEED=4 python summe.py
+  ['Uni-Campus', 'Altstadt', 'Hauptbahnhof'] 0.6
+  $ PYTHONHASHSEED=4 python summe.py
+  ['Uni-Campus', 'Altstadt', 'Hauptbahnhof'] 0.6
+  ```
+
+  Ein Test mit `assert list(stationen) == [...]` oder `assert gesamt == 0.6` ist deshalb in manchen Prozessen grün und in anderen rot. Innerhalb eines Prozesses bleibt er stabil, Wiederholungen im selben Lauf finden ihn also nicht. Aus demselben Grund taugt so ein Programm nicht als Aufgabe „Ausgabe vorhersagen“: Es hat keine eine richtige Ausgabe. Die Reparatur: als Menge vergleichen oder sortieren; gehört die Reihenfolge zum Vertrag, sortiert der Code. Dasselbe gilt für Datenbankabfragen ohne `ORDER BY`. Geld rechnet Radwerk in Cent als `int`; für gemessene Werte wie Strecken gibt es `pytest.approx` und `math.fsum`. Seit Python 3.12 summiert `sum()` Gleitkommazahlen genauer und weniger abhängig von der Reihenfolge ([sum](https://docs.python.org/3/library/functions.html#sum)), die Schleife mit `+=` nicht.
+
+  ## Nebenläufigkeit, Netzwerk und geteilte Ressourcen
+
+  Bei Threads und async-Code entscheidet der Scheduler, welche Aufgabe wann weiterläuft. Zwei Reservierungen für dasselbe Rad zeigen, was dabei passieren kann. Zwischen Prüfen und Speichern liegt ein `await`, und in dieser Lücke prüft die zweite Anfrage:
+
+  ```python run
+  import asyncio
+
+  reservierungen: list[tuple[str, str]] = []
+
+
+  async def hat_ueberschneidung(rad: str) -> bool:
+      await asyncio.sleep(0)  # Datenbankabfrage
+      return any(r == rad for r, _ in reservierungen)
+
+
+  async def reserviere(rad: str, kunde: str) -> bool:
+      if await hat_ueberschneidung(rad):
+          return False
+      await asyncio.sleep(0)  # Preis berechnen, Zahlung vormerken
+      reservierungen.append((rad, kunde))
+      return True
+
+
+  print(await asyncio.gather(reserviere("R-117", "lena"), reserviere("R-117", "tom")))
+  print(reservierungen)
+  ```
+
+  Beide haben das Rad. Hier passiert es jedes Mal, weil `asyncio` die beiden Aufgaben fest abwechselnd ausführt. Gegen eine echte Datenbank hängt es an Millisekunden, ob die zweite Anfrage in die Lücke fällt: Der Test ist flaky, der Fehler echt. Repariert wird der Code – die Datenbank prüft und speichert in einem Schritt, etwa mit einem Constraint gegen überlappende Zeiträume. Der Test erzwingt danach den gleichzeitigen Zugriff, etwa mit einem Fake, der beide Anfragen erst nach dem Prüfen weiterlaufen lässt, und erwartet genau einen Erfolg.
+
+  Die häufigste Quelle bei Nebenläufigkeit ist Warten nach Gefühl. Dieser Test prüft die Verarbeitung eines Paystream-Webhooks, die im Hintergrund läuft:
+
+  ```python
+  import threading
+  import time
+
+
+  def verarbeite_im_hintergrund(zahlung: dict) -> threading.Thread:
+      def arbeit():
+          time.sleep(0.0099)  # Datenbank und Paystream: meist knapp unter 10 ms
+          zahlung["status"] = "bezahlt"
+
+      thread = threading.Thread(target=arbeit)
+      thread.start()
+      return thread
+
+
+  def test_webhook_markiert_zahlung_als_bezahlt():
+      zahlung = {"status": "offen"}
+      verarbeite_im_hintergrund(zahlung)
+      time.sleep(0.01)
+      assert zahlung["status"] == "bezahlt"
+  ```
+
+  `time.sleep(0.01)` rät, wie lange die Arbeit dauert. Meist reicht es, unter Last nicht. Mit [pytest-repeat](https://github.com/pytest-dev/pytest-repeat) läuft ein verdächtiger Test so oft, bis er scheitert:
+
+  ```console
+  $ pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --count=500 -x
+  …
+  collected 500 items
+
+  tests/test_webhook.py .................................................. [ 10%]
+  …
+  .............F
+  …
+  FAILED tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt[424-500]
+  !!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+  ======================== 1 failed, 423 passed in 4.66s =========================
+  ```
+
+  Hier war der 424. Durchgang rot. Jeder Lauf trifft einen anderen, und auf einem ausgelasteten Rechner kommt der erste rote früher. Die Reparatur wartet auf das Ereignis statt auf die Uhr: `verarbeite_im_hintergrund(zahlung).join(timeout=5)`, bei asyncio `await auftrag` oder `await asyncio.wait_for(ereignis.wait(), timeout=5)`. Der Timeout ist nur eine Obergrenze für den Fehlerfall; im Normalfall geht es sofort weiter. Playwright wartet bei Locators und Assertions nach demselben Prinzip (siehe [End-to-End-Tests mit Playwright](/testing/e2e-tests)).
+
+  Tests gegen die Paystream-Sandbox scheitern an Timeouts, Rate Limits und Wartungsfenstern, die mit Radwerks Code nichts zu tun haben. Ersetze den Dienst am Adapter durch einen Fake (siehe [Test Doubles](/testing/test-doubles)), sichere die Schnittstelle mit [Contract Testing](/testing/contract-testing) ab und lass die wenigen Tests gegen die Sandbox in einem eigenen Job laufen, der nicht blockiert.
+
+  Geteilte Ressourcen werden bei parallelen Läufen zum Problem, etwa mit `pytest -n auto` aus pytest-xdist. Ein fester Port ist belegt – mit Port 0 wählt das Betriebssystem einen freien. Eine feste Datei wird überschrieben – mit `tmp_path` hat jeder Test seine eigene. Die Kundin `test@radwerk.example` gibt es schon – eindeutige Testdaten, etwa mit einer UUID im Namen, vermeiden den Konflikt.
+
+  ## Flaky Tests finden und eindämmen: Statistik, Retries und Quarantäne
+
+  Den sichersten Hinweis liefert die CI: Ein Test, der auf demselben Commit grün und rot war, ist flaky. Wer die JUnit-Berichte jedes Laufs aufhebt, rechnet pro Test eine Flake-Rate aus und sieht, welche Tests am meisten kosten. Lokal helfen die Werkzeuge von oben: `--count` mit `-x` für einen verdächtigen Test, pytest-randomly für die Reihenfolge, `-n` für Parallelität, `TZ` und `LC_ALL` für die Umgebung.
+
+  Automatische Wiederholungen sind verführerisch. [pytest-rerunfailures](https://pytest-rerunfailures.readthedocs.io/latest/) führt rote Tests erneut aus, global mit `--reruns 2` oder pro Test mit `@pytest.mark.flaky(reruns=2)`. Derselbe Webhook-Test, 500-mal mit Wiederholungen:
+
+  ```console
+  $ pytest tests/test_webhook.py --count=500 --reruns 2 -q
+  .......R................................................................ [ 14%]
+  ........................................................................ [ 28%]
+  ........................................................................ [ 43%]
+  ........................................................................ [ 57%]
+  ............................R........................................... [ 71%]
+  ........................................................................ [ 86%]
+  ......................................................................   [100%]
+  500 passed, 2 rerun in 5.67s
+  ```
+
+  Grün. Zwei echte Fehlschläge stehen nur noch als „2 rerun“ in der letzten Zeile, ihre Tracebacks zeigt das Plugin ohne `--rerun-show-tracebacks` nicht. Genau so verdeckt ein Retry eine Race Condition wie die Doppelbuchung: Jeder Lauf, in dem das Timing gnädig ist, macht die Pipeline grün, und der Fehler geht in Produktion. Google schreibt Ähnliches über das eigene Quarantäne-Werkzeug: Es könne „leicht eine echte Race Condition verdecken“. Playwright macht Retries wenigstens sichtbar und führt Tests, die erst im zweiten Versuch bestehen, als „flaky“ ([Playwright · Retries](https://playwright.dev/docs/test-retries#retries)). Retries sind vertretbar, wenn sie im Bericht auftauchen, nur für teure Tests auf hoher Ebene gelten und jeder wiederholte Fehler ein Ticket bekommt. Mit `--fail-on-flaky` lässt pytest-rerunfailures den Lauf trotzdem scheitern, wenn ein Test erst bei einer Wiederholung besteht.
+
+  Für Tests, die das Team gerade nicht reparieren kann, gibt es die Quarantäne: Der Test läuft weiter, blockiert aber keine Merges. Bei Radwerk ist das ein eigener Marker:
+
+  ```toml
+  [tool.pytest]
+  addopts = ["-m", "not quarantaene"]
+  markers = ["quarantaene(reason): bekannter Flaky Test, läuft nur im Quarantäne-Job"]
+  strict_markers = true
+  ```
+
+  ```python
+  @pytest.mark.quarantaene(reason="RAD-412 · Lena · bis 2026-10-17 · Sandbox-Timeout")
+  def test_checkout_mit_paystream_sandbox(): ...
+  ```
+
+  Der blockierende Job läuft mit der Voreinstellung; ein zweiter, nicht blockierender Job startet `pytest -m quarantaene` und meldet seine Ergebnisse. Das `-m` auf der Kommandozeile ersetzt das aus `addopts`.
+
+  > [!WARNING] `xfail` ist keine Quarantäne
+  > `@pytest.mark.xfail(strict=False)` lässt einen Test scheitern, ohne den Lauf rot zu machen. Die pytest-Dokumentation nennt das für den Dauerbetrieb gefährlich ([xfail strict](https://docs.pytest.org/en/stable/explanation/flaky.html#xfail-strict)): Niemand bemerkt, ob der Test noch rot ist, wieder grün wird oder einen neuen Fehler zeigt.
+
+  > [!PRAXIS] Radwerks Regeln für Flaky Tests
+  > Ein Flaky Test ist ein Bug mit Ticket. Wer ihn zuerst sieht, legt das Ticket an und hängt den Link zum Lauf an. Innerhalb eines Arbeitstags wird entschieden: sofort reparieren oder in Quarantäne, mit Verantwortlicher und Frist von zwei Wochen. Nach der Frist wird der Test repariert, auf einer niedrigeren Ebene neu geschrieben oder gelöscht – Quarantäne ist kein Endlager. Retries gibt es nur in der Playwright-Suite, mit Flaky-Bericht. Einmal pro Woche schaut das Team auf die Flake-Rate pro Test.
+
+  > [!INTERVIEW] „Wie geht ihr mit Flaky Tests um?“
+  > Ich behandle sie als Bugs, entweder im Test oder im Produkt. Erst messe ich: Ein Test, der auf demselben Commit grün und rot war, ist flaky. Dann suche ich die versteckte Eingabe – Zeit, Reihenfolge, Zufall, Scheduler, Netz, geteilte Ressourcen – und reproduziere mit Seed, Wiederholungen oder Umgebungsvariablen. Repariert wird mit festen Zeitpunkten, übergebenen Abhängigkeiten, Isolation und Warten auf Ereignisse. Was nicht sofort geht, kommt mit Ticket und Frist in Quarantäne. Automatische Retries setze ich nur sichtbar und nur für E2E-Tests ein, weil sie sonst echte Race Conditions verstecken.
+
+  ## Häufige Fehler
+
+  - **„Nur flaky“ und neu starten.** Der nächste rote Lauf wird genauso behandelt, auch wenn er einen echten Fehler zeigt. Jeder Flaky Test bekommt ein Ticket.
+  - **`time.sleep` als Synchronisation.** Auf dem Laptop reicht die Zeit, auf dem ausgelasteten Runner nicht. Auf das Ereignis warten, mit großzügigem Timeout als Obergrenze.
+  - **`datetime.now()` im Test.** Der Test prüft je nach Uhrzeit etwas anderes. Feste Zeitpunkte, Grenzen als eigene Fälle.
+  - **Den Opfer-Test reparieren statt den Verursacher.** Setzt nur der rote Test den Zustand zurück, trifft es den nächsten Test. Wer Zustand ändert, räumt ihn auf.
+  - **Retries als Lösung.** Sie machen die Pipeline grün und den Fehler unsichtbar. Nur sichtbar, nur für E2E, nie ohne Ticket.
+  - **Quarantäne ohne Frist.** Der Test läuft weiter, aber niemand liest das Ergebnis. Immer mit Ticket, Person und Datum.
+  - **Den Flaky Test löschen, ohne das Risiko neu abzudecken.** Was er prüfen sollte, ist dann ungetestet. Besser auf einer niedrigeren, deterministischen Ebene neu schreiben.
+
+  ## Zusammenfassung
+
+  - Ein Flaky Test liefert mit demselben Code mal Grün, mal Rot. Er kostet Vertrauen und kann einen echten Fehler im Produkt zeigen.
+  - Dahinter steckt eine versteckte Eingabe: Uhr, Zustand anderer Tests, Zufall, Hash-Salt, Scheduler, Netz oder geteilte Ressourcen.
+  - Zeit übergeben und in UTC rechnen; Mitternacht und Sommerzeit als eigene Testfälle.
+  - Jeder Test baut seinen Zustand selbst und räumt auf; pytest-randomly deckt Abhängigkeiten auf, der Seed macht sie reproduzierbar.
+  - Mengen sortieren oder als Menge vergleichen, Geld in Cent als `int`, Zufall als Parameter.
+  - Auf Ereignisse warten statt zu schlafen; fremde Dienste am Adapter ersetzen; Port 0, `tmp_path`, eindeutige Testdaten.
+  - Finden mit CI-Statistik (grün und rot auf demselben Commit), `--count` und zufälliger Reihenfolge.
+  - Retries nur sichtbar und nur für teure Tests; Quarantäne mit Ticket, Verantwortlicher und Frist.
+exercises:
+  - id: was-ist-flaky
+    type: choice
+    title: Flaky oder nicht?
+    prompt: |
+      Welche Beobachtungen zeigen einen Flaky Test?
+    options:
+      - text: Auf demselben Commit lief der Test um 14 Uhr grün und im Nightly-Lauf um 22 Uhr rot.
+        correct: true
+        why: Gleicher Code, verschiedene Ergebnisse. Die versteckte Eingabe ist hier vermutlich die Uhrzeit.
+      - text: Der Test ist allein grün und in der ganzen Suite rot, ohne Codeänderung dazwischen.
+        correct: true
+        why: Das Ergebnis hängt von der Reihenfolge und von anderen Tests ab – ein Flaky Test durch geteilten Zustand.
+      - text: Im Nightly-Lauf mit `pytest -n 8` scheitert der Test etwa jeden fünften Tag, im Pull Request nie.
+        correct: true
+        why: Parallele Läufe teilen Ports, Dateien oder Daten; welche Tests gleichzeitig laufen, ändert sich von Lauf zu Lauf.
+      - text: Seit dem Merge von Commit `a1b2c3d` ist der Test in jedem Lauf rot.
+        correct: false
+        why: Das ist eine deterministische Regression. Hier hilft `git bisect`, kein Wiederholen.
+      - text: Der Test ist immer grün, obwohl die Funktion einen bekannten Fehler hat.
+        correct: false
+        why: Ein Test, der den Fehler nicht sieht, ist zu schwach, aber nicht flaky. Sein Ergebnis ändert sich nie.
+    explanation: |
+      Flaky heißt: dasselbe Programm, derselbe Test, verschiedene Ergebnisse. Die Ursache liegt in einer Eingabe, die nicht im Test steht – Uhrzeit, andere Tests, parallele Prozesse. Ein Test, der seit einem bestimmten Commit immer rot ist, hat einen klaren Auslöser und gehört zu `git bisect`. Ein Test, der einen bekannten Fehler nie sieht, ist ein Fall für bessere Testfälle oder Mutationstests, nicht für Flaky-Werkzeuge.
+    resources:
+      - title: Google Testing Blog · Flaky Tests at Google
+        url: https://testing.googleblog.com/2016/05/flaky-tests-at-google-and-how-we.html
+
+  - id: flaky-e2e-entscheiden
+    type: choice
+    title: Der Checkout-Test und die Sandbox
+    prompt: |
+      Der Playwright-Test „Buchung mit Paystream bezahlen“ läuft im Pull Request gegen Staging und die Paystream-Sandbox. Er ist in etwa 4 % der Läufe rot, immer mit einem Timeout auf der Zahlungsseite: Die Sandbox antwortet manchmal erst nach 40 Sekunden. Das Team sammelt Vorschläge. Welche sind gut?
+    options:
+      - text: Statusübergänge, Webhook-Verarbeitung und Fehlerfälle der Zahlung mit einem Fake des Paystream-Adapters auf Unit- und Integrationsebene testen und die Schnittstelle mit Contract Tests absichern.
+        correct: true
+        why: Die Risiken der Zahlungslogik lassen sich ohne Sandbox deterministisch prüfen, schneller und mit besserer Fehlerlokalisierung.
+      - text: Einen einzigen End-to-End-Test gegen die Sandbox behalten, aber in einen nächtlichen Job verschieben, der nicht blockiert und Fehlschläge ans Team meldet.
+        correct: true
+        why: Ob die echte Integration funktioniert, prüft nur ein Test gegen die Sandbox. Er soll aber nicht jeden Merge an deren Launen binden.
+      - text: "`retries: 3` für alle E2E-Tests setzen, damit die Pipeline grün bleibt."
+        correct: false
+        why: Das versteckt auch echte Fehler im Checkout und verlängert jeden roten Lauf um drei weitere Versuche.
+      - text: Den Timeout auf der Zahlungsseite auf fünf Minuten erhöhen.
+        correct: false
+        why: Jeder echte Fehler kostet dann fünf Minuten, und Ausfälle der Sandbox blockieren weiter die Pull Requests.
+      - text: Den Test löschen, weil er nur stört.
+        correct: false
+        why: Der Checkout ist Radwerks wichtigster Ablauf. Ohne Ersatz auf anderer Ebene wäre sein Risiko ungetestet.
+    explanation: |
+      Ein Risiko gehört auf die niedrigste Ebene, die es zuverlässig zeigt. Die Zahlungslogik braucht keine echte Sandbox; ein Fake am Adapter und Contract Tests prüfen sie deterministisch in jedem Pull Request. Was nur die echte Integration zeigen kann – Zugangsdaten, Netzwerk, das echte Verhalten der Sandbox –, prüft ein einzelner E2E-Test außerhalb des blockierenden Pfads. Retries und längere Timeouts behandeln das Symptom und verdecken dabei echte Fehler.
+    resources:
+      - title: pytest · Flaky tests – Split up test suites
+        url: https://docs.pytest.org/en/stable/explanation/flaky.html#split-up-test-suites
+
+  - id: sommerzeit-dauer
+    type: output
+    title: Eine Stunde, die fehlt
+    prompt: |
+      Am 29. März 2026 beginnt in Berlin die Sommerzeit: Um 2 Uhr wird die Uhr auf 3 Uhr vorgestellt. Was gibt das Programm aus?
+    lang: python
+    code: |
+      from datetime import datetime, timezone
+      from zoneinfo import ZoneInfo
+
+      BERLIN = ZoneInfo("Europe/Berlin")
+      start = datetime(2026, 3, 29, 1, 30, tzinfo=BERLIN)
+      ende = datetime(2026, 3, 29, 3, 10, tzinfo=BERLIN)
+      print(ende - start)
+      print(ende.astimezone(timezone.utc) - start.astimezone(timezone.utc))
+      print(start.utcoffset(), ende.utcoffset())
+    expected: |
+      1:40:00
+      0:40:00
+      1:00:00 2:00:00
+    explanation: |
+      Haben beide Werte dieselbe `tzinfo`, rechnet Python die Differenz als Wanduhrzeit: 3:10 minus 1:30 sind 1:40. Tatsächlich vergingen 40 Minuten, denn die Stunde von 2 bis 3 Uhr gab es an diesem Tag nicht. 1:30 Uhr hat noch den Offset +1 (Winterzeit), 3:10 Uhr schon +2 (Sommerzeit). In UTC sind das 0:30 und 1:10 Uhr, und die Differenz stimmt. Die Lektion zeigt den umgekehrten Fall im Oktober, wenn eine Stunde doppelt vorkommt. Eine Fahrt von 40 Minuten kostet zwei Takte, nach Wanduhr wären es vier. Fahrtdauern rechnest du deshalb in UTC. Ein Test mit `datetime.now()` trifft diesen Fall fast nie; ein Test mit diesen beiden festen Zeitpunkten jedes Mal.
+    resources:
+      - title: Python · datetime-Objekte (Arithmetik)
+        url: https://docs.python.org/3/library/datetime.html#datetime-objects
+      - title: Python · datetime.fold
+        url: https://docs.python.org/3/library/datetime.html#datetime.datetime.fold
+
+  - id: cache-zwischen-tests
+    type: output
+    title: Aufgeräumt und trotzdem schmutzig
+    prompt: |
+      Die beiden Funktionen `test_…` stehen für zwei Tests derselben Suite, die nacheinander im selben Prozess laufen. Was gibt das Programm aus?
+    lang: python
+    code: |
+      from functools import cache
+
+      TAKT_CENT = {"city": 150, "ebike": 300}
+
+
+      @cache
+      def takt_cent(rad: str) -> int:
+          return TAKT_CENT[rad]
+
+
+      def test_aktionstag():
+          TAKT_CENT["ebike"] = 200
+          ergebnis = takt_cent("ebike") == 200
+          TAKT_CENT["ebike"] = 300  # aufräumen
+          return ergebnis
+
+
+      def test_normaler_tarif():
+          return takt_cent("ebike") == 300
+
+
+      print(test_normaler_tarif(), test_aktionstag())
+      takt_cent.cache_clear()
+      print(test_aktionstag(), test_normaler_tarif())
+      print(TAKT_CENT["ebike"], takt_cent("ebike"))
+    expected: |
+      True False
+      True False
+      300 200
+    explanation: |
+      `functools.cache` merkt sich das Ergebnis je Argument für die Lebensdauer des Prozesses. In der ersten Zeile füllt `test_normaler_tarif` den Cache mit 300, und `test_aktionstag` bekommt danach den alten Wert, obwohl er das Dictionary geändert hat. Nach `cache_clear()` läuft die Reihenfolge andersherum: Jetzt landet die 200 im Cache, und `test_normaler_tarif` scheitert, obwohl `test_aktionstag` sein Dictionary sauber zurückgesetzt hat. Je nach Reihenfolge wird also ein anderer Test rot. Aufräumen muss alles erfassen, was sich verändert hat – hier auch den Cache, etwa mit einer Fixture, die `takt_cent.cache_clear()` aufruft.
+    resources:
+      - title: Python · functools.cache
+        url: https://docs.python.org/3/library/functools.html#functools.cache
+
+  - id: float-reihenfolge
+    type: output
+    title: Dieselben Beträge, andere Summe
+    prompt: |
+      Was gibt das Programm aus?
+    lang: python
+    code: |
+      import math
+
+      euro = [0.1, 0.2, 0.3]
+
+
+      def aufsummieren(werte):
+          gesamt = 0.0
+          for wert in werte:
+              gesamt += wert
+          return gesamt
+
+
+      print(aufsummieren(euro) == 0.6)
+      print(aufsummieren(reversed(euro)) == 0.6)
+      print(math.fsum(euro) == 0.6)
+      print(sum([10, 20, 30]) == 60)
+    expected: |
+      False
+      True
+      True
+      True
+    explanation: |
+      Gleitkommaaddition ist nicht assoziativ. `(0.1 + 0.2) + 0.3` ergibt `0.6000000000000001`, `(0.3 + 0.2) + 0.1` genau den `float`, der als `0.6` geschrieben wird. `math.fsum` führt die Zwischensummen exakt mit und rundet nur einmal am Ende, das Ergebnis hängt nicht von der Reihenfolge ab. Mit Cent als `int` stellt sich die Frage gar nicht. Kommen die Beträge aus einem `set` von Tupeln mit Strings, hängt die Reihenfolge der Schleife vom Hash-Salt des Prozesses ab – dann ist das Ergebnis von Lauf zu Lauf verschieden. Ein solches Programm eignet sich nicht für eine Aufgabe dieser Art, weil es keine eine richtige Ausgabe hat; deshalb steht hier eine Liste mit fester Reihenfolge.
+    resources:
+      - title: Python · math.fsum
+        url: https://docs.python.org/3/library/math.html#math.fsum
+      - title: Python · Floating-Point Arithmetic
+        url: https://docs.python.org/3/tutorial/floatingpoint.html
+
+  - id: bis-zum-fehler-wiederholen
+    type: command
+    title: So oft, bis er fällt
+    prompt: |
+      Der Webhook-Test ist etwa einmal pro Woche rot. Führe nur `test_webhook_markiert_zahlung_als_bezahlt` aus `tests/test_webhook.py` 500-mal aus und brich beim ersten Fehler ab. Schreib die Node-ID direkt hinter `pytest`, danach die Optionen.
+    context: Du bist im Projektverzeichnis; pytest-repeat ist installiert.
+    answers: ["pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --count=500 -x", "pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt -x --count=500", "pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --count=500 --exitfirst", "pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --exitfirst --count=500", "pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --count=500 --maxfail=1", "pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --maxfail=1 --count=500", "pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --count 500 -x", "pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt -x --count 500", "pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --count 500 --exitfirst", "pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --exitfirst --count 500", "pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --count 500 --maxfail=1", "pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --maxfail=1 --count 500", "python -m pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --count=500 -x", "python -m pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt -x --count=500", "python -m pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --count=500 --exitfirst", "python -m pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --exitfirst --count=500", "python -m pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --count=500 --maxfail=1", "python -m pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --maxfail=1 --count=500", "python -m pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --count 500 -x", "python -m pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt -x --count 500", "python -m pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --count 500 --exitfirst", "python -m pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --exitfirst --count 500", "python -m pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --count 500 --maxfail=1", "python -m pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --maxfail=1 --count 500", "python3 -m pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --count=500 -x", "python3 -m pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt -x --count=500", "python3 -m pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --count=500 --exitfirst", "python3 -m pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --exitfirst --count=500", "python3 -m pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --count=500 --maxfail=1", "python3 -m pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --maxfail=1 --count=500", "python3 -m pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --count 500 -x", "python3 -m pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt -x --count 500", "python3 -m pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --count 500 --exitfirst", "python3 -m pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --exitfirst --count 500", "python3 -m pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --count 500 --maxfail=1", "python3 -m pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --maxfail=1 --count 500", "uv run pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --count=500 -x", "uv run pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt -x --count=500", "uv run pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --count=500 --exitfirst", "uv run pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --exitfirst --count=500", "uv run pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --count=500 --maxfail=1", "uv run pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --maxfail=1 --count=500", "uv run pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --count 500 -x", "uv run pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt -x --count 500", "uv run pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --count 500 --exitfirst", "uv run pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --exitfirst --count 500", "uv run pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --count 500 --maxfail=1", "uv run pytest tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt --maxfail=1 --count 500"]
+    output: |
+      ============================= test session starts ==============================
+      platform linux -- Python 3.14.7, pytest-9.0.2, pluggy-1.6.0
+      …
+      plugins: repeat-0.9.4
+      collected 500 items
+
+      tests/test_webhook.py .................................................. [ 10%]
+      ........................................................................ [ 24%]
+      ........................................................................ [ 38%]
+      ........................................................................ [ 53%]
+      ........................................................................ [ 67%]
+      ........................................................................ [ 82%]
+      .............F
+
+      =================================== FAILURES ===================================
+      ______________ test_webhook_markiert_zahlung_als_bezahlt[424-500] ______________
+      …
+      >       assert zahlung["status"] == "bezahlt"
+      E       AssertionError: assert 'offen' == 'bezahlt'
+      …
+      FAILED tests/test_webhook.py::test_webhook_markiert_zahlung_als_bezahlt[424-500]
+      !!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+      ======================== 1 failed, 423 passed in 4.66s =========================
+    explanation: |
+      `--count=500` aus pytest-repeat erzeugt 500 Fälle desselben Tests mit IDs wie `[424-500]`; `-x` beendet den Lauf beim ersten roten. So wird aus „einmal pro Woche“ ein Fehler, den du in Sekunden siehst und mit dem du eine Reparatur prüfen kannst: Nach dem Fix müssen alle 500 grün sein. Wiederholungen im selben Prozess finden Ursachen wie Timing und Zufall. Hängt der Fehler vom Hash-Salt, von der Uhrzeit oder von der Reihenfolge ab, ist jeder Durchlauf gleich – dann brauchst du andere Werkzeuge.
+    resources:
+      - title: pytest-repeat
+        url: https://github.com/pytest-dev/pytest-repeat
+
+  - id: reihenfolge-nachstellen
+    type: command
+    title: Dieselbe Mischung noch einmal
+    prompt: |
+      In der CI läuft pytest-randomly. Der rote Lauf beginnt mit `Using --randomly-seed=3953809260`. Führe die Suite lokal in genau dieser Reihenfolge aus.
+    context: Du bist im Projektverzeichnis; pytest-randomly ist installiert.
+    answers: ["pytest --randomly-seed=3953809260", "pytest --randomly-seed 3953809260", "pytest -p randomly --randomly-seed=3953809260", "python -m pytest --randomly-seed=3953809260", "python -m pytest --randomly-seed 3953809260", "python -m pytest -p randomly --randomly-seed=3953809260", "python3 -m pytest --randomly-seed=3953809260", "python3 -m pytest --randomly-seed 3953809260", "python3 -m pytest -p randomly --randomly-seed=3953809260", "uv run pytest --randomly-seed=3953809260", "uv run pytest --randomly-seed 3953809260", "uv run pytest -p randomly --randomly-seed=3953809260"]
+    output: |
+      ============================= test session starts ==============================
+      platform linux -- Python 3.14.7, pytest-9.0.2, pluggy-1.6.0
+      Using --randomly-seed=3953809260
+      …
+      tests/test_wochenendaktion.py .                                          [ 33%]
+      tests/test_tarife.py .F                                                  [100%]
+
+      =================================== FAILURES ===================================
+      ______________________ test_ebike_kostet_300_cent_je_takt ______________________
+
+          def test_ebike_kostet_300_cent_je_takt():
+      >       assert mietpreis("ebike", 31) == 600
+      E       AssertionError: assert 400 == 600
+      E        +  where 400 = mietpreis('ebike', 31)
+      …
+      ========================= 1 failed, 2 passed in 0.10s ==========================
+    explanation: |
+      pytest-randomly leitet aus dem Seed die Reihenfolge der Module, Klassen und Funktionen ab und setzt vor jedem Test `random.seed()` auf einen daraus berechneten Wert. Mit demselben Seed bekommst du dieselbe Reihenfolge und dieselben Zufallszahlen – vorausgesetzt, die Testauswahl ist gleich. Danach grenzt du ein: denselben Seed mit einzelnen Dateien, schließlich das verdächtige Paar mit `-p no:randomly` in fester Reihenfolge. `--randomly-seed=last` nimmt den Seed des letzten lokalen Laufs; das klappt nur, solange der Cache von pytest aktiv ist.
+    resources:
+      - title: pytest-randomly
+        url: https://github.com/pytest-dev/pytest-randomly
+
+  - id: mitternacht-reparieren
+    type: code
+    title: Der Test, der um 22 Uhr rot wird
+    prompt: |
+      `tageskosten(fahrten)` aus `abrechnung.py` bekommt eine Liste von Paaren `(start, cent)` – `start` ist ein `datetime` mit Zeitzone, `cent` der Preis der Fahrt – und liefert ein Dictionary Kalendertag → Cent. Regel: Je **Kalendertag in Europe/Berlin** kosten die E-Bike-Fahrten zusammen höchstens 3 000 Cent (Tageshöchstpreis). Die Funktion liest selbst keine Uhr.
+
+      Der Test im Editor ist tagsüber grün und rot, sobald er nach 21 Uhr läuft, etwa im Nightly-Lauf. `uhr.jetzt()` liefert die aktuelle Zeit in Berlin.
+
+      Repariere den Test so, dass er zu jeder Uhrzeit dasselbe Ergebnis liefert und weiterhin prüft, dass der Tageshöchstpreis greift. Die Prüfung führt deinen Test zu verschiedenen Uhrzeiten aus und gegen fehlerhafte Varianten von `tageskosten` – auch gegen eine, die Kalendertage falsch abgrenzt. Die Tagesgrenze kam im alten Test nur zufällig vor; teste sie ausdrücklich.
+    lang: python
+    setup: |
+      from pathlib import Path
+
+      ABRECHNUNG = '''
+      from datetime import datetime, timezone
+      from zoneinfo import ZoneInfo
+
+      BERLIN = ZoneInfo("Europe/Berlin")
+      DECKEL_CENT = 3000
+
+
+      def tageskosten(fahrten):
+          summen = {}
+          for start, cent in fahrten:
+              tag = start.astimezone(BERLIN).date()
+              summen[tag] = summen.get(tag, 0) + cent
+          return {tag: min(summe, DECKEL_CENT) for tag, summe in summen.items()}
+      '''
+      OHNE_DECKEL = ABRECHNUNG.replace("min(summe, DECKEL_CENT)", "summe")
+      UTC_TAG = ABRECHNUNG.replace("start.astimezone(BERLIN).date()", "start.astimezone(timezone.utc).date()")
+      for variante in (OHNE_DECKEL, UTC_TAG):
+          assert variante != ABRECHNUNG, "Eine fehlerhafte Variante ist identisch mit der richtigen."
+
+
+      def uhr_modul(stunde, minute):
+          return f'''
+      from datetime import datetime
+      from zoneinfo import ZoneInfo
+
+
+      def jetzt():
+          return datetime(2026, 10, 3, {stunde}, {minute}, tzinfo=ZoneInfo("Europe/Berlin"))
+      '''
+
+
+      Path("abrechnung.py").write_text(ABRECHNUNG)
+      Path("uhr.py").write_text('''
+      from datetime import datetime
+      from zoneinfo import ZoneInfo
+
+
+      def jetzt():
+          return datetime.now(ZoneInfo("Europe/Berlin"))
+      ''')
+    starter: |
+      from datetime import timedelta
+
+      from abrechnung import tageskosten
+      from uhr import jetzt
+
+
+      def test_tageshoechstpreis_deckelt_zwei_lange_fahrten():
+          start = jetzt()
+          fahrten = [(start, 1800), (start + timedelta(hours=3), 1800)]
+          assert sum(tageskosten(fahrten).values()) == 3000
+    solution: |
+      from datetime import date, datetime
+      from zoneinfo import ZoneInfo
+
+      from abrechnung import tageskosten
+
+      BERLIN = ZoneInfo("Europe/Berlin")
+
+
+      def um(text):
+          return datetime.fromisoformat(text).replace(tzinfo=BERLIN)
+
+
+      def test_tageshoechstpreis_deckelt_zwei_fahrten_am_selben_tag():
+          fahrten = [(um("2026-10-03T09:00"), 1800), (um("2026-10-03T12:00"), 1800)]
+          assert tageskosten(fahrten) == {date(2026, 10, 3): 3000}
+
+
+      def test_fahrten_vor_und_nach_mitternacht_zaehlen_zu_zwei_tagen():
+          fahrten = [(um("2026-10-03T23:30"), 1800), (um("2026-10-04T00:30"), 1800)]
+          assert tageskosten(fahrten) == {date(2026, 10, 3): 1800, date(2026, 10, 4): 1800}
+    tests:
+      - name: Grün am Vormittag
+        code: |
+          lauf = run_pytest({"abrechnung.py": ABRECHNUNG, "uhr.py": uhr_modul(9, 0)})
+          assert lauf.ok, lauf.output
+      - name: Grün am späten Abend
+        code: |
+          lauf = run_pytest({"abrechnung.py": ABRECHNUNG, "uhr.py": uhr_modul(22, 30)})
+          assert lauf.ok, "Um 22:30 Uhr ist dein Test rot:\n" + lauf.output
+      - name: Fängt einen fehlenden Tageshöchstpreis
+        code: |
+          lauf = run_pytest({"abrechnung.py": OHNE_DECKEL, "uhr.py": uhr_modul(9, 0)})
+          assert not lauf.ok, "Eine Variante ohne Tageshöchstpreis bleibt grün. Prüft dein Test noch, dass der Deckel greift?"
+      - name: Fängt eine falsch gezogene Tagesgrenze
+        code: |
+          lauf = run_pytest({"abrechnung.py": UTC_TAG, "uhr.py": uhr_modul(9, 0)})
+          assert not lauf.ok, "Eine Variante, die Kalendertage in UTC statt in Berlin abgrenzt, bleibt grün. Lege zwei Fahrten so, dass sie in Berlin auf verschiedene Tage fallen, in UTC aber auf denselben."
+    hints:
+      - "`tageskosten` liest keine Uhr – nur dein Test tut es. Brauchst du `jetzt()` überhaupt?"
+      - "Feste Zeitpunkte wie `datetime(2026, 10, 3, 9, 0, tzinfo=ZoneInfo(\"Europe/Berlin\"))` machen den Test unabhängig von der Uhrzeit."
+      - "Für die Tagesgrenze: 23:30 Uhr am 3. Oktober und 0:30 Uhr am 4. Oktober sind in Berlin zwei Tage, in UTC (21:30 und 22:30 Uhr) derselbe."
+    explanation: |
+      Der alte Test hatte eine versteckte Eingabe, die Uhrzeit. Ab 21 Uhr lag die zweite Fahrt am nächsten Tag, und der Test prüfte etwas anderes, als sein Name sagt. Weil `tageskosten` selbst keine Uhr liest, fliegt die Uhr aus dem Test, und feste Zeitpunkte ersetzen sie. Eine gefälschte Uhr per `monkeypatch` wäre hier ein Umweg – und mit `from uhr import jetzt` im Test würde ein Patch auf `uhr.jetzt` nicht einmal wirken. Die Tagesgrenze, die der alte Test nur nachts traf, wird ein eigener Fall. Zwei Fahrten um 23:30 und 0:30 Uhr liegen in Berlin an zwei Tagen, in UTC an einem; so fällt auch eine Variante auf, die in UTC abgrenzt.
+    resources:
+      - title: Python · zoneinfo
+        url: https://docs.python.org/3/library/zoneinfo.html#using-zoneinfo
+      - title: Martin Fowler · Eradicating Non-Determinism in Tests
+        url: https://martinfowler.com/articles/nonDeterminism.html
+
+  - id: geteilten-zustand-reparieren
+    type: code
+    title: Der Aktionstag, der nicht endet
+    prompt: |
+      `tarife.py` hält die Takte in einer Modulvariable `TAKT_CENT = {"city": 150, "ebike": 300}`. `mietpreis(rad, minuten)` berechnet den Takt je angefangene 30 Minuten, Fahrten bis einschließlich 5 Minuten kosten 0 Cent. `setze_aktionspreis(rad, cent)` ändert den Takt eines Radtyps für einen Aktionstag.
+
+      Die beiden Tests im Editor sind einzeln grün, zusammen ist einer rot. Repariere sie so, dass
+
+      - beide Tests in jeder Reihenfolge grün sind,
+      - nach deinen Tests `TAKT_CENT` wieder den ursprünglichen Inhalt hat – auch für Tests in anderen Dateien, die später laufen,
+      - der Aktionstag-Test weiterhin `setze_aktionspreis` prüft und der zweite Test den echten E-Bike-Takt aus `tarife.py`.
+
+      Die Prüfung führt deine Tests in verschiedenen Reihenfolgen aus, zusammen mit einer weiteren Testdatei, und gegen fehlerhafte Varianten von `tarife.py`.
+    lang: python
+    setup: |
+      from pathlib import Path
+
+      TARIFE = '''
+      TAKT_CENT = {"city": 150, "ebike": 300}
+
+
+      def setze_aktionspreis(rad, cent):
+          TAKT_CENT[rad] = cent
+
+
+      def mietpreis(rad, minuten):
+          if minuten <= 5:
+              return 0
+          return -(-minuten // 30) * TAKT_CENT[rad]
+      '''
+      AKTION_WIRKUNGSLOS = TARIFE.replace("    TAKT_CENT[rad] = cent", "    pass")
+      EBIKE_250 = TARIFE.replace('"ebike": 300', '"ebike": 250')
+      for variante in (AKTION_WIRKUNGSLOS, EBIKE_250):
+          assert variante != TARIFE, "Eine fehlerhafte Variante ist identisch mit der richtigen."
+      # Kehrt die Reihenfolge der Tests um und setzt test_danach.py ans Ende.
+      UMGEKEHRT_DANACH_ZULETZT = '''
+      def pytest_collection_modifyitems(items):
+          items.reverse()
+          items.sort(key=lambda item: item.path.name == "test_danach.py")
+      '''
+      DANACH = '''
+      import tarife
+
+
+      def test_tarif_ist_nach_den_anderen_tests_unveraendert():
+          assert tarife.TAKT_CENT == {"city": 150, "ebike": 300}
+      '''
+      Path("tarife.py").write_text(TARIFE)
+    starter: |
+      from tarife import mietpreis, setze_aktionspreis
+
+
+      def test_aktionstag_senkt_den_ebike_takt():
+          setze_aktionspreis("ebike", 200)
+          assert mietpreis("ebike", 31) == 400
+
+
+      def test_ebike_kostet_300_cent_je_angefangene_halbe_stunde():
+          assert mietpreis("ebike", 31) == 600
+    solution: |
+      import pytest
+
+      import tarife
+      from tarife import mietpreis, setze_aktionspreis
+
+
+      @pytest.fixture(autouse=True)
+      def tarife_sichern(monkeypatch):
+          # Jeder Test arbeitet auf einer Kopie; monkeypatch setzt danach das Original zurück.
+          monkeypatch.setattr(tarife, "TAKT_CENT", dict(tarife.TAKT_CENT))
+
+
+      def test_aktionstag_senkt_den_ebike_takt():
+          setze_aktionspreis("ebike", 200)
+          assert mietpreis("ebike", 31) == 400
+
+
+      def test_ebike_kostet_300_cent_je_angefangene_halbe_stunde():
+          assert mietpreis("ebike", 31) == 600
+    tests:
+      - name: Grün in der Reihenfolge der Datei
+        code: |
+          lauf = run_pytest({"tarife.py": TARIFE})
+          assert lauf.ok, lauf.output
+      - name: Grün in umgekehrter Reihenfolge, spätere Testdateien sehen den ursprünglichen Tarif
+        code: |
+          lauf = run_pytest({"tarife.py": TARIFE, "test_danach.py": DANACH, "conftest.py": UMGEKEHRT_DANACH_ZULETZT}, args=["test_danach.py"])
+          assert "test_tarif_ist_nach_den_anderen_tests_unveraendert" in lauf.passed, "Nach deinen Tests ist TAKT_CENT verändert. Ein Test in einer anderen Datei, der danach läuft, sieht noch den Aktionspreis – räumt der Test auf, der den Tarif ändert?\n" + lauf.output
+          assert lauf.ok, "In umgekehrter Reihenfolge ist ein Test rot:\n" + lauf.output
+      - name: Prüft den Aktionspreis weiterhin
+        code: |
+          lauf = run_pytest({"tarife.py": AKTION_WIRKUNGSLOS})
+          assert not lauf.ok, "Eine Variante, in der setze_aktionspreis nichts bewirkt, bleibt grün. Ruft dein Aktionstag-Test die Funktion noch auf?"
+      - name: Prüft den normalen E-Bike-Takt weiterhin
+        code: |
+          lauf = run_pytest({"tarife.py": EBIKE_250})
+          assert not lauf.ok, "Eine Variante mit 250 statt 300 Cent je Takt bleibt grün. Setzt dein Test die Preise selbst, statt die Werte aus tarife.py zu prüfen?"
+    hints:
+      - Der rote Test ist das Opfer. Den Schaden richtet der Test an, der `setze_aktionspreis` aufruft und den Tarif danach nicht zurücksetzt.
+      - "`monkeypatch` macht Änderungen nach dem Test rückgängig. Gib dem Test eine Kopie des Dictionarys: `monkeypatch.setattr(tarife, \"TAKT_CENT\", dict(tarife.TAKT_CENT))` – dafür brauchst du `import tarife`."
+      - Mit `@pytest.fixture(autouse=True)` gilt die Fixture für jeden Test der Datei. Alternativ sicherst du den Tarif in einer `yield`-Fixture und stellst ihn nach dem `yield` wieder her.
+    explanation: |
+      Der Aktionstag-Test verändert eine Modulvariable und lässt sie so zurück. Alle Tests im selben Prozess teilen sich dieses Modul, also hängt jeder spätere Test davon ab, ob der Aktionstag vor ihm lief. Wer den roten Test repariert, indem er dort die Preise wieder auf 150 und 300 setzt, verschiebt das Problem: Je nach Reihenfolge trifft es den nächsten Test, und der Test prüft dann seine eigenen Zahlen statt die aus `tarife.py`. Die Reparatur gehört zum Verursacher. `monkeypatch.setattr` ersetzt `TAKT_CENT` für die Dauer des Tests durch eine Kopie; `setze_aktionspreis` ändert die Kopie, weil es den Namen zur Laufzeit im Modul nachschlägt, und nach dem Test hängt `monkeypatch` das Original wieder ein. Langfristig hilft Design: Ein Aktionspreis gehört in ein Objekt, das der Test selbst erzeugt, nicht in globalen Zustand.
+    resources:
+      - title: pytest · How to monkeypatch
+        url: https://docs.pytest.org/en/stable/how-to/monkeypatch.html
+      - title: pytest · Flaky tests – System state
+        url: https://docs.pytest.org/en/stable/explanation/flaky.html#system-state
+
+  - id: zufall-reparieren
+    type: code
+    title: Jedes zweite Mal das falsche Rad
+    prompt: |
+      `vergib_rad(akkus, rng=random)` aus `raeder.py` bekommt ein Dictionary Rad-ID → Akkustand in Prozent. Die Funktion wählt mit `rng.choice` zufällig eines der Räder mit **mindestens 30 %** Akku, damit sich die Abnutzung verteilt. Gibt es keins, wirft sie `LookupError`. Für `rng` kannst du ein eigenes `random.Random` übergeben.
+
+      Der Test im Editor ist in etwa der Hälfte der Läufe rot. Repariere ihn und decke die Regeln ab: Er muss mit jeder Zufallsfolge grün sein und trotzdem Fehler an der Akkugrenze und beim Fall ohne geeignetes Rad bemerken. Die Prüfung führt deine Tests mit verschiedenen Seeds für das Modul `random` und gegen fehlerhafte Varianten aus.
+    lang: python
+    setup: |
+      from pathlib import Path
+
+      RAEDER = '''
+      import random
+
+
+      def vergib_rad(akkus, rng=random):
+          geeignet = sorted(rad for rad, akku in akkus.items() if akku >= 30)
+          if not geeignet:
+              raise LookupError("Kein Rad mit mindestens 30 % Akku")
+          return rng.choice(geeignet)
+      '''
+      GRENZE = RAEDER.replace("akku >= 30", "akku > 30")
+      OHNE_FEHLER = RAEDER.replace('        raise LookupError("Kein Rad mit mindestens 30 % Akku")', "        return None")
+      for variante in (GRENZE, OHNE_FEHLER):
+          assert variante != RAEDER, "Eine fehlerhafte Variante ist identisch mit der richtigen."
+
+
+      def conftest_mit_seed(seed):
+          return f'''
+      import random
+
+      random.seed({seed})
+      '''
+
+
+      Path("raeder.py").write_text(RAEDER)
+    starter: |
+      from raeder import vergib_rad
+
+
+      def test_vergibt_ein_rad_mit_genug_akku():
+          assert vergib_rad({"R-101": 80, "R-102": 25, "R-103": 64}) == "R-101"
+    solution: |
+      import random
+
+      import pytest
+
+      from raeder import vergib_rad
+
+
+      def test_vergibt_nur_raeder_mit_genug_akku():
+          assert vergib_rad({"R-101": 80, "R-102": 25, "R-103": 64}) in {"R-101", "R-103"}
+
+
+      def test_30_prozent_reichen():
+          assert vergib_rad({"R-101": 30, "R-102": 29}) == "R-101"
+
+
+      def test_ohne_geeignetes_rad_gibt_es_lookuperror():
+          with pytest.raises(LookupError):
+              vergib_rad({"R-101": 29, "R-102": 5})
+
+
+      def test_gleicher_seed_gleiche_wahl():
+          akkus = {"R-101": 80, "R-103": 64, "R-104": 91}
+          assert vergib_rad(akkus, rng=random.Random(7)) == vergib_rad(akkus, rng=random.Random(7))
+    tests:
+      - name: Grün mit einer Zufallsfolge
+        code: |
+          lauf = run_pytest({"raeder.py": RAEDER, "conftest.py": conftest_mit_seed(1)})
+          assert lauf.ok, lauf.output
+      - name: Grün mit einer anderen Zufallsfolge
+        code: |
+          lauf = run_pytest({"raeder.py": RAEDER, "conftest.py": conftest_mit_seed(5)})
+          assert lauf.ok, "Mit einer anderen Zufallsfolge ist dein Test rot:\n" + lauf.output
+      - name: Fängt einen Fehler an der Akkugrenze
+        code: |
+          lauf = run_pytest({"raeder.py": GRENZE, "conftest.py": conftest_mit_seed(1)})
+          assert not lauf.ok, "Eine Variante, die erst ab 31 % Akku vergibt, bleibt grün."
+      - name: Fängt eine fehlende Fehlermeldung
+        code: |
+          lauf = run_pytest({"raeder.py": OHNE_FEHLER, "conftest.py": conftest_mit_seed(1)})
+          assert not lauf.ok, "Eine Variante, die ohne geeignetes Rad None zurückgibt, statt LookupError zu werfen, bleibt grün."
+    hints:
+      - Prüfe eine Eigenschaft, die bei jeder Wahl gilt, statt eines bestimmten Rads – oder übergib einen Zufallsgenerator mit festem Seed.
+      - Ist nur ein Rad geeignet, gibt es nichts zu raten. Ein Rad mit genau 30 % neben einem mit 29 % prüft die Grenze.
+      - "`with pytest.raises(LookupError):` prüft den Fall ohne geeignetes Rad."
+    explanation: |
+      Der alte Test behauptete, dass ein bestimmtes von zwei geeigneten Rädern gewählt wird – eine Annahme, die die Regel nicht hergibt. Ob er grün war, entschied der Zustand des globalen Zufallsgenerators. Es gibt zwei saubere Reparaturen. Entweder prüfst du, was immer gilt: Das Rad ist eines der geeigneten. Oder du machst den Zufall zur sichtbaren Eingabe und übergibst `random.Random(7)`; dann ist die Wahl reproduzierbar, aber der Test hängt an der Implementierung von `choice`. Fälle mit nur einem geeigneten Rad brauchen keinen Zufall und prüfen die Regeln am genauesten: die Grenze bei 30 % und die Ausnahme ohne geeignetes Rad.
+    resources:
+      - title: Python · random.Random
+        url: https://docs.python.org/3/library/random.html#random.Random
+      - title: pytest · Assertions about expected exceptions
+        url: https://docs.pytest.org/en/stable/how-to/assert.html#assertraises
+
+  - id: schlafen-statt-warten
+    type: bug
+    title: Der Webhook, der manchmal zu spät kommt
+    prompt: |
+      Dieser Integrationstest läuft mit pytest-asyncio gegen die Testdatenbank. Lokal ist er immer grün, in der CI unter Last ungefähr jeden fünfzigsten Lauf rot:
+
+      ```text
+      >       assert await repo.status("pay_7f3a") == "bezahlt"
+      E       AssertionError: assert 'offen' == 'bezahlt'
+      ```
+
+      Finde die Zeile, die den Test flaky macht, und korrigiere sie. Falls du eine Obergrenze setzt, nimm 5 Sekunden.
+    lang: python
+    code: |
+      import asyncio
+
+      import pytest
+
+      from radwerk.webhooks import verarbeite_webhook
+
+
+      @pytest.mark.asyncio
+      async def test_webhook_setzt_zahlung_auf_bezahlt(repo):
+          await repo.lege_zahlung_an("pay_7f3a", status="offen")
+          ereignis = {"type": "payment.succeeded", "data": {"id": "pay_7f3a"}}
+          auftrag = asyncio.create_task(verarbeite_webhook(repo, ereignis))
+          await asyncio.sleep(0.05)
+          assert await repo.status("pay_7f3a") == "bezahlt"
+    lines: [13]
+    fix:
+      - line: 13
+        answers: ["await auftrag", "await asyncio.wait_for(auftrag, timeout=5)", "await asyncio.wait_for(auftrag, 5)", "await asyncio.wait_for(auftrag, timeout=5.0)", "await asyncio.wait_for(auftrag, 5.0)", "await asyncio.gather(auftrag)", "await asyncio.wait_for(auftrag, timeout=10)", "await asyncio.wait_for(auftrag, timeout=1)"]
+    hints:
+      - Woher weiß der Test, dass `verarbeite_webhook` fertig ist?
+      - "`asyncio.create_task` liefert ein Task-Objekt, auf das du warten kannst."
+    explanation: |
+      `asyncio.sleep(0.05)` rät, wie lange die Verarbeitung dauert. Gegen die Testdatenbank reichen 50 Millisekunden meistens, auf einem ausgelasteten CI-Runner nicht. Dann prüft der Test, bevor der Webhook den Status geschrieben hat. `await auftrag` wartet genau so lange wie nötig und gibt außerdem eine Exception aus `verarbeite_webhook` an den Test weiter, die vorher unbemerkt im Task geblieben wäre. `asyncio.wait_for(auftrag, timeout=5)` setzt zusätzlich eine Obergrenze, damit ein hängender Webhook den Test nicht endlos blockiert. Eine längere Pause wäre keine Reparatur, nur ein seltenerer Fehler.
+    resources:
+      - title: Python · asyncio.wait_for
+        url: https://docs.python.org/3/library/asyncio-task.html#asyncio.wait_for
+      - title: Python · asyncio.create_task
+        url: https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task
+
+  - id: fester-port
+    type: bug
+    title: Nur parallel rot
+    prompt: |
+      Seit die CI mit `pytest -n 4` (pytest-xdist) läuft, scheitern die Webhook-Tests in etwa jedem dritten Lauf schon in der Vorbereitung:
+
+      ```text
+      ERROR at setup of test_webhook_ohne_signatur_wird_abgelehnt
+      E   OSError: [Errno 98] Address already in use
+      ```
+
+      Ohne `-n` sind sie immer grün. Finde die Zeile, die das verursacht, und korrigiere sie.
+    lang: python
+    code: |
+      import threading
+      from http.server import HTTPServer
+
+      import pytest
+
+      from radwerk.webhooks import WebhookHandler
+
+
+      @pytest.fixture
+      def webhook_server():
+          httpd = HTTPServer(("127.0.0.1", 8765), WebhookHandler)
+          thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+          thread.start()
+          yield f"http://127.0.0.1:{httpd.server_port}"
+          httpd.shutdown()
+          httpd.server_close()
+    lines: [11]
+    fix:
+      - line: 11
+        answers: ["httpd = HTTPServer((\"127.0.0.1\", 0), WebhookHandler)", "httpd = HTTPServer((\"localhost\", 0), WebhookHandler)"]
+    hints:
+      - Mehrere Worker-Prozesse führen diese Fixture gleichzeitig aus.
+      - Welche Portnummer lässt das Betriebssystem einen freien Port wählen?
+    explanation: |
+      pytest-xdist startet mehrere Worker-Prozesse, und jeder führt seine Tests mit eigenen Fixtures aus. Laufen zwei Webhook-Tests gleichzeitig, will der zweite Server Port 8765 belegen, den der erste schon hält. Mit Port 0 vergibt das Betriebssystem einen freien Port; die Fixture liest ihn danach aus `httpd.server_port` und gibt die URL weiter – der Rest des Codes war darauf schon vorbereitet. Dasselbe Muster gilt für Dateien (`tmp_path` statt fester Pfad) und für Testdaten (eindeutige Namen statt `test@radwerk.example`).
+    resources:
+      - title: Python · socketserver (Port 0 im Beispiel)
+        url: https://docs.python.org/3/library/socketserver.html#asynchronous-mixins
+      - title: pytest-xdist
+        url: https://pytest-xdist.readthedocs.io/en/stable/
+
+  - id: retry-versteckt-race
+    type: explain
+    title: Drei Versuche für eine Doppelbuchung
+    prompt: |
+      Ein Kollege hat diesen Test mit `@pytest.mark.flaky(reruns=3)` aus pytest-rerunfailures versehen, weil er „ab und zu rot“ war. Seitdem ist die Pipeline grün. Erkläre im Review, warum das gefährlich ist, was der Test wirklich zeigt und wie es richtig gelöst wird.
+    lang: python
+    code: |
+      async def reserviere(db, rad_id: str, kunde: str, start, ende) -> bool:
+          if await db.hat_ueberschneidung(rad_id, start, ende):
+              return False
+          await db.speichere_reservierung(rad_id, kunde, start, ende)
+          return True
+
+
+      @pytest.mark.flaky(reruns=3)
+      @pytest.mark.asyncio
+      async def test_gleichzeitig_gewinnt_nur_eine_reservierung(db):
+          ergebnisse = await asyncio.gather(
+              reserviere(db, "R-117", "lena", START, ENDE),
+              reserviere(db, "R-117", "tom", START, ENDE),
+          )
+          assert sorted(ergebnisse) == [False, True]
+    points:
+      - "Zwischen `hat_ueberschneidung` und `speichere_reservierung` liegt ein `await`. In dieser Lücke kann die zweite Anfrage prüfen, beide sehen ein freies Rad, beide speichern: eine Doppelbuchung (Check-then-Act)."
+      - Ob der Test rot wird, hängt davon ab, wie die beiden Aufgaben gegen die Datenbank verzahnt laufen. Das Rot ist das echte Verhalten des Codes, kein Messfehler.
+      - "`reruns=3` macht die Pipeline grün, sobald ein Versuch zufällig nicht in die Lücke fällt. Der Fehler bleibt in Produktion, und die Tracebacks der gescheiterten Versuche sieht ohne `--rerun-show-tracebacks` niemand."
+      - "Repariert wird der Code: Prüfen und Speichern müssen atomar sein, etwa mit einem Constraint der Datenbank gegen überlappende Zeiträume oder einer Sperre je Rad."
+      - Der Test sollte die Verzahnung danach erzwingen, zum Beispiel mit einem Fake, der beide Anfragen erst nach dem Prüfen weiterlaufen lässt, damit er bei einem Rückfall jedes Mal rot ist.
+    explanation: |
+      Der Test ist nicht kaputt, er ist der einzige Hinweis auf einen echten Fehler. `reserviere` folgt dem Muster „erst prüfen, dann handeln“, und zwischen beiden Schritten gibt die Funktion die Kontrolle ab. Kommt die zweite Anfrage genau in dieser Lücke an, sehen beide ein freies Rad und speichern. Wie oft das passiert, hängt an der Latenz der Datenbank – deshalb „ab und zu“. Mit drei Wiederholungen besteht der Test fast immer, die Doppelbuchungen bleiben, und die Kunden stehen zu zweit an derselben Station. Im Review würde ich den Marker entfernen und den Code atomar machen: In PostgreSQL verhindert ein Exclusion-Constraint auf `rad_id` und den Zeitraum überlappende Zeilen, die zweite Anfrage scheitert dann mit einem Fehler, den `reserviere` in `False` übersetzt. Den Test würde ich so umbauen, dass beide Anfragen sicher in die Lücke fallen; dann ist er vor dem Fix immer rot und danach immer grün.
+    resources:
+      - title: pytest-rerunfailures
+        url: https://pytest-rerunfailures.readthedocs.io/latest/
+      - title: Google Testing Blog · Flaky Tests at Google (Quarantäne und Race Conditions)
+        url: https://testing.googleblog.com/2016/05/flaky-tests-at-google-and-how-we.html
+
+  - id: flaky-richtlinie
+    type: practice
+    title: Eine Flaky-Richtlinie für Radwerk
+    prompt: |
+      Radwerk hat 1 400 pytest-Tests (Unit und Integration, eine Suite mit PostgreSQL) und 35 Playwright-Tests. In den letzten vier Wochen waren 9 Tests auf demselben Commit mal grün und mal rot, darunter zwei Playwright-Tests gegen die Paystream-Sandbox. Das Team klickt bei Rot inzwischen reflexhaft auf „Re-run“.
+
+      Schreibe eine Richtlinie für den Umgang mit Flaky Tests, höchstens eine Seite. Sie soll festlegen:
+
+      1. woran das Team einen Flaky Test erkennt und wie es das misst,
+      2. was in den ersten 24 Stunden nach dem ersten Auftreten passiert,
+      3. wie die Quarantäne technisch funktioniert und wann ein Test sie wieder verlässt,
+      4. wo automatische Retries erlaubt sind und wo nicht – mit Begründung,
+      5. welche Reparaturmuster für welche Ursachen gelten,
+      6. welche Kennzahl das Team regelmäßig ansieht.
+    lang: text
+    solution: |
+      Flaky-Richtlinie Radwerk (Stand Oktober 2026)
+
+      1. Erkennen und messen
+         Flaky ist ein Test, der auf demselben Commit grün und rot war. Jeder CI-Lauf
+         speichert den JUnit-Bericht; ein nächtlicher Job wertet die letzten 30 Tage aus
+         und listet Tests mit Flake-Rate > 0 (rote Läufe ohne Codeänderung / alle Läufe).
+
+      2. Die ersten 24 Stunden
+         Wer einen roten Lauf sieht, startet nicht neu, sondern liest den Bericht.
+         Ist der Fehler auf demselben Commit schon grün gewesen: Ticket mit Link zum Lauf,
+         Label "flaky", eine verantwortliche Person aus dem Team, das den Test besitzt.
+         Innerhalb eines Arbeitstags fällt die Entscheidung: sofort reparieren oder Quarantäne.
+
+      3. Quarantäne
+         Marker @pytest.mark.quarantaene(reason="Ticket · Person · Frist · Ursache"),
+         registriert mit strict_markers. Blockierender Job: -m "not quarantaene".
+         Nicht blockierender Job: -m quarantaene, Ergebnis geht in den Team-Kanal.
+         Frist: 14 Tage. Danach repariert, auf niedrigerer Ebene neu geschrieben oder gelöscht,
+         wenn das Risiko anders abgedeckt ist. Höchstens 10 Tests gleichzeitig in Quarantäne.
+         Raus aus der Quarantäne erst nach 200 grünen Wiederholungen (--count=200).
+
+      4. Retries
+         Erlaubt nur in der Playwright-Suite: retries: 2 in der CI, Bericht mit "flaky"-Kategorie,
+         jeder flaky markierte Test bekommt automatisch ein Ticket.
+         Nicht erlaubt für pytest-Tests: Unit- und Integrationstests sind deterministisch
+         zu halten; ein Retry würde Race Conditions wie Doppelbuchungen verdecken.
+
+      5. Reparaturmuster
+         Zeit: Uhr übergeben, feste Zeitpunkte, Mitternacht und Zeitumstellung als Fälle.
+         Reihenfolge/Zustand: monkeypatch, Fixtures mit Aufräumen, Transaktion je Test;
+           pytest-randomly läuft in jeder CI, Seed steht im Log.
+         Zufall: Random-Objekt übergeben oder Eigenschaften prüfen; Hypothesis statt eigener Zufallsdaten.
+         Nebenläufigkeit: auf Ereignisse warten, nie sleep; Races im Code beheben, nicht im Test.
+         Netz: Fake am Adapter, Contract Tests; Sandbox-Tests nur nachts, nicht blockierend.
+         Ressourcen: Port 0, tmp_path, eindeutige Testdaten (UUID).
+
+      6. Kennzahlen
+         Wöchentlich: Anzahl Tests in Quarantäne, Flake-Rate der Suite und die fünf teuersten
+         Flaky Tests (Flake-Rate x Laufzeit). Ziel: weniger als 1 % der CI-Läufe mit Flaky-Ergebnis.
+    checklist:
+      - Die Definition ist messbar (grün und rot auf demselben Commit), und die Daten kommen aus gespeicherten Testberichten.
+      - Für das erste Auftreten gibt es eine Frist und eine verantwortliche Person, „neu starten und vergessen“ ist ausgeschlossen.
+      - Die Quarantäne ist technisch beschrieben (Marker, zwei Jobs), hat eine Frist und eine Bedingung zum Verlassen.
+      - Retries sind auf eine Testebene begrenzt, bleiben im Bericht sichtbar, und du begründest, warum sie Race Conditions verdecken können.
+      - Jeder Ursache aus der Lektion ist ein Reparaturmuster zugeordnet.
+      - Die Kennzahl ist konkret und wird regelmäßig angesehen.
+    explanation: |
+      Eine Richtlinie wirkt nur, wenn sie das Neustarten teurer macht als das Hinsehen und die Quarantäne nicht zum Abstellgleis wird. Deshalb brauchen beide Wege – reparieren oder Quarantäne – eine Person und eine Frist. Die Messung über „grün und rot auf demselben Commit“ ist objektiv und braucht nur die JUnit-Berichte, die die CI ohnehin erzeugt. Retries gehören höchstens in die teure, langsame E2E-Ebene und auch dort nur mit Bericht: In Unit- und Integrationstests verdeckt jede automatische Wiederholung genau die Nebenläufigkeitsfehler, die dort am billigsten zu finden wären. Die Zahlen in der Musterlösung (14 Tage, 10 Tests, 200 Wiederholungen) sind Vorschläge; wichtig ist, dass es überhaupt Grenzen gibt.
+    resources:
+      - title: pytest · Flaky tests – Quarantine
+        url: https://docs.pytest.org/en/stable/explanation/flaky.html#quarantine
+      - title: Playwright · Retries
+        url: https://playwright.dev/docs/test-retries#retries

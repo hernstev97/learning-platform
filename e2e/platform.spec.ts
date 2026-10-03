@@ -253,7 +253,7 @@ test('practice, bug and explain exercises', async ({ page }) => {
   for (const box of await page.locator('[data-point]').all()) await box.check();
   await expect(page.locator('#feedback')).toContainText('Richtig.');
   await page.goto('/beispiel');
-  await expect(page.locator('.module-row .label').last()).toHaveText('3/13');
+  await expect(page.locator('.module-row .label').last()).toHaveText('3/15');
 });
 
 test('SQL runs in the browser: table preview, result table, feedback and runnable lesson blocks', async ({ page }) => {
@@ -288,6 +288,34 @@ test('SQL runs in the browser: table preview, result table, feedback and runnabl
   await block.getByRole('button', { name: 'Ausführen' }).click();
   await expect(block.locator('.run-output table')).toContainText('160.5', { timeout: 60_000 });
   await expect(page.locator('.codeblock[data-lang="excel"] .syntax-fn')).toHaveText('SUMMEWENNS');
+});
+
+test('pytest runs lesson blocks and checks whether written tests catch a broken variant', async ({ page }) => {
+  test.setTimeout(180_000);
+  const errors = errorsOf(page);
+  await page.goto(base);
+  const blocks = page.locator('.codeblock[data-run="pytest"]');
+  await expect(blocks).toHaveCount(2);
+  await blocks.nth(0).getByRole('button', { name: 'Ausführen' }).click();
+  await expect(blocks.nth(0).locator('.run-output')).toContainText('2 passed', { timeout: 120_000 });
+  await expect(blocks.nth(0).locator('.run-output')).not.toHaveClass(/error/);
+  await blocks.nth(1).getByRole('button', { name: 'Ausführen' }).click();
+  await expect(blocks.nth(1).locator('.run-output')).toContainText('assert [1, 2, 3] == [3, 2, 1]', { timeout: 60_000 });
+  await expect(blocks.nth(1).locator('.run-output')).toHaveClass(/error/);
+  await expect(page.locator('.codeblock[data-lang="typescript"] .syntax-keyword').first()).toHaveText('const');
+
+  await page.goto(`${base}/14`);
+  const editor = page.locator('#editor');
+  // A test without a rounding case passes against the correct version but misses the broken one.
+  await editor.fill('from preise import brutto\n\ndef test_brutto():\n    assert brutto(100) == 119\n');
+  await page.locator('#run').click();
+  await expect(page.locator('#test-0')).toHaveClass(/pass/, { timeout: 120_000 });
+  await expect(page.locator('#test-1')).toHaveClass(/fail/);
+  await expect(page.locator('#test-1 .test-message')).toContainText('nicht mehr gerundet');
+  await editor.fill('from preise import brutto\n\ndef test_brutto():\n    assert brutto(9.99) == 11.89\n');
+  await page.locator('#run').click();
+  await expect(page.locator('#feedback')).toContainText('Richtig.', { timeout: 60_000 });
+  expect(errors).toEqual([]);
 });
 
 test('a scenario runs a real Linux in the browser, loaded only on start and only from this site', async ({ page }) => {
@@ -503,7 +531,7 @@ test('unsaved work can be exported and merged when browser storage is blocked', 
   backup.areas.beispiel.read = { 'alle-typen': '2026-09-28' };
   await page.locator('#import-file').setInputFiles({ name: 'backup.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(backup)) });
   await expect(page.locator('#data-message')).toContainText('übernommen');
-  await expect(page.locator('.data-table tr', { hasText: 'Beispielbereich' })).toContainText('1 / 13');
+  await expect(page.locator('.data-table tr', { hasText: 'Beispielbereich' })).toContainText('1 / 15');
 });
 
 test('malformed addresses render the not-found page without an unhandled exception', async ({ page }) => {

@@ -1,0 +1,1052 @@
+id: contract-testing
+title: Contract Testing
+level: 3
+minutes: 150
+summary: Verträge zwischen Diensten prüfen, ohne alle Dienste gemeinsam zu starten – consumer-driven mit Pact, schema-basiert mit OpenAPI, dazu Regeln für Änderungen, die keinen Client brechen.
+goals:
+  - Du erklärst, warum eine gemeinsame E2E-Umgebung für mehrere Dienste langsam und flaky wird und welche Frage ein Contract Test stattdessen beantwortet.
+  - Du beschreibst den Ablauf von Pact – Consumer-Test, Pact-Datei, Provider-Verifikation mit Provider States, Broker und `can-i-deploy` – und schreibst einen Consumer-Test mit Matchern.
+  - Du entscheidest zwischen consumer-driven und schema-basierten Verträgen, auch für Drittanbieter wie einen Zahlungsdienst.
+  - Du beurteilst, ob eine API-Änderung rückwärtskompatibel ist, und planst einen Breaking Change mit Expand and Contract.
+  - Du benennst, was Contract Tests nicht prüfen, und ordnest diese Risiken anderen Testebenen zu.
+resources:
+  - title: Pact Docs · How Pact works
+    url: https://docs.pact.io/getting_started/how_pact_works
+  - title: Pact Python · Consumer
+    url: https://pact-foundation.github.io/pact-python/consumer/
+  - title: Pact Python · Provider
+    url: https://pact-foundation.github.io/pact-python/provider/
+  - title: Pact Broker · Can I Deploy
+    url: https://docs.pact.io/pact_broker/can_i_deploy
+  - title: OpenAPI Specification 3.2
+    url: https://spec.openapis.org/oas/v3.2.0.html
+lesson: |
+  Dienstagabend, 18:40 Uhr: Das Backend-Team deployt Version p58 der Buchungs-API. Alle Tests sind grün. Um 19:05 melden die ersten Kundinnen, dass die Android-App bei laufenden Fahrten „Preis unbekannt“ anzeigt. Im Pull Request stand eine Aufräumarbeit: Das alte Feld `preis` (Euro als Kommazahl) fliegt raus, seit Monaten gibt es `preis_cent`. Die aktuelle App liest `preis_cent`, Version 4.10 auf vielen Handys aber noch `preis`. Ihre Tests waren grün, gegen einen Mock mit `preis`. Beide Seiten haben getestet, aber gegen verschiedene Annahmen.
+
+  Ein Contract Test prüft diese Lücke: ob der *Consumer* (die App, die Anfragen schickt) und der *Provider* (die Buchungs-API, die antwortet) dieselbe Vorstellung von den Nachrichten haben, die sie austauschen. Er prüft das, ohne beide Dienste gemeinsam zu starten. Die fachlichen Tests eines einzelnen Dienstes behandelt [Backend- und API-Tests](/testing/api-tests).
+
+  ## Warum End-to-End über Dienste nicht skaliert
+
+  Der naheliegende Schutz wäre eine gemeinsame Testumgebung: App-Build, Buchungs-API, Datenbank, Paystream-Sandbox und SMS-Dienst laufen zusammen in „Staging“, und eine E2E-Suite bucht, fährt und bezahlt. Bei drei Diensten geht das noch. Mit jedem weiteren wird es schlechter:
+
+  - **Langsam.** Die Rückmeldung kommt erst nach dem Deploy in die gemeinsame Umgebung, oft Stunden nach dem Pull Request, und ein Lauf dauert Minuten.
+  - **Flaky.** Die Paystream-Sandbox antwortet nicht, ein anderer Lauf hat die Testdaten verändert, ein Timeout greift: Der Test wird rot, ohne dass dein Code schuld ist. Ein Flaky Test ist ein Test, der bei gleichem Code mal grün, mal rot ist.
+  - **Schlechte Fehlerortung.** „Fahrt beenden schlägt fehl“ sagt nicht, welcher der vier Dienste sich anders verhält als erwartet.
+  - **Die falschen Versionen.** Staging enthält von jedem Dienst genau eine Version. In Produktion laufen aber gleichzeitig die App-Versionen 4.10, 4.11 und 4.12 auf den Handys der Kunden. Staging prüft nur die neueste App gegen die neueste API.
+  - **Gekoppelte Releases.** Damit Staging grün ist, müssen alle Teams gleichzeitig einen stabilen Stand liefern.
+
+  Contract Tests teilen die Frage auf. Die App prüft in ihrer Pipeline, dass ihr HTTP-Client die erwarteten Anfragen stellt und mit den erwarteten Antworten umgehen kann. Die Buchungs-API prüft in ihrer Pipeline, dass sie auf diese Anfragen so antwortet. Jede Seite braucht Sekunden und die andere gar nicht; das Verbindungsstück ist der Vertrag als Datei. Wenige Smoke Tests nach dem Deploy prüfen dann nur noch die Verdrahtung.
+
+  > [!MERKE]
+  > Ein Mock auf Consumer-Seite ist eine Behauptung über den Provider. Ein Contract Test macht diese Behauptung prüfbar: Dieselbe Erwartung, die im Consumer-Test als Mock dient, wird später gegen den echten Provider abgespielt.
+
+  ## Consumer-driven Contracts mit Pact
+
+  Bei consumer-driven Contracts schreibt der Consumer den Vertrag. Er enthält nur, was der Consumer wirklich benutzt, keine vollständige API-Beschreibung. Das bekannteste Werkzeug dafür ist Pact. Der Ablauf hat zwei Hälften: Der Consumer erzeugt den Vertrag, der Provider spielt ihn ab.
+
+  ### Der Consumer-Test erzeugt den Vertrag
+
+  Im Consumer-Test beschreibst du eine *Interaktion*: Zustand des Providers, Anfrage, erwartete Antwort. Pact startet einen Mock-Server, dein echter Client-Code schickt die Anfrage dorthin, der Mock prüft sie und antwortet wie beschrieben. Nach dem Test schreibt Pact alle Interaktionen in eine Pact-Datei.
+
+  Die App schreibt diesen Test in Kotlin mit [Pact JVM](https://docs.pact.io/implementation_guides/jvm/consumer/junit5). Die Bausteine heißen in allen Pact-Bibliotheken gleich, deshalb hier die Python-Fassung mit pact-python 3.4 ([Consumer-Test](https://pact-foundation.github.io/pact-python/consumer/#consumer-test)). Pact läuft nicht im Browser, die Beispiele hier sind mit pact-python 3.4.1 geprüft.
+
+  ```python
+  from pathlib import Path
+
+  import pytest
+  from pact import Pact, match
+
+  from radwerk.client import BuchungsClient
+
+
+  @pytest.fixture
+  def pact():
+      pact = Pact("radwerk-android", "buchungs-api").with_specification("V4")
+      yield pact
+      pact.write_file(Path(__file__).parent / "pacts")
+
+
+  def test_laufende_buchung(pact):
+      (
+          pact.upon_receiving("eine Anfrage nach einer laufenden Buchung")
+          .given("Buchung existiert", id="B-1042", status="laufend")
+          .with_request("GET", "/buchungen/B-1042")
+          .will_respond_with(200)
+          .with_body(
+              {
+                  "id": match.str("B-1042"),
+                  "status": match.regex("laufend", regex=r"^(reserviert|laufend|beendet)$"),
+                  "preis_cent": match.int(450),
+              },
+              content_type="application/json",
+          )
+      )
+      with pact.serve() as server:
+          buchung = BuchungsClient(str(server.url)).buchung("B-1042")
+      assert buchung.preis_cent == 450
+  ```
+
+  Drei Dinge machen aus diesem Test einen Vertrag statt eines gewöhnlichen Mocks:
+
+  1. **Der echte Client läuft.** `BuchungsClient` baut URL und Header und liest die Antwort so wie in der App. Fragt er `/buchung/B-1042` ab, scheitert der Test, weil der Mock keine passende Interaktion kennt.
+  2. **Matcher statt fester Werte.** `match.int(450)` heißt „irgendeine Ganzzahl; 450 ist nur das Beispiel für den Mock“. Der Regex-Matcher legt fest, welche Statuswerte die App versteht. Mit festen Werten würde jede andere Testbuchung beim Provider den Vertrag brechen.
+  3. **Nur, was der Consumer liest.** Die API liefert auch `rad`, `start` und `tarif`. Die App braucht hier drei Felder, also stehen drei Felder im Vertrag. Jedes weitere würde den Provider an etwas binden, das niemand liest.
+
+  Gekürzt sieht die Pact-Datei so aus:
+
+  ```json
+  {
+    "interactions": [{
+      "description": "eine Anfrage nach einer laufenden Buchung",
+      "providerStates": [{ "name": "Buchung existiert", "params": { "id": "B-1042", "status": "laufend" } }],
+      "request": { "method": "GET", "path": "/buchungen/B-1042" },
+      "response": {
+        "status": 200,
+        "body": { "content": { "id": "B-1042", "preis_cent": 450, "status": "laufend" } },
+        "matchingRules": { "body": {
+          "$.id": { "matchers": [{ "match": "type" }] },
+          "$.preis_cent": { "matchers": [{ "match": "integer" }] },
+          "$.status": { "matchers": [{ "match": "regex", "regex": "^(reserviert|laufend|beendet)$" }] }
+        } }
+      }
+    }]
+  }
+  ```
+
+  Beim Vergleich folgt Pact dem Robustheitsgrundsatz ([Matching](https://docs.pact.io/getting_started/matching#best-practice)): Anfragen werden streng verglichen, unerwartete Felder im JSON einer Anfrage sind ein Fehler. In Antworten ignoriert Pact zusätzliche Felder, denn ein anderer Consumer kann sie brauchen. Der Vergleich selbst passt in zwanzig Zeilen:
+
+  ```python run
+  import re
+
+  VERTRAG = {
+      "id": "string",
+      "status": re.compile(r"reserviert|laufend|beendet"),
+      "preis_cent": "integer",
+  }
+
+
+  def abweichungen(vertrag, antwort):
+      gefunden = []
+      for feld, regel in vertrag.items():
+          if feld not in antwort:
+              gefunden.append(f"$.{feld}: fehlt")
+              continue
+          wert = antwort[feld]
+          if regel == "string" and not isinstance(wert, str):
+              gefunden.append(f"$.{feld}: Text erwartet, bekommen {wert!r}")
+          elif regel == "integer" and type(wert) is not int:
+              gefunden.append(f"$.{feld}: ganze Zahl erwartet, bekommen {wert!r}")
+          elif isinstance(regel, re.Pattern) and not (isinstance(wert, str) and regel.fullmatch(wert)):
+              gefunden.append(f"$.{feld}: {wert!r} passt nicht zu {regel.pattern}")
+      return gefunden
+
+
+  vorher = {"id": "B-1042", "status": "laufend", "preis_cent": 450, "rad": {"nummer": 3107}}
+  nachher = {"id": "B-1042", "status": "aktiv", "preis": 4.5, "rad": {"nummer": 3107}}
+  print(abweichungen(VERTRAG, vorher))
+  print(abweichungen(VERTRAG, nachher))
+  ```
+
+  `rad` steht in keiner Regel und stört nicht. `type(wert) is not int` statt `isinstance`, weil in Python `True` ein `int` ist; im JSON-Vertrag ist ein Boolean keine Zahl.
+
+  ### Die Provider-Verifikation spielt ihn ab
+
+  Die zweite Hälfte läuft in der Pipeline der Buchungs-API. Der Verifier liest die Pact-Dateien, spielt jede Anfrage gegen die echte, im Test gestartete API ab und vergleicht die Antwort mit den Matching-Regeln. Damit `GET /buchungen/B-1042` etwas findet, muss die Buchung vorher existieren. Dafür steht im Vertrag der *Provider State* „Buchung existiert“ mit Parametern. Auf Provider-Seite legt ein State Handler diese Daten an ([Provider States](https://pact-foundation.github.io/pact-python/provider/#provider-states)):
+
+  ```python
+  from pathlib import Path
+
+  from pact import Verifier
+
+  from buchungen.testdaten import buchung_anlegen, buchung_loeschen
+
+
+  def buchung_existiert(action, parameters):
+      parameters = parameters or {}
+      if action == "setup":
+          buchung_anlegen(id=parameters["id"], status=parameters["status"], preis_cent=450)
+      elif action == "teardown":
+          buchung_loeschen(parameters["id"])
+
+
+  def test_buchungs_api_erfuellt_die_vertraege(api_url):  # Fixture: API im Testprozess, http://localhost:<port>
+      verifier = (
+          Verifier("buchungs-api")
+          .add_transport(url=api_url)
+          .add_source(Path(__file__).parent / "pacts")
+          .state_handler({"Buchung existiert": buchung_existiert}, teardown=True)
+      )
+      verifier.verify()
+  ```
+
+  Am Dienstag hätte die Verifikation von p58 gegen den Pact von App 4.10, der `preis` erwartet, Folgendes gemeldet (echte Ausgabe von pact-python 3.4.1, gekürzt):
+
+  ```text
+  Verifying a pact between radwerk-android and buchungs-api
+
+    eine Anfrage nach einer laufenden Buchung (0s loading, 11ms verification)
+       Given Buchung existiert
+      returns a response which
+        has status code 200 (OK)
+        includes headers
+          "Content-Type" with value "application/json" (OK)
+        has a matching body (FAILED)
+
+  Failures:
+
+  1) Verifying a pact between radwerk-android and buchungs-api Given Buchung existiert - eine Anfrage nach einer laufenden Buchung
+      1.1) has a matching body
+             $ -> Actual map is missing the following keys: preis
+      {
+    "id": "B-1042",
+      -  "preis": 4.5,
+      +  "preis_cent": 450,
+    …
+  ```
+
+  Der Fehler hätte im Pull Request gestanden, Minuten nach dem Push. Zusätzliche Felder wie `preis_cent` und `rad` stehen nur im Diff; als Fehler zählen sie nicht.
+
+  Provider States sind Testdaten auf Bestellung. Der Handler schreibt direkt in die Testdatenbank, nicht über die API, die gerade geprüft wird, und räumt mit `teardown` wieder auf, damit keine Interaktion von der vorigen abhängt. Die Verifikation läuft gegen den echten HTTP-Stack mit Routing, Serialisierung und Validierung. Abhängigkeiten der API nach außen, etwa Paystream oder den SMS-Dienst, darf sie durch Fakes ersetzen: Deren Verträge sind eigene Grenzen.
+
+  > [!WARNING] Matcher prüfen Form, nicht Fachlogik
+  > `match.int(450, min=0)` liest sich wie „nie negativ“. `min` und `max` steuern in pact-python aber nur den Generator für Beispielwerte; in der Pact-Datei steht danach nur `"match": "integer"`. Ob ein Preis stimmt, prüft kein Vertrag. Das gehört in die Unit-Tests der API.
+
+  ## Pact Broker und can-i-deploy
+
+  Pact-Dateien zwischen zwei Repositories hin- und herzukopieren reicht für eine Demo. Im Team übernimmt das der Pact Broker: Er speichert jede Pact-Datei mit Version (meist der Git-SHA) und Branch des Consumers, nimmt die Verifikationsergebnisse des Providers entgegen und baut daraus die *Matrix*: Welche Consumer-Version wurde mit welcher Provider-Version erfolgreich geprüft?
+
+  Vor jedem Deployment fragt die Pipeline den Broker mit `can-i-deploy`, ob die neue Version zu allen Versionen passt, die in der Zielumgebung laufen. Danach meldet sie, was jetzt läuft ([Can I Deploy](https://docs.pact.io/pact_broker/can_i_deploy#summary)):
+
+  ```bash
+  # Pipeline der App: nach den Consumer-Tests
+  pact-broker publish ./pacts --consumer-app-version "$GIT_SHA" --branch "$GIT_BRANCH"
+  # vor dem Upload in den Play Store
+  pact-broker can-i-deploy --pacticipant radwerk-android --version "$GIT_SHA" --to-environment production
+  # nach der Freigabe im Store
+  pact-broker record-release --pacticipant radwerk-android --version "$GIT_SHA" --environment production
+
+  # Pipeline der API: Pacts verifizieren und Ergebnis veröffentlichen, dann
+  pact-broker can-i-deploy --pacticipant buchungs-api --version "$GIT_SHA" --to-environment production
+  # nach dem Deployment
+  pact-broker record-deployment --pacticipant buchungs-api --version "$GIT_SHA" --environment production
+  ```
+
+  Der Unterschied zwischen den beiden `record`-Befehlen ist für Radwerk entscheidend ([Releases](https://docs.pact.io/pact_broker/recording_deployments_and_releases#releases)). `record-deployment` ersetzt die vorige Version: Auf dem Server läuft genau eine API. `record-release` fügt hinzu: Eine neue App-Version im Store löscht die alten nicht von den Handys. Deshalb verlangt `can-i-deploy` für die API eine erfolgreiche Verifikation gegen *jede* freigegebene App-Version, bis das Team mit `record-support-ended` eine Version aufgibt, etwa nachdem die App ein Pflicht-Update erzwingt.
+
+  Ändert die App ihren Vertrag, startet ein Webhook des Brokers die Verifikation beim Provider. Mit *pending pacts* lässt eine neue Erwartung, die der Provider noch nie erfüllt hat, dessen Build nicht scheitern; sie blockiert nur das Deployment der App-Version, die sie braucht.
+
+  > [!PRAXIS] Radwerk: zwei Pipelines, ein Broker
+  > Die API-Pipeline verifiziert bei jedem Push die Pacts vom `main`-Branch der App und von allen App-Versionen, die in `production` freigegeben sind – zusammen 40 Sekunden. Staging gibt es noch, aber nur für drei Smoke Tests nach dem Deploy: anmelden, Rad reservieren, Fahrt mit der Paystream-Sandbox beenden. Beim zweiten Versuch, `preis` zu entfernen, sagte `can-i-deploy` nein: App 4.10 las das Feld noch. Entfernt wurde es erst nach dem Pflicht-Update auf 4.11.
+
+  ## Schema-basierte Verträge: OpenAPI, JSON Schema und Paystream
+
+  Pact setzt voraus, dass beide Seiten mitmachen: Der Provider muss die Pacts seiner Consumer verifizieren. Paystream wird das für Radwerk nie tun. Die Pact-Doku nennt APIs, deren Gegenseite kein Pact nutzt, und öffentliche APIs ausdrücklich als schlechten Einsatz ([What is it not good for](https://docs.pact.io/getting_started/what_is_pact_good_for#what-is-it-not-good-for)).
+
+  Die Alternative ist ein *provider-driven* Vertrag: Der Provider veröffentlicht eine Beschreibung seiner Schnittstelle, meist OpenAPI mit JSON Schema für die Bodies. Seit OpenAPI 3.1 beschreibt das Feld [`webhooks`](https://spec.openapis.org/oas/v3.2.0.html#oas-webhooks) auch Aufrufe, die ein Anbieter an dich schickt, etwa die Zahlungsereignisse von Paystream. Die Buchungs-API beschreibt ihre eigene Antwort so:
+
+  ```yaml
+  components:
+    schemas:
+      Buchung:
+        type: object
+        required: [id, status, preis_cent]
+        properties:
+          id: { type: string }
+          status: { type: string, enum: [reserviert, laufend, beendet] }
+          preis_cent: { type: integer, minimum: 0 }
+          preis:
+            type: number
+            deprecated: true
+            description: Euro als Kommazahl, wird entfernt. Neue Clients lesen preis_cent.
+  ```
+
+  Ein Schema beschreibt, was der Provider liefern *kann*. Ein Pact beschreibt, was ein Consumer *benutzt*. Daraus folgen die Prüfungen:
+
+  - **Provider gegen sein Schema:** Werkzeuge wie [Schemathesis](https://schemathesis.readthedocs.io/en/stable/) erzeugen aus dem Schema Anfragen und prüfen, ob Statuscodes und Antworten dazu passen. Schemathesis baut auf Hypothesis auf, das Prinzip steht in [Property-based Testing](/testing/property-based-testing).
+  - **Schema gegen Schema:** Ein Diff zweier Versionen in der CI meldet Breaking Changes, bevor sie jemand deployt, etwa mit `oasdiff breaking`. Erst `--fail-on ERR` macht daraus einen roten Schritt; ohne die Option endet der Befehl auch bei Breaking Changes mit Exit-Code 0 ([oasdiff](https://github.com/oasdiff/oasdiff/blob/main/docs/BREAKING-CHANGES.md#preventing-breaking-changes)).
+  - **Consumer gegen Schema:** Der Client wird aus dem Schema generiert, oder Tests prüfen aufgezeichnete Antworten und Webhook-Payloads gegen das Schema.
+
+  ```bash
+  schemathesis run openapi.yaml --url http://localhost:8000
+  oasdiff breaking --fail-on ERR openapi-p57.yaml openapi-p58.yaml
+  ```
+
+  Was ein Schema nicht weiß: wer welches Feld liest. Ob `preis` noch gebraucht wird, sagt nur der Broker mit den Pacts aller App-Versionen. Umgekehrt garantiert ein schemakonformer Provider nicht, dass der Consumer richtig liest: Eine App, die das optionale Feld `rad` für Pflicht hält, stürzt trotz gültiger Antwort ab.
+
+  Für Paystream heißt das: Radwerk sammelt echte Webhook-Payloads aus der Sandbox als Testdaten, prüft sie in der CI gegen Paystreams veröffentlichtes Schema und testet den eigenen Handler damit auf Unit-Ebene. Der Handler ist ein Tolerant Reader (siehe unten): Unbekannte Felder und Ereignistypen ignoriert er und protokolliert sie, statt mit 500 zu antworten. Ein nächtlicher Smoke Test gegen die Sandbox meldet, wenn Paystream etwas ändert.
+
+  ## Rückwärtskompatibilität: Änderungen, die keinen Client brechen
+
+  Ob eine Änderung einen Client bricht, hängt davon ab, in welche Richtung die Nachricht fließt. Für ein Feld gilt:
+
+  | Änderung | in einer Antwort (Provider → App) | in einer Anfrage (App → Provider) |
+  | --- | --- | --- |
+  | neues optionales Feld | kompatibel, wenn Clients unbekannte Felder ignorieren | kompatibel, alte Clients schicken es nicht |
+  | neues Pflichtfeld | kompatibel | **bricht** alte Clients |
+  | Feld entfernen oder umbenennen | **bricht** jeden, der es liest | Entfernen: technisch kompatibel, wenn der Provider unbekannte Felder ignoriert – die Information fehlt aber. Umbenennen: **bricht**, sobald der neue Name Pflicht ist |
+  | Typ ändern (`"450"` statt `450`) | **bricht** | **bricht** |
+  | optional → Pflicht | kompatibel | **bricht** |
+  | Pflicht → optional oder `null` erlaubt | **bricht**, der Client verlässt sich darauf | kompatibel |
+  | neuer Enum-Wert | **bricht** Clients ohne Fallback | kompatibel |
+
+  Als Faustregel: Ein Provider darf in Antworten mehr versprechen und in Anfragen weniger verlangen. Was eine Antwort ärmer oder eine Anfrage strenger macht, bricht jemanden.
+
+  Kompatibilität hängt auch am Client. Ein [Tolerant Reader](https://martinfowler.com/bliki/TolerantReader.html) liest nur die Felder, die er braucht, ignoriert unbekannte und hat für unbekannte Enum-Werte einen Fallback. In der App mit kotlinx.serialization:
+
+  ```kotlin
+  @Serializable
+  data class BuchungDto(
+      val id: String,
+      val status: String,
+      @SerialName("preis_cent") val preisCent: Int,
+  )
+
+  private val json = Json { ignoreUnknownKeys = true }
+
+  fun lies(text: String): BuchungDto = json.decodeFromString(text)
+
+  fun anzeigeStatus(status: String): String = when (status) {
+      "reserviert" -> "Reserviert"
+      "laufend" -> "Unterwegs"
+      "beendet" -> "Beendet"
+      else -> "Unbekannt"
+  }
+  ```
+
+  Ohne `ignoreUnknownKeys` wirft `decodeFromString` beim ersten neuen Feld eine `SerializationException`, und eine kompatible Änderung wird zum Ausfall. Der Status bleibt ein `String`, damit ein neuer Wert wie `pausiert` nicht beim Parsen scheitert.
+
+  Einen echten Breaking Change wie die Umbenennung von `preis` zerlegst du in kompatible Schritte, das [Parallel Change](https://martinfowler.com/bliki/ParallelChange.html) oder *Expand and Contract*:
+
+  1. **Expand:** Die API liefert `preis` und `preis_cent`. Additiv, also kompatibel.
+  2. **Migrate:** App 4.11 liest `preis_cent`; ihr Pact enthält `preis` nicht mehr.
+  3. **Deprecate:** `deprecated: true` im Schema, ein Eintrag im Changelog. Für ganze Endpunkte gibt es die Header `Deprecation` (RFC 9745) und `Sunset` (RFC 8594).
+  4. **Contract:** `preis` fällt weg, sobald `can-i-deploy` zustimmt, also keine freigegebene, unterstützte App-Version das Feld mehr liest. Bei einer Mobile-App dauert das Monate.
+
+  Eine neue API-Version (`/v2/buchungen`) ist der letzte Ausweg: Dann laufen zwei Versionen, die beide betrieben werden.
+
+  ## Was Contract Tests nicht testen
+
+  Ein Contract Test prüft die Form der Nachrichten an der Grenze. Alles andere gehört auf andere Ebenen ([Contract tests vs functional tests](https://docs.pact.io/consumer/contract_tests_not_functional_tests)):
+
+  - **Fachlogik.** Ob 450 Cent der richtige Preis ist und ob der Tageshöchstpreis greift, prüfen Unit-Tests der API. Der Vertrag sagt nur „ganze Zahl“.
+  - **Seiteneffekte.** Ob die Buchung gespeichert, die SMS verschickt und Paystream belastet wurde, sieht die Verifikation nicht; sie vergleicht nur die Antwort.
+  - **Jede Validierungsregel.** Eine Interaktion pro Verhalten, das der Consumer unterschiedlich behandelt (200, 404, 409), nicht eine pro Pflichtfeld. Die vollständige Validierung testet der Provider selbst.
+  - **Infrastruktur.** TLS, Routing im Gateway, Timeouts, Rate Limits und Konfiguration in Produktion zeigen Smoke Tests und Monitoring.
+  - **Last und Performance.**
+  - **Die Oberfläche der App.** Der Consumer-Test deckt den HTTP-Client ab, nicht, was der Bildschirm daraus macht.
+
+  > [!INTERVIEW] „Wie testet ihr die Zusammenarbeit eurer Services?“
+  > „Nicht über eine gemeinsame E2E-Umgebung, die ist langsam, flaky und prüft nur die neuesten Versionen. Zwischen unseren eigenen Diensten nutzen wir consumer-driven Contracts mit Pact: Der Consumer-Test erzeugt den Vertrag aus dem echten Client-Code, der Provider verifiziert ihn in seiner Pipeline mit Provider States, und `can-i-deploy` gegen den Broker entscheidet vor jedem Deployment. Für Drittanbieter ohne Pact prüfen wir gegen deren OpenAPI-Schema und lesen tolerant. Fachlogik testen wir darunter mit Unit-Tests, die Verdrahtung mit wenigen Smoke Tests nach dem Deploy.“
+
+  ## Häufige Fehler
+
+  - **Feste Werte im Vertrag.** Zeitstempel, IDs oder Preise als exakte Werte lassen die Verifikation bei jeder anderen Testbuchung scheitern. Feste Werte nur dort, wo der Consumer davon abhängt.
+  - **Vertrag ohne echten Client.** Ein Consumer-Test, der den Mock mit `requests.get` selbst aufruft, prüft den Mock, nicht die App. Der Vertrag muss aus dem Client-Code entstehen, der in Produktion läuft.
+  - **Pact als Funktionstest.** Eine Interaktion je Validierungsregel macht den Vertrag spröde. Das gehört in die API-Tests des Providers.
+  - **Provider States über die API oder aus dem vorigen Test.** Interaktionen, die sich auf Daten einer früheren Interaktion verlassen, werden flaky. Jeder State legt seine Daten selbst an.
+  - **Kein `can-i-deploy`.** Der Vertrag wird geprüft, aber nichts hält das Deployment auf.
+  - **`record-deployment` für die App.** Der Broker hält dann nur die neueste App-Version für relevant, und die API bricht ältere Versionen auf den Handys.
+
+  ## Zusammenfassung
+
+  - Eine gemeinsame E2E-Umgebung über viele Dienste ist langsam, flaky, ortet Fehler schlecht und prüft nur eine Kombination von Versionen.
+  - Consumer-driven Contracts: Der Consumer-Test erzeugt aus dem echten Client-Code eine Pact-Datei, der Provider spielt sie mit Provider States gegen seine echte API ab.
+  - Matcher prüfen Typ und Format statt fester Werte. Anfragen werden streng verglichen, zusätzliche Felder in Antworten ignoriert.
+  - Der Broker verbindet Versionen und Ergebnisse zur Matrix; `can-i-deploy` entscheidet vor jedem Deployment. Mobile Apps meldest du mit `record-release`, weil alte Versionen weiterlaufen.
+  - Schema-basierte Verträge (OpenAPI, JSON Schema) passen für Drittanbieter und öffentliche APIs; sie wissen aber nicht, wer welches Feld liest.
+  - Kompatibel: in Antworten hinzufügen, in Anfragen lockern. Breaking Changes laufen über Expand and Contract, mit Tolerant Readern auf Client-Seite.
+  - Contract Tests prüfen nicht Fachlogik, Seiteneffekte, Infrastruktur oder Last. Dafür gibt es Unit-, API- und Smoke-Tests.
+exercises:
+  - id: was-der-vertrag-faengt
+    type: choice
+    title: Was meldet die Provider-Verifikation?
+    prompt: |
+      Die Android-App hat einen Pact mit drei Interaktionen: `GET /buchungen/{id}` mit 200 (Felder `id`, `status` mit Regex `reserviert|laufend|beendet`, `preis_cent` als Ganzzahl), dieselbe Anfrage für eine unbekannte Buchung mit 404 und `POST /buchungen` mit 201. Ein neuer Stand der Buchungs-API soll deployt werden. Welche Probleme meldet die Provider-Verifikation?
+    options:
+      - text: Die API liefert `preis` statt `preis_cent`.
+        correct: true
+        why: Das Feld steht im Vertrag, also meldet der Verifier „Actual map is missing the following keys“.
+      - text: Für eine unbekannte Buchung antwortet die API mit 400 statt 404.
+        correct: true
+        why: Die App hat genau diese Interaktion im Pact. Der Statuscode gehört zum Vertrag.
+      - text: Der Tagespreis wird nicht mehr bei 1 500 Cent gedeckelt.
+        correct: false
+        why: "`preis_cent` bleibt eine Ganzzahl, nur eine falsche. Fachlogik prüft der Vertrag nicht; das ist Aufgabe der Unit-Tests der API."
+      - text: Die API liefert zusätzlich das Feld `akku_prozent`.
+        correct: false
+        why: Zusätzliche Felder in Antworten ignoriert Pact. Das ist auch kein Problem – solange die App unbekannte Felder ignoriert.
+      - text: "`POST /buchungen` speichert die Buchung nicht mehr, antwortet aber weiter mit 201 und demselben Body."
+        correct: false
+        why: Die Verifikation vergleicht nur die Antwort. Seiteneffekte wie das Speichern prüfen Integrationstests des Providers.
+    explanation: |
+      Ein Pact prüft Form und Status der Nachrichten, die der Consumer tatsächlich austauscht. Umbenannte Felder und geänderte Statuscodes in genutzten Interaktionen fallen deshalb auf. Was hinter der Antwort passiert – Berechnung, Speichern, Versand –, und Felder, die niemand liest, bleiben außerhalb. Deshalb ersetzt ein Contract Test die Unit- und Integrationstests des Providers nicht.
+    resources:
+      - title: Pact Docs · Contract tests vs functional tests
+        url: https://docs.pact.io/consumer/contract_tests_not_functional_tests
+
+  - id: pact-ablauf
+    type: order
+    title: Vom Consumer-Test bis zum Store
+    prompt: |
+      Die App ändert ihren Vertrag und soll danach als neue Version in den Play Store. Bring die Schritte in die richtige Reihenfolge.
+    lang: text
+    lines: |
+      Der Consumer-Test der App läuft gegen den Pact-Mock-Server und schreibt die Pact-Datei
+      Die App-Pipeline veröffentlicht die Pact-Datei mit Git-SHA und Branch im Broker
+      Ein Webhook des Brokers startet die Verifikation in der Pipeline der Buchungs-API
+      Der State Handler legt die Buchung aus dem Provider State in der Testdatenbank an
+      Der Verifier spielt die Anfrage gegen die laufende API ab und vergleicht die Antwort
+      Die API-Pipeline veröffentlicht das Ergebnis der Verifikation im Broker
+      can-i-deploy prüft die neue App-Version gegen die API-Versionen in production
+      Nach der Freigabe im Store meldet record-release die neue App-Version
+    explanation: |
+      Der Vertrag entsteht beim Consumer und reist über den Broker zum Provider. Der Provider verifiziert ihn mit seinen eigenen Testdaten und meldet das Ergebnis zurück; erst dann hat die Matrix einen Eintrag für das Paar aus neuer App-Version und laufender API. `can-i-deploy` liest genau diese Matrix. `record-release` steht ganz am Ende, weil der Broker nur Versionen als freigegeben kennen soll, die wirklich bei Kunden ankommen.
+    resources:
+      - title: Pact Broker · Webhooks
+        url: https://docs.pact.io/pact_broker/webhooks#the-contract-requiring-verification-published-event
+
+  - id: matcher-vorhersagen
+    type: output
+    title: Ein selbst gebauter Matcher
+    prompt: |
+      Ein Team baut für erste Versuche einen eigenen Vergleich von Vertrag und Antwort. Was gibt das Programm aus?
+    lang: python
+    code: |
+      import re
+
+
+      def passt(erwartet, wert):
+          if erwartet == "string":
+              return isinstance(wert, str)
+          if erwartet == "integer":
+              return isinstance(wert, int)
+          if isinstance(erwartet, re.Pattern):
+              return isinstance(wert, str) and erwartet.match(wert) is not None
+          return all(feld in wert and passt(teil, wert[feld]) for feld, teil in erwartet.items())
+
+
+      vertrag = {"id": "string", "status": re.compile(r"laufend|beendet"), "preis_cent": "integer"}
+
+      print(passt(vertrag, {"id": "B-7", "status": "laufend", "preis_cent": 450, "rad": 3107}))
+      print(passt(vertrag, {"id": None, "status": "laufend", "preis_cent": 450}))
+      print(passt(vertrag, {"id": "B-7", "status": "beendet_storniert", "preis_cent": 450}))
+      print(passt(vertrag, {"id": "B-7", "status": "laufend", "preis_cent": True}))
+      print(passt(vertrag, {"id": "B-7", "status": "laufend"}))
+    expected: |
+      True
+      False
+      True
+      True
+      False
+    explanation: |
+      Das zusätzliche Feld `rad` stört nicht, `None` ist kein `str`, ein fehlendes Feld fällt auf – so weit richtig. Zwei Antworten kommen aber durch, die nicht passen sollten. `re.match` prüft nur den Anfang, deshalb passt `beendet_storniert` zu `laufend|beendet`; richtig wäre `fullmatch`. Und `bool` ist in Python eine Unterklasse von `int`, deshalb gilt `True` als Ganzzahl. Pact selbst unterscheidet beides; ein eigener Vergleich braucht `fullmatch` und einen Ausschluss von `bool`.
+    resources:
+      - title: Python · re.fullmatch
+        url: https://docs.python.org/3/library/re.html#re.fullmatch
+      - title: Python · bool ist eine Unterklasse von int
+        url: https://docs.python.org/3/library/functions.html#bool
+
+  - id: strenger-leser
+    type: output
+    title: Ein Feld mehr
+    prompt: |
+      Die API liefert seit heute zusätzlich das Feld `rad`. Zwei Varianten eines Clients lesen dieselben Antworten. Was gibt das Programm aus?
+    lang: python
+    code: |
+      import json
+      from dataclasses import dataclass
+
+
+      @dataclass
+      class Buchung:
+          id: str
+          status: str
+          preis_cent: int
+
+
+      def streng(text):
+          return Buchung(**json.loads(text))
+
+
+      def tolerant(text):
+          daten = json.loads(text)
+          return Buchung(daten["id"], daten["status"], daten["preis_cent"])
+
+
+      vorher = '{"id": "B-7", "status": "laufend", "preis_cent": 450}'
+      nachher = '{"id": "B-7", "status": "laufend", "preis_cent": 450, "rad": 3107}'
+
+      for lesen in (streng, tolerant):
+          for text in (vorher, nachher):
+              try:
+                  print(lesen.__name__, lesen(text).preis_cent)
+              except TypeError as fehler:
+                  print(lesen.__name__, "TypeError:", fehler)
+    expected: |
+      streng 450
+      streng TypeError: Buchung.__init__() got an unexpected keyword argument 'rad'
+      tolerant 450
+      tolerant 450
+    explanation: |
+      `Buchung(**daten)` reicht jedes Feld der Antwort als Schlüsselwortargument weiter. Ein neues Feld wird zu einem unbekannten Argument, und der Konstruktor wirft `TypeError`. Die additive Änderung ist für die API kompatibel, für diesen Client nicht. Der tolerante Client liest nur die drei Felder, die er braucht. In Kotlin entspricht das `Json { ignoreUnknownKeys = true }`.
+    resources:
+      - title: Martin Fowler · Tolerant Reader
+        url: https://martinfowler.com/bliki/TolerantReader.html
+
+  - id: consumer-test-luecken
+    type: gap
+    title: Ein Consumer-Test mit pact-python
+    prompt: |
+      Ergänze den Consumer-Test (pact-python 3). Die Interaktion braucht eine Beschreibung, einen Provider State mit Parametern, den erwarteten Statuscode, einen Regex-Matcher für den Status und einen laufenden Mock-Server für den echten Client.
+    lang: python
+    code: |
+      from pact import Pact, match
+
+      from radwerk.client import BuchungsClient
+
+
+      def test_laufende_buchung(pact: Pact) -> None:
+          (
+              pact.⟦upon_receiving⟧("eine Anfrage nach einer laufenden Buchung")
+              .⟦given⟧("Buchung existiert", id="B-1042", status="laufend")
+              .with_request("GET", "/buchungen/B-1042")
+              .⟦will_respond_with⟧(200)
+              .with_body(
+                  {
+                      "id": match.str("B-1042"),
+                      "status": ⟦match.regex⟧("laufend", regex=r"^(reserviert|laufend|beendet)$"),
+                      "preis_cent": match.int(450),
+                  },
+                  content_type="application/json",
+              )
+          )
+          with pact.⟦serve⟧() as server:
+              buchung = BuchungsClient(str(server.url)).buchung("B-1042")
+          assert buchung.status == "laufend"
+    gaps:
+      - label: Beschreibung der Interaktion
+        hint: Die Methode beginnt die Interaktion („beim Empfang von …“).
+      - label: Provider State
+        hint: Der Zustand, in dem der Provider sein soll – wie „gegeben, dass …“.
+      - label: erwarteter Status
+        hint: Trennt die Anfrage von der Antwort und nimmt den Statuscode.
+      - label: Regex-Matcher
+        hint: Ein Matcher aus dem Modul `match`, der ein Beispiel und ein Muster nimmt.
+      - label: Mock-Server starten
+        hint: Ein Kontextmanager auf dem `Pact`-Objekt; `server.url` ist die Adresse für den Client.
+    explanation: |
+      `upon_receiving` beschreibt die Interaktion und identifiziert sie in der Pact-Datei. `given` setzt den Provider State, die Parameter landen beim State Handler des Providers. `will_respond_with` trennt Anfrage und Antwort und legt den Status fest, `match.regex` erlaubt jeden Status, den die App kennt. `pact.serve()` startet den Mock-Server; der echte `BuchungsClient` spricht mit ihm, und nur so prüft der Test den Code, der in der App läuft.
+    resources:
+      - title: Pact Python · Consumer-Test
+        url: https://pact-foundation.github.io/pact-python/consumer/#consumer-test
+      - title: Pact Python · match
+        url: https://pact-foundation.github.io/pact-python/api/match/
+
+  - id: verifier-tests
+    type: code
+    title: Tests für einen Vertragsprüfer
+    prompt: |
+      `pruefe(erwartung, wert)` aus `vertrag.py` vergleicht eine JSON-Antwort mit einer Erwartung aus einem Vertrag und liefert eine Liste von Abweichungen; eine leere Liste heißt „passt“. Die Erwartung ist so aufgebaut:
+
+      - `"string"`: Der Wert muss ein `str` sein (`None` ist kein Text).
+      - `"integer"`: Der Wert muss ein `int` sein, aber kein `bool`.
+      - ein kompiliertes Muster (`re.compile(...)`): Der Wert muss ein `str` sein, und das Muster muss den **ganzen** Wert treffen.
+      - ein Dictionary: Der Wert muss ein Dictionary sein. Jedes Feld der Erwartung muss vorhanden sein und wird rekursiv geprüft, auch verschachtelte Objekte. Zusätzliche Felder im Wert sind erlaubt.
+
+      Ein fehlendes Feld meldet `pruefe` als `"$.feld: fehlt"`, verschachtelt etwa `"$.rad.nummer: fehlt"`.
+
+      Schreibe pytest-Tests. Sie müssen gegen die richtige Implementierung grün sein und jede fehlerhafte Variante, die die Prüfung bereithält, rot werden lassen.
+    lang: python
+    setup: |
+      from pathlib import Path
+
+      RICHTIG = '''
+      import re
+
+
+      def pruefe(erwartung, wert, pfad="$"):
+          """Vergleicht einen Wert mit der Erwartung aus dem Vertrag. Liefert die Abweichungen, leer heißt: passt."""
+          if erwartung == "string":
+              return [] if isinstance(wert, str) else [f"{pfad}: Text erwartet"]
+          if erwartung == "integer":
+              return [] if isinstance(wert, int) and not isinstance(wert, bool) else [f"{pfad}: ganze Zahl erwartet"]
+          if isinstance(erwartung, re.Pattern):
+              if isinstance(wert, str) and erwartung.fullmatch(wert):
+                  return []
+              return [f"{pfad}: passt nicht zu {erwartung.pattern}"]
+          if not isinstance(wert, dict):
+              return [f"{pfad}: Objekt erwartet"]
+          abweichungen = []
+          for feld, teil in erwartung.items():
+              if feld not in wert:
+                  abweichungen.append(f"{pfad}.{feld}: fehlt")
+              else:
+                  abweichungen += pruefe(teil, wert[feld], f"{pfad}.{feld}")
+          return abweichungen
+      '''
+      MUTANTEN = {
+          "null": RICHTIG.replace("[] if isinstance(wert, str) else", "[] if isinstance(wert, str) or wert is None else"),
+          "fehlende_felder": RICHTIG.replace('            abweichungen.append(f"{pfad}.{feld}: fehlt")', "            continue"),
+          "praefix": RICHTIG.replace("erwartung.fullmatch(wert)", "erwartung.match(wert)"),
+          "flach": RICHTIG.replace(
+              '            abweichungen += pruefe(teil, wert[feld], f"{pfad}.{feld}")',
+              '            if not isinstance(teil, dict):\n                abweichungen += pruefe(teil, wert[feld], f"{pfad}.{feld}")',
+          ),
+      }
+      assert all(m != RICHTIG for m in MUTANTEN.values()), "Ein Mutant ist identisch mit der richtigen Version."
+      Path("vertrag.py").write_text(RICHTIG)
+    starter: |
+      import re
+
+      from vertrag import pruefe
+
+      BUCHUNG = {
+          "id": "string",
+          "status": re.compile(r"reserviert|laufend|beendet"),
+          "preis_cent": "integer",
+          "rad": {"nummer": "integer", "typ": re.compile(r"city|e-bike")},
+      }
+
+
+      def test_pruefe():
+          ...
+    solution: |
+      import re
+
+      from vertrag import pruefe
+
+      BUCHUNG = {
+          "id": "string",
+          "status": re.compile(r"reserviert|laufend|beendet"),
+          "preis_cent": "integer",
+          "rad": {"nummer": "integer", "typ": re.compile(r"city|e-bike")},
+      }
+
+
+      def antwort(**aenderungen):
+          daten = {"id": "B-1042", "status": "laufend", "preis_cent": 450, "rad": {"nummer": 3107, "typ": "city"}}
+          daten.update(aenderungen)
+          return daten
+
+
+      def test_passende_antwort_mit_zusatzfeld():
+          assert pruefe(BUCHUNG, antwort(akku_prozent=80)) == []
+
+
+      def test_null_ist_kein_text():
+          assert pruefe(BUCHUNG, antwort(id=None)) != []
+
+
+      def test_fehlendes_feld_faellt_auf():
+          daten = antwort()
+          del daten["preis_cent"]
+          assert pruefe(BUCHUNG, daten) == ["$.preis_cent: fehlt"]
+
+
+      def test_muster_muss_den_ganzen_wert_treffen():
+          assert pruefe(BUCHUNG, antwort(status="laufend_storniert")) != []
+
+
+      def test_verschachtelte_objekte_werden_geprueft():
+          assert pruefe(BUCHUNG, antwort(rad={"nummer": "3107", "typ": "city"})) != []
+    tests:
+      - name: Grün gegen die richtige Implementierung
+        code: |
+          lauf = run_pytest({"vertrag.py": RICHTIG})
+          assert lauf.ok, lauf.output
+      - name: Fängt einen Fehler bei Textfeldern
+        code: |
+          lauf = run_pytest({"vertrag.py": MUTANTEN["null"]})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl die Variante null als Text durchgehen lässt."
+      - name: Fängt einen Fehler bei fehlenden Feldern
+        code: |
+          lauf = run_pytest({"vertrag.py": MUTANTEN["fehlende_felder"]})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl die Variante Felder, die in der Antwort fehlen, still überspringt."
+      - name: Fängt einen Fehler bei Mustern
+        code: |
+          lauf = run_pytest({"vertrag.py": MUTANTEN["praefix"]})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl die Variante nur den Anfang des Werts gegen das Muster prüft."
+      - name: Fängt einen Fehler bei verschachtelten Objekten
+        code: |
+          lauf = run_pytest({"vertrag.py": MUTANTEN["flach"]})
+          assert not lauf.ok, "Deine Tests bleiben grün, obwohl die Variante in verschachtelte Objekte wie rad nicht hineinschaut."
+    hints:
+      - Eine Hilfsfunktion, die eine gültige Antwort baut und einzelne Felder ersetzt, macht jeden Test zu einer Zeile.
+      - Jede Regel aus der Aufgabe ist ein Kandidat für einen Test – auch die Regeln über `None`, den ganzen Wert und verschachtelte Objekte.
+      - Ein Wert wie `"laufend_storniert"` beginnt mit einem gültigen Status, ist aber keiner.
+    explanation: |
+      Jede Variante ist ein Fehler, den man in einem selbst gebauten Prüfer leicht macht. `None` als Text durchzulassen versteckt Antworten, an denen die App beim Parsen scheitert, weil ihr Feld `String` und nicht `String?` ist. Fehlende Felder zu überspringen macht das entfernte `preis` aus der Lektion unsichtbar. `match` statt `fullmatch` lässt jeden Wert durch, der mit einem gültigen Status beginnt. Und ein Prüfer, der verschachtelte Objekte nur auf „ist ein Dictionary“ prüft, sieht nicht, dass `rad.nummer` plötzlich ein String ist. Ein Test „gültige Antwort mit Zusatzfeld passt“ gehört dazu, sonst wäre ein Prüfer, der alles ablehnt, auch grün.
+    resources:
+      - title: Pact Docs · Matching
+        url: https://docs.pact.io/getting_started/matching#type-matching
+
+  - id: aenderung-bewerten
+    type: code
+    title: Bricht diese Änderung einen Client?
+    prompt: |
+      Schreibe `brechende_aenderungen(alt, neu, richtung)`. `alt` und `neu` beschreiben die Felder eines JSON-Objekts als Dictionary, zum Beispiel `{"preis_cent": {"typ": "integer", "pflicht": True}}`. `richtung` ist `"antwort"` (Provider schickt, Client liest) oder `"anfrage"` (Client schickt, Provider liest). Clients und Provider ignorieren unbekannte Felder.
+
+      Die Funktion liefert eine **sortierte** Liste von Gründen, warum die Änderung alte Clients bricht; eine leere Liste heißt kompatibel. Pro Feld höchstens ein Grund, eine Typänderung geht vor.
+
+      Antwort:
+      - Feld aus `alt` fehlt in `neu` → `"feld: entfernt"`
+      - anderer Typ → `"feld: Typ geändert"`
+      - war Pflicht, ist es nicht mehr → `"feld: nicht mehr Pflicht"`
+      - neue Felder und Felder, die Pflicht werden, sind kompatibel.
+
+      Anfrage:
+      - anderer Typ → `"feld: Typ geändert"`
+      - war optional, ist jetzt Pflicht → `"feld: jetzt Pflicht"`
+      - neues Feld, das Pflicht ist → `"feld: neues Pflichtfeld"`
+      - entfernte Felder, neue optionale Felder und Felder, die optional werden, sind kompatibel.
+    lang: python
+    starter: |
+      def brechende_aenderungen(alt: dict, neu: dict, richtung: str) -> list[str]:
+          ...
+    solution: |
+      def brechende_aenderungen(alt: dict, neu: dict, richtung: str) -> list[str]:
+          gruende = []
+          for feld, vorher in alt.items():
+              nachher = neu.get(feld)
+              if nachher is None:
+                  if richtung == "antwort":
+                      gruende.append(f"{feld}: entfernt")
+                  continue
+              if nachher["typ"] != vorher["typ"]:
+                  gruende.append(f"{feld}: Typ geändert")
+              elif richtung == "antwort" and vorher["pflicht"] and not nachher["pflicht"]:
+                  gruende.append(f"{feld}: nicht mehr Pflicht")
+              elif richtung == "anfrage" and not vorher["pflicht"] and nachher["pflicht"]:
+                  gruende.append(f"{feld}: jetzt Pflicht")
+          if richtung == "anfrage":
+              for feld, nachher in neu.items():
+                  if feld not in alt and nachher["pflicht"]:
+                      gruende.append(f"{feld}: neues Pflichtfeld")
+          return sorted(gruende)
+    setup: |
+      BUCHUNG = {
+          "id": {"typ": "string", "pflicht": True},
+          "status": {"typ": "string", "pflicht": True},
+          "preis_cent": {"typ": "integer", "pflicht": True},
+          "rad": {"typ": "string", "pflicht": False},
+      }
+      ANFRAGE = {
+          "rad": {"typ": "string", "pflicht": True},
+          "start": {"typ": "string", "pflicht": True},
+          "gutschein": {"typ": "string", "pflicht": False},
+      }
+    tests:
+      - name: Unveränderte Schemas sind kompatibel
+        code: |
+          ergebnis = brechende_aenderungen(BUCHUNG, BUCHUNG, "antwort")
+          assert ergebnis == [], f"Nichts geändert, trotzdem gemeldet: {ergebnis!r}"
+      - name: Neue Felder in einer Antwort sind kompatibel
+        code: |
+          neu = {**BUCHUNG, "akku_prozent": {"typ": "integer", "pflicht": True}, "notiz": {"typ": "string", "pflicht": False}}
+          ergebnis = brechende_aenderungen(BUCHUNG, neu, "antwort")
+          assert ergebnis == [], f"Zusätzliche Felder brechen keinen Client, der unbekannte Felder ignoriert – gemeldet: {ergebnis!r}"
+      - name: Umbenennen in einer Antwort bricht
+        code: |
+          neu = {k: v for k, v in BUCHUNG.items() if k != "preis_cent"} | {"preis": {"typ": "integer", "pflicht": True}}
+          ergebnis = brechende_aenderungen(BUCHUNG, neu, "antwort")
+          assert ergebnis == ["preis_cent: entfernt"], f"erwartet ['preis_cent: entfernt'], bekommen {ergebnis!r}"
+      - name: Typ und Pflicht in einer Antwort
+        code: |
+          neu = {
+              **BUCHUNG,
+              "preis_cent": {"typ": "string", "pflicht": True},
+              "status": {"typ": "string", "pflicht": False},
+              "rad": {"typ": "string", "pflicht": True},
+          }
+          ergebnis = brechende_aenderungen(BUCHUNG, neu, "antwort")
+          assert ergebnis == ["preis_cent: Typ geändert", "status: nicht mehr Pflicht"], f"bekommen {ergebnis!r}"
+      - name: Strengere Anfragen brechen
+        code: |
+          neu = {
+              "rad": {"typ": "string", "pflicht": True},
+              "gutschein": {"typ": "string", "pflicht": True},
+              "tarif": {"typ": "string", "pflicht": True},
+              "notiz": {"typ": "string", "pflicht": False},
+          }
+          ergebnis = brechende_aenderungen(ANFRAGE, neu, "anfrage")
+          assert ergebnis == ["gutschein: jetzt Pflicht", "tarif: neues Pflichtfeld"], f"bekommen {ergebnis!r}"
+      - name: Lockerere Anfragen sind kompatibel, Typänderungen nicht
+        code: |
+          neu = {**ANFRAGE, "start": {"typ": "integer", "pflicht": False}, "rad": {"typ": "string", "pflicht": False}}
+          ergebnis = brechende_aenderungen(ANFRAGE, neu, "anfrage")
+          assert ergebnis == ["start: Typ geändert"], f"bekommen {ergebnis!r}"
+    hints:
+      - Gehe zuerst über die Felder von `alt` und vergleiche jedes mit `neu.get(feld)`. Neue Felder brauchst du nur für Anfragen.
+      - Die Richtung entscheidet, welche Pflicht-Änderung bricht – in einer Antwort das Wegfallen, in einer Anfrage das Hinzukommen.
+      - "`sorted(gruende)` am Ende sorgt für die verlangte Reihenfolge."
+    explanation: |
+      Die Regeln folgen aus der Frage, wer sich worauf verlässt. In einer Antwort liest der Client: Fällt ein Feld weg, ändert es den Typ oder ist es nicht mehr garantiert, bricht er. In einer Anfrage liest der Provider: Verlangt er etwas Neues oder Strengeres, schicken alte Clients es nicht. Eine Umbenennung ist für den Client ein Entfernen plus ein Hinzufügen, und das Entfernen bricht. Dass entfernte Felder in Anfragen „kompatibel“ sind, gilt nur technisch: Liest die API `gutschein` nicht mehr, nimmt sie Buchungen weiter an, gewährt aber keinen Rabatt mehr. Solche fachlichen Brüche sieht kein Schemavergleich.
+    resources:
+      - title: Martin Fowler · Parallel Change
+        url: https://martinfowler.com/bliki/ParallelChange.html
+
+  - id: fester-zeitstempel
+    type: bug
+    title: Die Verifikation scheitert jeden Tag anders
+    prompt: |
+      Seit die App die Startzeit einer Fahrt anzeigt, scheitert die Provider-Verifikation der Buchungs-API bei jedem Lauf. Die Meldung lautet jedes Mal ähnlich, nur mit anderer Uhrzeit:
+
+      ```text
+      $.gestartet_um -> Expected '2026-10-03T08:15:41+02:00' (String) to be equal to '2026-10-03T08:15:00+02:00' (String)
+      ```
+
+      Die App braucht nur einen Zeitstempel im Format ISO 8601 mit Offset. Finde die Zeile im Consumer-Test, die den Vertrag zu streng macht, und korrigiere sie mit einem Matcher.
+    lang: python
+    code: |
+      def test_laufende_fahrt(pact):
+          (
+              pact.upon_receiving("eine Anfrage nach der laufenden Fahrt")
+              .given("Fahrt läuft", buchung="B-1042")
+              .with_request("GET", "/buchungen/B-1042/fahrt")
+              .will_respond_with(200)
+              .with_body(
+                  {
+                      "gestartet_um": "2026-10-03T08:15:00+02:00",
+                      "preis_cent": match.int(450),
+                  },
+                  content_type="application/json",
+              )
+          )
+          with pact.serve() as server:
+              fahrt = FahrtClient(str(server.url)).laufende_fahrt("B-1042")
+          assert fahrt.preis_cent == 450
+    lines: [9]
+    fix:
+      - line: 9
+        answers:
+          - '"gestartet_um": match.datetime("2026-10-03T08:15:00+02:00", "%Y-%m-%dT%H:%M:%S%:z"),'
+          - '"gestartet_um": match.datetime("2026-10-03T08:15:00+02:00", format="%Y-%m-%dT%H:%M:%S%:z"),'
+          - '"gestartet_um": match.str("2026-10-03T08:15:00+02:00"),'
+          - '"gestartet_um": match.like("2026-10-03T08:15:00+02:00"),'
+          - '"gestartet_um": match.type("2026-10-03T08:15:00+02:00"),'
+          - '"gestartet_um": match.string("2026-10-03T08:15:00+02:00"),'
+          - '"gestartet_um": match.timestamp("2026-10-03T08:15:00+02:00", "%Y-%m-%dT%H:%M:%S%:z"),'
+          - '"gestartet_um": match.timestamp("2026-10-03T08:15:00+02:00", format="%Y-%m-%dT%H:%M:%S%:z"),'
+    explanation: |
+      Ein Wert ohne Matcher heißt in Pact „genau dieser Wert“. Die Testbuchung beim Provider startet aber zu einer anderen Zeit, also scheitert die Verifikation – nicht wegen eines Vertragsbruchs, sondern wegen eines zu strengen Vertrags. `match.str` oder `match.like` prüfen nur den Typ. Genauer ist `match.datetime` (auch `match.timestamp`) mit Format. Achtung: Ohne Format nimmt pact-python `%Y-%m-%dT%H:%M:%S%z`, und `%z` steht für einen Offset wie `+0200`. Für `+02:00` brauchst du `%:z`; sonst scheitert die Verifikation mit einer Formatmeldung. Beide Fassungen sind mit pact-python 3.4.1 geprüft.
+    resources:
+      - title: Pact Docs · Matching (best practice)
+        url: https://docs.pact.io/getting_started/matching#response-matching
+      - title: Pact Python · match.datetime
+        url: https://pact-foundation.github.io/pact-python/api/match/
+
+  - id: verifikation-erklaeren
+    type: explain
+    title: Die Verifikation in der CI
+    prompt: |
+      So verifiziert die Buchungs-API in ihrer Pipeline die Verträge ihrer Consumer. Erkläre, welche Pacts dieser Test prüft, was die State Handler tun, was mit dem Ergebnis passiert und was der Test trotz grünem Ergebnis nicht garantiert.
+    lang: python
+    code: |
+      import os
+
+      from pact import Verifier
+
+
+      def test_vertraege_der_consumer(api_url):
+          verifier = (
+              Verifier("buchungs-api")
+              .add_transport(url=api_url)
+              .broker_source(os.environ["PACT_BROKER_URL"], token=os.environ["PACT_BROKER_TOKEN"], selector=True)
+              .consumer_version(main_branch=True)
+              .consumer_version(deployed_or_released=True)
+              .include_pending()
+              .build()
+              .state_handler({"Buchung existiert": buchung_existiert, "keine Buchung": keine_buchung}, teardown=True)
+          )
+          if os.environ.get("CI"):
+              verifier.set_publish_options(version=os.environ["GITHUB_SHA"], branch=os.environ["GITHUB_REF_NAME"])
+          verifier.verify()
+    points:
+      - Der Test holt die Pacts aus dem Broker – vom main-Branch jedes Consumers und von allen Versionen, die gerade deployt oder freigegeben sind, also auch ältere App-Versionen auf den Handys.
+      - Pending Pacts (neue Erwartungen, die der Provider noch nie erfüllt hat) laufen mit, lassen den Build aber nicht scheitern.
+      - Für jede Interaktion legt der passende State Handler die Testdaten an und räumt sie mit teardown wieder ab; die Anfrage geht an die echte API unter api_url.
+      - Nur in der CI veröffentlicht der Test das Ergebnis mit Git-SHA und Branch im Broker; daraus entsteht die Matrix, die can-i-deploy liest.
+      - Grün heißt nur, dass Form und Status der Antworten passen – nicht, dass Preise stimmen, Daten gespeichert werden oder die API in Produktion erreichbar ist.
+    explanation: |
+      Der Verifier fragt den Broker nach den Pacts, die für die Buchungs-API zählen: dem Stand vom `main`-Branch jedes Consumers und jeder Version, die in einer Umgebung deployt oder freigegeben ist – bei der App also mehrere Versionen gleichzeitig. Mit `include_pending` laufen auch neue Erwartungen mit, ohne dass ein noch nicht umgesetzter Wunsch der App den Build der API blockiert. Vor jeder Interaktion ruft Pact den State Handler zum Provider State auf, danach mit `teardown` zum Aufräumen; die Anfrage selbst geht über HTTP an die laufende API. Lokal bleibt das Ergebnis lokal, in der CI geht es mit SHA und Branch an den Broker, und erst damit kann `can-i-deploy` entscheiden. Ein grüner Lauf sagt: Die API antwortet so, wie ihre Consumer es erwarten. Ob sie fachlich richtig rechnet oder Seiteneffekte auslöst, prüfen andere Tests.
+    resources:
+      - title: Pact Python · Verifying from a Pact Broker
+        url: https://pact-foundation.github.io/pact-python/provider/#verifying-from-a-pact-broker
+      - title: Pact Broker · Pending pacts
+        url: https://docs.pact.io/pact_broker/advanced_topics/pending_pacts
+
+  - id: paystream-webhooks
+    type: choice
+    title: Webhooks von einem Drittanbieter
+    prompt: |
+      Die Buchungs-API empfängt Webhooks von Paystream, etwa `zahlung.erfolgreich` und `zahlung.fehlgeschlagen`. Paystream ist ein externer Anbieter, veröffentlicht eine OpenAPI-Beschreibung mit JSON Schema für die Webhook-Payloads und bietet eine Sandbox. Paystream kündigt Änderungen per Changelog an und fügt gelegentlich Felder hinzu. Welcher Testansatz passt am besten?
+    options:
+      - text: Aufgezeichnete Sandbox-Payloads als Testdaten, in der CI gegen Paystreams Schema geprüft; Unit-Tests des Handlers damit; der Handler ignoriert unbekannte Felder und Ereignistypen; ein nächtlicher Smoke Test gegen die Sandbox.
+        correct: true
+        why: Schnell und zuverlässig im Pull Request, das Schema des Anbieters ist der Vertrag, der tolerante Handler übersteht additive Änderungen, und der nächtliche Lauf meldet, wenn die Sandbox vom Schema abweicht.
+      - text: Ein Pact zwischen Buchungs-API (Consumer) und Paystream (Provider), den Paystream in seiner Pipeline verifizieren soll.
+        correct: false
+        why: Paystream verifiziert keine Pacts seiner Kunden, und `can-i-deploy` kann Deployments eines Drittanbieters nicht aufhalten. Die Pact-Doku nennt diesen Fall als schlechten Einsatz.
+      - text: Bei jedem Pull Request eine echte Testzahlung in der Sandbox auslösen und auf den Webhook warten.
+        correct: false
+        why: Langsam, abhängig vom Netz und von der Verfügbarkeit der Sandbox, und für jeden Pull Request flaky. Als nächtlicher Smoke Test sinnvoll, als Gate im Pull Request nicht.
+      - text: Keine eigenen Tests – Paystream garantiert die Kompatibilität seiner Webhooks.
+        correct: false
+        why: Der Parser und der Handler sind Radwerks Code. Ein additives Feld bricht einen strengen Parser trotzdem, und Fehler beim Zuordnen einer Zahlung zur Buchung fallen nur in eigenen Tests auf.
+    explanation: |
+      Consumer-driven Contracts brauchen einen Provider, der mitmacht. Bei Drittanbietern ist deren veröffentlichtes Schema der Vertrag, und deine Tests prüfen die eigene Seite: Passen echte Payloads zum Schema, liest der Handler sie richtig, übersteht er neue Felder? Den Kontakt mit der echten Sandbox hältst du aus dem Pull Request heraus und prüfst ihn regelmäßig, aber nicht blockierend. So bekommt jede Frage die billigste Ebene, die sie zuverlässig beantwortet.
+    resources:
+      - title: Pact Docs · What is Pact not good for
+        url: https://docs.pact.io/getting_started/what_is_pact_good_for#what-is-it-not-good-for
+      - title: OpenAPI 3.2 · webhooks
+        url: https://spec.openapis.org/oas/v3.2.0.html#oas-webhooks
+
+  - id: can-i-deploy-nachbauen
+    type: code
+    title: Darf p58 raus?
+    prompt: |
+      Bau die Entscheidung des Brokers für zwei Teilnehmer nach: die App `APP` (Consumer) und die API `API` (Provider).
+
+      **1.** `produktion(ereignisse)` bekommt Ereignisse `(art, teilnehmer, version)` in zeitlicher Reihenfolge und liefert, welche Versionen jedes Teilnehmers in Produktion laufen, als Dictionary von Mengen:
+
+      - `"deploy"`: Diese Version ersetzt alle bisherigen des Teilnehmers.
+      - `"release"`: Diese Version kommt dazu, die bisherigen bleiben.
+      - `"support-ende"`: Diese Version fällt weg.
+
+      **2.** `kann_deployen(teilnehmer, version, stand, matrix)` prüft, ob eine Version in Produktion darf. `matrix` bildet `(app_version, api_version)` auf das Ergebnis der Verifikation ab (`True` oder `False`); fehlt ein Paar, wurde es nie verifiziert. Eine API-Version muss zu **jeder** App-Version in `stand` passen, eine App-Version zu jeder API-Version in `stand`. Die Funktion liefert eine Liste von Tupeln `(app_version, api_version, grund)` mit `grund` `"fehlgeschlagen"` oder `"nicht verifiziert"`, sortiert nach den Versionen aus `stand` mit `sorted()`. Eine leere Liste heißt: darf.
+    lang: python
+    setup: |
+      APP, API = "radwerk-android", "buchungs-api"
+    starter: |
+      APP, API = "radwerk-android", "buchungs-api"
+
+
+      def produktion(ereignisse):
+          ...
+
+
+      def kann_deployen(teilnehmer, version, stand, matrix):
+          ...
+    solution: |
+      APP, API = "radwerk-android", "buchungs-api"
+
+
+      def produktion(ereignisse):
+          stand = {}
+          for art, teilnehmer, version in ereignisse:
+              versionen = stand.setdefault(teilnehmer, set())
+              if art == "deploy":
+                  versionen.clear()
+                  versionen.add(version)
+              elif art == "release":
+                  versionen.add(version)
+              elif art == "support-ende":
+                  versionen.discard(version)
+          return stand
+
+
+      def kann_deployen(teilnehmer, version, stand, matrix):
+          if teilnehmer == API:
+              paare = [(app, version) for app in sorted(stand.get(APP, set()))]
+          else:
+              paare = [(version, api) for api in sorted(stand.get(API, set()))]
+          gruende = []
+          for paar in paare:
+              ergebnis = matrix.get(paar)
+              if ergebnis is None:
+                  gruende.append((*paar, "nicht verifiziert"))
+              elif not ergebnis:
+                  gruende.append((*paar, "fehlgeschlagen"))
+          return gruende
+    tests:
+      - name: Ein Deployment ersetzt die vorige Version
+        code: |
+          stand = produktion([("deploy", API, "p56"), ("deploy", API, "p57")])
+          assert stand.get(API) == {"p57"}, f"Auf dem Server läuft nur die zuletzt deployte API, bekommen {stand.get(API)!r}"
+      - name: Ein Release ergänzt, Support-Ende entfernt
+        code: |
+          stand = produktion([
+              ("release", APP, "4.10"), ("release", APP, "4.11"), ("deploy", API, "p57"),
+              ("release", APP, "4.12"), ("support-ende", APP, "4.10"),
+          ])
+          assert stand == {APP: {"4.11", "4.12"}, API: {"p57"}}, f"bekommen {stand!r}"
+      - name: Die API muss zu jeder freigegebenen App passen
+        code: |
+          stand = {APP: {"4.11", "4.12"}, API: {"p57"}}
+          matrix = {("4.11", "p57"): True, ("4.12", "p57"): True, ("4.12", "p58"): True, ("4.11", "p58"): False}
+          ergebnis = kann_deployen(API, "p58", stand, matrix)
+          assert ergebnis == [("4.11", "p58", "fehlgeschlagen")], f"bekommen {ergebnis!r}"
+      - name: Ohne Verifikation kein Deployment
+        code: |
+          stand = {APP: {"4.11", "4.12"}, API: {"p57"}}
+          ergebnis = kann_deployen(API, "p59", stand, {("4.12", "p59"): True})
+          assert ergebnis == [("4.11", "p59", "nicht verifiziert")], f"Ein fehlendes Ergebnis heißt nicht „kompatibel“, bekommen {ergebnis!r}"
+      - name: Eine neue App-Version gegen die laufende API
+        code: |
+          stand = {APP: {"4.11", "4.12"}, API: {"p57"}}
+          matrix = {("4.13", "p57"): True, ("4.13", "p58"): False}
+          assert kann_deployen(APP, "4.13", stand, matrix) == [], "4.13 ist gegen p57 verifiziert, die einzige API in Produktion."
+          ergebnis = kann_deployen(APP, "4.14", stand, matrix)
+          assert ergebnis == [("4.14", "p57", "nicht verifiziert")], f"bekommen {ergebnis!r}"
+    hints:
+      - "`stand.setdefault(teilnehmer, set())` liefert die Menge des Teilnehmers und legt sie bei Bedarf an."
+      - Für die API-Version bildest du Paare mit jeder App-Version aus `stand`, für eine App-Version Paare mit jeder API-Version.
+      - "`matrix.get(paar)` liefert `None`, wenn das Paar nie verifiziert wurde – das ist ein eigener Grund, kein Erfolg."
+    explanation: |
+      Der Kern von `can-i-deploy` ist eine Abfrage der Matrix gegen alles, was in der Zielumgebung läuft. Der Unterschied zwischen Deployment und Release entscheidet, was das ist: Eine deployte API ersetzt die alte, eine freigegebene App-Version kommt zu den alten dazu. Deshalb muss p58 auch gegen 4.11 bestehen, obwohl 4.12 die neueste App ist. Ein fehlendes Ergebnis zählt als Nein; sonst könnte eine Version ohne jede Verifikation durchrutschen. Mit `support-ende` gibt das Team eine alte App-Version bewusst auf, und erst dann darf die API Felder entfernen, die nur diese Version liest.
+    resources:
+      - title: Pact Broker · Recording deployments and releases
+        url: https://docs.pact.io/pact_broker/recording_deployments_and_releases#releases
+      - title: Pact Broker · Can I Deploy
+        url: https://docs.pact.io/pact_broker/can_i_deploy
+
+  - id: feld-umbenennen
+    type: practice
+    title: preis wird preis_cent – ohne Ausfall
+    prompt: |
+      Spiel die Umstellung aus der Lektion von vorn durch, diesmal ohne Ausfall. Ausgangslage: Die Buchungs-API liefert nur `preis` (Euro als Kommazahl, etwa `4.5`). Künftig soll es nur noch `preis_cent` (Ganzzahl in Cent) geben. In Produktion sind die App-Versionen 4.10, 4.11 und 4.12 freigegeben, alle lesen `preis`. Die Website der Buchung liest das Feld ebenfalls. Paystream ist nicht betroffen.
+
+      Schreibe einen Plan für die Umstellung, wie du ihn ins Ticket schreiben würdest:
+
+      1. die Schritte in Reihenfolge, jeweils mit dem Zustand von API und Clients,
+      2. welche Tests und Prüfungen in jedem Schritt laufen und auf welcher Ebene (Unit-Test, Contract Test, Schema-Diff, Smoke Test),
+      3. woran du erkennst, dass `preis` entfernt werden darf,
+      4. was passiert, wenn jemand den letzten Schritt zu früh macht.
+    lang: text
+    solution: |
+      1. Expand (API p58): Die API liefert preis und preis_cent. Additiv, also kompatibel.
+         - Unit-Test der API: preis_cent == round(preis * 100) für typische Werte und Grenzen (0, Deckel).
+         - Provider-Verifikation gegen die Pacts von main und allen freigegebenen App-Versionen: grün,
+           denn zusätzliche Felder in Antworten stören keinen Vertrag.
+         - Schema-Diff (oasdiff breaking) in der CI: keine Breaking Changes. preis bekommt deprecated: true.
+      2. Migrate (App 4.13, Website): Die Clients lesen preis_cent.
+         - Consumer-Test der App erwartet preis_cent als match.int(...) und preis nicht mehr; der neue
+           Pact geht mit SHA und Branch in den Broker, die API verifiziert ihn.
+         - can-i-deploy für App 4.13 gegen production: grün, p58 liefert preis_cent.
+         - Die App liest tolerant (ignoreUnknownKeys), damit preis sie weder stört noch später fehlt.
+      3. Warten: Ältere Versionen bleiben auf Handys. Die App erzwingt ab einem Stichtag mindestens 4.13;
+         danach meldet das Team record-support-ended für 4.10, 4.11 und 4.12.
+         - Die Website hat eine eigene Pact-Datei oder wird mit dem Schema geprüft; sie wird vorher umgestellt.
+      4. Contract (API p6x): preis fällt weg.
+         - can-i-deploy für die neue API-Version: erst grün, wenn kein unterstützter Consumer-Pact mehr
+           preis enthält. Das ist das Signal, nicht ein Datum im Kalender.
+         - Smoke Test nach dem Deploy: Fahrt beenden in Staging zeigt einen Preis in App und Website.
+
+      Zu früh entfernt: can-i-deploy blockiert das Deployment, weil die Verifikation gegen den Pact von
+      4.11 fehlschlägt ("Actual map is missing the following keys: preis"). Ohne can-i-deploy zeigt 4.11
+      auf den Handys "Preis unbekannt", bis die Kunden updaten – ein Rollback der API hilft sofort, ein
+      Fix der App erst nach dem Store-Review.
+    checklist:
+      - Der Plan hat mindestens die Schritte Expand (beide Felder), Migrate (Clients lesen das neue Feld) und Contract (altes Feld entfernen), in dieser Reihenfolge.
+      - Jeder Schritt nennt, welche Prüfung ihn absichert, und keine Prüfung steht auf einer teureren Ebene als nötig (Umrechnung im Unit-Test, Feldnutzung im Contract Test, Verdrahtung im Smoke Test).
+      - Das Entfernen hängt an `can-i-deploy` gegen alle freigegebenen, unterstützten App-Versionen, nicht an einem festen Datum.
+      - Ältere App-Versionen werden mit `record-release` geführt und erst mit `record-support-ended` aufgegeben, etwa nach einem erzwungenen Update.
+      - Die Website als zweiter Consumer ist berücksichtigt (eigener Pact oder Schema-Prüfung).
+      - Der Plan sagt, was bei einem zu frühen Entfernen passiert und warum ein Rollback der API schneller hilft als ein Fix der App.
+    explanation: |
+      Ein Breaking Change wird zu einer Folge kompatibler Schritte. Die Tests verteilen sich nach Risiko: Die Umrechnung von Euro in Cent ist Fachlogik und gehört in einen Unit-Test der API; ob noch jemand `preis` liest, weiß nur der Broker mit den Pacts aller unterstützten Versionen; ob nach dem Deploy alles zusammenspielt, zeigt ein Smoke Test. Bei einer Mobile-App ist der Engpass die Zeit, bis alte Versionen verschwinden. Deshalb hängt der letzte Schritt an einer Prüfung und nicht an einem Datum.
+    resources:
+      - title: Martin Fowler · Parallel Change
+        url: https://martinfowler.com/bliki/ParallelChange.html
+      - title: Pact Broker · record-support-ended
+        url: https://docs.pact.io/pact_broker/recording_deployments_and_releases#recording-support-ended-for-a-release
