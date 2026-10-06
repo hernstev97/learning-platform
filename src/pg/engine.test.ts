@@ -90,6 +90,10 @@ describe('PgEngine (PostgreSQL in PGlite)', () => {
     expect(selectInstead.actual.error).toContain('Gesucht ist eine Änderung der Daten (UPDATE … RETURNING)');
     const otherChange = await engine.exercise(schema, "INSERT INTO raum VALUES (1, 'Studio') ON CONFLICT (id) DO UPDATE SET name = excluded.name RETURNING id, name", "UPDATE raum SET name = 'Studio' WHERE id = 1 RETURNING id, name", null);
     expect(compareSql(otherChange.expected, otherChange.actual, false).ok).toBe(true);
+    const cte = await engine.exercise(schema, "WITH neu AS (UPDATE raum SET name = 'Studio' WHERE id = 1 RETURNING id, name) SELECT * FROM neu", "UPDATE raum SET name = 'Studio' WHERE id = 1 RETURNING id, name", null);
+    expect(compareSql(cte.expected, cte.actual, false).ok).toBe(true);
+    const locked = await engine.exercise(schema, "SELECT 1 AS id, 'Studio' AS name FROM raum WHERE id = 1 FOR UPDATE", "UPDATE raum SET name = 'Studio' WHERE id = 1 RETURNING id, name", null);
+    expect(locked.actual.error).toContain('keine reine Abfrage');
     const tooMany = await engine.exercise(schema, 'SELECT 1; SELECT 2', 'SELECT 1', null);
     expect(tooMany.actual.error).toContain('2 Anweisungen');
     const noRows = await engine.exercise(schema, 'DELETE FROM raum', 'SELECT 1', null);

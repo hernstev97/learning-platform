@@ -25,6 +25,10 @@ export type PgTable = { name: string; columns: string[]; rows: SqlValue[][]; cel
 
 const ROW_LIMIT = 1000;
 const DML = new Set(['INSERT', 'UPDATE', 'DELETE', 'MERGE']);
+/** A data-modifying CTE (`WITH x AS (UPDATE … RETURNING …) SELECT …`) changes data although its tag says SELECT. */
+const changesData = (statement: string) => /\b(?:insert|update|delete|merge)\b/i.test(statement
+  .replace(/--[^\n]*|\/\*[\s\S]*?\*\/|'(?:[^']|'')*'|"(?:[^"]|"")*"/g, ' ')
+  .replace(/\bfor\s+(?:no\s+key\s+)?update\b/gi, ' '));
 const PREVIEW_ROWS = 12;
 // int8, int2, int4, oid, float4, float8, numeric: compared as numbers, so 3, 3.0 and 3.00 are equal.
 const NUMERIC_TYPES = new Set([20, 21, 23, 26, 700, 701, 1700]);
@@ -262,7 +266,7 @@ export class PgEngine {
     if (!expected) { expected = (await run(solution)).result; this.expected.set(key, expected); }
     // A change with RETURNING is only solved by a change: a SELECT computing the same rows does not count.
     const command = (result: PgQueryResult) => (result as PgQueryResult & { tag?: string }).tag?.split(' ')[0] ?? '';
-    if (!check && !actual.result.error && DML.has(command(expected)) && !DML.has(command(actual.result))) {
+    if (!check && !actual.result.error && DML.has(command(expected)) && !DML.has(command(actual.result)) && !changesData(query)) {
       return { actual: { ...actual.result, error: `Gesucht ist eine Änderung der Daten (${command(expected)} … RETURNING), keine reine Abfrage.` }, expected, script: actual.script };
     }
     return { actual: actual.result, expected, script: actual.script };
