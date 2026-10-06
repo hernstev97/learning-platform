@@ -1,6 +1,6 @@
 # learn.kiumu.app
 
-Private Lernplattform für Kotlin & Android, Rust, Linux, Python, Automation mit Python, Git, Data Analysis mit Excel, SQL und Python, Testing & Softwarequalität sowie SQL & PostgreSQL für Anwendungsentwickler. Live: [learn.kiumu.app](https://learn.kiumu.app) · Privates Repository: [hernstev97/learning-platform](https://github.com/hernstev97/learning-platform)
+Private Lernplattform für Kotlin & Android, Rust, Linux, Python, Automation mit Python, Git, Data Analysis mit Excel, SQL und Python, Testing & Softwarequalität sowie SQL & PostgreSQL für Anwendungsentwickler. Live: [learn.kiumu.app](https://learn.kiumu.app) · Öffentliches Repository: [hernstev97/learning-platform](https://github.com/hernstev97/learning-platform)
 
 Die Plattform ist kein Nachschlagewerk. Jedes Modul besteht aus einer Lektion, die ein Denkmodell aufbaut und auf die offizielle Dokumentation verweist, und aus 10–14 Übungen in fester Reihenfolge: verstehen → vorhersagen → schreiben → Fehler finden → erklären → anwenden. Jeder Bereich hat Interview-Karteikarten mit Wiederholung, Projekte und ein Abschlussprojekt, das wie eine Take-Home-Aufgabe im Bewerbungsprozess geschnitten ist.
 
@@ -34,6 +34,21 @@ pnpm dev            # http://127.0.0.1:5180
 | `pnpm screenshots /pfad@390 …` | Screenshots gegen den laufenden Dev-Server |
 
 `CONTENT_LENIENT=1 pnpm dev` überspringt ungültige oder fehlende Module statt abzubrechen – praktisch, während man an Inhalten schreibt. Der Produktionsbuild ist immer strikt.
+
+## CI
+
+`.github/workflows/ci.yml` läuft bei jedem Pull Request und jedem Push auf `main`. Merge-Pflicht ist nur der gesammelte Job **`ci-ok`**.
+
+| Job | Inhalt | Läuft |
+| --- | --- | --- |
+| `check` | lint, typecheck, test, content:check, bear:check, build | PR, main, nachts |
+| `verify` | `pnpm verify` | PR, main, nachts |
+| `e2e` | Playwright-Hauptsuite und PWA-Suite (Chromium) | PR, main, nachts |
+| `convex` | lokales Convex und `test:convex:e2e` (`tooling/ci/convex-e2e.sh`) | PR, main, nachts |
+| `vm` | `pnpm vm:verify`, auf 8 Runner verteilt | PR nur bei Änderungen an Linux-, VM- oder CI-Dateien; main, nachts |
+| `links` | `pnpm links`, nie Merge-Pflicht | montags, manuell, Hinweis bei Änderungen an `.github/` |
+
+Nachts ist 02:17 UTC, der Linkcheck montags 02:43 UTC. Nicht in der CI: `pnpm vm:build` (Docker), Firefox und WebKit, Deploy (Vercel deployt selbst) und die Anmeldung mit echtem Clerk-Konto.
 
 ## Aufbau
 
