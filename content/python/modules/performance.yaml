@@ -1,0 +1,1114 @@
+id: performance
+title: Performance – messen, finden, beschleunigen
+level: 3
+minutes: 180
+summary: Python-Code erst messen und dann gezielt beschleunigen. Profile lesen, Speicher untersuchen, teure Muster erkennen und entscheiden, wann NumPy oder eine native Erweiterung den Aufwand wert ist.
+goals:
+  - Du liest eine `cProfile`-Ausgabe und unterscheidest `tottime` von `cumtime`, `ncalls` und `percall`.
+  - Du misst Laufzeiten mit `timeit.repeat`, nimmst das Minimum statt des Mittelwerts und erkennst typische Messfehler.
+  - Du findest Speicherfresser mit `tracemalloc`, erklärst, warum `sys.getsizeof` nur die flache Größe zeigt, und beurteilst `__slots__`.
+  - Du ersetzt teure Muster durch bessere. Das sind `in` auf Listen, schrittweise Strings, volles Sortieren für Top-k, unnötige Kopien und Listen statt Generatoren.
+  - Du entscheidest mit dem Amdahl-Gedanken, ob Vektorisierung, Cython oder Rust-Bindings sich lohnen, und wählst erst danach die Technik.
+resources:
+  - title: The Python Profilers (cProfile und pstats)
+    url: https://docs.python.org/3/library/profile.html
+  - title: timeit – Measure execution time of small code snippets
+    url: https://docs.python.org/3/library/timeit.html
+  - title: tracemalloc – Trace memory allocations
+    url: https://docs.python.org/3/library/tracemalloc.html
+  - title: heapq – Heap queue algorithm
+    url: https://docs.python.org/3/library/heapq.html
+  - title: TimeComplexity im Python-Wiki
+    url: https://wiki.python.org/moin/TimeComplexity
+lesson: |
+  Ein Export-Job lief bisher in fünf Sekunden und braucht seit dem letzten Release vierzig. Ein Kollege vermutet die Datenbank, ein zweiter will auf `multiprocessing` umstellen, ein dritter die Schleife in Rust neu schreiben. Alle drei raten. Wer misst, findet meist eine einzige Zeile. Eine Listensuche steckt in einer Schleife, oder eine Datei wird für jede Bestellung neu gelesen.
+
+  Diese Lektion zeigt, wie du solche Stellen findest und die Verbesserung belegst. Zuerst kommen die Messwerkzeuge der Standardbibliothek: `cProfile`, `timeit` und `tracemalloc`. Danach folgen die Kostenfallen, die in Python-Code am häufigsten vorkommen. Zum Schluss geht es um die Frage, wann NumPy, Cython oder Rust den Aufwand wert sind. Du solltest [Datenstrukturen](/python/datenstrukturen), [Iteratoren & Generatoren](/python/iteratoren-generatoren) und das GIL-Denkmodell aus [Nebenläufigkeit](/python/nebenlaeufigkeit) kennen.
+
+  > [!NOTE] Zeitmessungen gibt es hier nur als Text
+  > Der Python-Interpreter dieser Plattform läuft als WebAssembly in deinem Browser. Seine Laufzeiten sagen nichts über einen echten Rechner aus und schwanken von Lauf zu Lauf. Deshalb geben die ausführbaren Beispiele nie Zeiten aus, und die Übungen zählen Aufrufe, Vergleiche und Objekte. Das ist deterministisch. Messwerte stehen in Blöcken ohne `run` und stammen von einem Linux-Rechner mit Python 3.14. Bei dir weichen die Zahlen ab. Probiere die Beispiele lokal aus.
+
+  ## Erst messen, dann ändern
+
+  Ein Programm ist langsam, weil ein kleiner Teil des Codes den größten Teil der Zeit braucht. Wenn du an der falschen Stelle optimierst, bleibt das Programm langsam und der Code wird schlechter lesbar. Der **Amdahl-Gedanke** rechnet das nach. Macht ein Teil den Anteil `p` der Laufzeit aus und wird er um den Faktor `s` schneller, dann ist das Programm insgesamt um `1 / ((1 - p) + p / s)` schneller.
+
+  | Anteil `p` | Faktor `s` | Gesamt schneller um | Obergrenze (`s` unendlich) |
+  | --- | --- | --- | --- |
+  | 25 % | 10 | 1,29-fach | 1,33-fach |
+  | 80 % | 10 | 3,57-fach | 5-fach |
+  | 80 % | 2 | 1,67-fach | 5-fach |
+
+  Eine Funktion, die ein Viertel der Zeit braucht, kannst du nicht über 1,33-fach hinaus beschleunigen, auch nicht mit der besten Rust-Implementierung der Welt. Daraus folgt ein fester Ablauf:
+
+  1. Lege fest, was „schnell genug“ heißt, zum Beispiel 5 Sekunden für den Export.
+  2. Baue eine Messung, die du wiederholen kannst: dieselben Daten, derselbe Rechner, dieselbe Python-Version.
+  3. Profiliere, um die Stelle zu finden. Rate nicht.
+  4. Ändere genau eine Sache und miss mit derselben Messung erneut.
+  5. Hör auf, sobald das Ziel erreicht ist. Jede weitere Optimierung kostet Lesbarkeit.
+
+  Die Reihenfolge der Mittel richtet sich nach dem Hebel. Ein besserer Algorithmus oder eine bessere Datenstruktur bringt oft das Hundertfache. Vektorisierung mit NumPy bringt das Zehn- bis Fünfzigfache. Kleine Handgriffe in Schleifen bringen wenige Prozent. Paralleles Rechnen bringt höchstens so viel Beschleunigung, wie du Kerne hast.
+
+  ## cProfile und pstats lesen
+
+  Ein **Profiler** zeichnet auf, welche Funktionen wie oft laufen und wie lange sie brauchen. Die Standardbibliothek bringt [`cProfile`](https://docs.python.org/3/library/profile.html) mit. Das Beispiel wertet 20 000 Zeilen eines Zugriffslogs aus und zählt Serverfehler, die nicht von bekannten Bots stammen:
+
+  ```python
+  import cProfile
+  import pstats
+
+  BOT_IPS = [f"10.9.{i // 250}.{i % 250}" for i in range(1500)]
+
+  def parse_zeile(zeile):
+      ip, methode, pfad, status = zeile.split()
+      return ip, pfad, int(status)
+
+  def ist_bot(ip):
+      return ip in BOT_IPS
+
+  def zaehle_fehler(zeilen):
+      fehler = {}
+      for zeile in zeilen:
+          ip, pfad, status = parse_zeile(zeile)
+          if status >= 500 and not ist_bot(ip):
+              fehler[pfad] = fehler.get(pfad, 0) + 1
+      return fehler
+
+  zeilen = erzeuge_log(20_000)         # 20 000 Zeilen wie "10.9.0.7 GET /login 500"
+
+  with cProfile.Profile() as profiler:
+      zaehle_fehler(zeilen)
+
+  stats = pstats.Stats(profiler).strip_dirs()
+  stats.sort_stats("tottime").print_stats(4)
+  stats.print_callers("ist_bot")
+  ```
+
+  Beispielausgabe (die Zahlen variieren):
+
+  ```text
+           51670 function calls in 0.062 seconds
+
+     Ordered by: internal time
+     List reduced from 7 to 4 due to restriction <4>
+
+     ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+       6667    0.047    0.000    0.047    0.000 auswertung.py:18(ist_bot)
+          1    0.006    0.006    0.062    0.062 auswertung.py:21(zaehle_fehler)
+      20000    0.005    0.000    0.008    0.000 auswertung.py:14(parse_zeile)
+      20000    0.003    0.000    0.003    0.000 {method 'split' of 'str' objects}
+
+  Function                                   was called by...
+                                                 ncalls  tottime  cumtime
+  auswertung.py:18(ist_bot)  <-    6667    0.047    0.047  auswertung.py:21(zaehle_fehler)
+  ```
+
+  Die Spalten bedeuten:
+
+  - **`ncalls`** ist die Zahl der Aufrufe. Bei Rekursion steht dort `15/1`: 15 Aufrufe insgesamt, davon einer von außen (ein „primitiver“ Aufruf).
+  - **`tottime`** ist die Zeit in der Funktion selbst, **ohne** die Zeit in Funktionen, die sie aufruft.
+  - **`cumtime`** ist die kumulierte Zeit **mit** allen Unteraufrufen.
+  - **`percall`** gibt es zweimal. Das erste ist `tottime / ncalls`, das zweite `cumtime` geteilt durch die primitiven Aufrufe.
+
+  So liest du die Tabelle. Sortiert nach `tottime` steht oben, wo Rechenzeit tatsächlich verbraucht wird. `ist_bot` ruft keine weitere Funktion auf, deshalb sind `tottime` und `cumtime` gleich. Der Vergleich der Liste läuft in C innerhalb von `in`, die Zeit landet also in `ist_bot` selbst. Das sind 76 % der Gesamtzeit in einer Zeile. Sortiert nach `cumtime` liest du den Aufrufbaum von oben nach unten: `zaehle_fehler` hat fast keine eigene Zeit, aber die gesamte kumulierte. Die Funktion zu optimieren brächte nichts, der Aufwand steckt in ihren Aufrufen. `print_callers` zeigt, wer eine Funktion aufruft, `print_callees` die Gegenrichtung. Beide helfen, wenn eine Funktion von vielen Stellen kommt.
+
+  Die Lösung ist hier ein Set statt einer Liste (`BOT_IPS = frozenset(...)`). Das ist die Regel aus dem Modul Datenstrukturen. Du erkennst sie jetzt an Zahlen statt an einer Vermutung.
+
+  Drei Punkte vermeiden Fehlinterpretationen:
+
+  - **Der Profiler bremst.** `cProfile` ist ein deterministischer Profiler: Er hakt jeden Aufruf ab. Funktionen mit vielen winzigen Aufrufen wirken im Profil teurer, als sie sind. Lies die Verhältnisse, nicht die Sekunden. Sampling-Profiler wie `py-spy` greifen den Stack in Abständen ab und verfälschen weniger.
+  - **Profile über ein ganzes Programm** erzeugst du von der Kommandozeile: `python -m cProfile -o profil.out skript.py`. Mit `python -m pstats profil.out` blätterst du darin. `-s tottime` druckt direkt eine sortierte Tabelle.
+  - **Profile sind kein Beweis.** Nach der Änderung misst du mit `timeit` oder einem echten Lauf, ob es schneller geworden ist.
+
+  Die Aufrufzähler sind deterministisch und taugen deshalb für Tests. Dieses Beispiel läuft im Browser:
+
+  ```python run
+  import cProfile
+  import pstats
+
+  def fib(n):
+      return n if n < 2 else fib(n - 1) + fib(n - 2)
+
+  def mehrmals(n, wiederholungen):
+      return [fib(n) for _ in range(wiederholungen)]
+
+  with cProfile.Profile() as profiler:
+      mehrmals(5, 3)
+
+  profil = pstats.Stats(profiler).get_stats_profile().func_profiles
+  print(profil["fib"].ncalls)        # 45/3: 45 Aufrufe, 3 davon von außen
+  print(profil["mehrmals"].ncalls)   # 1
+  ```
+
+  ## timeit richtig einsetzen
+
+  Wenn du zwei Varianten vergleichen willst, nimmst du [`timeit`](https://docs.python.org/3/library/timeit.html). Es schaltet den Garbage Collector während der Messung ab und wählt die passende Uhr. Die wichtigste Funktion ist `timeit.repeat`:
+
+  ```python
+  import timeit
+
+  setup = "daten = list(range(10_000)); menge = set(daten)"
+  for stmt in ("9_999 in daten", "9_999 in menge"):
+      zeiten = timeit.repeat(stmt, setup=setup, number=1_000, repeat=5)
+      print(stmt, f"{min(zeiten) / 1_000 * 1e6:.2f} µs pro Aufruf")
+  ```
+
+  ```text
+  9_999 in daten 38.60 µs pro Aufruf
+  9_999 in menge 0.02 µs pro Aufruf
+  ```
+
+  - **`number`** ist die Zahl der Aufrufe je Messung. `repeat` liefert die Gesamtzeit für `number` Aufrufe, du teilst also selbst. Wähle `number` so, dass eine Messung mindestens etwa 0,2 Sekunden dauert. Genau das macht [`Timer.autorange`](https://docs.python.org/3/library/timeit.html#timeit.Timer.autorange).
+  - **`repeat`** ist die Zahl der Messungen. Aus ihnen nimmst du das **Minimum**. Die Doku begründet das im Eintrag zu [`Timer.repeat`](https://docs.python.org/3/library/timeit.html#timeit.Timer.repeat): Der kleinste Wert ist die untere Schranke dafür, wie schnell der Rechner den Code ausführen kann. Höhere Werte kommen von anderen Prozessen, nicht von Python. Ein Mittelwert mischt dieses Rauschen in dein Ergebnis.
+  - **`setup`** läuft einmal vor der Messung und zählt nicht mit. Baust du das Set im gemessenen Ausdruck, misst du den Aufbau mit.
+  - Auf der Kommandozeile erledigt `python -m timeit -s "daten = list(range(10_000))" "9_999 in daten"` die Wahl von `number` und `repeat` und druckt `10000 loops, best of 5: 39.1 usec per loop`.
+
+  Typische Messfehler:
+
+  - **Kein Warmup.** Der erste Lauf importiert Module, füllt Caches und lässt den Interpreter seine Anweisungen spezialisieren (seit 3.11). Lass einen Probelauf vorweg laufen und verwirf ihn.
+  - **Kalter und warmer Cache.** Die erste Datei oder Datenbankabfrage kommt von der Platte, die folgenden aus dem Betriebssystem-Cache. Ein `lru_cache` im Code macht jeden zweiten Aufruf scheinbar kostenlos.
+  - **Eingaben, die der Test selbst verändert.** `daten.sort()` im gemessenen Ausdruck sortiert nur beim ersten Mal. Danach liegen die Daten sortiert vor, und Timsort braucht für sortierte Daten linear viel Zeit. Miss `sorted(daten)`, das die Eingabe unverändert lässt.
+  - **Unrealistische Daten.** Eine Liste mit zehn Elementen sagt nichts über eine mit zehn Millionen. Miss mit Daten in der Größe und Form der Produktion.
+  - **Rauschen.** Andere Prozesse, Energiesparmodus und Thermik verändern Messwerte um zweistellige Prozent. Vergleiche Varianten im selben Lauf und wiederhole, wenn die Unterschiede klein sind.
+
+  > [!INTERVIEW] „Wie misst du, ob eine Änderung etwas gebracht hat?“
+  > Ich lege vorher fest, was ich messe, und nutze dieselben Daten vor und nach der Änderung. Kurze Abschnitte miss ich mit `timeit.repeat` und nehme das Minimum, weil Ausreißer nach oben durch andere Prozesse entstehen. Die Stelle selbst finde ich mit `cProfile` und lese `tottime`, nicht nur `cumtime`. Zum Schluss prüfe ich, dass das Ergebnis des Codes gleich geblieben ist.
+
+  ## Speicher messen: tracemalloc, getsizeof und `__slots__`
+
+  Wächst ein Dienst im Betrieb von 300 MB auf 2 GB, ist die Frage nicht „wie lange“, sondern „wer hält das fest“. [`tracemalloc`](https://docs.python.org/3/library/tracemalloc.html) hängt sich in die Speicherverwaltung von Python und merkt sich, **in welcher Zeile** jeder Block angefordert wurde. Du vergleichst zwei Momentaufnahmen (Snapshots):
+
+  ```python
+  import tracemalloc
+
+  def lade_nutzer(n):
+      return [{"id": i, "name": f"nutzer{i}", "rollen": ["leser"]} for i in range(n)]
+
+  tracemalloc.start()
+  vorher = tracemalloc.take_snapshot()
+  cache = lade_nutzer(50_000)
+  nachher = tracemalloc.take_snapshot()
+
+  for stat in nachher.compare_to(vorher, "lineno")[:2]:
+      print(stat)
+  aktuell, spitze = tracemalloc.get_traced_memory()
+  ```
+
+  ```text
+  tm1.py:4: size=16.2 MiB (+16.2 MiB), count=299702 (+299702), average=57 B
+  tm1.py:7: size=400 B (+400 B), count=1 (+1), average=400 B
+  ```
+
+  - **`size`** ist der aktuell belegte Speicher der Zeile, **`(+…)`** die Differenz zum ersten Snapshot, `count` die Zahl der Blöcke. Wichtig ist die Differenz. Eine Zeile mit viel Speicher, die nicht wächst, ist kein Leck.
+  - [`get_traced_memory()`](https://docs.python.org/3/library/tracemalloc.html#tracemalloc.get_traced_memory) liefert den aktuellen Wert und die Spitze (`peak`). Die Spitze zählt, wenn du wissen willst, ob ein Lauf in den Speicher passt.
+  - `tracemalloc.start(25)` speichert 25 Stack-Frames je Block. Damit gruppiert `compare_to(..., "traceback")` nach der ganzen Aufrufkette. Tracing kostet Speicher und Zeit. Schalte es für die Fehlersuche ein und im Normalbetrieb aus.
+
+  ### sys.getsizeof zeigt nur die flache Größe
+
+  [`sys.getsizeof(obj)`](https://docs.python.org/3/library/sys.html#sys.getsizeof) liefert die Größe des Objekts selbst. Die Objekte, auf die es zeigt, zählt es nicht mit. Die Doku sagt es ausdrücklich: Es wird nur der direkt belegte Speicher gezählt, nicht der von Objekten, auf die es verweist. Eine Liste mit drei riesigen Listen ist deshalb flach genauso groß wie eine mit drei leeren:
+
+  ```python run
+  import sys
+
+  klein = [[], [], []]
+  gross = [list(range(100_000)), list(range(100_000)), list(range(100_000))]
+
+  print(sys.getsizeof(klein) == sys.getsizeof(gross))     # True: drei Zeiger je Liste
+  print(sys.getsizeof(gross[0]) > sys.getsizeof(gross))   # True: die Inhalte zählen nicht mit
+  ```
+
+  Für den echten Gesamtverbrauch brauchst du `tracemalloc` oder eine Summe über alle erreichbaren Objekte (Bibliotheken wie `pympler` bieten `asizeof`). Hartkodierte Byte-Zahlen aus Blogartikeln helfen nicht: Sie ändern sich zwischen Python-Versionen und Betriebssystemen.
+
+  ### `__slots__` spart das Dictionary pro Instanz
+
+  Eine normale Instanz kann beliebige Attribute bekommen und trägt dafür ein `__dict__`. Mit [`__slots__`](https://docs.python.org/3/reference/datamodel.html#slots) legst du die Attribute vorab fest. Es gibt dann kein `__dict__` mehr:
+
+  ```python run
+  class Punkt:
+      def __init__(self, x, y):
+          self.x = x
+          self.y = y
+
+  class PunktSlots:
+      __slots__ = ("x", "y")
+
+      def __init__(self, x, y):
+          self.x = x
+          self.y = y
+
+  a, b = Punkt(1, 2), PunktSlots(1, 2)
+  print(hasattr(a, "__dict__"), hasattr(b, "__dict__"))   # True False
+
+  a.farbe = "rot"                      # geht: beliebige neue Attribute
+  try:
+      b.farbe = "rot"                  # geht nicht
+  except AttributeError:
+      print("PunktSlots erlaubt nur x und y")
+  ```
+
+  Das zahlt sich aus, wenn du Hunderttausende kleiner Objekte hältst. Bei 100 000 Instanzen in einer Liste zeigte `tracemalloc` auf dem Testrechner rund 12,8 MB ohne und 8,8 MB mit `__slots__`. Das ist eine Tendenz, kein Versprechen. CPython legt Attributwerte in neuen Versionen ohnehin kompakter ab, der Abstand schrumpft also. Miss mit `tracemalloc`, bevor du Klassen umbaust. Die Einschränkungen: Neue Attribute sind nicht möglich. Eine Unterklasse ohne eigenes `__slots__` bekommt ihr `__dict__` zurück. Für Dataclasses gibt es `@dataclass(slots=True)` (seit 3.10, siehe [Klassen & Objektorientierung](/python/oop)).
+
+  > [!PRAXIS] Wer hält den Speicher fest?
+  > Echte Speicherprobleme sind selten eine große Liste, die jemand vergessen hat. Meist wächst ein Cache ohne Obergrenze, ein Dictionary pro Anfrage wird nie geleert, oder Objekte halten Referenzen aufeinander. In `tracemalloc`-Auswertungen steht dann eine einzige Zeile mit `+400 MiB` an der Spitze. Danach prüfst du, ob dort eine Grenze fehlt (`maxsize`, Ablaufzeit) oder ein Generator reichen würde.
+
+  ## Kostenfallen mit Zählern statt Stoppuhr
+
+  Die folgenden Muster tauchen in Code-Reviews immer wieder auf. Wir belegen sie, wo es geht, mit **Zählern**: Anzahl Vergleiche, Aufrufe, Kopien. Zähler sind in jeder Umgebung gleich. Eine Stoppuhr ist es nicht.
+
+  ### Strings aufbauen: `+=` gegen `join`
+
+  Strings sind unveränderlich. `s += teil` erzeugt in der Theorie einen neuen String, kopiert also alles, was bisher da war. Bei `n` Teilen sind das quadratisch viele Kopien. Die [Dokumentation](https://docs.python.org/3/library/stdtypes.html#common-sequence-operations) sagt es so, nennt aber eine Einschränkung: CPython kann `s += t` oft **an Ort und Stelle** erledigen. Diese Optimierung hängt von Version und Implementierung ab, die Doku rät für zeitkritischen Code zu `str.join()`.
+
+  Der Unterschied ist messbar. 50 000 Zeilen aufgebaut, Minimum aus fünf Läufen:
+
+  ```python
+  def lokale_variable(n):
+      s = ""
+      for i in range(n):
+          s += f"zeile {i}\n"          # CPython optimiert: 5 ms
+      return s
+
+  def mit_join(n):
+      return "".join([f"zeile {i}\n" for i in range(n)])      # 5 ms
+
+  class Puffer:
+      text = ""
+      def schreibe(self, n):
+          for i in range(n):
+              self.text += f"zeile {i}\n"   # Attribut: Optimierung greift nicht, 550 ms
+  ```
+
+  Die lokale Variable ist so schnell wie `join`. Dieselbe Schleife auf einem Attribut (`self.text += …`) ist über hundertmal langsamer, weil dort der Interpreter die Optimierung nicht anwenden kann. Verlasse dich also nicht darauf. `"".join(teile)` ist in jeder Python-Implementierung linear und wirkt sofort verständlich.
+
+  ### `in` auf Listen, Sets und Dictionaries
+
+  `x in liste` vergleicht Element für Element. `x in menge` berechnet den Hashwert und springt zum Platz im Hash-Table, im Mittel mit einem Vergleich (siehe [Datenstrukturen](/python/datenstrukturen) und die [Laufzeittabelle im Wiki](https://wiki.python.org/moin/TimeComplexity)). Der Unterschied lässt sich zählen. Die Klasse zählt ihre `__eq__`-Aufrufe:
+
+  ```python run
+  class Kennung:
+      vergleiche = 0
+
+      def __init__(self, wert):
+          self.wert = wert
+
+      def __eq__(self, andere):
+          Kennung.vergleiche += 1
+          return self.wert == andere.wert
+
+      def __hash__(self):
+          return hash(self.wert)
+
+  liste = [Kennung(i) for i in range(1000)]
+  menge = set(liste)
+  gesucht = Kennung(900)
+
+  Kennung.vergleiche = 0
+  print(gesucht in liste, Kennung.vergleiche)    # True 901
+  Kennung.vergleiche = 0
+  print(gesucht in menge, Kennung.vergleiche)    # True 1
+  ```
+
+  Die Liste vergleicht 901-mal, die Menge einmal. Steckt das in einer Schleife über 50 000 Elemente, wird aus O(n) ein O(n · m). Das Set muss einmal **vor** der Schleife entstehen. Baust du es in der Schleife, zahlst du den Aufbau jedes Mal. Dictionaries funktionieren wie Sets und taugen als Index: Statt für jede Bestellung die Kundenliste zu durchsuchen, baust du einmal `{kunde.id: kunde for kunde in kunden}`.
+
+  ### Top-k mit heapq statt volles Sortieren
+
+  Für die drei größten von 1 000 Einträgen musst du nicht alle 1 000 sortieren. [`heapq.nlargest(k, daten)`](https://docs.python.org/3/library/heapq.html#heapq.nlargest) hält einen Heap der Größe `k` und prüft jedes Element dagegen. Das kostet O(n log k) statt O(n log n). Der Unterschied lässt sich wieder zählen:
+
+  ```python run
+  import heapq
+
+  class Messwert:
+      vergleiche = 0
+
+      def __init__(self, wert):
+          self.wert = wert
+
+      def __lt__(self, anderer):
+          Messwert.vergleiche += 1
+          return self.wert < anderer.wert
+
+  n = 1000
+  werte = [Messwert((i * 7919) % n) for i in range(n)]    # eine feste Mischung der Zahlen 0 bis 999
+
+  Messwert.vergleiche = 0
+  voll = sorted(werte, reverse=True)[:3]
+  print(Messwert.vergleiche > 5 * n)     # True: Sortieren braucht rund n log n Vergleiche
+
+  Messwert.vergleiche = 0
+  heap = heapq.nlargest(3, werte)
+  print(Messwert.vergleiche < 2 * n)     # True: rund n Vergleiche
+  print([w.wert for w in heap] == [w.wert for w in voll])   # True: dasselbe Ergebnis
+  ```
+
+  Die Doku nennt die Grenzen: Die Funktionen sind für kleine `k` am besten. Für große `k` ist `sorted()` effizienter, und für `k == 1` nimmst du `min()` oder `max()`. [`heapq.merge`](https://docs.python.org/3/library/heapq.html#heapq.merge) verschmilzt bereits sortierte Eingaben (zum Beispiel mehrere sortierte Logdateien) lazy zu einem sortierten Strom, ohne alles in den Speicher zu laden.
+
+  ### Kopien und heiße Schleifen
+
+  - **Unnötige Kopien.** `werte[1:]` in einer Schleife oder Rekursion kopiert jedes Mal O(n) Elemente und macht aus einem linearen Algorithmus einen quadratischen. Arbeite mit Indizes oder `itertools.islice`. `copy.deepcopy` in einer Schleife ist fast immer ein Warnsignal. `for k in list(d)` ist nur nötig, wenn du das Dictionary beim Durchlaufen veränderst.
+  - **Attributzugriffe und Funktionsaufrufe.** Der Tipp, `math.sqrt` in eine lokale Variable zu legen, stammt aus älteren Versionen. Seit 3.11 [spezialisiert der Interpreter](https://docs.python.org/3/whatsnew/3.11.html#faster-cpython) häufige Zugriffe und Aufrufe. Bei 100 000 Punkten brachte der Alias auf dem Testrechner etwa 2 %, eine List Comprehension etwa 5 %, ein NumPy-Aufruf rund 95 %. Lohnend ist in heißen Schleifen deshalb meist nur, **weniger Python-Code pro Element** auszuführen.
+
+  ### Generator statt Liste
+
+  `sum([i * i for i in range(n)])` baut zuerst die gesamte Liste und summiert danach. `sum(i * i for i in range(n))` erzeugt die Werte einzeln. Für `n = 1_000_000` zeigte `tracemalloc` als Spitze rund 40 MB gegenüber unter 1 KB. Die Rechenzeit ist ähnlich, der Speicher nicht. Ein Generator lässt sich nur einmal durchlaufen. Brauchst du das Ergebnis mehrfach oder `len()` und Indexzugriff, nimm eine Liste. Siehe [Iteratoren & Generatoren](/python/iteratoren-generatoren).
+
+  ### lru_cache: Ergebnisse merken
+
+  Eine reine Funktion mit wiederkehrenden Argumenten rechnest du nur einmal. [`functools.lru_cache`](https://docs.python.org/3/library/functools.html#functools.lru_cache) erledigt das. Ob der Cache etwas bringt, zeigt `cache_info()`:
+
+  ```python run
+  from functools import lru_cache
+
+  aufrufe = []
+
+  @lru_cache(maxsize=2)
+  def kurs(waehrung):
+      aufrufe.append(waehrung)          # steht für einen teuren API-Aufruf
+      return {"USD": 1.08, "GBP": 0.84, "CHF": 0.95}[waehrung]
+
+  for w in ["USD", "USD", "GBP", "USD", "CHF", "USD"]:
+      kurs(w)
+
+  print(kurs.cache_info())   # CacheInfo(hits=3, misses=3, maxsize=2, currsize=2)
+  print(aufrufe)             # ['USD', 'GBP', 'CHF']
+  ```
+
+  Von sechs Abfragen gingen drei an den Cache. Bei `CHF` verdrängt der Cache `GBP`, den am längsten ungenutzten Eintrag, weil `maxsize=2` nur zwei Plätze lässt.
+
+  `hits` und `misses` sind deine Kennzahlen. Bleibt die Trefferquote niedrig, war der Cache umsonst und kostet nur Speicher. `maxsize=None` wächst ohne Grenze. Die Fallen (unhashbare Argumente, geteilte Ergebnisse, Methoden) stehen im Modul [Dekoratoren & funktionale Werkzeuge](/python/dekoratoren-funktional).
+
+  ## Wann Vektorisierung und native Erweiterungen helfen
+
+  Steckt die Zeit nach dem Profil in einer Schleife, die für Millionen Zahlen dasselbe tut, hilft **Vektorisierung**. [NumPy](https://numpy.org/doc/stable/) führt die Schleife in C über einen zusammenhängenden Speicherblock aus. Der Python-Aufwand pro Element (Objekt anlegen, Typ prüfen, Aufruf) entfällt.
+
+  ```python run
+  import numpy as np
+
+  preise = [19.99, 5.0, 12.5, 100.0]
+  brutto_py = [round(p * 1.19, 2) for p in preise]
+  brutto_np = np.round(np.array(preise) * 1.19, 2)
+  print(brutto_py == brutto_np.tolist())     # True: dasselbe Ergebnis
+  ```
+
+  Bei 100 000 Punkten brauchte die Schleife mit `math.sqrt` etwa 5,3 ms, `np.hypot` auf zwei Arrays etwa 0,23 ms. Das ist ein Faktor von rund 20. Er gilt nur für diesen Fall. Vektorisierung hilft nicht, wenn
+
+  - die Daten klein sind, weil jeder NumPy-Aufruf einen festen Aufwand hat und das Umwandeln einer Liste in ein Array selbst O(n) kostet,
+  - jedes Element von seinem Vorgänger abhängt (Zustandsautomat, Rekursion) und keine Formel auf ganzen Arrays dafür existiert,
+  - die Elemente gemischt oder Objekte sind: Ein Array mit `dtype=object` ist kaum schneller als eine Liste,
+  - es um Strings, Dictionaries oder Dateizugriff geht.
+
+  Es gibt eine Falle bei den Zahlentypen. NumPy rechnet mit festen Breiten wie `int64` und läuft bei Überschreitung **still** über, anders als Python-`int`:
+
+  ```python run
+  import numpy as np
+
+  print(2**62 * 4)                       # 18446744073709551616: Python-int wachsen beliebig
+  print(np.array([2**62]) * 4)           # [0]: int64 läuft über, ohne Warnung
+  ```
+
+  In pandas gilt das Gleiche eine Ebene höher. `df.apply(f, axis=1)` ist eine Python-Schleife über Zeilen. Spaltenoperationen, `.str`-Methoden und `groupby` laufen vektorisiert. Mehr dazu in [pandas-Grundlagen](/data/pandas-grundlagen) und im [pandas-Leitfaden zur Performance](https://pandas.pydata.org/docs/user_guide/enhancingperf.html).
+
+  Bleibt ein kleiner, stabiler, rechenintensiver Kern, der sich nicht vektorisieren lässt, kommen **native Erweiterungen** in Frage:
+
+  | Ansatz | Idee | Preis |
+  | --- | --- | --- |
+  | [Cython](https://cython.readthedocs.io/) | Python-Code mit Typangaben wird zu C übersetzt | Build-Schritt, eigene Syntax für Typen |
+  | [mypyc](https://mypyc.readthedocs.io/) | Typannotierter Python-Code wird zu C-Erweiterungen kompiliert | Nur der annotierte Teil, Einschränkungen bei dynamischem Code |
+  | [PyO3](https://pyo3.rs/) mit [maturin](https://www.maturin.rs/) | Eine Rust-Funktion wird als Python-Modul veröffentlicht | Zweite Sprache und Toolchain im Projekt |
+  | [C-API](https://docs.python.org/3/extending/index.html) oder `cffi` | Bestehende C-Bibliothek anbinden | Speicherverwaltung von Hand |
+
+  Der Preis ist nicht klein. Du brauchst Wheels für jede Plattform (siehe [Tooling & Packaging](/python/tooling-packaging)), Debugging über zwei Sprachen und Menschen im Team, die den Kern pflegen. Bekannte Beispiele sind `pydantic-core` und `orjson`, beide in Rust geschrieben, hinter einer Python-Schnittstelle. Dort hat sich der Aufwand gelohnt, weil Millionen Nutzer denselben kleinen Kern aufrufen. Ein Skript, das einmal pro Nacht läuft, ist kein solcher Fall. Der experimentelle JIT-Compiler ([PEP 744](https://peps.python.org/pep-0744/)) ist kein Ersatz dafür. Plane nicht mit ihm.
+
+  Der GIL spielt dabei eine kleine Rolle. NumPy und viele C-Erweiterungen geben ihn bei langen Berechnungen frei, mehrere Threads rechnen dann parallel. Ob Threads, Prozesse oder asyncio zum Problem passen, steht in [Nebenläufigkeit](/python/nebenlaeufigkeit). Parallelisiere nach dem Messen, nicht davor: Zehn Prozesse für einen Algorithmus mit quadratischer Laufzeit sind teurer als ein Set.
+
+  ## Häufige Fehler
+
+  - **Raten statt messen.** Die vermutete Stelle ist selten die teure. Erst Profil, dann ändern.
+  - **Nur `cumtime` lesen.** Oben stehen immer `main` und seine Aufrufer. Die Arbeit steckt dort, wo `tottime` hoch ist.
+  - **Mittelwert aus `timeit`.** Ein einziger Ausreißer verdirbt ihn. Nimm das Minimum von `repeat`.
+  - **Den Aufbau mitmessen.** Daten, Sets und Importe gehören in `setup`.
+  - **In-place-Operationen im Benchmark.** `daten.sort()` sortiert nur beim ersten Lauf wirklich. Miss `sorted(daten)`.
+  - **`getsizeof` als Gesamtgröße lesen.** Es zählt nur das Objekt selbst, nicht seine Inhalte.
+  - **Mikro-Optimierung vor Algorithmus.** Lokale Aliase sparen Prozente, ein Set spart Größenordnungen.
+  - **Unlesbaren Code für Winzigkeiten.** Ein Gewinn von 2 % rechtfertigt keine undurchsichtige Zeile.
+  - **Ohne Regressionsschutz optimieren.** Ein Test, der das Ergebnis vor und nach der Änderung vergleicht, verhindert, dass du Tempo mit Korrektheit bezahlst.
+
+  > [!INTERVIEW] „Ein Skript ist mit wachsenden Daten langsam. Was tust du?“
+  > Ich reproduziere das Problem mit realistischen Daten und messe, ob CPU, Speicher oder Warten auf I/O dominiert. Bei CPU lege ich ein `cProfile`-Profil an und sortiere nach `tottime`. Typische Funde sind eine Listensuche in einer Schleife oder wiederholtes Einlesen derselben Datei. Ich ändere eine Sache, miss mit derselben Messung erneut und prüfe, dass das Ergebnis gleich bleibt. Erst wenn der Algorithmus stimmt, überlege ich NumPy oder eine native Erweiterung. Mit dem Amdahl-Gedanken schätze ich vorher, wie viel überhaupt zu holen ist.
+
+  > [!MERKE]
+  > Ohne Messung vorher und nachher ist jede Optimierung eine Vermutung. Prüfe Laufzeiten auf dem Zielrechner mit der Python-Version, die du einsetzt, und nicht im Browser.
+
+  ## Zusammenfassung
+
+  - Erst messen, dann ändern. Die Laufzeit steckt meist in sehr wenigen Zeilen.
+  - Amdahl: Ein Teil mit Anteil `p`, `s`-mal schneller, beschleunigt das Ganze um `1 / ((1 - p) + p / s)`. Die Obergrenze ist `1 / (1 - p)`.
+  - In `cProfile` zeigt `tottime` die Eigenzeit, `cumtime` die Zeit mit Unteraufrufen. `ncalls` mit `/` meint Rekursion. `print_callers` zeigt den Aufrufer.
+  - `timeit.repeat` liefert mehrere Messungen. Nimm das Minimum, teile durch `number`, und halte `setup` aus der Messung heraus.
+  - `tracemalloc` verrät, in welcher Zeile Speicher entsteht. `sys.getsizeof` zeigt nur die flache Größe. `__slots__` entfernt das `__dict__` je Instanz und spart eine Tendenz an Speicher.
+  - `in` auf Listen kostet O(n), auf Set und Dict im Mittel O(1). `heapq.nlargest` kostet O(n log k) gegenüber O(n log n) beim Sortieren. `join` ist `+=` auf Strings in jeder Implementierung überlegen.
+  - Generatoren sparen Speicher, Listen erlauben Mehrfachnutzung. `lru_cache` lohnt sich bei reinen Funktionen mit hoher Trefferquote.
+  - Zuerst Algorithmus und Datenstruktur, dann Vektorisierung, dann native Erweiterungen, zuletzt Parallelität.
+exercises:
+  - id: tottime-oder-cumtime
+    type: choice
+    title: Wo verbrennt die Funktion selbst Zeit?
+    prompt: |
+      Ein Export-Job ist langsam. Das Profil ist nach `cumtime` sortiert. Welche Funktion verbraucht **selbst** die meiste Rechenzeit, und woran siehst du das?
+    lang: text
+    code: |
+         ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+              1    0.004    0.004    1.210    1.210 export.py:40(main)
+              1    0.010    0.010    1.206    1.206 export.py:25(lade_bestellungen)
+            900    0.050    0.000    1.100    0.001 export.py:12(hole_preis)
+            900    1.040    0.001    1.040    0.001 export.py:5(suche_artikel)
+    options:
+      - text: "`suche_artikel`: Ihr `tottime` ist mit 1,040 s der größte, und er ist fast so groß wie ihr `cumtime`."
+        correct: true
+        why: "`tottime` ist die Zeit ohne Unteraufrufe. Dass `tottime` und `cumtime` fast gleich sind, zeigt, dass `suche_artikel` kaum etwas aufruft. Die Zeit steckt in der Funktion selbst."
+      - text: "`main`: Sie hat mit 1,210 s den größten `cumtime`."
+        correct: false
+        why: "`cumtime` enthält alle Unteraufrufe. `main` steht oben, weil sie alles andere aufruft. Ihr `tottime` beträgt 0,004 s."
+      - text: "`hole_preis`: Sie wurde 900-mal aufgerufen und braucht 1,100 s kumuliert."
+        correct: false
+        why: "Der größte Teil ihrer 1,100 s steckt in `suche_artikel`. Ihr eigener Anteil (`tottime`) liegt bei 0,050 s."
+      - text: "`lade_bestellungen`: Sie steht an zweiter Stelle und braucht kumuliert 1,206 s."
+        correct: false
+        why: "Ihre 1,206 s sind fast vollständig die Zeit ihrer Unteraufrufe. Der `tottime` von 0,010 s zeigt, wie wenig sie selbst rechnet."
+    explanation: |
+      Beim Lesen eines Profils fragst du zuerst nach `tottime`: Dort wird Rechenzeit tatsächlich verbraucht. `cumtime` zeigt den Aufrufbaum. Funktionen weit oben haben immer große kumulierte Zeit, auch wenn sie selbst nichts tun. Optimiert wird dort, wo `tottime` hoch ist, hier also `suche_artikel`. Die 900 Aufrufe sind außerdem ein Hinweis, dass jede Bestellung eine eigene Suche auslöst.
+    resources:
+      - title: The Python Profilers · Instant User's Manual
+        url: https://docs.python.org/3/library/profile.html#instant-user-s-manual
+      - title: pstats.Stats.sort_stats
+        url: https://docs.python.org/3/library/profile.html#pstats.Stats.sort_stats
+
+  - id: timeit-ergebnis-lesen
+    type: choice
+    title: Welche Zahl nennst du?
+    prompt: |
+      Du misst `sortiere(daten)` mit `timeit.repeat(..., number=100, repeat=5)`. Das Ergebnis ist die Liste unten (Sekunden für je 100 Aufrufe). Welche Aussage über das Ergebnis stimmt?
+    lang: python
+    code: |
+      zeiten = [0.412, 0.398, 0.401, 0.655, 0.399]
+    options:
+      - text: "Ich melde das Minimum, `0.398`, geteilt durch `number`: rund 4,0 ms pro Aufruf."
+        correct: true
+        why: "Das Minimum ist die untere Schranke. Höhere Werte entstehen meist durch andere Prozesse auf dem Rechner. Die Zeit für 100 Aufrufe teilst du durch 100."
+      - text: "Ich melde den Mittelwert, `0.453`, weil er alle Messungen berücksichtigt."
+        correct: false
+        why: "Der Ausreißer `0.655` zieht den Mittelwert nach oben. Er sagt etwas über den Rechner in diesem Moment aus, nicht über den Code."
+      - text: "Ich melde den größten Wert, `0.655`, weil man vom schlechtesten Fall ausgehen soll."
+        correct: false
+        why: "Der größte Wert ist meist ein Störeffekt. Der Worst Case im Betrieb entsteht durch andere Eingaben, nicht durch einen schlechten Messlauf."
+      - text: "Ich wiederhole die Messung, bis ich den Wert `0.398` nicht mehr sehe, denn er ist ein Messfehler."
+        correct: false
+        why: "Der kleinste Wert ist der aussagekräftigste, weil er am wenigsten gestört wurde."
+    explanation: |
+      Die Doku zu `Timer.repeat` begründet es: Der niedrigste Wert gibt eine untere Schranke dafür, wie schnell der Rechner den Code ausführen kann, und die höheren Werte stammen von anderen Prozessen, nicht von Python. Deshalb ist `min()` die Zahl, die du vergleichst. Mittelwert und Standardabweichung sind hier wenig hilfreich. Denk an die Division durch `number`, sonst vergleichst du Gesamtzeiten verschieden großer Messungen.
+    resources:
+      - title: timeit.Timer.repeat
+        url: https://docs.python.org/3/library/timeit.html#timeit.Timer.repeat
+
+  - id: amdahl-rechnen
+    type: choice
+    title: Lohnt der Umbau nach Rust?
+    prompt: |
+      Das Profil zeigt: `parse_zeile` macht 25 % der Gesamtlaufzeit aus. Dein Kollege schreibt sie in Rust (PyO3) neu, und sie wird 10-mal so schnell. Was ist die Folge für das Programm?
+    options:
+      - text: "Das Programm wird gesamt etwa 1,3-mal schneller. Selbst eine unendlich schnelle `parse_zeile` brächte höchstens das 1,33-Fache."
+        correct: true
+        why: "Die neue Laufzeit ist 0,75 + 0,25 / 10 = 0,775 der alten, das sind 1 / 0,775 ≈ 1,29. Der Rest des Programms bleibt gleich langsam."
+      - text: "Das Programm wird 10-mal so schnell, weil der Hotspot jetzt in Rust läuft."
+        correct: false
+        why: "Nur der Anteil von 25 % wird schneller. Die übrigen 75 % laufen weiter in Python."
+      - text: "Das Programm wird etwa 2,5-mal so schnell: 25 % mal Faktor 10."
+        correct: false
+        why: "Diese Rechnung vermischt Anteil und Faktor. Richtig ist `1 / ((1 - p) + p / s)`."
+      - text: "Das Programm wird etwa 4-mal so schnell, weil 75 % der Zeit erhalten bleiben und 25 % wegfallen."
+        correct: false
+        why: "Es fallen nicht 25 % weg, sondern nur 90 % dieser 25 %. Auch wenn 25 % ganz verschwänden, wären es höchstens 1,33-fach."
+    explanation: |
+      Das ist das Gesetz von Amdahl: Der beschleunigte Teil begrenzt den Gewinn durch seinen Anteil. Mit `p = 0,25` und `s = 10` ergibt sich 1,29. Mit unendlichem `s` bleibt `1 / 0,75 = 1,33`. Vor einem Umbau lohnt sich die Rechnung: Ist der Gewinn klein, such zuerst die 75 % und prüfe, ob dort ein besserer Algorithmus hilft.
+    resources:
+      - title: PyO3 – Rust-Bindings für Python
+        url: https://pyo3.rs/
+      - title: Cython – Dokumentation
+        url: https://cython.readthedocs.io/
+
+  - id: profil-skript-ordnen
+    type: order
+    title: Ein Profil von Hand aufnehmen
+    prompt: |
+      Bring die Zeilen in die richtige Reihenfolge. Das Skript profiliert genau den Aufruf `verarbeite(zeilen)` und druckt die Ergebnisse sortiert nach kumulierter Zeit.
+    lang: python
+    lines: |
+      import cProfile
+      profiler = cProfile.Profile()
+      profiler.enable()
+      verarbeite(zeilen)
+      profiler.disable()
+      profiler.print_stats(sort="cumulative")
+    hints:
+      - Der Profiler zeichnet nur zwischen `enable()` und `disable()` auf.
+    explanation: |
+      Erst entsteht das `Profile`-Objekt, dann beginnt mit `enable()` die Aufzeichnung. Danach läuft der Code, den du untersuchen willst, und `disable()` beendet sie. Erst mit dem fertigen Profil druckst du die Statistik, hier mit `print_stats(sort="cumulative")`. Dieselbe Reihenfolge erledigt `with cProfile.Profile() as profiler:` für dich, auch wenn eine Exception fliegt.
+    resources:
+      - title: cProfile.Profile
+        url: https://docs.python.org/3/library/profile.html#profile.Profile
+
+  - id: aufrufe-zaehlen
+    type: output
+    title: Wie oft wurde was aufgerufen?
+    prompt: |
+      Was gibt dieses Programm aus? `ncalls` ist hier der Text, den `pstats` in der Spalte `ncalls` zeigt (die Funktionsnamen im Profil sind eindeutig).
+    lang: python
+    code: |
+      import cProfile
+      import pstats
+
+      def fib(n):
+          return n if n < 2 else fib(n - 1) + fib(n - 2)
+
+      def normalisiere(zeile):
+          return zeile.strip().lower()
+
+      def lade(zeilen):
+          return [normalisiere(z) for z in zeilen]
+
+      with cProfile.Profile() as profiler:
+          lade([" A", "b ", " C "])
+          fib(6)
+
+      profil = pstats.Stats(profiler).get_stats_profile().func_profiles
+      for name in ("lade", "normalisiere", "fib"):
+          print(name, profil[name].ncalls)
+    expected: |
+      lade 1
+      normalisiere 3
+      fib 25/1
+    hints:
+      - "`fib(2)` ruft `fib(1)` und `fib(0)` auf. Zähle für `fib(3)` und `fib(4)` mit und erkenne das Muster."
+      - Bei Rekursion steht in der Spalte `Aufrufe insgesamt/primitive Aufrufe`.
+    explanation: |
+      `lade` läuft einmal, `normalisiere` einmal je Eintrag. Bei `fib` ruft sich die Funktion selbst auf: `fib(6)` führt zu 25 Aufrufen. Davon kommt nur einer von außen, der „primitive“ Aufruf, die übrigen 24 sind Rekursion. `pstats` schreibt das als `25/1`. Dieser Zähler hängt nur vom Code ab, nicht von der Geschwindigkeit des Rechners. Deshalb sind Aufrufzähler besser für Tests geeignet als Zeiten.
+    resources:
+      - title: The Python Profilers · Instant User's Manual (ncalls)
+        url: https://docs.python.org/3/library/profile.html#instant-user-s-manual
+      - title: pstats.Stats.get_stats_profile
+        url: https://docs.python.org/3/library/profile.html#pstats.Stats.get_stats_profile
+
+  - id: vergleiche-liste-menge
+    type: output
+    title: Wie oft wird verglichen?
+    prompt: |
+      Die Klasse zählt in `verglichen`, wie oft `__eq__` aufgerufen wird. Was gibt das Programm aus?
+    lang: python
+    code: |
+      class Messwert:
+          verglichen = 0
+
+          def __init__(self, n):
+              self.n = n
+
+          def __eq__(self, andere):
+              Messwert.verglichen += 1
+              return self.n == andere.n
+
+          def __hash__(self):
+              return hash(self.n)
+
+      liste = [Messwert(i) for i in range(50)]
+      menge = set(liste)
+
+      Messwert.verglichen = 0
+      print(Messwert(49) in liste, Messwert.verglichen)
+
+      Messwert.verglichen = 0
+      print(Messwert(49) in menge, Messwert.verglichen)
+
+      Messwert.verglichen = 0
+      print(Messwert(-1) in liste, Messwert.verglichen)
+
+      Messwert.verglichen = 0
+      print(Messwert(-1) in menge, Messwert.verglichen)
+    expected: |
+      True 50
+      True 1
+      False 50
+      False 0
+    hints:
+      - Eine Liste prüft Element für Element. Hört sie auf, sobald sie etwas findet?
+      - "Eine Menge vergleicht erst die Hashwerte. `__eq__` kommt nur dran, wenn ein Hashwert passt."
+    explanation: |
+      In der Liste steht `Messwert(49)` ganz hinten: Die Suche vergleicht alle 50 Elemente. Fehlt der Wert, vergleicht sie ebenfalls alle 50. Bei der Menge reicht ein Hashwert, um den passenden Platz zu finden. Gibt es dort einen Eintrag mit demselben Hashwert, ruft Python einmal `__eq__` auf, um zu bestätigen, dass es dasselbe Objekt ist. Findet es keinen, entfällt jeder Vergleich. Das Muster ist O(n) gegen O(1), und hier siehst du es als Zahl.
+    resources:
+      - title: Python-Wiki · TimeComplexity
+        url: https://wiki.python.org/moin/TimeComplexity
+      - title: Sets – Implementierung und Hashbarkeit
+        url: https://docs.python.org/3/library/stdtypes.html#set-types-set-frozenset
+
+  - id: slots-vorhersagen
+    type: output
+    title: Wer hat noch ein __dict__?
+    prompt: Was gibt dieses Programm aus?
+    lang: python
+    code: |
+      class Messpunkt:
+          def __init__(self, x, y):
+              self.x = x
+              self.y = y
+
+      class MesspunktSlots:
+          __slots__ = ("x", "y")
+
+          def __init__(self, x, y):
+              self.x = x
+              self.y = y
+
+      class Gewichtet(MesspunktSlots):
+          pass
+
+      a = Messpunkt(1, 2)
+      b = MesspunktSlots(1, 2)
+      c = Gewichtet(1, 2)
+
+      print(hasattr(a, "__dict__"), hasattr(b, "__dict__"), hasattr(c, "__dict__"))
+
+      a.farbe = "rot"
+      c.farbe = "blau"
+      print(sorted(vars(a)), sorted(vars(c)))
+
+      try:
+          b.farbe = "grün"
+      except AttributeError:
+          print("b: AttributeError")
+    expected: |
+      True False True
+      ['farbe', 'x', 'y'] ['farbe']
+      b: AttributeError
+    hints:
+      - Eine Unterklasse erbt `__slots__`, aber was passiert, wenn sie selbst keins deklariert?
+      - "`x` und `y` von `c` liegen in Slots, nicht im `__dict__`."
+    explanation: |
+      Die Klasse `MesspunktSlots` hat kein `__dict__`. Die Unterklasse `Gewichtet` deklariert kein eigenes `__slots__`, deshalb bekommt sie ein `__dict__` zurück. Neue Attribute wie `farbe` landen dort. `x` und `y` liegen weiter in den Slots der Elternklasse, also zeigt `vars(c)` nur `farbe`. Bei `b` gibt es weder Platz noch Dictionary, Python wirft `AttributeError`. Der Speichergewinn von `__slots__` geht also verloren, wenn eine Unterklasse es vergisst.
+    resources:
+      - title: Data model · __slots__
+        url: https://docs.python.org/3/reference/datamodel.html#slots
+
+  - id: getsizeof-flach
+    type: output
+    title: Wie groß ist die große Liste?
+    prompt: |
+      `sys.getsizeof` liefert die Größe eines Objekts in Bytes. Was gibt dieses Programm aus? Die absoluten Zahlen sind egal, nur die Vergleiche zählen.
+    lang: python
+    code: |
+      import sys
+
+      klein = [[], [], []]
+      gross = [list(range(1000)), list(range(1000)), list(range(1000))]
+
+      print(sys.getsizeof(klein) == sys.getsizeof(gross))
+      print(sys.getsizeof(gross) > sum(sys.getsizeof(zeile) for zeile in gross))
+      print(sys.getsizeof(gross[0]) > sys.getsizeof(gross))
+    expected: |
+      True
+      False
+      True
+    hints:
+      - "Eine Liste speichert Zeiger auf ihre Elemente, nicht die Elemente selbst."
+      - Wie viele Zeiger enthält `gross`, und wie viele jede innere Liste?
+    explanation: |
+      `klein` und `gross` haben beide drei Einträge, also gleich viele Zeiger und dieselbe flache Größe. Die erste Ausgabe ist `True`. Die drei inneren Listen haben je 1000 Zeiger und sind zusammen viel größer als die äußere Liste, deshalb ist die zweite Ausgabe `False`. Die dritte ist `True`: Jede innere Liste ist größer als die äußere. `getsizeof` zählt Inhalte, auf die ein Objekt zeigt, nicht mit. Für den echten Verbrauch brauchst du `tracemalloc` oder eine Summe über alle erreichbaren Objekte.
+    resources:
+      - title: sys.getsizeof
+        url: https://docs.python.org/3/library/sys.html#sys.getsizeof
+
+  - id: top-k-beschleunigen
+    type: code
+    title: Beschleunige das Ranking
+    prompt: |
+      `top_k(eintraege, k, key=None)` soll die `k` größten Einträge **absteigend** zurückgeben. Bei gleichem Schlüssel bleibt die Eingabereihenfolge erhalten (wie bei `sorted(..., reverse=True)`). Ist `k` größer als die Zahl der Einträge, kommen alle zurück. Bei `k = 0` kommt eine leere Liste.
+
+      Der Startcode ist richtig, sortiert aber alle Einträge. Bei 1 000 Einträgen und `k = 3` sind das rund 8 600 Vergleiche. Beschleunige ihn so, dass die Funktion dafür weniger als `3 * n` Vergleiche braucht. Die Tests zählen die Vergleiche.
+    lang: python
+    starter: |
+      def top_k(eintraege, k, key=None):
+          return sorted(eintraege, key=key, reverse=True)[:k]
+    solution: |
+      import heapq
+
+      def top_k(eintraege, k, key=None):
+          return heapq.nlargest(k, eintraege, key=key)
+    setup: |
+      class Messwert:
+          vergleiche = 0
+
+          def __init__(self, wert):
+              self.wert = wert
+
+          def __lt__(self, anderer):
+              Messwert.vergleiche += 1
+              return self.wert < anderer.wert
+
+          def __eq__(self, anderer):
+              return self.wert == anderer.wert
+
+          def __hash__(self):
+              return hash(self.wert)
+    tests:
+      - name: Die größten Einträge, absteigend
+        code: |
+          ergebnis = top_k([5, 1, 9, 3, 7], 3)
+          assert ergebnis == [9, 7, 5], f"erwartet [9, 7, 5], bekommen {ergebnis!r}"
+      - name: Mit Schlüsselfunktion
+        code: |
+          umsatz = [{"kunde": "A", "summe": 40}, {"kunde": "B", "summe": 90}, {"kunde": "C", "summe": 65}]
+          ergebnis = top_k(umsatz, 2, key=lambda zeile: zeile["summe"])
+          assert [z["kunde"] for z in ergebnis] == ["B", "C"], ergebnis
+      - name: Gleicher Schlüssel behält die Eingabereihenfolge
+        code: |
+          paare = [("a", 1), ("b", 1), ("c", 0), ("d", 1)]
+          ergebnis = top_k(paare, 2, key=lambda p: p[1])
+          assert ergebnis == [("a", 1), ("b", 1)], ergebnis
+      - name: k größer als die Liste und k gleich 0
+        code: |
+          assert top_k([2, 1], 5) == [2, 1]
+          assert top_k([2, 1], 0) == []
+      - name: Weniger Vergleiche als vollständiges Sortieren
+        code: |
+          n = 1000
+          werte = [Messwert((i * 7919) % n) for i in range(n)]
+          Messwert.vergleiche = 0
+          ergebnis = top_k(werte, 3)
+          assert [w.wert for w in ergebnis] == [999, 998, 997], [w.wert for w in ergebnis]
+          assert Messwert.vergleiche < 3 * n, f"{Messwert.vergleiche} Vergleiche bei n = {n}: sortierst du noch alles?"
+    hints:
+      - Das Modul `heapq` hat eine Funktion, die nur die `k` größten Elemente liefert.
+      - "`heapq.nlargest(k, iterable, key=key)` liefert absteigend sortiert und unterstützt `key`."
+    explanation: |
+      Der Startcode ist O(n log n), obwohl du nur `k` Einträge brauchst. `heapq.nlargest` hält einen Heap mit den bisher besten `k` und prüft jedes Element dagegen: O(n log k). Für `k = 3` und 1 000 Einträge sind das knapp über 1 000 Vergleiche statt rund 8 600. Das Ergebnis ist laut Doku gleich zu `sorted(iterable, key=key, reverse=True)[:n]`, einschließlich der Reihenfolge bei Gleichstand. Bei großem `k` (etwa die Hälfte der Daten) ist `sorted` besser, bei `k == 1` reicht `max`.
+    resources:
+      - title: heapq.nlargest
+        url: https://docs.python.org/3/library/heapq.html#heapq.nlargest
+
+  - id: neue-kennungen-set
+    type: code
+    title: Repariere die Dublettenprüfung
+    prompt: |
+      `neue_kennungen(eingang, bekannt)` gibt alle Kennungen aus `eingang` zurück, die **nicht** in `bekannt` stehen. Die Reihenfolge des Eingangs bleibt erhalten, jede Kennung erscheint nur einmal. Die Kennungen sind hashbar.
+
+      Der Startcode liefert das richtige Ergebnis, vergleicht aber bei 500 Kennungen und 300 bekannten rund 150 000-mal. Mach daraus eine Lösung mit weniger als 1 000 Vergleichen. Die Tests zählen `__eq__`-Aufrufe.
+    lang: python
+    starter: |
+      def neue_kennungen(eingang, bekannt):
+          neu = []
+          for kennung in eingang:
+              if kennung not in bekannt and kennung not in neu:
+                  neu.append(kennung)
+          return neu
+    solution: |
+      def neue_kennungen(eingang, bekannt):
+          gesehen = set(bekannt)
+          neu = []
+          for kennung in eingang:
+              if kennung not in gesehen:
+                  gesehen.add(kennung)
+                  neu.append(kennung)
+          return neu
+    setup: |
+      class Kennung:
+          vergleiche = 0
+
+          def __init__(self, wert):
+              self.wert = wert
+
+          def __eq__(self, andere):
+              Kennung.vergleiche += 1
+              return self.wert == andere.wert
+
+          def __hash__(self):
+              return hash(self.wert)
+
+          def __repr__(self):
+              return f"K{self.wert}"
+    tests:
+      - name: Bekannte fallen weg, Dubletten auch
+        code: |
+          assert neue_kennungen([3, 1, 3, 2, 1], [2]) == [3, 1]
+      - name: Reihenfolge des Eingangs bleibt erhalten
+        code: |
+          assert neue_kennungen(["z", "a", "m"], []) == ["z", "a", "m"]
+      - name: Leerer Eingang
+        code: |
+          assert neue_kennungen([], [1, 2]) == []
+      - name: Der Eingang wird nicht verändert
+        code: |
+          eingang = [4, 4, 5]
+          neue_kennungen(eingang, [5])
+          assert eingang == [4, 4, 5], "eingang darf nicht verändert werden"
+      - name: Weniger als 1 000 Vergleiche bei 500 und 300
+        code: |
+          bekannt = [Kennung(i) for i in range(0, 600, 2)]
+          eingang = [Kennung((i * 37) % 700) for i in range(500)]
+          Kennung.vergleiche = 0
+          ergebnis = neue_kennungen(eingang, bekannt)
+          assert len(ergebnis) == 285, f"{len(ergebnis)} neue Kennungen, erwartet 285"
+          assert len({k.wert for k in ergebnis}) == 285
+          assert Kennung.vergleiche < 1000, f"{Kennung.vergleiche} Vergleiche: nutzt du ein Set statt einer Liste?"
+    hints:
+      - Jedes `in` auf einer Liste durchsucht die Liste. Welche Datenstruktur beantwortet „schon gesehen?“ in einem Schritt?
+      - Bau das Set einmal vor der Schleife und füge neue Kennungen sofort hinzu.
+    explanation: |
+      Im Startcode durchsucht `kennung not in bekannt` bis zu 300 Elemente, `kennung not in neu` bis zu 285. Bei 500 Kennungen sind das rund 150 000 Vergleiche. Ein Set beantwortet beides mit einem Hash-Lookup. `gesehen` enthält anfangs alle bekannten Kennungen und wächst um jede neue, damit fallen Dubletten im Eingang ebenfalls raus. Ein einziges Set ersetzt beide Listen. Du baust es einmal vor der Schleife, nicht in ihr.
+    resources:
+      - title: Python-Wiki · TimeComplexity
+        url: https://wiki.python.org/moin/TimeComplexity
+      - title: set (Built-in Types)
+        url: https://docs.python.org/3/library/stdtypes.html#set-types-set-frozenset
+
+  - id: kurse-nur-einmal-holen
+    type: code
+    title: Jeden Kurs nur einmal abrufen
+    prompt: |
+      `summe_in_euro(posten, hole_kurs)` addiert Beträge in verschiedenen Währungen zu einer Summe in Euro. `posten` ist eine Liste aus `(betrag, waehrung)`. `hole_kurs(waehrung)` liefert den Umrechnungskurs nach Euro und steht für einen teuren API-Aufruf. Die Funktion gibt `round(summe, 2)` zurück.
+
+      Der Startcode ruft `hole_kurs` für jeden Posten auf. Ändere ihn so, dass jede Währung **höchstens einmal je Aufruf** von `summe_in_euro` abgefragt wird. Das Ergebnis bleibt gleich.
+    lang: python
+    starter: |
+      def summe_in_euro(posten, hole_kurs):
+          summe = 0.0
+          for betrag, waehrung in posten:
+              summe += betrag * hole_kurs(waehrung)
+          return round(summe, 2)
+    solution: |
+      def summe_in_euro(posten, hole_kurs):
+          kurse = {}
+          summe = 0.0
+          for betrag, waehrung in posten:
+              if waehrung not in kurse:
+                  kurse[waehrung] = hole_kurs(waehrung)
+              summe += betrag * kurse[waehrung]
+          return round(summe, 2)
+    setup: |
+      class FakeKurse:
+          def __init__(self):
+              self.aufrufe = []
+
+          def __call__(self, waehrung):
+              self.aufrufe.append(waehrung)
+              return {"EUR": 1.0, "USD": 0.5, "GBP": 1.25}[waehrung]
+    tests:
+      - name: Die Summe stimmt
+        code: |
+          posten = [(100, "USD"), (40, "GBP"), (10, "EUR"), (50, "USD")]
+          assert summe_in_euro(posten, FakeKurse()) == 135.0
+      - name: Jede Währung wird einmal abgerufen
+        code: |
+          kurse = FakeKurse()
+          summe_in_euro([(100, "USD"), (40, "GBP"), (10, "EUR"), (50, "USD"), (5, "USD")], kurse)
+          assert sorted(kurse.aufrufe) == ["EUR", "GBP", "USD"], f"abgerufen wurde: {kurse.aufrufe}"
+      - name: Keine Posten, keine Abrufe
+        code: |
+          kurse = FakeKurse()
+          assert summe_in_euro([], kurse) == 0.0
+          assert kurse.aufrufe == []
+      - name: Der Cache gilt nur für einen Aufruf
+        code: |
+          kurse = FakeKurse()
+          summe_in_euro([(1, "USD")], kurse)
+          summe_in_euro([(1, "USD")], kurse)
+          assert kurse.aufrufe == ["USD", "USD"], "Kurse ändern sich: jeder Aufruf holt sie neu"
+    hints:
+      - Ein Dictionary `waehrung → kurs`, das vor der Schleife angelegt wird, merkt sich das Ergebnis.
+      - "`lru_cache` geht hier nicht: `hole_kurs` ist ein Parameter, und der Cache soll nicht länger leben als der Aufruf."
+    explanation: |
+      Der Startcode ruft die API einmal je Posten auf, bei 5 000 Posten in drei Währungen also 5 000-mal statt dreimal. Ein lokales Dictionary merkt sich die Kurse während eines Aufrufs. Ein dauerhafter Cache (etwa `lru_cache`) würde veraltete Kurse liefern, bis jemand ihn leert. Die Lebensdauer des Caches gehört zum Entwurf. Hier hat jeder Aufruf frische Kurse und holt jede Währung genau einmal.
+    resources:
+      - title: functools.lru_cache
+        url: https://docs.python.org/3/library/functools.html#functools.lru_cache
+      - title: dict (Mapping Types)
+        url: https://docs.python.org/3/library/stdtypes.html#mapping-types-dict
+
+  - id: benchmark-sortiert-nur-einmal
+    type: bug
+    title: Der Benchmark ist zu gut
+    prompt: |
+      Ein Benchmark soll messen, wie lange das Sortieren von 100 000 zufälligen Zahlen dauert. Er meldet 0,2 ms je Sortierung. Im Betrieb mit zufälligen Daten dauert dieselbe Sortierung über 15 ms. Finde die Zeile, die die Messung unbrauchbar macht, und korrigiere sie.
+    lang: python
+    code: |
+      import random
+      import timeit
+
+      daten = [random.random() for _ in range(100_000)]
+      zeiten = timeit.repeat(lambda: daten.sort(), number=10, repeat=5)
+      print(f"{min(zeiten) / 10 * 1000:.2f} ms pro Sortierung")
+    lines: [5]
+    fix:
+      - line: 5
+        answers:
+          - "zeiten = timeit.repeat(lambda: sorted(daten), number=10, repeat=5)"
+          - "zeiten = timeit.repeat(lambda: list(daten).sort(), number=10, repeat=5)"
+          - "zeiten = timeit.repeat(lambda: daten.copy().sort(), number=10, repeat=5)"
+    hints:
+      - Was ist `daten` nach dem ersten Lauf von `daten.sort()`?
+      - Timsort braucht für schon sortierte Daten nur einen Durchlauf.
+    explanation: |
+      `daten.sort()` sortiert die Liste an Ort und Stelle. Nur der allererste Lauf arbeitet auf zufälligen Daten. Die übrigen 49 sortieren eine schon sortierte Liste, für die Timsort nur einen linearen Durchlauf braucht. Weil du das Minimum nimmst, siehst du genau diese unrealistisch schnelle Messung. Benchmarks müssen in jedem Lauf auf denselben Anfangszustand starten. `sorted(daten)` und `daten.copy().sort()` erledigen das, denn beide sortieren eine Kopie. Die Kopie kostet etwas Zeit, die im Betrieb ebenfalls anfällt.
+    resources:
+      - title: timeit · Examples
+        url: https://docs.python.org/3/library/timeit.html#examples
+      - title: Sorting HOWTO
+        url: https://docs.python.org/3/howto/sorting.html
+
+  - id: pstats-export-lesen
+    type: explain
+    title: Das Profil des Export-Jobs
+    prompt: |
+      Der Export-Job für Rechnungen braucht 6,9 Sekunden. Unten steht ein Profil, sortiert nach `cumulative`. `lade_kunde(kunden_id)` sucht den Datensatz jedes Mal in `kunden.csv`. Erkläre, wo die Zeit hingeht, was `tottime` und `cumtime` bei `baue_zeile` und bei `lade_kunde` aussagen und was du als Nächstes tust.
+    lang: text
+    code: |2
+             1829441 function calls (1829381 primitive calls) in 6.912 seconds
+
+       Ordered by: cumulative time
+       List reduced from 94 to 6 due to restriction <6>
+
+       ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+            1    0.001    0.001    6.912    6.912 export.py:61(main)
+            1    0.020    0.020    6.911    6.911 export.py:40(schreibe_bericht)
+        12000    0.310    0.000    6.480    0.001 export.py:22(baue_zeile)
+        12000    5.870    0.000    5.870    0.000 export.py:12(lade_kunde)
+        12000    0.095    0.000    0.200    0.000 export.py:30(formatiere_betrag)
+      1020000    0.140    0.000    0.140    0.000 {method 'append' of 'list' objects}
+    points:
+      - "Rund 85 % der Gesamtzeit (5,87 von 6,91 s) stecken in `lade_kunde` selbst. `tottime` und `cumtime` sind gleich, die Funktion ruft also fast nichts auf."
+      - "`baue_zeile` hat hohe `cumtime`, aber kleine `tottime`. Die Zeit liegt in ihren Unteraufrufen. Sie umzuschreiben brächte nichts."
+      - "`main` und `schreibe_bericht` stehen oben, weil sie alles aufrufen. Das sagt nichts über Engpässe."
+      - "12 000 Aufrufe bei je rund 0,5 ms zeigen ein Muster. Dieselbe Datei wird 12 000-mal gelesen. Ich lese sie einmal in ein Dictionary und schlage nach."
+      - "Danach messe ich mit derselben Eingabe erneut. Nach Amdahl sind mit 85 % Anteil höchstens etwa 6,7-fach drin."
+    explanation: |
+      Die Tabelle ist nach `cumulative` sortiert, deshalb stehen oben die Aufrufer. Der Engpass zeigt sich an `tottime`: `lade_kunde` verbraucht 5,87 von 6,91 Sekunden selbst und hat fast keine Unteraufrufe. `baue_zeile` hat eine kumulierte Zeit von 6,48 s, aber nur 0,31 s eigene Zeit, denn der Rest ist `lade_kunde`. Es wird 12 000-mal aufgerufen und liest dabei jedes Mal die CSV-Datei. Ich würde die Kundendatei einmal in ein Dictionary laden, `lade_kunde` durch einen Lookup ersetzen und mit derselben Eingabe neu messen. Mit 85 % Anteil liegt die Obergrenze nach Amdahl bei etwa 6,7-fach. Dann prüfe ich das Profil erneut, denn der zweitgrößte Posten wird jetzt sichtbar.
+    resources:
+      - title: The Python Profilers · Instant User's Manual
+        url: https://docs.python.org/3/library/profile.html#instant-user-s-manual
+
+  - id: tracemalloc-leck-erklaeren
+    type: explain
+    title: Das Leck im tracemalloc-Vergleich
+    prompt: |
+      Ein Dienst wächst im Betrieb von 300 MB auf über 2 GB. Du hast morgens und abends einen Snapshot gemacht und `abends.compare_to(morgens, "lineno")` ausgegeben (die drei größten Zeilen unten). Erkläre die Ausgabe, benenne die verdächtige Zeile und sage, warum `sys.getsizeof` hier nicht reicht.
+    lang: text
+    code: |
+      app/cache.py:31: size=412 MiB (+398 MiB), count=3600120 (+3500100), average=120 B
+      app/parser.py:58: size=18.2 MiB (+0 B), count=52000 (+0), average=367 B
+      app/models.py:14: size=9.6 MiB (+1210 KiB), count=21000 (+3000), average=479 B
+    points:
+      - "`size` ist der aktuelle Speicher der Zeile, der Wert in Klammern die Differenz zum ersten Snapshot, `count` die Zahl der Blöcke."
+      - "`app/cache.py:31` wächst um 398 MiB und 3,5 Mio. Blöcke. Dort legt Code Objekte an, die nie freigegeben werden. Verdacht ist ein Cache ohne Obergrenze."
+      - "`app/parser.py:58` ist groß, wächst aber nicht (+0 B). Das ist Grundlast und kein Leck. Auf die Differenz kommt es an, nicht auf die Größe."
+      - "`sys.getsizeof` zeigt nur die flache Größe eines Objekts und nicht, wo es entstand. `tracemalloc` ordnet jeden Block seiner Zeile zu."
+      - "Als Nächstes setze ich eine Obergrenze oder Ablaufzeit (zum Beispiel `lru_cache(maxsize=…)`) und prüfe mit `tracemalloc.start(25)` die Aufrufkette."
+    explanation: |
+      `compare_to` zieht den ersten vom zweiten Snapshot ab und sortiert nach der Differenz. Die erste Zeile sticht heraus: 398 MiB und 3,5 Millionen Blöcke von je etwa 120 Byte kamen in `cache.py:31` hinzu. Das spricht für einen Cache oder ein Dictionary, das nur wächst. `parser.py:58` ist mit 18 MiB beträchtlich, aber stabil. `getsizeof` kann das nicht leisten: Es zeigt für ein Objekt nur die flache Größe, kennt weder die Herkunft noch die Entwicklung über die Zeit. Mit `tracemalloc.start(25)` speicherst du die Aufrufkette und siehst mit `compare_to(..., "traceback")`, wer `cache.py:31` aufruft.
+    resources:
+      - title: tracemalloc · Compute differences
+        url: https://docs.python.org/3/library/tracemalloc.html#compute-differences
+      - title: tracemalloc.Snapshot.compare_to
+        url: https://docs.python.org/3/library/tracemalloc.html#tracemalloc.Snapshot.compare_to
+
+  - id: auswertung-selbst-profilieren
+    type: practice
+    title: Profiliere und beschleunige die Log-Auswertung
+    prompt: |
+      Hier läuft nichts im Browser, denn Zeiten sind dort wertlos. Lege den Starter lokal als `auswertung.py` ab und arbeite mit dem Terminal.
+
+      1. Nimm ein Profil von `zaehle_fehler` auf und sortiere nach `tottime`.
+      2. Benenne den Engpass anhand der Spalten und behebe ihn.
+      3. Stelle sicher, dass das Ergebnis dasselbe ist wie vorher.
+      4. Vergleiche vorher und nachher mit `timeit.repeat` und nenne das Minimum je Aufruf.
+    lang: python
+    starter: |
+      BOT_IPS = [f"10.9.{i // 250}.{i % 250}" for i in range(1500)]
+      PFADE = ["/", "/login", "/api/nutzer", "/api/bestellungen", "/health"]
+
+      def erzeuge_log(n):
+          zeilen = []
+          for i in range(n):
+              ip = BOT_IPS[(i * 7) % 1500] if i % 4 == 0 else f"192.168.{i % 40}.{i % 250}"
+              zeilen.append(f"{ip} GET {PFADE[i % 5]} {500 if i % 3 == 0 else 200}")
+          return zeilen
+
+      def parse_zeile(zeile):
+          ip, methode, pfad, status = zeile.split()
+          return ip, pfad, int(status)
+
+      def ist_bot(ip):
+          return ip in BOT_IPS
+
+      def zaehle_fehler(zeilen):
+          fehler = {}
+          for zeile in zeilen:
+              ip, pfad, status = parse_zeile(zeile)
+              if status >= 500 and not ist_bot(ip):
+                  fehler[pfad] = fehler.get(pfad, 0) + 1
+          return fehler
+    solution: |
+      import cProfile
+      import pstats
+      import timeit
+
+      BOT_IPS = [f"10.9.{i // 250}.{i % 250}" for i in range(1500)]
+      PFADE = ["/", "/login", "/api/nutzer", "/api/bestellungen", "/health"]
+
+      def erzeuge_log(n):
+          zeilen = []
+          for i in range(n):
+              ip = BOT_IPS[(i * 7) % 1500] if i % 4 == 0 else f"192.168.{i % 40}.{i % 250}"
+              zeilen.append(f"{ip} GET {PFADE[i % 5]} {500 if i % 3 == 0 else 200}")
+          return zeilen
+
+      def parse_zeile(zeile):
+          ip, methode, pfad, status = zeile.split()
+          return ip, pfad, int(status)
+
+      def ist_bot(ip, bots):
+          return ip in bots
+
+      def zaehle_fehler(zeilen, bots):
+          fehler = {}
+          for zeile in zeilen:
+              ip, pfad, status = parse_zeile(zeile)
+              if status >= 500 and not ist_bot(ip, bots):
+                  fehler[pfad] = fehler.get(pfad, 0) + 1
+          return fehler
+
+      def messe(label, funktion):
+          zeiten = timeit.repeat(funktion, number=1, repeat=7)
+          print(f"{label}: {min(zeiten) * 1000:.1f} ms (Minimum aus 7)")
+
+      if __name__ == "__main__":
+          zeilen = erzeuge_log(20_000)
+
+          with cProfile.Profile() as profiler:
+              vorher = zaehle_fehler(zeilen, BOT_IPS)
+          pstats.Stats(profiler).strip_dirs().sort_stats("tottime").print_stats(4)
+          # Engpass: ist_bot hat die höchste tottime. `ip in BOT_IPS` durchsucht eine Liste.
+
+          bots = frozenset(BOT_IPS)
+          nachher = zaehle_fehler(zeilen, bots)
+          assert nachher == vorher, "Das Ergebnis darf sich nicht ändern"
+
+          messe("Liste", lambda: zaehle_fehler(zeilen, BOT_IPS))
+          messe("Set", lambda: zaehle_fehler(zeilen, bots))
+    checklist:
+      - "Du hast das Profil mit `cProfile` aufgenommen und nach `tottime` sortiert, nicht nach `cumtime`."
+      - "Du hast `ist_bot` als Engpass benannt und begründet: hohe `tottime`, Listensuche per `in`."
+      - "Die Bots liegen in einem `set` oder `frozenset`, das einmal vor der Schleife entsteht."
+      - "Ein Vergleich (`assert`) stellt sicher, dass das Ergebnis vor und nach der Änderung gleich ist."
+      - "Du hast mit `timeit.repeat` gemessen, das Minimum genommen und `setup` oder die Datenerzeugung aus der Messung gehalten."
+      - "Du hast nur eine Sache geändert, und nur diese."
+    explanation: |
+      Auf einem normalen Rechner liegen der Listenlauf bei rund 45 ms und der Set-Lauf bei rund 5 ms für 20 000 Zeilen. Die Zahlen auf deinem Rechner weichen ab, das Verhältnis (etwa Faktor 9) sollte ähnlich sein. Das Profil hat dir gezeigt, wohin du schauen musst, und der Vergleich mit `assert` hat gesichert, dass die Beschleunigung nicht das Ergebnis verändert. Das ist der Ablauf, den du in jedem Projekt wiederholst: Profil, eine Änderung, Kontrolle, Messung.
+    resources:
+      - title: The Python Profilers
+        url: https://docs.python.org/3/library/profile.html
+      - title: timeit.repeat
+        url: https://docs.python.org/3/library/timeit.html#timeit.repeat

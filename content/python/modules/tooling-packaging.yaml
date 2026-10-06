@@ -1,7 +1,7 @@
 id: tooling-packaging
 title: Tooling & Packaging
 level: 3
-minutes: 160
+minutes: 240
 summary: 'Python-Projekte reproduzierbar aufbauen: uv, virtuelle Umgebungen, Ruff, pyproject.toml, src-Layout und
   installierbare Pakete.'
 goals:
@@ -9,6 +9,9 @@ goals:
 - Du pflegst pyproject.toml und uv.lock mit bewusstem Versionsvertrag.
 - Du formatierst und prüfst Code mit Ruff und führst Werkzeuge reproduzierbar aus.
 - Du baust ein Wheel und prüfst seine Installation außerhalb des Quellverzeichnisses.
+- Du trennst Entwicklungswerkzeuge (`[dependency-groups]`) von optionalen Funktionen (Extras) und wählst Versionsangaben für Anwendung und Bibliothek.
+- Du aktualisierst Abhängigkeiten kontrolliert (`uv lock --upgrade-package`, Diff im PR, `--locked` in der CI) und prüfst sie mit `uv audit` oder `pip-audit`.
+- Du liest den Inhalt eines Wheels und einer sdist und findest Dateien, die dort nicht hingehören.
 resources:
 - &id001
   title: uv · Projects
@@ -19,6 +22,10 @@ resources:
   url: https://docs.astral.sh/ruff/tutorial/
 - title: Packaging · src layout
   url: https://packaging.python.org/en/latest/discussions/src-layout-vs-flat-layout/
+- title: uv · Managing dependencies
+  url: https://docs.astral.sh/uv/concepts/projects/dependencies/
+- title: Packaging · Dependency Groups
+  url: https://packaging.python.org/en/latest/specifications/dependency-groups/
 lesson: |
   „Auf meinem Rechner läuft es“ hilft wenig, wenn ein Kollege eine andere Bibliotheksversion installiert oder die CI versehentlich den falschen Interpreter verwendet. Tooling macht aus einer lose zusammenkopierten Sammlung von Dateien ein Projekt mit nachvollziehbaren Eingaben, Prüfungen und auslieferbaren Ergebnissen.
 
@@ -153,6 +160,252 @@ lesson: |
 
   Der Beispielpfad gehört zu Linux oder macOS. Nutze auf Windows die entsprechende `Scripts`-Struktur. Für eine ausführliche Einführung in Build und Distribution siehe das [Packaging-Tutorial](https://packaging.python.org/en/latest/tutorials/packaging-projects/).
 
+  ## Entwicklungswerkzeuge trennen: dependency-groups
+
+  `pytest` und `ruff` braucht das Team, die Nutzer deines Pakets nicht. Früher landeten sie in einer `requirements-dev.txt`. Heute gibt es dafür einen Standard: [Dependency Groups](https://packaging.python.org/en/latest/specifications/dependency-groups/) (PEP 735), eine eigene Tabelle `[dependency-groups]` neben `[project]`.
+
+  ```toml
+  [dependency-groups]
+  dev = ["pytest>=9.1.1"]
+  lint = ["ruff>=0.16.10"]
+  ```
+
+  Du legst Gruppen mit `uv add` an und wählst beim Installieren, welche du brauchst ([Dependency groups in uv](https://docs.astral.sh/uv/concepts/projects/dependencies/#dependency-groups)):
+
+  ```console
+  $ uv add --dev pytest
+  $ uv add --group lint ruff
+  $ uv sync
+  $ uv sync --group lint
+  $ uv sync --no-dev
+  $ uv sync --only-group lint
+  ```
+
+  `uv add --dev` schreibt in die Gruppe `dev`. Diese Gruppe ist besonders: uv installiert sie bei `uv sync` und `uv run` standardmäßig ([Default groups](https://docs.astral.sh/uv/concepts/projects/dependencies/#default-groups)). Jede andere Gruppe kommt nur mit `--group name` dazu, alle mit `--all-groups`. `--no-dev` lässt `dev` weg, `--only-group lint` installiert ausschließlich `ruff`, nicht einmal dein Projekt. Das ist ideal für einen Lint-Job in der CI, der keine Abhängigkeiten der Anwendung braucht. `uv sync` stellt die Umgebung exakt her und deinstalliert, was zu keiner gewählten Gruppe gehört.
+
+  Gruppen stehen nicht in den Metadaten des Wheels. Wer dein Paket installiert, bekommt `pytest` nie. Auch pip installiert Gruppen aus einer `pyproject.toml`: `pip install --group lint` gibt es seit pip 25.1 ([Release Notes](https://pip.pypa.io/en/stable/news/)).
+
+  ## Extras: optionale Funktionen für Nutzer
+
+  Manche Funktionen brauchen zusätzliche Pakete, die nicht jeder will. Die farbige Ausgabe deiner CLI zieht `rich` nach, aber nur für Nutzer, die sie wünschen. Das regelt ein Extra in `[project.optional-dependencies]`:
+
+  ```toml
+  [project.optional-dependencies]
+  cli = ["rich>=13"]
+  ```
+
+  ```console
+  $ uv add --optional cli "rich>=13"
+  $ uv sync --extra cli
+  $ uv sync --all-extras
+  $ pip install "bericht-cli[cli]"
+  ```
+
+  Anders als Gruppen veröffentlicht das Wheel Extras in seinen Metadaten. Die Zeilen `Provides-Extra: cli` und `Requires-Dist: rich>=13; extra == 'cli'` stehen in der `METADATA`. Mit `pip install "bericht-cli[cli]"` bekommen Nutzer `rich` dazu, ohne Extra nicht ([uv · Optional dependencies](https://docs.astral.sh/uv/concepts/projects/dependencies/#optional-dependencies)).
+
+  | | `[dependency-groups]` | `[project.optional-dependencies]` |
+  | --- | --- | --- |
+  | Zielgruppe | Entwickler des Projekts | Nutzer des Pakets |
+  | Im Wheel | nein | ja |
+  | Installieren | `uv sync --group lint` | `pip install "paket[extra]"`, `uv sync --extra cli` |
+  | Beispiel | `pytest`, `ruff`, `mypy` | `rich` für eine optionale CLI |
+
+  Brauchen nur die Entwickler etwas, nimm eine Gruppe. Soll ein Nutzer eine Funktion zuschalten können, nimm ein Extra. Ältere Projekte führen Testwerkzeuge oft als Extra `test` oder `dev`. Das veröffentlicht sie als installierbare Option. Neue Projekte nehmen Gruppen.
+
+  ## Versionsangaben: Bereich, Untergrenze, exakter Pin
+
+  Eine Versionsangabe ist ein Vertrag mit deinen Nutzern und mit dir selbst. Die Schreibweise legt [PEP 440](https://packaging.python.org/en/latest/specifications/version-specifiers/) fest:
+
+  | Angabe | Erlaubt | Beispiel |
+  | --- | --- | --- |
+  | `==1.4.2` | genau diese Version | nur 1.4.2 |
+  | `>=1.4` | diese und jede neuere | 1.4, 1.9, 2.0 |
+  | `>=1.4,<2` | ein Bereich bis vor die nächste Hauptversion | 1.4 bis 1.x |
+  | `~=1.4` | kompatibel: `>=1.4, ==1.*` | 1.4, 1.9, nicht 2.0 |
+  | `~=1.4.2` | kompatibel: `>=1.4.2, ==1.4.*` | 1.4.2, 1.4.9, nicht 1.5 |
+
+  Das [kompatible Release](https://packaging.python.org/en/latest/specifications/version-specifiers/#compatible-release) `~=` bindet die letzte angegebene Stelle nach oben: Die vorletzte darf nicht steigen.
+
+  Welche Angabe richtig ist, hängt davon ab, wer dein Projekt installiert.
+
+  - **Anwendung** (läuft bei dir oder in deinem Betrieb): In der `pyproject.toml` stehen Untergrenzen, wie `uv add` sie schreibt. Die exakten Versionen hält `uv.lock` fest, und du committest die Datei. Der Pin lebt im Lockfile, nicht in `dependencies`.
+  - **Bibliothek** (andere installieren sie in ihre Projekte): Nutze Untergrenzen und keine Obergrenze ohne bekannten Grund. Ein `==` ist fast immer falsch.
+
+  Der Grund liegt im Resolver. Nutzer kombinieren deine Bibliothek mit anderen Paketen. Pinnt `radwerk-client` die Version `httpx==0.27.2`, braucht aber das Projekt des Nutzers `httpx>=0.28`, gibt es keine Lösung, und der Nutzer kann nichts ändern:
+
+  ```console
+  $ uv lock
+  error: No solution found when resolving dependencies
+    cause: Because only radwerk-client==2.3.0 is available and radwerk-client==2.3.0 depends on httpx==0.27.2, we can conclude that all versions of radwerk-client depend on httpx==0.27.2.
+           And because your project depends on httpx>=0.28 and radwerk-client, we can conclude that your project's requirements are unsatisfiable.
+  ```
+
+  Das Python Packaging User Guide nennt es nicht empfohlen, Abhängigkeiten in `install_requires` auf Versionen festzulegen ([install_requires vs requirements files](https://packaging.python.org/en/latest/discussions/install-requires-vs-requirements/)). Henry Schreiner begründet ausführlich, warum Obergrenzen in Bibliotheken mehr Probleme schaffen als lösen ([Should you use upper bound version constraints?](https://iscinumpy.dev/post/bound-version-constraints/)). Eine Obergrenze brauchst du nur, wenn du eine Inkompatibilität kennst. Schreibe dann den Grund als Kommentar daneben. Das `<1` im Beispiel weiter oben ist so eine bewusste Grenze: Es fängt eine Hauptversion ab, die Brüche bringen darf.
+
+  > [!INTERVIEW] „Pinnst du Abhängigkeiten?“
+  > Das hängt davon ab, wer das Projekt installiert. Eine Anwendung hat ein Lockfile mit exakten Versionen und Untergrenzen in der `pyproject.toml`. Eine Bibliothek gibt Bereiche an, ohne Obergrenze, solange ich keine Inkompatibilität kenne. Ein exakter Pin in einer Bibliothek erzeugt Konflikte in den Projekten, die sie nutzen.
+
+  Die Untergrenze sollte die älteste Version sein, gegen die du wirklich testest. `uv add` trägt die aktuelle Version ein. Ob die Untergrenze stimmt, prüfst du mit `uv lock --resolution lowest-direct` und einem Testlauf.
+
+  ## Aktualisieren: Upgrade-Workflow
+
+  Ein Lockfile friert Versionen ein. Aktualisierungen sind deshalb eine bewusste Änderung. Der Ablauf besteht aus fünf Schritten.
+
+  1. **Veraltetes finden.** `uv tree --outdated --depth 1` zeigt hinter jeder direkten Abhängigkeit die neueste Version.
+  2. **Gezielt aktualisieren.** `uv lock --upgrade-package httpx` hebt nur `httpx` und das, was es zwingend nachzieht. `uv lock --upgrade` hebt alles, was die Bereiche in `pyproject.toml` erlauben ([Upgrading locked package versions](https://docs.astral.sh/uv/concepts/projects/sync/#upgrading-locked-package-versions)).
+  3. **Diff prüfen.** `git diff uv.lock` zeigt, welche Pakete neu, entfernt oder in der Hauptversion gesprungen sind. Ein Lockfile-Diff ist ein Review von Fremdcode.
+  4. **Testen.** Voller Testlauf mit der neuen Auflösung.
+  5. **Als eigener PR mergen.** So lässt sich ein Fehler später einem Upgrade zuordnen.
+
+  ```console
+  $ uv tree --outdated --depth 1
+  Resolved 19 packages in 1ms
+  bericht-cli v0.1.0
+  ├── httpx v0.27.2 (latest: v0.28.1)
+  ├── rich v15.0.0 (extra: cli)
+  └── pytest v9.1.1 (group: dev)
+  $ uv lock --upgrade-package httpx
+  Resolved 18 packages in 94ms
+  Updated httpx v0.27.2 -> v0.28.1
+  Removed sniffio v1.3.1
+  $ uv tree --invert --package h11
+  Resolved 18 packages in 0.55ms
+  h11 v0.16.0
+  └── httpcore v1.0.9
+      └── httpx v0.28.1
+          └── bericht-cli v0.1.0
+  ```
+
+  `uv tree --invert --package h11` beantwortet die Frage, warum ein unbekanntes Paket im Lockfile steht: Es kommt über `httpcore` und `httpx` herein.
+
+  In der CI darf niemand das Lockfile still ändern. Dafür gibt es zwei Optionen ([Locking and syncing](https://docs.astral.sh/uv/concepts/projects/sync/)):
+
+  | Option | Verhalten |
+  | --- | --- |
+  | `--locked` | Scheitert, wenn `uv.lock` nicht zu `pyproject.toml` passt. |
+  | `--frozen` | Nimmt `uv.lock` unverändert, ohne zu prüfen, ob es aktuell ist. |
+
+  ```console
+  $ uv sync --locked
+  error: The lockfile at `uv.lock` needs to be updated, but `--locked` was provided.
+
+  hint: To update the lockfile, run `uv lock`.
+  ```
+
+  Nutze in der CI `uv sync --locked` oder `uv run --locked pytest`. `uv lock --check` prüft dasselbe, ohne etwas zu installieren. `--frozen` passt, wenn ein früherer Schritt die Übereinstimmung schon geprüft hat, etwa in einem Docker-Build.
+
+  ## Sicherheitsprüfung: bekannte Schwachstellen in Abhängigkeiten
+
+  Jedes Paket im Lockfile ist Code, den du nicht geschrieben hast. Für viele Versionen sind Schwachstellen veröffentlicht. Ein Audit gleicht dein Lockfile gegen solche Datenbanken ab. Zwei Werkzeuge stehen zur Wahl.
+
+  `uv audit` ist in uv eingebaut und liest `uv.lock`. Es ist in uv 0.12 noch eine Vorschau („experimental“), und sein Verhalten kann sich ändern ([Ankündigung](https://astral.sh/blog/uv-audit), [Referenz](https://docs.astral.sh/uv/reference/cli/#uv-audit)). Es fragt die OSV-Datenbank ab. Bei Funden endet es mit Exit-Code 1.
+
+  ```console
+  $ uv audit
+  warning: `uv audit` is experimental and may change without warning. Pass `--preview-features audit-command` to disable this warning.
+  Resolved 6 packages in 0.54ms
+  Found 38 known vulnerabilities and no adverse project statuses in 5 packages
+
+  Vulnerabilities:
+
+  idna 2.7 has 4 known vulnerabilities:
+
+  - GHSA-jjg7-2v4v-x38h: Internationalized Domain Names in Applications (IDNA) vulnerable to denial of service from specially crafted inputs to idna.encode
+
+    Fixed in: 3.7
+
+    Advisory information: https://nvd.nist.gov/vuln/detail/CVE-2024-3651
+  …
+  ```
+
+  [`pip-audit`](https://pypi.org/project/pip-audit/) gehört zur Python Packaging Authority und ist seit Jahren stabil. Es liest Requirements-Dateien. Exportiere das Lockfile dorthin und starte das Werkzeug ohne Installation mit `uvx`:
+
+  ```console
+  $ uv export --no-emit-project -o requirements.txt
+  $ uvx pip-audit -r requirements.txt
+  Found 37 known vulnerabilities in 3 packages
+  Name     Version ID              Fix Versions
+  -------- ------- --------------- -------------
+  idna     2.7     PYSEC-2024-60   3.7
+  idna     2.7     PYSEC-2026-215  3.15
+  requests 2.19.0  PYSEC-2018-28   2.20.0
+  …
+  ```
+
+  `pip-audit -r -` liest nicht von der Standardeingabe, das Werkzeug meldet `invalid requirements input: -` (geprüft mit pip-audit 2.10.1). Schreibe die Datei und gib sie an. Alternativ liest es `pylock.toml`: `uv export --format pylock.toml -o pylock.toml`, dann `uvx pip-audit --locked .`. Die `uv.lock` selbst versteht pip-audit nicht (`no lockfiles found`). Die Zahlen oben sind Beispiele, jeden Tag kommen neue Meldungen dazu.
+
+  Was ein Treffer verlangt, hängt vom Eintrag ab. Die Spalte `Fix Versions` nennt die Version, die den Fehler behebt. Du hebst das Paket an (`uv lock --upgrade-package idna`), testest und mergst. Ist es eine transitive Abhängigkeit, genügt das Lockfile, in `pyproject.toml` ändert sich nichts. Gibt es noch keine Korrektur, entscheidest du bewusst: warten, ersetzen oder die Meldung mit `--ignore-vuln ID` (pip-audit) beziehungsweise `--ignore ID` (uv) ausblenden, aber nur mit Ticket und Frist.
+
+  Grenzen:
+
+  - Beide Werkzeuge kennen nur veröffentlichte Schwachstellen. Eine neue Lücke fehlt, bis jemand sie meldet.
+  - Sie prüfen Versionen, nicht deinen Code. Ob du die verwundbare Funktion aufrufst, sagen sie nicht.
+  - Neue Meldungen erscheinen für unveränderten Code. Lasse den Audit deshalb zusätzlich nach Zeitplan laufen, etwa wöchentlich, und nicht nur im PR.
+
+  ## Das gebaute Wheel lesen: Inhalt, Metadaten, sdist
+
+  `uv build` legt unter `dist/` zwei Dateien ab. Es baut zuerst eine Quelldistribution (sdist) und daraus das Wheel ([Building distributions](https://docs.astral.sh/uv/concepts/projects/build/#building-distributions)). Mit `--sdist` oder `--wheel` bekommst du nur eine der beiden.
+
+  | | Wheel (`.whl`) | sdist (`.tar.gz`) |
+  | --- | --- | --- |
+  | Inhalt | genau die Dateien, die bei der Installation kopiert werden | Quellcode samt `pyproject.toml` und `PKG-INFO` |
+  | Installation | direkt, ohne Build | braucht erst einen Build |
+  | Tests und Doku | gehören nicht hinein | oft dabei |
+
+  Das beschreibt der Leitfaden [Source distributions vs. wheels](https://packaging.python.org/en/latest/discussions/package-formats/). Ein Wheel ist ein ZIP-Archiv. Du liest es, ohne es zu installieren:
+
+  ```console
+  $ uv build
+  Building source distribution...
+  Building wheel from source distribution...
+  Successfully built dist/bericht_cli-0.1.0.tar.gz
+  Successfully built dist/bericht_cli-0.1.0-py3-none-any.whl
+  $ unzip -l dist/bericht_cli-0.1.0-py3-none-any.whl
+    Length      Date    Time    Name
+  ---------  ---------- -----   ----
+         48  2020-02-02 00:00   bericht_cli/__init__.py
+          0  2020-02-02 00:00   bericht_cli/py.typed
+        264  2020-02-02 00:00   bericht_cli-0.1.0.dist-info/METADATA
+         87  2020-02-02 00:00   bericht_cli-0.1.0.dist-info/WHEEL
+         45  2020-02-02 00:00   bericht_cli-0.1.0.dist-info/entry_points.txt
+        468  2020-02-02 00:00   bericht_cli-0.1.0.dist-info/RECORD
+  ---------                     -------
+        912                     6 files
+  $ unzip -p dist/bericht_cli-0.1.0-py3-none-any.whl '*/METADATA'
+  Metadata-Version: 2.5
+  Name: bericht-cli
+  Version: 0.1.0
+  Requires-Python: >=3.12
+  Requires-Dist: httpx>=0.28
+  Provides-Extra: cli
+  Requires-Dist: rich>=13; extra == 'cli'
+  ```
+
+  Prüfe vier Dinge. Das Paketverzeichnis `bericht_cli/` mit allen Modulen und Datendateien ist vollständig. `entry_points.txt` enthält deinen Befehl (`bericht = bericht_cli:main`). In `METADATA` stehen deine Abhängigkeiten und Extras, aber keine Gruppen wie `pytest`. Und `tests/`, `.env` und `uv.lock` fehlen, denn ins Wheel gehören sie nicht.
+
+  Der Dateiname `bericht_cli-0.1.0-py3-none-any.whl` besteht aus Paketname, Version und drei Tags: Python-Version, ABI und Plattform. `py3-none-any` heißt: reines Python, überall installierbar ([Dateinamen-Konvention](https://packaging.python.org/en/latest/specifications/binary-distribution-format/#file-name-convention)).
+
+  Die sdist verhält sich anders. Mit dem Build-Backend `hatchling` und dem Projekt aus `uv init` enthält sie auch `tests/`, `.python-version` und `uv.lock`, und die Liste zeigt eine `.env` mit Zugangsdaten:
+
+  ```console
+  $ tar tzf dist/bericht_cli-0.1.0.tar.gz | sort
+  bericht_cli-0.1.0/.env
+  bericht_cli-0.1.0/.gitignore
+  bericht_cli-0.1.0/.python-version
+  bericht_cli-0.1.0/PKG-INFO
+  bericht_cli-0.1.0/README.md
+  bericht_cli-0.1.0/pyproject.toml
+  bericht_cli-0.1.0/src/bericht_cli/__init__.py
+  bericht_cli-0.1.0/src/bericht_cli/py.typed
+  bericht_cli-0.1.0/tests/test_cli.py
+  bericht_cli-0.1.0/uv.lock
+  ```
+
+  Was in eine sdist kommt, entscheidet das Build-Backend, und es nimmt je nach Konfiguration alles, was `.gitignore` nicht ausschließt. Steht `.env` im Archiv, trage sie in `.gitignore` ein oder schließe sie im Backend aus (für hatchling mit `[tool.hatch.build.targets.sdist] exclude`, siehe die [Hatch-Dokumentation](https://hatch.pypa.io/latest/config/build/)). Prüfe das Wheel wie oben, das Archiv mit `tar tzf`, und installiere das Wheel danach in einer frischen Umgebung.
+
+  > [!WARNING] Zugangsdaten in der sdist
+  > Eine `.env` mit Tokens im Projektverzeichnis kann in der sdist landen, auch wenn sie nie im Wheel steckt. Wer die sdist hochlädt, veröffentlicht sie. Liste das Archiv vor jedem Upload.
+
   ## Häufige Fehler und Review
 
   Ein `ModuleNotFoundError` kann bedeuten, dass das Paket nicht installiert ist, der falsche Interpreter läuft oder der Build Dateien ausgeschlossen hat. Das sind unterschiedliche Ursachen. Starte mit einer frischen Umgebung und einem reproduzierbaren Befehl; vermeide dauerhafte `sys.path`-Manipulationen als Schnellreparatur.
@@ -171,6 +424,11 @@ lesson: |
   - Ruff, Typchecker und Tests prüfen unterschiedliche Eigenschaften.
   - Ein Entry Point verweist auf eine Funktion im installierten Paket.
   - Prüfe das Wheel auch außerhalb des Quellverzeichnisses.
+  - `[dependency-groups]` hält Entwicklungswerkzeuge zurück, Extras in `[project.optional-dependencies]` erscheinen im Wheel.
+  - Anwendungen pinnen im Lockfile, Bibliotheken geben Bereiche mit Untergrenze an und kaum Obergrenzen.
+  - Upgrades laufen gezielt (`uv lock --upgrade-package`) und mit Diff-Review; die CI nutzt `--locked`.
+  - `uv audit` und `pip-audit` finden bekannte Schwachstellen in Versionen, nicht in deinem Code.
+  - `unzip -l` zeigt den Inhalt eines Wheels; die sdist kann Dateien wie `.env` enthalten.
 exercises:
 - id: artefakte
   type: choice
@@ -190,6 +448,58 @@ exercises:
     von abweichenden Rechnern.
   resources:
   - *id001
+- id: locked-oder-frozen
+  type: choice
+  title: Lockfile in der CI absichern
+  prompt: Die CI soll scheitern, wenn jemand `pyproject.toml` ändert, ohne `uv.lock` zu aktualisieren. Welche Option setzt das um?
+  options:
+  - text: "`uv sync --locked`"
+    correct: true
+    why: '`--locked` bricht mit einem Fehler ab, wenn `uv.lock` nicht zu `pyproject.toml` passt, und schreibt das Lockfile nicht um.'
+  - text: "`uv sync --frozen`"
+    correct: false
+    why: '`--frozen` nimmt `uv.lock` unverändert und prüft nicht, ob es aktuell ist. Genau die Abweichung bliebe unbemerkt.'
+  - text: "`uv lock --upgrade`"
+    correct: false
+    why: Das hebt alle Pakete an und schreibt das Lockfile um. Es prüft nichts.
+  - text: "`uv sync --no-dev`"
+    correct: false
+    why: Die Option lässt die Gruppe `dev` weg. Mit dem Lockfile hat sie nichts zu tun.
+  explanation: '`--locked` macht eine Abweichung zwischen Bedarf und Auflösung sichtbar, statt sie still zu reparieren. `--frozen` passt, wenn ein früherer Schritt die Übereinstimmung schon geprüft hat, etwa in einem Docker-Build. `uv lock --check` prüft dasselbe, ohne etwas zu installieren.'
+  resources:
+  - title: uv · Locking and syncing
+    url: https://docs.astral.sh/uv/concepts/projects/sync/
+- id: audit-ausgabe-lesen
+  type: choice
+  title: Was tun nach einem Audit-Treffer?
+  prompt: Der Audit meldet Schwachstellen in `idna`. Dein Projekt hängt `idna` nicht selbst ein, es kommt über `httpx`. Was ist der passende nächste Schritt?
+  lang: console
+  code: |-
+    $ uvx pip-audit -r requirements.txt
+    Found 2 known vulnerabilities in 1 package
+    Name Version ID             Fix Versions
+    ---- ------- -------------- -------------
+    idna 2.7     PYSEC-2024-60  3.7
+    idna 2.7     PYSEC-2026-215 3.15
+  options:
+  - text: "`uv lock --upgrade-package idna` ausführen, die Tests laufen lassen und das Lockfile committen."
+    correct: true
+    why: Version 3.15 behebt beide Meldungen. Weil `idna` nur transitiv vorkommt, ändert sich nur `uv.lock`, die `pyproject.toml` bleibt unberührt.
+  - text: "`idna==3.7` in die `pyproject.toml` schreiben."
+    correct: false
+    why: Version 3.7 behebt nur die erste Meldung, und ein Pin auf ein Fremdpaket engt dein Projekt ohne Not ein.
+  - text: Beide IDs mit `--ignore-vuln` ausblenden, weil `idna` nur indirekt vorkommt.
+    correct: false
+    why: Indirekt installiert heißt trotzdem ausgeführt. Ausblenden ist nur mit Ticket und Frist vertretbar, wenn es keine Korrektur gibt.
+  - text: "`uv.lock` löschen und neu erzeugen."
+    correct: false
+    why: Das hebt alle Pakete auf einmal an. Der Diff ist nicht mehr prüfbar, und ein Fehler lässt sich keinem Upgrade zuordnen.
+  explanation: Die Spalte `Fix Versions` nennt, ab welcher Version die Meldung verschwindet. Bei mehreren Treffern zählt die höchste. Das gezielte Upgrade ändert genau das eine Paket, der Diff im PR bleibt lesbar, und ein Testlauf zeigt, ob die neue Version etwas bricht.
+  resources:
+  - title: pip-audit
+    url: https://pypi.org/project/pip-audit/
+  - title: uv · Upgrading locked package versions
+    url: https://docs.astral.sh/uv/concepts/projects/sync/#upgrading-locked-package-versions
 - id: locked-test
   type: command
   title: CI ohne stilles Neuauflösen
@@ -200,6 +510,58 @@ exercises:
     in CI sichtbar scheitern.
   resources:
   - *id001
+- id: gruppe-anlegen
+  type: command
+  title: Ruff in eine eigene Gruppe legen
+  prompt: Füge `ruff` als Abhängigkeit der Gruppe `lint` hinzu, nicht als Laufzeitabhängigkeit des Pakets.
+  context: Du bist im Projektverzeichnis von `bericht-cli`.
+  answers:
+  - uv add --group lint ruff
+  - uv add --group=lint ruff
+  - uv add ruff --group lint
+  output: |-
+    Resolved 18 packages in 3ms
+    Installed 1 package in 4ms
+     + ruff==0.16.10
+  explanation: '`--group lint` schreibt `ruff` in die Tabelle `[dependency-groups]` unter dem Schlüssel `lint`. Die Laufzeitabhängigkeiten in `[project]` und die Metadaten des Wheels bleiben unverändert. Nur die Gruppe `dev` installiert uv standardmäßig mit, `lint` kommt erst mit `uv sync --group lint`.'
+  resources:
+  - title: uv · Dependency groups
+    url: https://docs.astral.sh/uv/concepts/projects/dependencies/#dependency-groups
+- id: extra-installieren
+  type: command
+  title: Einen Extra mitinstallieren
+  prompt: Das Projekt hat in `[project.optional-dependencies]` den Extra `cli`. Installiere ihn zusätzlich in die Entwicklungsumgebung.
+  context: Du bist im Projektverzeichnis von `bericht-cli`.
+  answers:
+  - uv sync --extra cli
+  - uv sync --extra=cli
+  output: |-
+    Resolved 18 packages in 1ms
+    Installed 3 packages in 8ms
+     + markdown-it-py==4.2.0
+     + mdurl==0.1.2
+     + rich==15.0.0
+  explanation: '`--extra cli` nimmt genau den einen Extra dazu, `--all-extras` alle. Nutzer des Pakets schreiben dafür `pip install "bericht-cli[cli]"`. Anders als eine Gruppe steht der Extra in den Metadaten des Wheels.'
+  resources:
+  - title: uv · Optional dependencies
+    url: https://docs.astral.sh/uv/concepts/projects/dependencies/#optional-dependencies
+- id: paket-upgraden
+  type: command
+  title: Nur ein Paket aktualisieren
+  prompt: Aktualisiere im Lockfile ausschließlich `httpx`. Die übrigen Pakete behalten ihre Version, soweit `httpx` nichts anderes verlangt.
+  context: Du bist im Projektverzeichnis von `bericht-cli`.
+  answers:
+  - uv lock --upgrade-package httpx
+  - uv lock -P httpx
+  - uv lock --upgrade-package=httpx
+  output: |-
+    Resolved 18 packages in 94ms
+    Updated httpx v0.27.2 -> v0.28.1
+    Removed sniffio v1.3.1
+  explanation: '`--upgrade-package` (kurz `-P`) hebt ein Paket an, soweit die Bereiche in `pyproject.toml` es erlauben. `uv lock --upgrade` hebt alle an. Der Diff von `uv.lock` zeigt danach, was sich geändert hat. Hier ist `sniffio` weggefallen, weil die neue `httpx`-Version es nicht mehr braucht.'
+  resources:
+  - title: uv · Upgrading locked package versions
+    url: https://docs.astral.sh/uv/concepts/projects/sync/#upgrading-locked-package-versions
 - id: toml-projekt
   type: output
   title: Metadaten lesen
@@ -230,6 +592,39 @@ exercises:
     beim Import.
   resources:
   - *id001
+- id: pyproject-struktur-vorhersage
+  type: output
+  title: Wo stehen Extras und Gruppen?
+  prompt: Welche Ausgabe erzeugt dieses Programm?
+  lang: python
+  code: |-
+    import tomllib
+
+    projekt = tomllib.loads('''
+    [project]
+    name = "bericht-cli"
+    dependencies = ["httpx>=0.28"]
+
+    [project.optional-dependencies]
+    cli = ["rich>=13"]
+
+    [dependency-groups]
+    dev = ["pytest>=9"]
+    lint = ["ruff>=0.16"]
+    ''')
+    print(projekt["project"]["dependencies"])
+    print(sorted(projekt["project"]["optional-dependencies"]))
+    print(sorted(projekt["dependency-groups"]))
+    print("dependency-groups" in projekt["project"])
+  expected: |-
+    ['httpx>=0.28']
+    ['cli']
+    ['dev', 'lint']
+    False
+  explanation: Extras sind Teil der Tabelle `[project]`, deshalb liegen sie unter `projekt["project"]["optional-dependencies"]`, und das Wheel veröffentlicht sie. `[dependency-groups]` ist eine eigene Tabelle auf oberster Ebene und gehört nicht zu `[project]`. Deshalb erscheinen Gruppen nicht in den Metadaten des Pakets.
+  resources:
+  - title: Packaging · Dependency Groups
+    url: https://packaging.python.org/en/latest/specifications/dependency-groups/
 - id: projektname
   type: code
   title: Metadaten gezielt lesen
@@ -293,6 +688,83 @@ exercises:
   gaps:
   - label: Datei korrekt öffnen
     hint: Die Datei wird lesend und binär geöffnet.
+- id: pyproject-gruppen
+  type: gap
+  title: Extra oder Gruppe?
+  prompt: |-
+    `rich` soll Nutzer der CLI mit `pip install "bericht-cli[cli]"` zuschalten können. `pytest` und `ruff` brauchen nur die Entwickler und dürfen nicht ins Wheel. Ergänze die beiden Tabellennamen.
+  lang: toml
+  code: |-
+    [project]
+    name = "bericht-cli"
+    version = "0.1.0"
+    requires-python = ">=3.12"
+    dependencies = ["httpx>=0.28"]
+
+    [⟦project.optional-dependencies⟧]
+    cli = ["rich>=13"]
+
+    [⟦dependency-groups⟧]
+    dev = ["pytest>=9"]
+    lint = ["ruff>=0.16"]
+  gaps:
+  - label: Tabelle für Nutzer
+    hint: Die Tabelle liegt unter `project` und heißt „optionale Abhängigkeiten“.
+  - label: Tabelle für Entwickler
+    hint: Sie steht auf oberster Ebene, ohne `project`, und trägt Bindestrich im Namen.
+  explanation: |-
+    `[project.optional-dependencies]` ist Teil der Projektmetadaten: Das Wheel führt sie als `Provides-Extra: cli` und `Requires-Dist: rich>=13; extra == 'cli'`. `[dependency-groups]` (PEP 735) steht neben `[project]` und bleibt beim Bauen draußen. Ein Entwicklungswerkzeug in einem Extra würde dagegen als installierbare Option veröffentlicht, die Nutzer nie brauchen.
+  resources:
+  - title: uv · Dependency groups vs. optional dependencies
+    url: https://docs.astral.sh/uv/concepts/projects/dependencies/#dependency-groups
+- id: versionsangaben-setzen
+  type: gap
+  title: Versionsangaben einer Bibliothek
+  prompt: |-
+    `radwerk-client` ist eine Bibliothek. Sie wird mit `httpx` 0.28.1 getestet und soll jede neuere Version zulassen, ohne Obergrenze. `typer` soll ab 0.27.2 bis vor 0.28 erlaubt sein. Nutze dafür den Operator für kompatible Releases.
+  lang: toml
+  code: |-
+    [project]
+    name = "radwerk-client"
+    version = "2.3.0"
+    requires-python = ">=3.12"
+    dependencies = [
+        "httpx⟦>=0.28.1⟧",
+        "typer⟦~=0.27.2⟧",
+    ]
+  gaps:
+  - label: Nur Untergrenze
+    hint: Operator „größer oder gleich“, danach die getestete Version.
+  - label: Kompatibles Release
+    hint: Der Operator besteht aus Tilde und Gleichheitszeichen. Die Version nennt alle drei Stellen.
+  explanation: '`>=0.28.1` setzt eine Untergrenze und lässt jede neuere Version zu. Das ist die richtige Wahl für Bibliotheken, weil Nutzer sie mit anderen Paketen kombinieren. `~=0.27.2` bedeutet `>=0.27.2, ==0.27.*`: Die vorletzte Stelle darf nicht steigen, also bleibt 0.28 ausgeschlossen. Die Schreibweise `>=0.27.2,<0.28` meint dasselbe.'
+  resources:
+  - title: Packaging · Version specifiers
+    url: https://packaging.python.org/en/latest/specifications/version-specifiers/#compatible-release
+- id: wheel-inhalt
+  type: command
+  title: Ein Wheel ansehen
+  prompt: Liste den Inhalt von `dist/bericht_cli-0.1.0-py3-none-any.whl` auf, ohne das Archiv zu entpacken.
+  context: Du hast `uv build` ausgeführt und bist im Projektverzeichnis.
+  answers:
+  - unzip -l dist/bericht_cli-0.1.0-py3-none-any.whl
+  - unzip -l dist/*.whl
+  output: |-
+    Archive:  dist/bericht_cli-0.1.0-py3-none-any.whl
+      Length      Date    Time    Name
+    ---------  ---------- -----   ----
+           48  2020-02-02 00:00   bericht_cli/__init__.py
+            0  2020-02-02 00:00   bericht_cli/py.typed
+          264  2020-02-02 00:00   bericht_cli-0.1.0.dist-info/METADATA
+           87  2020-02-02 00:00   bericht_cli-0.1.0.dist-info/WHEEL
+           45  2020-02-02 00:00   bericht_cli-0.1.0.dist-info/entry_points.txt
+          468  2020-02-02 00:00   bericht_cli-0.1.0.dist-info/RECORD
+    ---------                     -------
+          912                     6 files
+  explanation: Ein Wheel ist ein ZIP-Archiv, `unzip -l` listet es auf. Prüfe, ob das Paketverzeichnis vollständig ist, `entry_points.txt` deinen Befehl enthält und `tests/`, `.env` und `uv.lock` fehlen. `unzip -p datei.whl '*/METADATA'` zeigt die Metadaten samt Abhängigkeiten und Extras.
+  resources:
+  - title: Packaging · Binary distribution format
+    url: https://packaging.python.org/en/latest/specifications/binary-distribution-format/
 - id: paketdateien
   type: code
   title: Artefaktinhalt sichten
@@ -317,6 +789,57 @@ exercises:
     eine vollständige Prüfung des Artefakts umfasst zusätzlich erwartete Paketdateien und Daten.
   resources:
   - *id001
+- id: lock-diff-lesen
+  type: code
+  title: Einen Lockfile-Diff zusammenfassen
+  prompt: |-
+    Im PR zeigt der Diff von `uv.lock` viele Zeilen. Schreibe `lock_diff(alt, neu)`, die ihn zusammenfasst. Beide Argumente sind Dictionaries `{paketname: version}` mit Versionen wie `"0.27.2"`. Die Funktion gibt ein Dictionary mit vier Listen zurück, jeweils nach Paketname sortiert:
+
+    - `"neu"`: Namen, die nur in `neu` stehen.
+    - `"entfernt"`: Namen, die nur in `alt` stehen.
+    - `"aktualisiert"`: Tupel `(name, alte_version, neue_version)` für Pakete in beiden, deren Version sich geändert hat.
+    - `"hauptversion"`: Namen aus `"aktualisiert"`, deren erste Versionszahl sich geändert hat (`1.10.0` zu `2.0.0`).
+  lang: python
+  starter: |-
+    def lock_diff(alt, neu):
+        ...
+  solution: |-
+    def lock_diff(alt, neu):
+        gemeinsam = sorted(alt.keys() & neu.keys())
+        aktualisiert = [(name, alt[name], neu[name]) for name in gemeinsam if alt[name] != neu[name]]
+        return {
+            "neu": sorted(neu.keys() - alt.keys()),
+            "entfernt": sorted(alt.keys() - neu.keys()),
+            "aktualisiert": aktualisiert,
+            "hauptversion": [n for n, a, b in aktualisiert if a.split(".")[0] != b.split(".")[0]],
+        }
+  tests:
+  - name: Neue und entfernte Pakete
+    code: |-
+      diff = lock_diff({"httpx": "0.27.2", "sniffio": "1.3.1"}, {"httpx": "0.28.1", "h11": "0.16.0"})
+      assert diff["neu"] == ["h11"], f"neu: {diff['neu']!r}"
+      assert diff["entfernt"] == ["sniffio"], f"entfernt: {diff['entfernt']!r}"
+  - name: Aktualisierte Pakete mit alter und neuer Version
+    code: |-
+      diff = lock_diff({"httpx": "0.27.2", "rich": "13.7.0"}, {"httpx": "0.28.1", "rich": "13.7.0"})
+      assert diff["aktualisiert"] == [("httpx", "0.27.2", "0.28.1")], f"aktualisiert: {diff['aktualisiert']!r}"
+  - name: Hauptversionssprung
+    code: |-
+      diff = lock_diff({"rich": "13.7.0", "pydantic": "1.10.0"}, {"rich": "13.9.0", "pydantic": "2.0.0"})
+      assert diff["aktualisiert"] == [("pydantic", "1.10.0", "2.0.0"), ("rich", "13.7.0", "13.9.0")], f"aktualisiert: {diff['aktualisiert']!r}"
+      assert diff["hauptversion"] == ["pydantic"], f"hauptversion: {diff['hauptversion']!r}"
+  - name: Unveränderte Lockfiles
+    code: |-
+      gleich = {"httpx": "0.28.1", "h11": "0.16.0"}
+      assert lock_diff(gleich, dict(gleich)) == {"neu": [], "entfernt": [], "aktualisiert": [], "hauptversion": []}
+  hints:
+  - Mengenoperationen auf `alt.keys()` und `neu.keys()` liefern neue, entfernte und gemeinsame Namen.
+  - Vergleiche für die gemeinsamen Namen `alt[name]` mit `neu[name]`. Erst dann gibt es ein Tupel.
+  - '`version.split(".")[0]` ist die erste Versionszahl als Text.'
+  explanation: Die Mengenoperationen auf `dict.keys()` trennen neue, entfernte und gemeinsame Pakete. Nur bei den gemeinsamen vergleichst du die Version. Ein Hauptversionssprung ist der Fall, den du im Review zuerst prüfen willst, weil dort Brüche erlaubt sind. Sortierte Listen machen die Ausgabe reproduzierbar.
+  resources:
+  - title: uv · Upgrading locked package versions
+    url: https://docs.astral.sh/uv/concepts/projects/sync/#upgrading-locked-package-versions
 - id: einstieg-import
   type: bug
   title: Ein Job startet beim Import
@@ -338,6 +861,33 @@ exercises:
     genau im falschen Lebenszyklus aus.
   resources:
   - *id001
+- id: bibliothek-pinnt-exakt
+  type: bug
+  title: Die Bibliothek verhindert ein Update
+  prompt: |-
+    Ein Nutzer meldet: In seinem Projekt, das `radwerk-client` und `httpx>=0.28` braucht, scheitert `uv lock`:
+
+    `Because only radwerk-client==2.3.0 is available and radwerk-client==2.3.0 depends on httpx==0.27.2, we can conclude that all versions of radwerk-client depend on httpx==0.27.2.` Korrigiere die Zeile der Bibliothek. Die Untergrenze bleibt die getestete Version 0.27.2, eine Obergrenze gibt es nicht.
+  lang: toml
+  code: |-
+    [project]
+    name = "radwerk-client"
+    version = "2.3.0"
+    requires-python = ">=3.12"
+    dependencies = [
+        "httpx==0.27.2",
+    ]
+  lines:
+  - 6
+  fix:
+  - line: 6
+    answers:
+    - '"httpx>=0.27.2",'
+    - '"httpx>=0.27.2"'
+  explanation: Eine Bibliothek, die eine Version mit `==` festlegt, erlaubt im Projekt des Nutzers keine andere. Verlangt irgendein anderes Paket `httpx>=0.28`, findet der Resolver keine Lösung, und der Nutzer kann nichts ändern. Mit `>=0.27.2` gilt die getestete Version als Untergrenze, und Nutzer können neuere nehmen. Den exakten Pin hält das Lockfile der Anwendung fest, nicht die Bibliothek.
+  resources:
+  - title: Packaging · install_requires vs requirements files
+    url: https://packaging.python.org/en/latest/discussions/install-requires-vs-requirements/
 - id: src-import
   type: explain
   title: Weshalb außerhalb testen?
@@ -355,6 +905,32 @@ exercises:
     Installation testet die tatsächliche Auslieferung und entdeckt fehlende Paketdateien oder Abhängigkeiten.
   resources:
   - *id001
+- id: bibliothek-vs-anwendung
+  type: explain
+  title: Bereich oder Pin?
+  prompt: Beide Projekte hängen `httpx` ein. Erkläre, warum die Bibliothek nur einen Bereich angibt, die Anwendung zusätzlich ein Lockfile mit exakten Versionen braucht und keines von beiden `==` in `dependencies` schreibt.
+  lang: toml
+  code: |-
+    # radwerk-client/pyproject.toml (Bibliothek, andere Projekte installieren sie)
+    [project]
+    dependencies = ["httpx>=0.27.2"]
+
+    # radwerk-api/pyproject.toml (Anwendung, läuft im eigenen Container)
+    [project]
+    dependencies = ["httpx>=0.28.1"]
+    # uv.lock ist committet und hält httpx 0.28.1 exakt fest
+  points:
+  - Die Anwendung kontrolliert ihre Umgebung. Das committete Lockfile macht Builds reproduzierbar, ohne `pyproject.toml` einzuengen.
+  - Die Bibliothek landet in fremden Projekten und wird mit anderen Paketen kombiniert. Ein Bereich lässt dem Resolver Spielraum.
+  - Ein `==` in einer Bibliothek erzeugt bei Nutzern unlösbare Konflikte, die sie nicht beheben können.
+  - Eine Obergrenze setzt du nur bei bekannter Inkompatibilität und erklärst sie in einem Kommentar.
+  explanation: |-
+    Eine Anwendung läuft in einer Umgebung, die ihr Team selbst baut. Dafür genügt das Lockfile: `uv sync --locked` installiert genau die getesteten Versionen, und `pyproject.toml` bleibt flexibel für Upgrades. Eine Bibliothek kennt die Umgebung ihrer Nutzer nicht. Sie gibt deshalb nur an, was sie braucht, ab welcher Version sie getestet ist und was sie sicher nicht verträgt. Ein exakter Pin würde jedes Projekt blockieren, das dasselbe Paket in einer anderen Version verlangt. Ihr Lockfile gilt nur für die eigene Entwicklung und Tests, Nutzer sehen es nicht.
+  resources:
+  - title: Packaging · install_requires vs requirements files
+    url: https://packaging.python.org/en/latest/discussions/install-requires-vs-requirements/
+  - title: Should you use upper bound version constraints?
+    url: https://iscinumpy.dev/post/bound-version-constraints/
 - id: paket-bauen
   type: practice
   title: Eine auslieferbare Berichts-CLI

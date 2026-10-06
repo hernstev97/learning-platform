@@ -1,7 +1,7 @@
 id: fehler-module
 title: Fehlerbehandlung, Module & Logging
 level: 2
-minutes: 180
+minutes: 230
 summary: Exceptions gezielt fangen, verketten und als eigene Hierarchie anbieten, verstehen, was `import` wirklich tut, Projekte sauber aufteilen – und mit `logging` statt `print` nachvollziehbar machen, was passiert.
 goals:
   - Du erklärst die Ausnahme-Hierarchie (`BaseException` vs. `Exception`) und sagst voraus, wann `except`, `else` und `finally` laufen.
@@ -9,6 +9,7 @@ goals:
   - Du wählst begründet zwischen EAFP und LBYL und räumst mit `finally` und `with` zuverlässig auf.
   - Du erklärst, dass Module einmal ausgeführt und in `sys.modules` gecacht werden, und löst zirkuläre Importe auf.
   - Du strukturierst ein Projekt mit Paketen, `if __name__ == "__main__":` und src-Layout und loggst mit `getLogger(__name__)`.
+  - Du konfigurierst Logging mit `dictConfig`, sagst die Wirkung von Logger-Level, Handler-Level und Propagation voraus und erklärst, warum Bibliotheken nur einen `NullHandler` setzen.
 resources:
   - title: Tutorial · Errors and Exceptions
     url: https://docs.python.org/3/tutorial/errors.html
@@ -18,6 +19,8 @@ resources:
     url: https://docs.python.org/3/tutorial/modules.html
   - title: Logging HOWTO
     url: https://docs.python.org/3/howto/logging.html
+  - title: logging.config – Logging configuration
+    url: https://docs.python.org/3/library/logging.config.html
   - title: Python Packaging User Guide · src layout vs flat layout
     url: https://packaging.python.org/en/latest/discussions/src-layout-vs-flat-layout/
 lesson: |
@@ -301,6 +304,190 @@ lesson: |
   > [!INTERVIEW] „Wie gehst du mit Exceptions um?“
   > „Ich fange so spezifisch und so spät wie möglich – dort, wo ich wirklich etwas tun kann: erneut versuchen, einen Standardwert nehmen oder in eine fachliche Exception übersetzen, dann mit `raise … from …`, damit die Ursache erhalten bleibt. Alles andere lasse ich durchlaufen bis zu einer zentralen Stelle, die mit `logger.exception` loggt. Nie ein nacktes `except:`, und für Aufräumarbeit nehme ich `with` oder `finally`.“
 
+  ## Logging konfigurieren: dictConfig, Bibliotheken und Kontext
+
+  `basicConfig` genügt für ein Skript mit einem Handler. Sobald eine Anwendung mehrere Ziele, Formate oder Level pro Paket braucht, beschreibst du die Konfiguration als Daten und lädst sie mit [`logging.config.dictConfig`](https://docs.python.org/3/library/logging.config.html#logging.config.dictConfig). Django ([`LOGGING`](https://docs.djangoproject.com/en/stable/topics/logging/)) und uvicorn ([`--log-config`](https://uvicorn.dev/settings/)) benutzen genau dieses Format. Die Grundregeln, dass nur der Einstiegspunkt konfiguriert und `-v` das Level steuert, stehen im Modul [CLI-Werkzeuge](/automation/cli-werkzeuge). Hier geht es um das, was darüber hinausgeht.
+
+  ### dictConfig: Konfiguration als Dictionary
+
+  ```python run
+  import logging
+  import logging.config
+
+  KONFIG = {
+      "version": 1,
+      "disable_existing_loggers": False,
+      "formatters": {
+          "kurz": {"format": "%(levelname)-7s %(name)s: %(message)s"},
+      },
+      "handlers": {
+          "konsole": {
+              "class": "logging.StreamHandler",
+              "formatter": "kurz",
+              "level": "INFO",
+              "stream": "ext://sys.stdout",
+          },
+      },
+      "loggers": {
+          "shop": {"level": "DEBUG", "handlers": ["konsole"], "propagate": False},
+      },
+      "root": {"level": "WARNING", "handlers": ["konsole"]},
+  }
+
+  logging.config.dictConfig(KONFIG)             # einmal, beim Programmstart
+
+  log = logging.getLogger("shop.import")
+  log.debug("DEBUG: der Handler steht auf INFO")
+  log.info("12 Zeilen importiert")
+  logging.getLogger("fremd").info("INFO: root steht auf WARNING")
+  logging.getLogger("fremd").warning("Warnung einer fremden Bibliothek")
+  ```
+
+  Das Dictionary hat feste Schlüssel ([Configuration dictionary schema](https://docs.python.org/3/library/logging.config.html#configuration-dictionary-schema)):
+
+  - `version` ist Pflicht und derzeit immer `1`.
+  - `formatters`, `handlers` und `filters` sind Namenstabellen. Ein Handler nennt seine Klasse (`class`), den Formatter, ein Level und weitere Argumente für den Konstruktor. `ext://sys.stdout` löst beim Laden das Objekt `sys.stdout` auf. Statt `class` darf auch `"()"` stehen, eine Factory-Funktion oder Klasse; die Übung unten nutzt das.
+  - `loggers` konfiguriert benannte Logger mit Level, Handlern und `propagate`. `root` konfiguriert den Wurzel-Logger.
+  - `disable_existing_loggers` ist standardmäßig `True`. Das ist eine Falle, siehe unten.
+
+  Die Struktur ist Daten. Du kannst sie aus einer TOML-, YAML- oder JSON-Datei laden und je nach Umgebung austauschen. Aufgerufen wird `dictConfig` einmal in `main()`, nie auf Modulebene und nie in einer Bibliothek.
+
+  Zwei Eigenheiten gehören zum Denkmodell:
+
+  **Zwei Schranken: Logger-Level und Handler-Level.** Der Logger verwirft Meldungen unter seinem [effektiven Level](https://docs.python.org/3/library/logging.html#logging.Logger.getEffectiveLevel) (das erste gesetzte Level auf dem Weg zur Wurzel). Danach prüft jeder Handler sein eigenes Level. Ein Logger auf `DEBUG` mit einem Handler auf `INFO` zeigt kein `DEBUG`. Im Beispiel verwirft der Handler `konsole` die `DEBUG`-Zeile, obwohl `shop` auf `DEBUG` steht.
+
+  **Propagation übergeht die Level der Vorfahren.** Mit `propagate: True` (Standard) reicht ein Logger die Meldung an die Handler seiner Vorfahren weiter. Deren **Logger**-Level und Filter zählen dann nicht mehr, nur ihre Handler-Level ([Logger-Ablauf im HOWTO](https://docs.python.org/3/howto/logging.html#logging-flow)):
+
+  ```python run
+  import logging
+  import logging.config
+
+  logging.config.dictConfig({
+      "version": 1,
+      "disable_existing_loggers": False,
+      "handlers": {"h": {"class": "logging.StreamHandler", "stream": "ext://sys.stdout"}},
+      "loggers": {
+          "kasse": {"level": "INFO", "handlers": ["h"]},
+          "kasse.db": {"level": "DEBUG"},
+      },
+  })
+  logging.getLogger("kasse").debug("1 kasse debug")
+  logging.getLogger("kasse.db").debug("2 db debug")
+  logging.getLogger("kasse.db.pool").info("3 pool info")
+  ```
+
+  Zeile 1 verwirft `kasse` selbst (INFO). Zeile 2 kommt durch: `kasse.db` steht auf `DEBUG`, hat keinen eigenen Handler und reicht die Meldung an den Handler von `kasse` weiter, ohne dessen Level `INFO` nochmals zu prüfen. Zeile 3 erbt `DEBUG` von `kasse.db` und gelangt ebenfalls zum Handler. Ohne `propagate: False` bei `shop` im ersten Beispiel würde jede `shop`-Meldung zusätzlich über den `root`-Handler laufen und doppelt erscheinen.
+
+  > [!WARNING] `disable_existing_loggers` ist standardmäßig `True`
+  > Ohne `"disable_existing_loggers": False` schaltet `dictConfig` jeden schon angelegten Logger stumm, der nicht in der Konfiguration steht und keinen Vorfahren darin hat (`logger.disabled` ist danach `True`). Typisch: Ein Modul legt beim Import `log = getLogger(__name__)` an, `main()` ruft danach `dictConfig` auf, und die Meldungen dieses Moduls verschwinden ohne Fehler. Setze den Schlüssel in jeder Anwendungskonfiguration auf `False`.
+
+  ### Bibliotheken: nur einen NullHandler
+
+  Eine Bibliothek weiß nicht, wohin eine Anwendung ihre Logs schreibt. Konfiguriert sie selbst Handler oder ruft `basicConfig` auf, greift sie in die Entscheidung der Anwendung ein:
+
+  ```python run
+  import logging
+  import logging.config
+  import sys
+
+  bib = logging.getLogger("geocode")
+  bib.handlers.clear()                                  # nur damit der Block wiederholbar bleibt
+  bib.addHandler(logging.StreamHandler(sys.stdout))     # FALSCH: Handler in einer Bibliothek
+
+  logging.config.dictConfig({                           # die Anwendung konfiguriert ihr Format
+      "version": 1,
+      "disable_existing_loggers": False,
+      "formatters": {"app": {"format": "APP %(message)s"}},
+      "handlers": {"h": {"class": "logging.StreamHandler", "stream": "ext://sys.stdout", "formatter": "app"}},
+      "root": {"level": "INFO", "handlers": ["h"]},
+  })
+  bib.warning("Adresse nicht gefunden")                 # erscheint zweimal, einmal im falschen Format
+  ```
+
+  Die Bibliothek gibt die Zeile selbst aus, und dank Propagation gibt sie der Handler der Anwendung ein zweites Mal aus. Die Anwendung kann das Doppel nur beseitigen, indem sie in den Code der Bibliothek greift. Das [Logging HOWTO](https://docs.python.org/3/howto/logging.html#configuring-logging-for-a-library) empfiehlt deshalb: Eine Bibliothek holt sich `getLogger(__name__)`, loggt und hängt höchstens einen `NullHandler` an den obersten Logger ihres Pakets, meist in `__init__.py`:
+
+  ```python
+  # meinlib/__init__.py
+  import logging
+
+  logging.getLogger(__name__).addHandler(logging.NullHandler())
+  ```
+
+  Was der `NullHandler` bewirkt, erklärt der **Handler of last resort**. Findet ein Logger auf dem Weg zur Wurzel keinen einzigen Handler, schreibt Python Meldungen ab `WARNING` über [`logging.lastResort`](https://docs.python.org/3/library/logging.html#logging.lastResort) auf stderr, ohne Zeitstempel und Format. Das ist für ein Skript ohne Logging-Konfiguration ein sinnvoller Standard: Warnungen gehen nicht verloren. Ein `NullHandler` zählt aber als gefundener Handler und tut nichts. Die Bibliothek bleibt damit still, solange die Anwendung nichts konfiguriert, und sobald sie es tut, entscheidet allein die Anwendung über Level, Format und Ziel.
+
+  > [!INTERVIEW] „Warum konfiguriert eine Bibliothek kein Logging?“
+  > „Weil Handler, Format und Level Sache der Anwendung sind. Ein Handler in der Bibliothek erzeugt doppelte Zeilen oder ein fremdes Format, und ein `basicConfig` beim Import legt einen Root-Handler an, sodass spätere `basicConfig`-Aufrufe der Anwendung wirkungslos sind. Die Bibliothek nimmt `getLogger(__name__)` und hängt höchstens einen `NullHandler` an den obersten Logger ihres Pakets. Den Rest entscheidet `dictConfig` in `main()`.“
+
+  ### Kontext mit `extra`, `LoggerAdapter` und `contextvars`
+
+  Logs werden erst nützlich, wenn sie sich nach Auftrag, Nutzer oder Request filtern lassen. Das Argument `extra` hängt dem Log-Datensatz zusätzliche Attribute an, die ein Format-String als `%(auftrag_id)s` ausgibt:
+
+  ```python run
+  import logging
+  import sys
+
+  log = logging.getLogger("versand")
+  log.setLevel(logging.INFO)
+  log.handlers.clear()                                  # nur damit der Block wiederholbar bleibt
+  log.propagate = False
+  handler = logging.StreamHandler(sys.stdout)
+  handler.setFormatter(logging.Formatter("%(levelname)s [%(auftrag_id)s] %(message)s"))
+  log.addHandler(handler)
+
+  log.info("reserviert", extra={"auftrag_id": "A-4711"})
+
+  adapter = logging.LoggerAdapter(log, {"auftrag_id": "A-4712"})    # Kontext einmal festlegen
+  adapter.info("versendet")
+
+  try:
+      log.info("fertig", extra={"name": "lager-2"})
+  except KeyError as fehler:
+      print("KeyError:", fehler)
+  ```
+
+  Dabei gibt es drei Fallen:
+
+  - **Reservierte Namen.** Ein Schlüssel in `extra` darf kein Attribut von `LogRecord` überschreiben (`name`, `message`, `args`, `levelname`, `msg` und weitere) und nicht `asctime` heißen. Sonst wirft `Logger.info` `KeyError: "Attempt to overwrite 'name' in LogRecord"`. Der Fehler tritt nur bei einer Zeile auf, die das Level wirklich ausgibt. Bei einer `debug`-Zeile fällt er erst auf, wenn jemand in der Produktion auf `DEBUG` stellt. Nimm präfixierte Namen wie `auftrag_id`.
+  - **Fehlendes Feld.** Verweist der Formatter auf `%(auftrag_id)s` und eine Meldung kommt ohne `extra`, schreibt `logging` `--- Logging error ---` mit Traceback auf stderr, das Programm läuft weiter, die Zeile geht verloren.
+  - **`LoggerAdapter` ersetzt `extra` pro Aufruf.** Standardmäßig überschreibt der Kontext des Adapters ein `extra` am einzelnen Aufruf. Seit Python 3.13 mischt `LoggerAdapter(log, kontext, merge_extra=True)` beide, und der Wert am Aufruf gewinnt ([LoggerAdapter](https://docs.python.org/3/library/logging.html#loggeradapter-objects)).
+
+  Wer den Kontext nicht durch jeden Aufruf reichen will, speichert ihn in einer [`contextvars.ContextVar`](https://docs.python.org/3/library/contextvars.html) und lässt einen Filter ihn in jeden Datensatz schreiben. Ein `ContextVar` gilt pro Thread und pro asyncio-Task, parallele Requests mischen sich also nicht:
+
+  ```python run
+  import contextvars
+  import logging
+  import logging.config
+
+  auftrag_id = contextvars.ContextVar("auftrag_id", default="-")
+
+  class KontextFilter(logging.Filter):
+      def filter(self, record: logging.LogRecord) -> bool:
+          record.auftrag_id = auftrag_id.get()
+          return True
+
+  logging.config.dictConfig({
+      "version": 1,
+      "disable_existing_loggers": False,
+      "filters": {"kontext": {"()": KontextFilter}},
+      "formatters": {"mit_id": {"format": "%(levelname)s [%(auftrag_id)s] %(message)s"}},
+      "handlers": {
+          "h": {"class": "logging.StreamHandler", "stream": "ext://sys.stdout",
+                "formatter": "mit_id", "filters": ["kontext"]},
+      },
+      "loggers": {"lager": {"level": "INFO", "handlers": ["h"], "propagate": False}},
+  })
+
+  log = logging.getLogger("lager")
+  log.info("Start ohne Kontext")
+  auftrag_id.set("A-4711")                  # in einem Web-Framework: einmal pro Request
+  log.info("Bestand reserviert")
+  ```
+
+  Der Filter hängt am **Handler**, nicht am Logger. Filter eines Loggers gelten nur für Meldungen, die dieser Logger selbst erzeugt, nicht für die seiner Kinder. Der Handler sieht dagegen alle Datensätze, die bei ihm ankommen, und der Filter stellt sicher, dass jeder das Feld `auftrag_id` hat.
+
+  > [!PRAXIS] Konfiguration als Datei, Kontext als Feld
+  > Services laden ihre `dictConfig` aus einer Datei der Umgebung (Entwicklung: lesbare Zeilen, Produktion: JSON-Zeilen für das zentrale Log-System). Der Kontext (`request_id`, `nutzer_id`) steht als eigenes Feld in jeder Zeile, damit sich ein Request im Log mit einer Suche verfolgen lässt. Beim Review fallen `basicConfig` in Bibliotheksmodulen und `disable_existing_loggers` ohne `False` auf.
+
   ## Häufige Fehler
 
   - **`except:` oder `except Exception: pass`.** Verschluckt Programmierfehler (`NameError`, `AttributeError`) und macht Bugs unsichtbar. Fange die konkrete Klasse; wenn du breit fangen musst, logge mit `logger.exception` und wirf weiter.
@@ -310,6 +497,9 @@ lesson: |
   - **Zirkuläre Importe.** `ImportError: cannot import name … from partially initialized module`. Gemeinsamen Code herausziehen.
   - **Datei heißt wie ein Modul der Standardbibliothek** (`logging.py`, `json.py`). Dein Modul verdeckt dann das echte, und Importe schlagen seltsam fehl.
   - **`logging.basicConfig` in einem Bibliotheksmodul** oder Logging vor dem Konfigurieren: Der erste Aufruf einer Logging-Funktion ohne Konfiguration kann selbst `basicConfig` auslösen, spätere Aufrufe bleiben dann wirkungslos.
+  - **`dictConfig` ohne `"disable_existing_loggers": False`.** Logger, die Module beim Import angelegt haben, werden stumm. Symptom: Meldungen eines Moduls fehlen ohne Fehler.
+  - **`extra` mit reserviertem Schlüssel** (`name`, `message`, `args`, `msg`). Symptom: `KeyError: "Attempt to overwrite 'name' in LogRecord"`, aber nur bei Zeilen, die das Level ausgibt.
+  - **Eigener Handler in einer Bibliothek.** Symptom: doppelte Zeilen oder ein fremdes Format. Behebung: nur ein `NullHandler`, den Rest konfiguriert die Anwendung.
 
   ## Zusammenfassung
 
@@ -321,6 +511,9 @@ lesson: |
   - Ein Modul wird beim ersten Import ausgeführt und in `sys.modules` gecacht; `from m import x` kopiert die Bindung.
   - `if __name__ == "__main__":` trennt Startcode von importierbarem Code; Module in Paketen startest du mit `python -m`.
   - `getLogger(__name__)` in jedem Modul, Konfiguration nur im Einstiegspunkt, `logger.exception` im `except`-Block.
+  - `dictConfig` beschreibt Formatter, Handler und Logger als Daten (`version: 1`, `disable_existing_loggers: False`). Eine Meldung passiert Logger-Level und Handler-Level; bei Propagation zählen für die Vorfahren nur die Handler-Level.
+  - Bibliotheken hängen höchstens einen `NullHandler` an den obersten Logger ihres Pakets. Ohne Handler schreibt `logging.lastResort` Warnungen nach stderr.
+  - Kontext kommt per `extra`, `LoggerAdapter` oder einem Filter mit `ContextVar` ins Log. `extra` darf kein `LogRecord`-Attribut überschreiben.
 exercises:
   - id: was-faengt-exception
     type: choice
@@ -467,6 +660,85 @@ exercises:
         url: https://docs.python.org/3/reference/import.html#the-module-cache
       - title: sys.modules
         url: https://docs.python.org/3/library/sys.html#sys.modules
+
+  - id: log-level-propagation
+    type: output
+    title: Wer sieht die Meldung?
+    prompt: |
+      Beide Handler schreiben nach stdout und stellen ihr Kürzel voran. Der Root-Logger hat keine Handler. Was gibt das Programm aus? Prüfe bei jeder Meldung das Level des Loggers, das Level jedes Handlers und `propagate`.
+    lang: python
+    code: |
+      import logging
+      import sys
+
+      def handler(kuerzel: str, level: int) -> logging.Handler:
+          h = logging.StreamHandler(sys.stdout)
+          h.setLevel(level)
+          h.setFormatter(logging.Formatter(f"{kuerzel} %(message)s"))
+          return h
+
+      app = logging.getLogger("app")
+      app.setLevel(logging.WARNING)
+      app.addHandler(handler("A", logging.DEBUG))
+
+      db = logging.getLogger("app.db")
+      db.setLevel(logging.DEBUG)
+      db.addHandler(handler("B", logging.INFO))
+
+      db.debug("d")
+      db.info("i")
+      app.info("p")
+      db.propagate = False
+      db.debug("x")
+      db.info("y")
+    expected: |
+      A d
+      B i
+      A i
+      B y
+    explanation: |
+      `db.debug("d")` passiert das Logger-Level `DEBUG` von `app.db`. Handler `B` verwirft die Meldung (Level `INFO`), danach geht sie an die Handler von `app`. Deren Logger-Level `WARNING` wird dabei **nicht** geprüft, nur das Handler-Level `DEBUG` von `A`: Es erscheint `A d`. `db.info("i")` druckt zuerst `B i` (eigene Handler zuerst), dann `A i`. `app.info("p")` scheitert am Level `WARNING` von `app` selbst, denn hier ist `app` der erzeugende Logger. Nach `db.propagate = False` erreicht nichts mehr `A`. `x` bleibt am Handler `B` hängen, `y` erscheint als `B y`.
+    resources:
+      - title: Logging HOWTO · Logging flow
+        url: https://docs.python.org/3/howto/logging.html#logging-flow
+      - title: logging · Logger.propagate
+        url: https://docs.python.org/3/library/logging.html#logging.Logger.propagate
+
+  - id: log-extra-reserviert
+    type: output
+    title: Eine Zeile, die nur manchmal scheitert
+    prompt: |
+      Was gibt das Programm aus? Python meldet einen Konflikt in `extra` mit `Attempt to overwrite '<schlüssel>' in LogRecord`. Prüfe, welche der vier Logging-Aufrufe überhaupt einen Datensatz erzeugen.
+    lang: python
+    code: |
+      import logging
+      import sys
+
+      log = logging.getLogger("versand")
+      log.setLevel(logging.INFO)
+      log.propagate = False
+      handler = logging.StreamHandler(sys.stdout)
+      handler.setFormatter(logging.Formatter("%(levelname)s [%(auftrag_id)s] %(message)s"))
+      log.addHandler(handler)
+
+      log.info("reserviert", extra={"auftrag_id": "A-1"})
+      log.debug("Details", extra={"message": "x"})
+      try:
+          log.info("versendet", extra={"name": "paketdienst"})
+      except KeyError as fehler:
+          print("abgelehnt:", fehler.args[0])
+      log.info("fertig", extra={"auftrag_id": "A-1"})
+    expected: |
+      INFO [A-1] reserviert
+      abgelehnt: Attempt to overwrite 'name' in LogRecord
+      INFO [A-1] fertig
+    explanation: |
+      Der Logger steht auf `INFO`. `log.debug(...)` erzeugt deshalb gar keinen Datensatz, und der verbotene Schlüssel `message` fällt nicht auf. Dieser Fehler taucht erst auf, wenn jemand `DEBUG` einschaltet. `log.info(..., extra={"name": ...})` erzeugt einen Datensatz und scheitert: `name` ist ein Attribut von `LogRecord`, und `makeRecord` weigert sich, es zu überschreiben, mit einem `KeyError`. Die dritte `info`-Zeile kommt durch, weil `auftrag_id` frei ist. Wähle Schlüssel, die keinem `LogRecord`-Attribut gleichen.
+    resources:
+      - title: logging · Logger.debug (extra)
+        url: https://docs.python.org/3/library/logging.html#logging.Logger.debug
+      - title: logging · LogRecord attributes
+        url: https://docs.python.org/3/library/logging.html#logrecord-attributes
 
   - id: luecken-fehler-logging
     type: gap
@@ -710,6 +982,34 @@ exercises:
       - title: PEP 758 – Allow except and except* expressions without parentheses
         url: https://peps.python.org/pep-0758/
 
+  - id: bibliothek-basicconfig
+    type: bug
+    title: Die Bibliothek redet der Anwendung dazwischen
+    prompt: |
+      Eine Anwendung importiert `zahlung` und konfiguriert danach ihr Logging mit `logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")`. Im Betrieb erscheinen trotzdem die `DEBUG`-Zeilen der Bibliothek, und das Format der Anwendung fehlt: Es wirkt, als hätte ihr `basicConfig` nichts getan. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: python
+    code: |
+      # zahlung/__init__.py
+      import logging
+
+      logging.basicConfig(level=logging.DEBUG)
+      log = logging.getLogger(__name__)
+
+      def abbuchen(betrag_cent: int) -> bool:
+          log.debug("Sende Abbuchung über %d Cent", betrag_cent)
+          return betrag_cent > 0
+    lines: [4]
+    fix:
+      - line: 4
+        answers: ["logging.getLogger(__name__).addHandler(logging.NullHandler())", "logging.getLogger('zahlung').addHandler(logging.NullHandler())"]
+    explanation: |
+      `basicConfig` legt einen Handler am Root-Logger an, wenn dort noch keiner hängt. Läuft es beim Import der Bibliothek, ist der Root-Logger danach belegt, und der spätere Aufruf der Anwendung tut nichts (ohne `force=True`). Die Anwendung bekommt Level `DEBUG` und das Standardformat der Bibliothek. Eine Bibliothek konfiguriert kein Logging, denn Level, Format und Ziel gehören der Anwendung. Sie hängt höchstens einen `NullHandler` an den obersten Logger ihres Pakets: Er tut nichts, verhindert aber die Ausgabe über den Handler of last resort, solange die Anwendung nichts konfiguriert. Der Logger in Zeile 5 und seine `debug`-Aufrufe bleiben unverändert richtig.
+    resources:
+      - title: Logging HOWTO · Configuring Logging for a Library
+        url: https://docs.python.org/3/howto/logging.html#configuring-logging-for-a-library
+      - title: logging · basicConfig
+        url: https://docs.python.org/3/library/logging.html#logging.basicConfig
+
   - id: import-reparieren
     type: code
     title: Repariere den Import, der alles verschluckt
@@ -813,6 +1113,52 @@ exercises:
     resources:
       - title: Language Reference · The module cache
         url: https://docs.python.org/3/reference/import.html#the-module-cache
+
+  - id: dictconfig-lesen
+    type: explain
+    title: Was bewirkt diese Logging-Konfiguration?
+    prompt: |
+      Erkläre diese Konfiguration, wie du es im Code-Review tun würdest: Was passiert mit einer `DEBUG`- und einer `INFO`-Meldung von `shop.zahlung`, und was mit einer `INFO`- und einer `WARNING`-Meldung von `fremdlib`? Wozu dienen `disable_existing_loggers: False` und `propagate: False`, und wo darf `dictConfig` aufgerufen werden?
+    lang: python
+    code: |
+      import logging.config
+
+      LOGGING = {
+          "version": 1,
+          "disable_existing_loggers": False,
+          "formatters": {
+              "zeile": {"format": "%(asctime)s %(levelname)s %(name)s: %(message)s"},
+          },
+          "handlers": {
+              "stdout": {
+                  "class": "logging.StreamHandler",
+                  "stream": "ext://sys.stdout",
+                  "formatter": "zeile",
+                  "level": "INFO",
+              },
+          },
+          "loggers": {
+              "shop": {"level": "DEBUG", "handlers": ["stdout"], "propagate": False},
+          },
+          "root": {"level": "WARNING", "handlers": ["stdout"]},
+      }
+
+      def main() -> None:
+          logging.config.dictConfig(LOGGING)
+          ...
+    points:
+      - "`shop.zahlung` erbt `DEBUG` von `shop`, aber der Handler steht auf `INFO`: Die `DEBUG`-Meldung verwirft der Handler, die `INFO`-Meldung erscheint auf stdout."
+      - "`fremdlib` hat keine eigene Konfiguration und läuft über `root` (`WARNING`): Die Warnung erscheint, die `INFO`-Meldung wird verworfen."
+      - "`propagate: False` verhindert, dass `shop`-Meldungen zusätzlich über den Handler von `root` laufen und doppelt erscheinen."
+      - "`disable_existing_loggers: False` lässt Logger aktiv, die schon beim Import angelegt wurden. Der Standard `True` würde sie stumm schalten."
+      - "`dictConfig` läuft einmal im Einstiegspunkt (`main`), nie auf Modulebene und nie in einer Bibliothek."
+    explanation: |
+      Meldungen durchlaufen zwei Schranken: das effektive Level des Loggers und das Level jedes Handlers. `shop` lässt ab `DEBUG` durch, der Handler `stdout` zeigt erst ab `INFO`; eine Änderung des Handler-Levels auf `DEBUG` würde in der Entwicklung alle Details sichtbar machen. Logger ohne eigenen Eintrag wie `fremdlib` erben das Level von `root`, hier `WARNING`, und nutzen dessen Handler. Ohne `propagate: False` bekäme jede `shop`-Meldung eine zweite Ausgabe über `root`, weil derselbe Handler dort hängt. `disable_existing_loggers: False` ist wichtig, weil Module ihre Logger beim Import anlegen, also vor dem `dictConfig`-Aufruf. Die Konfiguration gehört in den Einstiegspunkt der Anwendung, weil nur sie weiß, wohin Logs gehen sollen.
+    resources:
+      - title: logging.config · Configuration dictionary schema
+        url: https://docs.python.org/3/library/logging.config.html#configuration-dictionary-schema
+      - title: Logging HOWTO · Logging flow
+        url: https://docs.python.org/3/howto/logging.html#logging-flow
 
   - id: wiederholen-mit-logging
     type: code
@@ -924,3 +1270,123 @@ exercises:
         url: https://docs.python.org/3/library/logging.html#logging-levels
       - title: Logging HOWTO · Logging variable data
         url: https://docs.python.org/3/howto/logging.html#logging-variable-data
+
+  - id: log-config-bauen
+    type: code
+    title: Eine dictConfig-Konfiguration bauen
+    prompt: |
+      Schreibe `baue_config(level, handler_factory)`. Die Funktion liefert ein Dictionary für `logging.config.dictConfig`:
+
+      - `version` ist `1`, bereits angelegte Logger bleiben aktiv.
+      - Ein Formatter `standard` mit dem Format `%(levelname)s %(name)s: %(message)s`.
+      - Ein Handler `sammler`: Er wird von `handler_factory` erzeugt (Schlüssel `"()"`), nutzt den Formatter `standard` und lässt alles ab `DEBUG` durch.
+      - Ein Logger `shop` mit dem übergebenen `level` (ein String wie `"INFO"`) und dem Handler `sammler`. Seine Meldungen gehen **nicht** zusätzlich an `root`.
+      - `root` mit Level `WARNING` und demselben Handler.
+
+      Die Tests laden dein Dictionary mit `dictConfig` und lesen aus, was der Handler gesammelt hat. Rufe `dictConfig` nicht selbst auf.
+    lang: python
+    starter: |
+      def baue_config(level, handler_factory):
+          return {
+              "version": 1,
+              # formatters, handlers, loggers und root fehlen noch
+          }
+    solution: |
+      def baue_config(level, handler_factory):
+          return {
+              "version": 1,
+              "disable_existing_loggers": False,
+              "formatters": {
+                  "standard": {"format": "%(levelname)s %(name)s: %(message)s"},
+              },
+              "handlers": {
+                  "sammler": {"()": handler_factory, "formatter": "standard", "level": "DEBUG"},
+              },
+              "loggers": {
+                  "shop": {"level": level, "handlers": ["sammler"], "propagate": False},
+              },
+              "root": {"level": "WARNING", "handlers": ["sammler"]},
+          }
+    setup: |
+      import logging
+      import logging.config
+      from contextlib import contextmanager
+
+      class ListHandler(logging.Handler):
+          """Sammelt formatierte Zeilen in einer Liste, statt sie auszugeben."""
+
+          def __init__(self):
+              super().__init__()
+              self.zeilen = []
+
+          def emit(self, record):
+              self.zeilen.append(self.format(record))
+
+      def _aufraeumen():
+          wurzel = logging.getLogger()
+          wurzel.handlers.clear()
+          wurzel.setLevel(logging.WARNING)
+          for name in ("shop", "shop.import", "fremd"):
+              logger = logging.getLogger(name)
+              logger.handlers.clear()
+              logger.setLevel(logging.NOTSET)
+              logger.disabled = False
+              logger.propagate = True
+
+      @contextmanager
+      def geladen(level):
+          """Lädt baue_config(level, …) und liefert die Liste der gesammelten Zeilen. Räumt danach auf."""
+          erzeugt = []
+
+          def fabrik():
+              handler = ListHandler()
+              erzeugt.append(handler)
+              return handler
+
+          _aufraeumen()
+          try:
+              logging.config.dictConfig(baue_config(level, fabrik))
+              assert erzeugt, "dictConfig hat über handler_factory keinen Handler erzeugt"
+              yield erzeugt[0].zeilen
+          finally:
+              _aufraeumen()
+    tests:
+      - name: Format und Level des Loggers shop
+        code: |
+          with geladen("INFO") as zeilen:
+              logging.getLogger("shop.import").debug("Details")
+              logging.getLogger("shop.import").info("12 Zeilen")
+          assert zeilen == ["INFO shop.import: 12 Zeilen"], f"bekommen {zeilen!r}"
+      - name: Das Level ist einstellbar
+        code: |
+          with geladen("DEBUG") as zeilen:
+              logging.getLogger("shop").debug("Details")
+          assert zeilen == ["DEBUG shop: Details"], f"bekommen {zeilen!r}"
+      - name: Jede Meldung erscheint genau einmal
+        code: |
+          with geladen("INFO") as zeilen:
+              logging.getLogger("shop").warning("Achtung")
+          assert zeilen == ["WARNING shop: Achtung"], f"bekommen {zeilen!r}; propagate sollte False sein"
+      - name: Fremde Logger laufen über root ab WARNING
+        code: |
+          with geladen("INFO") as zeilen:
+              logging.getLogger("fremd").info("leise")
+              logging.getLogger("fremd").warning("laut")
+          assert zeilen == ["WARNING fremd: laut"], f"bekommen {zeilen!r}"
+      - name: Bereits angelegte Logger bleiben aktiv
+        code: |
+          vorher = logging.getLogger("fremd")
+          with geladen("INFO") as zeilen:
+              vorher.error("alt aber aktiv")
+          assert zeilen == ["ERROR fremd: alt aber aktiv"], f"bekommen {zeilen!r}"
+    hints:
+      - "Die Schlüssel auf oberster Ebene: `version`, `disable_existing_loggers`, `formatters`, `handlers`, `loggers`, `root`."
+      - "Ein Handler mit Factory: `{\"()\": handler_factory, \"formatter\": \"standard\", \"level\": \"DEBUG\"}`. Ein Schlüssel `class` kommt nicht dazu."
+      - "`propagate: False` im Logger `shop` verhindert die doppelte Ausgabe über `root`."
+    explanation: |
+      `dictConfig` baut aus dem Dictionary Formatter, Handler und Logger und verbindet sie über ihre Namen. Mit `"()"` ruft es `handler_factory` auf, statt eine Klasse über ihren Pfad zu importieren; so landet in den Tests ein Handler, der in eine Liste schreibt. `disable_existing_loggers: False` hält `fremd` aktiv, das vor dem Laden entstand. Ohne `propagate: False` im Logger `shop` liefe jede Meldung zusätzlich über den Handler von `root`, und der Handler würde sie zweimal sammeln. Wegen der gemeinsamen Namensräume räumen die Tests den Logging-Zustand nach jedem Lauf auf. In einem echten Programm läuft `dictConfig` einmal in `main()`.
+    resources:
+      - title: logging.config · dictConfig
+        url: https://docs.python.org/3/library/logging.config.html#logging.config.dictConfig
+      - title: logging.config · User-defined objects
+        url: https://docs.python.org/3/library/logging.config.html#user-defined-objects

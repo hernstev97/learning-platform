@@ -1,14 +1,16 @@
 id: dekoratoren-funktional
 title: Dekoratoren & funktionale Werkzeuge
 level: 2
-minutes: 150
-summary: Closures, Dekoratoren mit und ohne Argumente, functools und eigene Context Manager – die Werkzeuge hinter jedem `@` in FastAPI, pytest und Co.
+minutes: 190
+summary: Closures, Dekoratoren mit und ohne Argumente, functools, eigene Context Manager mit `ExitStack` und `asynccontextmanager` – die Werkzeuge hinter jedem `@` und `with` in FastAPI, pytest und Co.
 goals:
   - Du erklärst, was eine Closure einfängt, und vermeidest den Late-Binding-Fehler in Schleifen.
   - Du schreibst Dekoratoren mit und ohne Argumente, die Rückgabewerte und Metadaten (`functools.wraps`) erhalten.
   - Du sagst voraus, in welcher Reihenfolge gestapelte Dekoratoren angewendet werden und laufen.
   - Du setzt `cache`/`lru_cache`, `partial`, `reduce` und `singledispatch` gezielt ein und kennst ihre Fallen.
   - Du schreibst Context Manager als Klasse und mit `@contextmanager`, die auch bei Exceptions aufräumen.
+  - Du verwaltest mit `ExitStack` eine beliebige Zahl von Ressourcen, sagst die Aufräumreihenfolge voraus und übergibst den Besitz mit `pop_all()`.
+  - Du schreibst mit `@asynccontextmanager` Ressourcen für async-Code, die auch bei Abbruch aufräumen.
 resources:
   - title: Sprachreferenz · Function definitions (Dekoratoren)
     url: https://docs.python.org/3/reference/compound_stmts.html#function-definitions
@@ -322,6 +324,158 @@ lesson: |
 
   Zwei fertige Helfer aus `contextlib` solltest du kennen. [`suppress(FileNotFoundError)`](https://docs.python.org/3/library/contextlib.html#contextlib.suppress) ignoriert genau die genannten Exceptions; setze es sparsam ein, denn was verschluckt ist, taucht in keinem Log auf. [`ExitStack`](https://docs.python.org/3/library/contextlib.html#contextlib.ExitStack) verwaltet eine erst zur Laufzeit bekannte Zahl von Context Managern, etwa eine Liste von Dateien, die alle gleichzeitig offen sein müssen.
 
+  ## ExitStack: aufräumen bei beliebig vielen Ressourcen
+
+  `with a() as x, b() as y:` reicht für zwei oder drei Ressourcen. Kennst du die Zahl erst zur Laufzeit, etwa eine Verbindung pro Host aus der Konfiguration, kannst du keine Schleife in die `with`-Zeile schreiben. [`ExitStack`](https://docs.python.org/3/library/contextlib.html#contextlib.ExitStack) löst das. Er ist selbst ein Context Manager, nimmt beliebig viele weitere auf und beendet sie beim Verlassen in **umgekehrter Reihenfolge**, genau wie verschachtelte `with`-Blöcke. Die Doku nennt das Muster [„Supporting a variable number of context managers“](https://docs.python.org/3/library/contextlib.html#supporting-a-variable-number-of-context-managers).
+
+  ```python run
+  from contextlib import ExitStack, contextmanager
+
+  log: list[str] = []
+
+  @contextmanager
+  def ressource(name: str):
+      log.append(f"öffne {name}")
+      try:
+          yield name
+      finally:
+          log.append(f"schließe {name}")
+
+  namen = ["a.log", "b.log", "c.log"]
+  with ExitStack() as stack:
+      offen = [stack.enter_context(ressource(n)) for n in namen]
+      stack.callback(log.append, "Callback: Bericht schreiben")
+      log.append(f"arbeite mit {offen}")
+
+  print("\n".join(log))
+  ```
+
+  Zwei Methoden brauchst du fast immer:
+
+  - [`enter_context(cm)`](https://docs.python.org/3/library/contextlib.html#contextlib.ExitStack.enter_context) ruft `cm.__enter__()` auf, gibt dessen Wert zurück und merkt sich `cm.__exit__` für später.
+  - [`callback(func, *args, **kwargs)`](https://docs.python.org/3/library/contextlib.html#contextlib.ExitStack.callback) merkt sich eine gewöhnliche Funktion als Aufräumschritt. Du übergibst die Funktion und ihre Argumente getrennt, **ohne** sie aufzurufen: `stack.callback(verbindung.close)`, nicht `stack.callback(verbindung.close())`. Ein Callback bekommt keine Exception zu sehen und kann deshalb keine unterdrücken.
+
+  Das Fehlerverhalten ist der eigentliche Grund für `ExitStack`:
+
+  - **Scheitert das Öffnen mittendrin**, etwa bei der dritten von fünf Ressourcen, verlässt die Exception den `with`-Block. Der Stack schließt die zwei bereits geöffneten. Ein eigenes `try`/`finally` mit einer Liste „was ist schon offen“ brauchst du nicht.
+  - **Wirft ein Aufräumschritt**, laufen die übrigen trotzdem. Am Ende fliegt die Exception des zuletzt gelaufenen fehlerhaften Schritts. War schon eine Exception aus dem Block unterwegs, hängt sie als `__context__` daran.
+  - **Eine Exception aus dem Block** reicht der Stack der Reihe nach an die `__exit__`-Methoden weiter. Jede darf sie unterdrücken, indem sie einen wahren Wert zurückgibt. Ein `callback` kann das nicht.
+
+  ```python run
+  from contextlib import ExitStack
+
+  def schritt(name: str, kaputt: bool = False):
+      def aufraeumen() -> None:
+          print(f"räume {name} auf")
+          if kaputt:
+              raise RuntimeError(f"{name} ist kaputt")
+      return aufraeumen
+
+  try:
+      with ExitStack() as stack:
+          stack.callback(schritt("a"))
+          stack.callback(schritt("b", kaputt=True))
+          stack.callback(schritt("c"))
+  except RuntimeError as fehler:
+      print("Fehler:", fehler)
+  ```
+
+  ### pop_all: Besitz an den Aufrufer übergeben
+
+  Ein häufiges Muster: Ein Konstruktor oder eine Fabrikfunktion öffnet mehrere Ressourcen und gibt sie weiter. Klappt alles, sollen sie **offen bleiben**. Scheitert ein Schritt, muss alles sofort zu. Das ist „alles oder nichts“. [`pop_all()`](https://docs.python.org/3/library/contextlib.html#contextlib.ExitStack.pop_all) verschiebt alle Aufräumschritte auf einen neuen `ExitStack` und lässt den alten leer. Beim Verlassen des `with`-Blocks passiert dann nichts mehr, und der neue Stack gehört dem, der ihn behält. Er ruft später `close()` auf.
+
+  ```python run
+  from contextlib import ExitStack, contextmanager
+
+  @contextmanager
+  def verbinde(host: str):
+      if host == "db3":
+          raise ConnectionError(f"{host} nicht erreichbar")
+      print(f"verbunden mit {host}")
+      try:
+          yield host
+      finally:
+          print(f"getrennt von {host}")
+
+  class Verbindungen:
+      """Besitzt alle Verbindungen. Wer das Objekt erzeugt, ruft close() auf."""
+
+      def __init__(self, hosts: list[str]) -> None:
+          with ExitStack() as stack:
+              self.offen = [stack.enter_context(verbinde(h)) for h in hosts]
+              self._stack = stack.pop_all()      # Besitz wandert zum Objekt
+
+      def close(self) -> None:
+          self._stack.close()
+
+  pool = Verbindungen(["db1", "db2"])
+  print("im Einsatz:", pool.offen)
+  pool.close()
+
+  try:
+      Verbindungen(["db1", "db2", "db3"])
+  except ConnectionError as fehler:
+      print("Fehler:", fehler)
+  ```
+
+  Beim zweiten Aufruf scheitert `db3`. Der Konstruktor ist dann nie bis `pop_all()` gekommen, also schließt der `with`-Block `db2` und `db1`, und die Exception erreicht den Aufrufer. Die Doku zeigt dasselbe unter [„Cleaning up in an `__enter__` implementation“](https://docs.python.org/3/library/contextlib.html#cleaning-up-in-an-enter-implementation).
+
+  > [!WARNING] pop_all ist der letzte Schritt
+  > Alles, was nach `pop_all()` im `with`-Block schiefgeht, räumt niemand mehr auf: Der ursprüngliche Stack ist leer, und der neue ist noch nicht im Besitz des Aufrufers. Setze `pop_all()` deshalb als letzte Zeile in den Block.
+
+  > [!INTERVIEW] „Wie öffnest du eine variable Zahl von Dateien und schließt sie sicher?“
+  > Eine Schleife mit `open` ohne `with` schließt bei einem Fehler in der Mitte nichts. Die Antwort ist `ExitStack` mit `enter_context` in einer Schleife. Wer dazu sagt, dass die Aufräumschritte in umgekehrter Reihenfolge laufen, dass das Öffnen selbst abgesichert ist und dass `pop_all()` die Ressourcen übergibt, statt sie zu schließen, hat die Frage vollständig beantwortet.
+
+  ## asynccontextmanager: Context Manager für Coroutinen
+
+  In async-Code sind Aufbau und Abbau einer Ressource oft selbst Coroutinen: eine Verbindung aus einem Pool holen, eine Session sauber beenden. Dafür gibt es `async with` mit `__aenter__` und `__aexit__`, beides darf `await` nutzen. Wie `async with` und asynchrone Generatoren funktionieren, steht im Modul [Nebenläufigkeit](/python/nebenlaeufigkeit). Hier geht es um die Abkürzung: [`@asynccontextmanager`](https://docs.python.org/3/library/contextlib.html#contextlib.asynccontextmanager) macht aus einem asynchronen Generator einen solchen Context Manager, so wie `@contextmanager` es für normale Generatoren tut.
+
+  ```python run
+  import asyncio
+  from contextlib import AsyncExitStack, asynccontextmanager
+
+  log: list[str] = []
+
+  class Verbindung:
+      def __init__(self, name: str) -> None:
+          self.name = name
+          self.offen = True
+
+      async def abfrage(self, sql: str) -> str:
+          await asyncio.sleep(0)
+          if not self.offen:
+              raise RuntimeError("Verbindung geschlossen")
+          return f"{self.name}: {sql} -> 1 Zeile"
+
+  @asynccontextmanager
+  async def verbindung(name: str):
+      await asyncio.sleep(0)                  # Handshake
+      conn = Verbindung(name)
+      log.append(f"verbunden {name}")
+      try:
+          yield conn
+      finally:
+          conn.offen = False
+          await asyncio.sleep(0)              # sauber beenden darf warten
+          log.append(f"getrennt {name}")
+
+  async with verbindung("db") as conn:
+      print(await conn.abfrage("SELECT 1"))
+
+  async with AsyncExitStack() as stack:
+      pool = [await stack.enter_async_context(verbindung(n)) for n in ["a", "b"]]
+      print([c.name for c in pool])
+
+  print(log)
+  ```
+
+  Der Block läuft hier mit `await` auf oberster Ebene; in einem normalen Programm steckt derselbe Code in einer `async def` und läuft unter `asyncio.run`. Der Aufbau gleicht dem synchronen Fall: Vor `yield` steht das Öffnen, der `yield`-Wert landet hinter `as`, danach kommt das Aufräumen. Auch das `try`/`finally` ist aus demselben Grund Pflicht. Bei einem Timeout oder wenn eine `TaskGroup` ihre Tasks abbricht, löst asyncio an der Stelle des `await` im Block eine `CancelledError` aus ([Task cancellation](https://docs.python.org/3/library/asyncio-task.html#task-cancellation)). Sie läuft durch den Generator, und nur ein `finally` führt dann noch das Aufräumen aus.
+
+  [`AsyncExitStack`](https://docs.python.org/3/library/contextlib.html#contextlib.AsyncExitStack) ist das Gegenstück zu `ExitStack`. Er kennt `enter_async_context` für `async with`-Objekte und `push_async_callback` für Coroutinen als Aufräumschritt, und er beendet alles in umgekehrter Reihenfolge. Normale Context Manager nimmt er zusätzlich über `enter_context` auf. Schließen kannst du ihn mit `async with` oder mit `await stack.aclose()`.
+
+  > [!PRAXIS] Lebenszyklus einer Anwendung
+  > FastAPI beschreibt Start und Ende der App als `lifespan`: ein `@asynccontextmanager`, der vor `yield` das Modell lädt oder den Verbindungspool öffnet und danach aufräumt ([FastAPI · Lifespan](https://fastapi.tiangolo.com/advanced/events/#lifespan)). Dasselbe Muster steckt in async-pytest-Fixtures mit `yield`. Im Code-Review achtest du auf ein fehlendes `try`/`finally` und auf Ressourcen, die ein Aufrufer öffnet und nie schließt.
+
   ## map, filter, Comprehensions und operator
 
   [`map`](https://docs.python.org/3/library/functions.html#map) wendet eine Funktion auf jedes Element an, [`filter`](https://docs.python.org/3/library/functions.html#filter) behält die Elemente, für die eine Funktion wahr liefert. Beide geben **Iteratoren** zurück: Sie rechnen erst, wenn jemand die Werte abholt, und lassen sich nur einmal durchlaufen. List Comprehensions und Generator Expressions sind meist lesbarer, weil Ausdruck und Bedingung an einer Stelle stehen.
@@ -378,6 +532,8 @@ lesson: |
   - Ein guter Wrapper nimmt `*args, **kwargs`, gibt das Ergebnis zurück und trägt `@functools.wraps`.
   - `cache` und `lru_cache` brauchen hashbare Argumente und reine Funktionen; auf Methoden halten sie Instanzen am Leben.
   - `__exit__` läuft immer. Mit `@contextmanager` gehört das Aufräumen in `finally`.
+  - `ExitStack` schließt beliebig viele Ressourcen in umgekehrter Reihenfolge, auch wenn das Öffnen mittendrin scheitert. `callback` braucht Funktion und Argumente getrennt, `pop_all()` übergibt den Besitz.
+  - `@asynccontextmanager` und `AsyncExitStack` sind die async-Gegenstücke. Aufräumen gehört in `finally`, weil Abbruch als `CancelledError` am `await` ankommt.
   - Comprehensions statt `map`/`filter` mit `lambda`; `itemgetter` und `attrgetter` als Sortierschlüssel.
 exercises:
   - id: was-bewirkt-das-at
@@ -562,6 +718,97 @@ exercises:
         url: https://docs.python.org/3/reference/datamodel.html#context-managers
       - title: Die with-Anweisung
         url: https://docs.python.org/3/reference/compound_stmts.html#the-with-statement
+
+  - id: exitstack-reihenfolge
+    type: output
+    title: In welcher Reihenfolge räumt der Stack auf?
+    prompt: |
+      Was gibt dieses Programm aus? Achte darauf, wo der `callback` steht und was mit dem `KeyError` passiert.
+    lang: python
+    code: |
+      from contextlib import ExitStack, contextmanager
+
+      @contextmanager
+      def ressource(name):
+          print(f"auf {name}")
+          try:
+              yield name
+          finally:
+              print(f"zu {name}")
+
+      def melde(text):
+          print(f"callback {text}")
+
+      try:
+          with ExitStack() as stack:
+              stack.enter_context(ressource("db"))
+              stack.callback(melde, "mail")
+              stack.enter_context(ressource("cache"))
+              print("arbeite")
+              raise KeyError("fehlt")
+      except KeyError:
+          print("gefangen")
+    expected: |
+      auf db
+      auf cache
+      arbeite
+      zu cache
+      callback mail
+      zu db
+      gefangen
+    hints:
+      - "`enter_context` führt den Code vor `yield` sofort aus. `callback` merkt sich nur die Funktion."
+      - Die Aufräumschritte laufen in umgekehrter Reihenfolge, so wie sie registriert wurden.
+    explanation: |
+      Beim Registrieren druckt nur `enter_context` etwas, nämlich `auf db` und `auf cache`. Der `callback` ist bis zum Ende nur vorgemerkt. Der `KeyError` bricht den Block ab, der Stack arbeitet seine Einträge von hinten nach vorn ab: zuerst `cache`, dann den Callback, dann `db`. Der Stack unterdrückt die Exception nicht, denn kein `__exit__` gibt einen wahren Wert zurück. Sie kommt beim `except` an. Die Reihenfolge ist dieselbe wie bei drei verschachtelten `with`-Blöcken.
+    resources:
+      - title: contextlib.ExitStack
+        url: https://docs.python.org/3/library/contextlib.html#contextlib.ExitStack
+      - title: ExitStack.callback
+        url: https://docs.python.org/3/library/contextlib.html#contextlib.ExitStack.callback
+
+  - id: async-cm-reihenfolge
+    type: output
+    title: Ein Generator fängt die Exception
+    prompt: |
+      Was gibt dieses Programm aus? Der Code nutzt `await` auf oberster Ebene, ohne `asyncio.run`. Achte auf die Zeile `except ValueError` in `schritt` und darauf, was `a` danach zu sehen bekommt.
+    lang: python
+    code: |
+      import asyncio
+      from contextlib import AsyncExitStack, asynccontextmanager
+
+      @asynccontextmanager
+      async def schritt(name):
+          print(f"auf {name}")
+          try:
+              yield name
+          except ValueError:
+              print(f"{name}: ValueError gefangen")
+          finally:
+              print(f"zu {name}")
+
+      async with AsyncExitStack() as stack:
+          await stack.enter_async_context(schritt("a"))
+          await stack.enter_async_context(schritt("b"))
+          raise ValueError("kaputt")
+      print("weiter")
+    expected: |
+      auf a
+      auf b
+      b: ValueError gefangen
+      zu b
+      zu a
+      weiter
+    hints:
+      - Der Stack beendet erst `b`, dann `a`. Die Exception kommt zuerst bei `b` an.
+      - Wenn ein `@asynccontextmanager`-Generator die Exception fängt und normal endet, gilt sie als behandelt.
+    explanation: |
+      Der Stack räumt von hinten auf. Der `ValueError` wird an der Stelle des `yield` im Generator von `b` ausgelöst. Dort fängt ihn das `except`, der Generator endet normal, und `@asynccontextmanager` meldet dem Stack damit „behandelt“. `a` bekommt deshalb keine Exception mehr zu sehen. Sein `finally` läuft trotzdem, und der `with`-Block endet ohne Fehler, sodass `weiter` erscheint. Ein Generator, der eine Exception fängt und nicht erneut auslöst, verschluckt sie also genauso wie ein `__exit__`, das `True` zurückgibt.
+    resources:
+      - title: contextlib.asynccontextmanager
+        url: https://docs.python.org/3/library/contextlib.html#contextlib.asynccontextmanager
+      - title: contextlib.AsyncExitStack
+        url: https://docs.python.org/3/library/contextlib.html#contextlib.AsyncExitStack
 
   - id: limit-dekorator
     type: gap
@@ -1023,6 +1270,295 @@ exercises:
       - title: json.dumps und default
         url: https://docs.python.org/3/library/json.html#json.dumps
 
+  - id: dateien-parallel
+    type: code
+    title: Logs parallel lesen, auch wenn eines fehlt
+    prompt: |
+      Ein Skript vergleicht gleichzeitig die Logs mehrerer Server, Zeile für Zeile. Schreibe `lies_parallel(pfade, oeffne=open)` so, dass es alle Dateien offen hält und am Ende wieder schließt, **egal wie** die Funktion endet.
+
+      - Das Ergebnis ist eine Liste von Tupeln: Das erste Tupel enthält die erste Zeile jeder Datei, das zweite die zweite Zeile und so weiter. Zeilenumbrüche am Ende (`\n`) entfallen.
+      - Haben die Dateien verschieden viele Zeilen, fliegt `ValueError` (das erledigt `zip(..., strict=True)` von selbst).
+      - Lässt sich eine Datei nicht öffnen, fliegt die Exception weiter, und alle bis dahin geöffneten Dateien sind geschlossen.
+      - Geöffnet wird mit `oeffne(pfad, encoding="utf-8")`. Tests übergeben dafür eigene Objekte, die Context Manager sind.
+
+      Der Startcode funktioniert im Normalfall und räumt bei Fehlern nicht auf. Schreibe ihn mit `ExitStack` um.
+    lang: python
+    starter: |
+      def lies_parallel(pfade, oeffne=open):
+          dateien = [oeffne(pfad, encoding="utf-8") for pfad in pfade]
+          paare = list(zip(*dateien, strict=True))
+          for datei in dateien:
+              datei.close()
+          return [tuple(zeile.rstrip("\n") for zeile in paar) for paar in paare]
+    solution: |
+      from contextlib import ExitStack
+
+      def lies_parallel(pfade, oeffne=open):
+          with ExitStack() as stack:
+              dateien = [stack.enter_context(oeffne(pfad, encoding="utf-8")) for pfad in pfade]
+              return [
+                  tuple(zeile.rstrip("\n") for zeile in paar)
+                  for paar in zip(*dateien, strict=True)
+              ]
+    setup: |
+      from pathlib import Path
+
+      class FakeDatei:
+          def __init__(self, zeilen):
+              self.zeilen = zeilen
+              self.closed = False
+
+          def __iter__(self):
+              return iter(self.zeilen)
+
+          def __enter__(self):
+              return self
+
+          def __exit__(self, *exc):
+              self.close()
+
+          def close(self):
+              self.closed = True
+
+      def fake_oeffner(inhalte, kaputt=None):
+          geoeffnet = []
+
+          def oeffne(pfad, **kwargs):
+              if pfad == kaputt:
+                  raise PermissionError(f"{pfad}: keine Berechtigung")
+              datei = FakeDatei(inhalte[pfad])
+              geoeffnet.append(datei)
+              return datei
+
+          return oeffne, geoeffnet
+
+      Path("web1.log").write_text("start\nfehler\n", encoding="utf-8")
+      Path("web2.log").write_text("start\nok\n", encoding="utf-8")
+    tests:
+      - name: Echte Dateien Zeile für Zeile
+        code: |
+          ergebnis = lies_parallel(["web1.log", "web2.log"])
+          assert ergebnis == [("start", "start"), ("fehler", "ok")], f"bekommen {ergebnis!r}"
+      - name: Keine Pfade, keine Zeilen
+        code: |
+          assert lies_parallel([]) == []
+      - name: Schließt alle Dateien nach dem Lesen
+        code: |
+          oeffne, geoeffnet = fake_oeffner({"a": ["1\n"], "b": ["2\n"], "c": ["3\n"]})
+          assert lies_parallel(["a", "b", "c"], oeffne) == [("1", "2", "3")]
+          assert len(geoeffnet) == 3 and all(d.closed for d in geoeffnet), "Nicht alle Dateien sind geschlossen."
+      - name: Schließt alles, wenn die dritte Datei fehlt
+        code: |
+          oeffne, geoeffnet = fake_oeffner({"a": ["1\n"], "b": ["2\n"], "c": ["3\n"]}, kaputt="c")
+          try:
+              lies_parallel(["a", "b", "c"], oeffne)
+          except PermissionError:
+              pass
+          else:
+              raise AssertionError("Die PermissionError muss beim Aufrufer ankommen.")
+          assert len(geoeffnet) == 2, f"Es sollten zwei Dateien offen gewesen sein, geöffnet wurden {len(geoeffnet)}."
+          assert all(d.closed for d in geoeffnet), "Die zwei bereits geöffneten Dateien sind noch offen."
+      - name: Schließt alles bei ungleicher Länge
+        code: |
+          oeffne, geoeffnet = fake_oeffner({"a": ["1\n", "2\n"], "b": ["1\n"]})
+          try:
+              lies_parallel(["a", "b"], oeffne)
+          except ValueError:
+              pass
+          else:
+              raise AssertionError("Verschieden lange Dateien müssen ValueError auslösen.")
+          assert all(d.closed for d in geoeffnet), "Nach dem ValueError sind Dateien noch offen."
+    hints:
+      - "`with ExitStack() as stack:` und darin `stack.enter_context(oeffne(...))` in der Listenerzeugung."
+      - Das `return` darf im `with`-Block stehen. Der Stack schließt die Dateien erst danach.
+    explanation: |
+      Der Startcode schließt die Dateien nur, wenn nichts schiefgeht. Scheitert `oeffne` bei der dritten Datei oder wirft `zip(strict=True)`, bleiben die anderen offen. Bei ein paar Logs fällt das nicht auf, bei Hunderten Dateien in einem langlaufenden Prozess landest du bei `OSError: Too many open files`. `ExitStack` übernimmt genau das, was du von Hand mit einer Liste und `try`/`finally` bauen müsstest: Er merkt sich jede geöffnete Datei und schließt sie in umgekehrter Reihenfolge, auch wenn das Öffnen mittendrin scheitert.
+    resources:
+      - title: Supporting a variable number of context managers
+        url: https://docs.python.org/3/library/contextlib.html#supporting-a-variable-number-of-context-managers
+      - title: zip mit strict=True
+        url: https://docs.python.org/3/library/functions.html#zip
+
+  - id: verbindungen-uebergeben
+    type: code
+    title: Alles oder nichts, dann Besitz übergeben
+    prompt: |
+      Schreibe `oeffne_alle(hosts, verbinde)`. `verbinde(host)` liefert einen Context Manager, dessen `__enter__` die Verbindung zurückgibt.
+
+      - Klappt alles, gibt die Funktion das Tupel `(verbindungen, stapel)` zurück: die Liste der Verbindungen in der Reihenfolge von `hosts` und einen `ExitStack`. Die Verbindungen bleiben **offen**. Der Aufrufer schließt sie später mit `stapel.close()`, in umgekehrter Reihenfolge.
+      - Scheitert eine Verbindung, fliegt die Exception weiter, und alle bereits geöffneten Verbindungen sind sofort wieder geschlossen.
+
+      Im Startcode sind die Verbindungen schon beim Zurückgeben geschlossen.
+    lang: python
+    starter: |
+      from contextlib import ExitStack
+
+      def oeffne_alle(hosts, verbinde):
+          with ExitStack() as stapel:
+              verbindungen = [stapel.enter_context(verbinde(host)) for host in hosts]
+          return verbindungen, stapel
+    solution: |
+      from contextlib import ExitStack
+
+      def oeffne_alle(hosts, verbinde):
+          with ExitStack() as stapel:
+              verbindungen = [stapel.enter_context(verbinde(host)) for host in hosts]
+              return verbindungen, stapel.pop_all()
+    setup: |
+      from contextlib import ExitStack, contextmanager
+
+      LOG = []
+
+      def mache_verbinde(kaputt=()):
+          @contextmanager
+          def verbinde(host):
+              if host in kaputt:
+                  raise ConnectionError(f"{host} nicht erreichbar")
+              LOG.append(f"auf {host}")
+              try:
+                  yield f"verbindung:{host}"
+              finally:
+                  LOG.append(f"zu {host}")
+          return verbinde
+    tests:
+      - name: Verbindungen bleiben nach der Rückgabe offen
+        code: |
+          LOG.clear()
+          verbindungen, stapel = oeffne_alle(["db1", "db2"], mache_verbinde())
+          assert verbindungen == ["verbindung:db1", "verbindung:db2"], f"bekommen {verbindungen!r}"
+          assert isinstance(stapel, ExitStack), "Der zweite Rückgabewert soll ein ExitStack sein."
+          assert LOG == ["auf db1", "auf db2"], f"Die Verbindungen wurden zu früh geschlossen: {LOG!r}"
+          stapel.close()
+      - name: Der Aufrufer schließt in umgekehrter Reihenfolge
+        code: |
+          LOG.clear()
+          _, stapel = oeffne_alle(["db1", "db2", "db3"], mache_verbinde())
+          stapel.close()
+          assert LOG[3:] == ["zu db3", "zu db2", "zu db1"], f"bekommen {LOG[3:]!r}"
+      - name: Scheitert die dritte, schließt der Aufruf die ersten zwei
+        code: |
+          LOG.clear()
+          try:
+              oeffne_alle(["db1", "db2", "db3"], mache_verbinde(kaputt={"db3"}))
+          except ConnectionError as fehler:
+              assert "db3" in str(fehler)
+          else:
+              raise AssertionError("Die ConnectionError muss beim Aufrufer ankommen.")
+          assert LOG == ["auf db1", "auf db2", "zu db2", "zu db1"], f"bekommen {LOG!r}"
+      - name: Ohne Hosts gibt es nichts zu öffnen
+        code: |
+          verbindungen, stapel = oeffne_alle([], mache_verbinde())
+          assert verbindungen == []
+          stapel.close()
+    hints:
+      - "`stapel.pop_all()` gibt einen neuen `ExitStack` zurück, der die Aufräumschritte übernimmt."
+      - Gib den neuen Stack zurück, noch innerhalb des `with`-Blocks, und nicht den ursprünglichen.
+    explanation: |
+      Beim Verlassen des `with`-Blocks schließt der ursprüngliche Stack alles, was er noch besitzt. Das ist im Fehlerfall richtig, im Erfolgsfall nicht. `pop_all()` löst das: Es verschiebt die Aufräumschritte in einen neuen Stack und lässt dem alten nichts mehr zu tun. Der Aufrufer bekommt den neuen Stack, ist damit Besitzer der Verbindungen und schließt sie mit `close()`. Fliegt vor `pop_all()` eine Exception, kommt der Code nie bis dahin, und der alte Stack räumt auf.
+    resources:
+      - title: ExitStack.pop_all
+        url: https://docs.python.org/3/library/contextlib.html#contextlib.ExitStack.pop_all
+      - title: Cleaning up in an __enter__ implementation
+        url: https://docs.python.org/3/library/contextlib.html#cleaning-up-in-an-enter-implementation
+
+  - id: async-sitzung
+    type: code
+    title: Eine Sitzung, die auch bei Abbruch schließt
+    prompt: |
+      Die Klasse `Sitzung(name, log)` steht schon bereit. Sie hat die Coroutinen `oeffne()` und `schliesse()`, die je eine Zeile in die Liste `log` schreiben (`öffne a`, `schließe a`) und das Attribut `offen` setzen.
+
+      Schreibe `sitzung(name, log)` als `@asynccontextmanager`. Der Context Manager legt eine `Sitzung` an, öffnet sie mit `await`, gibt sie an den `async with`-Block und schließt sie danach mit `await`. Das Schließen muss auch laufen, wenn der Block eine Exception wirft oder ein Timeout ihn abbricht.
+
+      Die Tests nutzen `await` auf oberster Ebene.
+    lang: python
+    starter: |
+      import asyncio
+      from contextlib import asynccontextmanager
+
+      @asynccontextmanager
+      async def sitzung(name, log):
+          s = Sitzung(name, log)
+          await s.oeffne()
+          yield s
+          await s.schliesse()
+    solution: |
+      import asyncio
+      from contextlib import asynccontextmanager
+
+      @asynccontextmanager
+      async def sitzung(name, log):
+          s = Sitzung(name, log)
+          await s.oeffne()
+          try:
+              yield s
+          finally:
+              await s.schliesse()
+    setup: |
+      import asyncio
+      from contextlib import AsyncExitStack
+
+      class Sitzung:
+          def __init__(self, name, log):
+              self.name = name
+              self.log = log
+              self.offen = False
+
+          async def oeffne(self):
+              await asyncio.sleep(0)
+              self.offen = True
+              self.log.append(f"öffne {self.name}")
+
+          async def schliesse(self):
+              await asyncio.sleep(0)
+              self.offen = False
+              self.log.append(f"schließe {self.name}")
+    tests:
+      - name: Öffnet vor dem Block und schließt danach
+        code: |
+          log = []
+          async with sitzung("a", log) as s:
+              assert s.offen, "Im Block muss die Sitzung offen sein."
+              assert log == ["öffne a"], f"bekommen {log!r}"
+          assert not s.offen and log == ["öffne a", "schließe a"], f"bekommen {log!r}"
+      - name: Schließt nach einer Exception im Block
+        code: |
+          log = []
+          try:
+              async with sitzung("a", log) as s:
+                  raise ValueError("kaputt")
+          except ValueError:
+              pass
+          else:
+              raise AssertionError("Der ValueError muss beim Aufrufer ankommen.")
+          assert not s.offen and log == ["öffne a", "schließe a"], f"bekommen {log!r}"
+      - name: Schließt nach einem Timeout
+        code: |
+          log = []
+          try:
+              async with asyncio.timeout(0.01):
+                  async with sitzung("a", log):
+                      await asyncio.sleep(5)
+          except TimeoutError:
+              pass
+          assert log == ["öffne a", "schließe a"], f"bekommen {log!r}"
+      - name: Zwei Sitzungen in einem AsyncExitStack schließen rückwärts
+        code: |
+          log = []
+          async with AsyncExitStack() as stack:
+              await stack.enter_async_context(sitzung("a", log))
+              await stack.enter_async_context(sitzung("b", log))
+          assert log == ["öffne a", "öffne b", "schließe b", "schließe a"], f"bekommen {log!r}"
+    hints:
+      - Alles vor dem `yield` ist das Öffnen, alles danach das Schließen.
+      - "Genau wie bei `@contextmanager` braucht das Schließen ein `try`/`finally` um das `yield`."
+    explanation: |
+      Der Startcode räumt nur im Normalfall auf. Wirft der Block eine Exception oder bricht ein Timeout ihn mit `CancelledError` ab, kommt die Exception an der Stelle des `yield` an. Ohne `finally` endet der Generator dort, und `schliesse()` läuft nie. Mit `try`/`finally` läuft das Schließen in beiden Fällen, und es darf selbst `await` benutzen. Das ist der Unterschied zu einem Aufräumen in `__del__` oder per Garbage Collector: Ein `await` ist dort nicht möglich.
+    resources:
+      - title: contextlib.asynccontextmanager
+        url: https://docs.python.org/3/library/contextlib.html#contextlib.asynccontextmanager
+      - title: asyncio · Task cancellation
+        url: https://docs.python.org/3/library/asyncio-task.html#task-cancellation
+
   - id: wrapper-ohne-return
     type: bug
     title: Der Dekorator frisst das Ergebnis
@@ -1089,6 +1625,33 @@ exercises:
       - title: functools.partial
         url: https://docs.python.org/3/library/functools.html#functools.partial
 
+  - id: callback-sofort-aufgerufen
+    type: bug
+    title: Der Callback läuft zu früh und dann crasht der Block
+    prompt: |
+      `exportiere` schreibt Zeilen in ein Ziel und soll es am Ende leeren (`flush`) und schließen. Beim Verlassen des `with`-Blocks fliegt aber `TypeError: 'NoneType' object is not callable`, obwohl alle Zeilen geschrieben wurden. Das Ziel zeigt außerdem, dass `flush` schon vor dem ersten `write` lief. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: python
+    code: |
+      from contextlib import ExitStack
+
+      def exportiere(zeilen, oeffne_ziel):
+          with ExitStack() as stack:
+              ziel = stack.enter_context(oeffne_ziel())
+              stack.callback(ziel.flush())
+              for zeile in zeilen:
+                  ziel.write(zeile + "\n")
+    lines: [6]
+    fix:
+      - line: 6
+        answers: ["stack.callback(ziel.flush)"]
+    hints:
+      - Was bekommt `stack.callback` übergeben, wenn du `ziel.flush()` schreibst?
+    explanation: |
+      `ziel.flush()` ruft die Methode **sofort** auf und übergibt ihr Ergebnis `None` an `callback`. Der Stack merkt sich also `None`, und erst beim Aufräumen fällt das auf, als er `None()` aufrufen will. `stack.callback(ziel.flush)` übergibt die Funktion selbst. Argumente stehen dahinter, getrennt: `stack.callback(print, "fertig")`. Dieselbe Verwechslung begegnet dir bei `key=len()` und `@dekorator()` ohne Argumente. Da der Callback nach `enter_context` registriert ist, läuft er vor dem Schließen des Ziels, genau wie gewollt.
+    resources:
+      - title: ExitStack.callback
+        url: https://docs.python.org/3/library/contextlib.html#contextlib.ExitStack.callback
+
   - id: lru-cache-methode
     type: explain
     title: Warum hilft dieser Cache nicht?
@@ -1123,3 +1686,39 @@ exercises:
         url: https://docs.python.org/3/faq/programming.html#how-do-i-cache-method-calls
       - title: functools.lru_cache
         url: https://docs.python.org/3/library/functools.html#functools.lru_cache
+
+  - id: pop-all-erklaeren
+    type: explain
+    title: Wozu steht hier pop_all?
+    prompt: |
+      Ein Kollege hat einen Importer geschrieben, der mehrere Dateien offen hält. Im Review fragt jemand, ob `pop_all()` nicht überflüssig sei. Erkläre, was der Konstruktor tut, was bei einer fehlenden dritten Datei passiert und was ohne `pop_all()` schiefginge.
+    lang: python
+    code: |
+      from contextlib import ExitStack
+
+      class Importer:
+          def __init__(self, pfade: list[str]) -> None:
+              with ExitStack() as stack:
+                  self.dateien = [
+                      stack.enter_context(open(pfad, encoding="utf-8"))
+                      for pfad in pfade
+                  ]
+                  self._stack = stack.pop_all()
+
+          def __enter__(self):
+              return self
+
+          def __exit__(self, *exc):
+              self._stack.close()
+    points:
+      - Der `with ExitStack()` im Konstruktor macht das Öffnen zu „alles oder nichts“. Fehlt die dritte Datei, fliegt `FileNotFoundError`, und der Stack schließt die zwei bereits geöffneten.
+      - "`pop_all()` verschiebt die Aufräumschritte in einen neuen Stack, `self._stack`, und lässt den ursprünglichen leer. Das Ende des `with`-Blocks schließt deshalb nichts mehr."
+      - "Ohne `pop_all()` wären alle Dateien beim Verlassen des Konstruktors schon geschlossen, und das erste Lesen scheitert mit `ValueError: I/O operation on closed file`."
+      - Das Objekt besitzt jetzt die Dateien. `with Importer(...) as imp:` schließt sie über `__exit__` in umgekehrter Reihenfolge. `pop_all()` muss die letzte Anweisung im Block sein, denn danach räumt niemand mehr auf.
+    explanation: |
+      `pop_all()` ist nicht überflüssig. Es überträgt den Besitz. Im Fehlerfall, wenn das Öffnen der dritten Datei scheitert, kommt der Konstruktor gar nicht bis dorthin: Der `with`-Block schließt die ersten zwei, und der Aufrufer sieht nur die Exception, kein halbes Objekt. Im Erfolgsfall würde derselbe `with`-Block alle Dateien sofort schließen. `pop_all()` gibt die Aufräumschritte vorher an `self._stack` weiter, sodass der Block nichts mehr zu tun hat und die Dateien offen bleiben, bis `__exit__` aufgerufen wird. Wer `Importer(...)` ohne `with` benutzt, muss `close` selbst aufrufen. Das gehört dann in die Doku der Klasse.
+    resources:
+      - title: ExitStack.pop_all
+        url: https://docs.python.org/3/library/contextlib.html#contextlib.ExitStack.pop_all
+      - title: Cleaning up in an __enter__ implementation
+        url: https://docs.python.org/3/library/contextlib.html#cleaning-up-in-an-enter-implementation

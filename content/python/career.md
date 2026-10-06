@@ -28,14 +28,14 @@ Jede Woche endet mit etwas, das du ohne Musterlösung erneut vorführen kannst. 
 | 4 | Iteratoren & Generatoren | Pipeline entwickeln, einmaligen Verbrauch demonstrieren |
 | 5 | Dekoratoren & funktionale Werkzeuge | Wrapper erklären und Ressourcen mit Context Manager aufräumen |
 | 6 | Typisierung | Typisierte Grenzen im CLI; Typechecker findet einen absichtlich eingebauten Fehler |
-| 7 | Nebenläufigkeit | I/O- und CPU-Arbeit unterscheiden, begrenzte asynchrone Verarbeitung testen |
+| 7 | Nebenläufigkeit & Performance | I/O- und CPU-Arbeit unterscheiden, begrenzte asynchrone Verarbeitung mit Abbruch testen, einen Engpass mit cProfile finden |
 | 8 | Testen mit pytest | Fixtures, Parametrisierung und Regressionstest für einen echten Bug |
 | 9 | Tooling & Packaging | Installation, Linting, Typprüfung und Tests aus frischem Checkout |
 | 10 | Web & Datenbanken | Einen Ticket-Ablauf vom HTTP-Request bis zur Transaktion umsetzen |
 | 11 | Algorithmen & Interview | Zwei Aufgaben laut lösen und Laufzeit/Alternativen begründen |
 | 12 | Abschlussprojekt Team-Tickets | API abnehmen, Demo und README anhand der Projektkriterien prüfen |
 
-Die Modul-IDs bleiben deine Orientierung: `python-einstieg`, `kontrollfluss-funktionen`, `datenstrukturen`, `strings-dateien`, `oop`, `fehler-module`, `iteratoren-generatoren`, `dekoratoren-funktional`, `typisierung`, `nebenlaeufigkeit`, `testen-pytest`, `tooling-packaging`, `web-datenbanken`, `algorithmen`.
+Die Modul-IDs bleiben deine Orientierung: `python-einstieg`, `kontrollfluss-funktionen`, `datenstrukturen`, `strings-dateien`, `oop`, `fehler-module`, `iteratoren-generatoren`, `dekoratoren-funktional`, `typisierung`, `nebenlaeufigkeit`, `performance`, `testen-pytest`, `tooling-packaging`, `web-datenbanken`, `algorithmen`.
 
 ## Bewerbungsgespräche üben
 
