@@ -66,7 +66,8 @@ export const sql: ExerciseRenderer<SqlExercise, string> = (exercise, ctx) => ({
           ? `<p class="label">Fehler</p><pre class="run-output standalone error">${escape(actual.error)}</pre>`
           : `<p class="label">${exercise.check ? 'Prüfabfrage' : 'Dein Ergebnis'} · ${rowCount(actual.rows.length)}${actual.truncated ? ' (gekürzt)' : ''}</p>${sqlTableMarkup(actual.columns, actual.rows, actual.cells)}`);
         if (verdict.ok) ctx.complete();
-        else { fail(editor.value.trim()); ctx.feedback(actual.error ? 'bad' : 'partial', verdict.message); }
+        // The full error (psql's LINE, DETAIL and HINT) is shown above; the feedback keeps its first line.
+        else { fail(editor.value.trim()); ctx.feedback(actual.error ? 'bad' : 'partial', actual.error ? verdict.message.split('\n')[0] : verdict.message); }
       } catch (error) {
         if (!active) return;
         out.hidden = false;
