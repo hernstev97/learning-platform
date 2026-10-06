@@ -28,9 +28,10 @@ export function pgResultsMarkup(results: PgStatementResult[], error: string | nu
   const tables = results.filter((result) => result.returnsRows).length;
   let n = 0;
   const parts = results.map((result) => {
-    const notices = result.notices.map((notice) => `<span class="sql-notice">${escape(notice)}</span>`).join('\n');
-    if (result.error) return `${notices}${notices ? '\n' : ''}<span class="sql-error">${escape(result.error)}</span>`;
-    if (!result.returnsRows) return `${notices}${notices ? '\n' : ''}<span class="sql-tag">${escape(result.tag)}</span>`;
+    // Every part is a block of its own; newlines between them would add empty lines in the pre-wrapped output.
+    const notices = result.notices.map((notice) => `<span class="sql-notice">${escape(notice)}</span>`).join('');
+    if (result.error) return `${notices}<span class="sql-error">${escape(result.error)}</span>`;
+    if (!result.returnsRows) return `${notices}<span class="sql-tag">${escape(result.tag)}</span>`;
     n++;
     const label = `<span class="run-label">${tables > 1 ? `Ergebnis ${n} · ` : 'Ergebnis · '}${rowCount(result.rows.length)}${result.truncated ? ' (gekürzt)' : ''}</span>`;
     const plan = result.columns.length === 1 && result.columns[0] === 'QUERY PLAN';
@@ -40,5 +41,5 @@ export function pgResultsMarkup(results: PgStatementResult[], error: string | nu
     return `${notices}${label}${body}`;
   });
   const err = error ? `<span class="run-label">Fehler</span>${escape(error)}` : '';
-  return parts.join('\n') + (parts.length && err ? '\n' : '') + err || '<span class="run-label">Ergebnis</span>(keine Anweisung)';
+  return parts.join('') + err || '<span class="run-label">Ergebnis</span>(keine Anweisung)';
 }

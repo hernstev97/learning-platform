@@ -315,7 +315,7 @@ test('PostgreSQL runs in the browser: previews, results, checks after DDL and ru
   await page.locator('#run').click();
   await expect(page.locator('#sql-result')).toContainText('ALTER TABLE', { timeout: 90_000 });
   await expect(page.locator('#sql-result table')).toContainText('check_violation');
-  await expect(page.locator('#feedback')).toContainText('gehört so nicht ins Ergebnis');
+  await expect(page.locator('#feedback')).toContainText('weicht die Prüfabfrage in der Spalte „null_euro“ ab');
   await page.locator('#editor').fill('ALTER TABLE buchungen ADD CONSTRAINT preis_ok CHECK (preis >= 0);');
   await page.locator('#run').click();
   await expect(page.locator('#feedback')).toContainText('Richtig.');
