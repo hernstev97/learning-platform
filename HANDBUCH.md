@@ -535,6 +535,7 @@ Für alles, was kein Ergebnis liefert – Constraints anlegen, Daten migrieren, 
 ```
 
 - **Prüfe das Verhalten, nicht die Schreibweise.** `lp.versuch(anweisung)` führt eine Anweisung aus, rollt sie immer zurück und liefert `ok` oder den Namen des Fehlers (`check_violation`, `unique_violation`, `foreign_key_violation`, `restrict_violation`, `not_null_violation`, `exclusion_violation`, sonst den SQLSTATE). So gilt jeder Constraint-Name und jede gleichwertige Bedingung. Für Daten genügen Abfragen auf die Tabellen, für Indexe und Spalten der Katalog (`pg_indexes`, `information_schema.columns`) – aber nur Eigenschaften, die die Aufgabe verlangt, nicht Namen, die der Lernende frei wählt.
+- `lp.versuch` mit DDL auf ein Objekt, das dieselbe Prüfabfrage liest (`REFRESH MATERIALIZED VIEW`, `CREATE INDEX`, `ALTER TABLE` auf eine Tabelle im `FROM`), scheitert immer mit `55006` (Objekt in Benutzung) – nach der Lösung wie nach einer falschen Antwort. Prüfe solche Objekte über den Katalog (`pg_matviews`, `pg_index`) oder lies sie in der Prüfabfrage nicht.
 - Der Prompt nennt alles, was geprüft wird. Die Prüfabfrage ist für den Lernenden sichtbar und verrät die Lösung nicht.
 - `pnpm verify` verlangt: Nach der Lösung liefert die Prüfabfrage Zeilen und keinen Fehler, nach dem `starter` (oder, ohne Starter, auf dem nackten Schema) ein anderes Ergebnis.
 - `ordered: true` bezieht sich bei `check` auf die Prüfabfrage; sie braucht dann `ORDER BY`.
