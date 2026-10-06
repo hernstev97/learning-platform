@@ -330,6 +330,13 @@ test('PostgreSQL runs in the browser: previews, results, checks after DDL and ru
   await block.locator('textarea').fill('SELECT 1/0;');
   await block.getByRole('button', { name: 'Ausführen' }).click();
   await expect(block.locator('.run-output')).toContainText('ERROR:  division by zero');
+  // statement_timeout has no effect in PGlite: the time limit ends the worker, and the next run starts a new one.
+  await block.locator('textarea').fill('SELECT count(*) FROM generate_series(1, 2000000000);');
+  await block.getByRole('button', { name: 'Ausführen' }).click();
+  await expect(block.locator('.run-output')).toContainText('Zeitlimit von 10 Sekunden überschritten', { timeout: 30_000 });
+  await block.locator('textarea').fill('SELECT 42 AS antwort;');
+  await block.getByRole('button', { name: 'Ausführen' }).click();
+  await expect(block.locator('.run-output table')).toContainText('42', { timeout: 60_000 });
   expect(errors).toEqual([]);
 });
 

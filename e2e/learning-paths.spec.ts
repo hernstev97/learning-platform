@@ -5,6 +5,7 @@ import { parse as parseYaml } from 'yaml';
 import { CONTENT, lessonBlocks, loadContent } from '../tooling/content.ts';
 import type { Exercise } from '../src/content/types.ts';
 import { gapSolution } from '../src/engine/answers.ts';
+import { languageOf } from '../src/engine/highlight.ts';
 
 const loaded = loadContent();
 
@@ -134,7 +135,7 @@ for (const area of loaded.catalog.areas) {
     expect(errors).toEqual([]);
   });
 
-  if (['python', 'automation', 'data', 'testing'].includes(area.id)) test(`${area.id}: every runnable solution passes in the actual browser runtime`, async ({ page }) => {
+  if (['python', 'automation', 'data', 'testing', 'postgres'].includes(area.id)) test(`${area.id}: every runnable solution passes in the actual browser runtime`, async ({ page }) => {
     test.setTimeout(480_000);
     const errors: string[] = [];
     page.on('pageerror', (error) => errors.push(error.message));
@@ -154,6 +155,31 @@ for (const area of loaded.catalog.areas) {
       }
     }
     expect(executed).toBeGreaterThan(0);
+    expect(errors).toEqual([]);
+  });
+
+  // `pnpm verify` runs PostgreSQL lesson blocks with PGlite under Node; this runs them in the browser's worker.
+  const postgresBlocks = Object.values(loaded.areas[area.id].modules).filter((module) => !module.bear).map((module) => ({
+    module,
+    blocks: lessonBlocks(String(parseYaml(readFileSync(join(CONTENT, area.id, 'modules', `${module.id}.yaml`), 'utf8')).lesson ?? ''))
+      .filter((block) => languageOf(block.lang) === 'postgres' && block.flags.includes('run')),
+  })).filter(({ blocks }) => blocks.length);
+  if (postgresBlocks.length) test(`${area.id}: every PostgreSQL lesson block runs in the browser`, async ({ page }) => {
+    test.setTimeout(300_000);
+    const errors: string[] = [];
+    page.on('pageerror', (error) => errors.push(error.message));
+    for (const { module, blocks } of postgresBlocks) {
+      await page.goto(`/${area.id}/${module.id}`);
+      const rendered = page.locator('.codeblock[data-run="postgres"]');
+      await expect(rendered).toHaveCount(blocks.length);
+      for (const [i, block] of blocks.entries()) {
+        const output = rendered.nth(i).locator('.run-output');
+        await rendered.nth(i).getByRole('button', { name: 'Ausführen' }).click();
+        await expect(output, `${module.id}, PostgreSQL-Block ${i + 1}`).not.toHaveText(/^(Läuft …|PostgreSQL wird geladen)/, { timeout: 90_000 });
+        if (block.flags.includes('fails')) await expect(output, `${module.id}, PostgreSQL-Block ${i + 1}`).toHaveClass(/error/);
+        else await expect(output, `${module.id}, PostgreSQL-Block ${i + 1}`).not.toHaveClass(/error/);
+      }
+    }
     expect(errors).toEqual([]);
   });
 
