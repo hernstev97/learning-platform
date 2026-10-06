@@ -1,12 +1,14 @@
 // pnpm links [bereich ...]
 // Checks every external URL in content/ (lessons, exercises, resources, pages). Anchors (#…) are
 // checked too where the page is HTML: the id or name must exist in the document.
-import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { appendFileSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { Marked } from 'marked';
 import { parse as parseYaml } from 'yaml';
 import { CONTENT, ROOT } from './content.ts';
 
+const configuredDelay = Number(process.env.LINKS_RETRY_DELAY_MS);
+const RETRY_DELAY = Number.isFinite(configuredDelay) && configuredDelay >= 0 && process.env.LINKS_RETRY_DELAY_MS ? configuredDelay : 60_000;
 const only = process.argv.slice(2).filter((a) => !a.startsWith('--'));
 const files: string[] = [];
 const walk = (dir: string) => {
@@ -60,27 +62,46 @@ const fetchPage = (url: string) => {
   return pages.get(url)!;
 };
 
-const problems: string[] = [];
-const unreachable: string[] = [];
-const blocked: string[] = [];
-const queue = [...uses.keys()];
-async function worker() {
-  for (let url = queue.shift(); url; url = queue.shift()) {
-    const [page, anchor] = url.split('#');
-    const { status, body } = await fetchPage(page);
-    if ([403, 418, 429].includes(status)) { blocked.push(url); continue; }
-    if (status === 0) { unreachable.push(url); continue; }
-    if (status < 200 || status >= 400) { problems.push(`${status || 'Netzwerkfehler'}  ${url}\n      in ${[...new Set(uses.get(url))].join(', ')}`); continue; }
-    if (anchor && body && !/^:~:/.test(anchor)) {
-      const escaped = decodeURIComponent(anchor).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      // GitHub renders README headings with ids prefixed by `user-content-`; the URL leaves the prefix out.
-      const prefix = new URL(page).hostname === 'github.com' ? '(?:user-content-)?' : '';
-      if (!new RegExp(`(id|name)\\s*=\\s*["']?${prefix}${escaped}["'\\s>]`).test(body)) problems.push(`Anker fehlt  ${url}\n      in ${[...new Set(uses.get(url))].join(', ')}`);
-    }
+const problems = new Map<string, string>();
+const unreachable = new Set<string>();
+const blocked = new Set<string>();
+async function check(url: string) {
+  const [page, anchor] = url.split('#');
+  const { status, body } = await fetchPage(page);
+  if ([403, 418, 429].includes(status)) { blocked.add(url); return; }
+  if (status === 0) { unreachable.add(url); return; }
+  blocked.delete(url); unreachable.delete(url);
+  const where = `\n      in ${[...new Set(uses.get(url))].join(', ')}`;
+  if (status < 200 || status >= 400) { problems.set(url, `${status || 'Netzwerkfehler'}  ${url}${where}`); return; }
+  if (anchor && body && !/^:~:/.test(anchor)) {
+    const escaped = decodeURIComponent(anchor).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // GitHub renders README headings with ids prefixed by `user-content-`; the URL leaves the prefix out.
+    const prefix = new URL(page).hostname === 'github.com' ? '(?:user-content-)?' : '';
+    if (!new RegExp(`(id|name)\\s*=\\s*["']?${prefix}${escaped}["'\\s>]`).test(body)) problems.set(url, `Anker fehlt  ${url}${where}`);
   }
 }
-await Promise.all(Array.from({ length: 12 }, worker));
-console.log(`${uses.size} URLs geprüft, ${problems.length} Probleme.`);
-if (unreachable.length) console.log(`Nicht erreichbar (Zeitüberschreitung, bitte manuell prüfen):\n  ${unreachable.join('\n  ')}`);
-if (blocked.length) console.log(`Nicht automatisch prüfbar (HTTP 403/418/429):\n  ${blocked.join('\n  ')}`);
-if (problems.length) { console.log(problems.sort().join('\n')); process.exit(1); }
+async function run(urls: string[]) {
+  const queue = [...urls];
+  await Promise.all(Array.from({ length: 12 }, async () => { for (let url = queue.shift(); url; url = queue.shift()) await check(url); }));
+}
+await run([...uses.keys()]);
+// Foreign sites have bad minutes. Only what is still broken after a pause counts as broken.
+if (problems.size) {
+  const again = [...problems.keys()];
+  console.log(`${again.length} Probleme im ersten Durchgang, zweiter Durchgang in ${RETRY_DELAY / 1000} s …`);
+  await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY));
+  for (const url of again) { problems.delete(url); pages.delete(url.split('#')[0]); }
+  await run(again);
+}
+console.log(`${uses.size} URLs geprüft, ${problems.size} Probleme.`);
+const notes = [
+  unreachable.size && `Nicht erreichbar (Zeitüberschreitung, bitte manuell prüfen):\n  ${[...unreachable].join('\n  ')}`,
+  blocked.size && `Nicht automatisch prüfbar (HTTP 403/418/429):\n  ${[...blocked].join('\n  ')}`,
+].filter(Boolean) as string[];
+if (notes.length) console.log(notes.join('\n'));
+// In GitHub Actions the same text goes to the run summary, so "not checkable" stays visible on green runs.
+if (process.env.GITHUB_STEP_SUMMARY) {
+  const summary = [`### Linkcheck: ${uses.size} URLs, ${problems.size} Probleme`, ...notes.map((n) => `<details><summary>${n.split('\n')[0]}</summary>\n\n\`\`\`\n${n.split('\n').slice(1).join('\n')}\n\`\`\`\n</details>`)];
+  appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${summary.join('\n\n')}\n`);
+}
+if (problems.size) { console.log([...problems.values()].sort().join('\n')); process.exit(1); }
