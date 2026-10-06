@@ -263,7 +263,8 @@ export class PgEngine {
     // The solution's result never changes; a second attempt at the same exercise only runs the learner's statements.
     const key = JSON.stringify([schema, solution, check]);
     let expected = this.expected.get(key);
-    if (!expected) { expected = (await run(solution)).result; this.expected.set(key, expected); }
+    // Only a successful result is kept: a failure (say, a clone that failed) must not stick until the worker restarts.
+    if (!expected) { expected = (await run(solution)).result; if (!expected.error) this.expected.set(key, expected); }
     // A change with RETURNING is only solved by a change: a SELECT computing the same rows does not count.
     const command = (result: PgQueryResult) => (result as PgQueryResult & { tag?: string }).tag?.split(' ')[0] ?? '';
     if (!check && !actual.result.error && DML.has(command(expected)) && !DML.has(command(actual.result)) && !changesData(query)) {

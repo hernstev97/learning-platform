@@ -235,11 +235,11 @@ for (const { area, module, file, exercise: authored, normalized } of loaded.raw)
       if (!expected.rows.length) return `${ex.check ? 'Die Prüfabfrage' : 'Die Musterlösung'} liefert keine Zeilen – eine Aufgabe mit leerem Ergebnis lässt sich nicht sinnvoll prüfen.`;
       if (!blankSql(ex.starter)) {
         const { actual } = await engine.exercise(ex.schema, ex.starter, ex.solution, ex.check);
-        if (compareSql(expected, actual, ex.ordered).ok) return `${ex.check ? 'Nach den Startanweisungen liefert die Prüfabfrage' : 'Die Startabfrage liefert'} bereits das erwartete Ergebnis.`;
+        if (compareSql(expected, actual, ex.ordered, !!ex.check).ok) return `${ex.check ? 'Nach den Startanweisungen liefert die Prüfabfrage' : 'Die Startabfrage liefert'} bereits das erwartete Ergebnis.`;
       } else if (ex.check) {
         // Without any statement of the learner: the check query on the bare schema must not pass yet.
         const { actual } = await engine.exercise(ex.schema, ex.check, ex.solution, null);
-        if (compareSql(expected, actual, ex.ordered).ok) return 'Die Prüfabfrage besteht schon ohne eine Anweisung – sie prüft zu wenig.';
+        if (compareSql(expected, actual, ex.ordered, true).ok) return 'Die Prüfabfrage besteht schon ohne eine Anweisung – sie prüft zu wenig.';
       }
       return null;
     } });

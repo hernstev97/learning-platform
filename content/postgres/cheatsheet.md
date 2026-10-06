@@ -15,7 +15,7 @@ ORDER BY b.beginn, b.id;               -- Tiebreaker: id
 SELECT m.name,
        count(b.id) AS buchungen,                                     -- nicht count(*)
        count(*) FILTER (WHERE b.status = 'storniert') AS storniert,
-       coalesce(sum(b.preis), 0) AS umsatz,
+       coalesce(sum(b.preis) FILTER (WHERE b.status = 'bestaetigt'), 0) AS umsatz,
        string_agg(DISTINCT r.name, ', ' ORDER BY r.name) AS raeume
 FROM mitglieder m
 LEFT JOIN buchungen b ON b.mitglied_id = m.id
@@ -296,7 +296,10 @@ UPDATE jobs j SET status = 'laeuft', worker = 'worker-2', versuche = versuche + 
 FROM naechste WHERE j.id = naechste.id
 RETURNING j.id, j.art;
 
+BEGIN;                                                         -- xact-Sperren gelten nur in einer Transaktion
 SELECT pg_advisory_xact_lock(hashtext('monatsabrechnung'));   -- bis Transaktionsende
+-- … geschützte Abrechnung …
+COMMIT;                                                        -- gibt die Sperre frei
 SELECT pg_try_advisory_lock(42);                               -- true/false, bis pg_advisory_unlock(42)
 
 SET lock_timeout = '3s';      -- statt endlos warten: Fehler 55P03
