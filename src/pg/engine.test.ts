@@ -48,6 +48,8 @@ describe('PgEngine (PostgreSQL in PGlite)', () => {
       SELECT * FROM t;`);
     expect(result.error).toBeNull();
     expect(result.results.map((r) => r.tag)).toEqual(['CREATE TABLE', 'INSERT 0 2', 'SELECT 2']);
+    const created = await engine.script('CREATE TABLE z AS SELECT generate_series(1, 3) AS n; CREATE MATERIALIZED VIEW mz AS SELECT * FROM z; UPDATE z SET n = n + 1;');
+    expect(created.results.map((r) => r.tag)).toEqual(['SELECT 3', 'SELECT 3', 'UPDATE 3']);
     // The course's time zone is Europe/Berlin, summer time included.
     expect(result.text).toBe('12.50|t|{"x": 1}|{a,b}|2026-07-01 12:00:00+02\n||||\n');
     expect(result.results[2].rows[0][0]).toBe(12.5);

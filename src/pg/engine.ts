@@ -180,9 +180,10 @@ function resultSet(result: Results<unknown[]>): PgResultSet {
 function tag(result: Results, statement: string): string {
   const words = statement.replace(/^(?:\s|--[^\n]*\n|\/\*[\s\S]*?\*\/)+/, '').split(/\s+/).map((word) => word.toUpperCase());
   const command = (result as Results & { command?: string }).command?.toUpperCase() || words[0];
-  const count = result.affectedRows ?? 0;
+  // rowCount is PostgreSQL's count from the command tag (also for CREATE TABLE AS and materialized views).
+  const count = (result as Results & { rowCount?: number }).rowCount ?? result.affectedRows ?? 0;
   if (command === 'INSERT') return `INSERT 0 ${count}`;
-  if (['UPDATE', 'DELETE', 'MERGE', 'SELECT', 'COPY', 'FETCH', 'MOVE'].includes(command)) return `${command} ${result.fields.length ? result.rows.length : count}`;
+  if (['UPDATE', 'DELETE', 'MERGE', 'SELECT', 'COPY', 'FETCH', 'MOVE'].includes(command)) return `${command} ${count}`;
   if (['CREATE', 'DROP', 'ALTER'].includes(command)) {
     const object = words.slice(1).filter((word) => !['OR', 'REPLACE', 'UNIQUE', 'TEMP', 'TEMPORARY', 'UNLOGGED', 'MATERIALIZED', 'RECURSIVE', 'TRUSTED', 'PROCEDURAL'].includes(word));
     const kind = ['INDEX', 'TABLE', 'VIEW', 'FUNCTION', 'PROCEDURE', 'SEQUENCE', 'TYPE', 'DOMAIN', 'SCHEMA', 'EXTENSION', 'TRIGGER', 'ROLE', 'POLICY', 'STATISTICS'].includes(object[0]) ? object[0] : object[0] ?? '';
