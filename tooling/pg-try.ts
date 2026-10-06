@@ -21,7 +21,7 @@ if (!actual.error) {
   console.log(actual.columns.join('|'));
   for (const row of actual.cells) console.log(row.join('|'));
 }
-const verdict = compareSql(expected, actual, ex.ordered);
+const verdict = compareSql(expected, actual, ex.ordered, !!ex.check);
 console.log(`\n${verdict.ok ? '✓' : '✗'} ${verdict.message}`);
 await engine.base.close();
 process.exit(verdict.ok ? 0 : 1);

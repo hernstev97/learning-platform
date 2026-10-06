@@ -15,7 +15,14 @@ const show = (row: SqlValue[], cells: string[]) => `(${cells.map((cell, i) => ro
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
 const name = (column: string) => column.trim().toLowerCase();
 
-export function compareSql(expected: SqlResultLike, actual: SqlResultLike, ordered: boolean): SqlVerdict {
+/** Columns whose values (as a multiset) differ: in a check query each column usually tests one rule. */
+function differingColumns(expected: SqlResultLike, actual: SqlResultLike): string[] {
+  const values = (result: SqlResultLike, i: number) => result.rows.map((row) => key(row[i])).sort().join('\u0000');
+  return expected.columns.filter((_, i) => values(expected, i) !== values(actual, i));
+}
+
+/** `check`: the results come from a check query after the learner's statements, not from the learner's own query. */
+export function compareSql(expected: SqlResultLike, actual: SqlResultLike, ordered: boolean, check = false): SqlVerdict {
   if (expected.error) return { ok: false, message: `Die Musterlösung lässt sich nicht ausführen: ${expected.error}` };
   if (actual.error) return { ok: false, message: actual.error };
   if (actual.columns.length !== expected.columns.length) {
@@ -37,6 +44,11 @@ export function compareSql(expected: SqlResultLike, actual: SqlResultLike, order
     wanted.set(k, left - 1);
     return false;
   });
+  if (extra >= 0 && check) {
+    const columns = differingColumns(expected, actual);
+    const named = columns.length ? `in ${columns.length === 1 ? 'der Spalte' : 'den Spalten'} ${columns.map((column) => `„${column}“`).join(', ')}` : `in der Zeile ${show(actual.rows[extra], actual.cells[extra])}`;
+    return { ok: false, message: `Nach deinen Anweisungen weicht die Prüfabfrage ${named} ab. Lies im Prompt nach, welche Regel ${columns.length > 1 ? 'diese Spalten prüfen' : 'das prüft'}.` };
+  }
   if (extra >= 0) {
     return { ok: false, message: `Die Zeile ${show(actual.rows[extra], actual.cells[extra])} gehört so nicht ins Ergebnis (Zeile ${extra + 1} deiner Ausgabe). Prüfe Filter, Gruppierung und Berechnung.` };
   }

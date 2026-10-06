@@ -57,7 +57,7 @@ export const sql: ExerciseRenderer<SqlExercise, string> = (exercise, ctx) => ({
       try {
         const { actual, expected, script } = await execute(exercise, editor.value);
         if (!active) return;
-        const verdict = compareSql(expected, actual, exercise.ordered);
+        const verdict = compareSql(expected, actual, exercise.ordered, !!exercise.check);
         out.hidden = false;
         out.className = `sql-result${actual.error ? ' error' : ''}`;
         // In check mode the learner first sees what their statements did, then the check query's result.
