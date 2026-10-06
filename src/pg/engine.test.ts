@@ -86,6 +86,10 @@ describe('PgEngine (PostgreSQL in PGlite)', () => {
     expect(compareSql(select.expected, select.actual, false).ok).toBe(true);
     const returning = await engine.exercise(schema, "UPDATE raum SET name = 'Studio' WHERE id = 1 RETURNING id, name", "SELECT 1 AS id, 'Studio' AS name", null);
     expect(compareSql(returning.expected, returning.actual, false).ok).toBe(true);
+    const selectInstead = await engine.exercise(schema, "SELECT 1 AS id, 'Studio' AS name", "UPDATE raum SET name = 'Studio' WHERE id = 1 RETURNING id, name", null);
+    expect(selectInstead.actual.error).toContain('Gesucht ist eine Änderung der Daten (UPDATE … RETURNING)');
+    const otherChange = await engine.exercise(schema, "INSERT INTO raum VALUES (1, 'Studio') ON CONFLICT (id) DO UPDATE SET name = excluded.name RETURNING id, name", "UPDATE raum SET name = 'Studio' WHERE id = 1 RETURNING id, name", null);
+    expect(compareSql(otherChange.expected, otherChange.actual, false).ok).toBe(true);
     const tooMany = await engine.exercise(schema, 'SELECT 1; SELECT 2', 'SELECT 1', null);
     expect(tooMany.actual.error).toContain('2 Anweisungen');
     const noRows = await engine.exercise(schema, 'DELETE FROM raum', 'SELECT 1', null);

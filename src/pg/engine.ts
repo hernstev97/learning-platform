@@ -24,6 +24,7 @@ export type PgExerciseResult = { actual: PgQueryResult; expected: PgQueryResult;
 export type PgTable = { name: string; columns: string[]; rows: SqlValue[][]; cells: string[][]; total: number };
 
 const ROW_LIMIT = 1000;
+const DML = new Set(['INSERT', 'UPDATE', 'DELETE', 'MERGE']);
 const PREVIEW_ROWS = 12;
 // int8, int2, int4, oid, float4, float8, numeric: compared as numbers, so 3, 3.0 and 3.00 are equal.
 const NUMERIC_TYPES = new Set([20, 21, 23, 26, 700, 701, 1700]);
@@ -259,6 +260,11 @@ export class PgEngine {
     const key = JSON.stringify([schema, solution, check]);
     let expected = this.expected.get(key);
     if (!expected) { expected = (await run(solution)).result; this.expected.set(key, expected); }
+    // A change with RETURNING is only solved by a change: a SELECT computing the same rows does not count.
+    const command = (result: PgQueryResult) => (result as PgQueryResult & { tag?: string }).tag?.split(' ')[0] ?? '';
+    if (!check && !actual.result.error && DML.has(command(expected)) && !DML.has(command(actual.result))) {
+      return { actual: { ...actual.result, error: `Gesucht ist eine Änderung der Daten (${command(expected)} … RETURNING), keine reine Abfrage.` }, expected, script: actual.script };
+    }
     return { actual: actual.result, expected, script: actual.script };
   }
 
