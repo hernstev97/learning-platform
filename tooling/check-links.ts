@@ -7,7 +7,8 @@ import { Marked } from 'marked';
 import { parse as parseYaml } from 'yaml';
 import { CONTENT, ROOT } from './content.ts';
 
-const RETRY_DELAY = Number(process.env.LINKS_RETRY_DELAY_MS ?? 60_000);
+const configuredDelay = Number(process.env.LINKS_RETRY_DELAY_MS);
+const RETRY_DELAY = Number.isFinite(configuredDelay) && configuredDelay >= 0 && process.env.LINKS_RETRY_DELAY_MS ? configuredDelay : 60_000;
 const only = process.argv.slice(2).filter((a) => !a.startsWith('--'));
 const files: string[] = [];
 const walk = (dir: string) => {
