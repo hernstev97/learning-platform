@@ -1,14 +1,17 @@
 id: nebenlaeufigkeit
 title: Nebenläufigkeit – Threads, Prozesse, asyncio
 level: 3
-minutes: 180
-summary: Wann Threads, wann Prozesse, wann asyncio – mit einem klaren Denkmodell für GIL, Event-Loop und Race Conditions statt Rätselraten.
+minutes: 260
+summary: Wann Threads, wann Prozesse, wann asyncio – mit einem klaren Denkmodell für GIL, Event-Loop, Abbruch, Queues und Race Conditions statt Rätselraten.
 goals:
   - Du unterscheidest Nebenläufigkeit von Parallelität und I/O-bound von CPU-bound und wählst danach Threads, Prozesse oder asyncio.
   - Du erklärst, was der GIL schützt und was nicht, und wie der Stand der free-threaded Builds in Python 3.13 und 3.14 ist.
   - Du erkennst Race Conditions und behebst sie mit `Lock` oder `queue.Queue`.
   - Du nutzt `concurrent.futures` mit `map`, `submit` und `as_completed` für Thread- und Prozess-Pools.
   - Du schreibst asyncio-Code mit `gather`, `TaskGroup`, `timeout` und `Semaphore` und vermeidest blockierende Aufrufe in Coroutinen.
+  - Du brichst Tasks sauber ab (`cancel()`, `CancelledError` erneut auslösen, `shield`) und erklärst, was eine `TaskGroup` bei einem Fehler mit ihren Geschwistern macht.
+  - Du baust Producer/Consumer-Pipelines mit `asyncio.Queue` (`task_done`, `join`, `maxsize`, `shutdown()`) und nimmst `as_completed`, wenn Ergebnisse sofort zählen.
+  - Du schützt Zustand über ein `await` hinweg mit `asyncio.Lock`, signalisierst mit `Event` und schreibst eigene `async with`-Klassen und async Generatoren.
 resources:
   - title: Concurrent Execution (Überblick der Standardbibliothek)
     url: https://docs.python.org/3/library/concurrency.html
@@ -20,6 +23,10 @@ resources:
     url: https://docs.python.org/3/howto/free-threading-python.html
   - title: PEP 779 – Criteria for supported status for free-threaded Python
     url: https://peps.python.org/pep-0779/
+  - title: asyncio – Queues
+    url: https://docs.python.org/3/library/asyncio-queue.html
+  - title: asyncio – Synchronization Primitives
+    url: https://docs.python.org/3/library/asyncio-sync.html
 lesson: |
   Ein Skript holt Preise von 400 Produktseiten. Jede Anfrage dauert 300 ms, fast nur Warten auf das Netz. Nacheinander sind das zwei Minuten, in denen die CPU sich langweilt. Ein anderes Skript berechnet Prüfsummen für 10 000 Bilder in reinem Python. Hier wartet niemand, die CPU rechnet die ganze Zeit. Beide sollen schneller werden – und die Lösung ist jeweils eine andere.
 
@@ -229,6 +236,440 @@ lesson: |
   > [!WARNING] Blockierender Code in async
   > Ein `requests.get()` oder `time.sleep()` in einem FastAPI-Endpunkt mit `async def` blockiert den ganzen Worker: Während es wartet, bedient er keinen anderen Request. Entweder asynchrone Bibliotheken benutzen, `await asyncio.to_thread(blockierende_funktion, arg)` schreiben oder den Endpunkt als normales `def` deklarieren (dann führt FastAPI ihn in einem Thread-Pool aus). Der [asyncio-Entwicklerleitfaden](https://docs.python.org/3/library/asyncio-dev.html#running-blocking-code) beschreibt, wie der Debug-Modus solche Stellen findet.
 
+  ## Abbruch in asyncio: Cancellation
+
+  Ein Nutzer schließt den Tab, ein Timeout läuft ab, der Server fährt herunter, ein Geschwister-Task scheitert: In asyncio-Programmen wird ständig abgebrochen. Wer das nicht sauber behandelt, hat Tasks, die nicht enden, oder Aufräumcode, der nie läuft.
+
+  [`task.cancel()`](https://docs.python.org/3/library/asyncio-task.html#asyncio.Task.cancel) bricht nichts sofort ab. Es **bittet** um Abbruch: Beim nächsten Durchlauf der Loop wirft asyncio eine [`CancelledError`](https://docs.python.org/3/library/asyncio-exceptions.html#asyncio.CancelledError) an die Stelle, an der die Coroutine gerade wartet. Danach hat sie die Gelegenheit, aufzuräumen.
+
+  ```python run
+  import asyncio
+
+  log = []
+
+  async def job(gestartet: asyncio.Event) -> None:
+      log.append("job: start")
+      try:
+          gestartet.set()
+          await asyncio.sleep(3600)              # steht für einen langen Aufruf
+      except asyncio.CancelledError:
+          log.append("job: Abbruch erhalten")
+          raise                                  # immer erneut auslösen
+      finally:
+          log.append("job: aufgeräumt")
+
+  gestartet = asyncio.Event()
+  task = asyncio.create_task(job(gestartet))
+  await gestartet.wait()                         # erst abbrechen, wenn der Task im await hängt
+  task.cancel()
+  try:
+      await task                                 # wer den Task abwartet, bekommt die CancelledError
+  except asyncio.CancelledError:
+      log.append("main: Task abgebrochen")
+  print(task.cancelled(), log)
+  ```
+
+  Drei Regeln folgen aus dem Mechanismus:
+
+  1. **`CancelledError` ist keine `Exception`.** Die Klasse erbt seit Python 3.8 von `BaseException`. Ein `except Exception` lässt den Abbruch durch, ein nacktes `except:`, `except BaseException` und `except (Exception, asyncio.CancelledError)` fangen ihn.
+  2. **Aufräumen ja, verschlucken nein.** Gib Ressourcen in `finally` frei. Fängst du die `CancelledError` doch, löse sie danach mit `raise` erneut aus. Die Dokumentation nennt das Unterdrücken „actively discouraged“; wer es trotzdem tut, muss zusätzlich [`Task.uncancel()`](https://docs.python.org/3/library/asyncio-task.html#asyncio.Task.uncancel) aufrufen.
+  3. **Abbruch greift nur an einem `await`.** Eine Schleife ohne `await` läuft weiter, bis sie fertig ist. `cancel()` setzt nur eine Anfrage, das Ergebnis siehst du erst, wenn du den Task abwartest (`task.cancelled()` ist dann `True`).
+
+  > [!WARNING] Verschluckte Abbrüche hängen den Shutdown auf
+  > `except (Exception, asyncio.CancelledError): log.exception(...)` in einer Worker-Schleife wirkt wie Robustheit. Tatsächlich ignoriert der Worker jeden `cancel()`. Der Shutdown wartet auf Tasks, die nie enden, `asyncio.timeout` löst keinen `TimeoutError` mehr aus, und eine `TaskGroup` hängt. Fange in Schleifen `Exception`, nie die `CancelledError`.
+
+  Ein Task, der verschluckt, bleibt am Leben:
+
+  ```python run
+  import asyncio
+
+  async def sauber(bereit: asyncio.Event) -> None:
+      bereit.set()
+      await asyncio.sleep(3600)                  # CancelledError fliegt durch
+
+  async def stur(bereit: asyncio.Event) -> str:
+      try:
+          bereit.set()
+          await asyncio.sleep(3600)
+      except asyncio.CancelledError:
+          pass                                   # verschluckt: der Task läuft normal weiter
+      return "weitergemacht"
+
+  async def abbrechen(koro) -> asyncio.Task:
+      bereit = asyncio.Event()
+      task = asyncio.create_task(koro(bereit))
+      await bereit.wait()
+      task.cancel()
+      await asyncio.wait({task})                 # wartet, ohne die Ausnahme zu werfen
+      return task
+
+  print((await abbrechen(sauber)).cancelled())   # True
+  t = await abbrechen(stur)
+  print(t.cancelled(), t.result())               # False weitergemacht
+  ```
+
+  ### shield: der Aufrufer darf weg, die Arbeit nicht
+
+  [`asyncio.shield(task)`](https://docs.python.org/3/library/asyncio-task.html#asyncio.shield) schützt einen Task davor, mit seinem Aufrufer abgebrochen zu werden. Der Aufrufer bekommt trotzdem eine `CancelledError`, der innere Task läuft weiter. Das passt für Schritte, die zu Ende laufen müssen, etwa das Speichern einer bezahlten Bestellung.
+
+  ```python
+  async def speichere_bestellung(db, bestellung) -> None:
+      schreiben = asyncio.create_task(db.schreibe(bestellung))   # Referenz behalten
+      await asyncio.shield(schreiben)    # bricht der Aufrufer ab, läuft das Schreiben weiter
+  ```
+
+  Behalte eine Referenz auf den inneren Task, wie es die Dokumentation verlangt. `shield` ist eine Ausnahme, keine Gewohnheit: Ein geschützter Task, der beim Herunterfahren noch läuft, hält den Shutdown auf.
+
+  ### Wenn ein Task in der TaskGroup scheitert
+
+  Die [`TaskGroup`](https://docs.python.org/3/library/asyncio-task.html#task-groups) ist Structured Concurrency: Alle Tasks leben und enden innerhalb des `async with`-Blocks. Scheitert einer mit einer Exception, passiert nach der Dokumentation Folgendes:
+
+  1. Die übrigen Tasks der Gruppe werden abgebrochen.
+  2. Der Rumpf des `async with`-Blocks wird ebenfalls abgebrochen, wenn er noch läuft. Die `CancelledError` unterbricht dort ein `await`, tritt aber nicht aus dem Block aus.
+  3. Wenn alle Tasks beendet sind, löst die Gruppe die gesammelten Fehler als [`ExceptionGroup`](https://docs.python.org/3/library/exceptions.html#ExceptionGroup) aus.
+
+  Diese Gruppe fängst du mit [`except*`](https://docs.python.org/3/reference/compound_stmts.html#except-star). Jeder `except*`-Zweig bekommt die passenden Fehler als Untergruppe:
+
+  ```python run
+  import asyncio
+
+  log = []
+
+  async def pruefe_adresse() -> None:
+      await asyncio.sleep(0)
+      raise ValueError("Adresse ungültig")
+
+  async def pruefe_lager(nie: asyncio.Event) -> None:
+      try:
+          await nie.wait()                       # wird nie gesetzt
+      finally:
+          log.append("lager: abgebrochen")
+
+  async def main() -> None:
+      nie = asyncio.Event()
+      try:
+          async with asyncio.TaskGroup() as tg:
+              tg.create_task(pruefe_adresse())
+              tg.create_task(pruefe_lager(nie))
+              await asyncio.sleep(3600)          # der Rumpf wird ebenfalls abgebrochen
+              log.append("unerreichbar")
+      except* ValueError as gruppe:
+          print("ValueError:", [str(e) for e in gruppe.exceptions])
+      print(log)
+
+  await main()
+  ```
+
+  Ein einzelner `ValueError` kommt also nicht als `ValueError` an, sondern in einer Gruppe. Ein `except ValueError` ohne Stern fängt ihn nicht.
+
+  ### Timeout ist Cancellation
+
+  [`asyncio.timeout`](https://docs.python.org/3/library/asyncio-task.html#asyncio.timeout) baut auf demselben Mechanismus auf. Läuft die Frist ab, ruft es `cancel()` auf dem aktuellen Task auf. Am Ende des Blocks macht es aus der `CancelledError` einen `TimeoutError`. Dein `finally` läuft dabei wie bei jedem Abbruch. Verschluckt der Code im Block die `CancelledError`, bleibt der `TimeoutError` aus:
+
+  ```python run
+  import asyncio
+
+  log = []
+
+  async def lade() -> None:
+      try:
+          await asyncio.sleep(3600)
+      finally:
+          log.append("lade: finally")
+
+  async def schluckt() -> None:
+      try:
+          await asyncio.sleep(3600)
+      except asyncio.CancelledError:
+          log.append("verschluckt")
+      log.append("weiter")
+
+  try:
+      async with asyncio.timeout(0.01) as frist:
+          await lade()
+  except TimeoutError:
+      log.append("TimeoutError")
+  print(frist.expired(), log)
+
+  log.clear()
+  async with asyncio.timeout(0.01) as frist:     # kein TimeoutError, der Block endet normal
+      await schluckt()
+  print(frist.expired(), log)
+  ```
+
+  `frist.expired()` zeigt in beiden Fällen `True`. Im zweiten Fall bemerkt der Aufrufer es trotzdem nicht: Der Block lief einfach weiter. Genau so entstehen Timeouts, die nichts bewirken.
+
+  > [!DEEP] Wie timeout und TaskGroup ihren eigenen Abbruch erkennen
+  > Ein Task zählt, wie oft er abgebrochen wurde ([`Task.cancelling()`](https://docs.python.org/3/library/asyncio-task.html#asyncio.Task.cancelling)). `timeout` und `TaskGroup` merken sich den Stand beim Betreten und rufen beim Verlassen `uncancel()` auf. So unterscheiden sie ihren eigenen Abbruch von einem, den jemand von außen angefordert hat, und verwechseln einen äußeren `cancel()` nicht mit dem eigenen Timeout. Im Alltag brauchst du diese Zähler nicht. Sie erklären aber, warum man `CancelledError` weiterreichen muss.
+
+  ## asyncio.Queue: Producer, Consumer und Backpressure
+
+  Ein Importer liest 50 000 Zeilen aus einer CSV-Datei und schreibt sie in eine Datenbank. Alle Zeilen gleichzeitig als Tasks zu starten, sprengt Speicher und Verbindungslimit. Ein `Semaphore` begrenzt die Gleichzeitigkeit, aber die Tasks existieren trotzdem alle. Besser: Ein **Producer** legt Aufträge in eine [`asyncio.Queue`](https://docs.python.org/3/library/asyncio-queue.html#asyncio.Queue), eine feste Zahl **Consumer** (Worker) holt sie ab.
+
+  Das Denkmodell hat zwei Zähler: die Länge der Queue und die Zahl der **unfertigen Aufträge**. `put()` erhöht beide. `get()` senkt nur die Länge. Erst [`task_done()`](https://docs.python.org/3/library/asyncio-queue.html#asyncio.Queue.task_done) senkt die Zahl der unfertigen Aufträge. [`join()`](https://docs.python.org/3/library/asyncio-queue.html#asyncio.Queue.join) wartet, bis sie null ist.
+
+  ```python run
+  import asyncio
+
+  async def worker(name: str, queue: asyncio.Queue, ergebnisse: list) -> None:
+      while True:
+          auftrag = await queue.get()
+          try:
+              await asyncio.sleep(0.01)                  # steht für Arbeit
+              ergebnisse.append((name, auftrag * 2))
+          finally:
+              queue.task_done()                          # auch bei Fehlern, sonst hängt join()
+
+  async def main() -> None:
+      queue: asyncio.Queue[int] = asyncio.Queue(maxsize=4)   # Backpressure
+      ergebnisse: list = []
+      workers = [asyncio.create_task(worker(f"w{i}", queue, ergebnisse)) for i in range(3)]
+      for auftrag in range(10):
+          await queue.put(auftrag)                       # wartet, wenn die Queue voll ist
+      await queue.join()                                 # jeder Auftrag ist verarbeitet
+      for w in workers:
+          w.cancel()                                     # die Endlosschleifen beenden
+      await asyncio.gather(*workers, return_exceptions=True)
+      print(sorted(a for _, a in ergebnisse))
+
+  await main()
+  ```
+
+  - **Backpressure:** `maxsize=4` heißt: Ist die Queue voll, wartet `await queue.put(...)`, bis ein Worker Platz schafft. Der Producer läuft so nie weiter voraus, als die Worker verkraften. Ohne `maxsize` (Standard 0) ist die Queue unbegrenzt und wächst, wenn der Producer schneller ist.
+  - **`task_done()` genau einmal pro `get()`,** im `finally`. Ein Worker, der bei einem Fehler `task_done()` auslässt, lässt `join()` für immer hängen. Mehr Aufrufe als Aufträge lösen einen `ValueError` aus.
+  - **Worker beenden:** Die Worker sind Endlosschleifen. Nach `join()` brichst du sie ab (`cancel()`) und wartest mit `gather(..., return_exceptions=True)`, bis sie weg sind. Die Abbruch-Regeln von oben gelten: Der Worker fängt nur `Exception`.
+  - **`put_nowait()` und `get_nowait()`** warten nicht, sondern lösen `QueueFull` beziehungsweise `QueueEmpty` aus.
+
+  ### Ende signalisieren: Sentinel und Queue.shutdown()
+
+  Statt Worker abzubrechen, kannst du ihnen sagen, dass nichts mehr kommt. Der klassische Weg ist ein **Sentinel**: eine Marke wie `None`, die der Producer pro Consumer einmal in die Queue legt. Seit Python 3.13 gibt es [`Queue.shutdown()`](https://docs.python.org/3/library/asyncio-queue.html#asyncio.Queue.shutdown). Danach löst `put()` eine [`QueueShutDown`](https://docs.python.org/3/library/asyncio-queue.html#asyncio.QueueShutDown) aus, und `get()` liefert noch die vorhandenen Aufträge. Erst bei leerer Queue löst es `QueueShutDown` aus:
+
+  ```python run
+  import asyncio
+
+  async def konsument(queue: asyncio.Queue, log: list) -> None:
+      while True:
+          try:
+              eintrag = await queue.get()
+          except asyncio.QueueShutDown:
+              log.append("Queue beendet")
+              return                                     # normales Ende, keine Abbruch-Logik nötig
+          log.append(f"verarbeitet {eintrag}")
+          queue.task_done()
+
+  queue: asyncio.Queue[str] = asyncio.Queue()
+  log: list[str] = []
+  task = asyncio.create_task(konsument(queue, log))
+  for zeile in ["a", "b", "c"]:
+      queue.put_nowait(zeile)
+  queue.shutdown()                                       # der Producer ist fertig
+  await task
+  print(log)
+  ```
+
+  `shutdown(immediate=True)` leert die Queue sofort und verwirft offene Aufträge. Die Dokumentation warnt, dass dadurch `join()` zurückkehrt, obwohl die Arbeit nicht erledigt wurde.
+
+  > [!PRAXIS] Pipeline mit Stufen
+  > Crawler, Importer und Webhook-Versender haben oft die Form „lesen → verarbeiten → schreiben“, mit je einer Queue zwischen den Stufen. Jede Queue hat ein `maxsize`, damit die langsamste Stufe das Tempo der vorherigen bremst, statt dass sich der Speicher füllt. Die `asyncio.Queue` ist wie alle asyncio-Primitive [nicht threadsicher](https://docs.python.org/3/library/asyncio-queue.html#asyncio.Queue). Zwischen Threads brauchst du `queue.Queue`.
+
+  Wann Queue, wann `gather` mit `Semaphore`? Bei einer festen Liste mit Ergebnissen in Eingabereihenfolge reicht `gather` (siehe die Übung zum begrenzten Abrufen). Die Queue lohnt sich, wenn Aufträge fortlaufend entstehen, wenn Stufen sich gegenseitig bremsen sollen oder wenn die Zahl der Worker fest bleiben soll.
+
+  ## as_completed: Ergebnisse, sobald sie da sind
+
+  `gather` liefert erst, wenn **alle** fertig sind. Oft willst du früher handeln: das erste Ergebnis nehmen (der schnellste von drei Mirror-Servern), einen Fortschrittsbalken füllen oder Ergebnisse streamen. Dafür gibt es [`asyncio.as_completed`](https://docs.python.org/3/library/asyncio-task.html#asyncio.as_completed).
+
+  Seit Python 3.13 liefert es ein Objekt, das du auf zwei Arten durchlaufen kannst:
+
+  ```python run
+  import asyncio
+
+  async def hole(name: str, dauer: float) -> str:
+      await asyncio.sleep(dauer)
+      return name.upper()
+
+  tasks = {
+      asyncio.create_task(hole("langsam", 0.06)): "langsam",
+      asyncio.create_task(hole("schnell", 0.01)): "schnell",
+      asyncio.create_task(hole("mittel", 0.03)): "mittel",
+  }
+  async for fertig in asyncio.as_completed(tasks):       # liefert die Tasks selbst
+      print(tasks[fertig], await fertig)                 # Zuordnung über das Dictionary
+
+  for naechste in asyncio.as_completed([hole("a", 0.03), hole("b", 0.01)]):
+      print(await naechste)                              # neue Coroutine pro Schritt
+  ```
+
+  - **`async for`** (seit 3.13) liefert die Task-Objekte, die du übergeben hast. Du erkennst so, welcher Task fertig ist, und `await fertig` liefert das Ergebnis oder die Exception.
+  - **`for`** (auch vor 3.13) liefert pro Schritt eine neue Coroutine. Ihr `await` ergibt das Ergebnis des nächsten fertigen Tasks, aber du weißt nicht, welcher es war.
+  - **`timeout=`** löst einen `TimeoutError` aus, wenn die Frist abläuft, bevor alle fertig sind.
+
+  `as_completed` bricht nichts ab. Verlässt du die Schleife mit `break` oder `return`, oder läuft das Timeout ab, laufen die übrigen Tasks weiter. Das räumst du selbst auf: `cancel()` für die Verlierer und danach auf sie warten. So entsteht das Muster „der Schnellste gewinnt“, das eine Übung unten verlangt.
+
+  | Wenn du … | nimm |
+  | --- | --- |
+  | alle Ergebnisse in Eingabereihenfolge brauchst | `gather` |
+  | alle brauchst und bei einem Fehler alles abbrechen willst | `TaskGroup` |
+  | jedes Ergebnis sofort verarbeiten oder das erste nehmen willst | `as_completed` |
+
+  ## Synchronisation: Lock, Event und Condition
+
+  Weil asyncio nur an `await` wechselt, ist `zaehler += 1` ohne `await` dazwischen sicher. Die Race Condition entsteht, sobald zwischen Prüfen und Handeln ein `await` liegt: Dann laufen andere Coroutinen dazwischen und sehen den alten Zustand.
+
+  ```python run
+  import asyncio
+
+  class Konto:
+      def __init__(self, saldo: int) -> None:
+          self.saldo = saldo
+          self._lock = asyncio.Lock()
+
+      async def abbuchen_unsicher(self, betrag: int) -> bool:
+          if self.saldo >= betrag:             # prüfen ...
+              await asyncio.sleep(0)           # ... hier läuft eine andere Coroutine (Betrugsprüfung, DB)
+              self.saldo -= betrag             # ... handeln, mit veraltetem Wissen
+              return True
+          return False
+
+      async def abbuchen(self, betrag: int) -> bool:
+          async with self._lock:               # prüfen und abbuchen sind ein Schritt
+              if self.saldo >= betrag:
+                  await asyncio.sleep(0)
+                  self.saldo -= betrag
+                  return True
+              return False
+
+  unsicher = Konto(100)
+  print(await asyncio.gather(unsicher.abbuchen_unsicher(80), unsicher.abbuchen_unsicher(80)), unsicher.saldo)
+  sicher = Konto(100)
+  print(await asyncio.gather(sicher.abbuchen(80), sicher.abbuchen(80)), sicher.saldo)
+  ```
+
+  Die erste Zeile zeigt `[True, True] -60`: Beide Aufrufe sahen 100 Euro. Die zweite zeigt `[True, False] 20`.
+
+  Die Primitive im [asyncio-Modul für Synchronisation](https://docs.python.org/3/library/asyncio-sync.html) lösen verschiedene Probleme:
+
+  - **[`Lock`](https://docs.python.org/3/library/asyncio-sync.html#asyncio.Lock):** exklusiver Zugriff über ein `await` hinweg. Nutze es mit `async with`. Es ist nicht reentrant: Ein zweites `acquire` im selben Task wartet auf sich selbst und endet im Deadlock. Wartende kommen in der Reihenfolge ihres Eintreffens dran.
+  - **[`Event`](https://docs.python.org/3/library/asyncio-sync.html#asyncio.Event):** ein Signal „ist passiert“. `wait()` blockiert, bis jemand `set()` aufruft, dann wachen alle Wartenden auf. Typisch für „Cache ist warm“ oder ein Stopp-Signal für Worker.
+  - **[`Condition`](https://docs.python.org/3/library/asyncio-sync.html#asyncio.Condition):** Lock plus Wartelisten. Mit `await cond.wait_for(prädikat)` wartest du auf eine Bedingung, ein anderer Task weckt mit `notify_all()`. Du brauchst sie selten, weil Queue oder Event meist reichen.
+  - **[`Semaphore`](https://docs.python.org/3/library/asyncio-sync.html#asyncio.Semaphore):** höchstens *n* gleichzeitig, siehe oben.
+  - **`Queue`:** Daten von einem Task zum nächsten geben, siehe voriger Abschnitt.
+
+  ```python run
+  import asyncio
+
+  bereit = asyncio.Event()
+  log = []
+
+  async def warte(name: str) -> None:
+      await bereit.wait()
+      log.append(name)
+
+  tasks = [asyncio.create_task(warte(n)) for n in "abc"]
+  await asyncio.sleep(0)               # die Tasks hängen jetzt in wait()
+  log.append("set")
+  bereit.set()
+  await asyncio.gather(*tasks)
+  print(log)                           # ['set', 'a', 'b', 'c']
+  ```
+
+  Auch hier gilt: Das sind Primitive für Coroutinen im selben Thread. Für Threads nimmst du `threading.Lock` und `threading.Event` (siehe oben).
+
+  ## async with und async for: Context Manager und Generatoren
+
+  ### async with in Aktion
+
+  Du kennst `async with` schon von `Lock`, `Semaphore`, `TaskGroup` und `timeout`. Der Unterschied zu `with`: [`__aenter__` und `__aexit__`](https://docs.python.org/3/reference/datamodel.html#async-context-managers) sind Coroutinen, dürfen also selbst `await` benutzen. Das braucht man für alles, was beim Betreten oder Verlassen auf das Netz wartet: Verbindung öffnen, `COMMIT`, Sperre freigeben.
+
+  ```python run
+  import asyncio
+
+  class FakeDb:
+      def __init__(self) -> None:
+          self.log: list[str] = []
+      async def begin(self) -> None: self.log.append("begin")
+      async def commit(self) -> None: self.log.append("commit")
+      async def rollback(self) -> None: self.log.append("rollback")
+      async def execute(self, sql: str) -> None: self.log.append(sql)
+
+  class Transaktion:
+      def __init__(self, db: FakeDb) -> None:
+          self.db = db
+
+      async def __aenter__(self) -> FakeDb:
+          await self.db.begin()
+          return self.db
+
+      async def __aexit__(self, exc_type, exc, tb) -> bool:
+          if exc_type is None:
+              await self.db.commit()
+          else:
+              await self.db.rollback()
+          return False                  # die Exception nicht unterdrücken
+
+  db = FakeDb()
+  async with Transaktion(db) as t:
+      await t.execute("INSERT")
+  try:
+      async with Transaktion(db) as t:
+          raise ValueError("kaputt")
+  except ValueError:
+      pass
+  print(db.log)                         # ['begin', 'INSERT', 'commit', 'begin', 'rollback']
+  ```
+
+  `__aexit__` bekommt Typ, Wert und Traceback einer Exception aus dem Block, oder dreimal `None`. Gibt `__aexit__` einen wahren Wert zurück, unterdrückt es die Exception. Tu das nur bewusst, so wie `timeout` es mit seiner eigenen `CancelledError` tut. Das Muster ohne Klasse, mit `yield` in einer Funktion, ist [`contextlib.asynccontextmanager`](https://docs.python.org/3/library/contextlib.html#contextlib.asynccontextmanager); es steht im Modul [Dekoratoren & funktionale Werkzeuge](/python/dekoratoren-funktional).
+
+  ### Async-Generatoren und async for
+
+  Eine `async def`-Funktion mit `yield` ist ein [asynchroner Generator](https://docs.python.org/3/reference/expressions.html#asynchronous-generator-functions) ([PEP 525](https://peps.python.org/pep-0525/)). Er liefert Werte einzeln, und zwischen zwei Werten darf er `await` benutzen. Du liest ihn mit [`async for`](https://docs.python.org/3/reference/compound_stmts.html#async-for). Der Klassiker ist eine paginierte API: Seite holen, Einträge ausgeben, nächste Seite holen, aber nur, wenn jemand weiterliest. Wie synchrone Generatoren funktionieren, erklärt [Iteratoren & Generatoren](/python/iteratoren-generatoren).
+
+  ```python run
+  import asyncio
+  from contextlib import aclosing
+
+  log = []
+  DATEN = {1: ["a", "b"], 2: ["c", "d"], 3: ["e"]}
+
+  async def hole_seite(thema: str, seite: int) -> list[str]:
+      log.append(f"hole {seite}")
+      await asyncio.sleep(0)                    # steht für einen HTTP-Aufruf
+      return DATEN.get(seite, [])
+
+  async def eintraege(thema: str):
+      seite = 1
+      try:
+          while True:
+              liste = await hole_seite(thema, seite)
+              if not liste:
+                  return
+              for eintrag in liste:
+                  yield eintrag
+              seite += 1
+      finally:
+          log.append("Generator beendet")
+
+  alle = [e async for e in eintraege("python")]          # async Comprehension
+  print(alle, log)
+
+  log.clear()
+  async with aclosing(eintraege("python")) as gen:       # schließt den Generator sicher
+      async for e in gen:
+          if e == "c":
+              break
+  print(log)                                             # nur zwei Seiten geholt
+  ```
+
+  - **Faul wie sein synchrones Vorbild:** Nach `break` bei `c` wurde Seite 3 nie geholt.
+  - **Aufräumen:** Ein abgebrochener Generator steht still, sein `finally` läuft erst bei [`aclose()`](https://docs.python.org/3/reference/expressions.html#agen.aclose). Ohne Aufruf übernimmt das irgendwann der Garbage Collector über die Event-Loop, ohne dass du den Zeitpunkt kennst. [`contextlib.aclosing`](https://docs.python.org/3/library/contextlib.html#contextlib.aclosing) ruft `aclose()` zuverlässig auf. Nutze es, wenn der Generator Ressourcen hält und du früher aussteigen kannst.
+  - **Unter der Haube:** `async for` ruft `__aiter__` und wiederholt `__anext__`; das Ende ist `StopAsyncIteration` ([Datenmodell](https://docs.python.org/3/reference/datamodel.html#asynchronous-iterators)).
+  - **Async Comprehensions** (`[x async for x in gen()]`, [PEP 530](https://peps.python.org/pep-0530/)) gibt es in Listen, Sets und Dictionaries, aber nur innerhalb von `async def`. In einer normalen Funktion sind `async for` und `await` ein `SyntaxError`.
+
+  > [!WARNING] await in der Comprehension ist nicht nebenläufig
+  > `{k: await hole(k) for k in schluessel}` wartet jeden Aufruf nacheinander ab, drei Aufrufe à 20 ms brauchen 60 ms. Für Nebenläufigkeit nimmst du `await asyncio.gather(*(hole(k) for k in schluessel))`.
+
+  > [!INTERVIEW] „Was passiert bei `task.cancel()`?“
+  > Es setzt eine Anfrage: Beim nächsten `await` des Tasks wirft asyncio eine `CancelledError`. Der Task räumt in `finally` auf und löst sie erneut aus, dann gilt er als abgebrochen. Schluckt er sie, läuft er weiter, und Timeouts und TaskGroups funktionieren nicht mehr. Nenne dazu `shield` für Arbeit, die den Aufrufer überleben muss, und dass `CancelledError` von `BaseException` erbt.
+
   ## Entscheidungstabelle
 
   | Situation | Werkzeug | Warum |
@@ -238,6 +679,9 @@ lesson: |
   | CPU-lastige Berechnung in reinem Python (Standard-Build) | `ProcessPoolExecutor` | Echte Parallelität, eigener GIL pro Prozess |
   | CPU-lastig mit NumPy, `hashlib`, Kompression | Threads prüfen | Viele C-Erweiterungen geben den GIL frei |
   | Blockierende Funktion in asyncio-Code | `asyncio.to_thread` | Hält die Event-Loop frei |
+  | Aufträge entstehen laufend, feste Zahl Worker, langsame Stufe soll bremsen | `asyncio.Queue(maxsize=n)` | Backpressure: `put` wartet bei voller Queue |
+  | Ergebnis sofort verarbeiten oder das erste nehmen | `asyncio.as_completed` | Liefert nach Fertigstellung, bricht aber nichts ab |
+  | Prüfen und Ändern, dazwischen ein `await` | `asyncio.Lock` | Macht den Abschnitt über das `await` hinweg exklusiv |
   | Hintergrundjobs über Minuten, nach Neustart fortsetzen | Task-Queue (Celery, RQ) | Gehört in einen eigenen Dienst, nicht in den Webprozess |
 
   > [!INTERVIEW] „Threads, Prozesse oder asyncio – wann was?“
@@ -252,6 +696,12 @@ lesson: |
   - **Blockierende Aufrufe in `async def`.** Die Loop steht, alle Anfragen warten.
   - **`asyncio.run` in einer laufenden Loop.** `RuntimeError: asyncio.run() cannot be called from a running event loop`.
   - **Tasks ohne Referenz oder ohne Timeout.** Tasks verschwinden oder hängen für immer; nutze `TaskGroup` und `asyncio.timeout`.
+  - **`CancelledError` verschlucken.** `except BaseException`, nacktes `except:` oder `except (Exception, asyncio.CancelledError)` in einer Schleife macht den Task unkündbar. Der Shutdown hängt, `timeout` wirkt nicht.
+  - **`task_done()` vergessen.** Scheitert ein Auftrag und der Worker überspringt `task_done()`, wartet `queue.join()` ewig. Setze es in ein `finally`.
+  - **Unbegrenzte Queue.** Ohne `maxsize` füllt ein schneller Producer den Speicher, statt auf die Worker zu warten.
+  - **Check-then-Act über ein `await`.** Zwischen Prüfung und Änderung laufen andere Coroutinen. `asyncio.Lock` oder die Prüfung nach dem `await` wiederholen.
+  - **`except ValueError` um eine TaskGroup.** Die TaskGroup wirft eine `ExceptionGroup`; das passende Gegenstück ist `except*`.
+  - **Generator nach `break` nicht schließen.** Das `finally` im async Generator läuft dann zu einem unbestimmten Zeitpunkt. `contextlib.aclosing` löst das.
 
   > [!PRAXIS] So sieht es in Projekten aus
   > Web-Backends mit FastAPI laufen auf asyncio: Datenbank über `asyncpg` oder SQLAlchemy async, HTTP über `httpx.AsyncClient`, parallele Aufrufe mit `TaskGroup` oder `gather`, begrenzt mit einem `Semaphore`. Datenpipelines und Skripte, die viele Dateien verarbeiten, nutzen `ProcessPoolExecutor`. Im Code-Review wird bei jeder globalen, veränderlichen Variable in Multi-Thread-Code gefragt: Wer schreibt hier gleichzeitig? Und bei jedem `async def`: Steckt irgendwo ein blockierender Aufruf?
@@ -269,6 +719,12 @@ lesson: |
   - `concurrent.futures`: `map` in Eingabereihenfolge, `submit` + `as_completed` in Fertigstellungsreihenfolge.
   - asyncio: eine Event-Loop, Wechsel nur an `await`; `asyncio.run` einmal außen, `TaskGroup`, `timeout`, `Semaphore`, `gather`.
   - Nichts Blockierendes in `async def`; notfalls `asyncio.to_thread`.
+  - `task.cancel()` ist eine Anfrage: `CancelledError` kommt am nächsten `await` an, erbt von `BaseException`, räumt in `finally` auf und wird immer erneut ausgelöst.
+  - `asyncio.shield` lässt den inneren Task den Abbruch des Aufrufers überleben. Scheitert ein Task in der `TaskGroup`, bricht sie die Geschwister ab und löst eine `ExceptionGroup` aus (`except*`).
+  - `asyncio.timeout` ist Cancellation mit Umwandlung in `TimeoutError`. Wer die `CancelledError` verschluckt, entwertet das Timeout.
+  - `asyncio.Queue`: `put` wartet bei `maxsize` (Backpressure), `task_done` pro `get`, `join` wartet auf alle, `shutdown()` (seit 3.13) beendet die Consumer.
+  - `as_completed` liefert nach Fertigstellung und bricht nichts ab. `asyncio.Lock` schützt Check-then-Act über ein `await`, `Event` signalisiert.
+  - `async with` ruft `__aenter__`/`__aexit__` auf, ein Generator mit `async def` und `yield` ist ein async Generator. Schließe ihn bei frühem Ausstieg mit `aclosing`.
 exercises:
   - id: werkzeug-waehlen
     type: choice
@@ -294,6 +750,34 @@ exercises:
         url: https://docs.python.org/3/library/concurrency.html
       - title: Glossar · global interpreter lock
         url: https://docs.python.org/3/glossary.html#term-global-interpreter-lock
+
+  - id: sync-primitiv-waehlen
+    type: choice
+    title: Lock, Event, Semaphore oder Queue?
+    prompt: Alle Aufgaben laufen als Coroutinen in einer Event-Loop. Welche Zuordnungen passen?
+    options:
+      - text: "Höchstens 5 Datenbankverbindungen gleichzeitig vergeben → `asyncio.Semaphore(5)`"
+        correct: true
+        why: Ein Semaphore zählt freie Plätze. Die sechste Coroutine wartet am Eingang, bis eine Verbindung frei ist.
+      - text: "Worker sollen erst loslegen, wenn die Konfiguration geladen ist → `asyncio.Event`"
+        correct: true
+        why: Die Worker warten mit `await event.wait()`, der Lader ruft einmal `set()` auf, und alle wachen gemeinsam auf.
+      - text: "Zwischen Saldoprüfung und Abbuchung steht ein `await`, und zwei Aufrufe dürfen sich dort nicht überholen → `asyncio.Lock`"
+        correct: true
+        why: Ohne Sperre sehen beide Aufrufe den alten Saldo. Mit `async with lock` ist Prüfen und Abbuchen ein Schritt, auch über das `await` hinweg.
+      - text: "Ein Producer reicht Aufträge an Worker weiter, und es sollen nie mehr als 100 offen sein → `asyncio.Lock`"
+        correct: false
+        why: Ein Lock gibt keine Daten weiter und zählt nichts. Dafür gibt es `asyncio.Queue(maxsize=100)`.
+      - text: "Mehrere Betriebssystem-Threads erhöhen einen gemeinsamen Zähler → `asyncio.Lock`"
+        correct: false
+        why: asyncio-Primitive sind nicht threadsicher. Zwischen Threads braucht es `threading.Lock`.
+    explanation: |
+      Jedes Primitiv beantwortet eine eigene Frage. Der Semaphore begrenzt die Zahl gleichzeitiger Teilnehmer, das Event meldet „ist passiert“, der Lock macht einen Abschnitt exklusiv, die Queue gibt Daten weiter und bremst bei Bedarf. Alle vier arbeiten nur zwischen Coroutinen im selben Thread.
+    resources:
+      - title: asyncio · Synchronization Primitives
+        url: https://docs.python.org/3/library/asyncio-sync.html
+      - title: asyncio · Queues
+        url: https://docs.python.org/3/library/asyncio-queue.html
 
   - id: taskgroup-ordnen
     type: order
@@ -404,6 +888,215 @@ exercises:
       - title: asyncio · Coroutines
         url: https://docs.python.org/3/library/asyncio-task.html#coroutines
 
+  - id: cancel-ablauf
+    type: output
+    title: Was passiert bei cancel()?
+    prompt: |
+      Was gibt dieses Programm aus? (`await` auf oberster Ebene wie in `python -m asyncio`; im Skript stünde `asyncio.run(main())` darum.)
+    lang: python
+    code: |
+      import asyncio
+
+      async def pumpe(bereit):
+          print("pumpe: start")
+          try:
+              bereit.set()
+              await asyncio.sleep(3600)
+          except asyncio.CancelledError:
+              print("pumpe: Abbruch")
+              raise
+          finally:
+              print("pumpe: finally")
+          print("pumpe: Ende")
+
+      async def main():
+          bereit = asyncio.Event()
+          task = asyncio.create_task(pumpe(bereit))
+          await bereit.wait()
+          print("cancel:", task.cancel())
+          print("fertig vor await:", task.done())
+          try:
+              await task
+          except asyncio.CancelledError:
+              print("main: CancelledError")
+          print(task.cancelled(), task.done())
+          print("zweiter cancel:", task.cancel())
+
+      await main()
+    expected: |
+      pumpe: start
+      cancel: True
+      fertig vor await: False
+      pumpe: Abbruch
+      pumpe: finally
+      main: CancelledError
+      True True
+      zweiter cancel: False
+    hints:
+      - "`task.cancel()` setzt nur eine Anfrage. Wann läuft der Task weiter?"
+      - Erreicht der Task die letzte `print`-Zeile von `pumpe`?
+    explanation: |
+      `cancel()` liefert `True`, weil die Anfrage angenommen wurde, aber der Task läuft erst weiter, wenn `main` an `await task` abgibt. Deshalb ist er davor noch nicht fertig. Dann wirft die Loop die `CancelledError` an der Stelle von `asyncio.sleep`. Der `except`-Zweig meldet sich, `raise` gibt sie weiter, und `finally` läuft. `"pumpe: Ende"` erscheint nie. `await task` löst die `CancelledError` beim Aufrufer erneut aus, danach ist `task.cancelled()` wahr. Ein zweites `cancel()` auf einem beendeten Task liefert `False`.
+    resources:
+      - title: asyncio.Task.cancel
+        url: https://docs.python.org/3/library/asyncio-task.html#asyncio.Task.cancel
+      - title: asyncio.CancelledError
+        url: https://docs.python.org/3/library/asyncio-exceptions.html#asyncio.CancelledError
+
+  - id: taskgroup-fehler
+    type: output
+    title: Was bleibt von der TaskGroup übrig?
+    prompt: |
+      Was gibt dieses Programm aus? Zwei Tasks scheitern, ein dritter wartet. (`await` auf oberster Ebene.)
+    lang: python
+    code: |
+      import asyncio
+
+      async def pruefe_adresse():
+          await asyncio.sleep(0)
+          raise ValueError("Adresse ungültig")
+
+      async def pruefe_betrag():
+          await asyncio.sleep(0)
+          raise TypeError("Betrag ist kein Zahlenwert")
+
+      async def pruefe_lager(nie):
+          try:
+              await nie.wait()
+          finally:
+              print("lager: abgebrochen")
+
+      async def main():
+          nie = asyncio.Event()
+          try:
+              async with asyncio.TaskGroup() as tg:
+                  tg.create_task(pruefe_adresse())
+                  tg.create_task(pruefe_betrag())
+                  tg.create_task(pruefe_lager(nie))
+              print("alle fertig")
+          except* ValueError as gruppe:
+              print("ValueError:", [str(e) for e in gruppe.exceptions])
+          except* TypeError as gruppe:
+              print("TypeError:", [str(e) for e in gruppe.exceptions])
+          print("danach")
+
+      await main()
+    expected: |
+      lager: abgebrochen
+      ValueError: ['Adresse ungültig']
+      TypeError: ['Betrag ist kein Zahlenwert']
+      danach
+    hints:
+      - Was macht die TaskGroup mit dem dritten Task, sobald ein anderer scheitert?
+      - "Beide `except*`-Zweige laufen, jeder bekommt nur seine Fehler."
+    explanation: |
+      Der erste Task, der mit einer Exception endet, bricht die übrigen Tasks der Gruppe ab: `pruefe_lager` bekommt eine `CancelledError`, sein `finally` druckt. `"alle fertig"` fehlt, weil der Block nicht normal endet. Erst wenn alle Tasks beendet sind, löst die Gruppe eine `ExceptionGroup` mit beiden Fehlern aus. Bei `except*` laufen alle passenden Zweige hintereinander, jeder mit der Untergruppe seines Typs. Nach dem letzten Zweig läuft der Code ganz normal weiter. Ein einfaches `except ValueError` hätte die Gruppe nicht gefangen.
+    resources:
+      - title: asyncio · Task Groups
+        url: https://docs.python.org/3/library/asyncio-task.html#task-groups
+      - title: Die try-Anweisung (except*)
+        url: https://docs.python.org/3/reference/compound_stmts.html#except-star
+
+  - id: queue-backpressure
+    type: output
+    title: Wann wartet put()?
+    prompt: |
+      Was gibt dieses Programm aus? `asyncio.sleep(0)` gibt der Event-Loop genau einmal die Chance, andere Tasks laufen zu lassen. (`await` auf oberster Ebene.)
+    lang: python
+    code: |
+      import asyncio
+
+      q = asyncio.Queue(maxsize=2)
+      q.put_nowait("a")
+      q.put_nowait("b")
+      try:
+          q.put_nowait("c")
+      except asyncio.QueueFull:
+          print("voll")
+      print(q.full(), q.qsize())
+
+      put = asyncio.create_task(q.put("c"))
+      await asyncio.sleep(0)
+      print("put fertig:", put.done())
+      print("get:", await q.get())
+      await put
+      print("put fertig:", put.done(), q.qsize())
+    expected: |
+      voll
+      True 2
+      put fertig: False
+      get: a
+      put fertig: True 2
+    hints:
+      - "`put_nowait` wartet nie, `put` wartet bei voller Queue."
+      - Wer macht Platz, damit der wartende `put` weiterkommt?
+    explanation: |
+      Die Queue fasst zwei Einträge. `put_nowait("c")` wirft sofort `QueueFull`. Der Task mit `q.put("c")` kommt dagegen bis zum Warten und hängt dort, deshalb ist er nach dem `sleep(0)` nicht fertig. Das ist Backpressure: Der Producer wird gebremst. Erst das `get()` entnimmt `"a"` und weckt den Wartenden, der `"c"` einreiht. Danach ist die Queue wieder voll, `qsize()` zeigt 2.
+    resources:
+      - title: asyncio.Queue
+        url: https://docs.python.org/3/library/asyncio-queue.html#asyncio.Queue
+      - title: asyncio.QueueFull
+        url: https://docs.python.org/3/library/asyncio-queue.html#asyncio.QueueFull
+
+  - id: timeout-abbruch-ausgabe
+    type: output
+    title: Wer bekommt den TimeoutError?
+    prompt: |
+      Was gibt dieses Programm aus? Beide Blöcke haben eine Frist von 20 ms. (`await` auf oberster Ebene.)
+    lang: python
+    code: |
+      import asyncio
+
+      async def lade(name, dauer):
+          try:
+              await asyncio.sleep(dauer)
+              return f"{name} fertig"
+          except asyncio.CancelledError:
+              print(f"{name}: abgebrochen")
+              raise
+          finally:
+              print(f"{name}: finally")
+
+      async def tolerant(name, dauer):
+          try:
+              return await lade(name, dauer)
+          except asyncio.CancelledError:
+              return f"{name} teilweise"
+
+      async def main():
+          try:
+              async with asyncio.timeout(0.02):
+                  print(await lade("a", 0))
+                  print(await lade("b", 3600))
+                  print("unerreichbar")
+          except TimeoutError:
+              print("Timeout")
+          async with asyncio.timeout(0.02):
+              print(await tolerant("c", 3600))
+          print("fertig")
+
+      await main()
+    expected: |
+      a: finally
+      a fertig
+      b: abgebrochen
+      b: finally
+      Timeout
+      c: abgebrochen
+      c: finally
+      c teilweise
+      fertig
+    hints:
+      - "Bei `a` läuft `finally`, bevor der Rückgabewert ankommt."
+      - Was passiert mit dem Timeout, wenn `tolerant` die `CancelledError` fängt und normal zurückkehrt?
+    explanation: |
+      `lade("a", 0)` endet sofort. Sein `finally` läuft, bevor der Aufrufer den Rückgabewert druckt, darum steht `a: finally` vor `a fertig`. Bei `b` bricht die Frist den Task ab: Der `except`-Zweig meldet sich, `raise` gibt die `CancelledError` weiter, `finally` läuft, und `timeout` macht am Blockende einen `TimeoutError` daraus. Im zweiten Block fängt `tolerant` die `CancelledError` und kehrt normal zurück. Der Block endet ohne Ausnahme, und es gibt keinen `TimeoutError`. Wer den Abbruch verschluckt, entwertet das Timeout.
+    resources:
+      - title: asyncio.timeout
+        url: https://docs.python.org/3/library/asyncio-task.html#asyncio.timeout
+      - title: asyncio.Task.cancel
+        url: https://docs.python.org/3/library/asyncio-task.html#asyncio.Task.cancel
+
   - id: lock-ergaenzen
     type: gap
     title: Den Lagerbestand schützen
@@ -435,6 +1128,101 @@ exercises:
     resources:
       - title: threading · Lock objects
         url: https://docs.python.org/3/library/threading.html#lock-objects
+
+  - id: queue-shutdown-ergaenzen
+    type: gap
+    title: Consumer ohne cancel beenden
+    prompt: |
+      Der Producer ist fertig, und der Konsument soll nach den vorhandenen Einträgen von selbst enden, ohne `cancel()` und ohne Sentinel. Ergänze die Lücken (Python 3.13 oder neuer).
+    lang: python
+    code: |
+      import asyncio
+
+      async def konsument(queue, log):
+          while True:
+              try:
+                  eintrag = ⟦await queue.get()⟧
+              except ⟦asyncio.QueueShutDown⟧:
+                  return
+              log.append(eintrag.upper())
+              ⟦queue.task_done()⟧
+
+      async def main():
+          queue = asyncio.Queue()
+          log = []
+          task = asyncio.create_task(konsument(queue, log))
+          for zeile in ["a", "b"]:
+              await queue.put(zeile)
+          queue.⟦shutdown()⟧
+          await task
+          print(log)
+
+      await main()
+    gaps:
+      - label: Eintrag holen
+        hint: "`get()` ist eine Coroutine."
+      - label: Ausnahme beim Ende
+        hint: Eine Klasse aus dem Modul `asyncio`, die „Queue“ und „ShutDown“ im Namen trägt.
+      - label: Eintrag abschließen
+        hint: Pro `get()` ein Aufruf, damit `join()` zählen kann.
+      - label: Queue schließen
+        hint: Eine Methode ohne Argumente. Sie lässt die vorhandenen Einträge noch abholen.
+    explanation: |
+      Nach `shutdown()` löst `put()` einen `QueueShutDown` aus, `get()` liefert aber weiter die vorhandenen Einträge. Erst bei leerer Queue löst auch `get()` den `QueueShutDown` aus, und der Konsument beendet sich selbst. Das Ergebnis ist `['A', 'B']`. Vor Python 3.13 brauchte man dafür eine Sentinel-Marke pro Konsument oder `cancel()`. `task_done()` gehört trotzdem dazu: Es meldet der Queue jeden fertigen Eintrag.
+    resources:
+      - title: asyncio.Queue.shutdown
+        url: https://docs.python.org/3/library/asyncio-queue.html#asyncio.Queue.shutdown
+      - title: asyncio.QueueShutDown
+        url: https://docs.python.org/3/library/asyncio-queue.html#asyncio.QueueShutDown
+
+  - id: async-transaktion-ergaenzen
+    type: gap
+    title: Eine async Transaktion
+    prompt: |
+      `Transaktion` startet beim Betreten eine Datenbanktransaktion, committet bei Erfolg und rollt bei einer Exception zurück. Die Exception soll weiterfliegen. Ergänze die Lücken.
+    lang: python
+    code: |
+      class Transaktion:
+          def __init__(self, db):
+              self.db = db
+
+          ⟦async def __aenter__⟧(self):
+              await self.db.begin()
+              return self.db
+
+          ⟦async def __aexit__⟧(self, exc_type, exc, tb):
+              if ⟦exc_type is None⟧:
+                  await self.db.commit()
+              else:
+                  await self.db.⟦rollback()⟧
+              return ⟦False⟧
+
+      async def speichere(db, zeilen):
+          ⟦async with⟧ Transaktion(db) as t:
+              for zeile in zeilen:
+                  await t.insert(zeile)
+    gaps:
+      - label: Methode zum Betreten
+        hint: Beide Methoden sind Coroutinen und tragen ein `a` im Namen.
+      - label: Methode zum Verlassen
+        hint: Sie bekommt Typ, Wert und Traceback einer Exception.
+      - label: Erfolgsfall
+        hint: Ohne Exception ist der Typ `None`.
+        accept: ["exc is None"]
+      - label: Zurückrollen
+        hint: Das Gegenstück zu `commit()`.
+      - label: Exception nicht unterdrücken
+        hint: Ein wahrer Rückgabewert würde die Exception verschlucken.
+        accept: ["None"]
+      - label: Block öffnen
+        hint: Der Context Manager ist asynchron.
+    explanation: |
+      `async with` ruft `__aenter__` und `__aexit__` als Coroutinen auf und wartet sie ab. Deshalb dürfen sie `await`en: `begin`, `commit` und `rollback` sind Netzwerkaufrufe. `__aexit__` bekommt die Exception des Blocks, oder dreimal `None`. Ein falscher Rückgabewert (`False` oder `None`) lässt die Exception weiterfliegen. `return True` würde sie unterdrücken, und der Aufrufer sähe den Fehler nie, obwohl zurückgerollt wurde.
+    resources:
+      - title: Datenmodell · Asynchronous Context Managers
+        url: https://docs.python.org/3/reference/datamodel.html#async-context-managers
+      - title: Die async with-Anweisung
+        url: https://docs.python.org/3/reference/compound_stmts.html#async-with
 
   - id: begrenzt-abrufen
     type: code
@@ -739,6 +1527,433 @@ exercises:
       - title: Die try-Anweisung (except*)
         url: https://docs.python.org/3/reference/compound_stmts.html#except-star
 
+  - id: queue-pipeline
+    type: code
+    title: Worker-Pool mit Queue
+    prompt: |
+      Schreibe `async def verarbeite_alle(jobs, bearbeite, worker)`:
+
+      - `bearbeite` ist eine async-Funktion, `await bearbeite(job)` liefert das Ergebnis eines Jobs.
+      - Es arbeiten genau `worker` Worker-Tasks, die ihre Jobs aus einer `asyncio.Queue` holen. Nimm `maxsize=worker`, damit der Producer nicht weit vorausläuft.
+      - Rückgabe: die Ergebnisse **in der Reihenfolge der `jobs`**.
+      - Wirft `bearbeite(job)` eine `Exception`, steht an dieser Stelle der Ergebnisliste die Exception selbst, und die Verarbeitung der übrigen Jobs läuft weiter.
+      - Beim Zurückkehren sind alle Worker-Tasks beendet.
+    lang: python
+    starter: |
+      import asyncio
+
+      async def verarbeite_alle(jobs, bearbeite, worker):
+          return [await bearbeite(job) for job in jobs]
+    solution: |
+      import asyncio
+
+      async def verarbeite_alle(jobs, bearbeite, worker):
+          queue = asyncio.Queue(maxsize=worker)
+          ergebnisse = [None] * len(jobs)
+
+          async def arbeiter():
+              while True:
+                  index, job = await queue.get()
+                  try:
+                      ergebnisse[index] = await bearbeite(job)
+                  except Exception as fehler:
+                      ergebnisse[index] = fehler
+                  finally:
+                      queue.task_done()
+
+          tasks = [asyncio.create_task(arbeiter()) for _ in range(worker)]
+          try:
+              for index, job in enumerate(jobs):
+                  await queue.put((index, job))
+              await queue.join()
+          finally:
+              for task in tasks:
+                  task.cancel()
+              await asyncio.gather(*tasks, return_exceptions=True)
+          return ergebnisse
+    setup: |
+      import asyncio
+
+      class Messer:
+          def __init__(self):
+              self.aktiv = 0
+              self.maximal = 0
+          async def doppelt(self, n):
+              self.aktiv += 1
+              self.maximal = max(self.maximal, self.aktiv)
+              await asyncio.sleep(0.03 if n == 0 else 0.01)
+              self.aktiv -= 1
+              return n * 2
+
+      async def mit_fehler(n):
+          await asyncio.sleep(0)
+          if n == 2:
+              raise ValueError(f"Job {n} kaputt")
+          return n * 2
+    tests:
+      - name: Ergebnisse in der Reihenfolge der Jobs
+        code: |
+          messer = Messer()
+          ergebnis = await verarbeite_alle([0, 1, 2, 3, 4], messer.doppelt, worker=3)
+          assert ergebnis == [0, 2, 4, 6, 8], f"erwartet [0, 2, 4, 6, 8], bekommen {ergebnis!r}"
+      - name: Es arbeiten genau so viele Worker gleichzeitig wie verlangt
+        code: |
+          messer = Messer()
+          await verarbeite_alle(list(range(12)), messer.doppelt, worker=3)
+          assert messer.maximal == 3, f"höchstens {messer.maximal} Jobs gleichzeitig, erwartet genau 3"
+      - name: Ein Fehler wird Ergebnis und hält nichts auf
+        code: |
+          try:
+              async with asyncio.timeout(2):
+                  ergebnis = await verarbeite_alle([1, 2, 3], mit_fehler, worker=2)
+          except TimeoutError:
+              raise AssertionError("verarbeite_alle hängt: Wird task_done() auch nach einer Exception aufgerufen?")
+          assert ergebnis[0] == 2 and ergebnis[2] == 6, ergebnis
+          assert isinstance(ergebnis[1], ValueError), f"an Stelle 1 erwartet ValueError, bekommen {ergebnis[1]!r}"
+      - name: Nach der Rückkehr laufen keine Worker mehr
+        code: |
+          vorher = asyncio.all_tasks()
+          await verarbeite_alle([1, 2, 3], Messer().doppelt, worker=2)
+          uebrig = asyncio.all_tasks() - vorher
+          assert not uebrig, f"{len(uebrig)} Task(s) laufen noch: brich die Worker ab und warte auf sie."
+      - name: Leere Jobliste
+        code: |
+          assert await verarbeite_alle([], Messer().doppelt, worker=2) == []
+    hints:
+      - "Packe `(index, job)` in die Queue, damit ein Worker sein Ergebnis an die richtige Stelle schreiben kann."
+      - "`task_done()` gehört in ein `finally`, sonst wartet `queue.join()` nach einem Fehler ewig."
+      - Nach `join()` laufen die Worker noch. Brich sie ab und warte mit `asyncio.gather(*tasks, return_exceptions=True)`.
+    explanation: |
+      Der Producer legt `(index, job)` in die Queue, die Worker holen sie ab und schreiben das Ergebnis auf den Platz `index`. So bleibt die Eingabereihenfolge erhalten, obwohl die Jobs in beliebiger Reihenfolge fertig werden. `maxsize=worker` lässt `put` warten, wenn alle Worker beschäftigt sind (Backpressure). `queue.task_done()` im `finally` stellt sicher, dass `join()` auch nach einem Fehler zurückkehrt. Die Worker sind Endlosschleifen: Nach `join()` bricht der `finally`-Block sie ab und wartet mit `gather(..., return_exceptions=True)`, bis sie beendet sind. Der Worker fängt nur `Exception`, damit der Abbruch durchkommt.
+    resources:
+      - title: asyncio.Queue
+        url: https://docs.python.org/3/library/asyncio-queue.html#asyncio.Queue
+      - title: asyncio.Queue.join
+        url: https://docs.python.org/3/library/asyncio-queue.html#asyncio.Queue.join
+
+  - id: erster-erfolg
+    type: code
+    title: Der Schnellste gewinnt
+    prompt: |
+      Schreibe `async def erster_erfolg(quellen)`. `quellen` ist eine Liste von async-Funktionen ohne Argumente (etwa drei Mirror-Server). Alle starten gleichzeitig.
+
+      - Rückgabe: das Ergebnis der Quelle, die **zuerst erfolgreich** fertig wird.
+      - Eine Quelle, die eine `Exception` wirft, wird übersprungen.
+      - Scheitern alle, löse `RuntimeError("alle Quellen gescheitert")` aus.
+      - Beim Zurückkehren sind alle übrigen Quellen abgebrochen und beendet.
+
+      Nutze `asyncio.as_completed` (Python 3.13 oder neuer, mit `async for`).
+    lang: python
+    starter: |
+      import asyncio
+
+      async def erster_erfolg(quellen):
+          for quelle in quellen:
+              try:
+                  return await quelle()
+              except Exception:
+                  continue
+          raise RuntimeError("alle Quellen gescheitert")
+    solution: |
+      import asyncio
+
+      async def erster_erfolg(quellen):
+          tasks = [asyncio.create_task(quelle()) for quelle in quellen]
+          try:
+              async for fertig in asyncio.as_completed(tasks):
+                  try:
+                      return await fertig
+                  except Exception:
+                      continue
+              raise RuntimeError("alle Quellen gescheitert")
+          finally:
+              for task in tasks:
+                  task.cancel()
+              await asyncio.gather(*tasks, return_exceptions=True)
+    setup: |
+      import asyncio
+
+      log = []
+
+      def nach(dauer, wert):
+          async def quelle():
+              await asyncio.sleep(dauer)
+              return wert
+          return quelle
+
+      async def kaputt():
+          raise ConnectionError("Server nicht erreichbar")
+
+      async def haengt():
+          try:
+              await asyncio.Event().wait()
+          except asyncio.CancelledError:
+              log.append("haengt: abgebrochen")
+              raise
+    tests:
+      - name: Die schnellere Quelle gewinnt
+        code: |
+          ergebnis = await erster_erfolg([nach(0.05, "langsam"), nach(0.01, "schnell")])
+          assert ergebnis == "schnell", f"erwartet 'schnell', bekommen {ergebnis!r}: starten alle Quellen gleichzeitig?"
+      - name: Gescheiterte Quellen werden übersprungen
+        code: |
+          assert await erster_erfolg([kaputt, nach(0.01, "gut")]) == "gut"
+      - name: Verlierer werden abgebrochen und abgewartet
+        code: |
+          log.clear()
+          vorher = asyncio.all_tasks()
+          try:
+              async with asyncio.timeout(1):
+                  ergebnis = await erster_erfolg([haengt, nach(0.01, "schnell")])
+          except TimeoutError:
+              raise AssertionError("erster_erfolg hängt an der Quelle, die nie fertig wird.")
+          assert ergebnis == "schnell"
+          assert log == ["haengt: abgebrochen"], f"die hängende Quelle wurde nicht abgebrochen und abgewartet: {log}"
+          assert not (asyncio.all_tasks() - vorher), "es laufen noch Tasks"
+      - name: Alle scheitern
+        code: |
+          try:
+              await erster_erfolg([kaputt, kaputt])
+          except RuntimeError as fehler:
+              assert "alle Quellen gescheitert" in str(fehler)
+          else:
+              raise AssertionError("RuntimeError erwartet, wenn alle Quellen scheitern.")
+    hints:
+      - "Erzeuge mit `asyncio.create_task` für jede Quelle einen Task und gib die Liste an `asyncio.as_completed`."
+      - "`async for fertig in asyncio.as_completed(tasks)` liefert fertige Tasks. `await fertig` gibt das Ergebnis oder wirft die Exception."
+      - "`as_completed` bricht nichts ab. Räume in `finally` auf: `cancel()` für alle, dann `gather(..., return_exceptions=True)`."
+    explanation: |
+      Der Startcode probiert die Quellen nacheinander: Er wartet auf die langsame, obwohl die schnelle längst fertig wäre, und bleibt an einer hängenden Quelle ewig hängen. Mit `as_completed` laufen alle gleichzeitig, und die Schleife liefert die Tasks in der Reihenfolge ihrer Fertigstellung. Eine gescheiterte Quelle (`except Exception`) wird übersprungen, die erste erfolgreiche beendet die Funktion mit `return`. `as_completed` selbst bricht die übrigen Tasks nicht ab. Deshalb ruft das `finally` für alle `cancel()` auf und wartet danach mit `gather`, bis sie beendet sind. Das gilt auch für den Fall, dass alle scheitern.
+    resources:
+      - title: asyncio.as_completed
+        url: https://docs.python.org/3/library/asyncio-task.html#asyncio.as_completed
+      - title: asyncio.Task.cancel
+        url: https://docs.python.org/3/library/asyncio-task.html#asyncio.Task.cancel
+
+  - id: konto-sperren
+    type: code
+    title: Doppelt abgebucht
+    prompt: |
+      Ein Zahlungsdienst bucht von einem `Konto` ab. Zwischen Prüfung und Abbuchung ruft er eine Betrugsprüfung auf (`await asyncio.sleep(0)` steht dafür). Bei zwei gleichzeitigen Abbuchungen von je 80 Euro auf einem Konto mit 100 Euro gehen beide durch, und der Saldo fällt auf −60.
+
+      Repariere `Konto.abbuchen`: Gibt es genug Saldo, wird abgebucht und `True` zurückgegeben, sonst bleibt der Saldo unverändert und das Ergebnis ist `False`. Das muss auch bei beliebig vielen gleichzeitigen Aufrufen stimmen. Die Betrugsprüfung bleibt zwischen Prüfung und Abbuchung.
+    lang: python
+    starter: |
+      import asyncio
+
+      class Konto:
+          def __init__(self, saldo: int) -> None:
+              self.saldo = saldo
+
+          async def abbuchen(self, betrag: int) -> bool:
+              if self.saldo >= betrag:
+                  await asyncio.sleep(0)       # Betrugsprüfung beim Zahlungsdienst
+                  self.saldo -= betrag
+                  return True
+              return False
+    solution: |
+      import asyncio
+
+      class Konto:
+          def __init__(self, saldo: int) -> None:
+              self.saldo = saldo
+              self._lock = asyncio.Lock()
+
+          async def abbuchen(self, betrag: int) -> bool:
+              async with self._lock:
+                  if self.saldo >= betrag:
+                      await asyncio.sleep(0)   # Betrugsprüfung beim Zahlungsdienst
+                      self.saldo -= betrag
+                      return True
+                  return False
+    tests:
+      - name: Zwei gleichzeitige Abbuchungen, Geld nur für eine
+        code: |
+          konto = Konto(100)
+          ergebnis = await asyncio.gather(konto.abbuchen(80), konto.abbuchen(80))
+          assert sorted(ergebnis) == [False, True], f"erwartet genau eine erfolgreiche Abbuchung, bekommen {ergebnis}"
+          assert konto.saldo == 20, f"Saldo {konto.saldo}, erwartet 20"
+      - name: Genug Geld für alle
+        code: |
+          konto = Konto(100)
+          ergebnis = await asyncio.gather(*(konto.abbuchen(10) for _ in range(5)))
+          assert ergebnis == [True] * 5
+          assert konto.saldo == 50
+      - name: Zu viele Abbuchungen, der Saldo wird nie negativ
+        code: |
+          konto = Konto(100)
+          ergebnis = await asyncio.gather(*(konto.abbuchen(40) for _ in range(3)))
+          assert ergebnis.count(True) == 2, f"erwartet 2 erfolgreiche Abbuchungen, bekommen {ergebnis}"
+          assert konto.saldo == 20, f"Saldo {konto.saldo}, erwartet 20"
+      - name: Einzelne Abbuchung ohne genug Saldo
+        code: |
+          konto = Konto(30)
+          assert await konto.abbuchen(50) is False
+          assert konto.saldo == 30
+    hints:
+      - "Zwischen der Prüfung und der Abbuchung steht ein `await`: Dort laufen andere Coroutinen."
+      - "Ein `asyncio.Lock` in `__init__` und `async with self._lock:` um Prüfen und Abbuchen."
+    explanation: |
+      asyncio wechselt nur an einem `await`. Hier liegt eines zwischen Prüfung und Abbuchung: Beide Aufrufe sehen 100 Euro, bevor einer von ihnen abbucht, und beide buchen ab. Das ist ein Check-then-Act-Fehler, nur eben mit Coroutinen statt Threads. Der `asyncio.Lock` macht den ganzen Abschnitt exklusiv, auch über das `await` hinweg: Der zweite Aufruf wartet am `async with`, bis der erste fertig ist, und sieht dann den neuen Saldo. Das Lock gehört in `__init__`, damit jedes Konto sein eigenes hat. Alternativ prüfst du nach dem `await` erneut. Das Lock ist aber einfacher zu überblicken.
+    resources:
+      - title: asyncio.Lock
+        url: https://docs.python.org/3/library/asyncio-sync.html#asyncio.Lock
+
+  - id: bestellung-geschuetzt
+    type: code
+    title: Speichern darf nicht abbrechen
+    prompt: |
+      Ein Webhandler ruft `speichere_geschuetzt(speichern, daten)` auf. Die Funktion führt `await speichern(daten)` aus und gibt das Ergebnis zurück. Wird der Handler abgebrochen (Client trennt, Timeout), darf das **Speichern selbst nicht abbrechen**: Es läuft zu Ende, auch wenn niemand mehr auf das Ergebnis wartet.
+
+      Der Aufrufer bekommt bei Abbruch trotzdem seine `CancelledError`. Fehler aus `speichern` kommen unverändert beim Aufrufer an.
+    lang: python
+    starter: |
+      import asyncio
+
+      async def speichere_geschuetzt(speichern, daten):
+          return await speichern(daten)
+    solution: |
+      import asyncio
+
+      async def speichere_geschuetzt(speichern, daten):
+          schreiben = asyncio.create_task(speichern(daten))     # Referenz behalten
+          return await asyncio.shield(schreiben)
+    setup: |
+      import asyncio
+
+      log = []
+
+      async def speichern_mit_tor(daten, tor):
+          log.append("start")
+          await tor.wait()
+          log.append("fertig")
+          return f"gespeichert {daten}"
+
+      async def speichern_kaputt(daten):
+          await asyncio.sleep(0)
+          raise ConnectionError("Datenbank weg")
+    tests:
+      - name: Ergebnis kommt beim Aufrufer an
+        code: |
+          log.clear()
+          tor = asyncio.Event()
+          tor.set()
+          assert await speichere_geschuetzt(lambda d: speichern_mit_tor(d, tor), 7) == "gespeichert 7"
+      - name: Der Abbruch des Aufrufers bricht das Speichern nicht ab
+        code: |
+          log.clear()
+          tor = asyncio.Event()
+          aufrufer = asyncio.create_task(speichere_geschuetzt(lambda d: speichern_mit_tor(d, tor), 7))
+          for _ in range(3):
+              await asyncio.sleep(0)
+          assert log == ["start"], f"das Speichern sollte hängen und noch nicht fertig sein: {log}"
+          aufrufer.cancel()
+          try:
+              await aufrufer
+          except asyncio.CancelledError:
+              pass
+          assert aufrufer.cancelled(), "der Aufrufer sollte abgebrochen sein"
+          tor.set()
+          for _ in range(5):
+              await asyncio.sleep(0)
+          assert log == ["start", "fertig"], f"das Speichern wurde mit abgebrochen: {log}"
+      - name: Fehler aus dem Speichern kommen an
+        code: |
+          try:
+              await speichere_geschuetzt(speichern_kaputt, 1)
+          except ConnectionError:
+              pass
+          else:
+              raise AssertionError("ConnectionError aus dem Speichern muss beim Aufrufer ankommen.")
+    hints:
+      - "`asyncio.shield(aufgabe)` hält den Abbruch des Aufrufers vom inneren Task fern."
+      - "Erzeuge den inneren Task mit `asyncio.create_task(speichern(daten))` und behalte die Referenz."
+    explanation: |
+      `await speichern(daten)` läuft im Task des Aufrufers. Wird der abgebrochen, bekommt `speichern` die `CancelledError` mitten im Schreiben. `asyncio.shield` entkoppelt beides: Der innere Task gehört der Event-Loop, und der Abbruch erreicht nur das äußere `await`. Dort löst `shield` weiter eine `CancelledError` aus, der Aufrufer ist also wie verlangt abgebrochen. Das Speichern läuft weiter. Die Dokumentation verlangt eine Referenz auf den inneren Task, sonst kann er mitten in der Ausführung verschwinden. Exceptions aus dem inneren Task kommen über `shield` unverändert an.
+    resources:
+      - title: asyncio.shield
+        url: https://docs.python.org/3/library/asyncio-task.html#asyncio.shield
+
+  - id: async-generator-seiten
+    type: code
+    title: Paginierte API als async Generator
+    prompt: |
+      Eine API liefert Einträge seitenweise. `await hole_seite(n)` gibt die Einträge der Seite `n` zurück (ab Seite 1); eine **leere Liste** bedeutet: keine weiteren Seiten.
+
+      Schreibe `alle_eintraege(hole_seite)` als **async Generator**, der die Einträge einzeln liefert, Seite für Seite in Reihenfolge. Eine Seite wird erst geholt, wenn der Aufrufer ihre Einträge braucht. Wer nach dem dritten Eintrag aufhört, löst keine weiteren Abrufe aus.
+    lang: python
+    starter: |
+      import asyncio
+
+      async def alle_eintraege(hole_seite):
+          ergebnis = []
+          seite = 1
+          while True:
+              eintraege = await hole_seite(seite)
+              if not eintraege:
+                  break
+              ergebnis.extend(eintraege)
+              seite += 1
+          return ergebnis
+    solution: |
+      import asyncio
+
+      async def alle_eintraege(hole_seite):
+          seite = 1
+          while True:
+              eintraege = await hole_seite(seite)
+              if not eintraege:
+                  return
+              for eintrag in eintraege:
+                  yield eintrag
+              seite += 1
+    setup: |
+      import asyncio
+      import inspect
+
+      class FakeApi:
+          def __init__(self, seiten):
+              self.seiten = seiten
+              self.aufrufe = []
+          async def hole_seite(self, n):
+              self.aufrufe.append(n)
+              await asyncio.sleep(0)
+              return self.seiten.get(n, [])
+    tests:
+      - name: Alle Einträge in Reihenfolge
+        code: |
+          api = FakeApi({1: ["a", "b"], 2: ["c", "d"], 3: ["e"]})
+          ergebnis = [e async for e in alle_eintraege(api.hole_seite)]
+          assert ergebnis == ["a", "b", "c", "d", "e"], ergebnis
+      - name: Es ist ein async Generator
+        code: |
+          assert inspect.isasyncgenfunction(alle_eintraege), "alle_eintraege soll `async def` mit `yield` sein."
+      - name: Seiten werden erst bei Bedarf geholt
+        code: |
+          api = FakeApi({1: ["a", "b"], 2: ["c", "d"], 3: ["e"]})
+          gelesen = []
+          async for eintrag in alle_eintraege(api.hole_seite):
+              gelesen.append(eintrag)
+              if len(gelesen) == 3:
+                  break
+          assert gelesen == ["a", "b", "c"]
+          assert api.aufrufe == [1, 2], f"abgerufene Seiten: {api.aufrufe}, erwartet [1, 2]"
+      - name: Leere erste Seite
+        code: |
+          api = FakeApi({})
+          assert [e async for e in alle_eintraege(api.hole_seite)] == []
+          assert api.aufrufe == [1]
+    hints:
+      - "Ein `async def` mit `yield` ist ein async Generator. Er braucht kein `return` mit Wert."
+      - "Liefere in einer Schleife `yield eintrag`, und hole die nächste Seite erst danach."
+    explanation: |
+      Der Startcode holt zuerst alle Seiten und gibt dann eine Liste zurück. Das ist eine gewöhnliche Coroutine: Der Aufrufer kann nicht mit `async for` darüber laufen, und sie lädt alles, auch wenn er nach drei Einträgen aufhört. Ein async Generator liefert mit `yield` einen Wert und pausiert. Zwischen zwei Werten darf er `await` benutzen, etwa für den nächsten Abruf. Die nächste Seite wird deshalb erst geholt, wenn die Schleife des Aufrufers die Einträge der aktuellen verbraucht hat. Nach `break` bleibt der Generator stehen. Hält er Ressourcen, schließt du ihn mit `aclose()` oder `contextlib.aclosing`.
+    resources:
+      - title: Ausdrücke · Asynchronous generator functions
+        url: https://docs.python.org/3/reference/expressions.html#asynchronous-generator-functions
+      - title: Die async for-Anweisung
+        url: https://docs.python.org/3/reference/compound_stmts.html#async-for
+
   - id: blockierender-sleep
     type: bug
     title: Der Server hört auf zu antworten
@@ -802,6 +2017,78 @@ exercises:
       - title: asyncio · Detect never-awaited coroutines
         url: https://docs.python.org/3/library/asyncio-dev.html#detect-never-awaited-coroutines
 
+  - id: worker-schluckt-abbruch
+    type: bug
+    title: Der Shutdown hängt
+    prompt: |
+      Ein Service beendet sich mit `for w in workers: w.cancel()` und `await asyncio.gather(*workers)`. Meistens klappt das. Manchmal hängt der Shutdown für immer: Einige Worker laufen nach dem `cancel()` weiter und holen weitere Aufträge. Finde die Zeile und korrigiere sie.
+    lang: python
+    code: |
+      import asyncio
+      import logging
+
+      log = logging.getLogger("worker")
+
+      async def worker(queue: asyncio.Queue) -> None:
+          while True:
+              auftrag = await queue.get()
+              try:
+                  await verarbeite(auftrag)
+              except (Exception, asyncio.CancelledError):
+                  log.exception("Auftrag %s fehlgeschlagen", auftrag)
+              finally:
+                  queue.task_done()
+    lines: [11]
+    fix:
+      - line: 11
+        answers: ["except Exception:"]
+    explanation: |
+      `CancelledError` erbt von `BaseException`. Ein `except Exception` lässt sie durch, die Variante mit `asyncio.CancelledError` in der Liste fängt sie. Wird der Worker mitten in `verarbeite` abgebrochen, loggt er den Abbruch als Fehler und läuft in die nächste Runde. `cancel()` ist damit wirkungslos, und `gather` wartet auf einen Task, der nie endet. Mit `except Exception` bleiben echte Fehler einzelner Aufträge abgefangen, der Abbruch kommt durch, und `finally` ruft trotzdem `task_done()` auf. Willst du bei Abbruch aufräumen, fange `CancelledError` und rufe danach `raise` auf.
+    resources:
+      - title: asyncio.Task.cancel
+        url: https://docs.python.org/3/library/asyncio-task.html#asyncio.Task.cancel
+      - title: asyncio.CancelledError
+        url: https://docs.python.org/3/library/asyncio-exceptions.html#asyncio.CancelledError
+
+  - id: queue-ohne-grenze
+    type: bug
+    title: Der Import frisst den Arbeitsspeicher
+    prompt: |
+      Ein Import liest eine 4 GB große CSV-Datei Zeile für Zeile und schreibt sie mit vier Workern in die Datenbank. Der Prozess belegt trotzdem nach wenigen Sekunden mehrere Gigabyte Arbeitsspeicher, und die Datenbank sieht erst dann Last, wenn die Datei gelesen ist. Ops verlangt, dass höchstens 100 Zeilen im Speicher warten. Finde die Zeile und korrigiere sie.
+    lang: python
+    code: |
+      import asyncio
+
+      async def importiere(pfad: str, schreibe_zeile, worker_anzahl: int = 4) -> None:
+          queue: asyncio.Queue[str] = asyncio.Queue()
+
+          async def worker() -> None:
+              while True:
+                  zeile = await queue.get()
+                  try:
+                      await schreibe_zeile(zeile)
+                  finally:
+                      queue.task_done()
+
+          tasks = [asyncio.create_task(worker()) for _ in range(worker_anzahl)]
+          with open(pfad, encoding="utf-8") as datei:
+              for zeile in datei:
+                  await queue.put(zeile)
+          await queue.join()
+          for task in tasks:
+              task.cancel()
+    lines: [4]
+    fix:
+      - line: 4
+        answers: ["queue: asyncio.Queue[str] = asyncio.Queue(maxsize=100)", "queue = asyncio.Queue(maxsize=100)", "queue: asyncio.Queue[str] = asyncio.Queue(100)", "queue = asyncio.Queue(100)"]
+    explanation: |
+      Eine `Queue` ohne `maxsize` ist unbegrenzt: `put()` kehrt sofort zurück, ohne der Event-Loop die Kontrolle zu geben. Die Schleife liest deshalb die ganze Datei, bevor ein Worker auch nur eine Zeile bekommt. Alle Zeilen liegen im Speicher. Mit `maxsize=100` wartet `await queue.put(...)`, sobald die Queue voll ist, und die Worker kommen zum Zug. Das ist Backpressure: Die langsamste Stufe gibt das Tempo vor. Der Speicherbedarf bleibt klein, egal wie groß die Datei ist.
+    resources:
+      - title: asyncio.Queue
+        url: https://docs.python.org/3/library/asyncio-queue.html#asyncio.Queue
+      - title: asyncio.Queue.put
+        url: https://docs.python.org/3/library/asyncio-queue.html#asyncio.Queue.put
+
   - id: race-erklaeren
     type: explain
     title: Warum fehlen Seitenaufrufe?
@@ -860,6 +2147,58 @@ exercises:
         url: https://docs.python.org/3/library/concurrent.futures.html#processpoolexecutor
       - title: pickle · What can be pickled and unpickled?
         url: https://docs.python.org/3/library/pickle.html#what-can-be-pickled-and-unpickled
+
+  - id: pipeline-erklaeren
+    type: explain
+    title: Wie bremst und endet diese Pipeline?
+    prompt: |
+      Ein Kollege hat die Importpipeline in drei Stufen geschrieben und fragt im Review: „Warum zwei Queues mit `maxsize`, und woher weiß die letzte Stufe, wann Schluss ist?“ Erkläre, wie die Stufen zusammenspielen, was passiert, wenn `speichere` langsam ist, und wie die Pipeline endet.
+    lang: python
+    code: |
+      async def pipeline(zeilen, parse, speichere):
+          roh = asyncio.Queue(maxsize=50)
+          fertig = asyncio.Queue(maxsize=50)
+
+          async def lese():
+              for zeile in zeilen:
+                  await roh.put(zeile)
+              roh.shutdown()
+
+          async def wandle():
+              while True:
+                  try:
+                      zeile = await roh.get()
+                  except asyncio.QueueShutDown:
+                      break
+                  await fertig.put(parse(zeile))
+              fertig.shutdown()
+
+          async def schreibe():
+              while True:
+                  try:
+                      datensatz = await fertig.get()
+                  except asyncio.QueueShutDown:
+                      return
+                  await speichere(datensatz)
+
+          async with asyncio.TaskGroup() as tg:
+              tg.create_task(lese())
+              tg.create_task(wandle())
+              tg.create_task(schreibe())
+    points:
+      - "Drei Stufen (lesen, umwandeln, speichern) laufen nebenläufig und sind nur über Queues gekoppelt. Jede Stufe arbeitet in ihrem Tempo."
+      - "Ist `speichere` langsam, füllt sich `fertig`. Dann wartet `wandle` an `fertig.put`, danach füllt sich `roh`, und `lese` wartet an `roh.put`. Der Speicherbedarf bleibt durch `maxsize` begrenzt (Backpressure)."
+      - "Das Ende pflanzt sich per `shutdown()` fort: `lese` schließt `roh`, `wandle` arbeitet die Reste ab, bekommt dann `QueueShutDown` und schließt `fertig`, `schreibe` leert `fertig` und endet."
+      - "Die `TaskGroup` wartet auf alle drei Stufen. Scheitert eine, bricht sie die anderen ab, und die Pipeline hängt nicht an einer Queue, die niemand mehr leert."
+    explanation: |
+      Die Queues entkoppeln die Stufen: `lese` muss nicht wissen, wie schnell `speichere` ist. Damit der Puffer nicht unbegrenzt wächst, hat jede Queue ein `maxsize`. Ist die letzte Stufe langsam, wandert der Rückstau Queue für Queue nach vorn, bis `lese` an `put` wartet. Im Speicher liegen höchstens etwa hundert Zeilen plus die in Bearbeitung.
+
+      Das Ende ist eine Kettenreaktion: `roh.shutdown()` lässt `wandle` die vorhandenen Einträge abholen und erst dann `QueueShutDown` erhalten. `wandle` schließt `fertig` und der gleiche Ablauf wiederholt sich bei `schreibe`. Ohne `shutdown()` bräuchtest du Sentinel-Werte oder `cancel()`. Die `TaskGroup` sorgt dafür, dass ein Fehler in einer Stufe die anderen nicht für immer an einer Queue hängen lässt. Bei mehreren Workern pro Stufe müsste nur der Letzte von ihnen die nächste Queue schließen.
+    resources:
+      - title: asyncio.Queue
+        url: https://docs.python.org/3/library/asyncio-queue.html#asyncio.Queue
+      - title: asyncio.Queue.shutdown
+        url: https://docs.python.org/3/library/asyncio-queue.html#asyncio.Queue.shutdown
 
   - id: downloader-threads
     type: practice
