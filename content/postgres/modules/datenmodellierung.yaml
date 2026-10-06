@@ -1,0 +1,1028 @@
+id: datenmodellierung
+title: Datenmodellierung
+level: 2
+minutes: 150
+summary: Fachliche Anforderungen in ein PostgreSQL-Schema übersetzen – Kardinalitäten, Verbindungstabellen, Historie, Soft Delete, polymorphe Beziehungen, Geld, Wertelisten und Mandanten – so, dass die Datenbank die Regeln selbst durchsetzt.
+goals:
+  - Du leitest aus einer Anforderung Entitäten und Kardinalitäten ab und setzt 1:n, 1:1 und n:m mit Fremdschlüsseln, `UNIQUE` und Verbindungstabellen um.
+  - Du modellierst Zustände, die sich über die Zeit ändern, als Historie mit `daterange` und verhinderst Überschneidungen mit `WITHOUT OVERLAPS`.
+  - Du wägst Soft Delete gegen echtes Löschen ab und hältst E-Mail-Adressen trotzdem eindeutig, mit einem partiellen Unique-Index.
+  - Du ersetzt polymorphe Assoziationen durch Modelle mit echten Fremdschlüsseln und begründest, wann Spalten, JSONB oder Lookup-Tabellen passen.
+  - Du wählst Typen für Geld und Zeitpunkte richtig und sicherst Mandantengrenzen mit zusammengesetzten Fremdschlüsseln.
+resources:
+  - title: PostgreSQL · Constraints (Fremdschlüssel, UNIQUE, Exclusion)
+    url: https://www.postgresql.org/docs/current/ddl-constraints.html
+  - title: PostgreSQL · CREATE TABLE – UNIQUE und WITHOUT OVERLAPS
+    url: https://www.postgresql.org/docs/current/sql-createtable.html#SQL-CREATETABLE-PARMS-UNIQUE
+  - title: PostgreSQL · Partielle Indexe
+    url: https://www.postgresql.org/docs/current/indexes-partial.html
+  - title: PostgreSQL · Range-Typen
+    url: https://www.postgresql.org/docs/current/rangetypes.html
+  - title: PostgreSQL Wiki · Don't Do This
+    url: https://wiki.postgresql.org/wiki/Don't_Do_This
+lesson: |
+  Im Februar landet ein Ticket beim Deskwerk-Team. Firmenkunden wollen als Team buchen: Ein Team hat mehrere Mitglieder, eine Person kann für zwei Firmen arbeiten, und jedes Team braucht einen Admin, der Rechnungen sieht. Im selben Ticket stehen vier weitere Wünsche: Räume bekommen eine Ausstattungsliste, Tarifwechsel sollen nachvollziehbar sein, gekündigte Mitglieder verschwinden aus der App, ihre Rechnungen aber nicht, und das Personal will Notizen an Räume und an Buchungen hängen.
+
+  Jeder dieser Wünsche lässt sich in fünf Minuten irgendwie in Tabellen gießen. Ob das Schema in zwei Jahren noch trägt, entscheidet sich an Fragen, die im Ticket nicht stehen: Kann es mehrere davon geben? Ändert sich der Wert über die Zeit? Was passiert beim Löschen? Die Werkzeuge kennst du aus [Constraints](/postgres/constraints) und [Normalisierung](/postgres/normalisierung). Hier geht es um die Entscheidungen davor.
+
+  ## Von der Anforderung zum Schema: Kardinalitäten
+
+  Lies die Anforderung auf Substantive: Team, Mitglied, Rolle, Raum, Ausstattung, Tarif, Notiz. Jedes ist ein Kandidat für eine **Entität**, also eine Tabelle. Eine eigene Tabelle lohnt sich, wenn das Ding eine eigene Identität hat und eigene Attribute oder Beziehungen. „Beamer“ ist eine Entität, sobald Deskwerk Ausstattung verwaltet (Name, Anzahl, Inventarnummer). Bleibt es ein Etikett, reicht ein Wert.
+
+  Für jede Beziehung stellst du zwei Fragen, in beide Richtungen: *Wie viele B hat ein A höchstens?* und *Muss es mindestens eines geben?* Die Antworten ergeben die **Kardinalität** (1:1, 1:n, n:m) und die Optionalität. Ein ER-Diagramm (Entity-Relationship) hält das fest; im Repository reicht oft Text:
+
+  ```text
+  standorte 1 ──< raeume 1 ──< buchungen >── 1 mitglieder
+                    1                            1   1
+                    └──< raum_ausstattung        │   └── 0..1 schliessfaecher
+                              >── 1 ausstattung  │
+  teams 1 ──< team_mitgliedschaften >── 1 ───────┘
+  ```
+
+  `<` steht für „viele“. Aus jeder Kardinalität folgt eine Umsetzung:
+
+  | Kardinalität | Umsetzung in PostgreSQL |
+  | --- | --- |
+  | 1:n | Fremdschlüssel auf der n-Seite; `NOT NULL`, wenn der Partner Pflicht ist |
+  | 1:1 bzw. 0..1 | Fremdschlüssel mit `UNIQUE`, oder der Fremdschlüssel ist zugleich Primärschlüssel |
+  | n:m | Verbindungstabelle mit zwei Fremdschlüsseln, Primärschlüssel über beide |
+
+  Teams und Mitglieder stehen n:m zueinander. Die Rolle gehört weder zum Team noch zur Person, sondern zur **Mitgliedschaft**: Mehmet ist in einem Team Admin, im anderen nicht. Deshalb ist die Verbindungstabelle hier eine eigene Entität mit eigenen Attributen.
+
+  ```postgres run
+  CREATE TABLE mitglieder (
+    id    int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email text NOT NULL UNIQUE,
+    name  text NOT NULL
+  );
+  CREATE TABLE teams (
+    id   int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name text NOT NULL UNIQUE
+  );
+  -- n:m mit eigenen Attributen
+  CREATE TABLE team_mitgliedschaften (
+    team_id     int  NOT NULL REFERENCES teams (id) ON DELETE CASCADE,
+    mitglied_id int  NOT NULL REFERENCES mitglieder (id),
+    rolle       text NOT NULL DEFAULT 'mitglied' CHECK (rolle IN ('admin', 'mitglied')),
+    seit        date NOT NULL,
+    PRIMARY KEY (team_id, mitglied_id)
+  );
+  INSERT INTO mitglieder (email, name) VALUES
+    ('anna.krueger@example.org',  'Anna Krüger'),
+    ('mehmet.yilmaz@example.org', 'Mehmet Yılmaz'),
+    ('lena.vogel@example.org',    'Lena Vogel');
+  INSERT INTO teams (name) VALUES ('Studio Nordlicht'), ('Kanzlei Berger');
+  INSERT INTO team_mitgliedschaften (team_id, mitglied_id, rolle, seit) VALUES
+    (1, 1, 'admin',    '2026-01-01'),
+    (1, 2, 'mitglied', '2026-02-01'),
+    (2, 2, 'admin',    '2026-03-01');
+
+  SELECT t.name AS team, m.name AS mitglied, tm.rolle, tm.seit
+  FROM team_mitgliedschaften AS tm
+  JOIN teams AS t ON t.id = tm.team_id
+  JOIN mitglieder AS m ON m.id = tm.mitglied_id
+  ORDER BY t.name, m.name;
+  ```
+
+  Der zusammengesetzte Primärschlüssel verhindert, dass dieselbe Person zweimal im selben Team steht. Ein zusätzliches `id`-Feld als Primärschlüssel wäre erlaubt, braucht dann aber trotzdem `UNIQUE (team_id, mitglied_id)` – sonst entstehen Duplikate, die keine Fachregel erlaubt. `ON DELETE CASCADE` auf der Team-Seite räumt die Mitgliedschaften auf, wenn ein Team aufgelöst wird; Mitglieder mit Mitgliedschaften lassen sich dagegen nicht löschen ([Fremdschlüssel](https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-FK)). Der Primärschlüssel beginnt mit `team_id` und hilft bei „Mitglieder eines Teams“. Für „Teams eines Mitglieds“ brauchst du einen Index auf `mitglied_id` ([Indexe](/postgres/indexe)).
+
+  Eine 1:1-Beziehung ist eine 1:n-Beziehung mit `UNIQUE` auf dem Fremdschlüssel. Deskwerk vermietet Schließfächer: Ein Fach gehört höchstens einem Mitglied, ein Mitglied hat höchstens ein Fach.
+
+  ```postgres run fails
+  CREATE TABLE mitglieder (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name text NOT NULL);
+  CREATE TABLE schliessfaecher (
+    id          int  GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    nummer      text NOT NULL UNIQUE,
+    mitglied_id int  UNIQUE REFERENCES mitglieder (id)  -- NULL = Fach ist frei
+  );
+  INSERT INTO mitglieder (name) VALUES ('Anna Krüger'), ('Jonas Weber');
+  INSERT INTO schliessfaecher (nummer, mitglied_id) VALUES ('P-01', 1), ('P-02', NULL), ('P-03', NULL);
+  SELECT nummer, mitglied_id FROM schliessfaecher ORDER BY nummer;
+  -- Anna bekommt ein zweites Fach: abgelehnt
+  UPDATE schliessfaecher SET mitglied_id = 1 WHERE nummer = 'P-02';
+  ```
+
+  Zwei freie Fächer mit `NULL` sind erlaubt, weil `UNIQUE` `NULL`-Werte als verschieden behandelt ([Unique Constraints](https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-UNIQUE-CONSTRAINTS)). Eine eigene 1:1-Tabelle lohnt sich nur für optionale Daten mit eigenem Lebenszyklus oder eigenen Zugriffsrechten. Sonst gehören die Spalten in die Haupttabelle.
+
+  > [!PRAXIS] n:m im ORM
+  > Sobald die Verbindungstabelle eigene Spalten hat, reicht die n:m-Abbildung ohne eigene Klasse nicht mehr. In SQLAlchemy wird `team_mitgliedschaften` eine eigene Klasse, das [Association Object](https://docs.sqlalchemy.org/en/21/orm/basic_relationships.html#association-object), statt nur `secondary=` zu sein. Prisma legt bei [impliziten n:m-Relationen](https://www.prisma.io/docs/orm/prisma-schema/data-model/relations/many-to-many-relations#implicit-many-to-many-relations) eine Tabelle `_MitgliedToTeam` mit den Spalten `A` und `B` an – ohne Platz für Rolle oder Datum.
+
+  ## Zeit im Modell: Historie statt Überschreiben
+
+  Im kanonischen Schema steht der Tarif in `mitglieder.tarif`. Wechselt Anna am 15. März von `flex` zu `fix`, überschreibt ein `UPDATE` den alten Wert. Die Märzrechnung lässt sich danach nicht mehr nachrechnen, denn niemand weiß, ab wann `fix` galt. Zustände, die sich ändern und deren Vergangenheit zählt, gehören in eine **Historientabelle**: eine Zeile je Zeitraum, in dem ein Wert galt.
+
+  Den Zeitraum speicherst du als `daterange`. Nimm halboffene Ranges: `[2026-01-01,2026-03-15)` enthält den 14. März, aber nicht den 15. ([Range-Grenzen](https://www.postgresql.org/docs/current/rangetypes.html#RANGETYPES-INCLUSIVITY)). Die Konstruktorfunktion `daterange(a, b)` erzeugt diese Form, und `daterange` speichert auch geschlossene Grenzen so. Ein fehlendes Ende bedeutet „bis auf Weiteres“. Seit PostgreSQL 18 kann ein Primärschlüssel `WITHOUT OVERLAPS` tragen: Er verbietet dann zwei Zeilen desselben Mitglieds mit überlappendem Zeitraum ([temporaler Schlüssel](https://www.postgresql.org/docs/current/sql-createtable.html#SQL-CREATETABLE-PARMS-UNIQUE)). PostgreSQL setzt ihn wie einen Exclusion Constraint mit GiST-Index durch. Für die `int`-Spalte braucht er die Erweiterung `btree_gist`.
+
+  ```postgres run
+  CREATE EXTENSION btree_gist;
+  CREATE TABLE mitglied_tarife (
+    mitglied_id int       NOT NULL,
+    tarif       text      NOT NULL CHECK (tarif IN ('flex', 'fix', 'team')),
+    gueltig     daterange NOT NULL,
+    PRIMARY KEY (mitglied_id, gueltig WITHOUT OVERLAPS)
+  );
+  INSERT INTO mitglied_tarife (mitglied_id, tarif, gueltig) VALUES
+    (1, 'flex', '[2026-01-01,2026-03-15)'),
+    (1, 'fix',  '[2026-03-15,)'),
+    (2, 'team', '[2026-02-01,)');
+
+  -- Welcher Tarif galt am 14. und am 15. März?
+  SELECT s.stichtag, mt.mitglied_id, mt.tarif
+  FROM (VALUES (date '2026-03-14'), (date '2026-03-15')) AS s (stichtag)
+  JOIN mitglied_tarife AS mt ON mt.gueltig @> s.stichtag
+  ORDER BY s.stichtag, mt.mitglied_id;
+
+  -- Tarifwechsel zum 1. April: offenen Zeitraum schließen, neuen anlegen
+  BEGIN;
+  UPDATE mitglied_tarife
+  SET gueltig = daterange(lower(gueltig), '2026-04-01')
+  WHERE mitglied_id = 2 AND upper_inf(gueltig);
+  INSERT INTO mitglied_tarife (mitglied_id, tarif, gueltig) VALUES (2, 'flex', '[2026-04-01,)');
+  COMMIT;
+  SELECT * FROM mitglied_tarife WHERE mitglied_id = 2 ORDER BY lower(gueltig);
+  ```
+
+  Die Reihenfolge im Wechsel zählt: Fügst du den neuen Zeitraum ein, bevor der alte geschlossen ist, überlappen beide, und der Primärschlüssel lehnt das `INSERT` ab. Vor PostgreSQL 18 schreibst du dieselbe Regel als `EXCLUDE USING gist (mitglied_id WITH =, gueltig WITH &&)` ([Constraints](/postgres/constraints)). Zwei Spalten `gueltig_von` und `gueltig_bis` gehen auch, die Überschneidungsprüfung braucht aber trotzdem einen Range-Ausdruck.
+
+  Historie ist nicht dasselbe wie ein **Snapshot**. `buchungen.preis` friert den Preis zum Buchungszeitpunkt ein; der Raum darf danach teurer werden, die Buchung bleibt richtig. Eine Historie beantwortet „Was galt wann?“, ein Snapshot „Was wurde damals vereinbart?“. Beides ist bewusste Wiederholung von Daten, kein Verstoß gegen die [Normalisierung](/postgres/normalisierung).
+
+  ## Soft Delete und seine Kosten
+
+  „Gekündigte Mitglieder verschwinden, ihre Rechnungen bleiben.“ Der Reflex ist **Soft Delete**: eine Spalte `geloescht_am`, und „Löschen“ wird ein `UPDATE`. Das kostet mehr, als es zunächst scheint:
+
+  - Jede Abfrage braucht den Filter `geloescht_am IS NULL`. Vergisst ihn eine einzige Listenansicht, tauchen Gekündigte wieder auf. Eine View oder ein globaler Filter im ORM hilft, schützt aber kein handgeschriebenes SQL.
+  - `UNIQUE (email)` blockiert die Neuanmeldung mit derselben Adresse, denn die gelöschte Zeile existiert noch. Die Lösung ist ein **partieller Unique-Index**, der nur aktive Zeilen umfasst ([Partial Unique Index](https://www.postgresql.org/docs/current/indexes-partial.html#INDEXES-PARTIAL-EX3)).
+  - `ON DELETE CASCADE` greift nie, weil nie gelöscht wird. Für Rechnungen ist das gewollt, für Sitzungen oder Push-Tokens nicht.
+  - Datenschutz: Ein Flag löscht keine personenbezogenen Daten. Für das Recht auf Löschung musst du Name und E-Mail überschreiben oder die Zeile entfernen.
+
+  ```postgres run fails
+  CREATE TABLE mitglieder (
+    id           int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email        text NOT NULL,
+    name         text NOT NULL,
+    geloescht_am timestamptz
+  );
+  -- Eindeutig nur unter den nicht gelöschten Zeilen
+  CREATE UNIQUE INDEX mitglieder_email_aktiv ON mitglieder (email) WHERE geloescht_am IS NULL;
+  CREATE VIEW aktive_mitglieder AS
+    SELECT id, email, name FROM mitglieder WHERE geloescht_am IS NULL;
+
+  INSERT INTO mitglieder (email, name) VALUES ('jonas.weber@example.org', 'Jonas Weber');
+  UPDATE mitglieder SET geloescht_am = '2026-04-30 18:00+02' WHERE id = 1;
+  -- Neuanmeldung mit derselben Adresse: erlaubt
+  INSERT INTO mitglieder (email, name) VALUES ('jonas.weber@example.org', 'Jonas Weber');
+  SELECT id, email, geloescht_am FROM mitglieder ORDER BY id;
+  SELECT * FROM aktive_mitglieder;
+  -- Zweites aktives Konto: abgelehnt
+  INSERT INTO mitglieder (email, name) VALUES ('jonas.weber@example.org', 'J. Weber');
+  ```
+
+  Ein partieller Index ist kein Constraint. Ein Fremdschlüssel kann ihn nicht als Ziel nutzen, und ein Upsert muss die Bedingung wiederholen: `ON CONFLICT (email) WHERE geloescht_am IS NULL`. Ohne das `WHERE` meldet PostgreSQL `there is no unique or exclusion constraint matching the ON CONFLICT specification`. Die Alternativen zu Soft Delete sind oft klarer: ein echter Status (`aktiv`, `gekuendigt`) mit fachlicher Bedeutung oder eine Archivtabelle, in die ein `DELETE … RETURNING` die Zeile verschiebt ([Daten ändern](/postgres/daten-aendern)).
+
+  > [!INTERVIEW] „Soft Delete oder echtes Löschen?“
+  > Ich frage zuerst, wofür die gelöschten Daten noch gebraucht werden. Verweisen Rechnungen auf das Mitglied, nehme ich Soft Delete mit partiellem Unique-Index für die E-Mail und einer View für die aktiven Zeilen, und ich anonymisiere die personenbezogenen Spalten. Braucht niemand die Daten, lösche ich echt und lasse `ON DELETE` aufräumen. Soft Delete als Standard für jede Tabelle lehne ich ab: Jede Abfrage wird fehleranfälliger.
+
+  ## Polymorphe Beziehungen und flexible Attribute
+
+  Notizen sollen an Räumen und an Buchungen hängen. Frameworks wie Rails oder Laravel erzeugen dafür gern eine **polymorphe Assoziation**: `ziel_typ` sagt, welche Tabelle gemeint ist, `ziel_id` die Zeile. Ein Fremdschlüssel kann aber nur auf eine Tabelle zeigen. Die Datenbank prüft also nichts:
+
+  ```postgres run fails
+  CREATE TABLE raeume    (id int PRIMARY KEY, name text NOT NULL);
+  CREATE TABLE buchungen (id bigint PRIMARY KEY, raum_id int NOT NULL REFERENCES raeume (id));
+  INSERT INTO raeume VALUES (1, 'Atelier'), (2, 'Box 1');
+  INSERT INTO buchungen VALUES (100, 1);
+
+  -- Polymorph: kein Fremdschlüssel möglich
+  CREATE TABLE notizen_polymorph (
+    id       bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    ziel_typ text   NOT NULL,
+    ziel_id  bigint NOT NULL,
+    text     text   NOT NULL
+  );
+  INSERT INTO notizen_polymorph (ziel_typ, ziel_id, text) VALUES
+    ('raum', 7, 'Beamer flackert'),   -- Raum 7 gibt es nicht
+    ('Raum', 1, 'Fenster klemmt');    -- Tippfehler im Typ
+  SELECT count(*) AS notizen_ohne_ziel
+  FROM notizen_polymorph AS n
+  WHERE NOT EXISTS (SELECT 1 FROM raeume AS r WHERE n.ziel_typ = 'raum' AND r.id = n.ziel_id)
+    AND NOT EXISTS (SELECT 1 FROM buchungen AS b WHERE n.ziel_typ = 'buchung' AND b.id = n.ziel_id);
+
+  -- Alternative: eine Fremdschlüsselspalte je Ziel, genau eine ist gesetzt
+  CREATE TABLE notizen (
+    id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    raum_id    int    REFERENCES raeume (id),
+    buchung_id bigint REFERENCES buchungen (id),
+    text       text   NOT NULL,
+    CHECK (num_nonnulls(raum_id, buchung_id) = 1)
+  );
+  INSERT INTO notizen (raum_id, text)    VALUES (1, 'Beamer flackert');
+  INSERT INTO notizen (buchung_id, text) VALUES (100, 'Kunde kam 20 Minuten zu spät');
+  SELECT id, raum_id, buchung_id, text FROM notizen ORDER BY id;
+  INSERT INTO notizen (raum_id, text) VALUES (7, 'Beamer flackert');
+  ```
+
+  Beide polymorphen Notizen zeigen ins Leere, ohne jede Fehlermeldung. Die Alternative hat eine nullbare Fremdschlüsselspalte je Ziel. `num_nonnulls` zählt die gesetzten Argumente ([Vergleichsfunktionen](https://www.postgresql.org/docs/current/functions-comparison.html#FUNCTIONS-COMPARISON-FUNC-TABLE)), der `CHECK` verlangt genau eines. Jede Spalte bekommt ihr eigenes `ON DELETE`. Bei vielen Zielen wird die Tabelle breit; dann sind getrennte Tabellen (`raum_notizen`, `buchung_notizen`) die zweite saubere Lösung, mit `UNION ALL`, wenn du alle Notizen auf einmal brauchst.
+
+  Ähnlich verlockend ist **EAV** (Entity-Attribute-Value): eine Tabelle `raum_eigenschaften (raum_id, schluessel, wert text)` für beliebige Attribute. Sie verliert Typen, `NOT NULL` und `CHECK`, und jede Abfrage über zwei Attribute braucht zwei Joins. Für Daten mit wechselnder Struktur, die die App nur speichert und anzeigt, ist eine `jsonb`-Spalte die bessere Wahl ([PostgreSQL-Features](/postgres/postgres-features)). Alles, wonach die App filtert, sortiert oder was sie validiert, gehört in eigene Spalten.
+
+  ## Typen und Wertelisten: Geld, Zeit, Status
+
+  Geld speicherst du als `numeric` mit fester Skala, nie als `real` oder `double precision`. Gleitkommatypen speichern Binärbrüche, und 4,90 ist im Binärsystem nicht exakt darstellbar ([Gleitkommatypen](https://www.postgresql.org/docs/current/datatype-numeric.html#DATATYPE-FLOAT)):
+
+  ```postgres run
+  -- 30 Stunden Telefonbox à 4,90 EUR
+  SELECT sum(4.90::float8)  AS als_double,
+         sum(4.90::numeric) AS als_numeric
+  FROM generate_series(1, 30);
+  SELECT 0.1::float8 + 0.2::float8 = 0.3 AS double_gleich,
+         0.1 + 0.2 = 0.3                 AS numeric_gleich;
+  ```
+
+  `numeric(10,2)` rechnet exakt und rundet beim Speichern auf zwei Stellen. Der Typ `money` hängt in Ein- und Ausgabe von der Einstellung `lc_monetary` ab ([Monetary Types](https://www.postgresql.org/docs/current/datatype-money.html)); nimm ihn nicht. Cent als `bigint` ist ebenfalls exakt, verschiebt die Umrechnung aber in jede Ausgabe.
+
+  Zeitpunkte sind `timestamptz`: PostgreSQL speichert den Moment in UTC und gibt ihn in der Zeitzone der Sitzung aus. `timestamp` ohne Zeitzone speichert nur Ziffern; ob 09:00 Berliner Zeit oder UTC gemeint war, weiß danach niemand ([Zeitzonen](https://www.postgresql.org/docs/current/datatype-datetime.html#DATATYPE-TIMEZONES)). Für Tage ohne Uhrzeit passt `date`.
+
+  Für Wertelisten wie `buchungen.status` gibt es drei Werkzeuge:
+
+  | | `CHECK (status IN (…))` | Enum-Typ | Lookup-Tabelle mit Fremdschlüssel |
+  | --- | --- | --- | --- |
+  | Neuer Wert | Constraint ersetzen (Migration) | `ALTER TYPE … ADD VALUE` (Migration) | `INSERT` |
+  | Wert entfernen | Constraint ersetzen | nicht möglich, Typ neu anlegen | `DELETE`, wenn nicht mehr benutzt |
+  | Zusatzdaten (Anzeigename, Preis, aktiv) | nein | nein | ja |
+  | Wer pflegt | Entwickler | Entwickler | auch die Fachseite, etwa per Admin-Oberfläche |
+
+  Technische Zustände, die der Code einzeln behandelt (`bestaetigt`, `storniert`), passen in einen `CHECK` oder einen [Enum-Typ](https://www.postgresql.org/docs/current/datatype-enum.html). Kataloge, die die Fachseite pflegt und die eigene Attribute haben – Tarife mit Grundpreis, Ausstattungsarten –, gehören in eine Lookup-Tabelle.
+
+  ## Mandanten und Namen
+
+  Deskwerk will die App an andere Coworking-Betreiber lizenzieren. Jeder Betreiber ist ein **Mandant** (englisch Tenant). Die verbreitetste Umsetzung: Jede Tabelle bekommt `betreiber_id`. Ein Fremdschlüssel nur auf `raeume (id)` verhindert aber nicht, dass ein Deskwerk-Mitglied einen Raum des Hafenbüros bucht. Das leisten zusammengesetzte Fremdschlüssel über `(betreiber_id, …)`:
+
+  ```postgres run fails
+  CREATE TABLE betreiber (id int PRIMARY KEY, name text NOT NULL UNIQUE);
+  CREATE TABLE raeume (
+    betreiber_id int  NOT NULL REFERENCES betreiber (id),
+    id           int  GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name         text NOT NULL,
+    UNIQUE (betreiber_id, id)
+  );
+  CREATE TABLE mitglieder (
+    betreiber_id int  NOT NULL REFERENCES betreiber (id),
+    id           int  GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email        text NOT NULL,
+    UNIQUE (betreiber_id, email),
+    UNIQUE (betreiber_id, id)
+  );
+  CREATE TABLE buchungen (
+    betreiber_id int    NOT NULL,
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    raum_id      int    NOT NULL,
+    mitglied_id  int    NOT NULL,
+    FOREIGN KEY (betreiber_id, raum_id)     REFERENCES raeume (betreiber_id, id),
+    FOREIGN KEY (betreiber_id, mitglied_id) REFERENCES mitglieder (betreiber_id, id)
+  );
+  INSERT INTO betreiber VALUES (1, 'Deskwerk'), (2, 'Hafenbüro Rostock');
+  INSERT INTO raeume (betreiber_id, name) VALUES (1, 'Atelier'), (2, 'Kajüte');
+  INSERT INTO mitglieder (betreiber_id, email) VALUES
+    (1, 'anna.krueger@example.org'), (2, 'anna.krueger@example.org');
+  INSERT INTO buchungen (betreiber_id, raum_id, mitglied_id) VALUES (1, 1, 1);
+  -- Deskwerk-Mitglied bucht die Kajüte des Hafenbüros: abgelehnt
+  INSERT INTO buchungen (betreiber_id, raum_id, mitglied_id) VALUES (1, 2, 1);
+  ```
+
+  `UNIQUE (betreiber_id, id)` wirkt doppelt, weil `id` schon eindeutig ist. Es ist aber nötig: Ein Fremdschlüssel braucht auf der Zielseite einen Primärschlüssel, einen Unique-Constraint oder einen nicht partiellen Unique-Index über genau seine Spalten ([REFERENCES](https://www.postgresql.org/docs/current/sql-createtable.html#SQL-CREATETABLE-PARMS-REFERENCES)). Dass jede Abfrage `WHERE betreiber_id = …` trägt, sichert der Fremdschlüssel nicht. Das kann [Row-Level Security](https://www.postgresql.org/docs/current/ddl-rowsecurity.html) übernehmen, mit einer Policy, die die `betreiber_id` aus einer Sitzungsvariable liest.
+
+  Zuletzt die Namen. PostgreSQL faltet Bezeichner ohne Anführungszeichen in Kleinbuchstaben ([Identifiers](https://www.postgresql.org/docs/current/sql-syntax-lexical.html#SQL-SYNTAX-IDENTIFIERS)). Wer `"Mitglied"` mit Anführungszeichen anlegt – Prisma tut das ohne `@@map` für jedes Modell –, muss die Anführungszeichen in jedem handgeschriebenen SQL wiederholen:
+
+  ```postgres run fails
+  CREATE TABLE "Mitglied" (id int PRIMARY KEY, "createdAt" timestamptz NOT NULL DEFAULT now());
+  SELECT count(*) FROM "Mitglied";
+  SELECT count(*) FROM Mitglied;
+  ```
+
+  Deshalb: `snake_case` ohne Anführungszeichen, Tabellen einheitlich im Plural (`mitglieder`), Fremdschlüssel als `<einzahl>_id` (`mitglied_id`), Zeitpunkte mit `_am`. Welche Konvention, ist zweitrangig; sie muss im ganzen Schema gelten.
+
+  > [!MERKE]
+  > Jede Fachregel, die du in der Datenbank ausdrücken kannst – Kardinalität, Eindeutigkeit, keine Überschneidung, genau ein Ziel, gleicher Mandant –, gehört als Constraint ins Schema. Die App prüft zusätzlich für gute Fehlermeldungen, aber nur die Datenbank sieht alle Schreibzugriffe.
+
+  ## Häufige Fehler
+
+  - **Rolle in der falschen Tabelle.** `mitglieder.rolle` statt `team_mitgliedschaften.rolle`: Wer in zwei Teams ist, hat dann überall dieselbe Rolle. Attribute einer Beziehung gehören in die Verbindungstabelle.
+  - **Verbindungstabelle ohne Schlüssel.** Ohne `PRIMARY KEY (team_id, mitglied_id)` entstehen doppelte Mitgliedschaften.
+  - **Historie durch Überschreiben verloren.** `UPDATE mitglieder SET tarif = …` vernichtet die Vergangenheit. Zustände mit Bedeutung für Rechnungen oder Auswertungen bekommen eine Historientabelle.
+  - **Geschlossene Ranges.** `[2026-03-15,2026-03-31]` und danach `[2026-03-31,…)` überschneiden sich am 31. März. Bleib bei halboffenen Ranges `[)`.
+  - **Soft Delete und `UNIQUE (email)`.** Gekündigte können sich nicht neu anmelden. Partieller Unique-Index `WHERE geloescht_am IS NULL`, im Upsert mit derselben Bedingung.
+  - **Polymorphe Spalten ohne Prüfung.** `ziel_typ` und `ziel_id` lassen Waisen und Tippfehler zu. Eine Fremdschlüsselspalte je Ziel mit `CHECK (num_nonnulls(…) = 1)`.
+  - **Geld als `real` oder `double precision`.** Summen weichen ab, Vergleiche mit `=` scheitern. `numeric(10,2)`.
+  - **`timestamp` statt `timestamptz`.** Zeitpunkte verschieben sich um eine oder zwei Stunden, sobald App und Datenbank verschiedene Zeitzonen annehmen.
+  - **Mandantenfremde Verweise.** Ein Fremdschlüssel nur auf `id` lässt Verweise über Mandantengrenzen zu. Zusammengesetzte Fremdschlüssel mit `betreiber_id`.
+
+  ## Zusammenfassung
+
+  - Kardinalitäten ergeben sich aus zwei Fragen je Richtung: höchstens wie viele, mindestens eines? 1:n wird ein Fremdschlüssel, 1:1 ein Fremdschlüssel mit `UNIQUE`, n:m eine Verbindungstabelle.
+  - Attribute einer Beziehung (Rolle, seit) gehören in die Verbindungstabelle; ihr Primärschlüssel über beide Fremdschlüssel verhindert Duplikate.
+  - Zustände mit Vergangenheit bekommen eine Historie mit `daterange`; `PRIMARY KEY (…, gueltig WITHOUT OVERLAPS)` (PostgreSQL 18) oder ein Exclusion Constraint verhindert Überschneidungen.
+  - Soft Delete kostet Filter in jeder Abfrage, einen partiellen Unique-Index und Arbeit beim Datenschutz. Nimm es bewusst, nicht als Standard.
+  - Polymorphe Assoziationen und EAV verlieren Fremdschlüssel und Typen. Eine Spalte je Ziel, getrennte Tabellen oder `jsonb` sind die Alternativen.
+  - Geld als `numeric`, Zeitpunkte als `timestamptz`, Tage als `date`. Wertelisten: `CHECK` oder Enum für technische Zustände, Lookup-Tabellen für Kataloge der Fachseite.
+  - Mandantengrenzen sichern zusammengesetzte Fremdschlüssel; Namen in `snake_case` ohne Anführungszeichen.
+exercises:
+  - id: team-rolle-modellieren
+    type: choice
+    title: Wo steht die Rolle?
+    prompt: |
+      Anforderung: Ein Team hat mehrere Mitglieder, ein Mitglied kann in mehreren Teams sein. Je Team und Mitglied gibt es eine Rolle (`admin` oder `mitglied`), und Mehmet kann in einem Team Admin sein, im anderen nicht. Welches Schema bildet das richtig ab?
+    options:
+      - text: "`team_mitgliedschaften (team_id, mitglied_id, rolle)` mit `PRIMARY KEY (team_id, mitglied_id)` und Fremdschlüsseln auf `teams` und `mitglieder`."
+        correct: true
+        why: Die Rolle hängt an der Kombination aus Team und Mitglied, also an der Verbindungstabelle. Der Primärschlüssel über beide Fremdschlüssel lässt jede Person höchstens einmal je Team zu.
+      - text: "`mitglieder.team_id` als Fremdschlüssel und `mitglieder.rolle`."
+        correct: false
+        why: Das ist eine 1:n-Beziehung – jedes Mitglied hätte höchstens ein Team. Die Anforderung verlangt n:m.
+      - text: "`team_mitgliedschaften (team_id, mitglied_id)` als Verbindungstabelle und `rolle` in `mitglieder`."
+        correct: false
+        why: Die n:m-Beziehung stimmt, aber die Rolle gehört der Person statt der Mitgliedschaft. Mehmet hätte in allen Teams dieselbe Rolle.
+      - text: "`team_mitgliedschaften (team_id, mitglied_id, rolle)` mit `PRIMARY KEY (team_id, mitglied_id, rolle)`."
+        correct: false
+        why: Mit der Rolle im Schlüssel darf Mehmet im selben Team zweimal stehen, einmal als `admin` und einmal als `mitglied`. Der Schlüssel muss genau die Kombination umfassen, die einmalig sein soll.
+      - text: "`teams.mitglied_ids int[]` und `teams.admin_ids int[]`."
+        correct: false
+        why: Arrays können keine Fremdschlüssel auf ihre Elemente tragen. Nichts verhindert gelöschte Mitglieder in der Liste oder eine Person in beiden Listen, und „Teams eines Mitglieds“ wird eine Suche in allen Arrays.
+    explanation: |
+      Eine n:m-Beziehung wird eine Verbindungstabelle. Ob ein Attribut in die Verbindungstabelle gehört, entscheidet die Frage „Hängt der Wert an beiden Partnern zugleich?“. Die Rolle hängt an Team **und** Mitglied, also an der Mitgliedschaft. Der Primärschlüssel umfasst genau die Spalten, deren Kombination einmalig sein soll – nicht mehr, sonst sind Duplikate mit abweichendem Attribut möglich.
+    resources:
+      - title: PostgreSQL · Foreign Keys (Beispiel mit Verbindungstabelle)
+        url: https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-FK
+
+  - id: tarifhistorie-migrieren
+    type: order
+    title: Vom Feld zur Historie
+    prompt: |
+      Die Spalte `mitglieder.tarif` soll durch die Historientabelle `mitglied_tarife` ersetzt werden. Danach wechselt Mitglied 7 zum 1. April 2026 in den Tarif `team`. Bring das Skript in eine Reihenfolge, die ohne Fehler durchläuft und keine Daten verliert: erst die vier Zeilen der Migration, dann der Tarifwechsel als eigene Transaktion.
+    lang: postgres
+    lines: |
+      CREATE EXTENSION IF NOT EXISTS btree_gist;
+      CREATE TABLE mitglied_tarife (mitglied_id int NOT NULL REFERENCES mitglieder (id), tarif text NOT NULL, gueltig daterange NOT NULL, PRIMARY KEY (mitglied_id, gueltig WITHOUT OVERLAPS));
+      INSERT INTO mitglied_tarife (mitglied_id, tarif, gueltig) SELECT id, tarif, daterange(erstellt_am::date, NULL) FROM mitglieder;
+      ALTER TABLE mitglieder DROP COLUMN tarif;
+      BEGIN;
+      UPDATE mitglied_tarife SET gueltig = daterange(lower(gueltig), '2026-04-01') WHERE mitglied_id = 7 AND upper_inf(gueltig);
+      INSERT INTO mitglied_tarife (mitglied_id, tarif, gueltig) VALUES (7, 'team', '[2026-04-01,)');
+      COMMIT;
+    hints:
+      - Der Primärschlüssel mit `WITHOUT OVERLAPS` braucht für die `int`-Spalte eine Erweiterung. Die Daten können erst kopiert werden, wenn die Zieltabelle existiert, und die alte Spalte erst danach verschwinden.
+      - Beim Tarifwechsel prüft der Primärschlüssel jede Anweisung einzeln. Welche Zeile muss zuerst kommen, damit sich keine zwei offenen Zeiträume überlappen?
+    explanation: |
+      `btree_gist` muss vor der Tabelle existieren, sonst gibt es für `int` keinen GiST-Operator, und `CREATE TABLE` scheitert. Das `INSERT … SELECT` liest `mitglieder.tarif`, also darf die Spalte erst danach verschwinden. Im Wechsel muss das `UPDATE` den offenen Zeitraum schließen, bevor das `INSERT` den neuen anlegt. In umgekehrter Reihenfolge überlappen sich `[…,)` und `[2026-04-01,)`, und der Primärschlüssel meldet `conflicting key value violates exclusion constraint`. Die Transaktion sorgt dafür, dass niemand einen Zwischenstand ohne gültigen Tarif sieht.
+    resources:
+      - title: PostgreSQL · CREATE TABLE – WITHOUT OVERLAPS
+        url: https://www.postgresql.org/docs/current/sql-createtable.html#SQL-CREATETABLE-PARMS-UNIQUE
+
+  - id: tarif-am-stichtag-vorhersagen
+    type: output
+    title: Welcher Tarif galt?
+    prompt: |
+      Was geben die drei Abfragen aus? Ausgabe wie `psql -At`: Werte durch `|`, `NULL` leer, `t`/`f`, keine Kopfzeilen. Die Ergebnisse stehen direkt untereinander.
+    lang: postgres
+    code: |
+      CREATE EXTENSION btree_gist;
+      CREATE TABLE mitglied_tarife (
+        mitglied_id int       NOT NULL,
+        tarif       text      NOT NULL,
+        gueltig     daterange NOT NULL,
+        PRIMARY KEY (mitglied_id, gueltig WITHOUT OVERLAPS)
+      );
+      INSERT INTO mitglied_tarife VALUES
+        (1, 'flex', '[2026-01-01,2026-03-01)'),
+        (1, 'fix',  '[2026-03-01,2026-06-01)'),
+        (1, 'team', '[2026-06-01,)'),
+        (2, 'flex', '[2026-02-15,2026-03-31]');
+
+      SELECT mitglied_id, tarif
+      FROM mitglied_tarife
+      WHERE gueltig @> date '2026-03-01'
+      ORDER BY mitglied_id;
+
+      SELECT tarif, upper(gueltig), upper_inf(gueltig)
+      FROM mitglied_tarife
+      WHERE mitglied_id = 2 OR gueltig @> date '2026-12-31'
+      ORDER BY mitglied_id;
+
+      SELECT count(*)
+      FROM mitglied_tarife
+      WHERE gueltig && daterange('2026-05-31', '2026-06-01');
+    expected: |
+      1|fix
+      2|flex
+      team||t
+      flex|2026-04-01|f
+      1
+    hints:
+      - "`[a,b)` enthält `a`, aber nicht `b`. Am 1. März endet also `flex` von Mitglied 1, und `fix` beginnt."
+      - "`daterange` ist ein diskreter Typ: PostgreSQL speichert jede Range in der Form `[)`. Was wird aus `[2026-02-15,2026-03-31]`?"
+      - "`daterange('2026-05-31', '2026-06-01')` enthält genau einen Tag."
+    explanation: |
+      Am 1. März gilt für Mitglied 1 `fix`, denn `flex` endet ausschließlich am 1. März. Mitglied 2 hat `flex`. Die geschlossene Range `[2026-02-15,2026-03-31]` speichert PostgreSQL kanonisch als `[2026-02-15,2026-04-01)`, deshalb liefert `upper` den 1. April. Der offene Tarif `team` hat keine obere Grenze: `upper` ist `NULL`, `upper_inf` wahr. Die letzte Abfrage prüft nur den 31. Mai, und der liegt allein im Zeitraum von `fix` – `team` beginnt erst am 1. Juni.
+    resources:
+      - title: PostgreSQL · Discrete Range Types
+        url: https://www.postgresql.org/docs/current/rangetypes.html#RANGETYPES-DISCRETE
+      - title: PostgreSQL · Range-Funktionen
+        url: https://www.postgresql.org/docs/current/functions-range.html#RANGE-FUNCTIONS-TABLE
+
+  - id: soft-delete-folgen
+    type: output
+    title: Gekündigt, aber nicht weg
+    prompt: |
+      Anna kündigt, die App setzt `geloescht_am`. Was geben die vier Abfragen aus? Ausgabe wie `psql -At`: Werte durch `|`, `NULL` leer, keine Kopfzeilen.
+    lang: postgres
+    code: |
+      CREATE TABLE mitglieder (
+        id           int PRIMARY KEY,
+        email        text NOT NULL,
+        geloescht_am timestamptz
+      );
+      CREATE UNIQUE INDEX ON mitglieder (email) WHERE geloescht_am IS NULL;
+      CREATE TABLE buchungen (
+        id          int PRIMARY KEY,
+        mitglied_id int NOT NULL REFERENCES mitglieder (id) ON DELETE CASCADE,
+        preis       numeric(8,2) NOT NULL
+      );
+      INSERT INTO mitglieder VALUES
+        (1, 'anna.krueger@example.org', NULL),
+        (2, 'jonas.weber@example.org',  '2026-02-28 12:00+01'),
+        (3, 'jonas.weber@example.org',  NULL),
+        (4, 'lena.vogel@example.org',   NULL);
+      INSERT INTO buchungen VALUES (10, 1, 45.00), (11, 2, 30.00), (12, 2, 30.00), (13, 3, 12.50);
+
+      UPDATE mitglieder SET geloescht_am = '2026-03-31 18:00+02' WHERE id = 1;
+
+      SELECT count(*), count(*) FILTER (WHERE geloescht_am IS NULL) FROM mitglieder;
+      SELECT count(*), sum(preis) FROM buchungen;
+      SELECT count(*), sum(b.preis)
+      FROM buchungen AS b
+      JOIN mitglieder AS m ON m.id = b.mitglied_id
+      WHERE m.geloescht_am IS NULL;
+      SELECT email, geloescht_am FROM mitglieder WHERE id = 1;
+    expected: |
+      4|2
+      4|117.50
+      1|12.50
+      anna.krueger@example.org|2026-03-31 18:00:00+02
+    hints:
+      - Ein `UPDATE` ist kein `DELETE`. Welche Klausel des Fremdschlüssels reagiert nur auf `DELETE`?
+      - Jonas steht zweimal in `mitglieder`. Welche seiner Zeilen ist aktiv, und welcher gehören die beiden 30-Euro-Buchungen?
+    explanation: |
+      Soft Delete ändert nur eine Spalte: Alle vier Zeilen bleiben, aktiv sind Jonas' neues Konto und Lena. `ON DELETE CASCADE` reagiert nur auf `DELETE`, deshalb stehen alle vier Buchungen mit 117.50 EUR weiter in `buchungen`. Erst der Filter auf aktive Mitglieder blendet Annas Buchung und die zwei Buchungen von Jonas' altem Konto aus. Die E-Mail-Adresse bleibt gespeichert – für den Datenschutz ist Anna nicht gelöscht. Die Zeit erscheint mit `+02`, weil der 31. März nach der Umstellung auf Sommerzeit liegt.
+    resources:
+      - title: PostgreSQL · Partial Unique Index
+        url: https://www.postgresql.org/docs/current/indexes-partial.html#INDEXES-PARTIAL-EX3
+
+  - id: raum-ausstattung-anlegen
+    type: sql
+    lang: postgres
+    title: Welcher Raum hat einen Beamer?
+    prompt: |
+      Räume sollen ihre Ausstattung bekommen. Lege die Verbindungstabelle `raum_ausstattung` an, mit den Spalten `raum_id`, `ausstattung_id` und `anzahl`:
+
+      - Beide Fremdschlüssel sind Pflicht und verweisen auf `raeume (id)` bzw. `ausstattung (id)`.
+      - Jede Kombination aus Raum und Ausstattung darf es nur einmal geben.
+      - `anzahl` ist Pflicht, mindestens 1, Standardwert 1.
+      - Wird ein Raum gelöscht, verschwinden seine Einträge. Eine Ausstattung, die noch in einem Raum steht, lässt sich nicht löschen.
+
+      Die Prüfabfrage probiert Einfügungen und Löschungen und meldet `ok` oder den Fehler. Lehnt ein Fremdschlüssel ein Löschen ab, steht dort `abgelehnt` – egal ob mit `NO ACTION` oder `RESTRICT`.
+    schema: |
+      CREATE TABLE raeume (
+        id   int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        name text NOT NULL UNIQUE
+      );
+      CREATE TABLE ausstattung (
+        id   int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        name text NOT NULL UNIQUE
+      );
+      INSERT INTO raeume (name) VALUES ('Atelier'), ('Loft'), ('Box 1');
+      INSERT INTO ausstattung (name) VALUES ('Beamer'), ('Whiteboard'), ('Stehtisch');
+    starter: |
+      CREATE TABLE raum_ausstattung (
+        raum_id        int,
+        ausstattung_id int,
+        anzahl         int
+      );
+    solution: |
+      CREATE TABLE raum_ausstattung (
+        raum_id        int NOT NULL REFERENCES raeume (id) ON DELETE CASCADE,
+        ausstattung_id int NOT NULL REFERENCES ausstattung (id),
+        anzahl         int NOT NULL DEFAULT 1 CHECK (anzahl > 0),
+        PRIMARY KEY (raum_id, ausstattung_id)
+      );
+    check: |
+      SELECT pruefung, ergebnis
+      FROM (VALUES
+        ('Gültige Einträge',        lp.versuch($$INSERT INTO raum_ausstattung (raum_id, ausstattung_id) VALUES (1, 1), (1, 2), (2, 1)$$)),
+        ('Kombination doppelt',     lp.versuch($$INSERT INTO raum_ausstattung (raum_id, ausstattung_id) VALUES (1, 2), (1, 2)$$)),
+        ('Raum fehlt',              lp.versuch($$INSERT INTO raum_ausstattung (raum_id, ausstattung_id) VALUES (99, 1)$$)),
+        ('Ausstattung fehlt',       lp.versuch($$INSERT INTO raum_ausstattung (raum_id, ausstattung_id) VALUES (1, 99)$$)),
+        ('Ohne Raum',               lp.versuch($$INSERT INTO raum_ausstattung (ausstattung_id) VALUES (1)$$)),
+        ('Anzahl 0',                lp.versuch($$INSERT INTO raum_ausstattung (raum_id, ausstattung_id, anzahl) VALUES (1, 3, 0)$$)),
+        ('Anzahl leer',             lp.versuch($$INSERT INTO raum_ausstattung (raum_id, ausstattung_id, anzahl) VALUES (1, 3, NULL)$$)),
+        ('Raum löschen',            lp.versuch($$INSERT INTO raum_ausstattung (raum_id, ausstattung_id) VALUES (3, 1); DELETE FROM raeume WHERE id = 3$$)),
+        ('Benutzte Ausstattung löschen', (SELECT CASE WHEN v IN ('foreign_key_violation', 'restrict_violation') THEN 'abgelehnt' ELSE v END FROM lp.versuch($$INSERT INTO raum_ausstattung (raum_id, ausstattung_id) VALUES (3, 1); DELETE FROM ausstattung WHERE id = 1$$) AS v))
+      ) AS p (pruefung, ergebnis);
+    hints:
+      - Welche Spalten bilden zusammen den Primärschlüssel? Ein Primärschlüssel macht seine Spalten automatisch `NOT NULL`.
+      - "`ON DELETE CASCADE` gehört an genau einen der beiden Fremdschlüssel. Der andere bleibt beim Standard (`NO ACTION`) oder bekommt `RESTRICT`."
+      - "`anzahl int NOT NULL DEFAULT 1 CHECK (anzahl > 0)` und `PRIMARY KEY (raum_id, ausstattung_id)`."
+    explanation: |
+      Die Verbindungstabelle hat zwei Pflicht-Fremdschlüssel und einen Primärschlüssel über beide; damit ist jede Kombination einmalig, und `anzahl` ist ein Attribut der Beziehung. Ohne `NOT NULL` würde der `CHECK` eine leere Anzahl durchlassen, denn `NULL > 0` ist unbekannt, und ein `CHECK` lehnt nur `false` ab. `ON DELETE CASCADE` auf `raum_id` räumt beim Löschen eines Raums auf. Auf `ausstattung_id` bleibt die Standardaktion, damit niemand versehentlich den Beamer aus allen Räumen löscht. Der Standard `NO ACTION` und `RESTRICT` lehnen hier beide ab; sie unterscheiden sich nur darin, dass `NO ACTION` die Prüfung bis ans Ende der Anweisung oder, wenn der Constraint aufschiebbar ist, der Transaktion verschiebt.
+    resources:
+      - title: PostgreSQL · Foreign Keys und ON DELETE
+        url: https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-FK
+      - title: PostgreSQL · Check Constraints
+        url: https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-CHECK-CONSTRAINTS
+
+  - id: tarif-zum-stichtag
+    type: sql
+    lang: postgres
+    title: Tarife zum Monatsende
+    prompt: |
+      Für die Abrechnung März 2026 braucht die Buchhaltung **alle** Mitglieder mit dem Tarif, der am **31. März 2026** galt, und dessen Grundpreis. Mitglieder ohne gültigen Tarif an diesem Tag erscheinen mit leerem Tarif und Grundpreis (`NULL`).
+
+      Spalten: `name`, `tarif`, `grundpreis`. Sortierung: `name` aufsteigend.
+    schema: |
+      CREATE EXTENSION btree_gist;
+      CREATE TABLE mitglieder (
+        id   int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        name text NOT NULL
+      );
+      CREATE TABLE tarife (
+        tarif      text PRIMARY KEY,
+        grundpreis numeric(8,2) NOT NULL
+      );
+      CREATE TABLE mitglied_tarife (
+        mitglied_id int       NOT NULL REFERENCES mitglieder (id),
+        tarif       text      NOT NULL REFERENCES tarife (tarif),
+        gueltig     daterange NOT NULL,
+        PRIMARY KEY (mitglied_id, gueltig WITHOUT OVERLAPS)
+      );
+      INSERT INTO mitglieder (name) VALUES
+        ('Anna Krüger'), ('Mehmet Yılmaz'), ('Lena Vogel'), ('Jonas Weber'), ('Sophie Becker'), ('Paul Schulz');
+      INSERT INTO tarife VALUES ('flex', 0.00), ('fix', 249.00), ('team', 199.00);
+      INSERT INTO mitglied_tarife (mitglied_id, tarif, gueltig) VALUES
+        (1, 'flex', '[2026-01-01,2026-03-15)'),
+        (1, 'fix',  '[2026-03-15,)'),
+        (2, 'team', '[2026-02-01,)'),
+        (3, 'fix',  '[2025-11-01,2026-03-31)'),
+        (4, 'fix',  '[2026-04-01,)'),
+        (5, 'flex', '[2026-03-31,2026-04-01)'),
+        (6, 'fix',  '[2025-06-01,2026-01-01)'),
+        (6, 'team', '[2026-01-01,2026-04-01)'),
+        (6, 'flex', '[2026-04-01,)');
+    starter: |
+      SELECT m.name, mt.tarif, mt.gueltig
+      FROM mitglieder AS m
+      JOIN mitglied_tarife AS mt ON mt.mitglied_id = m.id
+      ORDER BY m.name;
+    solution: |
+      SELECT m.name, mt.tarif, t.grundpreis
+      FROM mitglieder AS m
+      LEFT JOIN mitglied_tarife AS mt
+        ON mt.mitglied_id = m.id
+       AND mt.gueltig @> date '2026-03-31'
+      LEFT JOIN tarife AS t ON t.tarif = mt.tarif
+      ORDER BY m.name;
+    ordered: true
+    hints:
+      - Der Operator `@>` prüft, ob eine Range einen Wert enthält. Er kennt die Grenzen der Range, auch offene Enden.
+      - Die Bedingung auf den Stichtag betrifft die rechte Tabelle eines `LEFT JOIN`. Steht sie im `WHERE`, verschwinden Lena und Jonas.
+      - "`LEFT JOIN mitglied_tarife AS mt ON mt.mitglied_id = m.id AND mt.gueltig @> date '2026-03-31'`, danach `LEFT JOIN tarife`."
+    explanation: |
+      `gueltig @> date '2026-03-31'` wertet die Grenzen so aus, wie sie gespeichert sind: Lenas Tarif endet ausschließlich am 31. März, ihr letzter Tag war der 30. Sophies eintägiger Tarif enthält den 31., Jonas beginnt erst im April. Selbstgebaute Vergleiche wie `upper(gueltig) >= '2026-03-31'` nehmen Lena fälschlich mit und vergessen leicht die offenen Enden, bei denen `upper` `NULL` ist. Weil alle Mitglieder erscheinen sollen, gehört der Stichtag ins `ON` des `LEFT JOIN`. Der zweite `LEFT JOIN` auf `tarife` muss ebenfalls ein äußerer sein, sonst fallen die Zeilen ohne Tarif wieder heraus. `WITHOUT OVERLAPS` garantiert, dass je Mitglied höchstens eine Zeile passt, der Join also nicht auffächert.
+    resources:
+      - title: PostgreSQL · Range-Operatoren
+        url: https://www.postgresql.org/docs/current/functions-range.html#RANGE-OPERATORS-TABLE
+      - title: PostgreSQL · Joined Tables
+        url: https://www.postgresql.org/docs/current/queries-table-expressions.html#QUERIES-JOIN
+
+  - id: tarifwechsel-buchen
+    type: sql
+    lang: postgres
+    title: Tarifwechsel ohne Lücke
+    prompt: |
+      Zwei Änderungen für die Tarifhistorie:
+
+      - Anna Krüger (`mitglied_id` 1) wechselt zum **1. April 2026** in den Tarif `team`. Ihr bisheriger Tarif gilt bis einschließlich 31. März.
+      - Mehmet Yılmaz (`mitglied_id` 2) kündigt. Sein letzter Tag mit Tarif ist der **30. April 2026**.
+
+      Alle Zeiträume bleiben halboffen, Mitglied 3 bleibt unverändert. Die Prüfabfrage zeigt die vollständige Historie.
+    schema: |
+      CREATE EXTENSION btree_gist;
+      CREATE TABLE mitglied_tarife (
+        mitglied_id int       NOT NULL,
+        tarif       text      NOT NULL CHECK (tarif IN ('flex', 'fix', 'team')),
+        gueltig     daterange NOT NULL,
+        PRIMARY KEY (mitglied_id, gueltig WITHOUT OVERLAPS)
+      );
+      INSERT INTO mitglied_tarife (mitglied_id, tarif, gueltig) VALUES
+        (1, 'flex', '[2026-01-01,2026-03-15)'),
+        (1, 'fix',  '[2026-03-15,)'),
+        (2, 'team', '[2026-02-01,)'),
+        (3, 'fix',  '[2025-11-01,)');
+    starter: |
+      INSERT INTO mitglied_tarife (mitglied_id, tarif, gueltig)
+      VALUES (1, 'team', '[2026-04-01,)');
+    solution: |
+      BEGIN;
+      UPDATE mitglied_tarife
+      SET gueltig = daterange(lower(gueltig), '2026-04-01')
+      WHERE mitglied_id = 1 AND upper_inf(gueltig);
+      INSERT INTO mitglied_tarife (mitglied_id, tarif, gueltig)
+      VALUES (1, 'team', '[2026-04-01,)');
+      UPDATE mitglied_tarife
+      SET gueltig = daterange(lower(gueltig), '2026-05-01')
+      WHERE mitglied_id = 2 AND upper_inf(gueltig);
+      COMMIT;
+    check: |
+      SELECT mitglied_id, tarif, lower(gueltig) AS von, upper(gueltig) AS bis_ausschliesslich
+      FROM mitglied_tarife
+      ORDER BY mitglied_id, lower(gueltig);
+    ordered: true
+    hints:
+      - Der Starter scheitert am Primärschlüssel. Welcher Zeitraum überlappt mit `[2026-04-01,)`?
+      - "Erst den offenen Zeitraum schließen: `daterange(lower(gueltig), '2026-04-01')`. Die obere Grenze ist bei `[)` der erste Tag, der **nicht** mehr dazugehört."
+      - Mehmets Kündigung ist nur ein `UPDATE`. Sein letzter Tag ist der 30. April, die ausschließliche Grenze also der 1. Mai.
+    explanation: |
+      Ein Tarifwechsel besteht aus zwei Schritten: den offenen Zeitraum schließen, dann den neuen anlegen. Der Primärschlüssel mit `WITHOUT OVERLAPS` prüft nach jeder Anweisung und erzwingt diese Reihenfolge. Bei halboffenen Ranges ist das Ende des alten Zeitraums zugleich der Beginn des neuen, so entsteht weder Lücke noch Überschneidung. Eine Kündigung zum 30. April schreibst du als Grenze `2026-05-01`; `[2026-02-01,2026-04-30]` wäre gleichwertig, weil PostgreSQL diskrete Ranges in die Form `[)` bringt. `upper_inf(gueltig)` findet den aktuellen Zeitraum, ohne sein Startdatum kennen zu müssen. Die Transaktion verhindert, dass ein paralleler Rechnungslauf Anna kurz ohne Tarif sieht.
+    resources:
+      - title: PostgreSQL · Range-Funktionen (lower, upper_inf)
+        url: https://www.postgresql.org/docs/current/functions-range.html#RANGE-FUNCTIONS-TABLE
+      - title: PostgreSQL · Range-Konstruktoren
+        url: https://www.postgresql.org/docs/current/rangetypes.html#RANGETYPES-CONSTRUCT
+
+  - id: email-nach-loeschung
+    type: sql
+    lang: postgres
+    title: Neu anmelden nach der Kündigung
+    prompt: |
+      Gekündigte Mitglieder haben `geloescht_am` gesetzt. Bisher verhindert `UNIQUE (email)`, dass sie sich mit derselben Adresse neu anmelden. Ändere das Schema so, dass gilt:
+
+      - Unter den aktiven Mitgliedern (`geloescht_am IS NULL`) ist jede Adresse höchstens einmal vergeben, **ohne Rücksicht auf Groß- und Kleinschreibung** (`Lena.Vogel@…` = `lena.vogel@…`).
+      - Gelöschte Zeilen zählen nicht mit: Eine Neuanmeldung mit der Adresse eines gelöschten Kontos ist erlaubt, und dieselbe Adresse darf mehrfach gelöscht vorkommen.
+
+      Der bestehende Constraint heißt `mitglieder_email_key`. Die Prüfabfrage probiert Anmeldungen und meldet `ok` oder `abgelehnt` – egal ob ein Unique-Index oder ein Exclusion Constraint ablehnt.
+    schema: |
+      CREATE TABLE mitglieder (
+        id           int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        email        text NOT NULL UNIQUE,
+        name         text NOT NULL,
+        geloescht_am timestamptz
+      );
+      INSERT INTO mitglieder (email, name, geloescht_am) VALUES
+        ('anna.krueger@example.org',  'Anna Krüger',   NULL),
+        ('jonas.weber@example.org',   'Jonas Weber',   '2026-02-28 12:00+01'),
+        ('Lena.Vogel@example.org',    'Lena Vogel',    NULL),
+        ('mehmet.yilmaz@example.org', 'Mehmet Yılmaz', '2026-03-31 18:00+02');
+    starter: |
+      -- ALTER TABLE mitglieder DROP CONSTRAINT …
+    solution: |
+      ALTER TABLE mitglieder DROP CONSTRAINT mitglieder_email_key;
+      CREATE UNIQUE INDEX mitglieder_email_aktiv
+        ON mitglieder (lower(email))
+        WHERE geloescht_am IS NULL;
+    check: |
+      SELECT pruefung,
+             CASE WHEN ergebnis IN ('unique_violation', 'exclusion_violation') THEN 'abgelehnt' ELSE ergebnis END AS ergebnis
+      FROM (VALUES
+        ('Neu nach Löschung',     lp.versuch($$INSERT INTO mitglieder (email, name) VALUES ('jonas.weber@example.org', 'Jonas Weber')$$)),
+        ('Zweites aktives Konto',  lp.versuch($$INSERT INTO mitglieder (email, name) VALUES ('anna.krueger@example.org', 'Anna K.')$$)),
+        ('Andere Schreibweise',    lp.versuch($$INSERT INTO mitglieder (email, name) VALUES ('lena.vogel@example.org', 'Lena Vogel')$$)),
+        ('Kündigen, neu anmelden', lp.versuch($$UPDATE mitglieder SET geloescht_am = '2026-04-01 09:00+02' WHERE id = 1; INSERT INTO mitglieder (email, name) VALUES ('Anna.Krueger@example.org', 'Anna Krüger')$$)),
+        ('Zweimal gelöscht',       lp.versuch($$INSERT INTO mitglieder (email, name, geloescht_am) VALUES ('mehmet.yilmaz@example.org', 'Mehmet Yılmaz', '2026-04-02 10:00+02')$$))
+      ) AS p (pruefung, ergebnis);
+    hints:
+      - Ein Unique-Constraint gilt immer für alle Zeilen. Eindeutigkeit für eine Teilmenge der Zeilen liefert ein Unique-**Index** mit `WHERE`.
+      - Ein Index darf statt einer Spalte einen Ausdruck enthalten. Welcher Ausdruck macht `Lena.Vogel@…` und `lena.vogel@…` gleich?
+      - "`CREATE UNIQUE INDEX … ON mitglieder (lower(email)) WHERE geloescht_am IS NULL;` – vorher den alten Constraint entfernen."
+    explanation: |
+      Der alte Constraint muss weg, denn er umfasst auch gelöschte Zeilen. Ein partieller Unique-Index prüft Eindeutigkeit nur unter den Zeilen, die sein `WHERE` erfüllen. Gelöschte Konten fallen heraus, auch mehrfach mit derselben Adresse. Der Ausdruck `lower(email)` macht die Prüfung unabhängig von der Schreibweise, ohne die gespeicherte Adresse zu verändern. `EXCLUDE (lower(email) WITH =) WHERE (geloescht_am IS NULL)` setzt dieselbe Regel durch, taugt aber nicht als Ziel für `ON CONFLICT … DO UPDATE`; der partielle Unique-Index ist die übliche Form. Im Code musst du daran denken: Ein Upsert auf diese Regel braucht `ON CONFLICT (lower(email)) WHERE geloescht_am IS NULL`, und Abfragen nutzen den Index nur mit `WHERE lower(email) = lower($1)`.
+    resources:
+      - title: PostgreSQL · Partial Unique Index
+        url: https://www.postgresql.org/docs/current/indexes-partial.html#INDEXES-PARTIAL-EX3
+      - title: PostgreSQL · Indexes on Expressions
+        url: https://www.postgresql.org/docs/current/indexes-expressional.html
+
+  - id: notizen-ohne-polymorphie
+    type: sql
+    lang: postgres
+    title: Notizen mit echten Fremdschlüsseln
+    prompt: |
+      Die alte Tabelle `notizen_alt` speichert polymorph `ziel_typ` (`'raum'` oder `'buchung'`) und `ziel_id`. Lege `notizen` neu an und übernimm die Daten:
+
+      - Spalten `id` (Primärschlüssel, Werte aus `notizen_alt.id` übernehmen), `raum_id`, `buchung_id`, `text` (Pflicht).
+      - `raum_id` verweist auf `raeume (id)`, `buchung_id` auf `buchungen (id)`. **Genau eine** der beiden ist gesetzt.
+      - Wird eine Buchung gelöscht, verschwinden ihre Notizen. Räume mit Notizen lassen sich nicht löschen.
+      - Übernimm alle alten Notizen, deren Ziel existiert. Notizen mit verwaistem Ziel bleiben nur in `notizen_alt`.
+
+      Lehnt ein Fremdschlüssel ein Löschen ab, meldet die Prüfabfrage `abgelehnt` – egal ob mit `NO ACTION` oder `RESTRICT`.
+    schema: |
+      CREATE TABLE raeume (
+        id   int PRIMARY KEY,
+        name text NOT NULL
+      );
+      CREATE TABLE buchungen (
+        id      bigint PRIMARY KEY,
+        raum_id int NOT NULL REFERENCES raeume (id)
+      );
+      CREATE TABLE notizen_alt (
+        id       bigint PRIMARY KEY,
+        ziel_typ text   NOT NULL,
+        ziel_id  bigint NOT NULL,
+        text     text   NOT NULL
+      );
+      INSERT INTO raeume VALUES (1, 'Atelier'), (2, 'Loft'), (3, 'Box 1');
+      INSERT INTO buchungen VALUES (100, 1), (101, 1), (102, 2);
+      INSERT INTO notizen_alt VALUES
+        (1, 'raum',    1,   'Beamer flackert'),
+        (2, 'raum',    3,   'Lüftung laut'),
+        (3, 'buchung', 100, 'Kunde kam 20 Minuten zu spät'),
+        (4, 'buchung', 102, 'Catering für 8 Personen'),
+        (5, 'raum',    9,   'Tür klemmt'),
+        (6, 'buchung', 555, 'Rechnung an Firma'),
+        (7, 'buchung', 101, 'Schlüssel nicht zurückgegeben');
+    starter: |
+      CREATE TABLE notizen (
+        id         bigint PRIMARY KEY,
+        raum_id    int,
+        buchung_id bigint,
+        text       text NOT NULL
+      );
+    solution: |
+      CREATE TABLE notizen (
+        id         bigint PRIMARY KEY,
+        raum_id    int    REFERENCES raeume (id),
+        buchung_id bigint REFERENCES buchungen (id) ON DELETE CASCADE,
+        text       text   NOT NULL,
+        CHECK (num_nonnulls(raum_id, buchung_id) = 1)
+      );
+      INSERT INTO notizen (id, raum_id, text)
+      SELECT n.id, n.ziel_id, n.text
+      FROM notizen_alt AS n
+      JOIN raeume AS r ON r.id = n.ziel_id
+      WHERE n.ziel_typ = 'raum';
+      INSERT INTO notizen (id, buchung_id, text)
+      SELECT n.id, n.ziel_id, n.text
+      FROM notizen_alt AS n
+      JOIN buchungen AS b ON b.id = n.ziel_id
+      WHERE n.ziel_typ = 'buchung';
+    check: |
+      SELECT pruefung, ergebnis
+      FROM (VALUES
+        ('Raumnotizen',      (SELECT string_agg(id::text, ',' ORDER BY id) FROM notizen WHERE raum_id IS NOT NULL)),
+        ('Buchungsnotizen',  (SELECT string_agg(id::text, ',' ORDER BY id) FROM notizen WHERE buchung_id IS NOT NULL)),
+        ('Beide Ziele',      lp.versuch($$INSERT INTO notizen (id, raum_id, buchung_id, text) VALUES (50, 1, 100, 'beides')$$)),
+        ('Kein Ziel',        lp.versuch($$INSERT INTO notizen (id, text) VALUES (51, 'ohne Ziel')$$)),
+        ('Raum fehlt',       lp.versuch($$INSERT INTO notizen (id, raum_id, text) VALUES (52, 9, 'Raum fehlt')$$)),
+        ('Buchung fehlt',    lp.versuch($$INSERT INTO notizen (id, buchung_id, text) VALUES (53, 555, 'Buchung fehlt')$$)),
+        ('Buchung löschen',  lp.versuch($$DELETE FROM buchungen WHERE id = 100$$)),
+        ('Raum mit Notiz löschen', (SELECT CASE WHEN v IN ('foreign_key_violation', 'restrict_violation') THEN 'abgelehnt' ELSE v END FROM lp.versuch($$DELETE FROM raeume WHERE id = 3$$) AS v))
+      ) AS p (pruefung, ergebnis);
+    hints:
+      - "`num_nonnulls(a, b)` zählt, wie viele Argumente nicht `NULL` sind. Ein `CHECK` auf dieses Ergebnis drückt „genau eines“ aus."
+      - Übernimm die Daten in zwei `INSERT … SELECT`, einen je Zieltyp. Ein `JOIN` auf die Zieltabelle lässt die Waisen weg – ohne ihn scheitert das `INSERT` am Fremdschlüssel.
+      - "`buchung_id bigint REFERENCES buchungen (id) ON DELETE CASCADE`, `raum_id int REFERENCES raeume (id)` ohne `ON DELETE`."
+    explanation: |
+      Je Ziel eine nullbare Fremdschlüsselspalte gibt der Datenbank zurück, was die polymorphe Tabelle verloren hatte: Sie prüft, dass das Ziel existiert, und jedes Ziel bekommt sein eigenes Verhalten beim Löschen. Der `CHECK` mit `num_nonnulls(raum_id, buchung_id) = 1` schließt Notizen ohne Ziel und mit zwei Zielen aus; `raum_id IS NOT NULL OR buchung_id IS NOT NULL` allein ließe beide zu. Die Migration ist zugleich eine Datenbereinigung: Notiz 5 zeigt auf einen Raum, den es nicht gibt, Notiz 6 auf eine gelöschte Buchung. Ein `JOIN` oder `EXISTS` filtert sie heraus, und sie bleiben zur Klärung in `notizen_alt`.
+    resources:
+      - title: PostgreSQL · num_nonnulls und num_nulls
+        url: https://www.postgresql.org/docs/current/functions-comparison.html#FUNCTIONS-COMPARISON-FUNC-TABLE
+      - title: PostgreSQL · INSERT … SELECT
+        url: https://www.postgresql.org/docs/current/sql-insert.html
+
+  - id: profil-und-mitgliedschaft
+    type: gap
+    title: 1:1 und n:m in DDL
+    prompt: |
+      Ergänze die beiden Tabellen. Ein Firmenprofil gehört zu genau einem Mitglied und hat keine eigene `id`: Der Schlüssel des Mitglieds ist zugleich sein Schlüssel, und das Profil verschwindet mit dem Mitglied. Eine Mitgliedschaft verbindet Team und Mitglied; jede Kombination gibt es nur einmal.
+    lang: postgres
+    code: |
+      CREATE TABLE firmenprofile (
+        mitglied_id int ⟦PRIMARY KEY⟧ REFERENCES mitglieder (id) ⟦ON DELETE CASCADE⟧,
+        firma       text NOT NULL,
+        ust_id      text
+      );
+
+      CREATE TABLE team_mitgliedschaften (
+        team_id     int  NOT NULL REFERENCES teams (id),
+        mitglied_id int  NOT NULL REFERENCES mitglieder (id),
+        rolle       text NOT NULL,
+        ⟦PRIMARY KEY (team_id, mitglied_id)⟧
+      );
+    gaps:
+      - label: Schlüssel des Profils
+        hint: Die Spalte soll eindeutig und Pflicht sein und die Zeile identifizieren.
+      - label: Verhalten beim Löschen
+        hint: Das Profil soll mit dem Mitglied verschwinden.
+      - label: Schlüssel der Verbindungstabelle
+        hint: Ein Tabellen-Constraint über beide Fremdschlüssel.
+        accept: ["PRIMARY KEY (mitglied_id, team_id)", "UNIQUE (team_id, mitglied_id)", "UNIQUE (mitglied_id, team_id)"]
+    explanation: |
+      Wenn der Fremdschlüssel zugleich Primärschlüssel ist, kann es je Mitglied höchstens ein Profil geben – eine 0..1-Beziehung ohne eigene `id` (Shared Primary Key). `ON DELETE CASCADE` bindet den Lebenszyklus an das Mitglied. In der Verbindungstabelle macht der Schlüssel über beide Fremdschlüssel jede Kombination einmalig. `UNIQUE` statt `PRIMARY KEY` erfüllt dieselbe Regel, weil beide Spalten schon `NOT NULL` sind; die Tabelle hätte dann aber keinen Primärschlüssel, und viele ORMs erwarten einen.
+    resources:
+      - title: PostgreSQL · Primary Keys
+        url: https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-PRIMARY-KEYS
+
+  - id: rechnung-geld-und-zeit
+    type: bug
+    title: Cent-Differenzen und verschobene Zahlungen
+    prompt: |
+      Zwei Meldungen aus der Buchhaltung zur neuen Tabelle `rechnungen`: Die Summe aller Rechnungen weicht im Export um mehrere Euro von der Summe der Einzelbeträge ab, und `WHERE betrag = 249.9` findet Rechnungen über 249,90 EUR nicht. Außerdem stehen Zahlungen, die der Zahlungsdienst (Server in UTC) meldet, im Berliner Export eine bzw. zwei Stunden zu früh. Finde die fehlerhaften Zeilen und korrigiere sie.
+    lang: postgres
+    code: |
+      CREATE TABLE rechnungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        mitglied_id int NOT NULL REFERENCES mitglieder (id),
+        monat       date NOT NULL,
+        betrag      real NOT NULL,
+        bezahlt_am  timestamp,
+        UNIQUE (mitglied_id, monat)
+      );
+    lines: [5, 6]
+    fix:
+      - line: 5
+        answers:
+          - "betrag      numeric(10,2) NOT NULL,"
+          - "betrag decimal(10,2) NOT NULL,"
+          - "betrag numeric(12,2) NOT NULL,"
+          - "betrag numeric(10,2) NOT NULL CHECK (betrag >= 0),"
+      - line: 6
+        answers:
+          - "bezahlt_am  timestamptz,"
+          - "bezahlt_am timestamp with time zone,"
+    hints:
+      - "`real` ist ein Gleitkommatyp mit etwa sechs Stellen Genauigkeit. Wie speichert er 249,90?"
+      - "`timestamp` ohne Zusatz heißt `timestamp without time zone`. Was weiß die Spalte nach dem Speichern über den Zeitpunkt?"
+    explanation: |
+      `real` speichert Binärbrüche mit rund sechs Dezimalstellen. 249,90 ist darin nicht exakt darstellbar, bei 1 200 Rechnungen summieren sich die Rundungsfehler auf Euro-Beträge, und der Vergleich mit dem `numeric`-Literal `249.9` findet den gespeicherten Näherungswert nicht. `numeric(10,2)` rechnet exakt in Dezimalstellen. `timestamp` speichert nur Datum und Uhrzeit ohne Bezug zu einer Zeitzone: Schreibt ein Dienst „08:00“ in UTC und liest der Export dasselbe „08:00“ als Berliner Zeit, liegt die Zahlung eine Stunde (Winter) bzw. zwei Stunden (Sommer) zu früh. `timestamptz` speichert den Zeitpunkt eindeutig und rechnet bei der Ausgabe in die Zeitzone der Sitzung um. `monat` als `date` ist richtig, denn ein Monat ist kein Zeitpunkt.
+    resources:
+      - title: PostgreSQL · Arbitrary Precision Numbers
+        url: https://www.postgresql.org/docs/current/datatype-numeric.html#DATATYPE-NUMERIC-DECIMAL
+      - title: PostgreSQL Wiki · Don't use timestamp (without time zone)
+        url: https://wiki.postgresql.org/wiki/Don't_Do_This#Don.27t_use_timestamp_.28without_time_zone.29
+
+  - id: werteliste-waehlen
+    type: choice
+    title: CHECK, Enum oder Lookup-Tabelle?
+    prompt: |
+      Drei Wertelisten im Deskwerk-Schema: `buchungen.status` (`bestaetigt`, `storniert`; der Code behandelt jeden Wert gesondert), die Ausstattungsarten (die Standortleitung legt in der Admin-Oberfläche neue an, mit Anzeigename und Symbol) und die Tarife (mit Grundpreis; alte Tarife laufen aus). Welche Aussagen stimmen?
+    options:
+      - text: "`buchungen.status` passt in einen `CHECK (status IN ('bestaetigt', 'storniert'))` oder einen Enum-Typ."
+        correct: true
+        why: Eine kleine, stabile Liste technischer Zustände, die der Code ohnehin kennt. Ein neuer Status kommt nur mit neuem Code; die Migration läuft im selben Deployment mit.
+      - text: Ausstattungsarten gehören in eine Lookup-Tabelle mit Fremdschlüssel.
+        correct: true
+        why: Die Fachseite pflegt die Liste selbst, und jede Art hat eigene Attribute. Beides kann nur eine Tabelle.
+      - text: Tarife sollten ein Enum-Typ sein, weil es nur drei gibt.
+        correct: false
+        why: Ein Enum kann keinen Grundpreis tragen, und auslaufende Werte lassen sich aus einem Enum nicht entfernen. Tarife sind ein Katalog mit Attributen, also eine Tabelle.
+      - text: Ein Enum-Typ lässt sich nachträglich nicht mehr erweitern.
+        correct: false
+        why: "`ALTER TYPE … ADD VALUE` fügt Werte hinzu. Nicht möglich ist, Werte zu entfernen oder ihre Reihenfolge zu ändern."
+      - text: Ausstattungsarten als `CHECK` sind besser, weil die Datenbank dann die Werte selbst prüft.
+        correct: false
+        why: Ein Fremdschlüssel auf eine Lookup-Tabelle prüft die Werte genauso. Mit `CHECK` bräuchte jede neue Ausstattungsart eine Migration durch Entwickler.
+    explanation: |
+      Die Frage ist, wer die Liste ändert und ob ihre Werte eigene Daten haben. Technische Zustände, die nur mit neuem Code dazukommen, passen in einen `CHECK` oder ein Enum. Kataloge, die die Fachseite pflegt oder die Attribute wie Preis und Anzeigename haben, sind Daten und gehören in eine Tabelle. Ein Fremdschlüssel validiert dabei genauso streng wie ein `CHECK`.
+    resources:
+      - title: PostgreSQL · Enumerated Types
+        url: https://www.postgresql.org/docs/current/datatype-enum.html
+      - title: PostgreSQL · ALTER TYPE
+        url: https://www.postgresql.org/docs/current/sql-altertype.html
+
+  - id: mandanten-schema-erklaeren
+    type: explain
+    title: Warum zweimal eindeutig?
+    prompt: |
+      Im Review fragt jemand: „`id` ist doch schon Primärschlüssel – wozu `UNIQUE (betreiber_id, id)`? Und warum steht `betreiber_id` in `buchungen` noch einmal, das ergibt sich doch aus dem Raum?“ Erkläre, was dieses Schema garantiert und was nicht.
+    lang: postgres
+    code: |
+      CREATE TABLE raeume (
+        betreiber_id int  NOT NULL REFERENCES betreiber (id),
+        id           int  GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        name         text NOT NULL,
+        UNIQUE (betreiber_id, id)
+      );
+      CREATE TABLE mitglieder (
+        betreiber_id int  NOT NULL REFERENCES betreiber (id),
+        id           int  GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        email        text NOT NULL,
+        UNIQUE (betreiber_id, email),
+        UNIQUE (betreiber_id, id)
+      );
+      CREATE TABLE buchungen (
+        betreiber_id int    NOT NULL,
+        id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        raum_id      int    NOT NULL,
+        mitglied_id  int    NOT NULL,
+        FOREIGN KEY (betreiber_id, raum_id)     REFERENCES raeume (betreiber_id, id),
+        FOREIGN KEY (betreiber_id, mitglied_id) REFERENCES mitglieder (betreiber_id, id)
+      );
+    points:
+      - Ein Fremdschlüssel braucht auf der Zielseite einen Primärschlüssel, Unique-Constraint oder nicht partiellen Unique-Index über genau seine Spalten. Ohne `UNIQUE (betreiber_id, id)` lässt sich der zusammengesetzte Fremdschlüssel nicht anlegen, obwohl die Kombination wegen des Primärschlüssels ohnehin eindeutig ist.
+      - Weil beide Fremdschlüssel dieselbe `betreiber_id` der Buchung benutzen, müssen Raum und Mitglied zum selben Betreiber gehören. Fremdschlüssel nur auf `id` würden Buchungen über Mandantengrenzen zulassen.
+      - "`betreiber_id` in `buchungen` ist bewusst wiederholt: Sie verbindet die beiden Prüfungen und erlaubt Filter und Indexe je Mandant ohne Join."
+      - "`UNIQUE (betreiber_id, email)` macht E-Mail-Adressen je Betreiber eindeutig; dieselbe Person darf Mitglied bei zwei Betreibern sein."
+      - Das Schema garantiert nicht, dass jede Abfrage nach `betreiber_id` filtert. Das leisten Disziplin im Code oder Row-Level Security.
+    explanation: |
+      Die Tabellen sichern die Mandantengrenze in der Datenbank. Eine Buchung trägt ihre `betreiber_id`, und beide Fremdschlüssel verlangen, dass Raum **und** Mitglied unter genau dieser `betreiber_id` existieren. Ein Mitglied von Deskwerk kann also keinen Raum des Hafenbüros buchen, egal welcher Code das `INSERT` schreibt. Dafür braucht jede Zieltabelle `UNIQUE (betreiber_id, id)`: Fremdschlüssel verweisen nur auf Spaltenlisten mit Primärschlüssel, Unique-Constraint oder nicht partiellem Unique-Index, und PostgreSQL leitet das nicht aus dem Primärschlüssel auf `id` ab. Die Wiederholung von `betreiber_id` ist eine bewusste Denormalisierung, die die Konsistenz erst prüfbar macht. Was das Schema nicht leistet: Ein `SELECT * FROM buchungen` ohne Filter sieht alle Mandanten. Dagegen helfen ein Repository-Layer, der den Filter immer setzt, oder Row-Level Security mit einer Policy auf `betreiber_id`.
+    resources:
+      - title: PostgreSQL · Foreign Keys (zusammengesetzt)
+        url: https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-FK
+      - title: PostgreSQL · Row Security Policies
+        url: https://www.postgresql.org/docs/current/ddl-rowsecurity.html
+
+  - id: teams-modellieren
+    type: sql
+    lang: postgres
+    title: Das Team-Feature ins Schema bringen
+    prompt: |
+      Setze die Team-Anforderung als Schema um und lege die ersten Daten an.
+
+      Tabelle `teams`:
+      - `id` wird automatisch vergeben und ist Primärschlüssel; `name` ist Pflicht und eindeutig.
+
+      Tabelle `team_mitgliedschaften` mit `team_id`, `mitglied_id`, `rolle`, `seit`:
+      - Beide Fremdschlüssel sind Pflicht. Ein Mitglied steht höchstens einmal im selben Team.
+      - `rolle` ist `admin` oder `mitglied`, Standardwert `mitglied`. `seit` (Datum) ist Pflicht.
+      - Jedes Team hat **höchstens einen** Admin. Ein Mitglied darf in mehreren Teams Admin sein.
+      - Wird ein Team gelöscht, verschwinden seine Mitgliedschaften. Ein Mitglied, das noch in einem Team ist, lässt sich nicht löschen.
+
+      Daten: Team „Studio Nordlicht“ mit Anna Krüger (`mitglied_id` 1) als Admin seit 1. Januar 2026 und Mehmet Yılmaz (`mitglied_id` 2) seit 1. Februar 2026 mit der Standardrolle.
+
+      Lehnt ein Fremdschlüssel ein Löschen ab, meldet die Prüfabfrage `abgelehnt` – egal ob mit `NO ACTION` oder `RESTRICT`. Ebenso beim zweiten Admin, egal ob ein Unique-Index oder ein Exclusion Constraint ablehnt.
+    schema: |
+      CREATE TABLE mitglieder (
+        id    int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        email text NOT NULL UNIQUE,
+        name  text NOT NULL
+      );
+      INSERT INTO mitglieder (email, name) VALUES
+        ('anna.krueger@example.org',  'Anna Krüger'),
+        ('mehmet.yilmaz@example.org', 'Mehmet Yılmaz'),
+        ('lena.vogel@example.org',    'Lena Vogel'),
+        ('jonas.weber@example.org',   'Jonas Weber');
+    starter: |
+      CREATE TABLE teams (
+        id   int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        name text
+      );
+      CREATE TABLE team_mitgliedschaften (
+        team_id     int,
+        mitglied_id int,
+        rolle       text,
+        seit        date
+      );
+    solution: |
+      CREATE TABLE teams (
+        id   int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        name text NOT NULL UNIQUE
+      );
+      CREATE TABLE team_mitgliedschaften (
+        team_id     int  NOT NULL REFERENCES teams (id) ON DELETE CASCADE,
+        mitglied_id int  NOT NULL REFERENCES mitglieder (id),
+        rolle       text NOT NULL DEFAULT 'mitglied' CHECK (rolle IN ('admin', 'mitglied')),
+        seit        date NOT NULL,
+        PRIMARY KEY (team_id, mitglied_id)
+      );
+      CREATE UNIQUE INDEX team_mitgliedschaften_ein_admin
+        ON team_mitgliedschaften (team_id)
+        WHERE rolle = 'admin';
+
+      INSERT INTO teams (name) VALUES ('Studio Nordlicht');
+      INSERT INTO team_mitgliedschaften (team_id, mitglied_id, rolle, seit)
+      SELECT t.id, 1, 'admin', date '2026-01-01' FROM teams AS t WHERE t.name = 'Studio Nordlicht';
+      INSERT INTO team_mitgliedschaften (team_id, mitglied_id, seit)
+      SELECT t.id, 2, date '2026-02-01' FROM teams AS t WHERE t.name = 'Studio Nordlicht';
+    check: |
+      SELECT pruefung, ergebnis
+      FROM (VALUES
+        ('Daten', (SELECT string_agg(m.name || ' ' || tm.rolle || ' seit ' || tm.seit, ', ' ORDER BY m.name)
+                   FROM team_mitgliedschaften AS tm JOIN mitglieder AS m ON m.id = tm.mitglied_id)),
+        ('Mitglied doppelt im Team', lp.versuch($$INSERT INTO team_mitgliedschaften (team_id, mitglied_id, seit) SELECT id, 2, date '2026-03-01' FROM teams WHERE name = 'Studio Nordlicht'$$)),
+        ('Weiteres Mitglied',        lp.versuch($$INSERT INTO team_mitgliedschaften (team_id, mitglied_id, seit) SELECT id, 3, date '2026-03-01' FROM teams WHERE name = 'Studio Nordlicht'$$)),
+        ('Zweiter Admin',            (SELECT CASE WHEN v IN ('unique_violation', 'exclusion_violation') THEN 'abgelehnt' ELSE v END FROM lp.versuch($$INSERT INTO team_mitgliedschaften (team_id, mitglied_id, rolle, seit) SELECT id, 3, 'admin', date '2026-03-01' FROM teams WHERE name = 'Studio Nordlicht'$$) AS v)),
+        ('Admin in zwei Teams',      lp.versuch($$INSERT INTO teams (name) VALUES ('Kanzlei Berger'); INSERT INTO team_mitgliedschaften (team_id, mitglied_id, rolle, seit) SELECT id, 1, 'admin', date '2026-03-01' FROM teams WHERE name = 'Kanzlei Berger'$$)),
+        ('Unbekannte Rolle',         lp.versuch($$INSERT INTO team_mitgliedschaften (team_id, mitglied_id, rolle, seit) SELECT id, 3, 'chef', date '2026-03-01' FROM teams WHERE name = 'Studio Nordlicht'$$)),
+        ('Ohne Beginn',              lp.versuch($$INSERT INTO team_mitgliedschaften (team_id, mitglied_id) SELECT id, 3 FROM teams WHERE name = 'Studio Nordlicht'$$)),
+        ('Teamname doppelt',         lp.versuch($$INSERT INTO teams (name) VALUES ('Studio Nordlicht')$$)),
+        ('Team löschen',             lp.versuch($$DELETE FROM teams WHERE name = 'Studio Nordlicht'$$)),
+        ('Mitglied im Team löschen', (SELECT CASE WHEN v IN ('foreign_key_violation', 'restrict_violation') THEN 'abgelehnt' ELSE v END FROM lp.versuch($$DELETE FROM mitglieder WHERE id = 2$$) AS v)),
+        ('Mitglied ohne Team löschen', lp.versuch($$DELETE FROM mitglieder WHERE id = 4$$))
+      ) AS p (pruefung, ergebnis);
+    hints:
+      - Die meisten Regeln sind Spalten-Constraints (`NOT NULL`, `DEFAULT`, `CHECK`, `REFERENCES … ON DELETE`) und ein Primärschlüssel über beide Fremdschlüssel.
+      - „Höchstens ein Admin je Team“ ist Eindeutigkeit von `team_id` – aber nur unter den Zeilen mit `rolle = 'admin'`.
+      - "`CREATE UNIQUE INDEX … ON team_mitgliedschaften (team_id) WHERE rolle = 'admin';` Die `team_id` für die Daten holst du per `INSERT … SELECT id … FROM teams WHERE name = 'Studio Nordlicht'` oder per `RETURNING` in einem CTE."
+    explanation: |
+      Jede Zeile der Anforderung wird ein Constraint. n:m wird eine Verbindungstabelle mit Primärschlüssel über `team_id` und `mitglied_id`. Rolle und Beginn sind Attribute der Mitgliedschaft und stehen deshalb dort, mit `CHECK` und `DEFAULT`. „Höchstens ein Admin je Team“ ist ein partieller Unique-Index auf `team_id` mit `WHERE rolle = 'admin'`: Unter den Admin-Zeilen darf jede `team_id` nur einmal vorkommen, normale Mitglieder zählen nicht, und dasselbe Mitglied darf in einem anderen Team Admin sein. `UNIQUE (team_id, rolle)` wäre zu streng: Es erlaubte auch nur ein normales Mitglied je Team. Die Lösch-Regeln sind die zwei `ON DELETE`-Varianten. Die Daten legst du ohne fest verdrahtete Team-`id` an, weil die Identity-Spalte sie vergibt. In der App würdest du sie per `RETURNING id` zurückbekommen, wie es ein ORM nach dem `INSERT` tut. Die Regel „mindestens ein Admin“ lässt sich so nicht ausdrücken; sie gehört in die Anwendung oder in einen Trigger.
+    resources:
+      - title: PostgreSQL · Partial Unique Index
+        url: https://www.postgresql.org/docs/current/indexes-partial.html#INDEXES-PARTIAL-EX3
+      - title: PostgreSQL · CREATE TABLE
+        url: https://www.postgresql.org/docs/current/sql-createtable.html

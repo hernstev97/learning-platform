@@ -1,0 +1,1003 @@
+id: postgres-features
+title: PostgreSQL-Features
+level: 2
+minutes: 160
+summary: Was PostgreSQL über Standard-SQL hinaus mitbringt – JSONB, Arrays, Ranges, generierte Spalten, Identity, uuidv7, Enums, Volltextsuche, pg_trgm, Views und Materialized Views – und wann es das Modell klarer macht statt nur bequemer.
+goals:
+  - Du liest und änderst JSONB mit `->`, `->>`, `@>`, `?` und `jsonb_set` und begründest, welche Daten in JSONB gehören und welche in Spalten.
+  - Du filterst Arrays mit `ANY` und `@>`, zerlegst sie mit `unnest` und rechnest mit halboffenen `tstzrange`-Zeiträumen, auch über die Zeitumstellung.
+  - Du setzt generierte Spalten (`STORED` und `VIRTUAL`), Identity-Spalten und `uuidv7()` gezielt ein und kennst ihre Grenzen.
+  - Du baust eine deutsche Volltextsuche mit `to_tsvector` und `websearch_to_tsquery` und ergänzt sie um unscharfe Suche mit `pg_trgm`.
+  - Du unterscheidest View und Materialized View und richtest `REFRESH … CONCURRENTLY` ein.
+resources:
+  - title: PostgreSQL · JSON Types
+    url: https://www.postgresql.org/docs/current/datatype-json.html
+  - title: PostgreSQL · Range Types
+    url: https://www.postgresql.org/docs/current/rangetypes.html
+  - title: PostgreSQL · Generated Columns
+    url: https://www.postgresql.org/docs/current/ddl-generated-columns.html
+  - title: PostgreSQL · Full Text Search – Controlling Text Search
+    url: https://www.postgresql.org/docs/current/textsearch-controls.html
+  - title: PostgreSQL · pg_trgm
+    url: https://www.postgresql.org/docs/current/pgtrgm.html
+lesson: |
+  Die Deskwerk-App wächst. Mitglieder wollen Sprache und Benachrichtigungen einstellen, die Raumsuche soll nach Ausstattung und freien Zeiten filtern und Tippfehler verzeihen, und das Dashboard zeigt den Umsatz je Raum. Ein ORM bildet so etwas gern mit Textspalten, Hilfstabellen und Python-Schleifen ab. PostgreSQL bringt für genau diese Aufgaben eigene Typen und Funktionen mit. Jede davon hat eine Falle, die du kennen musst, bevor sie in Produktion geht.
+
+  Ob sich ein solcher Typ statt einer Tabelle lohnt, entscheidest du mit den Fragen aus [Datenmodellierung](/postgres/datenmodellierung). Die Indexe, die diese Typen schnell machen (GIN, GiST), behandelt [Indexe](/postgres/indexe). Hier steht, wie die Features sich verhalten.
+
+  ## JSONB: Dokumente in einer Spalte
+
+  PostgreSQL hat zwei JSON-Typen. `json` speichert den Text unverändert. `jsonb` zerlegt ihn beim Speichern in ein Binärformat: Leerzeichen und Schlüsselreihenfolge gehen verloren, bei doppelten Schlüsseln gewinnt der letzte, dafür sind Abfragen schnell und indexierbar. In Anwendungen nimmst du fast immer `jsonb`.
+
+  ```postgres run
+  CREATE TABLE mitglieder (
+    id            int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name          text  NOT NULL,
+    einstellungen jsonb NOT NULL DEFAULT '{}'
+  );
+  INSERT INTO mitglieder (name, einstellungen) VALUES
+    ('Anna Krüger',   '{"sprache": "de", "benachrichtigungen": {"email": true, "push": false}, "lieblingsraeume": [3, 7]}'),
+    ('Mehmet Yılmaz', '{"sprache": "en", "benachrichtigungen": {"email": false}}'),
+    ('Lena Vogel',    '{}');
+
+  SELECT name,
+         einstellungen -> 'benachrichtigungen'          AS als_jsonb,
+         einstellungen ->> 'sprache'                    AS sprache,
+         einstellungen #>> '{benachrichtigungen,email}' AS email,
+         einstellungen ? 'sprache'                      AS hat_sprache
+  FROM mitglieder
+  ORDER BY id;
+
+  -- Wer will E-Mails? Containment mit @>
+  SELECT name FROM mitglieder
+  WHERE einstellungen @> '{"benachrichtigungen": {"email": true}}';
+
+  -- Lieblingsraum 7, mit jsonpath
+  SELECT name FROM mitglieder
+  WHERE einstellungen @? '$.lieblingsraeume[*] ? (@ == 7)';
+
+  -- Einen Pfad ändern, ohne den Rest zu überschreiben
+  UPDATE mitglieder
+  SET einstellungen = jsonb_set(einstellungen, '{benachrichtigungen,push}', 'true')
+  WHERE id IN (2, 3)
+  RETURNING name, einstellungen;
+  ```
+
+  `->` liefert wieder `jsonb`, `->>` Text; `#>` und `#>>` folgen einem Pfad ([JSONB-Operatoren](https://www.postgresql.org/docs/current/functions-json.html#FUNCTIONS-JSONB-OP-TABLE)). `?` prüft, ob ein Schlüssel auf oberster Ebene existiert. `@>` fragt, ob das linke Dokument das rechte enthält, und ist typgenau: `{"email": true}` passt nicht auf `{"email": "true"}` ([Containment](https://www.postgresql.org/docs/current/datatype-json.html#JSON-CONTAINMENT)). Für komplexere Bedingungen gibt es jsonpath mit `@?` und `jsonb_path_query`. Das `UPDATE` zeigt die Falle von `jsonb_set`: Bei Mehmet setzt es `push`, bei Lena bleibt `{}` stehen, weil der Zwischenschlüssel `benachrichtigungen` fehlt. `jsonb_set` legt nur das letzte Pfadelement an.
+
+  Wann JSONB? Für Daten, deren Struktur sich oft ändert und die die App vor allem als Ganzes liest: Einstellungen, Rohdaten eines Webhooks, optionale Zusatzangaben. Alles, was einen Fremdschlüssel, einen Typ mit Rechenregeln (`numeric` für Preise) oder einen `CHECK` braucht, gehört in Spalten. Die Doku empfiehlt auch für JSON eine halbwegs feste Struktur und kleine Dokumente, weil jedes Update die ganze Zeile sperrt und neu schreibt ([Designing JSON Documents](https://www.postgresql.org/docs/current/datatype-json.html#JSON-DOC-DESIGN)). `@>`, `?` und `@?` kann ein GIN-Index beschleunigen.
+
+  > [!PRAXIS] JSONB im ORM
+  > SQLAlchemy erkennt Änderungen *innerhalb* eines JSON-Dicts nicht: `mitglied.einstellungen["sprache"] = "en"` und `commit()` schreiben nichts. Entweder du weist ein neues Dict zu, oder du deklarierst die Spalte mit `MutableDict.as_mutable(JSONB)` ([SQLAlchemy · JSON](https://docs.sqlalchemy.org/en/21/core/type_basics.html#sqlalchemy.types.JSON)). `MutableDict` bemerkt nur Änderungen auf oberster Ebene; `einstellungen["benachrichtigungen"]["push"] = True` bleibt auch damit unbemerkt. Im Review fällt der Fehler auf, wenn ein Test nur das Python-Objekt prüft statt neu zu laden.
+
+  ## Arrays und Ranges: Listen und Zeiträume als ein Wert
+
+  Jeder Typ hat einen Array-Typ: `text[]`, `int[]`. Für kurze Etikettenlisten ohne eigene Attribute ist das bequemer als eine Verbindungstabelle:
+
+  ```postgres run
+  CREATE TABLE raeume (
+    id          int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name        text   NOT NULL,
+    ausstattung text[] NOT NULL DEFAULT '{}'
+  );
+  INSERT INTO raeume (name, ausstattung) VALUES
+    ('Atelier', '{beamer,whiteboard}'),
+    ('Loft',    '{beamer,stehtisch,whiteboard}'),
+    ('Box 1',   '{}');
+
+  SELECT name, ausstattung[1] AS erstes, cardinality(ausstattung) AS anzahl
+  FROM raeume ORDER BY id;
+  SELECT name FROM raeume WHERE 'beamer' = ANY (ausstattung) ORDER BY name;
+  SELECT name FROM raeume WHERE ausstattung @> '{beamer,stehtisch}';
+  -- Eine Zeile je Element, dann je Merkmal wieder eingesammelt
+  SELECT a.merkmal, array_agg(r.name ORDER BY r.name) AS raeume
+  FROM raeume AS r
+  CROSS JOIN unnest(r.ausstattung) AS a (merkmal)
+  GROUP BY a.merkmal
+  ORDER BY a.merkmal;
+  ```
+
+  Arrays zählen ab 1. `= ANY (…)` prüft ein Element, `@>` „enthält alle“, `&&` „mindestens eines gemeinsam“. `unnest` macht aus einem Array Zeilen, `array_agg` aus Zeilen ein Array. Die Doku warnt selbst: „Arrays are not sets“ – wer oft nach einzelnen Elementen sucht, braucht vielleicht eine eigene Tabelle ([Searching in Arrays](https://www.postgresql.org/docs/current/arrays.html#ARRAYS-SEARCHING)). Elemente eines Arrays können außerdem keinen Fremdschlüssel tragen.
+
+  Ein **Range** speichert einen Zeitraum als einen Wert mit unterer und oberer Grenze. `tstzrange(beginn, ende)` ist standardmäßig halboffen, `[)`: Der Beginn gehört dazu, das Ende nicht ([Inclusive and Exclusive Bounds](https://www.postgresql.org/docs/current/rangetypes.html#RANGETYPES-INCLUSIVITY)). Damit stoßen zwei Buchungen 9–11 und 11–12:30 aneinander, ohne sich zu überschneiden.
+
+  ```postgres run
+  CREATE TABLE buchungen (
+    id       bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    raum_id  int       NOT NULL,
+    zeitraum tstzrange NOT NULL
+  );
+  INSERT INTO buchungen (raum_id, zeitraum) VALUES
+    (1, '[2026-03-02 09:00, 2026-03-02 11:00)'),
+    (1, tstzrange('2026-03-02 11:00', '2026-03-02 12:30')),
+    (2, '[2026-03-28 22:00, 2026-03-29 06:00)');
+
+  SELECT id, zeitraum, upper(zeitraum) - lower(zeitraum) AS dauer
+  FROM buchungen ORDER BY id;
+
+  SELECT b1.zeitraum && b2.zeitraum  AS ueberlappen,
+         b1.zeitraum -|- b2.zeitraum AS grenzen_aneinander,
+         b1.zeitraum @> timestamptz '2026-03-02 11:00' AS enthaelt_11_uhr
+  FROM buchungen AS b1, buchungen AS b2
+  WHERE b1.id = 1 AND b2.id = 2;
+
+  -- Belegte und freie Zeiten von Raum 1 zwischen 8 und 18 Uhr
+  SELECT range_agg(zeitraum) AS belegt,
+         tstzmultirange(tstzrange('2026-03-02 08:00', '2026-03-02 18:00')) - range_agg(zeitraum) AS frei
+  FROM buchungen WHERE raum_id = 1;
+  ```
+
+  Die Nachtbuchung vom 28. auf den 29. März dauert sieben Stunden, nicht acht: In der Nacht beginnt die Sommerzeit, und `timestamptz` rechnet mit echten Zeitpunkten. `&&` (überlappt), `@>` (enthält) und `-|-` (grenzt an) sind die wichtigsten Range-Operatoren. Seit PostgreSQL 14 fasst `range_agg` Ranges zu einer Multirange zusammen; die Differenz liefert die freien Lücken. Den Schutz gegen Doppelbuchungen mit einem Exclusion Constraint auf `&&` zeigt [Constraints](/postgres/constraints).
+
+  ## Generierte Spalten, Identity und uuidv7
+
+  Eine **generierte Spalte** berechnet PostgreSQL aus anderen Spalten derselben Zeile. `STORED` (seit PostgreSQL 12) rechnet beim Schreiben und speichert das Ergebnis. `VIRTUAL` (seit PostgreSQL 18 und dort der Standard) rechnet beim Lesen und belegt keinen Platz ([Generated Columns](https://www.postgresql.org/docs/current/ddl-generated-columns.html)). Eine **Identity-Spalte** zieht ihre Werte aus einer Sequenz und ersetzt das ältere `serial`.
+
+  ```postgres run fails
+  CREATE TABLE buchungen (
+    id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    oeffentliche_id uuid NOT NULL DEFAULT uuidv7() UNIQUE,
+    beginn          timestamptz  NOT NULL,
+    ende            timestamptz  NOT NULL,
+    netto           numeric(8,2) NOT NULL,
+    brutto          numeric(8,2) GENERATED ALWAYS AS (round(netto * 1.19, 2)) VIRTUAL,
+    zeitraum        tstzrange    GENERATED ALWAYS AS (tstzrange(beginn, ende)) STORED
+  );
+  INSERT INTO buchungen (beginn, ende, netto)
+  VALUES ('2026-03-02 09:00+01', '2026-03-02 11:30+01', 60.00)
+  RETURNING id, brutto, zeitraum, uuid_extract_version(oeffentliche_id) AS uuid_version;
+  UPDATE buchungen SET netto = 80.00 WHERE id = 1 RETURNING netto, brutto;
+  -- Eine eigene id: abgelehnt
+  INSERT INTO buchungen (id, beginn, ende, netto)
+  VALUES (99, '2026-03-03 09:00+01', '2026-03-03 10:00+01', 30.00);
+  ```
+
+  Generierte Spalten lassen sich nicht schreiben (`column "brutto" can only be updated to DEFAULT`), und der Ausdruck darf nur `IMMUTABLE`-Funktionen verwenden. `now()` scheitert deshalb mit `generation expression is not immutable`, ebenso `concat_ws`. In PostgreSQL 18 lässt sich eine virtuelle Spalte nicht indexieren (`indexes on virtual generated columns are not supported`). Deshalb ist `zeitraum` hier `STORED`: Er soll einen GiST-Index tragen.
+
+  `GENERATED ALWAYS AS IDENTITY` lehnt eigene Werte ab, außer mit `OVERRIDING SYSTEM VALUE`. `BY DEFAULT` nimmt sie an, die Sequenz weiß aber nichts davon: Nach einem Import mit festen IDs scheitert das nächste normale `INSERT` mit `duplicate key`, bis jemand die Sequenz nachzieht ([Identity Columns](https://www.postgresql.org/docs/current/ddl-identity-columns.html)).
+
+  `uuidv7()` ist neu in PostgreSQL 18 ([UUID Functions](https://www.postgresql.org/docs/current/functions-uuid.html)). Anders als `gen_random_uuid()` (Version 4, rein zufällig) beginnt eine UUIDv7 mit einem Zeitstempel in Millisekunden. Neue Werte landen im B-Baum-Index deshalb am Ende statt an zufälligen Stellen, das hält den Index kompakt. Der Preis: `uuid_extract_timestamp(id)` verrät jedem, der die ID sieht, wann der Datensatz entstand.
+
+  > [!INTERVIEW] „bigint oder UUID als Primärschlüssel?“
+  > `bigint` mit Identity ist klein, schnell und lesbar, verrät aber Reihenfolge und Menge (`/buchungen/1042`). UUIDs lassen sich ohne Datenbank erzeugen, etwa offline im Client, und sind nicht erratbar. Zufällige UUIDv4 verteilen Einfügungen über den ganzen Index; UUIDv7 ist zeitlich sortiert und vermeidet das, legt aber den Erstellungszeitpunkt offen. Ein verbreiteter Mittelweg: intern `bigint`, nach außen eine zusätzliche `uuid`-Spalte mit `UNIQUE`.
+
+  ## Enum-Typen
+
+  Ein Enum ist ein eigener Typ mit fester, geordneter Werteliste:
+
+  ```postgres run fails
+  CREATE TYPE buchungsstatus AS ENUM ('angefragt', 'bestaetigt', 'storniert');
+  CREATE TABLE buchungen (
+    id     int PRIMARY KEY,
+    status buchungsstatus NOT NULL DEFAULT 'angefragt'
+  );
+  INSERT INTO buchungen VALUES (1, 'storniert'), (2, 'bestaetigt'), (3, DEFAULT);
+  -- Sortiert in der Reihenfolge der Definition, nicht alphabetisch
+  SELECT id, status FROM buchungen ORDER BY status;
+  ALTER TYPE buchungsstatus ADD VALUE 'abgeschlossen' AFTER 'bestaetigt';
+  SELECT enum_range(NULL::buchungsstatus);
+  INSERT INTO buchungen VALUES (4, 'Storniert');
+  ```
+
+  Ein Enum-Wert belegt vier Bytes, Vergleiche folgen der Definitionsreihenfolge, und Groß-/Kleinschreibung zählt. Werte lassen sich mit `ALTER TYPE … ADD VALUE` ergänzen, aber nicht entfernen oder umsortieren, ohne den Typ neu anzulegen. Ein in einer Transaktion hinzugefügter Wert ist erst nach dem `COMMIT` benutzbar, was manche Migrationswerkzeuge stolpern lässt. Prisma-`enum` und SQLAlchemys `Enum` legen solche Typen an. Wann ein `CHECK` oder eine Lookup-Tabelle besser passt, steht in [Datenmodellierung](/postgres/datenmodellierung).
+
+  ## Volltextsuche und unscharfe Suche
+
+  `LIKE '%whiteboards%'` findet das „große Whiteboard“ nicht: `LIKE` vergleicht Zeichen, keine Wörter, und unterscheidet Groß- und Kleinschreibung. Mit führendem `%` kann es außerdem keinen B-Baum-Index nutzen. Die Volltextsuche zerlegt Text in normalisierte Wortstämme (`tsvector`) und vergleicht sie mit einer Suchanfrage (`tsquery`). Die Konfiguration `german` entfernt Stoppwörter und reduziert Wörter auf ihren Stamm.
+
+  ```postgres run
+  CREATE EXTENSION pg_trgm;
+  CREATE TABLE raeume (
+    id           int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name         text NOT NULL,
+    beschreibung text NOT NULL,
+    suche        tsvector GENERATED ALWAYS AS (to_tsvector('german', name || ' ' || beschreibung)) STORED
+  );
+  CREATE INDEX raeume_suche ON raeume USING gin (suche);
+  INSERT INTO raeume (name, beschreibung) VALUES
+    ('Atelier', 'Heller Meetingraum mit großem Whiteboard und Beamer'),
+    ('Loft',    'Ruhige Ecke unter dem Dach, zwei Whiteboards, kein Beamer'),
+    ('Box 1',   'Schallgedämmte Telefonbox für Videocalls');
+
+  SELECT to_tsvector('german', 'Ruhige Ecke unter dem Dach, zwei Whiteboards');
+  SELECT websearch_to_tsquery('german', 'ruhig whiteboard -telefon');
+  SELECT name FROM raeume
+  WHERE suche @@ websearch_to_tsquery('german', '"zwei whiteboards" OR videocall')
+  ORDER BY name;
+  -- Tippfehler: Volltext findet nichts, Trigramme schon
+  SELECT count(*) FROM raeume WHERE suche @@ websearch_to_tsquery('german', 'Ateleir');
+  SELECT name, round(similarity(name, 'Ateleir')::numeric, 2) AS aehnlichkeit
+  FROM raeume
+  WHERE name % 'Ateleir';
+  ```
+
+  `websearch_to_tsquery` versteht die Syntax eines Suchfelds: Anführungszeichen für Phrasen, `OR`, `-` für „nicht“. Es wirft bei Eingaben von Nutzern keine Syntaxfehler, anders als `to_tsquery` ([Parsing Queries](https://www.postgresql.org/docs/current/textsearch-controls.html#TEXTSEARCH-PARSING-QUERIES)). Die gespeicherte `tsvector`-Spalte mit GIN-Index ist das übliche Muster ([Creating Indexes](https://www.postgresql.org/docs/current/textsearch-tables.html#TEXTSEARCH-TABLES-INDEX)). Ein Ausdrucksindex auf `to_tsvector('german', …)` geht auch und spart Platz, greift aber nur, wenn die Abfrage genau denselben Ausdruck wiederholt. Zwei Grenzen: Der Stemmer zerlegt keine Komposita, „Telefonbox“ wird nicht zu „telefon“, und Tippfehler findet die Volltextsuche nicht.
+
+  Für Tippfehler gibt es die Erweiterung `pg_trgm`. Sie zerlegt Text in Dreiergruppen von Zeichen (Trigramme) und misst die Ähnlichkeit zweier Texte von 0 bis 1. `%` ist wahr, wenn die Ähnlichkeit über der Schwelle `pg_trgm.similarity_threshold` liegt (Standard 0,3). Ein GIN-Index mit `gin_trgm_ops` beschleunigt `%` und auch `LIKE '%…%'` ([pg_trgm](https://www.postgresql.org/docs/current/pgtrgm.html)). Erweiterungen aktivierst du je Datenbank mit `CREATE EXTENSION`; welche verfügbar sind, zeigt `pg_available_extensions`.
+
+  ## Views, Materialized Views und LISTEN/NOTIFY
+
+  Eine **View** ist eine gespeicherte Abfrage: Sie enthält keine Daten und zeigt immer den aktuellen Stand. Eine **Materialized View** speichert das Ergebnis wie eine Tabelle; sie bleibt auf dem alten Stand, bis jemand `REFRESH` ausführt.
+
+  ```postgres run
+  CREATE TABLE buchungen (
+    id     int PRIMARY KEY,
+    raum   text NOT NULL,
+    status text NOT NULL,
+    preis  numeric(8,2) NOT NULL
+  );
+  INSERT INTO buchungen VALUES
+    (1, 'Atelier', 'bestaetigt', 90.00), (2, 'Loft', 'bestaetigt', 120.00),
+    (3, 'Atelier', 'storniert', 45.00),  (4, 'Atelier', 'bestaetigt', 45.00);
+
+  CREATE VIEW bestaetigte_buchungen AS
+    SELECT id, raum, preis FROM buchungen WHERE status = 'bestaetigt';
+  CREATE MATERIALIZED VIEW umsatz_je_raum AS
+    SELECT raum, count(*) AS buchungen, sum(preis) AS umsatz
+    FROM bestaetigte_buchungen
+    GROUP BY raum;
+
+  INSERT INTO buchungen VALUES (5, 'Loft', 'bestaetigt', 60.00);
+  SELECT count(*) AS in_der_view FROM bestaetigte_buchungen;
+  SELECT * FROM umsatz_je_raum ORDER BY raum;
+
+  CREATE UNIQUE INDEX ON umsatz_je_raum (raum);
+  REFRESH MATERIALIZED VIEW CONCURRENTLY umsatz_je_raum;
+  SELECT * FROM umsatz_je_raum ORDER BY raum;
+  ```
+
+  Ein normales `REFRESH` sperrt die Materialized View, Leser warten. `CONCURRENTLY` berechnet neu und tauscht nur die geänderten Zeilen aus, Leser sehen währenddessen den alten Stand. Dafür braucht PostgreSQL einen Unique-Index auf Spalten, ohne `WHERE` und ohne Ausdruck ([REFRESH MATERIALIZED VIEW](https://www.postgresql.org/docs/current/sql-refreshmaterializedview.html)). Fehlt er, meldet es `cannot refresh materialized view … concurrently`. Wer den Refresh auslöst (Cronjob, Worker nach jeder Buchung), entscheidet die Anwendung.
+
+  `LISTEN` und `NOTIFY` schicken Nachrichten zwischen Sitzungen, etwa „neue Buchung“ an einen Dienst, der Bestätigungsmails versendet. Mit psycopg sieht der Empfänger so aus:
+
+  ```python
+  import psycopg
+
+  with psycopg.connect(DSN, autocommit=True) as conn:
+      conn.execute("LISTEN buchungen")
+      for notify in conn.notifies():
+          versende_bestaetigung(int(notify.payload))
+  ```
+
+  Gesendet wird mit `NOTIFY buchungen, '1042'` oder `pg_notify('buchungen', …)`, gern aus einem Trigger. Nachrichten kommen erst beim `COMMIT` an und werden nicht gespeichert: Wer gerade nicht lauscht, verpasst sie ([NOTIFY](https://www.postgresql.org/docs/current/sql-notify.html)). Hinter PgBouncer im Transaction-Modus funktioniert `LISTEN` nicht. Für Aufgaben, die nicht verloren gehen dürfen, ist eine Job-Tabelle mit `FOR UPDATE SKIP LOCKED` robuster ([Isolation und Sperren](/postgres/isolation-sperren)); `NOTIFY` kann sie zusätzlich wecken.
+
+  > [!WARNING] Materialized Views sind Caches
+  > Eine Materialized View zeigt den Stand des letzten `REFRESH`. Steht im Dashboard „Umsatz heute“, muss daneben stehen, wie alt die Zahl ist. Für Werte, die sofort stimmen müssen, nimm eine normale View oder eine Abfrage mit passendem Index.
+
+  ## Häufige Fehler
+
+  - **`->` statt `->>` im Vergleich.** `einstellungen -> 'sprache' = 'de'` scheitert mit `invalid input syntax for type json`, weil `'de'` als JSON gelesen wird. Für Text `->>`, für JSON-Werte `@>`.
+  - **Strings statt Booleans in JSON.** `{"email": "true"}` passt nicht auf `@> '{"email": true}'`. Validiere JSON in der App oder mit einem `CHECK`.
+  - **`jsonb_set` auf fehlendem Zwischenpfad.** Das Dokument bleibt unverändert, ohne Fehler. Zwischenobjekte vorher anlegen oder mit `||` zusammenführen.
+  - **Arrays statt Tabellen.** Listen mit eigenen Attributen oder Verweisen auf andere Tabellen gehören in eine Verbindungstabelle.
+  - **Geschlossene Ranges.** `tstzrange(beginn, ende, '[]')` lässt aneinandergrenzende Buchungen überlappen. Bleib bei `[)`.
+  - **Virtuelle Spalte mit Index.** Geht in PostgreSQL 18 nicht. Spalten, die einen Index brauchen, als `STORED` anlegen.
+  - **`BY DEFAULT`-Identity und Import.** Feste IDs beim Import bringen die Sequenz durcheinander. `ALWAYS` nehmen oder die Sequenz nach dem Import mit `setval` nachziehen.
+  - **Enum-Wert entfernen.** Geht nicht. Für Listen, die schrumpfen, eine Lookup-Tabelle wählen.
+  - **Volltext-Spalte ohne `coalesce`.** Ist eine Teilspalte `NULL`, wird der ganze Ausdruck `NULL`, und die Zeile ist unauffindbar.
+  - **`REFRESH … CONCURRENTLY` ohne Unique-Index.** Index auf Spalten anlegen, ohne `WHERE`.
+
+  ## Zusammenfassung
+
+  - `jsonb` für flexible Dokumente, Spalten für alles mit Typ, Fremdschlüssel oder Regel. `->` liefert JSON, `->>` Text, `@>` prüft typgenau.
+  - Arrays für kurze Etikettenlisten: `ANY`, `@>`, `unnest`, `array_agg`. Arrays zählen ab 1.
+  - Ranges speichern Zeiträume halboffen `[)`. `&&`, `@>` und `-|-` vergleichen sie; `timestamptz` rechnet über die Zeitumstellung richtig.
+  - Generierte Spalten: `STORED` für Indexe, `VIRTUAL` (Standard seit PostgreSQL 18) spart Platz. Nur `IMMUTABLE`-Ausdrücke.
+  - Identity statt `serial`; `uuidv7()` (PostgreSQL 18) für zeitlich sortierte UUIDs, die den Erstellungszeitpunkt verraten.
+  - Enums sind geordnet und erweiterbar, aber nicht verkleinerbar.
+  - Volltext: `to_tsvector('german', …) @@ websearch_to_tsquery('german', …)` mit gespeicherter `tsvector`-Spalte und GIN-Index; Tippfehler mit `pg_trgm`.
+  - Views sind immer aktuell, Materialized Views sind Caches; `REFRESH … CONCURRENTLY` braucht einen Unique-Index. `NOTIFY` weckt, speichert aber nichts.
+exercises:
+  - id: jsonb-oder-spalte
+    type: choice
+    title: Was gehört in JSONB?
+    prompt: |
+      Deskwerk überlegt, mehr Daten in `jsonb`-Spalten zu legen. Welche Aussagen stimmen? Mehrere Antworten sind richtig.
+    options:
+      - text: Benachrichtigungs- und Oberflächeneinstellungen eines Mitglieds passen in `mitglieder.einstellungen jsonb`.
+        correct: true
+        why: Die Struktur ändert sich mit jeder App-Version, die App liest die Einstellungen als Ganzes, und keine andere Tabelle verweist darauf.
+      - text: "Eine Abfrage mit `WHERE einstellungen @> '{\"benachrichtigungen\": {\"push\": true}}'` kann ein GIN-Index auf `einstellungen` beschleunigen."
+        correct: true
+        why: "Beide GIN-Operatorklassen für `jsonb` (`jsonb_ops` und `jsonb_path_ops`) unterstützen `@>`."
+      - text: "`buchungen.preis` gehört in `details jsonb`, weil sich das Preismodell noch ändern kann."
+        correct: false
+        why: Preise brauchen `numeric`, `NOT NULL`, `CHECK` und Summen. In JSON ist der Preis eine Zahl ohne feste Nachkommastellen oder ein String, und nichts verhindert einen fehlenden Wert.
+      - text: "Die Teilnehmer einer Buchung als `{\"teilnehmer\": [12, 17]}` zu speichern spart die Verbindungstabelle ohne Nachteile."
+        correct: false
+        why: Elemente in JSON können keine Fremdschlüssel tragen. Gelöschte Mitglieder bleiben in der Liste stehen, und „Buchungen von Mitglied 12“ wird eine Suche über alle Dokumente.
+      - text: "`jsonb` bewahrt Schlüsselreihenfolge und doppelte Schlüssel, `json` nicht."
+        correct: false
+        why: Umgekehrt. `json` speichert den Text unverändert, `jsonb` normalisiert ihn, und bei doppelten Schlüsseln bleibt der letzte.
+    explanation: |
+      JSONB lohnt sich für Daten, deren Struktur flexibel ist und die als Ganzes gelesen werden. Sobald ein Wert einen Typ mit Rechenregeln, eine Pflicht, einen `CHECK` oder einen Fremdschlüssel braucht, ist er eine Spalte oder eine Tabelle. Filtern nach Inhalten geht trotzdem effizient: `@>`, `?` und `@?` nutzen GIN-Indexe.
+    resources:
+      - title: PostgreSQL · Designing JSON Documents
+        url: https://www.postgresql.org/docs/current/datatype-json.html#JSON-DOC-DESIGN
+      - title: PostgreSQL · jsonb Indexing
+        url: https://www.postgresql.org/docs/current/datatype-json.html#JSON-INDEXING
+
+  - id: jsonb-vorhersagen
+    type: output
+    title: Pfeil oder Doppelpfeil?
+    prompt: |
+      Was geben die drei Abfragen aus? Ausgabe wie `psql -At`: Werte durch `|`, `NULL` leer, `t`/`f`, keine Kopfzeilen. Die Ergebnisse stehen direkt untereinander.
+    lang: postgres
+    code: |
+      CREATE TABLE mitglieder (id int PRIMARY KEY, einstellungen jsonb NOT NULL);
+      INSERT INTO mitglieder VALUES
+        (1, '{"sprache": "de", "push": true,   "lieblingsraeume": [3, 7]}'),
+        (2, '{"sprache": "en", "push": "true", "sprache": "de"}'),
+        (3, '{"lieblingsraeume": []}');
+
+      SELECT id,
+             einstellungen -> 'sprache',
+             einstellungen ->> 'sprache',
+             einstellungen -> 'lieblingsraeume' ->> 1
+      FROM mitglieder
+      ORDER BY id;
+
+      SELECT string_agg(id::text, ',' ORDER BY id)
+      FROM mitglieder
+      WHERE einstellungen @> '{"push": true}';
+
+      SELECT einstellungen ? 'push',
+             einstellungen -> 'lieblingsraeume' @> '7',
+             jsonb_set(einstellungen, '{push}', 'false') ->> 'push'
+      FROM mitglieder
+      WHERE id = 3;
+    expected: |
+      1|"de"|de|7
+      2|"de"|de|
+      3|||
+      1
+      f|f|false
+    hints:
+      - "`->` liefert JSON, also einen String mit Anführungszeichen. JSON-Arrays zählen ab 0."
+      - Mitglied 2 hat den Schlüssel `sprache` zweimal. Was macht `jsonb` beim Speichern daraus?
+      - "`jsonb_set` legt das letzte Element des Pfads an, wenn es fehlt."
+    explanation: |
+      `->` gibt `jsonb` zurück, deshalb steht `"de"` in Anführungszeichen; `->>` liefert den Text `de`. Bei doppelten Schlüsseln behält `jsonb` den letzten, Mitglied 2 hat also `de`. `->> 1` greift auf das zweite Element zu, weil JSON-Arrays ab 0 zählen; fehlt der Index oder der Schlüssel, entsteht `NULL`. `@>` vergleicht typgenau: Der String `"true"` von Mitglied 2 enthält nicht das Boolean `true`. Für Mitglied 3 fehlt `push`, das leere Array enthält die 7 nicht, und `jsonb_set` legt den fehlenden Schlüssel `push` an, weil er direkt auf oberster Ebene liegt.
+    resources:
+      - title: PostgreSQL · jsonb-Operatoren
+        url: https://www.postgresql.org/docs/current/functions-json.html#FUNCTIONS-JSONB-OP-TABLE
+      - title: PostgreSQL · jsonb Containment
+        url: https://www.postgresql.org/docs/current/datatype-json.html#JSON-CONTAINMENT
+
+  - id: ranges-vorhersagen
+    type: output
+    title: Grenzfälle mit Zeiträumen
+    prompt: |
+      Was geben die vier Abfragen aus? Ausgabe wie `psql -At`: Werte durch `|`, `NULL` leer, `t`/`f`, keine Kopfzeilen. Die Sitzung läuft in `Europe/Berlin`; `timestamptz` erscheint als `2026-03-02 09:00:00+01`, Intervalle als `01:30:00`.
+    lang: postgres
+    code: |
+      SELECT tstzrange('2026-03-02 09:00', '2026-03-02 11:00') && tstzrange('2026-03-02 11:00', '2026-03-02 12:00'),
+             tstzrange('2026-03-02 09:00', '2026-03-02 11:00', '[]') && tstzrange('2026-03-02 11:00', '2026-03-02 12:00'),
+             tstzrange('2026-03-02 09:00', '2026-03-02 11:00') @> timestamptz '2026-03-02 11:00';
+
+      SELECT lower(r), upper(r) - lower(r)
+      FROM (VALUES (tstzrange('2026-03-28 20:00', '2026-03-29 08:00'))) AS t (r);
+
+      SELECT isempty(tstzrange('2026-03-02 10:00', '2026-03-02 10:00')),
+             upper(tstzrange('2026-03-02 10:00', NULL)),
+             daterange('2026-03-01', '2026-03-31', '[]');
+
+      SELECT tstzrange('2026-03-02 09:00', '2026-03-02 12:00') * tstzrange('2026-03-02 11:00', '2026-03-02 14:00');
+    expected: |
+      f|t|f
+      2026-03-28 20:00:00+01|11:00:00
+      t||[2026-03-01,2026-04-01)
+      ["2026-03-02 11:00:00+01","2026-03-02 12:00:00+01")
+    hints:
+      - Ohne dritten Parameter ist eine Range `[)`. Was ändert `'[]'` an der oberen Grenze?
+      - In der Nacht vom 28. auf den 29. März 2026 werden die Uhren in Deutschland vorgestellt.
+      - "`daterange` ist diskret: PostgreSQL speichert solche Ranges in der Form `[)`. `*` bildet die Schnittmenge."
+    explanation: |
+      Halboffene Zeiträume 9–11 und 11–12 berühren sich nur, deshalb ist `&&` falsch und 11 Uhr nicht in der ersten Range. Mit `'[]'` gehört 11 Uhr zur ersten Range, und beide überlappen – genau der Fehler, der aneinandergrenzende Buchungen blockiert. Von 20 bis 8 Uhr sind es über die Zeitumstellung nur elf Stunden. Eine Range mit gleicher unterer und oberer Grenze ist bei `[)` leer. `NULL` als Grenze bedeutet „unbegrenzt“, `upper` liefert dann `NULL`. Die geschlossene `daterange` bis 31. März wird kanonisch `[2026-03-01,2026-04-01)`. `*` liefert den gemeinsamen Teil 11–12 Uhr.
+    resources:
+      - title: PostgreSQL · Range-Operatoren
+        url: https://www.postgresql.org/docs/current/functions-range.html#RANGE-OPERATORS-TABLE
+      - title: PostgreSQL · Discrete Range Types
+        url: https://www.postgresql.org/docs/current/rangetypes.html#RANGETYPES-DISCRETE
+
+  - id: arrays-und-enums-vorhersagen
+    type: output
+    title: Reihenfolge und Indizes
+    prompt: |
+      Was geben die drei Abfragen aus? Ausgabe wie `psql -At`: Werte durch `|`, `NULL` leer, keine Kopfzeilen. Die Ergebnisse stehen direkt untereinander.
+    lang: postgres
+    code: |
+      CREATE TYPE raumart AS ENUM ('telefonbox', 'schreibtisch', 'meetingraum');
+      CREATE TABLE raeume (
+        name        text    NOT NULL,
+        art         raumart NOT NULL,
+        ausstattung text[]  NOT NULL
+      );
+      INSERT INTO raeume VALUES
+        ('Loft',    'meetingraum',  '{whiteboard,beamer}'),
+        ('Box 1',   'telefonbox',   '{}'),
+        ('Atelier', 'meetingraum',  '{beamer,whiteboard}'),
+        ('Platz 4', 'schreibtisch', '{monitor}');
+
+      SELECT name FROM raeume ORDER BY art, name;
+
+      SELECT ausstattung[0], ausstattung[1], cardinality(ausstattung), array_length(ausstattung, 1)
+      FROM raeume
+      WHERE name IN ('Loft', 'Box 1')
+      ORDER BY name;
+
+      SELECT count(*) FILTER (WHERE ausstattung = '{beamer,whiteboard}'),
+             count(*) FILTER (WHERE ausstattung @> '{beamer,whiteboard}'),
+             count(*) FILTER (WHERE art > 'telefonbox')
+      FROM raeume;
+    expected: |
+      Box 1
+      Platz 4
+      Atelier
+      Loft
+      ||0|
+      |whiteboard|2|2
+      1|2|3
+    hints:
+      - Ein Enum sortiert in der Reihenfolge, in der die Werte bei `CREATE TYPE` stehen.
+      - PostgreSQL-Arrays beginnen bei 1. Was liefert ein Index außerhalb des Arrays?
+      - "`=` vergleicht Arrays Element für Element in ihrer Reihenfolge, `@>` behandelt sie wie Mengen."
+    explanation: |
+      `ORDER BY art` folgt der Enum-Definition: `telefonbox` vor `schreibtisch` vor `meetingraum`, bei Gleichstand entscheidet der Name. `ausstattung[0]` gibt es nicht, PostgreSQL liefert ohne Fehler `NULL`. Für das leere Array ist `cardinality` 0, `array_length` aber `NULL` – eine bekannte Falle in Bedingungen wie `array_length(…, 1) = 0`. `=` vergleicht Arrays elementweise, deshalb ist nur das Atelier gleich `{beamer,whiteboard}`, während `@>` auch das Loft mit umgekehrter Reihenfolge findet. `art > 'telefonbox'` zählt alle Räume, deren Art in der Definition später kommt: drei.
+    resources:
+      - title: PostgreSQL · Array-Funktionen
+        url: https://www.postgresql.org/docs/current/functions-array.html#ARRAY-FUNCTIONS-TABLE
+      - title: PostgreSQL · Enum Ordering
+        url: https://www.postgresql.org/docs/current/datatype-enum.html#DATATYPE-ENUM-ORDERING
+
+  - id: email-benachrichtigungen
+    type: sql
+    lang: postgres
+    title: Wer bekommt die Newsletter-Mail?
+    prompt: |
+      Der Mailversand braucht alle Mitglieder, bei denen in `einstellungen` unter `benachrichtigungen` der Schlüssel `email` den JSON-Wert `true` (Boolean) hat. Andere Werte wie der String `"true"` zählen nicht. Dazu die Sprache aus dem Schlüssel `sprache`; fehlt er, gilt `de`.
+
+      Spalten: `name`, `sprache` (Text). Sortierung: `name` aufsteigend.
+    schema: |
+      CREATE TABLE mitglieder (
+        id            int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        name          text  NOT NULL,
+        einstellungen jsonb NOT NULL DEFAULT '{}'
+      );
+      INSERT INTO mitglieder (name, einstellungen) VALUES
+        ('Anna Krüger',   '{"sprache": "de", "benachrichtigungen": {"email": true, "push": false}}'),
+        ('Mehmet Yılmaz', '{"sprache": "en", "benachrichtigungen": {"email": true}}'),
+        ('Lena Vogel',    '{"benachrichtigungen": {"email": true}}'),
+        ('Jonas Weber',   '{"sprache": "de", "benachrichtigungen": {"email": "true"}}'),
+        ('Sophie Becker', '{"sprache": "en", "benachrichtigungen": {"email": false, "push": true}}'),
+        ('Paul Schulz',   '{}'),
+        ('Emine Kaya',    '{"sprache": "tr", "benachrichtigungen": {"push": true, "email": true}, "email": false}');
+    starter: |
+      SELECT name, einstellungen
+      FROM mitglieder
+      ORDER BY name;
+    solution: |
+      SELECT name,
+             coalesce(einstellungen ->> 'sprache', 'de') AS sprache
+      FROM mitglieder
+      WHERE einstellungen @> '{"benachrichtigungen": {"email": true}}'
+      ORDER BY name;
+    ordered: true
+    hints:
+      - "`->>` liefert Text, damit wird der Boolean `true` zu `'true'` – genau wie der String `\"true\"`. Welcher Operator vergleicht typgenau?"
+      - "`@>` mit einem verschachtelten Dokument: `'{\"benachrichtigungen\": {\"email\": true}}'`."
+      - "`coalesce(einstellungen ->> 'sprache', 'de') AS sprache`."
+    explanation: |
+      `@>` prüft, ob das Dokument die angegebene Struktur mit genau diesen Typen enthält. So bleibt Jonas mit dem String `"true"` draußen, und Emines zusätzlicher Schlüssel `email` auf oberster Ebene stört nicht. Ein Vergleich über `#>> '{benachrichtigungen,email}' = 'true'` würde Jonas mitnehmen, weil `#>>` beide Werte in denselben Text verwandelt. `(einstellungen #> '{benachrichtigungen,email}')::boolean` scheitert an Jonas' Zeile mit `cannot cast jsonb string to type boolean`. Mit `= 'true'::jsonb` auf den Pfad ist der Vergleich ebenfalls typgenau. `@>` kann zusätzlich einen GIN-Index nutzen. `coalesce` setzt die Standardsprache für Lena.
+    resources:
+      - title: PostgreSQL · jsonb Containment
+        url: https://www.postgresql.org/docs/current/datatype-json.html#JSON-CONTAINMENT
+      - title: PostgreSQL · jsonb-Operatoren
+        url: https://www.postgresql.org/docs/current/functions-json.html#FUNCTIONS-JSONB-OP-TABLE
+
+  - id: ausstattung-filterseite
+    type: sql
+    lang: postgres
+    title: Filter für die Raumsuche
+    prompt: |
+      Die Filterseite der Raumsuche zeigt je Ausstattungsmerkmal, wie viele Räume es haben, und ihre Namen. Ein Raum zählt je Merkmal einmal, auch wenn das Merkmal versehentlich doppelt in seinem Array steht. Räume ohne Ausstattung erscheinen nicht.
+
+      Spalten: `merkmal`, `raeume` (Anzahl), `namen` (Array `text[]` der Raumnamen, alphabetisch, ohne Duplikate). Sortierung: `raeume` absteigend, bei Gleichstand `merkmal` aufsteigend.
+    schema: |
+      CREATE TABLE raeume (
+        id          int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        standort    text   NOT NULL,
+        name        text   NOT NULL,
+        ausstattung text[] NOT NULL DEFAULT '{}'
+      );
+      INSERT INTO raeume (standort, name, ausstattung) VALUES
+        ('Plagwitz',    'Atelier',  '{beamer,whiteboard}'),
+        ('Plagwitz',    'Werkbank', '{whiteboard,whiteboard,stehtisch}'),
+        ('Plagwitz',    'Box 1',    '{}'),
+        ('Südvorstadt', 'Loft',     '{beamer,stehtisch,whiteboard}'),
+        ('Südvorstadt', 'Kammer',   '{monitor}'),
+        ('Zentrum',     'Salon',    '{beamer,whiteboard,monitor}'),
+        ('Zentrum',     'Box 2',    '{}');
+    starter: |
+      SELECT name, ausstattung
+      FROM raeume
+      ORDER BY name;
+    solution: |
+      SELECT a.merkmal,
+             count(DISTINCT r.id) AS raeume,
+             array_agg(DISTINCT r.name ORDER BY r.name) AS namen
+      FROM raeume AS r
+      CROSS JOIN unnest(r.ausstattung) AS a (merkmal)
+      GROUP BY a.merkmal
+      ORDER BY raeume DESC, a.merkmal;
+    ordered: true
+    hints:
+      - "`unnest(r.ausstattung)` im `FROM` erzeugt je Raum eine Zeile pro Element. Danach gruppierst du nach dem Element."
+      - Die Werkbank hat `whiteboard` zweimal im Array. Wie oft steht sie nach `unnest` in der Gruppe `whiteboard`?
+      - "`count(DISTINCT r.id)` und `array_agg(DISTINCT r.name ORDER BY r.name)`."
+    explanation: |
+      `unnest` im `FROM` macht aus jedem Array-Element eine eigene Zeile, der Raum wird dabei wiederholt – ein Fan-out wie bei einem Join. Räume mit leerem Array erzeugen keine Zeile und fallen weg. Weil die Werkbank `whiteboard` doppelt enthält, stünde sie ohne `DISTINCT` zweimal in der Gruppe, Anzahl 5 statt 4. `array_agg(DISTINCT … ORDER BY …)` sammelt jeden Namen einmal in alphabetischer Reihenfolge; bei `DISTINCT` muss der `ORDER BY`-Ausdruck der aggregierte Ausdruck sein. Das doppelte Element ist zugleich ein Hinweis auf die Grenze von Arrays: Eine Verbindungstabelle mit Primärschlüssel hätte es verhindert.
+    resources:
+      - title: PostgreSQL · Array-Funktionen (unnest, cardinality)
+        url: https://www.postgresql.org/docs/current/functions-array.html#ARRAY-FUNCTIONS-TABLE
+      - title: PostgreSQL · Aggregate Expressions
+        url: https://www.postgresql.org/docs/current/sql-expressions.html#SYNTAX-AGGREGATES
+
+  - id: freie-meetingraeume
+    type: sql
+    lang: postgres
+    title: Welcher Meetingraum ist frei?
+    prompt: |
+      Gesucht sind alle Meetingräume (`art = 'meetingraum'`), die am **2. März 2026 von 10 bis 12 Uhr** frei sind. Ein Raum ist belegt, wenn eine **bestätigte** Buchung sich mit diesem Zeitraum überschneidet. Eine Buchung, die genau um 10 Uhr endet oder um 12 Uhr beginnt, stört nicht.
+
+      Spalte: `name`. Sortierung: `name` aufsteigend.
+    schema: |
+      CREATE TABLE raeume (
+        id   int PRIMARY KEY,
+        name text NOT NULL,
+        art  text NOT NULL
+      );
+      CREATE TABLE buchungen (
+        id       bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        raum_id  int       NOT NULL REFERENCES raeume (id),
+        zeitraum tstzrange NOT NULL,
+        status   text      NOT NULL DEFAULT 'bestaetigt'
+      );
+      INSERT INTO raeume VALUES
+        (1, 'Atelier', 'meetingraum'), (2, 'Loft', 'meetingraum'), (3, 'Salon', 'meetingraum'),
+        (4, 'Kammer', 'meetingraum'), (5, 'Werkbank', 'meetingraum'), (6, 'Box 1', 'telefonbox');
+      INSERT INTO buchungen (raum_id, zeitraum, status) VALUES
+        (1, '[2026-03-02 08:00, 2026-03-02 10:00)', 'bestaetigt'),
+        (2, '[2026-03-02 11:59, 2026-03-02 13:00)', 'bestaetigt'),
+        (3, '[2026-03-02 09:00, 2026-03-02 17:00)', 'storniert'),
+        (4, '[2026-03-02 10:30, 2026-03-02 11:00)', 'bestaetigt'),
+        (5, '[2026-03-02 12:00, 2026-03-02 14:00)', 'bestaetigt'),
+        (5, '[2026-03-03 10:00, 2026-03-03 12:00)', 'bestaetigt'),
+        (6, '[2026-03-02 10:00, 2026-03-02 12:00)', 'bestaetigt');
+    starter: |
+      SELECT r.name
+      FROM raeume AS r
+      JOIN buchungen AS b ON b.raum_id = r.id
+      ORDER BY r.name;
+    solution: |
+      SELECT r.name
+      FROM raeume AS r
+      WHERE r.art = 'meetingraum'
+        AND NOT EXISTS (
+          SELECT 1
+          FROM buchungen AS b
+          WHERE b.raum_id = r.id
+            AND b.status = 'bestaetigt'
+            AND b.zeitraum && tstzrange('2026-03-02 10:00', '2026-03-02 12:00')
+        )
+      ORDER BY r.name;
+    ordered: true
+    hints:
+      - Gesucht sind Räume, für die **keine** störende Buchung existiert – ein Anti-Join mit `NOT EXISTS`.
+      - "`&&` prüft die Überschneidung zweier Ranges. Baue das Suchfenster mit `tstzrange('2026-03-02 10:00', '2026-03-02 12:00')`."
+      - Stornierte Buchungen gehören in die Bedingung der Unterabfrage, nicht ins äußere `WHERE`.
+    explanation: |
+      Frei ist ein Raum, wenn keine bestätigte Buchung das Fenster überschneidet, also ein Anti-Join mit `NOT EXISTS`. `&&` mit zwei halboffenen Ranges erledigt alle Grenzfälle: Das Atelier endet um 10 Uhr und ist frei, die Werkbank beginnt um 12 Uhr und ist frei, ihre Buchung am Folgetag spielt keine Rolle. Das Loft ab 11:59 Uhr und die Kammer mittendrin sind belegt. Die stornierte Buchung im Salon zählt nicht. Selbstgebaute Vergleiche wie `beginn <= '12:00' AND ende >= '10:00'` machen aus dem Atelier und der Werkbank fälschlich belegte Räume. Mit einem GiST-Index auf `(raum_id, zeitraum)` und `btree_gist` bleibt diese Abfrage auch bei vielen Buchungen schnell.
+    resources:
+      - title: PostgreSQL · Range-Operatoren
+        url: https://www.postgresql.org/docs/current/functions-range.html#RANGE-OPERATORS-TABLE
+      - title: PostgreSQL · EXISTS
+        url: https://www.postgresql.org/docs/current/functions-subquery.html#FUNCTIONS-SUBQUERY-EXISTS
+
+  - id: generierte-spalten-anlegen
+    type: sql
+    lang: postgres
+    title: Brutto und Zeitraum, die nie veralten
+    prompt: |
+      Bisher berechnet die App `brutto` und den Zeitraum einer Buchung selbst, und alte Datensätze sind inkonsistent. Ergänze `buchungen` um zwei generierte Spalten:
+
+      - `brutto numeric(8,2)`: `netto` mal 1,19, auf zwei Stellen gerundet. Ob gespeichert oder virtuell, entscheidest du.
+      - `zeitraum tstzrange`: halboffen von `beginn` bis `ende`. Die Spalte bekommt später einen GiST-Index und muss deshalb **gespeichert** sein.
+
+      Die Prüfabfrage zeigt die Werte, versucht eine neue Buchung und versucht, beide Spalten direkt zu setzen; `428C9` ist der Fehlercode für „generierte Spalte darf nicht geschrieben werden“.
+    schema: |
+      CREATE TABLE buchungen (
+        id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        raum_id int          NOT NULL,
+        beginn  timestamptz  NOT NULL,
+        ende    timestamptz  NOT NULL CHECK (ende > beginn),
+        netto   numeric(8,2) NOT NULL
+      );
+      INSERT INTO buchungen (raum_id, beginn, ende, netto) VALUES
+        (1, '2026-03-02 09:00+01', '2026-03-02 11:30+01', 60.00),
+        (2, '2026-03-28 20:00+01', '2026-03-29 08:00+02', 33.33),
+        (3, '2026-04-01 14:00+02', '2026-04-01 15:00+02', 4.90);
+    starter: |
+      ALTER TABLE buchungen
+        ADD COLUMN brutto numeric(8,2),
+        ADD COLUMN zeitraum tstzrange;
+      UPDATE buchungen
+      SET brutto = round(netto * 1.19, 2),
+          zeitraum = tstzrange(beginn, ende);
+    solution: |
+      ALTER TABLE buchungen
+        ADD COLUMN brutto numeric(8,2) GENERATED ALWAYS AS (round(netto * 1.19, 2)) VIRTUAL,
+        ADD COLUMN zeitraum tstzrange GENERATED ALWAYS AS (tstzrange(beginn, ende)) STORED;
+    check: |
+      SELECT pruefung, ergebnis
+      FROM (VALUES
+        ('Werte',            (SELECT string_agg(id || ': ' || brutto || ' ' || zeitraum, '; ' ORDER BY id) FROM buchungen)),
+        ('Neue Buchung',     lp.versuch($$INSERT INTO buchungen (raum_id, beginn, ende, netto) VALUES (1, '2026-03-03 09:00+01', '2026-03-03 10:00+01', 24.00)$$)),
+        ('brutto setzen',    lp.versuch($$UPDATE buchungen SET brutto = 10 WHERE id = 1$$)),
+        ('zeitraum setzen',  lp.versuch($$UPDATE buchungen SET zeitraum = tstzrange(beginn, ende) WHERE id = 1$$)),
+        ('Art von zeitraum', (SELECT CASE attgenerated WHEN 's' THEN 'stored' WHEN 'v' THEN 'virtual' ELSE 'normal' END
+                              FROM pg_attribute WHERE attrelid = 'buchungen'::regclass AND attname = 'zeitraum'))
+      ) AS p (pruefung, ergebnis);
+    hints:
+      - Der Starter rechnet einmal und speichert normale Werte – jede spätere Änderung an `netto` macht `brutto` falsch, und niemand hindert die App, Unsinn hineinzuschreiben.
+      - "`ADD COLUMN … GENERATED ALWAYS AS (ausdruck) STORED` bzw. `VIRTUAL`. Ohne Angabe ist eine generierte Spalte in PostgreSQL 18 virtuell."
+      - "`brutto numeric(8,2) GENERATED ALWAYS AS (round(netto * 1.19, 2))` und `zeitraum tstzrange GENERATED ALWAYS AS (tstzrange(beginn, ende)) STORED`."
+    explanation: |
+      Eine generierte Spalte macht die Berechnung zur Eigenschaft des Schemas: Jeder Schreibzugriff, auch aus einem zweiten Dienst oder einem Skript, bekommt denselben Wert, und direktes Setzen scheitert mit SQLSTATE `428C9`. `brutto` darf virtuell sein; es wird beim Lesen berechnet und belegt keinen Platz. `zeitraum` muss `STORED` sein, weil PostgreSQL 18 keine Indexe auf virtuellen generierten Spalten erlaubt. `round`, `*` und `tstzrange` sind `IMMUTABLE` und deshalb erlaubt. Die Buchung über die Zeitumstellung zeigt, dass die Range echte Zeitpunkte speichert; die Ausgabe zeigt jeden mit dem Offset, der in Berlin zu diesem Zeitpunkt galt (`+01` bzw. `+02`).
+    resources:
+      - title: PostgreSQL · Generated Columns
+        url: https://www.postgresql.org/docs/current/ddl-generated-columns.html
+      - title: PostgreSQL · CREATE TABLE – GENERATED ALWAYS AS
+        url: https://www.postgresql.org/docs/current/sql-createtable.html#SQL-CREATETABLE-PARMS-GENERATED-STORED
+
+  - id: volltextsuche-einrichten
+    type: sql
+    lang: postgres
+    title: Eine Suche, die Wortformen versteht
+    prompt: |
+      Richte für `raeume` eine deutsche Volltextsuche ein:
+
+      - Neue Spalte `suche` vom Typ `tsvector`, automatisch aus `name` und `beschreibung` berechnet und gespeichert, mit der Konfiguration `german`.
+      - `beschreibung` darf `NULL` sein; solche Räume müssen über ihren Namen trotzdem auffindbar sein.
+      - Ein GIN-Index auf `suche`.
+
+      Die Prüfabfrage sucht mit `websearch_to_tsquery('german', …)` und prüft Spaltenart und Index.
+    schema: |
+      CREATE TABLE raeume (
+        id           int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        name         text NOT NULL,
+        beschreibung text
+      );
+      INSERT INTO raeume (name, beschreibung) VALUES
+        ('Atelier',  'Heller Meetingraum mit großem Whiteboard und Beamer'),
+        ('Loft',     'Ruhige Ecke unter dem Dach, zwei Whiteboards, kein Beamer'),
+        ('Box 1',    'Schallgedämmte Telefonbox für Videocalls'),
+        ('Kammer',   NULL),
+        ('Werkbank', 'Ruhiger Projektraum mit Stehtischen');
+    starter: |
+      ALTER TABLE raeume ADD COLUMN suche tsvector;
+    solution: |
+      ALTER TABLE raeume
+        ADD COLUMN suche tsvector
+        GENERATED ALWAYS AS (to_tsvector('german', name || ' ' || coalesce(beschreibung, ''))) STORED;
+      CREATE INDEX raeume_suche ON raeume USING gin (suche);
+    check: |
+      SELECT pruefung, ergebnis
+      FROM (VALUES
+        ('whiteboard',    (SELECT string_agg(name, ', ' ORDER BY name) FROM raeume WHERE suche @@ websearch_to_tsquery('german', 'whiteboard'))),
+        ('ruhig -beamer', (SELECT string_agg(name, ', ' ORDER BY name) FROM raeume WHERE suche @@ websearch_to_tsquery('german', 'ruhig -beamer'))),
+        ('kammer',        (SELECT string_agg(name, ', ' ORDER BY name) FROM raeume WHERE suche @@ websearch_to_tsquery('german', 'kammer'))),
+        ('Neuer Raum',    lp.versuch($$INSERT INTO raeume (name) VALUES ('Box 2')$$)),
+        ('Spaltenart',    (SELECT CASE attgenerated WHEN 's' THEN 'stored' WHEN 'v' THEN 'virtual' ELSE 'normal' END
+                           FROM pg_attribute WHERE attrelid = 'raeume'::regclass AND attname = 'suche')),
+        ('GIN-Index',     (SELECT CASE WHEN count(*) > 0 THEN 'vorhanden' ELSE 'fehlt' END
+                           FROM pg_indexes WHERE tablename = 'raeume' AND indexdef LIKE '%USING gin (suche)%'))
+      ) AS p (pruefung, ergebnis);
+    hints:
+      - "`to_tsvector('german', text)` ist `IMMUTABLE` und darf in eine generierte Spalte. Der Index braucht eine gespeicherte Spalte: `STORED`."
+      - Was ergibt `'Kammer' || ' ' || NULL`?
+      - "`GENERATED ALWAYS AS (to_tsvector('german', name || ' ' || coalesce(beschreibung, ''))) STORED`, danach `CREATE INDEX … USING gin (suche)`."
+    explanation: |
+      Die generierte `tsvector`-Spalte hält den Suchindex automatisch aktuell, der GIN-Index macht `@@` schnell. `STORED` ist Pflicht, weil PostgreSQL 18 virtuelle Spalten nicht indexiert. Ohne `coalesce` macht die Verkettung mit `NULL` den ganzen Ausdruck `NULL`, und die Kammer wäre unauffindbar. `concat_ws` wäre bequemer, ist aber nur `STABLE` und wird in generierten Spalten abgelehnt. Die Suche nach „whiteboard“ findet auch „Whiteboards“, weil beide auf denselben Stamm reduziert werden. „ruhig -beamer“ schließt das Loft aus, obwohl dort „kein Beamer“ steht: Die Volltextsuche versteht Wörter, keine Verneinung. Wer Name und Beschreibung verschieden gewichten will, kombiniert `setweight(to_tsvector('german', name), 'A') || setweight(…, 'B')` – das Suchergebnis bleibt dasselbe, nur `ts_rank` ändert sich.
+    resources:
+      - title: PostgreSQL · Creating Indexes for Text Search
+        url: https://www.postgresql.org/docs/current/textsearch-tables.html#TEXTSEARCH-TABLES-INDEX
+      - title: PostgreSQL · Parsing Queries (websearch_to_tsquery)
+        url: https://www.postgresql.org/docs/current/textsearch-controls.html#TEXTSEARCH-PARSING-QUERIES
+
+  - id: umsatz-materialisieren
+    type: sql
+    lang: postgres
+    title: Ein Dashboard, das nicht blockiert
+    prompt: |
+      Das Dashboard rechnet bei jedem Aufruf den Umsatz je Raum und Monat aus allen Buchungen. Lege stattdessen eine **Materialized View** `umsatz_je_raum_monat` an, die ein Cronjob mit `REFRESH MATERIALIZED VIEW CONCURRENTLY` aktualisieren kann, ohne Leser zu blockieren.
+
+      Spalten: `raum_id`, `monat` (Typ `date`, erster Tag des Monats nach Berliner Zeit), `buchungen` (Anzahl), `umsatz` (Summe von `preis`). Es zählen nur bestätigte Buchungen; der Monat richtet sich nach `beginn`.
+
+      Die Prüfabfrage zeigt den Inhalt und prüft, ob es einen Unique-Index gibt, mit dem `REFRESH … CONCURRENTLY` arbeiten kann.
+    schema: |
+      CREATE TABLE raeume (
+        id   int PRIMARY KEY,
+        name text NOT NULL
+      );
+      CREATE TABLE buchungen (
+        id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        raum_id int          NOT NULL REFERENCES raeume (id),
+        beginn  timestamptz  NOT NULL,
+        ende    timestamptz  NOT NULL,
+        status  text         NOT NULL DEFAULT 'bestaetigt',
+        preis   numeric(8,2) NOT NULL
+      );
+      INSERT INTO raeume VALUES (1, 'Atelier'), (2, 'Loft'), (3, 'Box 1');
+      INSERT INTO buchungen (raum_id, beginn, ende, status, preis) VALUES
+        (1, '2026-03-02 09:00+01', '2026-03-02 11:00+01', 'bestaetigt', 90.00),
+        (1, '2026-03-05 14:00+01', '2026-03-05 15:00+01', 'storniert',  45.00),
+        (2, '2026-03-03 10:00+01', '2026-03-03 13:00+01', 'bestaetigt', 120.00),
+        (1, '2026-04-01 00:30+02', '2026-04-01 01:30+02', 'bestaetigt', 45.00),
+        (2, '2026-04-01 09:00+02', '2026-04-01 10:00+02', 'bestaetigt', 40.00),
+        (3, '2026-03-09 08:00+01', '2026-03-09 08:30+01', 'bestaetigt', 4.90);
+    starter: |
+      -- So rechnet das Dashboard heute bei jedem Aufruf:
+      SELECT raum_id, date_trunc('month', beginn)::date AS monat, count(*) AS buchungen, sum(preis) AS umsatz
+      FROM buchungen
+      WHERE status = 'bestaetigt'
+      GROUP BY raum_id, date_trunc('month', beginn)::date;
+    solution: |
+      CREATE MATERIALIZED VIEW umsatz_je_raum_monat AS
+      SELECT b.raum_id,
+             date_trunc('month', b.beginn AT TIME ZONE 'Europe/Berlin')::date AS monat,
+             count(*) AS buchungen,
+             sum(b.preis) AS umsatz
+      FROM buchungen AS b
+      WHERE b.status = 'bestaetigt'
+      GROUP BY b.raum_id, monat;
+      CREATE UNIQUE INDEX ON umsatz_je_raum_monat (raum_id, monat);
+    check: |
+      SELECT pruefung, ergebnis
+      FROM (VALUES
+        ('Inhalt', (SELECT string_agg(raum_id || ' ' || monat || ': ' || buchungen || ' / ' || umsatz, '; ' ORDER BY raum_id, monat)
+                    FROM umsatz_je_raum_monat)),
+        ('Materialized View', (SELECT count(*)::text FROM pg_matviews WHERE matviewname = 'umsatz_je_raum_monat')),
+        ('Unique-Index für CONCURRENTLY', (SELECT CASE WHEN count(*) > 0 THEN 'vorhanden' ELSE 'fehlt' END
+                                           FROM pg_index AS i
+                                           WHERE i.indrelid = 'umsatz_je_raum_monat'::regclass
+                                             AND i.indisunique AND i.indpred IS NULL AND i.indexprs IS NULL))
+      ) AS p (pruefung, ergebnis);
+    hints:
+      - "`CREATE MATERIALIZED VIEW name AS SELECT …` speichert das Ergebnis der Abfrage."
+      - "`CONCURRENTLY` vergleicht alten und neuen Inhalt Zeile für Zeile. Dafür muss jede Zeile über einen Unique-Index identifizierbar sein. Welche Spalten sind je Zeile eindeutig?"
+      - "`CREATE UNIQUE INDEX ON umsatz_je_raum_monat (raum_id, monat);` – ohne `WHERE`, ohne Ausdruck."
+    explanation: |
+      Die Materialized View speichert das Ergebnis der Dashboard-Abfrage; Aufrufe lesen nur noch wenige Zeilen. `REFRESH … CONCURRENTLY` berechnet den Inhalt neu und gleicht ihn mit dem alten ab, ohne Leser zu sperren. Dafür verlangt PostgreSQL mindestens einen Unique-Index, der nur Spaltennamen enthält und alle Zeilen umfasst. Je Raum und Monat gibt es genau eine Zeile, also passt `(raum_id, monat)`. Die Buchung am 1. April um 00:30 Uhr zählt zum April – in UTC wäre es noch der 31. März. `date_trunc('month', beginn)` rechnet in der Zeitzone der Sitzung, die beim `REFRESH` gilt; läuft der Cronjob mit UTC, wandert die Buchung in den März. `beginn AT TIME ZONE 'Europe/Berlin'` legt die Zeitzone in der Definition fest. Eine normale View würde immer aktuelle Zahlen liefern, aber bei jedem Aufruf rechnen.
+    resources:
+      - title: PostgreSQL · REFRESH MATERIALIZED VIEW
+        url: https://www.postgresql.org/docs/current/sql-refreshmaterializedview.html
+      - title: PostgreSQL · Materialized Views
+        url: https://www.postgresql.org/docs/current/rules-materializedviews.html
+
+  - id: typen-ergaenzen
+    type: gap
+    title: Enum, Identity, ANY und jsonb_set
+    prompt: |
+      Ergänze das Skript. Raumarten sind ein Enum-Typ. IDs vergibt ausschließlich die Datenbank; auch ein Import darf keine eigenen setzen. Die neue Raumart `eventflaeche` soll in der Sortierung direkt vor `telefonbox` stehen. Die Abfrage sucht Räume mit Beamer, das `UPDATE` setzt einen einzelnen Schlüssel, ohne die übrigen Einstellungen zu überschreiben.
+    lang: postgres
+    code: |
+      CREATE TYPE raumart AS ⟦ENUM⟧ ('schreibtisch', 'meetingraum', 'telefonbox');
+
+      CREATE TABLE raeume (
+        id            int ⟦GENERATED ALWAYS AS IDENTITY⟧ PRIMARY KEY,
+        name          text    NOT NULL,
+        art           raumart NOT NULL,
+        ausstattung   text[]  NOT NULL DEFAULT '{}',
+        einstellungen jsonb   NOT NULL DEFAULT '{}'
+      );
+
+      ALTER TYPE raumart ⟦ADD VALUE 'eventflaeche' BEFORE 'telefonbox'⟧;
+
+      SELECT name FROM raeume WHERE 'beamer' = ⟦ANY⟧ (ausstattung);
+
+      UPDATE raeume
+      SET einstellungen = ⟦jsonb_set⟧(einstellungen, '{buchbar}', 'false')
+      WHERE id = 3;
+    gaps:
+      - label: Typart
+        hint: Ein Typ mit fester, geordneter Werteliste.
+      - label: Automatische ID
+        hint: Eine Identity-Spalte, die eigene Werte ablehnt.
+      - label: Wert einsortieren
+        hint: "`ALTER TYPE … ADD VALUE` kann eine Position angeben."
+        accept: ["ADD VALUE 'eventflaeche' AFTER 'meetingraum'", "ADD VALUE IF NOT EXISTS 'eventflaeche' BEFORE 'telefonbox'", "ADD VALUE IF NOT EXISTS 'eventflaeche' AFTER 'meetingraum'"]
+      - label: Element enthalten
+        hint: Vergleicht einen Wert mit jedem Element eines Arrays.
+        accept: ["any", "some"]
+      - label: Einen Pfad setzen
+        hint: Eine Funktion, die ein JSONB-Dokument mit geändertem Wert an einem Pfad zurückgibt.
+    explanation: |
+      `CREATE TYPE … AS ENUM` legt die Werte und ihre Reihenfolge fest. `GENERATED ALWAYS AS IDENTITY` lehnt eigene Werte ab, außer jemand schreibt ausdrücklich `OVERRIDING SYSTEM VALUE`; `BY DEFAULT` würde Importe mit festen IDs still annehmen. `ADD VALUE … BEFORE 'telefonbox'` und `AFTER 'meetingraum'` sind hier gleichwertig. `= ANY (array)` ist wahr, wenn ein Element gleich ist; `SOME` ist ein Synonym. `jsonb_set` ersetzt nur den Wert unter `buchbar` und lässt alle anderen Schlüssel stehen, anders als `SET einstellungen = '{"buchbar": false}'`.
+    resources:
+      - title: PostgreSQL · ALTER TYPE
+        url: https://www.postgresql.org/docs/current/sql-altertype.html
+      - title: PostgreSQL · Identity Columns
+        url: https://www.postgresql.org/docs/current/ddl-identity-columns.html
+
+  - id: raumsuche-reparieren
+    type: bug
+    title: Die Raumsuche wirft und verschluckt Räume
+    prompt: |
+      Die Suche „Meetingräume mit Beamer, frei am 2. März von 10 bis 12 Uhr“ bricht ab mit:
+
+      ```text
+      ERROR:  invalid input syntax for type json
+      DETAIL:  Token "meetingraum" is invalid.
+      ```
+
+      Nachdem jemand das behelfsmäßig umgangen hat, fehlt im Ergebnis das Atelier, dessen letzte Buchung genau um 10 Uhr endet. Finde die fehlerhaften Zeilen und korrigiere sie.
+    lang: postgres
+    code: |
+      SELECT r.name
+      FROM raeume AS r
+      WHERE r.eigenschaften -> 'art' = 'meetingraum'
+        AND r.ausstattung @> '{beamer}'
+        AND NOT EXISTS (
+          SELECT 1
+          FROM buchungen AS b
+          WHERE b.raum_id = r.id
+            AND b.status = 'bestaetigt'
+            AND tstzrange(b.beginn, b.ende, '[]') && tstzrange('2026-03-02 10:00', '2026-03-02 12:00')
+        )
+      ORDER BY r.name;
+    lines: [3, 10]
+    fix:
+      - line: 3
+        answers:
+          - "WHERE r.eigenschaften ->> 'art' = 'meetingraum'"
+          - "WHERE r.eigenschaften @> '{\"art\": \"meetingraum\"}'"
+          - "WHERE r.eigenschaften -> 'art' = '\"meetingraum\"'"
+          - "WHERE r.eigenschaften -> 'art' = '\"meetingraum\"'::jsonb"
+      - line: 10
+        answers:
+          - "AND tstzrange(b.beginn, b.ende) && tstzrange('2026-03-02 10:00', '2026-03-02 12:00')"
+          - "AND tstzrange(b.beginn, b.ende, '[)') && tstzrange('2026-03-02 10:00', '2026-03-02 12:00')"
+          - "AND b.beginn < '2026-03-02 12:00' AND b.ende > '2026-03-02 10:00'"
+          - "AND b.ende > '2026-03-02 10:00' AND b.beginn < '2026-03-02 12:00'"
+          - "AND tstzrange(b.beginn, b.ende) && '[2026-03-02 10:00, 2026-03-02 12:00)'"
+    hints:
+      - "`->` liefert `jsonb`. Als was liest PostgreSQL dann das Literal `'meetingraum'` auf der anderen Seite des `=`?"
+      - "Der dritte Parameter von `tstzrange` bestimmt, ob die obere Grenze dazugehört. Gehört 10:00 Uhr zu einer Buchung, die um 10:00 endet?"
+    explanation: |
+      Zeile 3 vergleicht ein `jsonb` mit einem Literal ohne Typ. PostgreSQL liest das Literal deshalb als JSON, und `meetingraum` ohne Anführungszeichen ist kein gültiges JSON. Mit `->>` wird der Wert zu Text, mit `@>` oder einem JSON-String `'"meetingraum"'` bleibt der Vergleich in JSON. Zeile 10 baut die Buchungszeiträume geschlossen: `[08:00, 10:00]` enthält 10:00 Uhr und überlappt deshalb mit dem Suchfenster, das um 10:00 beginnt. Mit dem Standard `[)` grenzen beide nur aneinander, und das Atelier ist frei. Die Variante mit `beginn < Fensterende AND ende > Fensterbeginn` ist dieselbe Prüfung ohne Range.
+    resources:
+      - title: PostgreSQL · jsonb-Operatoren
+        url: https://www.postgresql.org/docs/current/functions-json.html#FUNCTIONS-JSONB-OP-TABLE
+      - title: PostgreSQL · Inclusive and Exclusive Bounds
+        url: https://www.postgresql.org/docs/current/rangetypes.html#RANGETYPES-INCLUSIVITY
+
+  - id: buchungstabelle-erklaeren
+    type: explain
+    title: Eine Buchungstabelle mit allem
+    prompt: |
+      Ein neues Teammitglied fragt, warum die Buchungstabelle so viele PostgreSQL-Eigenheiten nutzt. Erkläre, was jede Besonderheit leistet und welchen Preis sie hat: die beiden IDs, `zeitraum`, den `EXCLUDE`-Constraint und `details`.
+    lang: postgres
+    code: |
+      CREATE EXTENSION IF NOT EXISTS btree_gist;
+
+      CREATE TABLE buchungen (
+        id              bigint      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        oeffentliche_id uuid        NOT NULL DEFAULT uuidv7() UNIQUE,
+        raum_id         int         NOT NULL REFERENCES raeume (id),
+        beginn          timestamptz NOT NULL,
+        ende            timestamptz NOT NULL CHECK (ende > beginn),
+        zeitraum        tstzrange   GENERATED ALWAYS AS (tstzrange(beginn, ende)) STORED,
+        status          text        NOT NULL DEFAULT 'bestaetigt' CHECK (status IN ('bestaetigt', 'storniert')),
+        details         jsonb       NOT NULL DEFAULT '{}',
+        EXCLUDE USING gist (raum_id WITH =, zeitraum WITH &&) WHERE (status = 'bestaetigt')
+      );
+    points:
+      - "`id` ist ein interner `bigint`-Schlüssel, den nur die Datenbank vergibt. `oeffentliche_id` erscheint in URLs und APIs: nicht fortlaufend erratbar, durch UUIDv7 zeitlich sortiert und damit indexfreundlich – verrät aber den Erstellungszeitpunkt."
+      - "`zeitraum` wird aus `beginn` und `ende` berechnet und kann nie abweichen. Er ist `STORED`, weil der GiST-Index des Constraints eine gespeicherte Spalte braucht."
+      - "Der `EXCLUDE`-Constraint verbietet zwei bestätigte Buchungen desselben Raums mit überlappendem Zeitraum. Halboffene Ranges lassen aneinandergrenzende Buchungen zu, Stornierungen zählen wegen `WHERE` nicht. `btree_gist` ist nötig, damit `raum_id` mit `=` im GiST-Index steht."
+      - "`details` nimmt variable Zusatzangaben auf (Catering, Notizen), die die App als Ganzes liest. Alles, wonach gefiltert, gerechnet oder verwiesen wird, steht in eigenen Spalten."
+    explanation: |
+      Die Tabelle trennt interne und öffentliche Identität. `id` ist ein kompakter Identity-Schlüssel für Joins und Fremdschlüssel; `GENERATED ALWAYS` verhindert, dass jemand eigene Werte einschleust. Nach außen geht nur `oeffentliche_id`. Eine UUIDv7 aus `uuidv7()` (PostgreSQL 18) ist nicht erratbar und zeitlich sortiert, neue Werte landen also am Ende des Index. Wer die ID sieht, kann aber mit `uuid_extract_timestamp` ablesen, wann gebucht wurde. `zeitraum` ist eine gespeicherte generierte Spalte: Sie folgt jeder Änderung von `beginn` und `ende`, und weil virtuelle Spalten in PostgreSQL 18 nicht indexiert werden können, ist sie `STORED`. Darauf baut der Exclusion Constraint auf: Für jedes Paar bestätigter Buchungen mit gleichem `raum_id` dürfen sich die Zeiträume nicht überschneiden. Das verhindert Doppelbuchungen auch bei gleichzeitigen Requests, was eine Prüfung in der App nicht schafft. `details` ist bewusst `jsonb` für Angaben ohne feste Struktur. Kosten: Speicher für die doppelte Zeit, ein GiST-Index, der jedes Schreiben verlangsamt, und eine Erweiterung, die in jeder Umgebung installiert sein muss.
+    resources:
+      - title: PostgreSQL · Range Types – Constraints on Ranges
+        url: https://www.postgresql.org/docs/current/rangetypes.html#RANGETYPES-CONSTRAINT
+      - title: PostgreSQL · UUID Functions
+        url: https://www.postgresql.org/docs/current/functions-uuid.html
+
+  - id: raumsuche-api
+    type: sql
+    lang: postgres
+    title: Die Raumsuche der App
+    prompt: |
+      Baue die Abfrage hinter dem Endpunkt `GET /raeume/suche` mit diesen Filtern:
+
+      - Standort **Zentrum**, mindestens **6 Plätze**.
+      - Ausstattung enthält **beamer und whiteboard** (weitere Merkmale sind erlaubt).
+      - In `eigenschaften` ist `barrierefrei` der JSON-Wert `true` (Boolean).
+      - Die Beschreibung passt zur deutschen Volltextsuche nach `ruhig`: `to_tsvector('german', beschreibung) @@ websearch_to_tsquery('german', 'ruhig')`.
+      - Frei am **26. März 2026 von 14 bis 16 Uhr**: Keine bestätigte Buchung des Raums überschneidet diesen Zeitraum.
+
+      Spalten: `name`, `plaetze`, `preis_pro_stunde`. Sortierung: `preis_pro_stunde` aufsteigend, bei Gleichstand `name`.
+    schema: |
+      CREATE TABLE standorte (
+        id   int PRIMARY KEY,
+        name text NOT NULL UNIQUE
+      );
+      CREATE TABLE raeume (
+        id               int PRIMARY KEY,
+        standort_id      int          NOT NULL REFERENCES standorte (id),
+        name             text         NOT NULL,
+        plaetze          int          NOT NULL,
+        preis_pro_stunde numeric(8,2) NOT NULL,
+        ausstattung      text[]       NOT NULL DEFAULT '{}',
+        eigenschaften    jsonb        NOT NULL DEFAULT '{}',
+        beschreibung     text         NOT NULL
+      );
+      CREATE TABLE buchungen (
+        id       bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        raum_id  int       NOT NULL REFERENCES raeume (id),
+        zeitraum tstzrange NOT NULL,
+        status   text      NOT NULL DEFAULT 'bestaetigt'
+      );
+      INSERT INTO standorte VALUES (1, 'Plagwitz'), (2, 'Südvorstadt'), (3, 'Zentrum');
+      INSERT INTO raeume VALUES
+        (1, 3, 'Salon',     8, 45.00, '{beamer,whiteboard,monitor}',   '{"barrierefrei": true, "etage": 2}',  'Ruhiger Meetingraum zum Innenhof'),
+        (2, 3, 'Galerie',  12, 60.00, '{beamer,whiteboard}',           '{"barrierefrei": true, "etage": 1}',  'Großer Raum mit Blick auf den Markt, tagsüber laut'),
+        (3, 3, 'Studio',    6, 35.00, '{whiteboard,beamer}',           '{"barrierefrei": false, "etage": 3}', 'Ruhige Dachkammer mit Whiteboard'),
+        (4, 3, 'Kabinett',  4, 25.00, '{beamer,whiteboard}',           '{"barrierefrei": true}',              'Kleiner, ruhiger Besprechungsraum'),
+        (5, 3, 'Forum',    10, 55.00, '{whiteboard,beamer}',           '{"barrierefrei": true, "etage": 0}',  'Ruhige Lage, große Fensterfront'),
+        (6, 1, 'Atelier',   8, 40.00, '{beamer,whiteboard}',           '{"barrierefrei": true}',              'Ruhiger Raum in der alten Fabrik'),
+        (7, 3, 'Lounge',    8, 30.00, '{whiteboard}',                  '{"barrierefrei": true}',              'Ruhige Sofaecke'),
+        (8, 3, 'Saal',     20, 90.00, '{beamer,whiteboard}',           '{"barrierefrei": true}',              'Ruhiger Saal für Workshops'),
+        (9, 3, 'Kontor',    6, 35.00, '{whiteboard,beamer,stehtisch}', '{"barrierefrei": "ja"}',              'Ruhiges Büro mit Stehtischen'),
+        (10, 3, 'Kanzlei',  8, 50.00, '{beamer,whiteboard}',           '{"barrierefrei": "true"}',            'Ruhiges Eckbüro mit Blick ins Grüne'),
+        (11, 3, 'Werkstatt', 6, 30.00, '{beamer,whiteboard,stehtisch}', '{"barrierefrei": true}',             'Unruhige Ecke neben der Kaffeebar');
+      INSERT INTO buchungen (raum_id, zeitraum, status) VALUES
+        (1, '[2026-03-26 09:00, 2026-03-26 14:00)', 'bestaetigt'),
+        (5, '[2026-03-26 15:30, 2026-03-26 17:00)', 'bestaetigt'),
+        (8, '[2026-03-26 14:00, 2026-03-26 16:00)', 'storniert'),
+        (2, '[2026-03-26 13:00, 2026-03-26 14:30)', 'bestaetigt');
+    starter: |
+      SELECT r.name, r.plaetze, r.preis_pro_stunde
+      FROM raeume AS r
+      ORDER BY r.preis_pro_stunde, r.name;
+    solution: |
+      SELECT r.name, r.plaetze, r.preis_pro_stunde
+      FROM raeume AS r
+      JOIN standorte AS s ON s.id = r.standort_id
+      WHERE s.name = 'Zentrum'
+        AND r.plaetze >= 6
+        AND r.ausstattung @> '{beamer,whiteboard}'
+        AND r.eigenschaften @> '{"barrierefrei": true}'
+        AND to_tsvector('german', r.beschreibung) @@ websearch_to_tsquery('german', 'ruhig')
+        AND NOT EXISTS (
+          SELECT 1
+          FROM buchungen AS b
+          WHERE b.raum_id = r.id
+            AND b.status = 'bestaetigt'
+            AND b.zeitraum && tstzrange('2026-03-26 14:00', '2026-03-26 16:00')
+        )
+      ORDER BY r.preis_pro_stunde, r.name;
+    ordered: true
+    hints:
+      - Arbeite die Filter einzeln ab und prüfe nach jedem, welche Räume übrig sind. Bis auf die beiden Treffer scheitert jeder Raum an mindestens einer Bedingung, die Galerie an zweien.
+      - "Array: `@> '{beamer,whiteboard}'`. JSON: `@> '{\"barrierefrei\": true}'` – die Strings `\"ja\"` und `\"true\"` zählen nicht. Zeit: `NOT EXISTS` mit `&&` auf bestätigte Buchungen."
+      - Der Salon ist bis 14 Uhr gebucht. Überschneidet sich `[09:00, 14:00)` mit `[14:00, 16:00)`?
+    explanation: |
+      Die Abfrage verbindet vier Werkzeuge des Moduls in einem `WHERE`. `@>` auf dem Array verlangt alle Merkmale, egal in welcher Reihenfolge – die Lounge ohne Beamer fällt heraus. `@>` auf dem JSON prüft typgenau: Das Studio ist nicht barrierefrei, das Kontor hat den String `"ja"`, die Kanzlei den String `"true"` – ein Vergleich mit `->> 'barrierefrei' = 'true'` nähme sie mit. Die Volltextsuche findet „Ruhiger“, „Ruhige“ und „ruhiger“ über den Stamm `ruhig`; die Galerie ist laut. Die Werkstatt ist „unruhig“, Stamm `unruh`; `ILIKE '%ruhig%'` würde sie fälschlich finden. Der Anti-Join mit `&&` verwirft das Forum (ab 15:30 belegt) und die Galerie (bis 14:30 belegt), lässt aber den Salon zu, dessen Buchung um 14 Uhr endet, und den Saal, dessen Buchung storniert ist. Das Kabinett ist zu klein, das Atelier steht in Plagwitz. Ergebnis: Salon und Saal. In Produktion trügen `ausstattung` und `eigenschaften` GIN-Indexe, die Beschreibung eine gespeicherte `tsvector`-Spalte und die Buchungen einen GiST-Index auf `(raum_id, zeitraum)`.
+    resources:
+      - title: PostgreSQL · Array-Operatoren
+        url: https://www.postgresql.org/docs/current/functions-array.html#ARRAY-OPERATORS-TABLE
+      - title: PostgreSQL · Basic Text Matching
+        url: https://www.postgresql.org/docs/current/textsearch-intro.html#TEXTSEARCH-MATCHING

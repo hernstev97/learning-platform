@@ -253,7 +253,7 @@ test('practice, bug and explain exercises', async ({ page }) => {
   for (const box of await page.locator('[data-point]').all()) await box.check();
   await expect(page.locator('#feedback')).toContainText('Richtig.');
   await page.goto('/beispiel');
-  await expect(page.locator('.module-row .label').last()).toHaveText('3/15');
+  await expect(page.locator('.module-row .label').last()).toHaveText('3/18');
 });
 
 test('SQL runs in the browser: table preview, result table, feedback and runnable lesson blocks', async ({ page }) => {
@@ -288,6 +288,61 @@ test('SQL runs in the browser: table preview, result table, feedback and runnabl
   await block.getByRole('button', { name: 'Ausführen' }).click();
   await expect(block.locator('.run-output table')).toContainText('160.5', { timeout: 60_000 });
   await expect(page.locator('.codeblock[data-lang="excel"] .syntax-fn')).toHaveText('SUMMEWENNS');
+});
+
+test('PostgreSQL runs in the browser: previews, results, checks after DDL and runnable lesson blocks', async ({ page }) => {
+  test.setTimeout(120_000);
+  const errors = errorsOf(page);
+  await page.goto(`${base}/16`);
+  await expect(page.locator('.sql-table summary')).toContainText('buchungen');
+  // Previews come from PostgreSQL at build time: numeric keeps its scale, booleans print as t and f.
+  await expect(page.locator('.sql-table tbody tr').first()).toContainText('45.00');
+  await expect(page.locator('#runner-state')).toContainText('PostgreSQL 18');
+  await page.locator('#editor').fill('SELECT raum, sum(preis) AS umsatz FROM buchungen GROUP BY raum ORDER BY umsatz DESC');
+  await page.locator('#run').click();
+  await expect(page.locator('#feedback')).toContainText('Reihenfolge', { timeout: 90_000 });
+  await page.locator('#editor').fill('SELECT nope FROM buchungen');
+  await page.locator('#run').click();
+  await expect(page.locator('#sql-result')).toContainText('column "nope" does not exist');
+  await expect(page.locator('#sql-result')).toContainText('LINE 1: SELECT nope FROM buchungen');
+  await page.locator('#editor').fill('SELECT raum, sum(preis) AS umsatz FROM buchungen GROUP BY raum ORDER BY umsatz DESC NULLS LAST');
+  await page.keyboard.press('Control+Enter');
+  await expect(page.locator('#feedback')).toContainText('Richtig.');
+
+  await page.goto(`${base}/17`);
+  await expect(page.locator('.check-note')).toContainText('Prüfabfrage');
+  await page.locator('#editor').fill('ALTER TABLE buchungen ADD CHECK (preis > 0);');
+  await page.locator('#run').click();
+  await expect(page.locator('#sql-result')).toContainText('ALTER TABLE', { timeout: 90_000 });
+  await expect(page.locator('#sql-result table')).toContainText('check_violation');
+  await expect(page.locator('#feedback')).toContainText('weicht die Prüfabfrage in der Spalte „null_euro“ ab');
+  await page.locator('#editor').fill('ALTER TABLE buchungen ADD CONSTRAINT preis_ok CHECK (preis >= 0);');
+  await page.locator('#run').click();
+  await expect(page.locator('#feedback')).toContainText('Richtig.');
+
+  await page.goto(base);
+  const keepGoing = page.locator('.codeblock[data-run="postgres"][data-continue]');
+  await keepGoing.getByRole('button', { name: 'Ausführen' }).click();
+  await expect(keepGoing.locator('.run-output .sql-error').nth(1)).toContainText('current transaction is aborted', { timeout: 90_000 });
+  await expect(keepGoing.locator('.run-output')).toContainText('ROLLBACK');
+  await expect(keepGoing.locator('.run-output')).not.toHaveClass(/error/);
+  const block = page.locator('.codeblock[data-run="postgres"]').first();
+  await expect(block.locator('.codeblock-bar')).toContainText('PostgreSQL');
+  await block.getByRole('button', { name: 'Ausführen' }).click();
+  await expect(block.locator('.run-output table')).toContainText('75.00', { timeout: 90_000 });
+  await expect(block.locator('.run-output')).toContainText('INSERT 0 3');
+  await expect(block.locator('.run-output .sql-plan')).toContainText('Index Scan using buchungen_pkey on buchungen');
+  await block.locator('textarea').fill('SELECT 1/0;');
+  await block.getByRole('button', { name: 'Ausführen' }).click();
+  await expect(block.locator('.run-output')).toContainText('ERROR:  division by zero');
+  // statement_timeout has no effect in PGlite: the time limit ends the worker, and the next run starts a new one.
+  await block.locator('textarea').fill('SELECT count(*) FROM generate_series(1, 2000000000);');
+  await block.getByRole('button', { name: 'Ausführen' }).click();
+  await expect(block.locator('.run-output')).toContainText('Zeitlimit von 10 Sekunden überschritten', { timeout: 30_000 });
+  await block.locator('textarea').fill('SELECT 42 AS antwort;');
+  await block.getByRole('button', { name: 'Ausführen' }).click();
+  await expect(block.locator('.run-output table')).toContainText('42', { timeout: 60_000 });
+  expect(errors).toEqual([]);
 });
 
 test('pytest runs lesson blocks and checks whether written tests catch a broken variant', async ({ page }) => {
@@ -531,7 +586,7 @@ test('unsaved work can be exported and merged when browser storage is blocked', 
   backup.areas.beispiel.read = { 'alle-typen': '2026-09-28' };
   await page.locator('#import-file').setInputFiles({ name: 'backup.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(backup)) });
   await expect(page.locator('#data-message')).toContainText('übernommen');
-  await expect(page.locator('.data-table tr', { hasText: 'Beispielbereich' })).toContainText('1 / 15');
+  await expect(page.locator('.data-table tr', { hasText: 'Beispielbereich' })).toContainText('1 / 18');
 });
 
 test('malformed addresses render the not-found page without an unhandled exception', async ({ page }) => {

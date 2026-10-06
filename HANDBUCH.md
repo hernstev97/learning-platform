@@ -71,7 +71,7 @@ Eine vollständige, minimale Vorlage mit jeder Übungsart liegt in [`tooling/fix
 
 1. **Lehrplan entwerfen.** Schreibe zuerst die Liste der Module auf: 10–16 Module in 2–4 Tracks, vom Einstieg bis zum Profi-Niveau. Frage dich bei jedem Modul: *Was kann ich danach, was ich vorher nicht konnte?* Und: *Würde ein Arbeitgeber das erwarten?*
 2. **Ordner anlegen:** `content/<bereich>/` mit `area.yaml` (Abschnitt 4). Die Ordner-ID ist kurz, klein und kebab-case, zum Beispiel `go`, `typescript`, `devops`.
-3. **Farbe wählen.** Eine kräftige Farbe, auf der schwarzer Text gut lesbar ist (Kontrast ≥ 4,5 : 1 zu `#0B0B0B`). Vorhandene Farben nicht wiederholen: `#A98BFF` Kotlin, `#FF6A3D` Rust, `#FFD400` Linux, `#4D8BFF` Python, `#2BD97C` Automation, `#FF5CA8` Git, `#22D3EE` Data Analysis, `#C6F432` Testing. Guter freier Kandidat: `#FF9F1C` (Orange-Gelb).
+3. **Farbe wählen.** Eine kräftige Farbe, auf der schwarzer Text gut lesbar ist (Kontrast ≥ 4,5 : 1 zu `#0B0B0B`). Vorhandene Farben nicht wiederholen: `#A98BFF` Kotlin, `#FF6A3D` Rust, `#FFD400` Linux, `#4D8BFF` Python, `#2BD97C` Automation, `#FF5CA8` Git, `#22D3EE` Data Analysis, `#C6F432` Testing, `#FF9F1C` PostgreSQL. Guter freier Kandidat: `#F4A3FF` (Orchidee).
 4. **Module schreiben** (Abschnitte 5–7). Ein Modul pro Datei, Dateiname = Modul-ID.
 5. **Karten, Projekte, Glossar, Spickzettel, Berufsseite** ergänzen (Abschnitt 8).
 6. **Prüfen:** `pnpm content:check <bereich>`, dann `pnpm verify <bereich>`, dann `pnpm test` und `pnpm build`.
@@ -176,7 +176,7 @@ Richtwert: 3–6 Callouts pro Lektion, davon mindestens ein `INTERVIEW` und ein 
 
 ### Codeblöcke
 
-Codeblöcke immer mit Sprache angeben. Unterstützt werden `kotlin`, `rust`, `python`, `bash`/`sh`, `console`, `yaml`, `toml`, `json`, `sql`, `xml`, `dockerfile`, `ini` (auch für systemd-Units), `diff`, `excel` (Formeln), `powerquery` (Power Query M, auch `m`), `csv`, `typescript` (auch `ts`, `tsx`), `javascript` (auch `js`, `jsx`) und `text`.
+Codeblöcke immer mit Sprache angeben. Unterstützt werden `kotlin`, `rust`, `python`, `bash`/`sh`, `console`, `yaml`, `toml`, `json`, `sql`, `postgres` (auch `postgresql`, `pgsql`), `xml`, `dockerfile`, `ini` (auch für systemd-Units), `diff`, `excel` (Formeln), `powerquery` (Power Query M, auch `m`), `csv`, `typescript` (auch `ts`, `tsx`), `javascript` (auch `js`, `jsx`) und `text`.
 
 | Info-String | Wirkung |
 | --- | --- |
@@ -184,6 +184,8 @@ Codeblöcke immer mit Sprache angeben. Unterstützt werden `kotlin`, `rust`, `py
 | ` ```python run fails ` | Ausführbar, soll aber absichtlich eine Exception zeigen. `pnpm verify` prüft, dass er fehlschlägt. |
 | ` ```python pytest ` | Der Block ist eine Testdatei: editierbar, „Ausführen“ startet pytest (`-v --tb=short`) und zeigt dessen echten Bericht. Den getesteten Code definiert der Block selbst. `pnpm verify` verlangt, dass alle Tests bestehen; mit `pytest fails` muss mindestens einer scheitern – gut, um echte Fehlermeldungen zu zeigen. |
 | ` ```sql run ` | Block wird editierbar und läuft Anweisung für Anweisung gegen eine frische SQLite-Datenbank im Browser; jede Ergebnismenge erscheint als Tabelle. Der Block legt seine Tabellen selbst an (`CREATE TABLE`, `INSERT`). `pnpm verify` führt ihn aus; `sql run fails` erwartet einen Fehler. |
+| ` ```postgres run ` | Wie `sql run`, aber gegen ein frisches **PostgreSQL 18** (PGlite) im Browser. Zeigt je Anweisung, was psql zeigt: Tabelle, Befehlsmeldung (`CREATE TABLE`, `INSERT 0 3`), Hinweise (`NOTICE`), Pläne von `EXPLAIN` als Text, Fehler mit Zeilenmarker. `pnpm verify` führt ihn aus; `postgres run fails` erwartet einen Fehler. |
+| ` ```postgres run continue ` | Läuft nach einem Fehler weiter wie psql ohne `ON_ERROR_STOP`: Jeder Fehler erscheint an seiner Anweisung. Dafür gemacht, abgebrochene Transaktionen (`current transaction is aborted …`) und `ROLLBACK TO SAVEPOINT` nach einem Fehler vorzuführen. `pnpm verify` verlangt, dass mindestens eine Anweisung scheitert. |
 | ` ```rust ` mit `fn main` | Bekommt einen Link zum Rust Playground. `pnpm verify` kompiliert ihn. |
 | ` ```rust nocheck ` | Absichtlich nicht kompilierender Code (etwa um einen Borrow-Checker-Fehler zu zeigen). Kein Playground-Link, keine Prüfung. |
 | ` ```console ` | Terminal-Sitzung: Zeilen mit `$ ` oder `# ` am Anfang sind Befehle, der Rest ist Ausgabe. |
@@ -191,6 +193,16 @@ Codeblöcke immer mit Sprache angeben. Unterstützt werden `kotlin`, `rust`, `py
 | ` ```yaml title=docker-compose.yml ` | Eigene Beschriftung statt Sprachname (Unterstriche werden zu Leerzeichen). |
 
 SQL läuft im Browser mit **SQLite 3.39** (die Version in Pyodide), nicht mit der neueren SQLite auf dem Rechner. Fensterfunktionen, `RIGHT`/`FULL JOIN`, `IS DISTINCT FROM`, JSON-Funktionen und Mathefunktionen (`sqrt`, `ln`, `floor`) gibt es; `string_agg`, `concat`, `median` und `percentile` nicht. `pnpm verify` prüft SQL deshalb mit genau dieser Version.
+
+#### PostgreSQL im Browser
+
+Blöcke und Übungen mit `postgres` laufen in [PGlite](https://pglite.dev/), einem echten PostgreSQL 18 als WebAssembly, in einem Web Worker. Beim ersten Gebrauch lädt der Browser einmalig rund 5 MB (komprimiert); der Service Worker legt die Dateien danach ab. Jeder Lauf klont eine frische Datenbank, nichts überlebt bis zum nächsten. `pnpm verify` und die Tabellenvorschau beim Build nutzen dieselbe PGlite-Version unter Node.
+
+- **Einstellungen:** Zeitzone `Europe/Berlin` (Sommerzeit inklusive), Meldungen auf Englisch, `DateStyle` ISO, keine parallelen Pläne (`max_parallel_workers_per_gather = 0`, PGlite hat keine Worker-Prozesse). Die Erweiterungen `btree_gist` und `pg_trgm` stehen für `CREATE EXTENSION` bereit; `pg_stat_statements` und `auto_explain` nicht.
+- **Eine Sitzung:** PGlite ist ein einzelner Prozess mit einer Verbindung. Transaktionen, Savepoints, `SELECT … FOR UPDATE` und Isolationsstufen laufen, aber **zwei Sitzungen gleichzeitig gibt es nicht**: Sperrkonflikte, Deadlocks und Serialisierungsfehler zwischen Sitzungen lassen sich nicht vorführen. Zeige sie als Zeitleiste in einem `text`-Block oder in `explain`-, `order`- und `choice`-Übungen.
+- **Zeitlimit:** 10 Sekunden je Lauf. `statement_timeout` wirkt in PGlite nicht; der Worker wird beendet und neu gestartet. Tabellen für `EXPLAIN`-Beispiele mit `generate_series` füllen, ein paar tausend Zeilen genügen, danach `ANALYZE`.
+- **Nicht deterministisch** und deshalb ungeeignet für `output`-Übungen und für Spalten, die eine `sql`-Übung vergleicht: `now()`, `clock_timestamp()`, `random()`, `gen_random_uuid()`, Zeiten aus `EXPLAIN ANALYZE`. Für Pläne `EXPLAIN (COSTS OFF)` nehmen, mit `ANALYZE` zusätzlich `TIMING OFF, SUMMARY OFF, BUFFERS OFF` (PostgreSQL 18 zeigt Buffers sonst immer an).
+- **Ausprobieren:** `pnpm pg:run datei.sql` oder `pnpm pg:run -e 'SELECT …'` führt SQL in einer frischen Datenbank aus und zeigt jede Anweisung wie psql; `--tuples` gibt nur die Zeilen aus, genau das Format von `output`-Übungen.
 
 Python-Blöcke mit `run` laufen mit denselben Einschränkungen wie `code`-Übungen (siehe dort): frisches Verzeichnis, kein Netzwerk, keine Threads oder Prozesse, kein `input()`, kein `asyncio.run()` – `await` auf oberster Ebene funktioniert aber. Blöcke, die Threads oder Netzwerk zeigen, deshalb **ohne** `run` schreiben. Rust-Blöcke, die Crates wie `serde` oder `tokio` benutzen, werden nicht kompiliert; sie bekommen trotzdem einen Playground-Link, weil der Playground die beliebtesten Crates mitbringt.
 
@@ -258,7 +270,7 @@ Die Übungen eines Moduls stehen in dieser Reihenfolge. Jede Stufe setzt die vor
 | `gap` | Code schreiben (gezielt) | Schlüsselwörter, Ausdrücke, ganze Zeilen in echtem Code |
 | `command` | Befehle aus dem Kopf schreiben | Linux, Git, Cargo, Gradle, uv |
 | `code` | Code schreiben (frei, mit Tests) – nur Python | Funktionen schreiben, die im Browser automatisch geprüft werden |
-| `sql` | Abfragen schreiben, die im Browser laufen | Filtern, Gruppieren, Joins, Fensterfunktionen – verglichen wird das Ergebnis, nicht der Text |
+| `sql` | Abfragen schreiben, die im Browser laufen | Filtern, Gruppieren, Joins, Fensterfunktionen – verglichen wird das Ergebnis, nicht der Text. In PostgreSQL mit `check` auch DDL, Datenänderungen und Transaktionen |
 | `bug` | Fehler finden und beheben | Off-by-one, falsche Bedingung, Race Condition, Sicherheitslücke, falscher Befehl |
 | `explain` | Bestehende Implementierung erklären | Code lesen und in eigenen Worten wiedergeben – wie im Code-Review oder Interview |
 | `practice` | Größere Aufgaben mit Musterlösung | Rust/Kotlin-Programme, Konfigurationen, Skripte |
@@ -361,7 +373,7 @@ Die Plattform mischt die Zeilen deterministisch. 4–10 Zeilen sind ideal. Zeile
   explanation: …
 ```
 
-Verglichen wird zeilenweise ohne Leerraum am Zeilenende und ohne Leerzeilen am Anfang oder Ende. TypeScript und JavaScript (`lang: typescript`, `javascript`) führt `pnpm verify` mit Node 24 aus: nur eigenständiger Code ohne Imports aus npm-Paketen (`node:`-Module gehen) und nur TypeScript, das Node durch Entfernen der Typen ausführen kann (kein `enum`, kein `namespace`, keine Parameter-Properties). SQL (`lang: sql`) führt `pnpm verify` immer aus: Der Code legt seine Tabellen selbst an, erwartet wird die Ausgabe der `sqlite3`-Kommandozeile im Standardmodus – Werte durch `|` getrennt, keine Kopfzeile, `NULL` als leerer Wert, Kommazahlen mit Punkt (`3.0`, `12.5`). Sag das im Prompt. Für Shell-Code (`lang: bash`) kann `verify: true` gesetzt werden; dann führt `pnpm verify` ihn in einem leeren Wegwerf-Verzeichnis aus. Ausgaben mit Zeitstempeln, PIDs, Commit-Hashes oder Zufall sind ungeeignet.
+Verglichen wird zeilenweise ohne Leerraum am Zeilenende und ohne Leerzeilen am Anfang oder Ende. TypeScript und JavaScript (`lang: typescript`, `javascript`) führt `pnpm verify` mit Node 24 aus: nur eigenständiger Code ohne Imports aus npm-Paketen (`node:`-Module gehen) und nur TypeScript, das Node durch Entfernen der Typen ausführen kann (kein `enum`, kein `namespace`, keine Parameter-Properties). SQL (`lang: sql`) führt `pnpm verify` immer aus: Der Code legt seine Tabellen selbst an, erwartet wird die Ausgabe der `sqlite3`-Kommandozeile im Standardmodus – Werte durch `|` getrennt, keine Kopfzeile, `NULL` als leerer Wert, Kommazahlen mit Punkt (`3.0`, `12.5`). Sag das im Prompt. PostgreSQL (`lang: postgres`) ebenso, erwartet wird die Ausgabe von `psql -At`: Werte durch `|` getrennt, keine Kopfzeile, `NULL` leer, Wahrheitswerte als `t`/`f`, Zahlen und Zeiten so, wie PostgreSQL sie ausgibt (`numeric(8,2)` als `12.50`, `timestamptz` als `2026-03-02 09:00:00+01`). Nur Zeilen zählen, keine Befehlsmeldungen wie `INSERT 0 3`. `pnpm pg:run --tuples` zeigt genau diese Ausgabe. Für Shell-Code (`lang: bash`) kann `verify: true` gesetzt werden; dann führt `pnpm verify` ihn in einem leeren Wegwerf-Verzeichnis aus. Ausgaben mit Zeitstempeln, PIDs, Commit-Hashes oder Zufall sind ungeeignet.
 
 Git läuft dabei ohne System- und globale Konfiguration, mit fester Identität, `init.defaultBranch=main`, ohne Editor und Pager und mit englischen Meldungen (`GIT_ENV` in `tooling/verify-code.ts`). Verglichen wird nur stdout; viele Git-Meldungen landen auf stderr.
 
@@ -496,6 +508,39 @@ tests:
 - Die Rückmeldung nennt die erste Abweichung („Spalte 2 heißt `summe`, erwartet ist `umsatz`“, „Deine Abfrage liefert 5 Zeilen, erwartet sind 4“, „Die Zeile (West, 0) gehört so nicht ins Ergebnis“), ohne das erwartete Ergebnis zu verraten.
 - `pnpm verify` führt die Musterlösung mit derselben SQLite-Version aus: Sie muss Zeilen liefern, und der `starter` darf das erwartete Ergebnis noch nicht liefern.
 - SQL-Module mischen `sql` mit `output` (`lang: sql`, siehe oben), `gap`, `bug` und `explain`; `sql` ersetzt dort die `code`-Übungen.
+
+#### `sql` in PostgreSQL: `lang: postgres` und `check`
+
+Mit `lang: postgres` laufen Schema, Abfrage und Musterlösung in PostgreSQL 18 (siehe [PostgreSQL im Browser](#postgresql-im-browser)), und die Vorschau zeigt die Werte so, wie psql sie ausgibt. Gesucht ist weiter genau eine Anweisung, die Zeilen liefert – in PostgreSQL also auch `INSERT`, `UPDATE`, `DELETE` oder `MERGE` mit `RETURNING`.
+
+Für alles, was kein Ergebnis liefert – Constraints anlegen, Daten migrieren, Indexe bauen, Transaktionen –, gibt es `check`: Der Lernende schreibt beliebig viele Anweisungen, danach läuft die Prüfabfrage. Verglichen wird ihr Ergebnis mit ihrem Ergebnis nach der Musterlösung, wie bei einer Abfrage. Der Lernende sieht die Meldung jeder Anweisung, das Ergebnis der Prüfabfrage und die Prüfabfrage selbst (aufklappbar).
+
+```yaml
+- id: preis-nie-negativ
+  type: sql
+  lang: postgres
+  title: Kein Preis unter null
+  prompt: |
+    Sorge dafür, dass `buchungen.preis` nie negativ sein kann. Fehlende Preise (`NULL`) bleiben erlaubt.
+  schema: |
+    CREATE TABLE buchungen (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, raum text NOT NULL, preis numeric(8,2));
+  starter: |
+    -- ALTER TABLE …
+  solution: |
+    ALTER TABLE buchungen ADD CONSTRAINT preis_nicht_negativ CHECK (preis >= 0);
+  check: |                     # eine Abfrage; läuft nach den Anweisungen des Lernenden bzw. nach der Lösung
+    SELECT lp.versuch($$INSERT INTO buchungen (raum, preis) VALUES ('Loft', -1)$$) AS negativ,
+           lp.versuch($$INSERT INTO buchungen (raum) VALUES ('Loft')$$) AS ohne_preis;
+  explanation: …
+```
+
+- **Prüfe das Verhalten, nicht die Schreibweise.** `lp.versuch(anweisung)` führt eine Anweisung aus, rollt sie immer zurück und liefert `ok` oder den Namen des Fehlers (`check_violation`, `unique_violation`, `foreign_key_violation`, `restrict_violation`, `not_null_violation`, `exclusion_violation`, sonst den SQLSTATE). So gilt jeder Constraint-Name und jede gleichwertige Bedingung. Für Daten genügen Abfragen auf die Tabellen, für Indexe und Spalten der Katalog (`pg_indexes`, `information_schema.columns`) – aber nur Eigenschaften, die die Aufgabe verlangt, nicht Namen, die der Lernende frei wählt.
+- `lp.versuch` mit DDL auf ein Objekt, das dieselbe Prüfabfrage liest (`REFRESH MATERIALIZED VIEW`, `CREATE INDEX`, `ALTER TABLE` auf eine Tabelle im `FROM`), scheitert immer mit `55006` (Objekt in Benutzung) – nach der Lösung wie nach einer falschen Antwort. Prüfe solche Objekte über den Katalog (`pg_matviews`, `pg_index`) oder lies sie in der Prüfabfrage nicht.
+- Der Prompt nennt alles, was geprüft wird. Die Prüfabfrage ist für den Lernenden sichtbar und verrät die Lösung nicht.
+- `pnpm verify` verlangt: Nach der Lösung liefert die Prüfabfrage Zeilen und keinen Fehler, nach dem `starter` (oder, ohne Starter, auf dem nackten Schema) ein anderes Ergebnis.
+- `ordered: true` bezieht sich bei `check` auf die Prüfabfrage; sie braucht dann `ORDER BY`.
+- Ist die Musterlösung eine Änderung mit `RETURNING` (`INSERT`, `UPDATE`, `DELETE`, `MERGE`), zählt nur eine Änderung als Lösung, kein `SELECT`, das dieselben Zeilen berechnet.
+- **Andere Lösungen ausprobieren:** `pnpm pg:try bereich/modul/übung -e '…'` prüft eine Antwort genau wie der Browser. Probiere mindestens eine andere richtige Formulierung und einen typischen Fehler aus.
 
 ### `scenario` – Linux-Szenario (echte VM im Browser)
 
@@ -714,12 +759,14 @@ pnpm verify [bereich]          # führt Python aus, kompiliert Rust, vergleicht 
                                # beide mit --allow-missing: fehlende Moduldateien nur als Warnung
 pnpm vm:verify [bereich]       # Linux-Szenarien und vm-Blöcke in der echten VM (siehe scenario)
 pnpm vm:run skript.sh          # ein Skript in einer frischen VM ausführen (zum Ausprobieren)
+pnpm pg:run datei.sql          # SQL in einem frischen PostgreSQL ausführen (wie im Browser)
+pnpm pg:try bereich/modul/übung datei.sql   # eine Antwort gegen eine PostgreSQL-sql-Übung prüfen (Urteil wie im Browser)
 pnpm test                      # Unit-Tests inkl. Bear-Rekonstruktion und Prüflogik
 pnpm test:e2e                  # Browser-Tests (Playwright)
 pnpm build                     # TypeScript + Produktionsbuild
 ```
 
-`pnpm verify` braucht lokal `python3` und `rustc` (Edition 2024), für pandas- und pytest-Code zusätzlich `uv`: Beim ersten Lauf entsteht unter `node_modules/.cache/verify-python/` eine virtuelle Umgebung mit genau den pandas- und numpy-Versionen des Browsers (aus `pyodide-lock.json`) und den pytest- und Hypothesis-Versionen aus `src/python/packages.ts`. TypeScript- und JavaScript-`output` laufen mit dem Node, das auch `pnpm verify` ausführt. SQL prüft `verify` in Pyodide unter Node, also mit derselben SQLite wie im Browser. Kotlin wird nicht kompiliert; Kotlin-Aufgaben daher besonders sorgfältig gegen die offizielle Dokumentation prüfen. Excel-Formeln und Power-Query-Code laufen nirgends; sie brauchen besonders sorgfältige Prüfung gegen die Microsoft-Dokumentation.
+`pnpm verify` braucht lokal `python3` und `rustc` (Edition 2024), für pandas- und pytest-Code zusätzlich `uv`: Beim ersten Lauf entsteht unter `node_modules/.cache/verify-python/` eine virtuelle Umgebung mit genau den pandas- und numpy-Versionen des Browsers (aus `pyodide-lock.json`) und den pytest- und Hypothesis-Versionen aus `src/python/packages.ts`. TypeScript- und JavaScript-`output` laufen mit dem Node, das auch `pnpm verify` ausführt. SQL prüft `verify` in Pyodide unter Node, also mit derselben SQLite wie im Browser, PostgreSQL mit derselben PGlite-Version wie im Browser. Kotlin wird nicht kompiliert; Kotlin-Aufgaben daher besonders sorgfältig gegen die offizielle Dokumentation prüfen. Excel-Formeln und Power-Query-Code laufen nirgends; sie brauchen besonders sorgfältige Prüfung gegen die Microsoft-Dokumentation.
 
 `content:check` und `verify` nehmen auch einzelne Module: `pnpm verify data/sql-joins`. Dann zählen nur Fehler dieses Moduls und der `area.yaml` – praktisch, solange andere Module desselben Bereichs noch entstehen.
 

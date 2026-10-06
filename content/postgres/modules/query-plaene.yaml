@@ -1,0 +1,1057 @@
+id: query-plaene
+title: Query-Pläne lesen
+level: 3
+minutes: 170
+summary: EXPLAIN und EXPLAIN ANALYZE lesen wie ein Profi – Knoten, Kosten und Zeilenschätzungen, Scan-Arten und Join-Algorithmen, work_mem, die Statistik des Planers und die Muster, an denen ein Index scheitert.
+goals:
+  - Du liest einen Plan von innen nach außen und erklärst Kosten (`startup..total`), `rows`, `width`, `actual rows` und `loops`.
+  - Du misst mit `EXPLAIN (ANALYZE, BUFFERS)` sicher, auch bei `UPDATE` und `DELETE`.
+  - Du erkennst Seq Scan, Index Scan, Index-Only Scan und Bitmap Scan sowie Nested Loop, Hash Join und Merge Join und begründest, wann der Planer welchen wählt.
+  - Du findest Fehlschätzungen, führst sie auf veraltete Statistik oder abhängige Spalten zurück und behebst sie mit `ANALYZE` und `CREATE STATISTICS`.
+  - Du erkennst Funktionen auf indizierten Spalten, implizite Casts, `OR` über mehrere Spalten und `LIKE '%…'` im Plan und schreibst die Abfrage um.
+resources:
+  - title: PostgreSQL · Using EXPLAIN
+    url: https://www.postgresql.org/docs/current/using-explain.html
+  - title: PostgreSQL · EXPLAIN
+    url: https://www.postgresql.org/docs/current/sql-explain.html
+  - title: PostgreSQL · Statistics Used by the Planner
+    url: https://www.postgresql.org/docs/current/planner-stats.html
+  - title: PostgreSQL · Planner Method Configuration und Cost Constants
+    url: https://www.postgresql.org/docs/current/runtime-config-query.html
+lesson: |
+  Der Bericht „Umsatz je Standort“ läuft bei Deskwerk jeden Morgen. Seit dem letzten Release braucht er sieben Sekunden statt einer halben. Im Team kursieren drei Theorien: zu wenig Arbeitsspeicher, ein fehlender Index, das neue ORM-Update. Welche stimmt, sagt dir der **Query-Plan**: die Schritte, mit denen PostgreSQL eine Abfrage tatsächlich ausführt. Der Planer probiert für jede Abfrage viele mögliche Pläne durch, schätzt ihre Kosten und nimmt den billigsten ([Planner/Optimizer](https://www.postgresql.org/docs/current/planner-optimizer.html)). `EXPLAIN` zeigt diesen Plan, `EXPLAIN ANALYZE` zusätzlich, was beim Ausführen geschehen ist.
+
+  Welche Indexe es gibt und wann sie helfen, steht in [Indexe](/postgres/indexe). Hier geht es darum, den Plan zu lesen und aus Abweichungen die Ursache abzuleiten. Die Beispiele nutzen ein vereinfachtes Deskwerk-Schema (der Standort steht als Text am Raum) mit 20 000 Buchungen: 30 Räume, 2 000 Mitglieder mit je 10 Buchungen, jede 20. Buchung storniert.
+
+  ## EXPLAIN lesen: ein Baum aus Knoten
+
+  ```postgres run
+  CREATE TABLE raeume (id int PRIMARY KEY, standort text NOT NULL, name text NOT NULL);
+  INSERT INTO raeume
+  SELECT i, (ARRAY['Plagwitz', 'Südvorstadt', 'Zentrum'])[i % 3 + 1], 'Raum ' || i
+  FROM generate_series(1, 30) AS i;
+  CREATE TABLE buchungen (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    raum_id     int NOT NULL,
+    mitglied_id int NOT NULL,
+    beginn      timestamptz NOT NULL,
+    status      text NOT NULL,
+    preis       numeric(8,2)
+  );
+  -- 20 000 Buchungen ab Januar 2026: 30 Räume, 2 000 Mitglieder mit je 10 Buchungen, jede 20. storniert
+  INSERT INTO buchungen (raum_id, mitglied_id, beginn, status, preis)
+  SELECT i % 30 + 1, i * 7 % 2000 + 1,
+         timestamptz '2026-01-02 08:00+01' + i / 60 * interval '1 day' + i % 10 * interval '1 hour',
+         CASE WHEN i % 20 = 0 THEN 'storniert' ELSE 'bestaetigt' END,
+         (i % 5 + 1) * 12.50
+  FROM generate_series(1, 20000) AS i;
+  ANALYZE;
+
+  SELECT relname, relpages, reltuples FROM pg_class WHERE relname IN ('buchungen', 'raeume') ORDER BY relname;
+
+  -- Umsatz je Standort: erst der Plan mit Kosten …
+  EXPLAIN
+  SELECT r.standort, count(*) AS buchungen, sum(b.preis) AS umsatz
+  FROM buchungen AS b
+  JOIN raeume AS r ON r.id = b.raum_id
+  WHERE b.status = 'bestaetigt'
+  GROUP BY r.standort
+  ORDER BY umsatz DESC;
+
+  -- … dann ausgeführt, ohne Zeiten
+  EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF)
+  SELECT r.standort, count(*) AS buchungen, sum(b.preis) AS umsatz
+  FROM buchungen AS b
+  JOIN raeume AS r ON r.id = b.raum_id
+  WHERE b.status = 'bestaetigt'
+  GROUP BY r.standort
+  ORDER BY umsatz DESC;
+
+  -- Änderungen nur in einer Transaktion messen
+  BEGIN;
+  EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  UPDATE buchungen SET status = 'storniert' WHERE mitglied_id = 42;
+  ROLLBACK;
+  SELECT count(*) AS storniert FROM buchungen WHERE status = 'storniert';
+  ```
+
+  Der erste Plan:
+
+  ```text
+  Sort  (cost=630.15..630.16 rows=3 width=50)
+    Sort Key: (sum(b.preis)) DESC
+    ->  HashAggregate  (cost=630.09..630.13 rows=3 width=50)
+          Group Key: r.standort
+          ->  Hash Join  (cost=1.68..487.59 rows=19000 width=16)
+                Hash Cond: (b.raum_id = r.id)
+                ->  Seq Scan on buchungen b  (cost=0.00..429.00 rows=19000 width=10)
+                      Filter: (status = 'bestaetigt'::text)
+                ->  Hash  (cost=1.30..1.30 rows=30 width=14)
+                      ->  Seq Scan on raeume r  (cost=0.00..1.30 rows=30 width=14)
+  ```
+
+  Jede Zeile mit Namen ist ein **Knoten**, eingerückte Knoten hinter `->` sind seine Kinder. Ein Knoten holt Zeilen von seinen Kindern, verarbeitet sie und reicht sie nach oben weiter. Gelesen wird deshalb von innen nach außen: Die beiden Seq Scans lesen die Tabellen, `Hash` baut aus den 30 Räumen eine Hashtabelle, `Hash Join` sucht für jede bestätigte Buchung ihren Raum darin, `HashAggregate` summiert je Standort, `Sort` sortiert die drei Ergebnisse. Zeilen ohne `->` wie `Filter` oder `Hash Cond` beschreiben den Knoten darüber.
+
+  Die Zahlen in Klammern sind Schätzungen, bevor irgendetwas läuft ([Using EXPLAIN](https://www.postgresql.org/docs/current/using-explain.html#USING-EXPLAIN-BASICS)):
+
+  - `cost=0.00..429.00` sind **Startkosten** bis zur ersten Zeile und **Gesamtkosten** bis zur letzten, jeweils inklusive aller Kinder. Die Einheit ist willkürlich: eine sequenziell gelesene Seite kostet 1.
+  - `rows` ist die geschätzte Zahl der Zeilen, die der Knoten liefert, `width` ihre geschätzte Breite in Bytes.
+
+  Die Kosten des Seq Scans lassen sich nachrechnen. `buchungen` belegt 179 Seiten mit 20 000 Zeilen. Jede Seite kostet `seq_page_cost = 1`, jede Zeile `cpu_tuple_cost = 0.01`, jede Auswertung des Filters `cpu_operator_cost = 0.0025` ([Planner Cost Constants](https://www.postgresql.org/docs/current/runtime-config-query.html#RUNTIME-CONFIG-QUERY-CONSTANTS)): 179 + 200 + 50 = 429. Die Startkosten verraten blockierende Knoten. `Hash` beginnt bei 1.30, weil er seine ganze Eingabe gelesen haben muss, bevor er etwas liefert; ebenso `HashAggregate` und `Sort`, deren Startkosten fast so hoch sind wie die Gesamtkosten. Ein Plan mit niedrigen Startkosten liefert die ersten Zeilen schnell – das zählt bei `LIMIT`.
+
+  Die 19 000 geschätzten Zeilen kommen aus der Statistik: Der Planer weiß, dass 95 % der Buchungen bestätigt sind. Woher, steht weiter unten.
+
+  ## EXPLAIN ANALYZE: Schätzung gegen Wirklichkeit
+
+  `EXPLAIN ANALYZE` führt die Abfrage aus und schreibt an jeden Knoten, was tatsächlich geschah. So sieht die volle Ausgabe aus, mit Kosten und Zeiten (die Zeiten schwanken von Lauf zu Lauf):
+
+  ```text
+  Sort  (cost=630.15..630.16 rows=3 width=50) (actual time=18.174..18.177 rows=3.00 loops=1)
+    Sort Key: (sum(b.preis)) DESC
+    Sort Method: quicksort  Memory: 17kB
+    Buffers: shared hit=180
+    ->  HashAggregate  (cost=630.09..630.13 rows=3 width=50) (actual time=18.116..18.121 rows=3.00 loops=1)
+          Group Key: r.standort
+          Batches: 1  Memory Usage: 32kB
+          Buffers: shared hit=180
+          ->  Hash Join  (cost=1.68..487.59 rows=19000 width=16) (actual time=0.073..11.169 rows=19000.00 loops=1)
+                Hash Cond: (b.raum_id = r.id)
+                Buffers: shared hit=180
+                ->  Seq Scan on buchungen b  (cost=0.00..429.00 rows=19000 width=10) (actual time=0.026..4.570 rows=19000.00 loops=1)
+                      Filter: (status = 'bestaetigt'::text)
+                      Rows Removed by Filter: 1000
+                      Buffers: shared hit=179
+                ->  Hash  (cost=1.30..1.30 rows=30 width=14) (actual time=0.039..0.039 rows=30.00 loops=1)
+                      Buckets: 1024  Batches: 1  Memory Usage: 6kB
+                      Buffers: shared hit=1
+                      ->  Seq Scan on raeume r  (cost=0.00..1.30 rows=30 width=14) (actual time=0.007..0.019 rows=30.00 loops=1)
+                            Buffers: shared hit=1
+  Planning:
+    Buffers: shared hit=103 read=1
+  Planning Time: 0.410 ms
+  Execution Time: 18.270 ms
+  ```
+
+  - `actual time=0.026..4.570` sind Millisekunden bis zur ersten und bis zur letzten Zeile, `rows` die tatsächlich gelieferten Zeilen. Seit PostgreSQL 18 mit zwei Nachkommastellen, weil es Durchschnitte sind.
+  - `loops` sagt, wie oft der Knoten lief. Zeit und `rows` gelten **je Durchlauf**; für die Summe multiplizierst du mit `loops` ([EXPLAIN ANALYZE](https://www.postgresql.org/docs/current/using-explain.html#USING-EXPLAIN-ANALYZE)).
+  - `Buffers` zählt Seiten: `shared hit` kam aus dem Cache von PostgreSQL, `read` vom Betriebssystem oder der Platte. Seit PostgreSQL 18 zeigt `EXPLAIN ANALYZE` die Buffers ohne eigene Option.
+  - `Rows Removed by Filter` zählt verworfene Zeilen – ein hoher Wert neben wenigen gelieferten Zeilen ist der klassische Hinweis auf einen fehlenden oder ungenutzten Index.
+
+  Die wichtigste Frage beim Lesen: **Wo weichen `rows` und `actual rows` stark voneinander ab?** Hier passt alles. Liegt die Schätzung an einem Knoten um eine Größenordnung daneben, sind alle Entscheidungen darüber auf falschen Zahlen gebaut: Join-Algorithmus, Join-Reihenfolge, Index oder nicht.
+
+  > [!WARNING] EXPLAIN ANALYZE führt die Anweisung aus
+  > Bei `UPDATE`, `DELETE` und `INSERT` ändert `EXPLAIN ANALYZE` die Daten. Miss Änderungen deshalb in `BEGIN; … ROLLBACK;` wie im Block oben – das `UPDATE` hat zehn Buchungen storniert und wieder zurückgenommen, es bleibt bei 1 000. Für Ausgaben, die bei jedem Lauf gleich sein sollen, blendest du mit `TIMING OFF, SUMMARY OFF` die Zeiten aus.
+
+  ## Scan-Arten: wie ein Knoten an die Zeilen kommt
+
+  ```postgres run
+  CREATE TABLE buchungen (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    raum_id     int NOT NULL,
+    mitglied_id int NOT NULL,
+    beginn      timestamptz NOT NULL,
+    status      text NOT NULL,
+    preis       numeric(8,2)
+  );
+  INSERT INTO buchungen (raum_id, mitglied_id, beginn, status, preis)
+  SELECT i % 30 + 1, i * 7 % 2000 + 1,
+         timestamptz '2026-01-02 08:00+01' + i / 60 * interval '1 day' + i % 10 * interval '1 hour',
+         CASE WHEN i % 20 = 0 THEN 'storniert' ELSE 'bestaetigt' END,
+         (i % 5 + 1) * 12.50
+  FROM generate_series(1, 20000) AS i;
+  ANALYZE buchungen;
+  CREATE INDEX buchungen_mitglied_idx ON buchungen (mitglied_id);
+  VACUUM buchungen;
+
+  EXPLAIN (COSTS OFF) SELECT * FROM buchungen WHERE status = 'storniert';
+  EXPLAIN (COSTS OFF) SELECT * FROM buchungen WHERE id = 42;
+  EXPLAIN (COSTS OFF) SELECT count(*) FROM buchungen WHERE mitglied_id = 42;
+  EXPLAIN (COSTS OFF) SELECT * FROM buchungen WHERE mitglied_id <= 100;
+  EXPLAIN (COSTS OFF) SELECT * FROM buchungen WHERE mitglied_id = 42 OR id = 42;
+  ```
+
+  Die fünf Abfragen zeigen, wie ein Knoten an die Zeilen einer Tabelle kommt:
+
+  | Knoten | Was passiert | Typisch für |
+  | --- | --- | --- |
+  | `Seq Scan` | alle Seiten der Reihe nach, Bedingung als `Filter` | große Anteile, kleine Tabellen, kein passender Index |
+  | `Index Scan` | Index durchsuchen, jede Zeile einzeln aus dem Heap holen, `Index Cond` | wenige Zeilen, Sortierung über den Index |
+  | `Index Only Scan` | nur der Index, Heap nur für `Heap Fetches` | alle Spalten im Index, Visibility Map aktuell |
+  | `Bitmap Index Scan` + `Bitmap Heap Scan` | erst alle Adressen sammeln, dann jede Seite einmal lesen, `Recheck Cond` | mittlere Anteile, verstreute Zeilen |
+  | `BitmapOr` / `BitmapAnd` | Bitmaps mehrerer Indexe verknüpfen | `OR` und `AND` über indizierte Spalten |
+
+  Achte bei Index-Knoten auf den Unterschied zwischen `Index Cond` und `Filter`. Nur die `Index Cond` begrenzt, welcher Teil des Index gelesen wird; ein `Filter` am selben Knoten prüft danach Zeile für Zeile. Der `Recheck Cond` eines Bitmap Heap Scans wird nötig, wenn eine Bitmap bei Speichermangel nur noch ganze Seiten statt einzelner Zeilen kennt (`Heap Blocks: lossy`) oder der Index selbst nur Kandidaten liefert, etwa ein Trigramm-Index ([Combining Multiple Indexes](https://www.postgresql.org/docs/current/indexes-bitmap-scans.html)).
+
+  ## Joins: Nested Loop, Hash Join, Merge Join – und work_mem
+
+  PostgreSQL verbindet zwei Eingaben mit einem von drei Algorithmen. Welchen es wählt, hängt von den geschätzten Zeilenzahlen, den vorhandenen Indexen und der Sortierung der Eingaben ab.
+
+  ```postgres run
+  CREATE TABLE mitglieder (id int PRIMARY KEY, email text NOT NULL UNIQUE, tarif text NOT NULL);
+  INSERT INTO mitglieder
+  SELECT i, 'mitglied' || i || '@example.org', (ARRAY['flex', 'flex', 'fix', 'team'])[i % 4 + 1]
+  FROM generate_series(1, 2000) AS i;
+  CREATE TABLE buchungen (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    raum_id     int NOT NULL,
+    mitglied_id int NOT NULL,
+    beginn      timestamptz NOT NULL,
+    status      text NOT NULL,
+    preis       numeric(8,2)
+  );
+  INSERT INTO buchungen (raum_id, mitglied_id, beginn, status, preis)
+  SELECT i % 30 + 1, i * 7 % 2000 + 1,
+         timestamptz '2026-01-02 08:00+01' + i / 60 * interval '1 day' + i % 10 * interval '1 hour',
+         CASE WHEN i % 20 = 0 THEN 'storniert' ELSE 'bestaetigt' END,
+         (i % 5 + 1) * 12.50
+  FROM generate_series(1, 20000) AS i;
+  ANALYZE;
+  CREATE INDEX buchungen_mitglied_idx ON buchungen (mitglied_id);
+
+  -- Nested Loop: wenige Team-Mitglieder, ihre Buchungen über den Index
+  EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT m.email, b.beginn FROM mitglieder AS m
+  JOIN buchungen AS b ON b.mitglied_id = m.id
+  WHERE m.tarif = 'team' AND m.id <= 20;
+
+  -- Hash Join: alle Team-Mitglieder mit allen Buchungen
+  EXPLAIN (COSTS OFF)
+  SELECT m.email, b.beginn FROM mitglieder AS m
+  JOIN buchungen AS b ON b.mitglied_id = m.id
+  WHERE m.tarif = 'team';
+
+  -- Merge Join: beide Seiten nach dem Join-Schlüssel sortiert
+  EXPLAIN (COSTS OFF)
+  SELECT m.id, b.id FROM mitglieder AS m
+  JOIN buchungen AS b ON b.mitglied_id = m.id
+  ORDER BY m.id;
+
+  -- Sortieren mit 4 MB work_mem (Standard) und mit 64 kB
+  EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT mitglied_id, beginn, preis FROM buchungen ORDER BY preis DESC, beginn;
+  SET work_mem = '64kB';
+  EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT mitglied_id, beginn, preis FROM buchungen ORDER BY preis DESC, beginn;
+  RESET work_mem;
+  ```
+
+  Der Nested Loop zeigt, was `loops` bedeutet:
+
+  ```text
+  Nested Loop (actual rows=50.00 loops=1)
+    ->  Index Scan using mitglieder_pkey on mitglieder m (actual rows=5.00 loops=1)
+          Index Cond: (id <= 20)
+          Filter: (tarif = 'team'::text)
+          Rows Removed by Filter: 15
+          Index Searches: 1
+    ->  Bitmap Heap Scan on buchungen b (actual rows=10.00 loops=5)
+          Recheck Cond: (m.id = mitglied_id)
+          Heap Blocks: exact=50
+          ->  Bitmap Index Scan on buchungen_mitglied_idx (actual rows=10.00 loops=5)
+                Index Cond: (mitglied_id = m.id)
+                Index Searches: 5
+  ```
+
+  Die äußere Seite liefert fünf Team-Mitglieder. Für jedes läuft die innere Seite einmal (`loops=5`) und liefert durchschnittlich zehn Buchungen, zusammen 50.
+
+  | Algorithmus | Arbeitsweise | Gut, wenn … |
+  | --- | --- | --- |
+  | **Nested Loop** | für jede Zeile außen die passenden Zeilen innen suchen | außen wenige Zeilen und innen ein Index auf der Join-Spalte |
+  | **Hash Join** | kleinere Seite in eine Hashtabelle laden (`Hash`), größere Seite einmal durchlaufen und nachschlagen | viele Zeilen, Gleichheitsbedingung, kein passender Index nötig |
+  | **Merge Join** | beide Seiten nach dem Join-Schlüssel sortiert nebeneinander durchlaufen | beide Seiten schon sortiert, etwa über Indexe, oder das Ergebnis soll sortiert sein |
+
+  Der Nested Loop ist der einzige, der auch Bedingungen wie `<` oder `&&` verbinden kann, und wird teuer, wenn die äußere Seite unerwartet groß ist. Für `EXISTS` und `NOT EXISTS` erscheinen dieselben Algorithmen als Semi Join und Anti Join (siehe [Unterabfragen und CTEs](/postgres/unterabfragen-ctes)).
+
+  Sortieren und Hashtabellen bauen braucht Arbeitsspeicher. Jeder `Sort`- und `Hash`-Knoten darf bis zu `work_mem` belegen, standardmäßig 4 MB, Hash-Knoten das Doppelte (`hash_mem_multiplier = 2`) ([work_mem](https://www.postgresql.org/docs/current/runtime-config-resource.html#GUC-WORK-MEM)). Reicht das nicht, lagert PostgreSQL auf die Platte aus. Im Block oben sortiert die erste Abfrage im Speicher, die zweite mit 64 kB auf der Platte:
+
+  ```text
+  Sort Method: quicksort  Memory: 1294kB
+  Sort Method: external merge  Disk: 648kB
+  ```
+
+  Bei Hash-Knoten zeigt sich dasselbe als `Batches` größer als 1. `work_mem` gilt je Knoten und je Verbindung: Eine Abfrage mit drei Sortierungen auf 100 Verbindungen kann das 300-Fache belegen. Hebe den Wert deshalb nicht global an, sondern für einen bekannten Bericht mit `SET LOCAL work_mem = '64MB'` in dessen Transaktion.
+
+  ## Statistik: woher der Planer seine Zahlen hat
+
+  Alle Schätzungen beruhen auf der Statistik, die `ANALYZE` sammelt ([Statistics Used by the Planner](https://www.postgresql.org/docs/current/planner-stats.html)): Zeilen und Seiten je Tabelle in `pg_class`, je Spalte in `pg_stats` den Anteil `NULL`, die Zahl verschiedener Werte (`n_distinct`), die häufigsten Werte mit ihren Anteilen (`most_common_vals`, `most_common_freqs`) und ein Histogramm der übrigen ([pg_stats](https://www.postgresql.org/docs/current/view-pg-stats.html)). Autovacuum startet `ANALYZE` von selbst, wenn sich seit dem letzten Lauf genug Zeilen geändert haben, standardmäßig 50 plus 10 % der Tabelle ([Updating Planner Statistics](https://www.postgresql.org/docs/current/routine-vacuuming.html#VACUUM-FOR-STATISTICS)).
+
+  ```postgres run
+  CREATE TABLE buchungen (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    raum_id     int NOT NULL,
+    mitglied_id int NOT NULL,
+    beginn      timestamptz NOT NULL,
+    status      text NOT NULL,
+    preis       numeric(8,2)
+  );
+  -- Jede Buchung dauert zwei Stunden, der Preis hängt also nur am Raum
+  INSERT INTO buchungen (raum_id, mitglied_id, beginn, status, preis)
+  SELECT i % 30 + 1, i * 7 % 2000 + 1,
+         timestamptz '2026-01-02 08:00+01' + i / 60 * interval '1 day' + i % 10 * interval '1 hour',
+         CASE WHEN i % 20 = 0 THEN 'storniert' ELSE 'bestaetigt' END,
+         (i % 5 + 1) * 12.50
+  FROM generate_series(1, 20000) AS i;
+
+  -- 1. Frisch geladen, noch ohne Statistik
+  EXPLAIN (ANALYZE, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT * FROM buchungen WHERE status = 'storniert';
+
+  ANALYZE buchungen;
+
+  -- 2. Mit Statistik
+  EXPLAIN (ANALYZE, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT * FROM buchungen WHERE status = 'storniert';
+
+  SELECT attname, null_frac, n_distinct, most_common_vals, most_common_freqs
+  FROM pg_stats
+  WHERE tablename = 'buchungen' AND attname IN ('status', 'raum_id', 'preis')
+  ORDER BY attname;
+
+  -- 3. Zwei Bedingungen, die voneinander abhängen
+  EXPLAIN (ANALYZE, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT * FROM buchungen WHERE raum_id = 7 AND preis = 25.00;
+
+  CREATE STATISTICS buchungen_raum_preis (dependencies) ON raum_id, preis FROM buchungen;
+  ANALYZE buchungen;
+
+  EXPLAIN (ANALYZE, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT * FROM buchungen WHERE raum_id = 7 AND preis = 25.00;
+  ```
+
+  Ohne Statistik rät der Planer: `rows=74` bei tatsächlich 1 000 stornierten Buchungen. Nach `ANALYZE` liest er in `pg_stats`, dass `storniert` einen Anteil von 0.05 hat, und schätzt 0.05 × 20 000 = 1 000. Für `raum_id = 7` steht dort 0.03335, also 667 Zeilen, für `preis = 25.00` 0.2.
+
+  Bei zwei Bedingungen nimmt der Planer an, dass sie **unabhängig** sind, und multipliziert: 0.03335 × 0.2 × 20 000 = 133. Hier stimmt das nicht. Jede Buchung dauert zwei Stunden, der Preis hängt am Raum, und alle 667 Buchungen von Raum 7 kosten 25.00:
+
+  ```text
+  Seq Scan on buchungen  (cost=0.00..479.00 rows=133 width=40) (actual rows=667.00 loops=1)
+  …
+  Seq Scan on buchungen  (cost=0.00..479.00 rows=667 width=40) (actual rows=667.00 loops=1)
+  ```
+
+  `CREATE STATISTICS` (seit PostgreSQL 10) sammelt für die genannten Spalten zusätzliche Statistik ([Extended Statistics](https://www.postgresql.org/docs/current/planner-stats.html#PLANNER-STATS-EXTENDED)). `dependencies` misst, wie stark eine Spalte die andere bestimmt; `mcv` speichert die häufigsten Wertkombinationen und erkennt auch Kombinationen, die es nicht gibt; `ndistinct` hilft bei `GROUP BY` über mehrere Spalten. Wirksam wird sie erst nach dem nächsten `ANALYZE`.
+
+  > [!INTERVIEW] „Eine Abfrage ist seit gestern langsam. Wie gehst du vor?“
+  > Ich hole mir die konkrete Abfrage mit echten Parametern, etwa aus dem Log oder `pg_stat_statements`, und schaue mir `EXPLAIN (ANALYZE, BUFFERS)` an – bei Änderungen in einer Transaktion mit `ROLLBACK`. Dann suche ich den Knoten, an dem Schätzung und `actual rows` auseinanderlaufen, und den, der die meiste Zeit oder die meisten Buffers verbraucht. Typische Ursachen sind veraltete Statistik nach einem Import, abhängige Spalten, ein fehlender Index oder eine Bedingung, die keinen Index nutzen kann. Erst wenn ich die Ursache kenne, ändere ich etwas, und danach messe ich noch einmal.
+
+  ## Anti-Pattern im Plan: wenn der Index nicht greifen kann
+
+  Manche Abfragen können einen vorhandenen Index gar nicht nutzen. Im Plan erkennst du sie daran, dass die Bedingung als `Filter` an einem Seq Scan steht statt als `Index Cond`.
+
+  ```postgres run
+  CREATE TABLE mitglieder (id int PRIMARY KEY, email text NOT NULL UNIQUE, tarif text NOT NULL);
+  INSERT INTO mitglieder
+  SELECT i, 'mitglied' || i || '@example.org', (ARRAY['flex', 'flex', 'fix', 'team'])[i % 4 + 1]
+  FROM generate_series(1, 2000) AS i;
+  CREATE TABLE buchungen (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    raum_id     int NOT NULL,
+    mitglied_id int NOT NULL,
+    beginn      timestamptz NOT NULL,
+    status      text NOT NULL,
+    preis       numeric(8,2)
+  );
+  INSERT INTO buchungen (raum_id, mitglied_id, beginn, status, preis)
+  SELECT i % 30 + 1, i * 7 % 2000 + 1,
+         timestamptz '2026-01-02 08:00+01' + i / 60 * interval '1 day' + i % 10 * interval '1 hour',
+         CASE WHEN i % 20 = 0 THEN 'storniert' ELSE 'bestaetigt' END,
+         (i % 5 + 1) * 12.50
+  FROM generate_series(1, 20000) AS i;
+  ANALYZE;
+  CREATE INDEX buchungen_beginn_idx ON buchungen (beginn);
+  CREATE INDEX buchungen_mitglied_idx ON buchungen (mitglied_id);
+
+  -- 1. Funktion auf der indizierten Spalte – und die Umformulierung
+  EXPLAIN (COSTS OFF) SELECT * FROM buchungen WHERE date_trunc('day', beginn) = '2026-03-02';
+  EXPLAIN (COSTS OFF) SELECT * FROM buchungen WHERE beginn >= '2026-03-02' AND beginn < '2026-03-03';
+
+  -- 2. Impliziter Cast: der Wert kommt als numeric
+  EXPLAIN (COSTS OFF) SELECT * FROM buchungen WHERE mitglied_id = 42.0;
+
+  -- 3. LIKE mit Platzhalter vorn
+  EXPLAIN (COSTS OFF) SELECT * FROM mitglieder WHERE email LIKE 'mitglied42%';
+  EXPLAIN (COSTS OFF) SELECT * FROM mitglieder WHERE email LIKE '%42@example.org';
+
+  -- 4. OR auf derselben Spalte und auf verschiedenen Spalten
+  EXPLAIN (COSTS OFF) SELECT * FROM buchungen WHERE mitglied_id = 42 OR mitglied_id = 43;
+  EXPLAIN (COSTS OFF) SELECT * FROM buchungen WHERE mitglied_id = 42 OR raum_id = 7;
+  ```
+
+  Die vier Muster und was hilft:
+
+  1. **Funktion auf der Spalte.** `Filter: (date_trunc('day'::text, beginn) = …)`: Der Index kennt `beginn`, nicht `date_trunc('day', beginn)`. Schreibe die Bedingung als halboffenen Bereich `beginn >= '2026-03-02' AND beginn < '2026-03-03'`, dann steht sie als `Index Cond` da. Dasselbe gilt für `beginn::date`, `lower(email)` und `extract(…)`.
+  2. **Impliziter Cast.** `Filter: ((mitglied_id)::numeric = 42.0)`: Für `int = numeric` wandelt PostgreSQL die Spalte um, nicht den Wert, und der Index auf `mitglied_id` passt nicht mehr ([Operator Type Conversion](https://www.postgresql.org/docs/current/typeconv-oper.html)). In der Anwendung passiert das, wenn ein Treiber den Parameter als `numeric` schickt, etwa ein `Decimal` in Python. Ein Literal in Anführungszeichen (`mitglied_id = '42'`) ist dagegen harmlos, weil sein Typ aus der Spalte abgeleitet wird.
+  3. **`LIKE` mit Platzhalter vorn.** `'mitglied42%'` wird zu einem Bereich `email >= 'mitglied42' AND email < 'mitglied43'`. Das klappt hier nur, weil PGlite die Sortierung `C` nutzt; auf einem Server mit `de_DE.UTF-8` oder einer ICU-Sortierung braucht der Index dafür die Operatorklasse `text_pattern_ops`. `'%42@example.org'` hat keinen Anfang, an dem ein B-Baum ansetzen könnte. Hilfe bringt ein Trigramm-Index mit `pg_trgm` aus [Indexe](/postgres/indexe).
+  4. **`OR` über verschiedene Spalten.** Seit PostgreSQL 18 fasst der Planer `OR` auf derselben Spalte zu `= ANY ('{42,43}')` zusammen, eine einzige Indexbedingung statt zweier Indexsuchen, die mit `BitmapOr` verknüpft werden. Über zwei Spalten braucht er für jede einen Index und verknüpft sie mit `BitmapOr`; fehlt einer, bleibt nur der Seq Scan. Manchmal hilft es, die Abfrage als `UNION` zweier indizierbarer Abfragen zu schreiben.
+
+  > [!PRAXIS] Pläne hinter dem ORM
+  > ORM-Code versteckt diese Muster gern. `func.date(Buchung.beginn) == tag` in SQLAlchemy wird zu `date(buchungen.beginn) = …`, ein Prisma-Filter mit `gte` und `lt` dagegen zu einem indizierbaren Bereich. Lass dir das erzeugte SQL ausgeben (`echo=True`, Prisma `log: ['query']`, siehe [ORM und SQL](/postgres/orm-und-sql)) und prüfe es mit `EXPLAIN`, mit echten Parameterwerten. In Produktion protokolliert die Erweiterung `auto_explain` die Pläne langsamer Abfragen automatisch ([auto_explain](https://www.postgresql.org/docs/current/auto-explain.html)); im Browser-PostgreSQL steht sie nicht zur Verfügung. Wie du langsame Abfragen überhaupt findest, zeigt [Performance](/postgres/performance).
+
+  ## Häufige Fehler
+
+  - **`EXPLAIN ANALYZE` auf `DELETE` ohne Transaktion.** Die Daten sind weg. Immer `BEGIN; EXPLAIN ANALYZE …; ROLLBACK;`.
+  - **Kosten als Millisekunden lesen.** `cost` ist eine Schätzung in willkürlichen Einheiten. Zeit misst nur `ANALYZE`.
+  - **`loops` übersehen.** `actual rows=10.00 loops=681` sind 6 810 Zeilen, nicht 10. Dasselbe gilt für die Zeiten.
+  - **Pläne auf Testdaten beurteilen.** Mit 50 Zeilen ist der Seq Scan immer richtig. Pläne prüfst du mit realistischen Datenmengen und Verteilungen.
+  - **Statistik nach Massenimporten vergessen.** Direkt nach einem großen `INSERT` oder `COPY` schätzt der Planer mit alten Zahlen. `ANALYZE tabelle` gehört ans Ende des Imports.
+  - **Den Planer mit `enable_*` dauerhaft überstimmen.** `SET enable_seqscan = off` ist ein Werkzeug zum Experimentieren. Die Ursache liegt fast immer in Statistik, Index oder Abfrage.
+  - **`work_mem` global hochsetzen.** Der Wert gilt je Knoten und Verbindung. Gezielt mit `SET LOCAL` für einzelne Berichte.
+
+  ## Zusammenfassung
+
+  - Ein Plan ist ein Baum. Gelesen wird von innen nach außen; Zeilen ohne `->` beschreiben den Knoten darüber.
+  - `cost=Start..Gesamt`, `rows` und `width` sind Schätzungen in willkürlichen Einheiten. Die Kostenkonstanten machen sie nachrechenbar.
+  - `EXPLAIN ANALYZE` führt aus. `actual rows` und Zeiten gelten je Durchlauf, mal `loops` ergibt die Summe. `Buffers` zählt Seiten aus Cache und Platte.
+  - Die wichtigste Spur ist die Abweichung zwischen geschätzten und tatsächlichen Zeilen.
+  - Nested Loop für wenige Zeilen mit Index innen, Hash Join für viele Zeilen mit Gleichheit, Merge Join für sortierte Eingaben.
+  - `Sort Method: external merge` und `Batches` > 1 zeigen, dass `work_mem` nicht reicht.
+  - Schätzungen kommen aus `pg_stats`. Nach Importen hilft `ANALYZE`, bei abhängigen Spalten `CREATE STATISTICS`.
+  - Funktionen und Casts auf der Spalte, `LIKE '%…'` und `OR` über Spalten ohne Indexe verhindern die `Index Cond`.
+exercises:
+  - id: plan-zusammensetzen
+    type: order
+    title: Den Plan zusammensetzen
+    prompt: |
+      Für „Meine Buchungen“ mit Raumname gibt es einen Index auf `buchungen (mitglied_id, beginn)`:
+
+      ```postgres
+      SELECT b.beginn, r.name
+      FROM buchungen AS b
+      JOIN raeume AS r ON r.id = b.raum_id
+      WHERE b.mitglied_id = 42
+      ORDER BY b.beginn DESC
+      LIMIT 10;
+      ```
+
+      Unten stehen die Zeilen der `EXPLAIN (COSTS OFF)`-Ausgabe, ohne die Bedingungszeilen der beiden Bitmap-Knoten. Bring sie in die Reihenfolge, in der PostgreSQL sie ausgibt.
+    lang: text
+    lines: |
+      Limit
+        ->  Sort
+              Sort Key: b.beginn DESC
+              ->  Hash Join
+                    Hash Cond: (b.raum_id = r.id)
+                    ->  Bitmap Heap Scan on buchungen b
+                          ->  Bitmap Index Scan on buchungen_mitglied_beginn_idx
+                    ->  Hash
+                          ->  Seq Scan on raeume r
+    hints:
+      - Der oberste Knoten ist der, der zuletzt arbeitet. Was passiert mit den sortierten Zeilen ganz am Ende?
+      - Zeilen ohne `->` stehen direkt unter dem Knoten, den sie beschreiben, vor dessen Kindern.
+      - Beim Hash Join steht die Seite, die durchlaufen wird, vor dem `Hash`-Knoten.
+    explanation: |
+      Ganz oben steht `Limit`, weil er als Letzter arbeitet: Er gibt nach zehn Zeilen auf. Darunter sortiert `Sort` nach `b.beginn DESC`; seine Eigenschaft `Sort Key` folgt direkt auf ihn. Der `Hash Join` liefert ihm die verbundenen Zeilen. Sein erstes Kind ist die äußere Seite – die zehn Buchungen von Mitglied 42 aus dem Bitmap Scan –, sein zweites der `Hash`-Knoten, der die 30 Räume in eine Hashtabelle lädt. Dass PostgreSQL trotz Index auf `(mitglied_id, beginn)` sortiert, liegt an den Daten: Mitglied 42 hat nur zehn Buchungen, und `LIMIT 10` spart nichts. Bei einem Mitglied mit Hunderten Buchungen würde der Planer den Index rückwärts lesen.
+    resources:
+      - title: PostgreSQL · EXPLAIN Basics
+        url: https://www.postgresql.org/docs/current/using-explain.html#USING-EXPLAIN-BASICS
+
+  - id: work-mem-plan
+    type: choice
+    title: Der Bericht sortiert auf der Platte
+    prompt: |
+      Der nächtliche Export aller Buchungen läuft mit `work_mem = '64kB'`. Welche Aussagen über diesen Ausschnitt aus `EXPLAIN ANALYZE` stimmen? Mehrere Antworten richtig.
+    lang: text
+    code: |
+      Sort (actual rows=20000.00 loops=1)
+        Sort Key: preis DESC, beginn
+        Sort Method: external merge  Disk: 648kB
+        ->  Seq Scan on buchungen (actual rows=20000.00 loops=1)
+    options:
+      - text: Die zu sortierenden Daten passten nicht in `work_mem`, PostgreSQL hat in temporäre Dateien ausgelagert.
+        correct: true
+        why: "`external merge` mit `Disk:` heißt: sortierte Teilstücke auf der Platte, danach zusammengeführt. Im Speicher stünde `quicksort  Memory: …`."
+      - text: "`SET LOCAL work_mem = '4MB'` in der Transaktion des Exports bringt diese Sortierung in den Speicher, ohne andere Verbindungen zu verändern."
+        correct: true
+        why: "`SET LOCAL` gilt bis zum Ende der Transaktion. Mit 4 MB sortiert PostgreSQL dieselben Daten mit `quicksort  Memory: 1294kB`."
+      - text: Man kann `work_mem` für den ganzen Server bedenkenlos auf 1 GB setzen, weil jede Abfrage den Wert nur einmal nutzt.
+        correct: false
+        why: "`work_mem` gilt je Sort- oder Hash-Knoten und je Verbindung, Hash-Knoten sogar mit `hash_mem_multiplier`. Viele Verbindungen mit mehreren solchen Knoten können den Speicher des Servers sprengen."
+      - text: "`Disk: 648kB` ist die Größe der Tabelle `buchungen`."
+        correct: false
+        why: Die Zahl gibt an, wie viel die Sortierung auf die Platte geschrieben hat. Die Tabelle ist größer, und es wurden nur drei Spalten sortiert.
+    explanation: |
+      Sortieren und Hashen nutzen bis zu `work_mem` Arbeitsspeicher je Knoten. Reicht er nicht, schreibt PostgreSQL sortierte Teilstücke in temporäre Dateien und führt sie danach zusammen; das ist deutlich langsamer. Den Wert hebst du gezielt für einzelne Berichte an, am besten mit `SET LOCAL` in der Transaktion, nicht global. Bei Hash-Knoten zeigt sich dasselbe Problem als `Batches` größer als 1. `log_temp_files` protokolliert solche Dateien im Betrieb.
+    resources:
+      - title: PostgreSQL · work_mem
+        url: https://www.postgresql.org/docs/current/runtime-config-resource.html#GUC-WORK-MEM
+
+  - id: loops-vorhersagen
+    type: output
+    title: Zeilen je Durchlauf
+    prompt: |
+      Die Hilfsfunktion `ausfuehrung` führt die Abfrage mit `EXPLAIN ANALYZE` aus und gibt je Knoten die Spalten `zeilen` (der Wert hinter `actual rows`) und `loops` zurück, von oben nach unten.
+
+      Die Pläne haben diese Form:
+      - Abfrage 1: `Nested Loop` → `Index Scan using mitglieder_pkey on mitglieder m` → `Bitmap Heap Scan on buchungen b` → `Bitmap Index Scan on buchungen_mitglied_idx`
+      - Abfrage 2: `Index Scan using mitglieder_pkey on mitglieder m` → `Aggregate` (die Unterabfrage) → `Bitmap Heap Scan on buchungen b` → `Bitmap Index Scan on buchungen_mitglied_idx`
+
+      Jedes Mitglied hat genau 10 Buchungen, `tarif = 'fix'` haben die Mitglieder mit `id % 4 = 2`. Was gibt das Skript aus? Ausgabe wie `psql -At`: Werte durch `|` getrennt, `zeilen` mit zwei Nachkommastellen wie in PostgreSQL 18 (`10.00`).
+    lang: postgres
+    code: |
+      CREATE TABLE mitglieder (id int PRIMARY KEY, email text NOT NULL UNIQUE, tarif text NOT NULL);
+      INSERT INTO mitglieder
+      SELECT i, 'mitglied' || i || '@example.org', (ARRAY['flex', 'flex', 'fix', 'team'])[i % 4 + 1]
+      FROM generate_series(1, 2000) AS i;
+      CREATE TABLE buchungen (
+        id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        raum_id int NOT NULL, mitglied_id int NOT NULL, beginn timestamptz NOT NULL
+      );
+      INSERT INTO buchungen (raum_id, mitglied_id, beginn)
+      SELECT i % 30 + 1, i * 7 % 2000 + 1,
+             timestamptz '2026-01-02 08:00+01' + i / 60 * interval '1 day' + i % 10 * interval '1 hour'
+      FROM generate_series(1, 20000) AS i;
+      ANALYZE;
+      CREATE INDEX buchungen_mitglied_idx ON buchungen (mitglied_id);
+
+      CREATE FUNCTION ausfuehrung(abfrage text) RETURNS TABLE (zeilen numeric, loops int) LANGUAGE plpgsql AS $$
+      DECLARE zeile text;
+      BEGIN
+        FOR zeile IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || abfrage LOOP
+          IF zeile ~ 'actual rows=' THEN
+            zeilen := substring(zeile from 'rows=([0-9.]+)')::numeric;
+            loops := substring(zeile from 'loops=([0-9]+)')::int;
+            RETURN NEXT;
+          END IF;
+        END LOOP;
+      END $$;
+
+      -- 1. Die fix-Mitglieder unter den ersten 40 mit ihren Buchungen
+      SELECT * FROM ausfuehrung($$
+        SELECT m.email, b.beginn FROM mitglieder AS m
+        JOIN buchungen AS b ON b.mitglied_id = m.id
+        WHERE m.tarif = 'fix' AND m.id <= 40$$);
+
+      -- 2. Die letzte Buchung der ersten acht Mitglieder, als korrelierte Unterabfrage
+      SELECT * FROM ausfuehrung($$
+        SELECT m.email, (SELECT max(b.beginn) FROM buchungen AS b WHERE b.mitglied_id = m.id)
+        FROM mitglieder AS m WHERE m.id <= 8$$);
+    expected: |
+      100.00|1
+      10.00|1
+      10.00|10
+      10.00|10
+      8.00|1
+      1.00|8
+      10.00|8
+      10.00|8
+    accept:
+      - |
+        100|1
+        10|1
+        10|10
+        10|10
+        8|1
+        1|8
+        10|8
+        10|8
+    hints:
+      - Wie viele Mitglieder mit `id <= 40` haben `id % 4 = 2`? So oft läuft die innere Seite des Nested Loop.
+      - "`actual rows` gilt je Durchlauf. Der Nested Loop selbst läuft einmal und liefert alle Zeilen zusammen."
+      - Eine korrelierte Unterabfrage läuft einmal je Zeile der äußeren Abfrage, ihr `Aggregate` liefert je Lauf eine Zeile.
+    explanation: |
+      In Abfrage 1 liefert der Index Scan die zehn fix-Mitglieder 2, 6, …, 38 in einem Durchlauf. Für jedes läuft die innere Seite einmal, also `loops=10`, und findet je zehn Buchungen. `actual rows` ist ein Durchschnitt je Durchlauf, deshalb steht dort 10 und nicht 100; der Nested Loop selbst läuft einmal und liefert 10 × 10 = 100 Zeilen. Abfrage 2 hat keinen Join, sondern eine korrelierte Unterabfrage (im vollen Plan als `SubPlan 1`): Für jedes der acht Mitglieder läuft sie einmal, ihr `Aggregate` liefert je Lauf genau eine Zeile – das Maximum aus zehn Buchungen. Wer `loops` übersieht, unterschätzt die Arbeit innerer Knoten um genau diesen Faktor.
+    resources:
+      - title: PostgreSQL · EXPLAIN ANALYZE
+        url: https://www.postgresql.org/docs/current/using-explain.html#USING-EXPLAIN-ANALYZE
+
+  - id: schaetzungen-vorhersagen
+    type: output
+    title: Rechnen wie der Planer
+    prompt: |
+      Die Hilfsfunktion `schaetzung` liefert die geschätzte Zeilenzahl (`rows`) des obersten Plan-Knotens. In `pg_stats` steht nach `ANALYZE` für die 20 000 Buchungen:
+
+      | Spalte | häufigste Werte und Anteile |
+      | --- | --- |
+      | `status` | `bestaetigt` 0.95, `storniert` 0.05 |
+      | `raum_id` | 30 Werte, `7` mit 0.03335 |
+      | `preis` | 5 Werte, `25.00` mit 0.2 |
+      | `mitglied_id` | 2 000 Werte, `42` mit 0.0005 |
+
+      Was gibt das Skript aus? Ausgabe wie `psql -At`, eine Zahl je Zeile. PostgreSQL rundet Schätzungen auf ganze Zeilen.
+    lang: postgres
+    code: |
+      CREATE TABLE buchungen (
+        id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        raum_id int NOT NULL, mitglied_id int NOT NULL, status text NOT NULL, preis numeric(8,2)
+      );
+      INSERT INTO buchungen (raum_id, mitglied_id, status, preis)
+      SELECT i % 30 + 1, i * 7 % 2000 + 1,
+             CASE WHEN i % 20 = 0 THEN 'storniert' ELSE 'bestaetigt' END,
+             (i % 5 + 1) * 12.50
+      FROM generate_series(1, 20000) AS i;
+      ANALYZE buchungen;
+
+      CREATE FUNCTION schaetzung(abfrage text) RETURNS numeric LANGUAGE plpgsql AS $$
+      DECLARE plan json;
+      BEGIN
+        EXECUTE 'EXPLAIN (FORMAT JSON) ' || abfrage INTO plan;
+        RETURN (plan -> 0 -> 'Plan' ->> 'Plan Rows')::numeric;
+      END $$;
+
+      SELECT schaetzung($$SELECT * FROM buchungen WHERE status = 'storniert'$$);
+      SELECT schaetzung($$SELECT * FROM buchungen WHERE raum_id = 7$$);
+      SELECT schaetzung($$SELECT * FROM buchungen WHERE status = 'storniert' AND raum_id = 7$$);
+      SELECT schaetzung($$SELECT * FROM buchungen WHERE raum_id = 7 AND preis = 25.00$$);
+      SELECT schaetzung($$SELECT * FROM buchungen WHERE mitglied_id = 42$$);
+    expected: |
+      1000
+      667
+      33
+      133
+      10
+    hints:
+      - Für eine Bedingung mit einem häufigen Wert rechnet der Planer Anteil × Zeilen der Tabelle.
+      - Für zwei Bedingungen mit `AND` multipliziert er beide Anteile – er nimmt an, dass sie unabhängig sind.
+      - 20 000 × 0.05 × 0.03335 = 33.35.
+    explanation: |
+      Der Planer schlägt jeden Wert in der Liste der häufigsten Werte nach: 0.05 × 20 000 = 1 000 stornierte Buchungen, 0.03335 × 20 000 = 667 Buchungen in Raum 7 und 0.0005 × 20 000 = 10 für Mitglied 42. Bei zwei Bedingungen multipliziert er die Anteile, als wären die Spalten unabhängig: 33 und 133. Beide Zahlen sind falsch, in entgegengesetzte Richtungen. Der Preis hängt am Raum, in Wirklichkeit kosten alle 667 Buchungen von Raum 7 genau 25.00. Und durch die Art, wie die Testdaten erzeugt sind, liegen die stornierten Buchungen nur in den Räumen 1, 11 und 21 – für Raum 7 gibt es keine. Gegen solche Abhängigkeiten hilft `CREATE STATISTICS`; mit `mcv` erkennt der Planer auch Kombinationen, die es gar nicht gibt.
+    resources:
+      - title: PostgreSQL · Row Estimation Examples
+        url: https://www.postgresql.org/docs/current/row-estimation-examples.html
+      - title: PostgreSQL · pg_stats
+        url: https://www.postgresql.org/docs/current/view-pg-stats.html
+
+  - id: kosten-vorhersagen
+    type: output
+    title: Was kostet ein Seq Scan?
+    prompt: |
+      Die Hilfsfunktion `kosten` liefert die Gesamtkosten (die zweite Zahl hinter `cost=`) des obersten Plan-Knotens. `buchungen` belegt 179 Seiten mit 20 000 Zeilen, `raeume` eine Seite mit 30 Zeilen. Es gelten die Standardwerte `seq_page_cost = 1`, `cpu_tuple_cost = 0.01` und `cpu_operator_cost = 0.0025` (je ausgewertetem Operator und Zeile). Alle Pläne sind Seq Scans.
+
+      Was gibt das Skript aus? Ausgabe wie `psql -At`, eine Zahl je Zeile mit zwei Nachkommastellen.
+    lang: postgres
+    code: |
+      CREATE TABLE raeume (id int PRIMARY KEY, standort text NOT NULL, name text NOT NULL);
+      INSERT INTO raeume
+      SELECT i, (ARRAY['Plagwitz', 'Südvorstadt', 'Zentrum'])[i % 3 + 1], 'Raum ' || i
+      FROM generate_series(1, 30) AS i;
+      CREATE TABLE buchungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        raum_id     int NOT NULL,
+        mitglied_id int NOT NULL,
+        beginn      timestamptz NOT NULL,
+        status      text NOT NULL,
+        preis       numeric(8,2)
+      );
+      INSERT INTO buchungen (raum_id, mitglied_id, beginn, status, preis)
+      SELECT i % 30 + 1, i * 7 % 2000 + 1,
+             timestamptz '2026-01-02 08:00+01' + i / 60 * interval '1 day' + i % 10 * interval '1 hour',
+             CASE WHEN i % 20 = 0 THEN 'storniert' ELSE 'bestaetigt' END,
+             (i % 5 + 1) * 12.50
+      FROM generate_series(1, 20000) AS i;
+      ANALYZE;
+
+      CREATE FUNCTION kosten(abfrage text) RETURNS numeric LANGUAGE plpgsql AS $$
+      DECLARE plan json;
+      BEGIN
+        EXECUTE 'EXPLAIN (FORMAT JSON) ' || abfrage INTO plan;
+        RETURN (plan -> 0 -> 'Plan' ->> 'Total Cost')::numeric;
+      END $$;
+
+      SELECT kosten($$SELECT * FROM buchungen$$);
+      SELECT kosten($$SELECT * FROM buchungen WHERE status = 'storniert'$$);
+      SELECT kosten($$SELECT * FROM buchungen WHERE raum_id = 7 AND preis = 25.00$$);
+      SELECT kosten($$SELECT * FROM raeume$$);
+    expected: |
+      379.00
+      429.00
+      479.00
+      1.30
+    hints:
+      - "Ohne Bedingung: Seiten × `seq_page_cost` + Zeilen × `cpu_tuple_cost`."
+      - Jede Bedingung ist ein Operator, der für jede gelesene Zeile einmal ausgewertet wird.
+      - "Zwei Bedingungen mit `AND`: zwei Operatoren je Zeile, also 2 × 20 000 × 0.0025."
+    explanation: |
+      Ein Seq Scan liest jede Seite (179 × 1 = 179) und verarbeitet jede Zeile (20 000 × 0.01 = 200): 379. Ein Filter mit einem Operator kostet je Zeile 0.0025 zusätzlich, bei 20 000 Zeilen also 50: 429. Mit zwei Vergleichen sind es 100: 479. `raeume` kostet eine Seite plus 30 × 0.01 = 1.30. Die Rechnung zeigt, warum Kosten keine Millisekunden sind: Sie sind ein Modell aus wenigen Konstanten, das nur dazu dient, Pläne miteinander zu vergleichen. Mit `random_page_cost = 4` für zufällige Zugriffe rechnet der Planer genauso die Kosten eines Index Scans aus.
+    resources:
+      - title: PostgreSQL · Planner Cost Constants
+        url: https://www.postgresql.org/docs/current/runtime-config-query.html#RUNTIME-CONFIG-QUERY-CONSTANTS
+
+  - id: sicher-messen
+    type: gap
+    title: Messen, ohne etwas kaputt zu machen
+    prompt: |
+      Ergänze das Skript. Es soll messen, was das Löschen alter Stornierungen kostet, ohne dass danach etwas gelöscht ist. Danach soll der Planer lernen, dass `raum_id` den `preis` bestimmt, und die neue Statistik sofort nutzen.
+    lang: postgres
+    code: |
+      ⟦BEGIN⟧;
+      EXPLAIN (⟦ANALYZE⟧, BUFFERS)
+      DELETE FROM buchungen
+      WHERE status = 'storniert' AND beginn < '2026-07-01';
+      ⟦ROLLBACK⟧;
+
+      CREATE ⟦STATISTICS⟧ buchungen_raum_preis (⟦dependencies⟧) ON raum_id, preis FROM buchungen;
+      ⟦ANALYZE buchungen⟧;
+    gaps:
+      - label: Transaktion öffnen
+        hint: Ohne sie ist das `DELETE` sofort endgültig.
+        accept: ["START TRANSACTION", "BEGIN TRANSACTION", "BEGIN WORK"]
+      - label: Ausführen und messen
+        hint: Ohne diese Option zeigt `EXPLAIN` nur die Schätzung.
+        accept: ["ANALYZE TRUE", "ANALYZE ON"]
+      - label: Transaktion beenden
+        hint: Die Änderungen sollen verworfen werden.
+        accept: ["ROLLBACK WORK", "ROLLBACK TRANSACTION", "ABORT"]
+      - label: Erweiterte Statistik
+        hint: Der Befehl heißt wie das Ding, das er anlegt.
+      - label: Art der Statistik
+        hint: Gemessen werden funktionale Abhängigkeiten. Auch `mcv` würde hier helfen.
+        accept: ["mcv", "dependencies, mcv", "mcv, dependencies"]
+      - label: Statistik erheben
+        hint: Erst dieser Befehl füllt die neue Statistik.
+        accept: ["ANALYZE", "VACUUM ANALYZE buchungen", "VACUUM ANALYZE"]
+    explanation: |
+      `EXPLAIN ANALYZE` führt das `DELETE` aus. In einer Transaktion mit `ROLLBACK` bekommst du Plan, Zeilen und Buffers, und die Daten bleiben unverändert – auf einem Produktionsserver hält die Transaktion dabei aber Sperren auf den betroffenen Zeilen, bis zum `ROLLBACK`. `CREATE STATISTICS` legt nur die Definition an; gefüllt wird sie beim nächsten `ANALYZE`. `dependencies` misst, wie stark `raum_id` den `preis` bestimmt, `mcv` speichert die häufigsten Kombinationen. Beides hebt die Schätzung für `raum_id = 7 AND preis = 25.00` von 133 auf 667.
+    resources:
+      - title: PostgreSQL · CREATE STATISTICS
+        url: https://www.postgresql.org/docs/current/sql-createstatistics.html
+      - title: PostgreSQL · EXPLAIN
+        url: https://www.postgresql.org/docs/current/sql-explain.html
+
+  - id: statistik-nach-import
+    type: sql
+    lang: postgres
+    title: Die Schätzung nach dem Import
+    prompt: |
+      Um 2:00 Uhr importiert ein Job die Buchungen ab Ende Oktober, um 2:01 Uhr läuft der Bericht – bevor Autovacuum die Statistik aktualisiert hat. Der Planer schätzt für `WHERE beginn >= '2026-11-20'` zwei Zeilen, es sind 681, und wählt deshalb für den Bericht einen Nested Loop mit 681 Durchläufen.
+
+      Sorge dafür, dass die Schätzung stimmt, ohne Abfrage oder Daten zu ändern. Die Prüfabfrage liefert, ob die Schätzung (Hilfsfunktion `schaetzung`, siehe Schema) höchstens 10 % neben der tatsächlichen Zeilenzahl liegt, und die tatsächliche Zahl.
+    schema: |
+      CREATE TABLE buchungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        raum_id     int NOT NULL,
+        mitglied_id int NOT NULL,
+        beginn      timestamptz NOT NULL,
+        status      text NOT NULL,
+        preis       numeric(8,2)
+      );
+      -- Bestand bis Ende Oktober, danach die Statistik
+      INSERT INTO buchungen (raum_id, mitglied_id, beginn, status, preis)
+      SELECT i % 30 + 1, i * 7 % 2000 + 1,
+             timestamptz '2026-01-02 08:00+01' + i / 60 * interval '1 day' + i % 10 * interval '1 hour',
+             CASE WHEN i % 20 = 0 THEN 'storniert' ELSE 'bestaetigt' END,
+             (i % 5 + 1) * 12.50
+      FROM generate_series(1, 18000) AS i;
+      ANALYZE buchungen;
+      -- Der nächtliche Import
+      INSERT INTO buchungen (raum_id, mitglied_id, beginn, status, preis)
+      SELECT i % 30 + 1, i * 7 % 2000 + 1,
+             timestamptz '2026-01-02 08:00+01' + i / 60 * interval '1 day' + i % 10 * interval '1 hour',
+             CASE WHEN i % 20 = 0 THEN 'storniert' ELSE 'bestaetigt' END,
+             (i % 5 + 1) * 12.50
+      FROM generate_series(18001, 20000) AS i;
+      -- Hilfsfunktion: geschätzte Zeilen des obersten Plan-Knotens
+      CREATE FUNCTION schaetzung(abfrage text) RETURNS numeric LANGUAGE plpgsql AS $$
+      DECLARE plan json;
+      BEGIN
+        EXECUTE 'EXPLAIN (FORMAT JSON) ' || abfrage INTO plan;
+        RETURN (plan -> 0 -> 'Plan' ->> 'Plan Rows')::numeric;
+      END $$;
+    starter: |
+      -- Was weiß der Planer über die neuen Buchungen?
+      SELECT schaetzung($$SELECT * FROM buchungen WHERE beginn >= '2026-11-20'$$);
+    solution: |
+      ANALYZE buchungen;
+    check: |
+      SELECT abs(schaetzung($$SELECT * FROM buchungen WHERE beginn >= '2026-11-20'$$) - count(*)) <= count(*) * 0.1 AS schaetzung_passt,
+             count(*) AS tatsaechlich
+      FROM buchungen
+      WHERE beginn >= '2026-11-20';
+    hints:
+      - Welche Statistik kennt der Planer? Sie stammt aus der Zeit vor dem Import.
+      - Das Histogramm von `beginn` endet Ende Oktober. Alles danach hält der Planer für fast leer.
+      - "`ANALYZE buchungen;`"
+    explanation: |
+      Das Histogramm in `pg_stats` beschreibt `beginn` so, wie es beim letzten `ANALYZE` war: bis Ende Oktober. Werte jenseits des letzten Histogrammwerts schätzt der Planer als fast leer, hier zwei Zeilen. `ANALYZE buchungen` liest die Tabelle neu ein, danach liegt die Schätzung bei den tatsächlichen 681 Zeilen. Autovacuum hätte das bald selbst getan – der Import ändert mehr als 50 Zeilen plus 10 % der Tabelle –, aber nicht vor dem Bericht um 2:01 Uhr. Deshalb gehört `ANALYZE` ans Ende jedes größeren Imports. Ein Index auf `beginn` mildert das Problem nur: Dann schaut der Planer für Werte am Rand des Histogramms im Index nach dem tatsächlichen Maximum, und die Schätzung steigt hier von 2 auf 68 – immer noch zehnmal zu wenig.
+    resources:
+      - title: PostgreSQL · ANALYZE
+        url: https://www.postgresql.org/docs/current/sql-analyze.html
+      - title: PostgreSQL · Updating Planner Statistics
+        url: https://www.postgresql.org/docs/current/routine-vacuuming.html#VACUUM-FOR-STATISTICS
+
+  - id: abhaengige-spalten
+    type: sql
+    lang: postgres
+    title: Raum und Preis hängen zusammen
+    prompt: |
+      Jede Buchung dauert zwei Stunden, ihr Preis hängt also nur am Raum. Für `WHERE raum_id = 7 AND preis = 25.00` schätzt der Planer 133 Zeilen, es sind 667.
+
+      Bring dem Planer den Zusammenhang bei, ohne Abfrage oder Daten zu ändern. Die Prüfabfrage meldet, ob die Schätzung (Hilfsfunktion `schaetzung`, siehe Schema) höchstens 10 % neben der tatsächlichen Zeilenzahl liegt und ob es für `buchungen` eine erweiterte Statistik gibt.
+    schema: |
+      CREATE TABLE buchungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        raum_id     int NOT NULL,
+        mitglied_id int NOT NULL,
+        beginn      timestamptz NOT NULL,
+        status      text NOT NULL,
+        preis       numeric(8,2)
+      );
+      INSERT INTO buchungen (raum_id, mitglied_id, beginn, status, preis)
+      SELECT i % 30 + 1, i * 7 % 2000 + 1,
+             timestamptz '2026-01-02 08:00+01' + i / 60 * interval '1 day' + i % 10 * interval '1 hour',
+             CASE WHEN i % 20 = 0 THEN 'storniert' ELSE 'bestaetigt' END,
+             (i % 5 + 1) * 12.50
+      FROM generate_series(1, 20000) AS i;
+      ANALYZE buchungen;
+      -- Hilfsfunktion: geschätzte Zeilen des obersten Plan-Knotens
+      CREATE FUNCTION schaetzung(abfrage text) RETURNS numeric LANGUAGE plpgsql AS $$
+      DECLARE plan json;
+      BEGIN
+        EXECUTE 'EXPLAIN (FORMAT JSON) ' || abfrage INTO plan;
+        RETURN (plan -> 0 -> 'Plan' ->> 'Plan Rows')::numeric;
+      END $$;
+    starter: |
+      SELECT schaetzung($$SELECT * FROM buchungen WHERE raum_id = 7 AND preis = 25.00$$);
+    solution: |
+      CREATE STATISTICS buchungen_raum_preis (dependencies) ON raum_id, preis FROM buchungen;
+      ANALYZE buchungen;
+    check: |
+      SELECT abs(schaetzung($$SELECT * FROM buchungen WHERE raum_id = 7 AND preis = 25.00$$) - count(*)) <= count(*) * 0.1 AS schaetzung_passt,
+             (SELECT count(*) > 0 FROM pg_statistic_ext WHERE stxrelid = 'buchungen'::regclass) AS erweiterte_statistik
+      FROM buchungen
+      WHERE raum_id = 7 AND preis = 25.00;
+    hints:
+      - Ein erneutes `ANALYZE` allein hilft nicht. Die Statistik je Spalte weiß nichts über die andere Spalte.
+      - "`CREATE STATISTICS name (art) ON spalte1, spalte2 FROM tabelle;` – und danach?"
+      - "`CREATE STATISTICS … (dependencies) ON raum_id, preis FROM buchungen;` und `ANALYZE buchungen;`"
+    explanation: |
+      Ohne erweiterte Statistik multipliziert der Planer die Anteile 0.03335 und 0.2, als wären die Spalten unabhängig. `CREATE STATISTICS … (dependencies)` misst beim nächsten `ANALYZE`, dass `raum_id` den Preis vollständig bestimmt, und der Planer rechnet dann nur noch mit dem Anteil von Raum 7: 667 Zeilen. Ohne das `ANALYZE` danach bleibt die Statistik leer. `(mcv)` besteht die Prüfung ebenso und schätzt auch unmögliche Kombinationen wie `raum_id = 7 AND preis = 12.50` richtig; `dependencies` nimmt an, dass die Werte zusammenpassen, und schätzt dort wieder 667. Ohne Art legt PostgreSQL alle Arten an.
+    resources:
+      - title: PostgreSQL · Extended Statistics
+        url: https://www.postgresql.org/docs/current/planner-stats.html#PLANNER-STATS-EXTENDED
+      - title: PostgreSQL · CREATE STATISTICS
+        url: https://www.postgresql.org/docs/current/sql-createstatistics.html
+
+  - id: planer-nachrechnen
+    type: sql
+    lang: postgres
+    title: Die Schätzung aus pg_stats nachrechnen
+    prompt: |
+      Rechne nach, wie der Planer `WHERE status = 'storniert' AND raum_id = 7` schätzt – mit einer Abfrage auf `pg_stats` und `pg_class`.
+
+      In `pg_stats` (Tabelle `buchungen`) stehen je Spalte `most_common_vals` (Typ `anyarray`) und `most_common_freqs` (`real[]`). Den Anteil eines Werts findest du über seine Position: `most_common_vals::text::text[]` macht aus dem `anyarray` ein Textarray, `array_position` liefert die Position. Die Zahl der Zeilen steht in `pg_class.reltuples`.
+
+      Spalten: `anteil_status` (Anteil von `storniert`), `anteil_raum` (Anteil von `7` in `raum_id`), `geschaetzte_zeilen` (`reltuples` × beide Anteile, auf eine ganze Zahl gerundet).
+    schema: |
+      CREATE TABLE buchungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        raum_id     int NOT NULL,
+        mitglied_id int NOT NULL,
+        beginn      timestamptz NOT NULL,
+        status      text NOT NULL,
+        preis       numeric(8,2)
+      );
+      INSERT INTO buchungen (raum_id, mitglied_id, beginn, status, preis)
+      SELECT i % 30 + 1, i * 7 % 2000 + 1,
+             timestamptz '2026-01-02 08:00+01' + i / 60 * interval '1 day' + i % 10 * interval '1 hour',
+             CASE WHEN i % 20 = 0 THEN 'storniert' ELSE 'bestaetigt' END,
+             (i % 5 + 1) * 12.50
+      FROM generate_series(1, 20000) AS i;
+      ANALYZE buchungen;
+    starter: |
+      SELECT attname, most_common_vals, most_common_freqs
+      FROM pg_stats
+      WHERE tablename = 'buchungen' AND attname IN ('status', 'raum_id');
+    solution: |
+      WITH s AS (
+        SELECT most_common_freqs[array_position(most_common_vals::text::text[], 'storniert')] AS anteil
+        FROM pg_stats WHERE tablename = 'buchungen' AND attname = 'status'
+      ), r AS (
+        SELECT most_common_freqs[array_position(most_common_vals::text::text[], '7')] AS anteil
+        FROM pg_stats WHERE tablename = 'buchungen' AND attname = 'raum_id'
+      )
+      SELECT s.anteil AS anteil_status,
+             r.anteil AS anteil_raum,
+             round((c.reltuples * s.anteil * r.anteil)::numeric) AS geschaetzte_zeilen
+      FROM s, r, pg_class AS c
+      WHERE c.relname = 'buchungen';
+    hints:
+      - "Für eine Spalte: `SELECT most_common_freqs[array_position(most_common_vals::text::text[], 'storniert')] FROM pg_stats WHERE tablename = 'buchungen' AND attname = 'status'`."
+      - Der Wert `7` steht im Textarray als `'7'`.
+      - "Verbinde die beiden Anteile und `pg_class` (`relname = 'buchungen'`) und runde mit `round(…::numeric)`."
+    explanation: |
+      Für `status = 'storniert'` findet der Planer den Wert in der Liste der häufigsten Werte und nimmt dessen Anteil 0.05, für `raum_id = 7` den Anteil 0.03335. Weil er die Spalten für unabhängig hält, multipliziert er: 20 000 × 0.05 × 0.03335 = 33.35, also 33 – genau das `rows=33` aus `EXPLAIN`. Werte, die nicht in der Liste stehen, schätzt er aus dem restlichen Anteil, geteilt durch die Zahl der übrigen verschiedenen Werte, Bereiche aus dem Histogramm. Die Dokumentation rechnet diese Fälle Schritt für Schritt vor. Wer die Rechnung einmal nachvollzogen hat, liest Fehlschätzungen im Plan nicht mehr als Rätsel.
+    resources:
+      - title: PostgreSQL · Row Estimation Examples
+        url: https://www.postgresql.org/docs/current/row-estimation-examples.html
+      - title: PostgreSQL · pg_stats
+        url: https://www.postgresql.org/docs/current/view-pg-stats.html
+
+  - id: decimal-parameter
+    type: bug
+    title: Der Index wird nicht benutzt
+    prompt: |
+      Auf `buchungen` liegt ein Index auf `(mitglied_id, beginn)`. Trotzdem zeigt `auto_explain` für diese Funktion einen Seq Scan über alle Buchungen:
+
+      ```text
+      ->  Seq Scan on buchungen b
+            Filter: ((mitglied_id)::numeric = '42'::numeric)
+      ```
+
+      psycopg 3 schickt Parameter mit ihrem Typ an den Server. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: python
+    code: |
+      from decimal import Decimal
+
+      def meine_buchungen(conn, mitglied_id):
+          return conn.execute(
+              """
+              SELECT b.id, b.beginn, r.name
+              FROM buchungen AS b
+              JOIN raeume AS r ON r.id = b.raum_id
+              WHERE b.mitglied_id = %s
+              ORDER BY b.beginn DESC
+              LIMIT 10
+              """,
+              (Decimal(mitglied_id),),
+          ).fetchall()
+    lines: [13]
+    fix:
+      - line: 13
+        answers:
+          - "(mitglied_id,),"
+          - "(int(mitglied_id),),"
+          - "[mitglied_id],"
+          - "[int(mitglied_id)],"
+    hints:
+      - "Im Plan steht `(mitglied_id)::numeric`. Wer hat entschieden, dass verglichen wird, als wäre es `numeric`?"
+      - Welchen PostgreSQL-Typ bekommt ein Python-`Decimal`?
+    explanation: |
+      psycopg 3 übergibt ein `Decimal` als `numeric`. Für `integer = numeric` gibt es keinen passenden Operator im Index, also wandelt PostgreSQL die Spalte nach `numeric` um und vergleicht dann – Zeile für Zeile im Seq Scan. Mit einem `int` als Parameter steht die Bedingung als `Index Cond: (mitglied_id = 42)` im Plan. Solche Casts schleichen sich über Typen der Anwendung ein: `Decimal` aus einer JSON-Bibliothek, ein Python-`float` (wird `double precision`), `bigint`-Spalten gegen `numeric`-Parameter. Im Plan verrät sie der Cast auf der Spaltenseite der Bedingung.
+    resources:
+      - title: PostgreSQL · Operator Type Conversion
+        url: https://www.postgresql.org/docs/current/typeconv-oper.html
+      - title: psycopg 3 · Adapting basic Python types
+        url: https://www.psycopg.org/psycopg3/docs/basic/adapt.html
+
+  - id: fehlschaetzung-nach-import
+    type: explain
+    title: 681 Durchläufe statt zwei
+    prompt: |
+      Der Bericht „Wer hat ab dem 20. November gebucht, und wann war die Person im Haus?“ ist nach dem nächtlichen Import langsam. `ANALYZE` lief zuletzt vor dem Import. Erkläre den Plan: Wie liest du ihn, wo liegt das Problem, warum hat der Planer so entschieden, und was tust du?
+    lang: text
+    code: |
+      EXPLAIN (ANALYZE, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+      SELECT b.id, b.beginn, c.zeitpunkt
+      FROM buchungen AS b
+      JOIN checkins AS c ON c.mitglied_id = b.mitglied_id
+      WHERE b.beginn >= '2026-11-20';
+
+      Nested Loop  (cost=4.30..450.84 rows=5 width=24) (actual rows=1648.00 loops=1)
+        ->  Seq Scan on buchungen b  (cost=0.00..429.15 rows=2 width=20) (actual rows=681.00 loops=1)
+              Filter: (beginn >= '2026-11-20 00:00:00+01'::timestamp with time zone)
+              Rows Removed by Filter: 19319
+        ->  Bitmap Heap Scan on checkins c  (cost=4.30..10.82 rows=2 width=12) (actual rows=2.42 loops=681)
+              Recheck Cond: (mitglied_id = b.mitglied_id)
+              Heap Blocks: exact=1648
+              ->  Bitmap Index Scan on checkins_mitglied_idx  (cost=0.00..4.30 rows=2 width=0) (actual rows=2.42 loops=681)
+                    Index Cond: (mitglied_id = b.mitglied_id)
+                    Index Searches: 681
+    points:
+      - Gelesen von innen nach außen; die innere Seite des Nested Loop läuft einmal je Zeile der äußeren (`loops=681`), 2.42 Zeilen je Lauf ergeben die 1 648 Zeilen des Joins.
+      - "Die Fehlschätzung sitzt im Seq Scan auf `buchungen`: geschätzt 2 Zeilen, tatsächlich 681."
+      - Ursache ist die veraltete Statistik – das Histogramm von `beginn` endet vor den importierten Buchungen, Werte dahinter hält der Planer für fast leer.
+      - Bei zwei äußeren Zeilen ist ein Nested Loop mit Index innen billig; bei 681 wäre ein Hash Join die bessere Wahl gewesen.
+      - "Abhilfe: `ANALYZE buchungen` am Ende des Imports und danach erneut messen."
+    explanation: |
+      Ich lese den Plan von innen nach außen. Außen liest ein Seq Scan alle Buchungen und behält die ab dem 20. November. Für jede davon sucht der Nested Loop über den Index auf `checkins.mitglied_id` die Check-ins des Mitglieds: Der innere Teil läuft 681-mal mit durchschnittlich 2.42 Zeilen, zusammen 1 648 Zeilen – das ist die Zahl am Nested Loop. Der Fehler sitzt am äußeren Seq Scan: geschätzt 2 Zeilen, tatsächlich 681. Das Histogramm von `beginn` stammt aus der Zeit vor dem Import und endet im Oktober, also hält der Planer alles nach dem 20. November für fast leer. Für zwei Zeilen ist ein Nested Loop mit 2 Indexsuchen ideal, für 681 sind es 681 Suchen – ein Hash Join über beide Tabellen hätte jede nur einmal gelesen. Auf diesen kleinen Tabellen ist der Unterschied gering, bei Millionen Zeilen wird aus derselben Fehlschätzung ein Bericht, der Minuten statt Sekunden braucht. Die Abhilfe ist `ANALYZE buchungen` als letzter Schritt des Imports. Danach messe ich noch einmal: Mit frischer Statistik schätzt der Planer 688 Zeilen und wählt einen Hash Join.
+    resources:
+      - title: PostgreSQL · Using EXPLAIN – Caveats
+        url: https://www.postgresql.org/docs/current/using-explain.html#USING-EXPLAIN-CAVEATS
+
+  - id: monatsbericht-beschleunigen
+    type: sql
+    lang: postgres
+    title: Der Monatsbericht soll den Index nutzen
+    prompt: |
+      Der Monatsbericht ruft `umsatz_je_standort(monat)` auf (siehe Schema). Die Funktion liest jedes Mal alle Buchungen, obwohl sie nur einen Monat braucht.
+
+      Sorge dafür, dass `SELECT * FROM umsatz_je_standort('2026-03-01')` `buchungen` über einen Index liest. Du darfst Indexe anlegen und die Funktion mit `CREATE OR REPLACE FUNCTION` neu schreiben; Signatur, `LANGUAGE sql STABLE` und Ergebnis bleiben gleich. Die Prüfabfrage vergleicht die Ergebnisse für März und Oktober (`standort:buchungen:umsatz`) und meldet anhand von `plan_knoten`, ob `buchungen` per Seq Scan gelesen wird und ob ein Index-Knoten auf `buchungen` vorkommt.
+    schema: |
+      CREATE TABLE raeume (id int PRIMARY KEY, standort text NOT NULL, name text NOT NULL);
+      INSERT INTO raeume
+      SELECT i, (ARRAY['Plagwitz', 'Südvorstadt', 'Zentrum'])[i % 3 + 1], 'Raum ' || i
+      FROM generate_series(1, 30) AS i;
+      CREATE TABLE buchungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        raum_id     int NOT NULL,
+        mitglied_id int NOT NULL,
+        beginn      timestamptz NOT NULL,
+        status      text NOT NULL,
+        preis       numeric(8,2)
+      );
+      INSERT INTO buchungen (raum_id, mitglied_id, beginn, status, preis)
+      SELECT i % 30 + 1, i * 7 % 2000 + 1,
+             timestamptz '2026-01-02 08:00+01' + i / 60 * interval '1 day' + i % 10 * interval '1 hour',
+             CASE WHEN i % 20 = 0 THEN 'storniert' ELSE 'bestaetigt' END,
+             (i % 5 + 1) * 12.50
+      FROM generate_series(1, 20000) AS i;
+      -- Nachtveranstaltungen an Monatsgrenzen
+      INSERT INTO buchungen (raum_id, mitglied_id, beginn, status, preis) VALUES
+        (1, 11, '2026-03-31 23:30+02', 'bestaetigt', 80.00),
+        (2, 12, '2026-04-01 00:00+02', 'bestaetigt', 80.00),
+        (3, 13, '2026-10-31 23:30+01', 'bestaetigt', 80.00),
+        (4, 14, '2026-11-01 00:00+01', 'bestaetigt', 80.00);
+      ANALYZE;
+      CREATE FUNCTION umsatz_je_standort(monat date)
+      RETURNS TABLE (standort text, buchungen bigint, umsatz numeric)
+      LANGUAGE sql STABLE AS $$
+        SELECT r.standort, count(*), sum(b.preis)
+        FROM buchungen AS b
+        JOIN raeume AS r ON r.id = b.raum_id
+        WHERE date_trunc('month', b.beginn) = monat
+          AND b.status = 'bestaetigt'
+        GROUP BY r.standort
+      $$;
+      -- Hilfsfunktion: die Knoten des Plans ohne Einrückung und ohne Bedingungszeilen
+      CREATE FUNCTION plan_knoten(abfrage text) RETURNS SETOF text LANGUAGE plpgsql AS $$
+      DECLARE zeile text;
+      BEGIN
+        FOR zeile IN EXECUTE 'EXPLAIN (COSTS OFF) ' || abfrage LOOP
+          zeile := ltrim(zeile, ' ->');
+          IF zeile !~ '^[A-Z][A-Za-z ]*: ' THEN RETURN NEXT zeile; END IF;
+        END LOOP;
+      END $$;
+    starter: |
+      -- Plan ansehen: SELECT plan_knoten($$SELECT * FROM umsatz_je_standort('2026-03-01')$$);
+      CREATE OR REPLACE FUNCTION umsatz_je_standort(monat date)
+      RETURNS TABLE (standort text, buchungen bigint, umsatz numeric)
+      LANGUAGE sql STABLE AS $$
+        SELECT r.standort, count(*), sum(b.preis)
+        FROM buchungen AS b
+        JOIN raeume AS r ON r.id = b.raum_id
+        WHERE date_trunc('month', b.beginn) = monat
+          AND b.status = 'bestaetigt'
+        GROUP BY r.standort
+      $$;
+    solution: |
+      CREATE INDEX buchungen_beginn_idx ON buchungen (beginn);
+      CREATE OR REPLACE FUNCTION umsatz_je_standort(monat date)
+      RETURNS TABLE (standort text, buchungen bigint, umsatz numeric)
+      LANGUAGE sql STABLE AS $$
+        SELECT r.standort, count(*), sum(b.preis)
+        FROM buchungen AS b
+        JOIN raeume AS r ON r.id = b.raum_id
+        WHERE b.beginn >= monat
+          AND b.beginn < monat + interval '1 month'
+          AND b.status = 'bestaetigt'
+        GROUP BY r.standort
+      $$;
+    check: |
+      SELECT (SELECT string_agg(u.standort || ':' || u.buchungen || ':' || u.umsatz, ', ' ORDER BY u.standort)
+              FROM umsatz_je_standort('2026-03-01') AS u) AS maerz,
+             (SELECT string_agg(u.standort || ':' || u.buchungen || ':' || u.umsatz, ', ' ORDER BY u.standort)
+              FROM umsatz_je_standort('2026-10-01') AS u) AS oktober,
+             bool_or(k LIKE 'Seq Scan on buchungen%') AS seq_scan_buchungen,
+             bool_or(k LIKE '%Scan%on buchungen%' AND k NOT LIKE 'Seq Scan%') AS index_auf_buchungen
+      FROM plan_knoten($$SELECT * FROM umsatz_je_standort('2026-03-01')$$) AS k;
+    hints:
+      - "`SELECT plan_knoten(…)` zeigt den Plan. Eine `LANGUAGE sql`-Funktion mit `STABLE` wird in die Abfrage eingebettet, deshalb siehst du ihre Tabellen."
+      - "`date_trunc('month', b.beginn) = monat` kann keinen Index auf `beginn` nutzen. Wie sieht derselbe Monat als halboffener Bereich aus?"
+      - Es gibt Buchungen, die genau um Mitternacht am Monatsersten beginnen. Gehören sie zum alten oder zum neuen Monat?
+      - "`CREATE INDEX … ON buchungen (beginn);` und in der Funktion `WHERE b.beginn >= monat AND b.beginn < monat + interval '1 month'`."
+    explanation: |
+      Zwei Dinge fehlen: ein Index auf `beginn` und eine Bedingung, die ihn nutzen kann. `date_trunc('month', b.beginn) = monat` rechnet für jede Zeile den Monatsanfang aus; ein Index auf `beginn` passt dazu nicht. Als halboffener Bereich `b.beginn >= monat AND b.beginn < monat + interval '1 month'` steht die Bedingung als `Index Cond` im Plan. `monat + interval '1 month'` ergibt einen Zeitpunkt in der Zeitzone der Sitzung, genau wie der Vergleich mit `date_trunc` – deshalb bleiben die Ergebnisse gleich, auch für die Nachtveranstaltungen an den Monatsgrenzen und im Oktober mit dem Ende der Sommerzeit. `BETWEEN monat AND monat + interval '1 month'` wäre falsch: Es schließt die obere Grenze ein und zählt die Buchung, die am 1. April um 0:00 Uhr beginnt, zum März. Ein partieller Index `ON buchungen (beginn) WHERE status = 'bestaetigt'` besteht die Prüfung ebenso. Bleibt die Funktion `STABLE` und `LANGUAGE sql`, bettet PostgreSQL ihren Rumpf in die aufrufende Abfrage ein; als `VOLATILE` oder in PL/pgSQL wäre sie für `EXPLAIN` eine Blackbox (`Function Scan`).
+    resources:
+      - title: PostgreSQL Wiki · Inlining of SQL functions
+        url: https://wiki.postgresql.org/wiki/Inlining_of_SQL_functions
+      - title: PostgreSQL · Using EXPLAIN
+        url: https://www.postgresql.org/docs/current/using-explain.html

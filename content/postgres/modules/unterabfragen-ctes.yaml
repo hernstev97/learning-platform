@@ -1,0 +1,1030 @@
+id: unterabfragen-ctes
+title: Unterabfragen, CTEs und LATERAL
+level: 2
+minutes: 150
+summary: Abfragen in Abfragen so schreiben, dass sie richtig rechnen und PostgreSQL sie gut planen kann – skalare und korrelierte Unterabfragen, EXISTS, ANY und ALL, CTEs mit und ohne Materialisierung, rekursive CTEs für Hierarchien und LATERAL für „die letzten N je Gruppe“.
+goals:
+  - Du setzt skalare und korrelierte Unterabfragen ein und sagst vorher, wann sie `NULL` liefern und wann sie mit „more than one row“ scheitern.
+  - Du wählst zwischen `EXISTS`, `IN`, `= ANY` und `<> ALL` und erkennst am Query-Plan, ob PostgreSQL einen Semi- oder Anti-Join daraus macht.
+  - Du erklärst, wann PostgreSQL seit Version 12 einen CTE in die Abfrage faltet und wann er materialisiert wird, und steuerst das mit `MATERIALIZED`.
+  - Du durchläufst Hierarchien mit `WITH RECURSIVE` und fängst Zyklen mit `CYCLE` ab.
+  - Du holst die letzten N Zeilen je Gruppe mit `LEFT JOIN LATERAL` in einer Abfrage statt in einer Schleife.
+resources:
+  - title: PostgreSQL · Subquery Expressions (EXISTS, IN, ANY, ALL)
+    url: https://www.postgresql.org/docs/current/functions-subquery.html
+  - title: PostgreSQL · WITH Queries (Common Table Expressions)
+    url: https://www.postgresql.org/docs/current/queries-with.html
+  - title: PostgreSQL · LATERAL Subqueries
+    url: https://www.postgresql.org/docs/current/queries-table-expressions.html#QUERIES-LATERAL
+  - title: SQLAlchemy 2.1 · Subqueries, CTEs, LATERAL und EXISTS
+    url: https://docs.sqlalchemy.org/en/21/tutorial/data_select.html#subqueries-and-ctes
+lesson: |
+  Die Profilseite der Deskwerk-App zeigt je Mitglied die Zahl der Buchungen, die letzten drei Buchungen und wer das Mitglied geworben hat. Die erste Fassung im Backend lud die Mitglieder einer Seite, danach in einer Schleife die Buchungen jedes Mitglieds, und sortierte in Python. Bei 20 Mitgliedern je Seite waren das 21 Abfragen und einige tausend Zeilen, von denen die Seite 60 anzeigte. Dieselbe Seite entsteht mit einer einzigen Abfrage, wenn du weißt, wo eine Abfrage in einer anderen stehen darf und was PostgreSQL daraus macht.
+
+  Die Grundlagen kennst du aus [Joins und Datenmodelle abfragen](/data/sql-joins): `EXISTS` als Semi-Join, `NOT EXISTS` als Anti-Join, warum `NOT IN` an einem einzigen `NULL` scheitert und wie CTEs eine Auswertung in lesbare Schritte zerlegen. Dieses Modul nimmt die Sicht der Anwendung ein: Wie oft läuft eine Unterabfrage, wie plant PostgreSQL sie, wann bremst ein CTE, wie durchläufst du eine Hierarchie, und wie holst du die letzten N Zeilen je Gruppe?
+
+  ## Skalare und korrelierte Unterabfragen
+
+  Eine **skalare Unterabfrage** steht in Klammern dort, wo ein einzelner Wert erwartet wird, etwa in der `SELECT`-Liste. Sie darf höchstens eine Zeile mit einer Spalte liefern. Liefert sie keine Zeile, ist ihr Wert `NULL` ([PostgreSQL · Scalar Subqueries](https://www.postgresql.org/docs/current/sql-expressions.html#SQL-SYNTAX-SCALAR-SUBQUERIES)). Bezieht sie sich auf eine Spalte der äußeren Abfrage, heißt sie **korreliert**: Gedanklich läuft sie für jede äußere Zeile neu.
+
+  ```postgres run
+  CREATE TABLE mitglieder (
+    id    int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email text NOT NULL UNIQUE,
+    name  text NOT NULL
+  );
+  CREATE TABLE buchungen (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    mitglied_id int NOT NULL REFERENCES mitglieder (id),
+    raum        text NOT NULL,
+    beginn      timestamptz NOT NULL,
+    status      text NOT NULL DEFAULT 'bestaetigt'
+  );
+  INSERT INTO mitglieder (email, name) VALUES
+    ('anna.schulz@example.org',   'Anna Schulz'),
+    ('jonas.becker@example.org',  'Jonas Becker'),
+    ('leonie.wagner@example.org', 'Leonie Wagner');
+  INSERT INTO buchungen (mitglied_id, raum, beginn, status) VALUES
+    (1, 'Atelier', '2026-03-02 09:00', 'bestaetigt'),
+    (1, 'Box 1',   '2026-03-09 14:00', 'bestaetigt'),
+    (2, 'Loft',    '2026-03-04 10:00', 'storniert'),
+    (1, 'Loft',    '2026-03-16 09:00', 'storniert');
+
+  SELECT m.name,
+         (SELECT count(*)
+            FROM buchungen AS b
+           WHERE b.mitglied_id = m.id AND b.status = 'bestaetigt') AS bestaetigt,
+         (SELECT max(b.beginn)
+            FROM buchungen AS b
+           WHERE b.mitglied_id = m.id AND b.status = 'bestaetigt') AS letzte_buchung
+  FROM mitglieder AS m
+  ORDER BY m.id;
+  ```
+
+  Jonas Becker und Leonie Wagner haben keine bestätigte Buchung. Trotzdem steht bei ihnen `0` und nicht `NULL`: Ein Aggregat ohne `GROUP BY` liefert immer genau eine Zeile, auch über null Eingabezeilen. `count(*)` ist dort `0`, `max(…)` dagegen `NULL`. Ohne Aggregat sieht das anders aus. Die folgende Unterabfrage soll „den Raum“ eines Mitglieds zeigen:
+
+  ```postgres run fails
+  CREATE TABLE mitglieder (id int PRIMARY KEY, name text NOT NULL);
+  CREATE TABLE buchungen (id bigint PRIMARY KEY, mitglied_id int NOT NULL, raum text NOT NULL);
+  INSERT INTO mitglieder VALUES (1, 'Anna Schulz'), (2, 'Jonas Becker');
+  INSERT INTO buchungen VALUES (101, 1, 'Atelier'), (102, 2, 'Loft'), (103, 1, 'Box 1');
+
+  SELECT m.name,
+         (SELECT b.raum FROM buchungen AS b WHERE b.mitglied_id = m.id) AS raum
+  FROM mitglieder AS m;
+  ```
+
+  Die Meldung lautet `more than one row returned by a subquery used as an expression` (SQLSTATE 21000). Gefährlich ist, wann sie kommt: In der Testdatenbank hat jedes Mitglied eine Buchung, und alles läuft. In Produktion bucht Anna Schulz zum zweiten Mal, und die Profilseite antwortet mit einem Fehler 500. Eine skalare Unterabfrage braucht deshalb eine Garantie für höchstens eine Zeile: ein Aggregat, eine Bedingung auf einen eindeutigen Schlüssel oder `ORDER BY … LIMIT 1`.
+
+  Korreliert heißt auch: Die Unterabfrage läuft je äußerer Zeile. Mit 2 000 Mitgliedern, 20 000 Buchungen und ohne Index auf `buchungen.mitglied_id` zeigt `EXPLAIN (COSTS OFF)` für die Abfrage oben, nur mit der Spalte `bestaetigt`, diesen Plan:
+
+  ```text
+  Seq Scan on mitglieder m
+    SubPlan 1
+      ->  Aggregate
+            ->  Seq Scan on buchungen b
+                  Filter: ((mitglied_id = m.id) AND (status = 'bestaetigt'::text))
+  ```
+
+  `SubPlan 1` steht unter dem Scan der Mitglieder: Für jedes der 2 000 Mitglieder liest PostgreSQL alle 20 000 Buchungen. PostgreSQL legt für Fremdschlüssel keinen Index an, das ist deine Aufgabe ([Indexe](/postgres/indexe)). Mit einem Index auf `buchungen (mitglied_id)` wird daraus ein kurzer Index-Zugriff je Mitglied. Für eine Seite mit 20 Mitgliedern ist das schnell. Für einen Bericht über alle Mitglieder ist ein `LEFT JOIN` mit `GROUP BY` oft besser, weil er die Buchungen in einem Durchgang liest.
+
+  ## EXISTS, IN, ANY und ALL
+
+  `EXISTS (Unterabfrage)` ist wahr, sobald die Unterabfrage eine Zeile liefert ([PostgreSQL · EXISTS](https://www.postgresql.org/docs/current/functions-subquery.html#FUNCTIONS-SUBQUERY-EXISTS)). `x IN (Unterabfrage)` ist dasselbe wie `x = ANY (Unterabfrage)`, `x NOT IN (…)` dasselbe wie `x <> ALL (…)`. Für Anwendungen zählt neben dem Ergebnis, was der Planer daraus macht. Mit denselben 2 000 Mitgliedern und 20 000 Buchungen:
+
+  ```postgres run
+  CREATE TABLE mitglieder (id int PRIMARY KEY, name text NOT NULL);
+  CREATE TABLE buchungen (
+    id bigint PRIMARY KEY,
+    mitglied_id int NOT NULL REFERENCES mitglieder (id),
+    status text NOT NULL
+  );
+  INSERT INTO mitglieder SELECT g, 'Mitglied ' || g FROM generate_series(1, 2000) AS g;
+  INSERT INTO buchungen
+  SELECT g, 1 + g % 1500, CASE WHEN g % 10 = 0 THEN 'storniert' ELSE 'bestaetigt' END
+  FROM generate_series(1, 20000) AS g;
+  ANALYZE;
+
+  -- Anti-Join: Mitglieder ohne Buchung
+  EXPLAIN (COSTS OFF)
+  SELECT m.id FROM mitglieder AS m
+  WHERE NOT EXISTS (SELECT 1 FROM buchungen AS b WHERE b.mitglied_id = m.id);
+
+  -- Dieselbe Frage mit NOT IN
+  EXPLAIN (COSTS OFF)
+  SELECT m.id FROM mitglieder AS m
+  WHERE m.id NOT IN (SELECT b.mitglied_id FROM buchungen AS b);
+  ```
+
+  ```text
+  Hash Right Anti Join
+    Hash Cond: (b.mitglied_id = m.id)
+    ->  Seq Scan on buchungen b
+    ->  Hash
+          ->  Seq Scan on mitglieder m
+
+  Seq Scan on mitglieder m
+    Filter: (NOT (ANY (id = (hashed SubPlan 1).col1)))
+    SubPlan 1
+      ->  Seq Scan on buchungen b
+  ```
+
+  `NOT EXISTS` wird ein echter **Anti Join**, den der Planer mit jeder Join-Strategie ausführen kann. `NOT IN` bleibt ein Filter mit `hashed SubPlan`: PostgreSQL baut eine Hashtabelle aus allen `mitglied_id` und prüft jedes Mitglied dagegen. Einen Anti-Join macht PostgreSQL 18 aus `NOT IN` nicht, denn ein einziges `NULL` in der Unterabfrage würde das Ergebnis ändern ([PostgreSQL · NOT IN](https://www.postgresql.org/docs/current/functions-subquery.html#FUNCTIONS-SUBQUERY-NOTIN)). Dass `mitglied_id` hier `NOT NULL` ist, ändert daran nichts. Passt die Hashtabelle nicht in `work_mem`, zeigt der Plan nur noch `SubPlan 1` mit `Materialize`: Dann durchsucht PostgreSQL das zwischengespeicherte Ergebnis für jedes Mitglied Zeile für Zeile. Ein zweiter Grund, Anti-Joins mit `NOT EXISTS` zu schreiben.
+
+  `ANY` und `ALL` vergleichen auch mit einem **Array** ([PostgreSQL · ANY/SOME mit Arrays](https://www.postgresql.org/docs/current/functions-comparisons.html#FUNCTIONS-COMPARISONS-ANY-SOME)). Das ist das übliche Muster, wenn die Anwendung eine Liste von IDs übergibt. psycopg wandelt eine Python-Liste in ein PostgreSQL-Array, und `cur.execute("SELECT id, name FROM raeume WHERE id = ANY(%s)", (raum_ids,))` hat immer genau einen Parameter, egal wie lang die Liste ist ([psycopg · Lists adaptation](https://www.psycopg.org/psycopg3/docs/basic/adapt.html#lists-adaptation)). Mit `IN (%s, %s, …)` entstünde für jede Listenlänge ein anderer SQL-Text.
+
+  Für `ANY` und `ALL` gelten dieselben Regeln der dreiwertigen Logik wie für `IN` und `NOT IN`. `ANY` braucht einen wahren Vergleich, `ALL` darf keinen falschen haben. Ohne Treffer, aber mit `NULL` in der Liste ist das Ergebnis `NULL`, und `WHERE` behandelt `NULL` wie falsch. Über eine leere Menge ist `ANY` falsch und `ALL` wahr. Das ist mathematisch korrekt („alle null Elemente erfüllen die Bedingung“), überrascht aber in Prüfungen wie `preis > ALL (SELECT …)`, wenn die Unterabfrage nichts findet.
+
+  > [!MERKE]
+  > Existenz prüfen mit `EXISTS`, Abwesenheit mit `NOT EXISTS`. `= ANY(array)` ist das Werkzeug für ID-Listen aus der Anwendung. `NOT IN` und `<> ALL` nur über Werte, die nie `NULL` sein können.
+
+  ## Abgeleitete Tabellen und CTEs
+
+  Eine Unterabfrage im `FROM` heißt **abgeleitete Tabelle** ([PostgreSQL · Subqueries im FROM](https://www.postgresql.org/docs/current/queries-table-expressions.html#QUERIES-SUBQUERIES)). Seit PostgreSQL 16 braucht sie keinen Alias mehr, einer ist für die Lesbarkeit trotzdem gut. Ein CTE (`WITH name AS (…)`) ist dasselbe mit einem Namen davor. Für Anwendungen ist eine Frage wichtig: Rechnet PostgreSQL den CTE getrennt aus und speichert ihn zwischen, oder faltet er ihn in die äußere Abfrage?
+
+  Bis PostgreSQL 11 wurde jeder CTE **materialisiert**: erst vollständig berechnet, dann wie eine temporäre Tabelle gelesen. Bedingungen der äußeren Abfrage drangen nicht hinein, und Indexe der darunterliegenden Tabelle halfen nicht. Seit PostgreSQL 12 faltet der Planer einen CTE in die äußere Abfrage, wenn er nicht rekursiv ist, keine Seiteneffekte hat (ein `SELECT` ohne volatile Funktionen wie `random()`) und nur **einmal** referenziert wird. Wird er mehrfach referenziert, materialisiert PostgreSQL ihn weiterhin. `AS MATERIALIZED` und `AS NOT MATERIALIZED` überstimmen beide Entscheidungen. Rekursive CTEs und CTEs mit Seiteneffekten bleiben aber immer materialisiert, dort ignoriert PostgreSQL `NOT MATERIALIZED` ([PostgreSQL · CTE Materialization](https://www.postgresql.org/docs/current/queries-with.html#QUERIES-WITH-CTE-MATERIALIZATION), [PostgreSQL · SELECT, WITH-Klausel](https://www.postgresql.org/docs/current/sql-select.html#SQL-WITH)).
+
+  ```postgres run
+  CREATE TABLE buchungen (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    mitglied_id int NOT NULL,
+    beginn      timestamptz NOT NULL,
+    status      text NOT NULL
+  );
+  INSERT INTO buchungen (mitglied_id, beginn, status)
+  SELECT 1 + g % 2000,
+         timestamptz '2026-01-01 08:00' + g * interval '17 minutes',
+         CASE WHEN g % 10 = 0 THEN 'storniert' ELSE 'bestaetigt' END
+  FROM generate_series(1, 20000) AS g;
+  CREATE INDEX ON buchungen (mitglied_id);
+  ANALYZE buchungen;
+
+  EXPLAIN (COSTS OFF)
+  WITH aktiv AS (
+    SELECT * FROM buchungen WHERE status = 'bestaetigt'
+  )
+  SELECT * FROM aktiv WHERE mitglied_id = 42;
+
+  EXPLAIN (COSTS OFF)
+  WITH aktiv AS MATERIALIZED (
+    SELECT * FROM buchungen WHERE status = 'bestaetigt'
+  )
+  SELECT * FROM aktiv WHERE mitglied_id = 42;
+  ```
+
+  ```text
+  Bitmap Heap Scan on buchungen
+    Recheck Cond: (mitglied_id = 42)
+    Filter: (status = 'bestaetigt'::text)
+    ->  Bitmap Index Scan on buchungen_mitglied_id_idx
+          Index Cond: (mitglied_id = 42)
+
+  CTE Scan on aktiv
+    Filter: (mitglied_id = 42)
+    CTE aktiv
+      ->  Seq Scan on buchungen
+            Filter: (status = 'bestaetigt'::text)
+  ```
+
+  Im ersten Plan ist vom CTE nichts mehr zu sehen: Beide Bedingungen wirken direkt auf `buchungen`, und der Index findet die Zeilen von Mitglied 42. Im zweiten Plan berechnet PostgreSQL erst alle 18 000 bestätigten Buchungen und filtert danach. `MATERIALIZED` lohnt sich, wenn der CTE eine teure Berechnung enthält, die sonst je Referenz wiederholt würde, oder wenn du den Planer gezielt daran hindern willst, eine Bedingung umzustellen. CTEs mit `INSERT`, `UPDATE` oder `DELETE` laufen immer genau einmal ([Daten ändern](/postgres/daten-aendern)).
+
+  > [!DEEP] Optimierungsgrenze von gestern
+  > Ältere Blogartikel und Stack-Overflow-Antworten nennen CTEs eine „optimization fence“ und raten von ihnen ab. Das beschreibt PostgreSQL bis Version 11. Wer heute aus Gewohnheit ein `OFFSET 0` in eine Unterabfrage schreibt, um sie vom Falten abzuhalten, drückt dasselbe mit `MATERIALIZED` lesbarer aus.
+
+  ## Rekursive CTEs: Hierarchien durchlaufen
+
+  Deskwerk belohnt Empfehlungen: `mitglieder.geworben_von` zeigt auf das Mitglied, das geworben hat. „Wen hat Anna Schulz direkt oder über andere geworben?“ ist mit Joins allein nicht zu beantworten, weil die Tiefe vorher unbekannt ist. Ein **rekursiver CTE** löst das in zwei Teilen, verbunden mit `UNION ALL` ([PostgreSQL · Recursive Queries](https://www.postgresql.org/docs/current/queries-with.html#QUERIES-WITH-RECURSIVE)):
+
+  ```postgres run
+  CREATE TABLE mitglieder (
+    id           int PRIMARY KEY,
+    name         text NOT NULL,
+    geworben_von int REFERENCES mitglieder (id)
+  );
+  INSERT INTO mitglieder VALUES
+    (1, 'Anna Schulz',   NULL),
+    (2, 'Jonas Becker',  1),
+    (3, 'Leonie Wagner', 1),
+    (4, 'Mehmet Yilmaz', 2),
+    (5, 'Sophie Krüger', 4),
+    (6, 'Tim Hoffmann',  NULL),
+    (7, 'Clara Neumann', 3);
+
+  WITH RECURSIVE netzwerk AS (
+    SELECT id, name, 0 AS ebene, name AS pfad
+    FROM mitglieder
+    WHERE id = 1
+    UNION ALL
+    SELECT m.id, m.name, n.ebene + 1, n.pfad || ' > ' || m.name
+    FROM mitglieder AS m
+    JOIN netzwerk AS n ON m.geworben_von = n.id
+  )
+  SELECT ebene, name, pfad
+  FROM netzwerk
+  ORDER BY pfad;
+  ```
+
+  Der erste Teil vor `UNION ALL` ist der **Anker**: Er liefert die Startzeilen, hier Anna Schulz. Der zweite Teil verweist auf `netzwerk` selbst. PostgreSQL führt ihn wiederholt aus, und jedes Mal sieht `netzwerk` nur die Zeilen der vorigen Runde: erst Anna, dann Jonas und Leonie, dann Mehmet und Clara, dann Sophie. Liefert eine Runde keine Zeile mehr, ist die Rekursion fertig. Die Spalte `pfad` dient als Sortierschlüssel, der den Baum in Lesereihenfolge bringt. Dasselbe Muster durchläuft jede Tabelle mit einer `parent_id`: Standort → Etage → Raum, Kategoriebäume, Kommentar-Threads.
+
+  Zwei Regeln brechen Anfängern die erste rekursive Abfrage. Die Spaltentypen beider Teile müssen übereinstimmen; ist `name` ein `varchar(40)`, scheitert die Abfrage oben, weil `pfad || …` den Typ `varchar` ohne Länge hat, und braucht ein `name::text AS pfad` im Anker. Und die Rekursion endet nur, wenn eine Runde leer bleibt. Enthalten die Daten einen Kreis, endet sie nie. Ein fehlerhafter Import hat Anna Schulz als von Sophie Krüger geworben eingetragen. Seit PostgreSQL 14 erkennt die `CYCLE`-Klausel solche Kreise ([PostgreSQL · Cycle Detection](https://www.postgresql.org/docs/current/queries-with.html#QUERIES-WITH-CYCLE)):
+
+  ```postgres run
+  CREATE TABLE mitglieder (
+    id           int PRIMARY KEY,
+    name         text NOT NULL,
+    geworben_von int REFERENCES mitglieder (id)
+  );
+  INSERT INTO mitglieder VALUES
+    (1, 'Anna Schulz',   5),
+    (2, 'Jonas Becker',  1),
+    (4, 'Mehmet Yilmaz', 2),
+    (5, 'Sophie Krüger', 4);
+
+  WITH RECURSIVE netzwerk AS (
+    SELECT id, name, 0 AS ebene
+    FROM mitglieder
+    WHERE id = 1
+    UNION ALL
+    SELECT m.id, m.name, n.ebene + 1
+    FROM mitglieder AS m
+    JOIN netzwerk AS n ON m.geworben_von = n.id
+  ) CYCLE id SET zyklus USING besucht
+  SELECT ebene, name, zyklus, besucht
+  FROM netzwerk;
+  ```
+
+  `CYCLE id SET zyklus USING besucht` merkt sich je Pfad die besuchten `id`-Werte in der Spalte `besucht`. Taucht eine `id` erneut auf, wird die Zeile mit `zyklus = true` ausgegeben und nicht weiter verfolgt. Das Ergebnis hat fünf Zeilen: Anna, Jonas, Mehmet, Sophie mit `zyklus = f` und noch einmal Anna mit `t` und dem Weg `{(1),(2),(4),(5),(1)}`. Die Abfrage endet, und diese letzte Zeile zeigt dir, wo sich der Kreis schließt. In der Anwendung filterst du mit `WHERE NOT zyklus` – und reparierst die Daten.
+
+  > [!WARNING] Rekursion ohne Abbruch
+  > Ein rekursiver CTE über Daten mit einem Kreis läuft, bis ihm der Speicher ausgeht oder ein `statement_timeout` greift. Schreibe beim Entwickeln ein `LIMIT` in die äußere Abfrage, nutze `CYCLE` für Daten, die du nicht selbst kontrollierst, und setze für die Anwendung einen `statement_timeout` ([Performance](/postgres/performance)).
+
+  ## LATERAL: die letzten N je Gruppe
+
+  Zurück zur Profilseite: je Mitglied die letzten drei Buchungen. Eine skalare Unterabfrage liefert nur einen Wert. Eine abgeleitete Tabelle im `FROM` kann sich nicht auf `m.id` beziehen, weil Unterabfragen im `FROM` die anderen Tabellen derselben Ebene nicht sehen. Genau das erlaubt `LATERAL`: Eine Unterabfrage mit diesem Schlüsselwort darf auf Spalten der Tabellen links von ihr zugreifen und wird für jede Zeile dort ausgewertet ([PostgreSQL · LATERAL](https://www.postgresql.org/docs/current/queries-table-expressions.html#QUERIES-LATERAL)).
+
+  ```postgres run
+  CREATE TABLE mitglieder (id int PRIMARY KEY, name text NOT NULL);
+  CREATE TABLE buchungen (
+    id          bigint PRIMARY KEY,
+    mitglied_id int NOT NULL REFERENCES mitglieder (id),
+    raum        text NOT NULL,
+    beginn      timestamptz NOT NULL
+  );
+  INSERT INTO mitglieder VALUES (1, 'Anna Schulz'), (2, 'Jonas Becker'), (3, 'Tim Hoffmann');
+  INSERT INTO buchungen VALUES
+    (101, 1, 'Atelier', '2026-03-02 09:00'),
+    (102, 1, 'Box 1',   '2026-03-05 14:00'),
+    (103, 2, 'Loft',    '2026-03-06 10:00'),
+    (104, 1, 'Loft',    '2026-03-11 09:00'),
+    (105, 1, 'Atelier', '2026-03-18 13:00'),
+    (106, 2, 'Salon',   '2026-03-20 15:00');
+
+  SELECT m.name, l.raum, l.beginn
+  FROM mitglieder AS m
+  LEFT JOIN LATERAL (
+    SELECT b.raum, b.beginn
+    FROM buchungen AS b
+    WHERE b.mitglied_id = m.id
+    ORDER BY b.beginn DESC
+    LIMIT 3
+  ) AS l ON true
+  ORDER BY m.name, l.beginn DESC;
+  ```
+
+  Anna Schulz erscheint mit ihren drei jüngsten Buchungen, Jonas Becker mit beiden, Tim Hoffmann mit einer Zeile voller `NULL`. Dafür sorgt `LEFT JOIN … ON true`: Die Verknüpfung steckt schon im `WHERE` der Unterabfrage, das `ON` hat nichts mehr zu prüfen, und `LEFT` behält Mitglieder, für die die Unterabfrage leer bleibt. Mit `JOIN LATERAL` oder `CROSS JOIN LATERAL` würde Tim Hoffmann verschwinden.
+
+  Schnell wird das mit einem passenden Index. Mit 500 Mitgliedern, 30 000 Buchungen und einem Index `buchungen_mitglied_beginn` auf `buchungen (mitglied_id, beginn DESC)` plant PostgreSQL dieselbe Abfrage für eine Seite mit 20 Mitgliedern (`WHERE m.id <= 20`, ohne das äußere `ORDER BY`) so:
+
+  ```text
+  Nested Loop Left Join
+    ->  Index Scan using mitglieder_pkey on mitglieder m
+          Index Cond: (id <= 20)
+    ->  Limit
+          ->  Index Scan using buchungen_mitglied_beginn on buchungen b
+                Index Cond: (mitglied_id = m.id)
+  ```
+
+  Für jedes Mitglied springt der Index zu dessen Buchungen, die dort schon nach `beginn` absteigend sortiert liegen. `Limit` hört nach drei Zeilen auf. Gelesen werden rund 60 Indexeinträge, nicht 30 000 Buchungen. Fragt die Unterabfrage nur `beginn` ab, steht statt `Index Scan` ein `Index Only Scan` im Plan: Alle nötigen Spalten stehen dann im Index ([Indexe](/postgres/indexe)). Die Alternative mit `row_number() OVER (PARTITION BY mitglied_id ORDER BY beginn DESC) <= 3` nummeriert alle Buchungen der beteiligten Mitglieder und filtert danach ([Fensterfunktionen und Analysemuster](/data/sql-fensterfunktionen)). Für Berichte über alle Gruppen ist das gut, für eine Seite mit wenigen Gruppen ist `LATERAL` mit Index meist billiger. Brauchst du nur die eine letzte Zeile je Gruppe, geht es auch mit `DISTINCT ON` ([Abfragen für Anwendungen](/postgres/abfragen)).
+
+  > [!PRAXIS] Unterabfragen aus dem ORM
+  > SQLAlchemy 2 hat für die Bausteine dieses Moduls eigene Methoden: `.scalar_subquery()` für skalare Unterabfragen, `.exists()` für `EXISTS`, `.cte(recursive=True)` für rekursive CTEs und `.lateral()` für `LATERAL` ([SQLAlchemy · LATERAL correlation](https://docs.sqlalchemy.org/en/21/tutorial/data_select.html#lateral-correlation)). Prisma Client hat keine API, mit der du selbst `LATERAL` oder einen rekursiven CTE formulierst. Solche Abfragen schreibt das Team bei Deskwerk als `prisma.$queryRaw` mit Tagged Template, das die Werte als Parameter bindet ([Prisma · Raw queries](https://www.prisma.io/docs/orm/v7/prisma-client/using-raw-sql/raw-queries#queryraw)). In beiden Fällen gilt: Erst die Abfrage in psql bauen und mit `EXPLAIN` prüfen, dann ins ORM übersetzen und das erzeugte SQL im Log vergleichen ([ORM und SQL](/postgres/orm-und-sql)).
+
+  ```python
+  from sqlalchemy import select, true
+
+  letzte = (
+      select(Buchung.raum_id, Buchung.beginn)
+      .where(Buchung.mitglied_id == Mitglied.id)
+      .order_by(Buchung.beginn.desc())
+      .limit(3)
+      .lateral("letzte")
+  )
+  stmt = (
+      select(Mitglied.name, letzte.c.raum_id, letzte.c.beginn)
+      .outerjoin(letzte, true())
+      .order_by(Mitglied.name, letzte.c.beginn.desc())
+  )
+  ```
+
+  > [!INTERVIEW] „Wie holst du die letzten drei Bestellungen je Kunde?“
+  > In PostgreSQL mit `LEFT JOIN LATERAL` und einer Unterabfrage mit `ORDER BY bestellt_am DESC LIMIT 3`, dazu ein Index auf `(kunde_id, bestellt_am DESC)`. Dann liest die Datenbank je Kunde nur drei Indexeinträge. `LEFT` und `ON true` behalten Kunden ohne Bestellung. Die Alternative ist `row_number()` über eine Fensterfunktion und `WHERE rn <= 3`; sie ist portabel, nummeriert aber erst alle Bestellungen. Was ich vermeide, ist die Schleife in der Anwendung mit einer Abfrage je Kunde – das ist das N+1-Problem.
+
+  ## Häufige Fehler
+
+  - **`more than one row returned by a subquery used as an expression`.** Eine skalare Unterabfrage liefert mehr als eine Zeile, meist erst mit Produktionsdaten. Aggregieren, über einen eindeutigen Schlüssel filtern oder `ORDER BY … LIMIT 1`; für mehrere Werte je Zeile `LATERAL`.
+  - **Skalare Unterabfrage gibt `NULL` statt `0`.** Ohne Aggregat liefert eine leere Unterabfrage `NULL`, `sum` und `max` über null Zeilen ebenfalls. Nur `count` liefert `0`. Mit `coalesce(…, 0)` abfangen, wo die Anwendung eine Zahl erwartet.
+  - **Korrelierte Unterabfrage ist langsam.** Sie läuft je äußerer Zeile. Im Plan steht `SubPlan` unter einem Scan. Index auf die Korrelationsspalte oder als Join mit `GROUP BY` umschreiben.
+  - **Anti-Join liefert nichts oder ist langsam.** `NOT IN` über eine Spalte mit `NULL` leert das Ergebnis, und der Planer kann daraus keinen Anti-Join machen. `NOT EXISTS` verwenden.
+  - **Mitglieder ohne Buchung fehlen.** `JOIN LATERAL` oder `CROSS JOIN LATERAL` statt `LEFT JOIN LATERAL … ON true`.
+  - **`LIMIT` ohne `ORDER BY` in der Unterabfrage.** Dann sind es irgendwelche drei Zeilen, nicht die letzten drei. Mit Tiebreaker sortieren, wenn Zeitpunkte gleich sein können.
+  - **Rekursion endet nicht.** Kreis in den Daten. `CYCLE` verwenden oder einen Pfad mitführen und prüfen.
+  - **`recursive query … column 4 has type character varying(40) in non-recursive term but type character varying overall`.** Anker und rekursiver Teil liefern verschiedene Typen. Im Anker casten, etwa `name::text`.
+  - **CTE wird unerwartet langsam, sobald er zweimal vorkommt.** Ab der zweiten Referenz materialisiert PostgreSQL ihn, und äußere Bedingungen wirken nicht mehr auf die Tabelle. `NOT MATERIALIZED` oder die Bedingung in den CTE ziehen.
+
+  ## Zusammenfassung
+
+  - Skalare Unterabfragen liefern höchstens eine Zeile. Keine Zeile ergibt `NULL`, mehr als eine einen Fehler – oft erst in Produktion.
+  - Korrelierte Unterabfragen laufen je äußerer Zeile. Ein Index auf die Korrelationsspalte entscheidet über die Geschwindigkeit.
+  - `EXISTS` und `NOT EXISTS` plant PostgreSQL als Semi- und Anti-Join. `NOT IN` bleibt ein Filter mit SubPlan und scheitert an `NULL`.
+  - `= ANY(array)` übergibt eine ID-Liste als einen Parameter. `ANY` über eine leere Menge ist falsch, `ALL` wahr.
+  - Seit PostgreSQL 12 werden nicht rekursive, einmal referenzierte CTEs ohne Seiteneffekte gefaltet. `MATERIALIZED` und `NOT MATERIALIZED` steuern das ausdrücklich.
+  - `WITH RECURSIVE` besteht aus Anker und rekursivem Teil. Gleiche Spaltentypen sind Pflicht, `CYCLE` fängt Kreise ab.
+  - `LEFT JOIN LATERAL (… ORDER BY … LIMIT n) ON true` holt die letzten N je Gruppe. Mit passendem Index liest PostgreSQL nur diese N Zeilen.
+exercises:
+  - id: cte-falten-oder-materialisieren
+    type: choice
+    title: Was macht PostgreSQL 18 mit diesem CTE?
+    prompt: |
+      Die Tabelle `buchungen` hat 200 000 Zeilen und einen Index auf `mitglied_id`. Welche Aussagen über diese Abfrage in PostgreSQL 18 stimmen?
+    lang: postgres
+    code: |
+      WITH bestaetigt AS (
+        SELECT * FROM buchungen WHERE status = 'bestaetigt'
+      )
+      SELECT b.id, b.beginn
+      FROM bestaetigt AS b
+      WHERE b.mitglied_id = 42;
+    options:
+      - text: Der Planer faltet den CTE in die äußere Abfrage. Beide Bedingungen wirken direkt auf `buchungen`, der Index auf `mitglied_id` kann genutzt werden.
+        correct: true
+        why: Der CTE ist nicht rekursiv, hat keine Seiteneffekte und wird einmal referenziert. Seit PostgreSQL 12 wird er dann standardmäßig gefaltet.
+      - text: PostgreSQL berechnet zuerst alle bestätigten Buchungen, speichert sie zwischen und filtert erst danach nach Mitglied 42.
+        correct: false
+        why: So arbeitete PostgreSQL bis Version 11. Heute passiert das nur noch mit `AS MATERIALIZED` oder wenn der CTE mehrfach referenziert wird.
+      - text: Würde die Abfrage `bestaetigt` zweimal verwenden, etwa in einem Self-Join, würde PostgreSQL den CTE ohne weitere Angabe materialisieren.
+        correct: true
+        why: Bei mehreren Referenzen materialisiert PostgreSQL, damit der CTE nur einmal berechnet wird. `NOT MATERIALIZED` erzwingt dann das Falten.
+      - text: "`WITH bestaetigt AS MATERIALIZED (…)` erzwingt eine getrennte Berechnung – sinnvoll, wenn der CTE eine teure Funktion je Zeile aufruft, die sonst mehrfach liefe."
+        correct: true
+        why: Genau dafür gibt es die Angabe. Hier wäre sie schädlich, weil der Index dann nicht mehr hilft.
+      - text: Ein CTE ist grundsätzlich langsamer als dieselbe Unterabfrage im `FROM`, weil er eine temporäre Tabelle anlegt.
+        correct: false
+        why: Ein gefalteter CTE ergibt denselben Plan wie die Unterabfrage im `FROM`. Auch ein materialisierter CTE ist keine Tabelle im Katalog, sondern ein Zwischenergebnis innerhalb der Abfrage – und ob das schadet, hängt vom Fall ab.
+    explanation: |
+      Seit PostgreSQL 12 entscheidet der Planer: Ein nicht rekursiver CTE ohne Seiteneffekte, der einmal referenziert wird, wird in die äußere Abfrage gefaltet. Dann ist er nur noch Schreibweise, und `WHERE b.mitglied_id = 42` kann den Index nutzen. Mehrfach referenzierte CTEs werden materialisiert, damit sie nur einmal laufen; dabei gehen Indexe verloren. `MATERIALIZED` und `NOT MATERIALIZED` überstimmen die Standardentscheidung in beide Richtungen. Wer es genau wissen will, schaut in `EXPLAIN`: Ein materialisierter CTE erscheint als `CTE Scan`.
+    resources:
+      - title: PostgreSQL · CTE Materialization
+        url: https://www.postgresql.org/docs/current/queries-with.html#QUERIES-WITH-CTE-MATERIALIZATION
+
+  - id: rekursion-ordnen
+    type: order
+    title: Leonies Empfehlungsnetz
+    prompt: |
+      Die Abfrage soll alle Mitglieder liefern, die Leonie Wagner (`id = 3`) direkt oder über andere geworben hat. Direkt Geworbene haben `ebene` 1. Bring die Zeilen in die richtige Reihenfolge.
+    lang: postgres
+    lines: |
+      WITH RECURSIVE geworben AS (
+        SELECT id, name, 1 AS ebene FROM mitglieder
+        WHERE geworben_von = 3
+        UNION ALL
+        SELECT m.id, m.name, g.ebene + 1 FROM mitglieder AS m
+        JOIN geworben AS g ON m.geworben_von = g.id
+      )
+      SELECT name, ebene FROM geworben ORDER BY ebene, name;
+    hints:
+      - Ein rekursiver CTE beginnt mit dem Teil, der sich nicht auf sich selbst bezieht.
+      - Der Anker liefert die direkt Geworbenen. Der rekursive Teil verbindet `mitglieder` mit den Zeilen der vorigen Runde.
+    explanation: |
+      Der Anker (`WHERE geworben_von = 3`) liefert die direkt von Leonie geworbenen Mitglieder mit `ebene` 1. Nach `UNION ALL` folgt der rekursive Teil: Er sucht Mitglieder, deren `geworben_von` auf eine Zeile der vorigen Runde zeigt, und erhöht die Ebene. PostgreSQL verlangt diese Reihenfolge – der Anker steht vor `UNION ALL`, und nur der rekursive Teil darf `geworben` referenzieren. Die äußere Abfrage nach der schließenden Klammer liest den fertigen CTE.
+    resources:
+      - title: PostgreSQL · Recursive Queries
+        url: https://www.postgresql.org/docs/current/queries-with.html#QUERIES-WITH-RECURSIVE
+
+  - id: skalar-leer-oder-null
+    type: output
+    title: Null, NULL oder Fehler?
+    prompt: |
+      Was gibt die letzte Abfrage aus? Ausgabe wie `psql -At`: eine Zeile je Ergebniszeile, Werte durch `|` getrennt, `NULL` als leerer Wert, `numeric` mit seinen Nachkommastellen.
+    lang: postgres
+    code: |
+      CREATE TABLE mitglieder (id int PRIMARY KEY, name text NOT NULL);
+      CREATE TABLE buchungen (
+        id bigint PRIMARY KEY,
+        mitglied_id int NOT NULL REFERENCES mitglieder (id),
+        raum text NOT NULL,
+        preis numeric(8,2)
+      );
+      INSERT INTO mitglieder VALUES (1, 'Anna'), (2, 'Jonas'), (3, 'Tim');
+      INSERT INTO buchungen VALUES
+        (101, 1, 'Atelier', 32.00),
+        (102, 1, 'Loft', 45.00),
+        (103, 1, 'Box 1', NULL),
+        (104, 2, 'Box 2', 6.00);
+
+      SELECT m.name,
+             (SELECT count(*) FROM buchungen AS b WHERE b.mitglied_id = m.id),
+             (SELECT sum(b.preis) FROM buchungen AS b WHERE b.mitglied_id = m.id),
+             (SELECT b.raum FROM buchungen AS b WHERE b.mitglied_id = m.id AND b.preis > 40)
+      FROM mitglieder AS m
+      ORDER BY m.id;
+    expected: |
+      Anna|3|77.00|Loft
+      Jonas|1|6.00|
+      Tim|0||
+    hints:
+      - Ein Aggregat ohne `GROUP BY` liefert immer genau eine Zeile. Was ergeben `count(*)` und `sum` über null Zeilen?
+      - "`sum` überspringt `NULL`. Und wie viele Buchungen über 40 hat jedes Mitglied?"
+    explanation: |
+      Die ersten beiden Unterabfragen sind Aggregate und liefern je Mitglied genau eine Zeile. `count(*)` zählt Zeilen, auch die mit Preis `NULL`, und liefert für Tim `0`. `sum` überspringt `NULL` (Anna: 32.00 + 45.00) und ist über null Zeilen selbst `NULL`. Die dritte Unterabfrage hat kein Aggregat: Für Anna findet sie genau eine Buchung über 40, für Jonas und Tim keine, und eine leere skalare Unterabfrage ergibt `NULL`. Hätte Anna zwei Buchungen über 40, würde die ganze Abfrage mit `more than one row returned by a subquery used as an expression` scheitern.
+    resources:
+      - title: PostgreSQL · Scalar Subqueries
+        url: https://www.postgresql.org/docs/current/sql-expressions.html#SQL-SYNTAX-SCALAR-SUBQUERIES
+      - title: PostgreSQL · Aggregate Functions
+        url: https://www.postgresql.org/docs/current/functions-aggregate.html
+
+  - id: any-all-mit-null
+    type: output
+    title: ANY, ALL und die leere Menge
+    prompt: |
+      Was gibt die Abfrage aus? Ausgabe wie `psql -At`: Werte durch `|` getrennt, `NULL` als leerer Wert, Wahrheitswerte als `t`/`f`.
+    lang: postgres
+    code: |
+      SELECT 7 = ANY ('{3,7,NULL}'::int[]),
+             7 = ANY ('{3,NULL}'::int[]),
+             7 <> ALL ('{3,5}'::int[]),
+             7 <> ALL ('{3,NULL}'::int[]),
+             7 > ALL ('{}'::int[]),
+             7 = ANY ('{}'::int[]);
+    expected: |
+      t||t||t|f
+    hints:
+      - "`ANY` ist wahr, sobald ein Vergleich wahr ist. Was ist es, wenn keiner wahr ist, aber einer `NULL`?"
+      - "`ALL` ist falsch, sobald ein Vergleich falsch ist. Und über null Elemente?"
+    explanation: |
+      `7 = ANY ('{3,7,NULL}')` findet einen Treffer: wahr, das `NULL` spielt keine Rolle. Ohne Treffer bleibt der Vergleich mit `NULL` unbekannt, also ist das Ergebnis `NULL`. `<> ALL` ist das Gegenstück zu `NOT IN`: Mit `{3,5}` sind alle Vergleiche wahr, mit `{3,NULL}` ist einer unbekannt, das Ergebnis also `NULL` – genau die Falle von `NOT IN`. Über ein leeres Array ist `ALL` wahr und `ANY` falsch. Eine Bedingung wie `preis > ALL (SELECT …)` ist deshalb erfüllt, wenn die Unterabfrage nichts findet.
+    resources:
+      - title: PostgreSQL · Row and Array Comparisons (ANY/SOME, ALL)
+        url: https://www.postgresql.org/docs/current/functions-comparisons.html#FUNCTIONS-COMPARISONS-ANY-SOME
+
+  - id: zyklus-erkennen
+    type: output
+    title: Der Kreis im Empfehlungsnetz
+    prompt: |
+      Ein Import hat einen Kreis in die Empfehlungen gebracht. Was gibt die Abfrage aus? Ausgabe wie `psql -At`: Werte durch `|` getrennt, Wahrheitswerte als `t`/`f`.
+    lang: postgres
+    code: |
+      CREATE TABLE mitglieder (id int PRIMARY KEY, name text NOT NULL, geworben_von int);
+      INSERT INTO mitglieder VALUES
+        (1, 'Anna', 3), (2, 'Jonas', 1), (3, 'Leonie', 2), (4, 'Tim', NULL);
+
+      WITH RECURSIVE kette AS (
+        SELECT id, geworben_von, 0 AS schritte
+        FROM mitglieder
+        WHERE id = 2
+        UNION ALL
+        SELECT m.id, m.geworben_von, k.schritte + 1
+        FROM mitglieder AS m
+        JOIN kette AS k ON m.id = k.geworben_von
+      ) CYCLE id SET zyklus USING pfad
+      SELECT id, schritte, zyklus
+      FROM kette
+      ORDER BY schritte;
+    expected: |
+      2|0|f
+      1|1|f
+      3|2|f
+      2|3|t
+    hints:
+      - Die Abfrage läuft **nach oben**, von einem Mitglied zu dem, das es geworben hat. Wer hat Jonas geworben, wer Anna?
+      - "`CYCLE` gibt die Zeile, mit der sich der Kreis schließt, noch einmal aus – mit `zyklus = true` – und verfolgt sie dann nicht weiter."
+    explanation: |
+      Der Anker startet bei Jonas (2). Der rekursive Teil verbindet über `m.id = k.geworben_von`, geht also zum Werber: Jonas wurde von Anna (1) geworben, Anna von Leonie (3), Leonie von Jonas (2). Beim zweiten Besuch von `id` 2 erkennt `CYCLE` den Kreis, gibt die Zeile mit `zyklus = t` aus und setzt die Rekursion für diesen Pfad nicht fort. Tim gehört nicht zur Kette und erscheint nicht. Ohne `CYCLE` würde die Abfrage endlos laufen, weil jede Runde wieder eine Zeile liefert.
+    resources:
+      - title: PostgreSQL · Cycle Detection
+        url: https://www.postgresql.org/docs/current/queries-with.html#QUERIES-WITH-CYCLE
+
+  - id: teurer-als-die-art
+    type: sql
+    lang: postgres
+    title: Teurer als der Schnitt der eigenen Art
+    prompt: |
+      Die Preisstrategie will wissen, welche Räume **teurer** sind als der Durchschnitt aller Räume **derselben Art** (`art`) über alle Standorte.
+
+      Spalten: `standort` (Name des Standorts), `raum` (Name des Raums), `preis_pro_stunde` und `schnitt_art` (Durchschnittspreis der Art, auf zwei Nachkommastellen gerundet). Sortierung beliebig.
+    schema: |
+      CREATE TABLE standorte (
+        id   int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        name text NOT NULL UNIQUE
+      );
+      CREATE TABLE raeume (
+        id               int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        standort_id      int NOT NULL REFERENCES standorte (id),
+        name             text NOT NULL,
+        art              text NOT NULL CHECK (art IN ('schreibtisch', 'meetingraum', 'telefonbox')),
+        plaetze          int NOT NULL CHECK (plaetze > 0),
+        preis_pro_stunde numeric(8,2) NOT NULL CHECK (preis_pro_stunde >= 0),
+        UNIQUE (standort_id, name)
+      );
+      INSERT INTO standorte (name) VALUES ('Plagwitz'), ('Südvorstadt'), ('Zentrum');
+      INSERT INTO raeume (standort_id, name, art, plaetze, preis_pro_stunde) VALUES
+        (1, 'Atelier',      'meetingraum',   8, 32.00),
+        (1, 'Werkbank',     'schreibtisch',  1,  4.50),
+        (1, 'Box 1',        'telefonbox',    1,  6.00),
+        (2, 'Loft',         'meetingraum',  12, 45.00),
+        (2, 'Fensterplatz', 'schreibtisch',  1,  5.50),
+        (2, 'Box 2',        'telefonbox',    1,  6.00),
+        (3, 'Salon',        'meetingraum',   6, 38.00),
+        (3, 'Galerie',      'schreibtisch',  1,  6.50),
+        (3, 'Box 3',        'telefonbox',    1,  7.00),
+        (3, 'Box 4',        'telefonbox',    1,  5.00);
+    starter: |
+      SELECT s.name AS standort, r.name AS raum, r.preis_pro_stunde
+      FROM raeume AS r
+      JOIN standorte AS s ON s.id = r.standort_id
+      WHERE r.preis_pro_stunde > (SELECT avg(preis_pro_stunde) FROM raeume);
+    solution: |
+      SELECT s.name AS standort,
+             r.name AS raum,
+             r.preis_pro_stunde,
+             round((SELECT avg(r2.preis_pro_stunde)
+                      FROM raeume AS r2
+                     WHERE r2.art = r.art), 2) AS schnitt_art
+      FROM raeume AS r
+      JOIN standorte AS s ON s.id = r.standort_id
+      WHERE r.preis_pro_stunde > (SELECT avg(r2.preis_pro_stunde)
+                                    FROM raeume AS r2
+                                   WHERE r2.art = r.art);
+    hints:
+      - Der Startcode vergleicht mit dem Durchschnitt **aller** Räume. Die Unterabfrage muss sich auf die Art des aktuellen Raums beziehen.
+      - Gib der Tabelle in der Unterabfrage einen eigenen Alias (`r2`) und korreliere mit `r2.art = r.art`. Ohne eigenen Alias vergleicht `art = art` die Spalte mit sich selbst.
+      - Dieselbe korrelierte Unterabfrage brauchst du zweimal – im `WHERE` und, mit `round(…, 2)`, in der `SELECT`-Liste. Alternativ ein CTE mit `avg` je `art` und ein Join.
+    explanation: |
+      Die korrelierte Unterabfrage berechnet für jeden Raum den Durchschnitt seiner Art: Meetingräume 38.33, Schreibtische 5.50, Telefonboxen 6.00. Teurer sind der Loft (45.00), die Galerie (6.50) und Box 3 (7.00). Fensterplatz, Box 1 und Box 2 liegen genau auf dem Schnitt und zählen bei `>` nicht. Der Startcode vergleicht mit dem Gesamtdurchschnitt von 15.55 und liefert stattdessen alle drei Meetingräume. Ein CTE mit `GROUP BY art` und ein Join oder `avg(…) OVER (PARTITION BY art)` in einer abgeleiteten Tabelle liefern dasselbe Ergebnis; bei großen Tabellen sind sie oft günstiger, weil sie die Durchschnitte nur einmal je Art berechnen.
+    resources:
+      - title: PostgreSQL · Scalar Subqueries
+        url: https://www.postgresql.org/docs/current/sql-expressions.html#SQL-SYNTAX-SCALAR-SUBQUERIES
+
+  - id: gebucht-ohne-rechnung
+    type: sql
+    lang: postgres
+    title: Gebucht, aber nicht abgerechnet
+    prompt: |
+      Die Buchhaltung sucht Mitglieder, die im **März 2026** (Ortszeit Leipzig) mindestens eine **bestätigte** Buchung hatten, für die es aber **keine Rechnung für März** gibt (`rechnungen.monat = '2026-03-01'`). Jedes Mitglied soll genau einmal erscheinen.
+
+      Spalten: `id` und `name` des Mitglieds. Sortierung beliebig.
+    schema: |
+      CREATE TABLE mitglieder (
+        id    int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        email text NOT NULL UNIQUE,
+        name  text NOT NULL
+      );
+      CREATE TABLE buchungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        mitglied_id int NOT NULL REFERENCES mitglieder (id),
+        beginn      timestamptz NOT NULL,
+        ende        timestamptz NOT NULL,
+        status      text NOT NULL DEFAULT 'bestaetigt',
+        CHECK (ende > beginn)
+      );
+      CREATE TABLE rechnungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        mitglied_id int NOT NULL REFERENCES mitglieder (id),
+        monat       date NOT NULL,
+        betrag      numeric(10,2) NOT NULL,
+        bezahlt_am  timestamptz,
+        UNIQUE (mitglied_id, monat)
+      );
+      INSERT INTO mitglieder (email, name) VALUES
+        ('anna.schulz@example.org',   'Anna Schulz'),
+        ('jonas.becker@example.org',  'Jonas Becker'),
+        ('leonie.wagner@example.org', 'Leonie Wagner'),
+        ('mehmet.yilmaz@example.org', 'Mehmet Yilmaz'),
+        ('sophie.krueger@example.org','Sophie Krüger'),
+        ('tim.hoffmann@example.org',  'Tim Hoffmann');
+      INSERT INTO buchungen (mitglied_id, beginn, ende, status) VALUES
+        (1, '2026-03-03 09:00', '2026-03-03 12:00', 'bestaetigt'),
+        (2, '2026-03-10 14:00', '2026-03-10 16:00', 'bestaetigt'),
+        (2, '2026-03-20 09:00', '2026-03-20 11:00', 'bestaetigt'),
+        (3, '2026-03-12 10:00', '2026-03-12 11:00', 'storniert'),
+        (4, '2026-02-27 09:00', '2026-02-27 10:00', 'bestaetigt'),
+        (4, '2026-04-01 00:30', '2026-04-01 02:00', 'bestaetigt'),
+        (5, '2026-03-05 08:00', '2026-03-05 10:00', 'storniert'),
+        (5, '2026-03-31 23:30', '2026-04-01 00:30', 'bestaetigt');
+      INSERT INTO rechnungen (mitglied_id, monat, betrag, bezahlt_am) VALUES
+        (1, '2026-03-01', 96.00, NULL),
+        (2, '2026-02-01', 64.00, '2026-03-02 10:00'),
+        (4, '2026-02-01', 32.00, '2026-03-04 10:00');
+    starter: |
+      SELECT m.id, m.name
+      FROM mitglieder AS m
+      JOIN buchungen AS b ON b.mitglied_id = m.id
+      WHERE b.status = 'bestaetigt';
+    solution: |
+      SELECT m.id, m.name
+      FROM mitglieder AS m
+      WHERE EXISTS (
+              SELECT 1
+              FROM buchungen AS b
+              WHERE b.mitglied_id = m.id
+                AND b.status = 'bestaetigt'
+                AND b.beginn >= '2026-03-01'
+                AND b.beginn <  '2026-04-01'
+            )
+        AND NOT EXISTS (
+              SELECT 1
+              FROM rechnungen AS r
+              WHERE r.mitglied_id = m.id
+                AND r.monat = '2026-03-01'
+            );
+    hints:
+      - Zwei Fragen je Mitglied, beide nur Ja oder Nein. Welcher Operator prüft „es gibt mindestens eine“, welcher „es gibt keine“?
+      - "Jonas Becker hat zwei bestätigte März-Buchungen. Ein `JOIN` liefert ihn zweimal, `EXISTS` einmal. Den März begrenzt ein halboffenes Intervall: `beginn >= '2026-03-01' AND beginn < '2026-04-01'`."
+      - "`WHERE EXISTS (SELECT 1 FROM buchungen AS b WHERE b.mitglied_id = m.id AND …) AND NOT EXISTS (SELECT 1 FROM rechnungen AS r WHERE r.mitglied_id = m.id AND r.monat = '2026-03-01')`."
+    explanation: |
+      `EXISTS` prüft je Mitglied, ob es mindestens eine bestätigte März-Buchung gibt, und liefert jedes Mitglied höchstens einmal. `NOT EXISTS` schließt Mitglieder mit März-Rechnung aus; Rechnungen für Februar zählen nicht. Die Zeitgrenzen sind halboffen und werden in der Sitzungszeitzone Europe/Berlin gelesen: Sophies einzige bestätigte März-Buchung beginnt am 31. März um 23:30 und gehört zum März. `BETWEEN '2026-03-01' AND '2026-03-31'` endet dagegen am 31. März um 0:00 und verliert sie. Mehmets Buchung am 1. April um 0:30 gehört nicht zum März, obwohl sie in UTC noch am 31. März liegt. Ergebnis: Jonas Becker und Sophie Krüger. Anna hat eine Rechnung, Leonie hat nur storniert, Mehmet hat im März nicht gebucht, Tim gar nicht. Ein Join mit `bestaetigt`-Filter würde Jonas doppelt liefern und die Rechnungen nicht prüfen.
+    resources:
+      - title: PostgreSQL · EXISTS
+        url: https://www.postgresql.org/docs/current/functions-subquery.html#FUNCTIONS-SUBQUERY-EXISTS
+
+  - id: letzte-zwei-buchungen
+    type: sql
+    lang: postgres
+    title: Die letzten zwei Buchungen je Mitglied
+    prompt: |
+      Das Dashboard zeigt je Mitglied die **zwei jüngsten bestätigten** Buchungen (nach `beginn`) mit dem Namen des Raums. Mitglieder ohne bestätigte Buchung erscheinen mit einer Zeile, in der `raum` und `beginn` `NULL` sind.
+
+      Spalten: `name` (Mitglied), `raum` (Name des Raums) und `beginn`. Sortierung beliebig.
+    schema: |
+      CREATE TABLE raeume (
+        id   int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        name text NOT NULL
+      );
+      CREATE TABLE mitglieder (
+        id   int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        name text NOT NULL
+      );
+      CREATE TABLE buchungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        raum_id     int NOT NULL REFERENCES raeume (id),
+        mitglied_id int NOT NULL REFERENCES mitglieder (id),
+        beginn      timestamptz NOT NULL,
+        status      text NOT NULL DEFAULT 'bestaetigt'
+      );
+      INSERT INTO raeume (name) VALUES ('Atelier'), ('Loft'), ('Box 1'), ('Salon');
+      INSERT INTO mitglieder (name) VALUES
+        ('Anna Schulz'), ('Jonas Becker'), ('Leonie Wagner'), ('Tim Hoffmann');
+      INSERT INTO buchungen (raum_id, mitglied_id, beginn, status) VALUES
+        (1, 1, '2026-03-02 09:00', 'bestaetigt'),
+        (3, 1, '2026-03-05 14:00', 'bestaetigt'),
+        (2, 1, '2026-03-11 09:00', 'bestaetigt'),
+        (4, 1, '2026-03-19 10:00', 'storniert'),
+        (2, 2, '2026-03-06 10:00', 'bestaetigt'),
+        (1, 3, '2026-03-03 13:00', 'bestaetigt'),
+        (4, 3, '2026-03-17 15:00', 'bestaetigt'),
+        (3, 3, '2026-03-24 08:00', 'storniert'),
+        (2, 4, '2026-03-09 11:00', 'storniert');
+    starter: |
+      SELECT m.name, r.name AS raum, b.beginn
+      FROM mitglieder AS m
+      JOIN buchungen AS b ON b.mitglied_id = m.id
+      JOIN raeume AS r ON r.id = b.raum_id;
+    solution: |
+      SELECT m.name, l.raum, l.beginn
+      FROM mitglieder AS m
+      LEFT JOIN LATERAL (
+        SELECT r.name AS raum, b.beginn
+        FROM buchungen AS b
+        JOIN raeume AS r ON r.id = b.raum_id
+        WHERE b.mitglied_id = m.id
+          AND b.status = 'bestaetigt'
+        ORDER BY b.beginn DESC
+        LIMIT 2
+      ) AS l ON true;
+    hints:
+      - Eine Unterabfrage im `FROM`, die sich auf das aktuelle Mitglied bezieht, braucht das Schlüsselwort `LATERAL`.
+      - Innen sortierst du die bestätigten Buchungen des Mitglieds absteigend nach `beginn` und begrenzt auf zwei. Der Raumname kommt über einen Join in der Unterabfrage.
+      - "`FROM mitglieder AS m LEFT JOIN LATERAL (SELECT r.name AS raum, b.beginn FROM buchungen AS b JOIN raeume AS r … WHERE b.mitglied_id = m.id AND b.status = 'bestaetigt' ORDER BY b.beginn DESC LIMIT 2) AS l ON true`."
+    explanation: |
+      `LATERAL` erlaubt der Unterabfrage, `m.id` zu verwenden; sie läuft gedanklich je Mitglied. Darin filtert `status = 'bestaetigt'` die Stornierungen heraus, bevor `ORDER BY … LIMIT 2` die zwei jüngsten auswählt – stünde der Filter außerhalb, würde Annas stornierte Buchung vom 19. März einen der zwei Plätze belegen. `LEFT JOIN … ON true` behält Tim Hoffmann, der nur storniert hat, mit `NULL`-Werten. Ergebnis: Anna mit Loft und Box 1, Jonas mit Loft, Leonie mit Salon und Atelier, Tim mit einer leeren Zeile. Eine Lösung mit `row_number()` in einer abgeleiteten Tabelle und einem `LEFT JOIN` von `mitglieder` liefert dasselbe.
+    resources:
+      - title: PostgreSQL · LATERAL Subqueries
+        url: https://www.postgresql.org/docs/current/queries-table-expressions.html#QUERIES-LATERAL
+
+  - id: netzwerk-von-leonie
+    type: sql
+    lang: postgres
+    title: Wen hat Leonie Wagner geworben?
+    prompt: |
+      Für die Prämie im Empfehlungsprogramm: Liste alle Mitglieder, die **Leonie Wagner** direkt oder über andere geworben hat. Suche Leonie über ihren Namen, nicht über ihre `id`. Leonie selbst gehört nicht ins Ergebnis.
+
+      Spalten: `name` und `ebene` (1 = direkt von Leonie geworben, 2 = von einem direkt Geworbenen geworben usw.). Sortierung beliebig.
+    schema: |
+      CREATE TABLE mitglieder (
+        id           int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        name         text NOT NULL,
+        geworben_von int REFERENCES mitglieder (id)
+      );
+      INSERT INTO mitglieder (name, geworben_von) VALUES
+        ('Anna Schulz',   NULL),
+        ('Jonas Becker',  1),
+        ('Leonie Wagner', 1),
+        ('Mehmet Yilmaz', 2),
+        ('Sophie Krüger', 4),
+        ('Tim Hoffmann',  NULL),
+        ('Clara Neumann', 3),
+        ('Paul Richter',  3),
+        ('Emma Fischer',  7),
+        ('Lukas Weber',   9),
+        ('Mia Schröder',  6);
+    starter: |
+      SELECT m.name, 1 AS ebene
+      FROM mitglieder AS m
+      JOIN mitglieder AS w ON w.id = m.geworben_von
+      WHERE w.name = 'Leonie Wagner';
+    solution: |
+      WITH RECURSIVE netzwerk AS (
+        SELECT m.id, m.name, 1 AS ebene
+        FROM mitglieder AS m
+        JOIN mitglieder AS w ON w.id = m.geworben_von
+        WHERE w.name = 'Leonie Wagner'
+        UNION ALL
+        SELECT m.id, m.name, n.ebene + 1
+        FROM mitglieder AS m
+        JOIN netzwerk AS n ON m.geworben_von = n.id
+      )
+      SELECT name, ebene
+      FROM netzwerk;
+    hints:
+      - Der Startcode findet die direkt Geworbenen. Er ist ein guter Anker für einen rekursiven CTE.
+      - "Der rekursive Teil verbindet `mitglieder` mit den Zeilen der vorigen Runde: `JOIN netzwerk AS n ON m.geworben_von = n.id`, Ebene `n.ebene + 1`."
+      - Der CTE braucht die `id` der gefundenen Mitglieder, damit die nächste Runde darauf verweisen kann. In der äußeren Abfrage wählst du nur `name` und `ebene`.
+    explanation: |
+      Der Anker liefert die von Leonie direkt geworbenen Mitglieder Clara Neumann und Paul Richter mit Ebene 1. Die erste rekursive Runde findet Emma Fischer (von Clara geworben, Ebene 2), die zweite Lukas Weber (Ebene 3), die dritte nichts mehr. Ergebnis: vier Zeilen. Wichtig ist, dass der CTE die `id` mitführt – über sie verbindet der rekursive Teil. Anna, Jonas, Mehmet und Sophie liegen in einem anderen Zweig, Mia Schröder wurde von Tim geworben. Alternativ beginnt der Anker bei Leonie selbst mit Ebene 0, und die äußere Abfrage filtert `WHERE ebene > 0`.
+    resources:
+      - title: PostgreSQL · Recursive Queries
+        url: https://www.postgresql.org/docs/current/queries-with.html#QUERIES-WITH-RECURSIVE
+
+  - id: naechste-buchung-je-raum
+    type: gap
+    title: Die nächste Buchung je Raum
+    prompt: |
+      Die Anzeige vor jedem Raum zeigt die **nächste** Buchung ab dem 10. März 2026, 12 Uhr. Räume ohne kommende Buchung sollen trotzdem erscheinen, mit `NULL`. Ergänze die Lücken.
+    lang: postgres
+    code: |
+      SELECT r.name AS raum, n.beginn AS naechste_buchung
+      FROM raeume AS r
+      ⟦LEFT JOIN LATERAL⟧ (
+        SELECT b.beginn
+        FROM buchungen AS b
+        WHERE b.raum_id = ⟦r.id⟧
+          AND b.status = 'bestaetigt'
+          AND b.beginn >= timestamptz '2026-03-10 12:00'
+        ORDER BY ⟦b.beginn⟧
+        ⟦LIMIT 1⟧
+      ) AS n ⟦ON true⟧;
+    gaps:
+      - label: Join-Art
+        hint: Die Unterabfrage bezieht sich auf `r`, und Räume ohne Treffer sollen bleiben.
+        accept: ["LEFT OUTER JOIN LATERAL"]
+      - label: Korrelation
+        hint: Die Buchungen des aktuellen Raums der äußeren Abfrage.
+      - label: Sortierung
+        hint: Die nächste Buchung ist die mit dem frühesten Beginn ab dem Stichtag.
+        accept: ["b.beginn ASC", "beginn", "beginn ASC"]
+      - label: Begrenzung
+        hint: Nur eine Zeile je Raum.
+        accept: ["FETCH FIRST 1 ROW ONLY", "FETCH FIRST ROW ONLY", "FETCH FIRST 1 ROWS ONLY", "FETCH NEXT 1 ROW ONLY", "FETCH NEXT ROW ONLY", "FETCH NEXT 1 ROWS ONLY"]
+      - label: Join-Bedingung
+        hint: Die Verknüpfung steckt schon in der Unterabfrage. Was bleibt fürs `ON`?
+        accept: ["ON 1 = 1", "ON (true)"]
+    explanation: |
+      `LEFT JOIN LATERAL` lässt die Unterabfrage `r.id` verwenden und behält Räume, für die sie leer bleibt. Innen sortiert `ORDER BY b.beginn` aufsteigend, `LIMIT 1` nimmt die früheste kommende Buchung. Das `ON true` ist nötig, weil ein `LEFT JOIN` syntaktisch eine Bedingung verlangt; die Verknüpfung steht schon im `WHERE` der Unterabfrage. Mit einem Index auf `buchungen (raum_id, beginn)` liest PostgreSQL je Raum genau einen Indexeintrag.
+    resources:
+      - title: PostgreSQL · LATERAL Subqueries
+        url: https://www.postgresql.org/docs/current/queries-table-expressions.html#QUERIES-LATERAL
+      - title: PostgreSQL · LIMIT und FETCH FIRST
+        url: https://www.postgresql.org/docs/current/sql-select.html#SQL-LIMIT
+
+  - id: offener-betrag-fehler
+    type: bug
+    title: Die Mitgliederliste ist seit April kaputt
+    prompt: |
+      Die Mitgliederliste im Backoffice soll je Mitglied den **gesamten offenen Betrag** zeigen – die Summe aller unbezahlten Rechnungen. Bis Ende März lief sie. Seit dem 1. April, als die März-Rechnungen erstellt wurden, bricht sie ab mit:
+
+      ```text
+      ERROR:  more than one row returned by a subquery used as an expression
+      ```
+
+      Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: postgres
+    code: |
+      SELECT m.name,
+             m.email,
+             (SELECT r.betrag
+                FROM rechnungen AS r
+               WHERE r.mitglied_id = m.id
+                 AND r.bezahlt_am IS NULL) AS offener_betrag
+      FROM mitglieder AS m
+      ORDER BY m.name;
+    lines: [3]
+    fix:
+      - line: 3
+        answers:
+          - "(SELECT sum(r.betrag)"
+          - "(SELECT coalesce(sum(r.betrag), 0)"
+          - "(SELECT coalesce(sum(r.betrag), 0.00)"
+          - "(SELECT sum(betrag)"
+          - "(SELECT coalesce(sum(betrag), 0)"
+          - "(SELECT coalesce(sum(betrag), 0.00)"
+    hints:
+      - Wie viele unbezahlte Rechnungen kann ein Mitglied haben, nachdem die März-Rechnung dazugekommen ist?
+      - Die Unterabfrage soll einen Wert liefern, aus beliebig vielen Rechnungen.
+    explanation: |
+      Die skalare Unterabfrage liefert eine Zeile je unbezahlter Rechnung. Solange jedes Mitglied höchstens eine offene Rechnung hatte, ging das gut. Mit der März-Rechnung hat jemand zwei, und PostgreSQL bricht ab, weil eine skalare Unterabfrage höchstens eine Zeile liefern darf. Gemeint ist die Summe: `sum(r.betrag)` macht aus beliebig vielen Rechnungen genau eine Zeile. Über null offene Rechnungen ist `sum` `NULL`; mit `coalesce(sum(r.betrag), 0)` zeigt die Liste stattdessen `0`. `LIMIT 1` würde den Fehler verstecken und einen falschen Betrag anzeigen.
+    resources:
+      - title: PostgreSQL · Scalar Subqueries
+        url: https://www.postgresql.org/docs/current/sql-expressions.html#SQL-SYNTAX-SCALAR-SUBQUERIES
+
+  - id: lateral-verliert-mitglieder
+    type: bug
+    title: Neue Mitglieder fehlen auf dem Dashboard
+    prompt: |
+      Das Dashboard soll **alle** Mitglieder mit ihren letzten drei Check-ins zeigen. Mitglieder, die sich gerade angemeldet und noch nie eingecheckt haben, fehlen aber komplett. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: postgres
+    code: |
+      SELECT m.name, c.zeitpunkt, c.standort
+      FROM mitglieder AS m
+      JOIN LATERAL (
+        SELECT ci.zeitpunkt, s.name AS standort
+        FROM checkins AS ci
+        JOIN standorte AS s ON s.id = ci.standort_id
+        WHERE ci.mitglied_id = m.id
+        ORDER BY ci.zeitpunkt DESC
+        LIMIT 3
+      ) AS c ON true
+      ORDER BY m.name, c.zeitpunkt DESC;
+    lines: [3]
+    fix:
+      - line: 3
+        answers:
+          - "LEFT JOIN LATERAL ("
+          - "LEFT OUTER JOIN LATERAL ("
+    hints:
+      - Was liefert die Unterabfrage für ein Mitglied ohne Check-in? Und was macht ein innerer Join mit einer Zeile, die keinen Partner hat?
+      - "`ON true` ist für jedes Paar wahr – aber nur, wenn es überhaupt ein Paar gibt."
+    explanation: |
+      `JOIN LATERAL` ist ein innerer Join: Er verbindet jedes Mitglied mit jeder Zeile, die die Unterabfrage für dieses Mitglied liefert. Für ein Mitglied ohne Check-in liefert sie keine Zeile, es entsteht kein Paar, und `ON true` hat nichts zu prüfen – das Mitglied fällt heraus. `LEFT JOIN LATERAL` behält es mit `NULL` in `zeitpunkt` und `standort`. `CROSS JOIN LATERAL` hätte denselben Fehler wie der ursprüngliche Code. Die Unterabfrage selbst ist richtig: sortiert, begrenzt, korreliert über `m.id`.
+    resources:
+      - title: PostgreSQL · LATERAL Subqueries
+        url: https://www.postgresql.org/docs/current/queries-table-expressions.html#QUERIES-LATERAL
+
+  - id: lateral-plan-erklaeren
+    type: explain
+    title: Warum ist diese Abfrage schnell?
+    prompt: |
+      Im Code-Review fragt jemand, warum die Profilseite nicht mehr 21 Abfragen schickt und trotzdem schneller ist, obwohl `buchungen` 30 000 Zeilen hat. Erkläre, was die Abfrage tut, wie der Plan sie ausführt und welche Rolle der Index spielt.
+    lang: postgres
+    code: |
+      CREATE INDEX buchungen_mitglied_beginn ON buchungen (mitglied_id, beginn DESC);
+
+      SELECT m.name, l.beginn
+      FROM mitglieder AS m
+      LEFT JOIN LATERAL (
+        SELECT b.beginn
+        FROM buchungen AS b
+        WHERE b.mitglied_id = m.id
+        ORDER BY b.beginn DESC
+        LIMIT 3
+      ) AS l ON true
+      WHERE m.id <= 20;
+
+      -- EXPLAIN (COSTS OFF):
+      -- Nested Loop Left Join
+      --   ->  Index Scan using mitglieder_pkey on mitglieder m
+      --         Index Cond: (id <= 20)
+      --   ->  Limit
+      --         ->  Index Only Scan using buchungen_mitglied_beginn on buchungen b
+      --               Index Cond: (mitglied_id = m.id)
+    points:
+      - Die Abfrage liefert für 20 Mitglieder je bis zu drei jüngste Buchungen. `LEFT` und `ON true` behalten Mitglieder ohne Buchung mit `NULL`.
+      - "`LATERAL` erlaubt der Unterabfrage, `m.id` zu verwenden. Der Plan führt sie im `Nested Loop` einmal je Mitglied aus."
+      - Der Index liefert die Buchungen eines Mitglieds schon nach `beginn` absteigend sortiert, deshalb braucht der Plan keinen Sort-Schritt, und `Limit` hört nach drei Einträgen auf.
+      - Gelesen werden etwa 60 Indexeinträge statt 30 000 Buchungen. Weil der Index alle benötigten Spalten enthält, ist es ein Index Only Scan.
+      - Statt 21 Rundreisen zwischen Anwendung und Datenbank gibt es eine; das ist die Lösung des N+1-Problems.
+    explanation: |
+      Die Abfrage holt für die ersten 20 Mitglieder je bis zu drei jüngste Buchungen. Die Unterabfrage steht im `FROM` und bezieht sich über `LATERAL` auf das jeweilige Mitglied; `LEFT JOIN … ON true` behält Mitglieder ohne Buchung. Im Plan sieht man das als `Nested Loop Left Join`: außen 20 Mitglieder über den Primärschlüssel, innen für jedes Mitglied ein `Limit` über einen Index-Zugriff. Der Index `(mitglied_id, beginn DESC)` ist dabei entscheidend. Er führt direkt zu den Buchungen eines Mitglieds, und zwar schon in der gewünschten Reihenfolge – es gibt keinen `Sort`-Knoten, und `Limit` bricht nach drei Einträgen ab. Da `beginn` im Index steht, kann PostgreSQL die Tabelle auslassen (Index Only Scan) – für alle Seiten, die `VACUUM` in der Visibility Map als sichtbar markiert hat. Insgesamt liest die Datenbank rund 60 Indexeinträge in einer einzigen Abfrage; die alte Version schickte 21 Abfragen und lud alle Buchungen der 20 Mitglieder in die Anwendung.
+    resources:
+      - title: PostgreSQL · LATERAL Subqueries
+        url: https://www.postgresql.org/docs/current/queries-table-expressions.html#QUERIES-LATERAL
+      - title: PostgreSQL · Indexes and ORDER BY
+        url: https://www.postgresql.org/docs/current/indexes-ordering.html
+
+  - id: profilseite-in-einer-abfrage
+    type: sql
+    lang: postgres
+    title: Die Profilübersicht in einer Abfrage
+    prompt: |
+      Die Mitgliederübersicht der Deskwerk-App soll mit **einer** Abfrage auskommen. Je Mitglied:
+
+      - `name`
+      - `buchungen`: Anzahl der **bestätigten** Buchungen (0, wenn keine)
+      - `letzter_raum`: Name des Raums der **jüngsten bestätigten** Buchung (`NULL`, wenn keine)
+      - `netzwerk`: Anzahl der Mitglieder, die dieses Mitglied **direkt oder indirekt** geworben hat (0, wenn keine)
+
+      Sortierung: `name` aufsteigend.
+    schema: |
+      CREATE TABLE raeume (
+        id   int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        name text NOT NULL
+      );
+      CREATE TABLE mitglieder (
+        id           int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        name         text NOT NULL,
+        geworben_von int REFERENCES mitglieder (id)
+      );
+      CREATE TABLE buchungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        raum_id     int NOT NULL REFERENCES raeume (id),
+        mitglied_id int NOT NULL REFERENCES mitglieder (id),
+        beginn      timestamptz NOT NULL,
+        status      text NOT NULL DEFAULT 'bestaetigt'
+      );
+      INSERT INTO raeume (name) VALUES ('Atelier'), ('Loft'), ('Box 1'), ('Salon');
+      INSERT INTO mitglieder (name, geworben_von) VALUES
+        ('Anna Schulz',   NULL),
+        ('Jonas Becker',  1),
+        ('Leonie Wagner', 1),
+        ('Mehmet Yilmaz', 2),
+        ('Sophie Krüger', 4),
+        ('Tim Hoffmann',  NULL);
+      INSERT INTO buchungen (raum_id, mitglied_id, beginn, status) VALUES
+        (1, 1, '2026-03-02 09:00', 'bestaetigt'),
+        (2, 1, '2026-03-09 10:00', 'bestaetigt'),
+        (4, 1, '2026-03-20 14:00', 'storniert'),
+        (3, 2, '2026-03-04 08:00', 'bestaetigt'),
+        (2, 3, '2026-03-12 13:00', 'storniert'),
+        (1, 4, '2026-03-05 09:00', 'bestaetigt'),
+        (4, 4, '2026-03-26 15:00', 'bestaetigt'),
+        (3, 4, '2026-03-16 11:00', 'bestaetigt');
+    starter: |
+      SELECT m.name,
+             count(b.id) AS buchungen
+      FROM mitglieder AS m
+      LEFT JOIN buchungen AS b ON b.mitglied_id = m.id
+      GROUP BY m.id, m.name
+      ORDER BY m.name;
+    solution: |
+      WITH RECURSIVE netz AS (
+        SELECT id AS wurzel, id
+        FROM mitglieder
+        UNION ALL
+        SELECT n.wurzel, m.id
+        FROM mitglieder AS m
+        JOIN netz AS n ON m.geworben_von = n.id
+      ),
+      netz_groesse AS (
+        SELECT wurzel, count(*) - 1 AS netzwerk
+        FROM netz
+        GROUP BY wurzel
+      )
+      SELECT m.name,
+             (SELECT count(*)
+                FROM buchungen AS b
+               WHERE b.mitglied_id = m.id
+                 AND b.status = 'bestaetigt') AS buchungen,
+             l.raum AS letzter_raum,
+             ng.netzwerk
+      FROM mitglieder AS m
+      JOIN netz_groesse AS ng ON ng.wurzel = m.id
+      LEFT JOIN LATERAL (
+        SELECT r.name AS raum
+        FROM buchungen AS b
+        JOIN raeume AS r ON r.id = b.raum_id
+        WHERE b.mitglied_id = m.id
+          AND b.status = 'bestaetigt'
+        ORDER BY b.beginn DESC
+        LIMIT 1
+      ) AS l ON true
+      ORDER BY m.name;
+    ordered: true
+    hints:
+      - "Drei Teilfragen, drei Werkzeuge: Anzahl als skalare Unterabfrage mit `count(*)`, jüngster Raum mit `LEFT JOIN LATERAL … LIMIT 1`, Netzwerk mit einem rekursiven CTE."
+      - "Für das Netzwerk startet der rekursive CTE bei **jedem** Mitglied und merkt sich, wo er angefangen hat: Anker `SELECT id AS wurzel, id FROM mitglieder`, rekursiver Teil `SELECT n.wurzel, m.id … JOIN netz AS n ON m.geworben_von = n.id`."
+      - "Je `wurzel` zählt `count(*) - 1` alle Geworbenen ohne das Mitglied selbst. Joinst du die Buchungen mit `GROUP BY` statt mit einer skalaren Unterabfrage, achte auf Fan-out mit dem Netzwerk."
+    explanation: |
+      Die drei Spalten haben verschiedene Granularitäten, deshalb rechnet jede für sich. Die Anzahl ist eine korrelierte skalare Unterabfrage – `count` liefert für Leonie und Tim `0`, und stornierte Buchungen zählen nicht. Der jüngste Raum kommt aus `LEFT JOIN LATERAL` mit `ORDER BY beginn DESC LIMIT 1`; Annas stornierter Salon vom 20. März wird nicht angezeigt, weil der Filter vor dem `LIMIT` wirkt. Das Netzwerk zählt ein rekursiver CTE, der bei jedem Mitglied als `wurzel` startet und alle Nachfahren einsammelt; `count(*) - 1` zieht das Mitglied selbst ab. Ergebnis: Anna 2 Buchungen, Loft, Netzwerk 4 (Jonas, Leonie, Mehmet, Sophie); Jonas 1, Box 1, 2; Leonie 0, `NULL`, 0; Mehmet 3, Salon, 1; Sophie 0, `NULL`, 0; Tim 0, `NULL`, 0. Wer Buchungen und Netzwerk in einem Join mit `GROUP BY` verbindet, multipliziert die Zeilen und zählt falsch – das ist das Fan-out aus dem Data-Kurs.
+    resources:
+      - title: PostgreSQL · WITH Queries
+        url: https://www.postgresql.org/docs/current/queries-with.html
+      - title: PostgreSQL · LATERAL Subqueries
+        url: https://www.postgresql.org/docs/current/queries-table-expressions.html#QUERIES-LATERAL

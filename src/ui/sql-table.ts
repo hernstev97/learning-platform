@@ -1,5 +1,7 @@
-// Result tables for SQL: table previews of `sql` exercises, the learner's result and runnable SQL blocks in lessons.
+// Result tables for SQL: table previews of `sql` exercises, the learner's result and runnable SQL blocks in lessons
+// (SQLite and PostgreSQL).
 import type { SqlValue } from '../content/types.ts';
+import type { PgStatementResult } from '../pg/engine.ts';
 import { escape } from './dom.ts';
 
 const DISPLAY_LIMIT = 50;
@@ -17,3 +19,27 @@ export function sqlTableMarkup(columns: string[], rows: SqlValue[][], cells: str
 }
 
 export const rowCount = (n: number) => `${n} Zeile${n === 1 ? '' : 'n'}`;
+
+/**
+ * A PostgreSQL script's output, statement by statement as psql shows it: notices, result tables, plans from EXPLAIN as
+ * text and command tags (CREATE TABLE, INSERT 0 3) for statements without rows.
+ */
+export function pgResultsMarkup(results: PgStatementResult[], error: string | null): string {
+  const tables = results.filter((result) => result.returnsRows).length;
+  let n = 0;
+  const parts = results.map((result) => {
+    // Every part is a block of its own; newlines between them would add empty lines in the pre-wrapped output.
+    const notices = result.notices.map((notice) => `<span class="sql-notice">${escape(notice)}</span>`).join('');
+    if (result.error) return `${notices}<span class="sql-error">${escape(result.error)}</span>`;
+    if (!result.returnsRows) return `${notices}<span class="sql-tag">${escape(result.tag)}</span>`;
+    n++;
+    const label = `<span class="run-label">${tables > 1 ? `Ergebnis ${n} · ` : 'Ergebnis · '}${rowCount(result.rows.length)}${result.truncated ? ' (gekürzt)' : ''}</span>`;
+    const plan = result.columns.length === 1 && result.columns[0] === 'QUERY PLAN';
+    const body = plan
+      ? `<pre class="sql-plan">${escape(result.cells.map((row) => row[0]).join('\n'))}</pre>`
+      : sqlTableMarkup(result.columns, result.rows, result.cells);
+    return `${notices}${label}${body}`;
+  });
+  const err = error ? `<span class="run-label">Fehler</span>${escape(error)}` : '';
+  return parts.join('') + err || '<span class="run-label">Ergebnis</span>(keine Anweisung)';
+}

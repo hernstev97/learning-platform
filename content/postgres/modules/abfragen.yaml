@@ -1,0 +1,1028 @@
+id: abfragen
+title: Abfragen für Anwendungen
+level: 1
+minutes: 150
+summary: SELECT, JOIN und GROUP BY so schreiben, wie eine App sie braucht – Listenansichten über Fremdschlüssel, Zähler mit LEFT JOIN und FILTER, stabile Sortierung, Paginierung per Keyset, DISTINCT ON und Zeitfilter, die auch um die Sommerzeitumstellung stimmen.
+goals:
+  - Du baust Listenansichten mit `JOIN` über Fremdschlüssel und zählst mit `LEFT JOIN`, `count(spalte)` und `FILTER (WHERE …)`, ohne Mitglieder ohne Buchung zu verlieren.
+  - Du fasst Werte einer Gruppe mit `string_agg` und `array_agg` zusammen und filterst Gruppen mit `HAVING`.
+  - Du sortierst deterministisch mit eindeutigem Tiebreaker und paginierst lange Listen per Keyset statt mit `OFFSET`.
+  - Du unterscheidest `DISTINCT` und `DISTINCT ON` und holst damit den neuesten Datensatz je Gruppe.
+  - Du filterst Zeiträume mit halboffenen Intervallen und rechnest Tage und Monate mit `AT TIME ZONE` und `date_trunc` in der Zeitzone der Fachlichkeit.
+resources:
+  - title: PostgreSQL · SELECT
+    url: https://www.postgresql.org/docs/current/sql-select.html
+  - title: PostgreSQL · Aggregate Expressions (FILTER, ORDER BY im Aggregat)
+    url: https://www.postgresql.org/docs/current/sql-expressions.html#SYNTAX-AGGREGATES
+  - title: PostgreSQL · LIMIT and OFFSET
+    url: https://www.postgresql.org/docs/current/queries-limit.html
+  - title: PostgreSQL · AT TIME ZONE
+    url: https://www.postgresql.org/docs/current/functions-datetime.html#FUNCTIONS-DATETIME-ZONECONVERT
+  - title: PostgreSQL Wiki · Don't use BETWEEN (especially with timestamps)
+    url: https://wiki.postgresql.org/wiki/Don%27t_Do_This#Don.27t_use_BETWEEN_.28especially_with_timestamps.29
+lesson: |
+  Drei Bildschirme der Deskwerk-App erzeugen die meisten Datenbankabfragen. „Meine Buchungen“ zeigt einem Mitglied seine Termine, zwanzig pro Seite. Die Mitgliederübersicht im Admin-Bereich zählt für jedes Mitglied Buchungen und Umsatz. Die Monatsübersicht zeigt je Standort, was im März gelaufen ist. Hinter jedem Bildschirm steht ein `SELECT`, ob du es selbst schreibst oder SQLAlchemy und Prisma es erzeugen. Wer das SQL kennt, erkennt im Log des ORMs sofort, warum eine Liste springt, ein Mitglied fehlt oder die Märzzahlen nicht zur Buchhaltung passen.
+
+  Die Grundlagen – `SELECT`, `WHERE`, `GROUP BY`, `NULL` in Aggregaten, `INNER` und `LEFT JOIN`, Fan-out – behandelt der Data-Kurs in [SQL-Abfragen für Analysen](/data/sql-abfragen) und [Joins und Datenmodelle abfragen](/data/sql-joins). Dieses Modul nimmt die Sicht der Anwendung ein. Eine Sache brauchst du von dort: die **logische Auswertungsreihenfolge**. PostgreSQL wertet eine Abfrage gedanklich in dieser Reihenfolge aus, auch wenn du sie anders hinschreibst ([SELECT · Description](https://www.postgresql.org/docs/current/sql-select.html)):
+
+  ```text
+  FROM / JOIN → WHERE → GROUP BY → HAVING → SELECT → DISTINCT → ORDER BY → LIMIT / OFFSET
+  ```
+
+  Daraus folgt: `WHERE` sieht noch keine Aliase aus dem `SELECT` und keine Aggregate, `ORDER BY` sieht beides. `LIMIT` kommt zuletzt und schneidet aus dem fertig sortierten Ergebnis. Die Beispiele nutzen das [Schema von Deskwerk](/postgres/relationales-modell).
+
+  ## Listenansichten: Buchungen mit Raum und Standort
+
+  „Meine Buchungen“ zeigt je Buchung Zeitraum, Raum und Standort. Die Buchung kennt nur `raum_id`, der Raum nur `standort_id`. Zwei Joins entlang der Fremdschlüssel holen die Namen dazu:
+
+  ```postgres run
+  CREATE TABLE standorte (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name text NOT NULL UNIQUE);
+  CREATE TABLE raeume (
+    id               int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    standort_id      int NOT NULL REFERENCES standorte (id),
+    name             text NOT NULL,
+    preis_pro_stunde numeric(8,2) NOT NULL
+  );
+  CREATE TABLE mitglieder (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, email text NOT NULL UNIQUE, name text NOT NULL);
+  CREATE TABLE buchungen (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    raum_id     int NOT NULL REFERENCES raeume (id),
+    mitglied_id int NOT NULL REFERENCES mitglieder (id),
+    beginn      timestamptz NOT NULL,
+    ende        timestamptz NOT NULL,
+    status      text NOT NULL DEFAULT 'bestaetigt',
+    preis       numeric(8,2)
+  );
+  INSERT INTO standorte (name) VALUES ('Plagwitz'), ('Südvorstadt'), ('Zentrum');
+  INSERT INTO raeume (standort_id, name, preis_pro_stunde) VALUES
+    (1, 'Atelier', 25.00), (1, 'Box 1', 4.00), (2, 'Loft', 35.00), (3, 'Fensterplatz 3', 6.50);
+  INSERT INTO mitglieder (email, name) VALUES
+    ('jana.krueger@example.org', 'Jana Krüger'),
+    ('mehmet.oezdemir@example.org', 'Mehmet Özdemir'),
+    ('lea.hoffmann@example.org', 'Lea Hoffmann'),
+    ('tobias.schulz@example.org', 'Tobias Schulz');
+  INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, status, preis) VALUES
+    (1, 1, '2026-03-02 09:00', '2026-03-02 11:00', 'bestaetigt', 50.00),
+    (2, 2, '2026-03-02 09:00', '2026-03-02 09:30', 'bestaetigt',  2.00),
+    (3, 1, '2026-03-05 14:00', '2026-03-05 16:00', 'storniert',   NULL),
+    (4, 3, '2026-03-09 08:00', '2026-03-09 17:00', 'bestaetigt', 58.50),
+    (1, 1, '2026-03-30 10:00', '2026-03-30 12:00', 'bestaetigt', 50.00);
+
+  SELECT b.id, b.beginn, b.ende, r.name AS raum, s.name AS standort, b.status, b.preis
+  FROM buchungen AS b
+  JOIN raeume    AS r ON r.id = b.raum_id
+  JOIN standorte AS s ON s.id = r.standort_id
+  WHERE b.mitglied_id = 1
+  ORDER BY b.beginn DESC, b.id DESC;
+  ```
+
+  Jede Zeile des Ergebnisses ist eine Buchung, denn beide Joins gehen von „viele“ nach „eins“: Jede Buchung hat genau einen Raum, jeder Raum genau einen Standort. Ein `INNER JOIN` ist hier sicher, weil `raum_id` und `standort_id` `NOT NULL` sind und als Fremdschlüssel auf einen vorhandenen Raum bzw. Standort zeigen müssen. Keine Buchung kann ihren Partner verlieren. Wäre `raum_id` optional, etwa für Buchungen, denen noch kein Raum zugeteilt ist, bräuchtest du `LEFT JOIN`, sonst verschwänden sie still aus der Liste.
+
+  Wähle die Spalten aus, die der Bildschirm zeigt. Ein ORM lädt ohne Anweisung alle Spalten jedes Objekts, auch eine lange Beschreibung oder ein JSON-Feld, das die Liste nie anzeigt. In SQLAlchemy lädst du gezielt mit `select(Buchung.id, Buchung.beginn, Raum.name)`, in Prisma mit `select: { … }`. Wie das ORM Beziehungen nachlädt und wann daraus hundert Abfragen statt einer werden, zeigt [ORM und SQL](/postgres/orm-und-sql).
+
+  ## Zählen für Übersichten: LEFT JOIN, count und FILTER
+
+  Die Mitgliederübersicht zeigt **alle** Mitglieder, auch Tobias Schulz, der noch nie gebucht hat. Daraus folgt `LEFT JOIN`. Was danach gezählt wird, entscheidet über richtig und falsch:
+
+  ```postgres run
+  CREATE TABLE raeume (id int PRIMARY KEY, name text NOT NULL);
+  CREATE TABLE mitglieder (id int PRIMARY KEY, name text NOT NULL);
+  CREATE TABLE buchungen (
+    id          bigint PRIMARY KEY,
+    raum_id     int NOT NULL REFERENCES raeume (id),
+    mitglied_id int NOT NULL REFERENCES mitglieder (id),
+    beginn      timestamptz NOT NULL,
+    status      text NOT NULL,
+    preis       numeric(8,2)
+  );
+  INSERT INTO raeume VALUES (1, 'Atelier'), (2, 'Box 1'), (3, 'Loft'), (4, 'Fensterplatz 3');
+  INSERT INTO mitglieder VALUES (1, 'Jana Krüger'), (2, 'Mehmet Özdemir'), (3, 'Lea Hoffmann'), (4, 'Tobias Schulz');
+  INSERT INTO buchungen VALUES
+    (1, 1, 1, '2026-03-02 09:00', 'bestaetigt', 50.00),
+    (2, 2, 2, '2026-03-02 09:00', 'bestaetigt',  2.00),
+    (3, 3, 1, '2026-03-05 14:00', 'storniert',   NULL),
+    (4, 4, 3, '2026-03-09 08:00', 'bestaetigt', 58.50),
+    (5, 1, 1, '2026-03-30 10:00', 'bestaetigt', 50.00);
+
+  SELECT m.name,
+         count(*)    AS zeilen,
+         count(b.id) AS buchungen,
+         count(b.id) FILTER (WHERE b.status = 'bestaetigt') AS bestaetigt,
+         coalesce(sum(b.preis) FILTER (WHERE b.status = 'bestaetigt'), 0) AS umsatz,
+         string_agg(DISTINCT r.name, ', ' ORDER BY r.name) AS raeume,
+         array_agg(b.id ORDER BY b.beginn) AS buchung_ids
+  FROM mitglieder AS m
+  LEFT JOIN buchungen AS b ON b.mitglied_id = m.id
+  LEFT JOIN raeume    AS r ON r.id = b.raum_id
+  GROUP BY m.id
+  ORDER BY m.id;
+
+  SELECT m.name, count(*) AS bestaetigte
+  FROM mitglieder AS m
+  JOIN buchungen AS b ON b.mitglied_id = m.id
+  WHERE b.status = 'bestaetigt'
+  GROUP BY m.id
+  HAVING count(*) >= 2;
+  ```
+
+  Für Tobias Schulz erzeugt der `LEFT JOIN` eine Zeile, in der alle Spalten von `b` und `r` `NULL` sind. `count(*)` zählt Zeilen und meldet `1`, `count(b.id)` zählt Werte, die nicht `NULL` sind, und meldet die richtige `0`. Nach einem `LEFT JOIN` zählst du deshalb immer eine Spalte der rechten Tabelle, am besten ihren Primärschlüssel.
+
+  `FILTER (WHERE …)` lässt nur die passenden Zeilen in ein Aggregat ([Aggregate Expressions](https://www.postgresql.org/docs/current/sql-expressions.html#SYNTAX-AGGREGATES)). So entstehen mehrere Zähler in einer Abfrage, ohne dass ein `WHERE` die stornierten Buchungen – oder Tobias Schulz – aus allen Spalten entfernt. Ohne `FILTER` schreibt man dafür `sum(CASE WHEN … THEN 1 ELSE 0 END)`, das Ergebnis ist dasselbe. `sum` über keine Zeile liefert `NULL`, nicht `0`; `coalesce(…, 0)` macht daraus die Zahl, die die App anzeigen will.
+
+  `string_agg` und `array_agg` fassen die Werte einer Gruppe zu einem Text oder einem Array zusammen. Die Reihenfolge darin legst du mit `ORDER BY` im Aggregat fest, sonst ist sie nicht festgelegt ([Aggregate Functions](https://www.postgresql.org/docs/current/functions-aggregate.html)). Achte auf `{NULL}` bei Tobias Schulz: `array_agg` sammelt auch `NULL`. Mit `array_agg(b.id) FILTER (WHERE b.id IS NOT NULL)` bekommst du für ihn `NULL` statt eines Arrays mit einem `NULL` darin.
+
+  Zwei Details zu `GROUP BY m.id`: Die Abfrage darf `m.name` auswählen, ohne danach zu gruppieren, weil `m.id` der Primärschlüssel ist und der Name davon funktional abhängt ([GROUP BY Clause](https://www.postgresql.org/docs/current/sql-select.html#SQL-GROUPBY)). Und `HAVING` filtert nach dem Gruppieren, also auf Aggregate; `WHERE` filtert einzelne Zeilen davor. Die zweite Abfrage zeigt beides: `WHERE` wirft die Stornierungen raus, `HAVING` behält Mitglieder mit mindestens zwei bestätigten Buchungen.
+
+  > [!WARNING] Zwei 1:n-Joins in einer Abfrage
+  > Hängst du an `mitglieder` gleichzeitig `buchungen` und `checkins`, entsteht je Mitglied jede Kombination aus Buchung und Check-in. Drei Buchungen und vier Check-ins ergeben zwölf Zeilen, und beide Zähler sind falsch. Zähle jede Seite in einer eigenen Unterabfrage und verbinde dann. Den Mechanismus (Fan-out) erklärt [Joins und Datenmodelle abfragen](/data/sql-joins).
+
+  ## Sortieren und Paginieren
+
+  Eine Liste mit 2 000 Buchungen schickt keine App auf einmal. Sie lädt Seite für Seite, und dafür braucht sie eine **deterministische Sortierung**: Für dieselben Daten muss dieselbe Reihenfolge herauskommen. `ORDER BY beginn` reicht nicht, wenn zwei Buchungen um 9:00 Uhr beginnen. Ihre Reihenfolge untereinander ist dann nicht festgelegt und kann sich zwischen zwei Aufrufen ändern. Steht die Grenze zwischen zwei Seiten genau zwischen ihnen, kann eine Buchung doppelt erscheinen und die andere nie ([LIMIT and OFFSET](https://www.postgresql.org/docs/current/queries-limit.html)). Hänge deshalb einen eindeutigen **Tiebreaker** an, meist den Primärschlüssel: `ORDER BY beginn, id`. Beachte auch `NULL`: PostgreSQL sortiert `NULL` wie einen Wert größer als alle anderen, aufsteigend also ans Ende, absteigend an den Anfang. `NULLS LAST` und `NULLS FIRST` legen es ausdrücklich fest.
+
+  Die naheliegende Paginierung ist `LIMIT 20 OFFSET 40` für Seite 3. Sie hat zwei Probleme. Erstens verschiebt jede neue Zeile vor der aktuellen Position alles Folgende:
+
+  ```postgres run
+  CREATE TABLE buchungen (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, raum text NOT NULL, beginn timestamptz NOT NULL);
+  INSERT INTO buchungen (raum, beginn) VALUES
+    ('Atelier', '2026-03-02 09:00'), ('Box 1', '2026-03-02 09:00'), ('Loft', '2026-03-03 14:00'),
+    ('Atelier', '2026-03-04 10:00'), ('Box 1', '2026-03-05 08:30'), ('Loft', '2026-03-06 16:00');
+
+  -- Seite 1
+  SELECT id, raum, beginn FROM buchungen ORDER BY beginn, id LIMIT 3 OFFSET 0;
+
+  -- Währenddessen entsteht eine Buchung, die vorn einsortiert wird
+  INSERT INTO buchungen (raum, beginn) VALUES ('Fensterplatz 3', '2026-03-01 08:00');
+
+  -- Seite 2 mit OFFSET: Buchung 3 erscheint ein zweites Mal
+  SELECT id, raum, beginn FROM buchungen ORDER BY beginn, id LIMIT 3 OFFSET 3;
+
+  -- Seite 2 mit Keyset: weiter nach der letzten Zeile von Seite 1
+  SELECT id, raum, beginn FROM buchungen
+  WHERE (beginn, id) > ('2026-03-03 14:00', 3)
+  ORDER BY beginn, id
+  LIMIT 3;
+  ```
+
+  Zweitens wird `OFFSET` mit jeder Seite teurer. Die Dokumentation sagt: „The rows skipped by an OFFSET clause still have to be computed inside the server.“ Für Seite 501 liest PostgreSQL 10 020 Zeilen und wirft 10 000 davon weg. `EXPLAIN ANALYZE` zeigt das in `actual rows` (Zeiten ausgeblendet; Pläne lesen lernst du in [Query-Pläne](/postgres/query-plaene)):
+
+  ```postgres run
+  CREATE TABLE buchungen (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, raum_id int NOT NULL, beginn timestamptz NOT NULL);
+  INSERT INTO buchungen (raum_id, beginn)
+  SELECT 1 + i % 12, timestamptz '2026-01-05 08:00' + (i / 6) * interval '30 minutes'
+  FROM generate_series(1, 20000) AS i;
+  CREATE INDEX ON buchungen (beginn, id);
+  ANALYZE buchungen;
+
+  EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT id, raum_id, beginn FROM buchungen
+  ORDER BY beginn, id
+  LIMIT 20 OFFSET 10000;
+
+  EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT id, raum_id, beginn FROM buchungen
+  WHERE (beginn, id) > ('2026-02-09 00:30+01', 9999)
+  ORDER BY beginn, id
+  LIMIT 20;
+  ```
+
+  Die Alternative heißt **Keyset-Paginierung** (auch Seek-Methode). Die App merkt sich die Sortierwerte der letzten Zeile einer Seite und fragt nach den Zeilen danach. `(beginn, id) > ($1, $2)` ist ein **Zeilenvergleich**: Er vergleicht zuerst `beginn` und nur bei Gleichstand `id`, wie Wörter im Lexikon ([Row Constructor Comparison](https://www.postgresql.org/docs/current/functions-comparisons.html#ROW-WISE-COMPARISON)). Mit einem Index auf `(beginn, id)` springt PostgreSQL direkt an die Stelle und liest genau 20 Zeilen, egal ob Seite 2 oder Seite 501 ([Indexe](/postgres/indexe) erklärt, warum). Neue Buchungen verschieben nichts, weil die Position nicht gezählt, sondern über Werte bestimmt wird.
+
+  In SQLAlchemy schreibst du den Zeilenvergleich mit `tuple_`. Der Cursor ist ein Paar aus `beginn` und `id`, das die App etwa als `?nach=2026-03-04T10:00:00%2B01:00_812` an den Client gibt:
+
+  ```python
+  def buchungen_seite(session, mitglied_id: int, nach: tuple[datetime, int] | None, groesse: int = 20):
+      abfrage = (
+          select(Buchung.id, Buchung.beginn, Raum.name.label("raum"))
+          .join(Raum, Raum.id == Buchung.raum_id)
+          .where(Buchung.mitglied_id == mitglied_id)
+          .order_by(Buchung.beginn, Buchung.id)
+          .limit(groesse)
+      )
+      if nach is not None:
+          abfrage = abfrage.where(tuple_(Buchung.beginn, Buchung.id) > nach)
+      return session.execute(abfrage).all()
+  ```
+
+  Keyset hat Grenzen. Springen auf „Seite 17“ geht nicht, nur vor und zurück. Alle Sortierspalten gehören in den Cursor, und sie müssen in dieselbe Richtung sortieren, damit ein einziger Zeilenvergleich passt. Für Admin-Tabellen mit wenigen hundert Zeilen und Seitenzahlen ist `OFFSET` in Ordnung. Für Feeds, Verläufe und APIs, die durch große Mengen blättern, ist Keyset der Standard.
+
+  > [!INTERVIEW] „Wie paginierst du eine große Liste?“
+  > Mit Keyset-Paginierung: `ORDER BY beginn, id` mit eindeutigem Tiebreaker, und für die nächste Seite `WHERE (beginn, id) > (letzter_beginn, letzte_id) LIMIT 20`, gestützt von einem Index auf `(beginn, id)`. Jede Seite kostet dann gleich viel, und neue Einträge verschieben keine Zeilen. `OFFSET` muss alle übersprungenen Zeilen berechnen und liefert Dubletten, wenn sich die Daten zwischen zwei Seiten ändern. Ich nehme `OFFSET` nur, wenn die Liste klein ist oder Nutzer auf eine bestimmte Seitenzahl springen müssen.
+
+  ## DISTINCT und DISTINCT ON
+
+  `DISTINCT` entfernt doppelte Zeilen aus dem Ergebnis. Verglichen wird die ganze Auswahlliste: `SELECT DISTINCT mitglied_id, standort` liefert jedes Paar einmal. Häufiger braucht eine App aber „eine Zeile je Gruppe, und zwar die neueste“: den letzten Check-in je Mitglied für die Anwesenheitsanzeige am Empfang, die letzte Rechnung je Mitglied. Dafür hat PostgreSQL `DISTINCT ON` ([DISTINCT Clause](https://www.postgresql.org/docs/current/sql-select.html#SQL-DISTINCT)):
+
+  ```postgres run
+  CREATE TABLE checkins (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    mitglied_id int NOT NULL,
+    standort    text NOT NULL,
+    zeitpunkt   timestamptz NOT NULL
+  );
+  INSERT INTO checkins (mitglied_id, standort, zeitpunkt) VALUES
+    (1, 'Plagwitz',    '2026-03-02 08:55'),
+    (2, 'Zentrum',     '2026-03-02 09:10'),
+    (1, 'Südvorstadt', '2026-03-04 13:20'),
+    (3, 'Zentrum',     '2026-03-04 08:30'),
+    (2, 'Zentrum',     '2026-03-05 18:40'),
+    (1, 'Plagwitz',    '2026-03-06 07:45'),
+    (3, 'Plagwitz',    '2026-03-04 08:30');
+
+  -- An welchen Standorten war jedes Mitglied?
+  SELECT DISTINCT mitglied_id, standort
+  FROM checkins
+  ORDER BY mitglied_id, standort;
+
+  -- Letzter Check-in je Mitglied
+  SELECT DISTINCT ON (mitglied_id) mitglied_id, standort, zeitpunkt
+  FROM checkins
+  ORDER BY mitglied_id, zeitpunkt DESC, id DESC;
+  ```
+
+  `DISTINCT ON (mitglied_id)` behält je Wert von `mitglied_id` die **erste** Zeile in der Sortierung des `ORDER BY`. Deshalb muss das `ORDER BY` mit denselben Ausdrücken beginnen; dahinter bestimmt es, welche Zeile die erste ist. Mitglied 3 hat zwei Check-ins um 8:30 Uhr. Ohne den Tiebreaker `id DESC` wäre offen, welcher Standort angezeigt wird. `DISTINCT ON` ist eine Erweiterung von PostgreSQL und steht nicht im SQL-Standard. Portable Alternativen sind `row_number()` als Fensterfunktion ([Fensterfunktionen und Analysemuster](/data/sql-fensterfunktionen)) oder ein `LATERAL`-Join, der auch die letzten drei statt nur des letzten liefert ([Unterabfragen und CTEs](/postgres/unterabfragen-ctes)).
+
+  ## Zeiträume und Zeitzonen
+
+  „Alle Buchungen im März“ klingt eindeutig, ist es aber nicht. Zwei Fragen musst du beantworten: Wo endet der März, und in welcher Zeitzone?
+
+  Für das Ende gilt: Filtere Zeiträume als **halboffenes Intervall** `[Anfang, Ende)`, also `beginn >= '2026-03-01' AND beginn < '2026-04-01'`. `BETWEEN` schließt beide Grenzen ein, und das Datum `'2026-03-31'` wird für `timestamptz` zu Mitternacht am Anfang des 31. Damit fehlt der ganze letzte Tag. Mit `'2026-03-31 23:59:59'` fehlt der Rest der letzten Sekunde, denn `timestamptz` speichert Mikrosekunden. Und mit `'2026-04-01'` als Ende zählt eine Buchung um 0:00 Uhr am Monatsersten in zwei Monaten ([Wiki · Don't use BETWEEN](https://wiki.postgresql.org/wiki/Don%27t_Do_This#Don.27t_use_BETWEEN_.28especially_with_timestamps.29)). Halboffene Intervalle schließen lückenlos aneinander an: Das Ende des März ist der Anfang des April.
+
+  ```postgres run
+  CREATE TABLE buchungen (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, beginn timestamptz NOT NULL, preis numeric(8,2) NOT NULL);
+  INSERT INTO buchungen (beginn, preis) VALUES
+    ('2026-02-28 23:30', 12.00),
+    ('2026-03-01 00:30', 12.00),
+    ('2026-03-16 10:00', 50.00),
+    ('2026-03-31 18:00', 16.00),
+    ('2026-04-01 00:00', 25.00);
+
+  SELECT array_agg(id ORDER BY id) AS mit_between
+  FROM buchungen WHERE beginn BETWEEN '2026-03-01' AND '2026-03-31';
+
+  SELECT array_agg(id ORDER BY id) AS halboffen
+  FROM buchungen WHERE beginn >= '2026-03-01' AND beginn < '2026-04-01';
+
+  SELECT timestamptz '2026-03-28 12:00' + interval '1 day'    AS plus_ein_tag,
+         timestamptz '2026-03-28 12:00' + interval '24 hours' AS plus_24_stunden;
+  ```
+
+  Die letzte Abfrage zeigt die Sommerzeit: Ein Tag ab dem 28. März 12 Uhr endet am 29. März um 12 Uhr, obwohl er nur 23 Stunden hat. `interval '1 day'` rechnet in Kalendertagen der Sitzungszeitzone, `interval '24 hours'` in Stunden.
+
+  Die zweite Frage ist die Zeitzone. Ein Literal ohne Zeitzone wie `'2026-03-01'` liest PostgreSQL in der Zeitzone der **Sitzung**. Der Block oben lief mit `Europe/Berlin`. Der Abrechnungsdienst von Deskwerk läuft mit UTC, und dieselbe Abfrage liefert dort andere Buchungen:
+
+  ```postgres run
+  CREATE TABLE buchungen (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, beginn timestamptz NOT NULL, preis numeric(8,2) NOT NULL);
+  INSERT INTO buchungen (beginn, preis) VALUES
+    ('2026-02-28 23:30', 12.00),
+    ('2026-03-01 00:30', 12.00),
+    ('2026-03-16 10:00', 50.00),
+    ('2026-03-31 18:00', 16.00),
+    ('2026-04-01 00:00', 25.00);
+
+  SET TIME ZONE 'UTC';  -- wie der Abrechnungsdienst
+
+  SELECT array_agg(id ORDER BY id) AS halboffen_utc
+  FROM buchungen WHERE beginn >= '2026-03-01' AND beginn < '2026-04-01';
+
+  SELECT array_agg(id ORDER BY id) AS halboffen_berlin
+  FROM buchungen
+  WHERE beginn >= timestamptz '2026-03-01 00:00 Europe/Berlin'
+    AND beginn <  timestamptz '2026-04-01 00:00 Europe/Berlin';
+
+  SELECT id, beginn,
+         beginn::date                                 AS tag_sitzung,
+         (beginn AT TIME ZONE 'Europe/Berlin')::date  AS tag_berlin,
+         date_trunc('month', beginn, 'Europe/Berlin') AS monat_berlin
+  FROM buchungen
+  ORDER BY id;
+  ```
+
+  In UTC zählt Buchung 2 (0:30 Uhr am 1. März in Leipzig) zum Februar und Buchung 5 (Mitternacht am 1. April) zum März. Die Lösung ist, die Zeitzone der Fachlichkeit ausdrücklich zu nennen, statt sich auf die Sitzung zu verlassen:
+
+  - **Grenzen** als Zeitpunkte mit Zeitzone: `timestamptz '2026-03-01 00:00 Europe/Berlin'`, oder aus der App als `datetime` mit `ZoneInfo("Europe/Berlin")` als Parameter.
+  - **Tage** mit `beginn AT TIME ZONE 'Europe/Berlin'`. Das macht aus dem Moment die Leipziger Wanduhrzeit (`timestamp` ohne Zeitzone), `::date` schneidet den Tag ab ([AT TIME ZONE](https://www.postgresql.org/docs/current/functions-datetime.html#FUNCTIONS-DATETIME-ZONECONVERT)).
+  - **Monate** mit `date_trunc('month', beginn, 'Europe/Berlin')`. Die Variante mit drittem Argument gibt es seit PostgreSQL 12; sie liefert den Monatsanfang in Leipzig als `timestamptz` ([date_trunc](https://www.postgresql.org/docs/current/functions-datetime.html#FUNCTIONS-DATETIME-TRUNC)).
+
+  > [!PRAXIS] Die Zeitzone gehört in die Abfrage, nicht auf den Server
+  > Bei Deskwerk laufen Datenbank und Dienste mit UTC. Jede Abfrage, die nach Tag, Woche oder Monat fragt, nennt `Europe/Berlin` ausdrücklich, und die API nimmt Zeitpunkte nur mit Offset an (`2026-03-01T00:00:00+01:00`). Ein Test prüft den Monatsbericht mit Buchungen um 0:30 Uhr am Monatsersten und in der Nacht der Zeitumstellung. Seit dieser Test existiert, gibt es keine Tickets mehr, in denen die Buchhaltung einen Betrag im falschen Monat findet.
+
+  ## Häufige Fehler
+
+  - **Mitglieder ohne Buchung fehlen.** `JOIN` statt `LEFT JOIN`, oder eine Bedingung an `buchungen` steht im `WHERE`. `LEFT JOIN` nehmen und die Bedingung ins `ON` oder in ein `FILTER` verschieben.
+  - **Mitglieder ohne Buchung haben 1 Buchung.** `count(*)` nach dem `LEFT JOIN`. `count(b.id)` zählen.
+  - **`column "m.name" must appear in the GROUP BY clause or be used in an aggregate function`.** Gruppiert wird nach einer Spalte, die kein Primärschlüssel ist. Nach dem Primärschlüssel gruppieren oder die Spalte in `GROUP BY` aufnehmen.
+  - **Eine Buchung erscheint auf zwei Seiten, eine andere nie.** `ORDER BY` ohne eindeutigen Tiebreaker oder `OFFSET` bei sich ändernden Daten. `ORDER BY beginn, id` und Keyset.
+  - **Keyset überspringt Zeilen.** `WHERE beginn > $1 AND id > $2` statt des Zeilenvergleichs `(beginn, id) > ($1, $2)`. Der Vergleich der Einzelspalten verwirft spätere Buchungen mit kleinerer `id`.
+  - **`SELECT DISTINCT ON expressions must match initial ORDER BY expressions`.** Das `ORDER BY` beginnt nicht mit den Ausdrücken aus `DISTINCT ON`.
+  - **Der 31. fehlt im Monatsbericht.** `BETWEEN '2026-03-01' AND '2026-03-31'`. Halboffen filtern: `>= '2026-03-01' AND < '2026-04-01'`.
+  - **Zahlen weichen zwischen zwei Diensten ab.** Grenzen ohne Zeitzone oder `beginn::date` hängen von der `TimeZone` der Sitzung ab. Zeitzone in der Abfrage nennen.
+
+  ## Zusammenfassung
+
+  - Listenansichten folgen den Fremdschlüsseln von „viele“ nach „eins“. Ein `INNER JOIN` ist sicher, wenn der Fremdschlüssel `NOT NULL` ist; sonst `LEFT JOIN`.
+  - Nach einem `LEFT JOIN` zählt `count(b.id)`, nicht `count(*)`. `FILTER (WHERE …)` erlaubt mehrere Zähler in einer Abfrage, `coalesce` macht aus einer leeren Summe `0`.
+  - `string_agg` und `array_agg` brauchen ein `ORDER BY` im Aggregat. `HAVING` filtert Gruppen, `WHERE` Zeilen.
+  - Sortierung ist erst mit eindeutigem Tiebreaker deterministisch: `ORDER BY beginn, id`.
+  - Keyset-Paginierung mit `(beginn, id) > ($1, $2)` kostet je Seite gleich viel und verschiebt nichts; `OFFSET` berechnet alle übersprungenen Zeilen.
+  - `DISTINCT ON (x)` behält die erste Zeile je `x` in der Sortierung des `ORDER BY`.
+  - Zeiträume halboffen filtern, nie mit `BETWEEN`. Zeitzone der Fachlichkeit mit `AT TIME ZONE` und `date_trunc(…, 'Europe/Berlin')` ausdrücklich nennen.
+exercises:
+  - id: paginierung-verstehen
+    type: choice
+    title: OFFSET oder Keyset?
+    prompt: |
+      Die Liste „Alle Buchungen“ im Admin-Bereich lädt Seiten mit je 20 Buchungen. Welche Aussagen stimmen? Mehrere Antworten sind richtig.
+    lang: postgres
+    code: |
+      -- Variante A
+      SELECT id, beginn FROM buchungen ORDER BY beginn LIMIT 20 OFFSET 40;
+
+      -- Variante B
+      SELECT id, beginn FROM buchungen
+      WHERE (beginn, id) > ($1, $2)
+      ORDER BY beginn, id
+      LIMIT 20;
+    options:
+      - text: Für Variante A berechnet PostgreSQL auch die 40 übersprungenen Zeilen und verwirft sie danach.
+        correct: true
+        why: Die Dokumentation sagt ausdrücklich, dass übersprungene Zeilen im Server berechnet werden. Bei `OFFSET 10000` liest PostgreSQL also 10 020 Zeilen.
+      - text: Variante A liefert garantiert die Zeilen 41 bis 60, auch wenn mehrere Buchungen denselben Beginn haben.
+        correct: false
+        why: Ohne eindeutigen Tiebreaker ist die Reihenfolge innerhalb gleicher `beginn`-Werte offen. Liegt eine Seitengrenze darin, kann eine Buchung auf zwei Seiten erscheinen und eine andere auf keiner.
+      - text: In Variante B sind `$1` und `$2` der `beginn` und die `id` der letzten Zeile der vorherigen Seite.
+        correct: true
+        why: Das ist der Cursor der Keyset-Paginierung. Die nächste Seite beginnt direkt hinter dieser Zeile.
+      - text: "`WHERE beginn > $1 AND id > $2` wäre gleichwertig zu `(beginn, id) > ($1, $2)`."
+        correct: false
+        why: Der Zeilenvergleich prüft `id` nur bei gleichem `beginn`. Die Einzelvergleiche verlangen eine größere `id` für jede Zeile und verwerfen spätere Buchungen, die eine kleinere `id` haben, etwa weil sie früher angelegt wurden.
+      - text: Mit Variante B kann die App direkt auf Seite 17 springen.
+        correct: false
+        why: Keyset kennt keine Seitennummern. Für die nächste Seite braucht die App die letzte Zeile der aktuellen; springen geht nur über `OFFSET`.
+    explanation: |
+      `OFFSET` zählt Positionen: Der Server berechnet und verwirft alle übersprungenen Zeilen, und jede neue Zeile vor der aktuellen Position verschiebt die Seiten. Keyset merkt sich Werte: Der Zeilenvergleich `(beginn, id) > ($1, $2)` setzt genau hinter der letzten gezeigten Zeile fort, und mit einem Index auf `(beginn, id)` kostet jede Seite gleich viel. Beide Varianten brauchen eine eindeutige Sortierung, Keyset sogar zwingend, sonst findet der Cursor keine eindeutige Stelle.
+    resources:
+      - title: PostgreSQL · LIMIT and OFFSET
+        url: https://www.postgresql.org/docs/current/queries-limit.html
+      - title: PostgreSQL · Row Constructor Comparison
+        url: https://www.postgresql.org/docs/current/functions-comparisons.html#ROW-WISE-COMPARISON
+
+  - id: zaehler-vorhersagen
+    type: output
+    title: Drei Mitglieder, vier Buchungen
+    prompt: |
+      Was gibt die Abfrage aus? Ausgabe wie `psql -At`: eine Zeile je Ergebniszeile, Werte durch `|` getrennt, `NULL` als leerer Wert. Befehlsmeldungen wie `INSERT 0 4` erscheinen nicht.
+    lang: postgres
+    code: |
+      CREATE TABLE mitglieder (id int PRIMARY KEY, name text NOT NULL);
+      CREATE TABLE buchungen (
+        id          int PRIMARY KEY,
+        mitglied_id int NOT NULL REFERENCES mitglieder (id),
+        status      text NOT NULL,
+        preis       numeric(8,2)
+      );
+      INSERT INTO mitglieder VALUES (1, 'Krüger'), (2, 'Özdemir'), (3, 'Hoffmann');
+      INSERT INTO buchungen VALUES
+        (10, 1, 'bestaetigt', 50.00),
+        (11, 1, 'storniert',  NULL),
+        (12, 2, 'storniert',  35.00),
+        (13, 1, 'bestaetigt', 25.00);
+
+      SELECT m.name,
+             count(*),
+             count(b.id),
+             count(b.id) FILTER (WHERE b.status = 'bestaetigt'),
+             sum(b.preis)
+      FROM mitglieder AS m
+      LEFT JOIN buchungen AS b ON b.mitglied_id = m.id
+      GROUP BY m.id
+      ORDER BY m.id;
+    expected: |
+      Krüger|3|3|2|75.00
+      Özdemir|1|1|0|35.00
+      Hoffmann|1|0|0|
+    hints:
+      - Hoffmann hat keine Buchung. Wie viele Zeilen erzeugt der `LEFT JOIN` für sie, und was steht darin in `b.id`?
+      - "`FILTER` gilt nur für das Aggregat, hinter dem es steht. Welche Buchungen gehen in `sum(b.preis)` ein?"
+    explanation: |
+      Der `LEFT JOIN` liefert für Krüger drei Zeilen, für Özdemir eine und für Hoffmann eine aufgefüllte Zeile mit `NULL` in allen Spalten von `b`. `count(*)` zählt diese Zeile mit, `count(b.id)` nicht. Der gefilterte Zähler sieht nur bestätigte Buchungen: zwei für Krüger, keine für Özdemir. `sum(b.preis)` hat kein `FILTER`. Für Krüger überspringt es das `NULL` der Stornierung und kommt auf 75.00, für Özdemir zählt die stornierte Buchung mit 35.00 mit – ein typischer Fehler in Umsatzspalten. Für Hoffmann gibt es keinen Wert, also ist die Summe `NULL`, nicht `0`.
+    resources:
+      - title: PostgreSQL · Aggregate Expressions (FILTER)
+        url: https://www.postgresql.org/docs/current/sql-expressions.html#SYNTAX-AGGREGATES
+      - title: PostgreSQL · Aggregate Functions
+        url: https://www.postgresql.org/docs/current/functions-aggregate.html
+
+  - id: zeitraum-vorhersagen
+    type: output
+    title: Welche Buchungen liegen im März?
+    prompt: |
+      Was gibt das Skript aus? Die Sitzung beginnt mit `TimeZone = 'Europe/Berlin'`. Ausgabe wie `psql -At`: eine Zeile je Ergebniszeile; Arrays gibt PostgreSQL wie `{1,2}` aus.
+    lang: postgres
+    code: |
+      CREATE TABLE buchungen (id int PRIMARY KEY, beginn timestamptz NOT NULL);
+      INSERT INTO buchungen VALUES
+        (1, '2026-03-31 00:00'),
+        (2, '2026-03-31 17:45'),
+        (3, '2026-04-01 00:00'),
+        (4, '2026-03-01 00:00');
+
+      SELECT array_agg(id ORDER BY id) FROM buchungen
+      WHERE beginn BETWEEN '2026-03-01' AND '2026-03-31';
+
+      SELECT array_agg(id ORDER BY id) FROM buchungen
+      WHERE beginn >= '2026-03-01' AND beginn < '2026-04-01';
+
+      SELECT array_agg(id ORDER BY id) FROM buchungen
+      WHERE beginn::date = '2026-03-31';
+
+      SET TIME ZONE 'UTC';
+
+      SELECT array_agg(id ORDER BY id) FROM buchungen
+      WHERE beginn::date = '2026-03-31';
+    expected: |
+      {1,4}
+      {1,2,4}
+      {1,2}
+      {2,3}
+    hints:
+      - "`'2026-03-31'` als Zeitpunkt ist Mitternacht am Anfang des 31. März. Welche Buchungen liegen höchstens dort?"
+      - Ende März gilt in Berlin Sommerzeit (+02). Welcher Tag ist `2026-04-01 00:00+02` in UTC?
+    explanation: |
+      `BETWEEN` schließt beide Grenzen ein, aber `'2026-03-31'` bedeutet 31. März, 0:00 Uhr. Buchung 1 liegt genau darauf, Buchung 2 um 17:45 Uhr dahinter – der halbe letzte Tag fehlt. Das halboffene Intervall findet alle drei März-Buchungen. `beginn::date` wandelt in der Zeitzone der Sitzung um: In Berlin liegen Buchung 1 und 2 am 31. März. Nach `SET TIME ZONE 'UTC'` ist Buchung 1 (0:00 Uhr in Berlin, Sommerzeit) der 30. März um 22:00 Uhr UTC, und Buchung 3 (1. April, 0:00 Uhr in Berlin) der 31. März um 22:00 Uhr UTC. Dieselbe Abfrage liefert andere Buchungen, nur weil der Server anders eingestellt ist.
+    resources:
+      - title: PostgreSQL Wiki · Don't use BETWEEN (especially with timestamps)
+        url: https://wiki.postgresql.org/wiki/Don%27t_Do_This#Don.27t_use_BETWEEN_.28especially_with_timestamps.29
+      - title: PostgreSQL · Time Zones
+        url: https://www.postgresql.org/docs/current/datatype-datetime.html#DATATYPE-TIMEZONES
+
+  - id: distinct-on-vorhersagen
+    type: output
+    title: Wer war zuletzt wo?
+    prompt: |
+      Was gibt das Skript aus? Ausgabe wie `psql -At`: eine Zeile je Ergebniszeile, Werte durch `|` getrennt. Die Ergebnisse der drei Abfragen stehen direkt untereinander.
+    lang: postgres
+    code: |
+      CREATE TABLE checkins (
+        id          int PRIMARY KEY,
+        mitglied_id int NOT NULL,
+        standort    text NOT NULL,
+        zeitpunkt   timestamptz NOT NULL
+      );
+      INSERT INTO checkins VALUES
+        (1, 1, 'Plagwitz', '2026-03-02 08:55'),
+        (2, 2, 'Zentrum',  '2026-03-02 09:10'),
+        (3, 1, 'Zentrum',  '2026-03-03 08:40'),
+        (4, 2, 'Plagwitz', '2026-03-03 08:40'),
+        (5, 2, 'Zentrum',  '2026-03-03 08:40');
+
+      SELECT DISTINCT mitglied_id FROM checkins WHERE standort = 'Zentrum' ORDER BY mitglied_id;
+
+      SELECT DISTINCT ON (mitglied_id) mitglied_id, standort, id
+      FROM checkins
+      ORDER BY mitglied_id, zeitpunkt DESC, id DESC;
+
+      SELECT DISTINCT ON (standort) standort, mitglied_id
+      FROM checkins
+      ORDER BY standort, zeitpunkt, id;
+    expected: |
+      1
+      2
+      1|Zentrum|3
+      2|Zentrum|5
+      Plagwitz|1
+      Zentrum|2
+    hints:
+      - "`DISTINCT ON (x)` behält je Wert von `x` die erste Zeile in der Reihenfolge des `ORDER BY`."
+      - Mitglied 2 hat zwei Check-ins um 08:40. Welcher kommt bei `id DESC` zuerst?
+    explanation: |
+      Die erste Abfrage liefert jedes Mitglied, das im Zentrum war, einmal: 1 und 2. In der zweiten sortiert PostgreSQL je Mitglied den neuesten Check-in nach vorn. Mitglied 2 hat zwei Check-ins zur selben Zeit; der Tiebreaker `id DESC` entscheidet für Check-in 5 im Zentrum. Ohne ihn wäre offen, ob Plagwitz oder Zentrum erscheint. Die dritte Abfrage behält je Standort eine Zeile und sortiert aufsteigend nach Zeit, sie liefert also den **ersten** Check-in je Standort: Plagwitz um 08:55 am 2. März von Mitglied 1, Zentrum um 09:10 von Mitglied 2.
+    resources:
+      - title: PostgreSQL · DISTINCT Clause
+        url: https://www.postgresql.org/docs/current/sql-select.html#SQL-DISTINCT
+
+  - id: raumuebersicht
+    type: gap
+    title: Die Raumübersicht
+    prompt: |
+      Die Raumübersicht im Admin-Bereich zeigt **alle** Räume, auch Räume ohne Buchung. Je Raum: die Anzahl aller Buchungen (`0` für Räume ohne Buchung), die Anzahl der Stornierungen und die Namen der Mitglieder mit Buchung, jeder Name einmal, alphabetisch und durch Komma getrennt. Ergänze die Lücken.
+    lang: postgres
+    code: |
+      SELECT r.name AS raum,
+             ⟦count(b.id)⟧ AS buchungen,
+             count(b.id) ⟦FILTER (WHERE b.status = 'storniert')⟧ AS stornos,
+             ⟦string_agg⟧(DISTINCT m.name, ', ' ⟦ORDER BY m.name⟧) AS mitglieder
+      FROM raeume AS r
+      ⟦LEFT JOIN⟧ buchungen AS b ON b.raum_id = r.id
+      LEFT JOIN mitglieder AS m ON m.id = b.mitglied_id
+      GROUP BY r.id
+      ORDER BY r.name;
+    gaps:
+      - label: Anzahl der Buchungen
+        hint: Ein Aggregat, das für Räume ohne Buchung `0` liefert und nicht `1`.
+        accept: ["count(b.raum_id)", "count(b.mitglied_id)", "count(b.beginn)", "count(b.status)", "count(DISTINCT b.id)", "count(b.*)", "count(b)", "count(m.id)"]
+      - label: Nur Stornierungen
+        hint: Eine Klausel direkt hinter dem Aggregat, die nur bestimmte Zeilen hineinlässt.
+        accept: ["FILTER (WHERE 'storniert' = b.status)", "FILTER (WHERE status = 'storniert')"]
+      - label: Text zusammenfassen
+        hint: Ein Aggregat, das Texte mit einem Trennzeichen verbindet.
+      - label: Reihenfolge im Aggregat
+        hint: Ohne diese Angabe ist die Reihenfolge der Namen nicht festgelegt.
+        accept: ["ORDER BY m.name ASC"]
+      - label: Join-Art
+        hint: Räume ohne Partner in `buchungen` müssen erhalten bleiben.
+        accept: ["LEFT OUTER JOIN"]
+    explanation: |
+      Der `LEFT JOIN` behält Räume ohne Buchung, für sie sind alle Spalten von `b` und `m` `NULL`. `count(b.id)` – oder jede andere `NOT NULL`-Spalte von `buchungen` – zählt deshalb `0`, `count(*)` würde `1` melden. `FILTER (WHERE b.status = 'storniert')` lässt nur Stornierungen in den zweiten Zähler, ohne die anderen Spalten zu beeinflussen. `string_agg(DISTINCT m.name, ', ' ORDER BY m.name)` verbindet jeden Namen einmal, alphabetisch; bei `DISTINCT` im Aggregat muss das `ORDER BY` dieselben Ausdrücke verwenden. Für Räume ohne Buchung liefert `string_agg` `NULL`.
+    resources:
+      - title: PostgreSQL · Aggregate Expressions
+        url: https://www.postgresql.org/docs/current/sql-expressions.html#SYNTAX-AGGREGATES
+
+  - id: meine-buchungen
+    type: sql
+    lang: postgres
+    title: Meine Buchungen
+    prompt: |
+      Die Seite „Meine Buchungen“ für Jana Krüger (Mitglied `1`): alle **bestätigten** Buchungen mit `beginn` ab dem 1. März 2026, mit Raum und Standort.
+
+      Spalten: `id`, `beginn`, `raum` (Name des Raums), `standort` (Name des Standorts), `preis`. Sortierung: neueste zuerst (`beginn` absteigend), bei gleichem Beginn die höhere `id` zuerst.
+    schema: |
+      CREATE TABLE standorte (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name text NOT NULL UNIQUE);
+      CREATE TABLE raeume (
+        id               int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        standort_id      int NOT NULL REFERENCES standorte (id),
+        name             text NOT NULL,
+        preis_pro_stunde numeric(8,2) NOT NULL
+      );
+      CREATE TABLE mitglieder (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, email text NOT NULL UNIQUE, name text NOT NULL);
+      CREATE TABLE buchungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        raum_id     int NOT NULL REFERENCES raeume (id),
+        mitglied_id int NOT NULL REFERENCES mitglieder (id),
+        beginn      timestamptz NOT NULL,
+        ende        timestamptz NOT NULL,
+        status      text NOT NULL DEFAULT 'bestaetigt',
+        preis       numeric(8,2)
+      );
+      INSERT INTO standorte (name) VALUES ('Plagwitz'), ('Südvorstadt'), ('Zentrum');
+      INSERT INTO raeume (standort_id, name, preis_pro_stunde) VALUES
+        (1, 'Atelier', 25.00), (1, 'Box 1', 4.00), (2, 'Loft', 35.00),
+        (3, 'Fensterplatz 3', 6.50), (3, 'Box 2', 4.00);
+      INSERT INTO mitglieder (email, name) VALUES
+        ('jana.krueger@example.org', 'Jana Krüger'),
+        ('mehmet.oezdemir@example.org', 'Mehmet Özdemir'),
+        ('lea.hoffmann@example.org', 'Lea Hoffmann');
+      INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, status, preis) VALUES
+        (1, 1, '2026-02-26 09:00', '2026-02-26 11:00', 'bestaetigt', 50.00),
+        (3, 1, '2026-03-03 14:00', '2026-03-03 16:00', 'bestaetigt', 70.00),
+        (2, 2, '2026-03-03 14:00', '2026-03-03 14:30', 'bestaetigt',  2.00),
+        (4, 1, '2026-03-09 08:00', '2026-03-09 17:00', 'storniert',   NULL),
+        (1, 1, '2026-03-12 10:00', '2026-03-12 12:00', 'bestaetigt', 50.00),
+        (5, 1, '2026-03-12 10:00', '2026-03-12 10:30', 'bestaetigt',  2.00),
+        (4, 3, '2026-03-16 08:00', '2026-03-16 17:00', 'bestaetigt', 58.50),
+        (3, 1, '2026-03-30 09:00', '2026-03-30 11:00', 'bestaetigt', 70.00);
+    starter: |
+      SELECT b.id, b.beginn, b.raum_id, b.preis
+      FROM buchungen AS b
+      WHERE b.mitglied_id = 1;
+    solution: |
+      SELECT b.id, b.beginn, r.name AS raum, s.name AS standort, b.preis
+      FROM buchungen AS b
+      JOIN raeume    AS r ON r.id = b.raum_id
+      JOIN standorte AS s ON s.id = r.standort_id
+      WHERE b.mitglied_id = 1
+        AND b.status = 'bestaetigt'
+        AND b.beginn >= '2026-03-01'
+      ORDER BY b.beginn DESC, b.id DESC;
+    ordered: true
+    hints:
+      - "Zwei Joins entlang der Fremdschlüssel: `buchungen.raum_id` → `raeume.id` und `raeume.standort_id` → `standorte.id`."
+      - Beide Tabellen haben eine Spalte `name`. Gib ihnen mit `AS raum` und `AS standort` eindeutige Namen.
+      - "`WHERE b.mitglied_id = 1 AND b.status = 'bestaetigt' AND b.beginn >= '2026-03-01' ORDER BY b.beginn DESC, b.id DESC`."
+    explanation: |
+      Die Joins gehen von der Buchung zum Raum und vom Raum zum Standort, jeweils von „viele“ nach „eins“, deshalb bleibt es bei einer Zeile je Buchung. Die Februar-Buchung und die Stornierung fallen durch das `WHERE` heraus, die Buchung von Mehmet Özdemir zur selben Zeit gehört einem anderen Mitglied. Am 12. März hat Jana Krüger zwei Buchungen um 10 Uhr, Atelier und Box 2. Ohne `b.id DESC` wäre ihre Reihenfolge nicht festgelegt, und eine paginierte Liste könnte an dieser Stelle springen. Ergebnis: Buchungen 8, 6, 5 und 2.
+    resources:
+      - title: PostgreSQL · Joined Tables
+        url: https://www.postgresql.org/docs/current/queries-table-expressions.html#QUERIES-JOIN
+      - title: PostgreSQL · Sorting Rows
+        url: https://www.postgresql.org/docs/current/queries-order.html
+
+  - id: mitgliederuebersicht
+    type: sql
+    lang: postgres
+    title: Die Mitgliederübersicht
+    prompt: |
+      Die Mitgliederübersicht im Admin-Bereich zeigt **alle** Mitglieder, auch solche ohne Buchung.
+
+      Spalten:
+
+      - `name`
+      - `bestaetigt`: Anzahl bestätigter Buchungen
+      - `storniert`: Anzahl stornierter Buchungen
+      - `umsatz`: Summe von `preis` über die **bestätigten** Buchungen, `0` wenn es keine gibt
+      - `letzte_buchung`: der späteste `beginn` einer bestätigten Buchung, leer (`NULL`), wenn es keine gibt
+
+      Sortierung: `umsatz` absteigend, bei gleichem Umsatz `name` aufsteigend.
+    schema: |
+      CREATE TABLE mitglieder (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, email text NOT NULL UNIQUE, name text NOT NULL);
+      CREATE TABLE buchungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        raum_id     int NOT NULL,
+        mitglied_id int NOT NULL REFERENCES mitglieder (id),
+        beginn      timestamptz NOT NULL,
+        ende        timestamptz NOT NULL,
+        status      text NOT NULL DEFAULT 'bestaetigt',
+        preis       numeric(8,2)
+      );
+      INSERT INTO mitglieder (email, name) VALUES
+        ('jana.krueger@example.org', 'Jana Krüger'),
+        ('mehmet.oezdemir@example.org', 'Mehmet Özdemir'),
+        ('lea.hoffmann@example.org', 'Lea Hoffmann'),
+        ('tobias.schulz@example.org', 'Tobias Schulz'),
+        ('anna.wagner@example.org', 'Anna Wagner');
+      INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, status, preis) VALUES
+        (1, 1, '2026-03-02 09:00', '2026-03-02 11:00', 'bestaetigt', 50.00),
+        (3, 1, '2026-03-05 14:00', '2026-03-05 16:00', 'storniert',  70.00),
+        (1, 1, '2026-03-30 10:00', '2026-03-30 12:00', 'bestaetigt', 50.00),
+        (2, 2, '2026-03-02 09:00', '2026-03-02 09:30', 'bestaetigt',  2.00),
+        (4, 3, '2026-03-09 08:00', '2026-03-09 17:00', 'bestaetigt', 58.50),
+        (3, 3, '2026-03-18 13:00', '2026-03-18 15:00', 'bestaetigt', 70.00),
+        (4, 5, '2026-03-11 08:00', '2026-03-11 17:00', 'storniert',  58.50);
+    starter: |
+      SELECT m.name, count(*) AS bestaetigt, sum(b.preis) AS umsatz
+      FROM mitglieder AS m
+      JOIN buchungen AS b ON b.mitglied_id = m.id
+      WHERE b.status = 'bestaetigt'
+      GROUP BY m.id;
+    solution: |
+      SELECT m.name,
+             count(b.id) FILTER (WHERE b.status = 'bestaetigt') AS bestaetigt,
+             count(b.id) FILTER (WHERE b.status = 'storniert')  AS storniert,
+             coalesce(sum(b.preis) FILTER (WHERE b.status = 'bestaetigt'), 0) AS umsatz,
+             max(b.beginn) FILTER (WHERE b.status = 'bestaetigt') AS letzte_buchung
+      FROM mitglieder AS m
+      LEFT JOIN buchungen AS b ON b.mitglied_id = m.id
+      GROUP BY m.id
+      ORDER BY umsatz DESC, m.name;
+    ordered: true
+    hints:
+      - Die Startabfrage verliert Tobias Schulz und Anna Wagner. Welcher Join behält Mitglieder ohne passende Buchung?
+      - Ein `WHERE b.status = 'bestaetigt'` würde den Stornozähler leeren. Jeder Zähler bekommt stattdessen sein eigenes `FILTER (WHERE …)`.
+      - "`coalesce(sum(b.preis) FILTER (WHERE b.status = 'bestaetigt'), 0) AS umsatz` und `max(b.beginn) FILTER (WHERE b.status = 'bestaetigt') AS letzte_buchung`."
+    explanation: |
+      Der `LEFT JOIN` behält alle fünf Mitglieder, und `FILTER` verteilt die Buchungen auf die Zähler, ohne Zeilen zu entfernen. Ein `WHERE` auf den Status würde den `LEFT JOIN` zum `INNER JOIN` machen und Tobias Schulz verlieren. Die Fallen: Jana Krügers Stornierung hat einen Preis von 70.00, der nicht in den Umsatz gehört, und Anna Wagner hat nur eine Stornierung mit Preis. `coalesce` macht aus der leeren Summe `0`, `max` bleibt `NULL`. Tobias Schulz und Anna Wagner haben beide Umsatz 0; der zweite Sortierschlüssel `name` stellt Anna Wagner vor Tobias Schulz. Reihenfolge: Lea Hoffmann (128.50), Jana Krüger (100.00), Mehmet Özdemir (2.00), Anna Wagner, Tobias Schulz.
+    resources:
+      - title: PostgreSQL · Aggregate Expressions (FILTER)
+        url: https://www.postgresql.org/docs/current/sql-expressions.html#SYNTAX-AGGREGATES
+      - title: PostgreSQL · COALESCE
+        url: https://www.postgresql.org/docs/current/functions-conditional.html#FUNCTIONS-COALESCE-NVL-IFNULL
+
+  - id: naechste-seite
+    type: sql
+    lang: postgres
+    title: Die nächste Seite
+    prompt: |
+      Die Liste aller Buchungen ist nach `beginn` und `id` sortiert und zeigt vier Buchungen je Seite. Eine Nutzerin sieht Seite 1. Die letzte Zeile darauf hat `beginn = '2026-03-04 10:00+01'` und `id = 7`. Seit sie die Seite geladen hat, ist Buchung 12 dazugekommen. Lade die **nächste Seite** per Keyset, ohne `OFFSET`.
+
+      Spalten: `id`, `raum`, `beginn`. Sortierung: `beginn` aufsteigend, dann `id` aufsteigend. Höchstens vier Zeilen.
+    schema: |
+      CREATE TABLE buchungen (
+        id     bigint PRIMARY KEY,
+        raum   text NOT NULL,
+        beginn timestamptz NOT NULL
+      );
+      INSERT INTO buchungen VALUES
+        ( 1, 'Atelier',        '2026-03-02 09:00'),
+        ( 2, 'Box 1',          '2026-03-10 09:00'),
+        ( 3, 'Loft',           '2026-03-03 14:00'),
+        ( 5, 'Box 1',          '2026-03-04 10:00'),
+        ( 7, 'Atelier',        '2026-03-04 10:00'),
+        ( 9, 'Loft',           '2026-03-04 10:00'),
+        (11, 'Fensterplatz 3', '2026-03-04 10:00'),
+        (12, 'Box 2',          '2026-03-03 16:00'),
+        ( 4, 'Atelier',        '2026-03-05 08:30'),
+        ( 8, 'Box 1',          '2026-03-05 09:00'),
+        (10, 'Loft',           '2026-03-06 16:00'),
+        ( 6, 'Box 2',          '2026-03-09 11:00');
+    starter: |
+      SELECT id, raum, beginn
+      FROM buchungen
+      WHERE beginn > '2026-03-04 10:00+01'
+      ORDER BY beginn, id
+      LIMIT 4;
+    solution: |
+      SELECT id, raum, beginn
+      FROM buchungen
+      WHERE (beginn, id) > ('2026-03-04 10:00+01', 7)
+      ORDER BY beginn, id
+      LIMIT 4;
+    ordered: true
+    hints:
+      - Drei weitere Buchungen beginnen um 10:00 Uhr wie die letzte Zeile. Welche davon stehen in der Sortierung **hinter** ihr?
+      - "`beginn > …` allein verliert die Buchungen mit gleichem Beginn und größerer `id`. `id > 7` allein verliert spätere Buchungen mit kleinerer `id`."
+      - "`WHERE (beginn, id) > ('2026-03-04 10:00+01', 7) ORDER BY beginn, id LIMIT 4`."
+    explanation: |
+      Der Zeilenvergleich `(beginn, id) > ('2026-03-04 10:00+01', 7)` ist wahr, wenn `beginn` später ist oder bei gleichem `beginn` die `id` größer. Er findet deshalb zuerst die Buchungen 9 und 11 um 10:00 Uhr, dann 4 und 8 am 5. März. `LIMIT 4 OFFSET 4` würde Buchung 7 ein zweites Mal zeigen, weil die neue Buchung 12 davor einsortiert wurde. Die Startabfrage mit `beginn > …` überspringt 9 und 11 – zwei Buchungen, die die Nutzerin nie zu sehen bekommt. Ein Filter `id > 7` allein würde Buchung 12 vom 3. März fälschlich aufnehmen und die Buchungen 4 und 6 verlieren, deren `id` kleiner ist, obwohl sie später beginnen. Eine `OR`-Variante (`beginn > … OR (beginn = … AND id > 7)`) liefert dasselbe Ergebnis, der Zeilenvergleich ist kürzer und lässt sich direkt mit einem Index auf `(beginn, id)` beantworten.
+    resources:
+      - title: PostgreSQL · Row Constructor Comparison
+        url: https://www.postgresql.org/docs/current/functions-comparisons.html#ROW-WISE-COMPARISON
+      - title: PostgreSQL · LIMIT and OFFSET
+        url: https://www.postgresql.org/docs/current/queries-limit.html
+
+  - id: letzter-checkin
+    type: sql
+    lang: postgres
+    title: Anwesenheit am Empfang
+    prompt: |
+      Der Empfang zeigt für jedes Mitglied den **letzten Check-in**: Name, Standort und Zeitpunkt. Haben zwei Check-ins eines Mitglieds denselben Zeitpunkt, gilt der mit der höheren `id`. Mitglieder ohne Check-in erscheinen nicht.
+
+      Spalten: `name` (des Mitglieds), `standort` (Name des Standorts), `zeitpunkt`. Die Reihenfolge der Zeilen spielt keine Rolle.
+    schema: |
+      CREATE TABLE standorte (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name text NOT NULL UNIQUE);
+      CREATE TABLE mitglieder (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, email text NOT NULL UNIQUE, name text NOT NULL);
+      CREATE TABLE checkins (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        mitglied_id int NOT NULL REFERENCES mitglieder (id),
+        standort_id int NOT NULL REFERENCES standorte (id),
+        zeitpunkt   timestamptz NOT NULL
+      );
+      INSERT INTO standorte (name) VALUES ('Plagwitz'), ('Südvorstadt'), ('Zentrum');
+      INSERT INTO mitglieder (email, name) VALUES
+        ('jana.krueger@example.org', 'Jana Krüger'),
+        ('mehmet.oezdemir@example.org', 'Mehmet Özdemir'),
+        ('lea.hoffmann@example.org', 'Lea Hoffmann'),
+        ('tobias.schulz@example.org', 'Tobias Schulz');
+      INSERT INTO checkins (mitglied_id, standort_id, zeitpunkt) VALUES
+        (1, 1, '2026-03-02 08:55'),
+        (2, 3, '2026-03-02 09:10'),
+        (1, 2, '2026-03-04 13:20'),
+        (3, 3, '2026-03-04 08:30'),
+        (2, 3, '2026-03-05 18:40'),
+        (3, 1, '2026-03-04 08:30'),
+        (1, 1, '2026-03-03 07:45'),
+        (2, 2, '2026-03-05 07:15');
+    starter: |
+      SELECT DISTINCT m.name, s.name AS standort, c.zeitpunkt
+      FROM checkins AS c
+      JOIN mitglieder AS m ON m.id = c.mitglied_id
+      JOIN standorte  AS s ON s.id = c.standort_id;
+    solution: |
+      SELECT DISTINCT ON (c.mitglied_id) m.name, s.name AS standort, c.zeitpunkt
+      FROM checkins AS c
+      JOIN mitglieder AS m ON m.id = c.mitglied_id
+      JOIN standorte  AS s ON s.id = c.standort_id
+      ORDER BY c.mitglied_id, c.zeitpunkt DESC, c.id DESC;
+    hints:
+      - "`DISTINCT` vergleicht ganze Zeilen und bleibt bei mehreren Zeilen je Mitglied. Du brauchst eine Zeile **je Mitglied**."
+      - "`DISTINCT ON (c.mitglied_id)` behält die erste Zeile je Mitglied. Welche Sortierung bringt den neuesten Check-in nach vorn?"
+      - "`ORDER BY c.mitglied_id, c.zeitpunkt DESC, c.id DESC`."
+    explanation: |
+      `DISTINCT ON (c.mitglied_id)` behält je Mitglied die erste Zeile der Sortierung. Das `ORDER BY` beginnt deshalb mit `c.mitglied_id`; dahinter bringt `zeitpunkt DESC` den neuesten Check-in nach vorn und `id DESC` entscheidet Gleichstände. Lea Hoffmann hat zwei Check-ins am 4. März um 8:30 Uhr; der spätere Eintrag (Plagwitz) gewinnt. Bei Mehmet Özdemir zählt der Zeitpunkt, nicht die Reihenfolge des Einfügens: Der Check-in um 18:40 Uhr im Zentrum ist später als der um 7:15 Uhr in der Südvorstadt. Tobias Schulz ohne Check-in fällt durch den `JOIN` heraus. Mit `DISTINCT ON (m.name)` ginge es hier auch, aber nur, solange keine zwei Mitglieder gleich heißen – gruppiere nach dem Schlüssel.
+    resources:
+      - title: PostgreSQL · DISTINCT Clause
+        url: https://www.postgresql.org/docs/current/sql-select.html#SQL-DISTINCT
+
+  - id: tagesauslastung
+    type: sql
+    lang: postgres
+    title: Buchungen je Tag in Leipzig
+    prompt: |
+      Der Abrechnungsdienst läuft mit UTC; das Schema stellt die Sitzung deshalb mit `SET TIME ZONE 'UTC'` um, und die Vorschau zeigt Zeitpunkte in UTC (`+00`). Gesucht sind die **bestätigten** Buchungen mit `beginn` vom 27. bis einschließlich 31. März 2026, je **Kalendertag in Leipzig** (`Europe/Berlin`). Tage ohne Buchung erscheinen nicht.
+
+      Spalten: `tag` (Typ `date`), `buchungen` (Anzahl), `umsatz` (Summe von `preis`). Sortierung: `tag` aufsteigend.
+    schema: |
+      SET TIME ZONE 'UTC';
+      CREATE TABLE buchungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        raum_id     int NOT NULL,
+        mitglied_id int NOT NULL,
+        beginn      timestamptz NOT NULL,
+        ende        timestamptz NOT NULL,
+        status      text NOT NULL DEFAULT 'bestaetigt',
+        preis       numeric(8,2)
+      );
+      INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, status, preis) VALUES
+        (2, 4, '2026-03-26 23:45+01', '2026-03-27 00:15+01', 'bestaetigt',  2.00),
+        (1, 1, '2026-03-27 00:30+01', '2026-03-27 02:30+01', 'bestaetigt', 50.00),
+        (3, 2, '2026-03-27 14:00+01', '2026-03-27 16:00+01', 'bestaetigt', 70.00),
+        (4, 3, '2026-03-28 09:00+01', '2026-03-28 17:00+01', 'storniert',  52.00),
+        (2, 1, '2026-03-29 01:30+01', '2026-03-29 03:30+02', 'bestaetigt',  4.00),
+        (1, 2, '2026-03-29 10:00+02', '2026-03-29 12:00+02', 'bestaetigt', 50.00),
+        (3, 3, '2026-03-31 18:00+02', '2026-03-31 20:00+02', 'bestaetigt', 70.00),
+        (2, 4, '2026-03-31 23:30+02', '2026-04-01 00:30+02', 'bestaetigt',  4.00),
+        (1, 1, '2026-04-01 00:15+02', '2026-04-01 01:15+02', 'bestaetigt', 25.00);
+    starter: |
+      SELECT beginn::date AS tag, count(*) AS buchungen, sum(preis) AS umsatz
+      FROM buchungen
+      WHERE status = 'bestaetigt'
+        AND beginn BETWEEN '2026-03-27' AND '2026-03-31'
+      GROUP BY 1
+      ORDER BY 1;
+    solution: |
+      SELECT (beginn AT TIME ZONE 'Europe/Berlin')::date AS tag,
+             count(*)   AS buchungen,
+             sum(preis) AS umsatz
+      FROM buchungen
+      WHERE status = 'bestaetigt'
+        AND beginn >= timestamptz '2026-03-27 00:00 Europe/Berlin'
+        AND beginn <  timestamptz '2026-04-01 00:00 Europe/Berlin'
+      GROUP BY 1
+      ORDER BY 1;
+    ordered: true
+    hints:
+      - Die Startabfrage hat drei Fehler. Welche Zeitzone nutzen `beginn::date` und das Literal `'2026-03-27'` in dieser Sitzung, und was bedeutet `BETWEEN … '2026-03-31'`?
+      - Den Leipziger Tag bekommst du mit `(beginn AT TIME ZONE 'Europe/Berlin')::date`. Die Grenzen schreibst du als `timestamptz '2026-03-27 00:00 Europe/Berlin'`.
+      - Halboffen filtern, bis zum Anfang des 1. April – ausschließlich.
+    explanation: |
+      `beginn AT TIME ZONE 'Europe/Berlin'` macht aus dem gespeicherten Moment die Leipziger Wanduhrzeit, `::date` den Tag – unabhängig davon, wie die Sitzung eingestellt ist. Die Grenzen sind Zeitpunkte mit ausdrücklicher Zeitzone, und das halboffene Intervall endet am 1. April um 0:00 Uhr Leipziger Zeit. So zählt die Buchung um 0:30 Uhr am 27. März (in UTC noch der 26.) zum 27., die um 23:30 Uhr am 31. März (in UTC 21:30) zum 31., und die um 0:15 Uhr am 1. April (in UTC noch der 31. März) gar nicht. Die Buchung um 1:30 Uhr in der Nacht der Zeitumstellung gehört zum 29. März. Ergebnis: 27. März 2 Buchungen mit 120.00, 29. März 2 mit 54.00, 31. März 2 mit 74.00. Der 28. hat nur eine Stornierung und erscheint nicht.
+    resources:
+      - title: PostgreSQL · AT TIME ZONE
+        url: https://www.postgresql.org/docs/current/functions-datetime.html#FUNCTIONS-DATETIME-ZONECONVERT
+      - title: PostgreSQL · Time Zones
+        url: https://www.postgresql.org/docs/current/datatype-datetime.html#DATATYPE-TIMEZONES
+
+  - id: keyset-ueberspringt
+    type: bug
+    title: Buchungen verschwinden beim Blättern
+    prompt: |
+      Die App lädt die Buchungen eines Mitglieds seitenweise. `$2` und `$3` sind `beginn` und `id` der letzten Zeile der vorigen Seite. Ein Mitglied meldet: „Meine Buchung für den 20. März taucht in der Liste nicht auf. Auf Seite 1 stehen Termine bis zum 12. März, auf Seite 2 fehlt sie.“ Die Buchung für den 20. März hat die `id` 412, die letzte Zeile von Seite 1 die `id` 980 – das Mitglied hat den Termin früh angelegt. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: postgres
+    code: |
+      SELECT id, beginn, raum_id
+      FROM buchungen
+      WHERE mitglied_id = $1
+        AND beginn >= $2 AND id > $3
+      ORDER BY beginn, id
+      LIMIT 20;
+    lines: [4]
+    fix:
+      - line: 4
+        answers:
+          - "AND (beginn, id) > ($2, $3)"
+          - "AND (beginn > $2 OR (beginn = $2 AND id > $3))"
+          - "AND ((beginn, id) > ($2, $3))"
+          - "AND ROW(beginn, id) > ROW($2, $3)"
+          - "AND ($2, $3) < (beginn, id)"
+          - "AND (beginn > $2 OR beginn = $2 AND id > $3)"
+    hints:
+      - Für die Buchung vom 20. März ist `beginn >= $2` wahr. Wie steht es um `id > $3`?
+      - Die `id` soll nur entscheiden, wenn zwei Buchungen denselben Beginn haben.
+    explanation: |
+      Die Bedingung verlangt für jede Zeile eine größere `id` als die letzte Zeile der vorigen Seite. IDs spiegeln aber die Reihenfolge des Anlegens, nicht des Beginns: Die Buchung 412 beginnt später als Buchung 980, wurde aber früher angelegt und fällt deshalb heraus. Richtig ist der Zeilenvergleich `(beginn, id) > ($2, $3)`: Er vergleicht zuerst `beginn` und zieht `id` nur bei Gleichstand heran, genau wie das `ORDER BY beginn, id`. Die ausgeschriebene Form `beginn > $2 OR (beginn = $2 AND id > $3)` ist gleichwertig.
+    resources:
+      - title: PostgreSQL · Row Constructor Comparison
+        url: https://www.postgresql.org/docs/current/functions-comparisons.html#ROW-WISE-COMPARISON
+
+  - id: monatsumsatz-between
+    type: bug
+    title: Der März ist zu billig
+    prompt: |
+      Der Monatsbericht zeigt für März 2026 weniger Umsatz als die Buchhaltung. Beim Abgleich fällt auf: Die Buchungen vom 31. März fehlen im Bericht, und eine Buchung, die am 1. März um 0:30 Uhr Leipziger Zeit begann, ebenfalls. Der Bericht läuft im Abrechnungsdienst mit UTC. Finde die fehlerhaften Zeilen und korrigiere sie, ohne Zeilen hinzuzufügen oder zu entfernen. Das Ergebnis soll die Leipziger Monatsgrenzen nutzen.
+    lang: postgres
+    code: |
+      SELECT s.name AS standort, sum(b.preis) AS umsatz
+      FROM buchungen AS b
+      JOIN raeume    AS r ON r.id = b.raum_id
+      JOIN standorte AS s ON s.id = r.standort_id
+      WHERE b.status = 'bestaetigt'
+        AND b.beginn BETWEEN '2026-03-01' AND '2026-03-31'
+      GROUP BY s.name
+      ORDER BY s.name;
+    lines: [6]
+    fix:
+      - line: 6
+        answers:
+          - "AND b.beginn >= timestamptz '2026-03-01 00:00 Europe/Berlin' AND b.beginn < timestamptz '2026-04-01 00:00 Europe/Berlin'"
+          - "AND b.beginn >= '2026-03-01 00:00 Europe/Berlin' AND b.beginn < '2026-04-01 00:00 Europe/Berlin'"
+          - "AND b.beginn >= '2026-03-01 Europe/Berlin' AND b.beginn < '2026-04-01 Europe/Berlin'"
+          - "AND b.beginn >= timestamptz '2026-03-01 Europe/Berlin' AND b.beginn < timestamptz '2026-04-01 Europe/Berlin'"
+          - "AND b.beginn >= '2026-03-01 00:00+01' AND b.beginn < '2026-04-01 00:00+02'"
+          - "AND b.beginn >= timestamptz '2026-03-01 00:00+01' AND b.beginn < timestamptz '2026-04-01 00:00+02'"
+          - "AND (b.beginn AT TIME ZONE 'Europe/Berlin') >= '2026-03-01' AND (b.beginn AT TIME ZONE 'Europe/Berlin') < '2026-04-01'"
+          - "AND (b.beginn AT TIME ZONE 'Europe/Berlin')::date BETWEEN '2026-03-01' AND '2026-03-31'"
+          - "AND date_trunc('month', b.beginn, 'Europe/Berlin') = '2026-03-01 00:00 Europe/Berlin'"
+          - "AND date_trunc('month', b.beginn, 'Europe/Berlin') = timestamptz '2026-03-01 00:00 Europe/Berlin'"
+    hints:
+      - "`BETWEEN` schließt beide Grenzen ein. Welcher Zeitpunkt ist `'2026-03-31'`?"
+      - Das Literal ohne Zeitzone liest PostgreSQL in der Zeitzone der Sitzung, hier UTC. Wann beginnt der 1. März in Leipzig in UTC?
+    explanation: |
+      Zwei Fehler stecken in einer Zeile. `BETWEEN '2026-03-01' AND '2026-03-31'` endet am 31. März um 0:00 Uhr – in dieser Sitzung UTC, also 2:00 Uhr in Leipzig –, fast der ganze letzte Tag fehlt. Und beide Literale haben keine Zeitzone, deshalb liest der Abrechnungsdienst sie als UTC: Der März beginnt dann am 1. März um 1:00 Uhr Leipziger Zeit, und die Buchung um 0:30 Uhr rutscht in den Februar. Ein halboffenes Intervall mit ausdrücklicher Zeitzone behebt beides: `>= '2026-03-01 00:00 Europe/Berlin'` und `< '2026-04-01 00:00 Europe/Berlin'`. Die Varianten mit `AT TIME ZONE` oder `date_trunc` auf der Spalte sind ebenfalls richtig, können aber keinen gewöhnlichen Index auf `beginn` nutzen, weil die Spalte erst umgerechnet wird.
+    resources:
+      - title: PostgreSQL Wiki · Don't use BETWEEN (especially with timestamps)
+        url: https://wiki.postgresql.org/wiki/Don%27t_Do_This#Don.27t_use_BETWEEN_.28especially_with_timestamps.29
+      - title: PostgreSQL · Date/Time Input
+        url: https://www.postgresql.org/docs/current/datatype-datetime.html#DATATYPE-DATETIME-INPUT-TIME-STAMPS
+
+  - id: keyset-repository-erklaeren
+    type: explain
+    title: Ein Repository mit Cursor
+    prompt: |
+      Diese Funktion liefert die Buchungen eines Mitglieds für die App, Seite für Seite. Erkläre einer Kollegin, wie die Paginierung funktioniert: was der Cursor ist, warum die Abfrage nach `beginn` **und** `id` sortiert, wozu `groesse + 1` dient und welchen Index die Tabelle dafür braucht. Vergleiche mit `OFFSET`.
+    lang: python
+    code: |
+      def buchungen_seite(session, mitglied_id: int, nach: tuple[datetime, int] | None, groesse: int = 20):
+          abfrage = (
+              select(Buchung.id, Buchung.beginn, Raum.name.label("raum"))
+              .join(Raum, Raum.id == Buchung.raum_id)
+              .where(Buchung.mitglied_id == mitglied_id)
+              .order_by(Buchung.beginn, Buchung.id)
+              .limit(groesse + 1)
+          )
+          if nach is not None:
+              abfrage = abfrage.where(tuple_(Buchung.beginn, Buchung.id) > nach)
+          zeilen = session.execute(abfrage).all()
+          weitere = len(zeilen) > groesse
+          zeilen = zeilen[:groesse]
+          cursor = (zeilen[-1].beginn, zeilen[-1].id) if weitere else None
+          return zeilen, cursor
+    points:
+      - "Der Cursor ist das Paar `(beginn, id)` der letzten Zeile einer Seite; die nächste Seite fragt mit dem Zeilenvergleich `(beginn, id) > (…)` nach den Zeilen dahinter."
+      - "`id` ist der eindeutige Tiebreaker: Ohne ihn wäre die Reihenfolge bei gleichem `beginn` offen, und der Cursor könnte Buchungen überspringen oder doppelt liefern."
+      - "`groesse + 1` lädt eine Zeile mehr, um ohne zweite Abfrage (`count`) zu erkennen, ob es eine weitere Seite gibt; die zusätzliche Zeile wird nicht ausgeliefert."
+      - "Ein Index auf `(mitglied_id, beginn, id)` lässt PostgreSQL direkt an die Cursorposition springen, sodass jede Seite gleich viel kostet – anders als `OFFSET`, das alle übersprungenen Zeilen berechnet und bei neuen Buchungen Zeilen verschiebt."
+    explanation: |
+      Die Funktion paginiert per Keyset. Für die erste Seite ist `nach` `None`, und sie lädt die frühesten Buchungen. Danach gibt sie als Cursor `beginn` und `id` der letzten gezeigten Zeile zurück; die App reicht ihn beim nächsten Aufruf herein, und `tuple_(Buchung.beginn, Buchung.id) > nach` wird in SQL zum Zeilenvergleich `(buchungen.beginn, buchungen.id) > (…)`. Weil `nach` ein gewöhnliches Tupel ist, nimmt SQLAlchemy die Typen der Spalten, also `timestamptz` für `beginn`. Die Sortierung nach `beginn, id` ist eindeutig, deshalb gibt es genau eine Stelle, an der die nächste Seite beginnt. `groesse + 1` ist ein billiger Trick: Kommen 21 Zeilen zurück, gibt es eine weitere Seite, und die App zeigt „Mehr laden“, ohne alle Buchungen zu zählen. Mit einem Index auf `(mitglied_id, beginn, id)` liest PostgreSQL je Seite nur 21 Indexeinträge. `OFFSET` müsste für Seite 50 die 980 Zeilen davor berechnen und verwerfen, und eine neue Buchung zwischen zwei Aufrufen würde eine Zeile doppelt zeigen. Der Preis: Nutzer können nicht auf eine Seitennummer springen.
+    resources:
+      - title: SQLAlchemy · tuple_
+        url: https://docs.sqlalchemy.org/en/21/core/sqlelement.html#sqlalchemy.sql.expression.tuple_
+      - title: PostgreSQL · Row Constructor Comparison
+        url: https://www.postgresql.org/docs/current/functions-comparisons.html#ROW-WISE-COMPARISON
+
+  - id: standort-monatsbericht
+    type: sql
+    lang: postgres
+    title: Monatsübersicht je Standort
+    prompt: |
+      Die Geschäftsführung bekommt jeden Monat eine Übersicht je Standort. Erstelle sie für **März 2026** nach Leipziger Zeit. Die Sitzung läuft wie im Abrechnungsdienst mit UTC (`SET TIME ZONE 'UTC'` im Schema). Es zählen nur **bestätigte** Buchungen, deren `beginn` im März liegt. **Alle** Standorte erscheinen, auch ohne Buchung im März.
+
+      Spalten:
+
+      - `standort`: Name des Standorts
+      - `buchungen`: Anzahl der Buchungen
+      - `umsatz`: Summe von `preis`, `0` bei keiner Buchung
+      - `mitglieder`: Anzahl **verschiedener** Mitglieder mit Buchung
+
+      Sortierung: `umsatz` absteigend, bei gleichem Umsatz `standort` aufsteigend.
+    schema: |
+      SET TIME ZONE 'UTC';
+      CREATE TABLE standorte (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name text NOT NULL UNIQUE);
+      CREATE TABLE raeume (
+        id               int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        standort_id      int NOT NULL REFERENCES standorte (id),
+        name             text NOT NULL,
+        preis_pro_stunde numeric(8,2) NOT NULL
+      );
+      CREATE TABLE buchungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        raum_id     int NOT NULL REFERENCES raeume (id),
+        mitglied_id int NOT NULL,
+        beginn      timestamptz NOT NULL,
+        ende        timestamptz NOT NULL,
+        status      text NOT NULL DEFAULT 'bestaetigt',
+        preis       numeric(8,2)
+      );
+      INSERT INTO standorte (name) VALUES ('Plagwitz'), ('Südvorstadt'), ('Zentrum');
+      INSERT INTO raeume (standort_id, name, preis_pro_stunde) VALUES
+        (1, 'Atelier', 25.00), (1, 'Box 1', 4.00), (2, 'Loft', 35.00), (2, 'Box 2', 4.00), (3, 'Fensterplatz 3', 6.50);
+      INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, status, preis) VALUES
+        (1, 1, '2026-02-28 18:00+01', '2026-02-28 20:00+01', 'bestaetigt', 50.00),
+        (1, 2, '2026-03-01 00:30+01', '2026-03-01 02:30+01', 'bestaetigt', 50.00),
+        (2, 1, '2026-03-02 09:00+01', '2026-03-02 09:30+01', 'bestaetigt',  2.00),
+        (1, 1, '2026-03-12 10:00+01', '2026-03-12 12:00+01', 'bestaetigt', 50.00),
+        (3, 3, '2026-03-05 14:00+01', '2026-03-05 16:00+01', 'storniert',  70.00),
+        (3, 3, '2026-03-18 14:00+01', '2026-03-18 16:00+01', 'bestaetigt', 70.00),
+        (4, 3, '2026-03-31 23:00+02', '2026-03-31 23:30+02', 'bestaetigt',  2.00),
+        (4, 4, '2026-04-01 00:30+02', '2026-04-01 01:00+02', 'bestaetigt',  2.00),
+        (5, 4, '2026-04-02 08:00+02', '2026-04-02 17:00+02', 'bestaetigt', 58.50);
+    starter: |
+      SELECT s.name AS standort, count(*) AS buchungen, sum(b.preis) AS umsatz
+      FROM standorte AS s
+      JOIN raeume    AS r ON r.standort_id = s.id
+      JOIN buchungen AS b ON b.raum_id = r.id
+      WHERE b.beginn >= '2026-03-01' AND b.beginn < '2026-04-01'
+      GROUP BY s.id;
+    solution: |
+      SELECT s.name AS standort,
+             count(b.id) AS buchungen,
+             coalesce(sum(b.preis), 0) AS umsatz,
+             count(DISTINCT b.mitglied_id) AS mitglieder
+      FROM standorte AS s
+      LEFT JOIN raeume    AS r ON r.standort_id = s.id
+      LEFT JOIN buchungen AS b
+             ON b.raum_id = r.id
+            AND b.status = 'bestaetigt'
+            AND b.beginn >= timestamptz '2026-03-01 00:00 Europe/Berlin'
+            AND b.beginn <  timestamptz '2026-04-01 00:00 Europe/Berlin'
+      GROUP BY s.id
+      ORDER BY umsatz DESC, standort;
+    ordered: true
+    hints:
+      - Alle Standorte bleiben nur erhalten, wenn beide Joins `LEFT JOIN` sind und keine Bedingung an `buchungen` im `WHERE` steht. Setze sie ins `ON` oder in `FILTER`.
+      - "Die Monatsgrenzen brauchen eine Zeitzone: `timestamptz '2026-03-01 00:00 Europe/Berlin'` bis ausschließlich `timestamptz '2026-04-01 00:00 Europe/Berlin'`."
+      - "`count(b.id)`, `coalesce(sum(b.preis), 0)` und `count(DISTINCT b.mitglied_id)`, gruppiert nach `s.id`."
+    explanation: |
+      Die Übersicht verbindet alles aus diesem Modul. Der `LEFT JOIN` von `standorte` über `raeume` zu `buchungen` behält das Zentrum, das im März nichts verkauft hat. Status und Zeitraum stehen im `ON` des zweiten Joins (gleichwertig: `FILTER (WHERE …)` an jedem Aggregat); im `WHERE` würden sie das Zentrum wieder entfernen. Die Monatsgrenzen tragen die Leipziger Zeitzone, deshalb zählt die Buchung um 0:30 Uhr am 1. März mit, die um 0:30 Uhr am 1. April nicht – in der UTC-Sitzung wäre es umgekehrt. `count(b.id)` meldet für das Zentrum `0`, `count(DISTINCT b.mitglied_id)` zählt Mitglied 1 in Plagwitz nur einmal. Ergebnis: Plagwitz 3 Buchungen, 102.00, 2 Mitglieder; Südvorstadt 2, 72.00, 1; Zentrum 0, 0, 0.
+    resources:
+      - title: PostgreSQL · Joined Tables (Bedingungen im ON bei äußeren Joins)
+        url: https://www.postgresql.org/docs/current/queries-table-expressions.html#QUERIES-JOIN
+      - title: PostgreSQL · date_trunc und AT TIME ZONE
+        url: https://www.postgresql.org/docs/current/functions-datetime.html#FUNCTIONS-DATETIME-TRUNC

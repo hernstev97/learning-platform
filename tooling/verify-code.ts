@@ -10,6 +10,9 @@
 //    in a throwaway directory and must exit 0 (used for Git break-and-repair labs).
 //  - SQL (`sql` exercises, `output` exercises and lesson blocks marked `run`) runs in Pyodide under Node,
 //    i.e. with exactly the SQLite version of the browser: solutions return rows, starters do not already.
+//  - PostgreSQL (`lang: postgres`, lesson blocks `postgres run`) runs in PGlite under Node, the same build as in the
+//    browser: the same rules as for SQLite; with `check`, the check query returns rows after the solution and a
+//    different result after the starter.
 //  - Python lesson blocks marked `pytest`: pytest runs them; all tests pass (with `fails`: some fail).
 //  - Python that imports pandas or numpy, uses pytest or Hypothesis or calls `run_pytest` runs in a virtual
 //    environment with the versions the browser loads (node_modules/.cache/verify-python, created with uv on first use).
@@ -25,7 +28,9 @@ import { ROOT, lessonBlocks, loadContent } from './content.ts';
 import { assemble, fixedCode, gapSolution, normalizeOutput } from '../src/engine/answers.ts';
 import { languageOf } from '../src/engine/highlight.ts';
 import { compareSql } from '../src/engine/sql.ts';
+import type { PgEngine } from '../src/pg/engine.ts';
 import { testPins, USES_TESTS } from '../src/python/packages.ts';
+import { nodeEngine } from './pg-node.ts';
 import type { BugExercise, GapExercise, OrderExercise, OutputExercise, SqlExercise } from '../src/content/types.ts';
 
 type Job = { label: string; run: () => Promise<string | null> };
@@ -102,6 +107,10 @@ function pyodideHarness(): Promise<Harness> {
   return sqlHarness;
 }
 const sqlScript = async (code: string): Promise<{ text: string; error: string | null }> => (await pyodideHarness())('run_sql_script(args["code"])', { code });
+// One PostgreSQL for all checks; every run clones a fresh database from it, as in the browser.
+let pgEngine: Promise<PgEngine> | null = null;
+const postgres = () => pgEngine ??= nodeEngine();
+
 /** Comments and whitespace only: nothing to run. */
 const blankSql = (code: string) => !code.replace(/--[^\n]*|\/\*[\s\S]*?\*\//g, '').trim();
 
@@ -210,13 +219,30 @@ for (const { area, module, file, exercise: authored, normalized } of loaded.raw)
         const { stdout } = await script(ex.code, languageOf(lang));
         return normalizeOutput(stdout) === normalizeOutput(ex.expected[0]) ? null : diff(normalizeOutput(ex.expected[0]), normalizeOutput(stdout));
       } });
-    } else if (lang === 'sql') {
+    } else if (lang === 'sql' || lang === 'postgres') {
       jobs.push({ label, run: async () => {
-        const result = await sqlScript(ex.code);
+        const result = lang === 'postgres' ? await (await postgres()).script(ex.code) : await sqlScript(ex.code);
         if (result.error) return `SQL wirft einen Fehler:\n${result.error}`;
         return normalizeOutput(result.text) === normalizeOutput(ex.expected[0]) ? null : diff(normalizeOutput(ex.expected[0]), normalizeOutput(result.text));
       } });
     } else skipped++;
+  } else if (normalized.type === 'sql' && normalized.engine === 'postgres') {
+    const ex = normalized as SqlExercise;
+    jobs.push({ label, run: async () => {
+      const engine = await postgres();
+      const { expected } = await engine.exercise(ex.schema, ex.solution, ex.solution, ex.check);
+      if (expected.error) return `Musterlösung ${ex.check ? 'oder Prüfabfrage ' : ''}wirft einen Fehler:\n${expected.error}`;
+      if (!expected.rows.length) return `${ex.check ? 'Die Prüfabfrage' : 'Die Musterlösung'} liefert keine Zeilen – eine Aufgabe mit leerem Ergebnis lässt sich nicht sinnvoll prüfen.`;
+      if (!blankSql(ex.starter)) {
+        const { actual } = await engine.exercise(ex.schema, ex.starter, ex.solution, ex.check);
+        if (compareSql(expected, actual, ex.ordered, !!ex.check).ok) return `${ex.check ? 'Nach den Startanweisungen liefert die Prüfabfrage' : 'Die Startabfrage liefert'} bereits das erwartete Ergebnis.`;
+      } else if (ex.check) {
+        // Without any statement of the learner: the check query on the bare schema must not pass yet.
+        const { actual } = await engine.exercise(ex.schema, ex.check, ex.solution, null);
+        if (compareSql(expected, actual, ex.ordered, true).ok) return 'Die Prüfabfrage besteht schon ohne eine Anweisung – sie prüft zu wenig.';
+      }
+      return null;
+    } });
   } else if (normalized.type === 'sql') {
     const ex = normalized as SqlExercise;
     jobs.push({ label, run: async () => {
@@ -279,9 +305,14 @@ for (const areaId of Object.keys(loaded.areas)) {
           if (flags.includes('fails')) return result.error ? null : 'als "fails" markiert, läuft aber fehlerfrei';
           return result.error ? `Codeblock wirft einen Fehler:\n${result.error}` : null;
         } });
-      } else if (lang === 'sql' && flags.includes('run')) {
+      } else if ((lang === 'sql' || languageOf(lang) === 'postgres') && flags.includes('run')) {
         jobs.push({ label, run: async () => {
-          const result = await sqlScript(code);
+          if (flags.includes('continue') && lang !== 'sql') {
+            // Errors are part of the demonstration; the block only must show at least one and run to its end.
+            const result = await (await postgres()).script(code, true);
+            return result.results.some((r) => r.error) ? null : 'als "continue" markiert, aber keine Anweisung scheitert – dann genügt "run"';
+          }
+          const result = lang === 'sql' ? await sqlScript(code) : await (await postgres()).script(code);
           if (flags.includes('fails')) return result.error ? null : 'als "fails" markiert, läuft aber fehlerfrei';
           return result.error ? `Codeblock wirft einen Fehler:\n${result.error}` : null;
         } });
@@ -307,5 +338,7 @@ async function worker() {
   }
 }
 await Promise.all(Array.from({ length: Math.max(2, availableParallelism() - 1) }, worker));
+const started = pgEngine as Promise<PgEngine> | null;
+if (started) await (await started).base.close();
 console.log(`\n${done} Prüfungen ausgeführt, ${failures} fehlgeschlagen, ${skipped} Übungen ohne ausführbare Prüfung.`);
 process.exit(failures ? 1 : 0);

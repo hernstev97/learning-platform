@@ -1,0 +1,1049 @@
+id: performance
+title: "Performance: messen statt raten"
+level: 3
+minutes: 160
+summary: Langsame Anwendungen systematisch untersuchen und die typischen Bremsen lösen – zu viele Roundtrips, große OFFSETs, teure Zählungen, Schleifen statt Batches, zu viele Verbindungen, Bloat und Tabellen, die über Jahre wachsen.
+goals:
+  - Du gehst bei langsamen Abfragen nach einer Methode vor – Last mit `pg_stat_statements`, Logs und Statistik-Sichten messen, nach Gesamtzeit priorisieren, eine Änderung messen.
+  - Du ersetzt große `OFFSET`-Seiten durch Keyset-Paginierung und exakte Zählungen durch Schätzungen, wo die Oberfläche das erlaubt.
+  - Du fasst Einzelanweisungen zu Batches zusammen (`unnest`, `UPDATE … FROM`, `COPY`) und teilst große Änderungen in kurze Transaktionen.
+  - Du dimensionierst Connection Pools, kennst die Grenzen von PgBouncer im Transaktionsmodus und setzt `statement_timeout`, `lock_timeout` und `idle_in_transaction_session_timeout` gezielt.
+  - Du erklärst tote Zeilen, VACUUM, Bloat und HOT-Updates und liest sie in `pg_stat_user_tables` ab.
+  - Du partitionierst eine wachsende Tabelle nach Monat und prüfst im Plan, dass nur die nötigen Partitionen gelesen werden.
+resources:
+  - title: PostgreSQL · pg_stat_statements
+    url: https://www.postgresql.org/docs/current/pgstatstatements.html#PGSTATSTATEMENTS-PG-STAT-STATEMENTS
+  - title: PostgreSQL · Routine Vacuuming
+    url: https://www.postgresql.org/docs/current/routine-vacuuming.html#VACUUM-FOR-SPACE-RECOVERY
+  - title: PostgreSQL · Table Partitioning
+    url: https://www.postgresql.org/docs/current/ddl-partitioning.html#DDL-PARTITIONING-DECLARATIVE
+  - title: PostgreSQL · Client Connection Defaults (Timeouts)
+    url: https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-STATEMENT-TIMEOUT
+  - title: PgBouncer · Features und Pooling-Modi
+    url: https://www.pgbouncer.org/features.html
+lesson: |
+  Montag, 9:05 Uhr, Deskwerk Zentrum: Die Check-in-Welle läuft, und die Seite „Meine Buchungen“ braucht vier Sekunden. Im Team-Chat stehen drei Vorschläge – ein Index auf alles, ein Redis-Cache davor, ein größerer Datenbankserver. Jeder davon kann helfen. Jeder kann auch Geld und eine Woche kosten, ohne die Ursache zu treffen. Ein zusätzlicher Index macht jedes `INSERT` teurer, ein Cache liefert veraltete Buchungen, und ein größerer Server verschiebt das Problem um ein paar Monate.
+
+  Dieses Modul zeigt die Arbeitsweise, mit der du die Ursache findest, und die Muster, die in Anwendungen immer wieder bremsen: zu viele Roundtrips (je Anweisung einmal Anfrage und Antwort über das Netz), Seiten mit großem `OFFSET`, `count(*)` auf jeder Seite, Schleifen statt Batches, zu viele Verbindungen, aufgeblähte Tabellen und Tabellen, die über Jahre zu groß werden. Wie ein Index funktioniert, steht in [Indexe](/postgres/indexe), wie man einen Plan liest, in [Query-Pläne](/postgres/query-plaene), und was ein ORM an SQL erzeugt, in [ORM und SQL](/postgres/orm-und-sql). Das setzt dieses Modul voraus.
+
+  ## Messen statt raten: langsame Abfragen finden
+
+  Die Methode hat vier Schritte. Erstens das Symptom beziffern: welcher Endpunkt, wie langsam, seit wann. Zweitens die Abfragen finden, die die Zeit verbrauchen. Drittens für die wichtigste Abfrage den Plan mit echten Parametern lesen, mit `EXPLAIN (ANALYZE, BUFFERS)` aus [Query-Pläne](/postgres/query-plaene). Viertens genau eine Sache ändern und mit derselben Datenmenge erneut messen. Wer mehrere Dinge gleichzeitig ändert, weiß danach nicht, was gewirkt hat.
+
+  Für Schritt zwei gibt es die Erweiterung [`pg_stat_statements`](https://www.postgresql.org/docs/current/pgstatstatements.html#PGSTATSTATEMENTS-PG-STAT-STATEMENTS). Sie sammelt für jede Anweisung Aufrufe, Gesamt- und Mittelzeit, gelieferte Zeilen und gelesene Blöcke. Gleiche Anweisungen mit anderen Werten fasst sie zusammen und zeigt die Werte als `$1`, `$2`. Seit PostgreSQL 18 gilt das auch für Listen von Konstanten unterschiedlicher Länge: `IN (1, 2, 3)` und `IN (1, 2, 3, 4)` landen in einem Eintrag mit `IN ($1 /*, ... */)`. Die Zeiten misst sie in Millisekunden. Sie braucht einen Eintrag in `shared_preload_libraries` und damit einen Neustart des Servers, danach `CREATE EXTENSION pg_stat_statements;` in der Datenbank. Im Browser läuft sie nicht; so fragst du sie auf einem Server ab:
+
+  ```postgres
+  SELECT calls,
+         round(total_exec_time::numeric)   AS gesamt_ms,
+         round(mean_exec_time::numeric, 2) AS mittel_ms,
+         rows,
+         left(query, 58)                   AS query
+  FROM pg_stat_statements
+  ORDER BY total_exec_time DESC
+  LIMIT 4;
+  ```
+
+  So könnte das bei Deskwerk nach einer Woche aussehen (Zahlen und Abfragetexte ausgedacht, Spalten echt):
+
+  ```text
+    calls  | gesamt_ms | mittel_ms |  rows   |                           query
+  ---------+-----------+-----------+---------+------------------------------------------------------------
+    412360 |   1195844 |      2.90 | 8247200 | SELECT b.id, b.beginn, b.ende, b.raum_id FROM buchungen AS
+        31 |    260412 |   8400.39 |    3720 | SELECT m.id, m.name, sum(b.preis) AS umsatz FROM mitgliede
+   2913551 |    145671 |      0.05 | 2913551 | SELECT id, name, standort_id FROM raeume WHERE id = $1
+     95210 |     38084 |      0.40 |   95210 | INSERT INTO checkins (mitglied_id, standort_id, zeitpunkt)
+  ```
+
+  Sortiert wird nach Gesamtzeit, denn sie zeigt, was den Server insgesamt beschäftigt. Die Buchungsliste braucht im Mittel nur 2,9 ms, läuft aber 412 360-mal und kostet damit rund viereinhalbmal so viel wie der Monatsbericht mit seinen 8,4 Sekunden. `rows` ist die Summe über alle Aufrufe: 20 Zeilen je Aufruf, eine Seite der Liste. Die dritte Zeile hat die Handschrift eines N+1-Problems: Millionen Aufrufe, je eine Zeile, winzige Mittelzeit, ein Raum je Aufruf über `id = $1`. In der Datenbank kostet sie wenig, in der App aber je Aufruf einen Roundtrip über das Netz, und den sieht `pg_stat_statements` nicht. Die Ursache liegt im ORM ([ORM und SQL](/postgres/orm-und-sql)).
+
+  > [!MERKE]
+  > Priorisiere nach `total_exec_time`, nicht nach der langsamsten Einzelabfrage. 1 ms gespart bei einer Million Aufrufen sind über 16 Minuten Serverzeit.
+
+  Das Log ergänzt die Statistik um einzelne Fälle mit ihren Parametern. [`log_min_duration_statement`](https://www.postgresql.org/docs/current/runtime-config-logging.html#GUC-LOG-MIN-DURATION-STATEMENT) schreibt jede Anweisung ins Log, die mindestens so lange läuft wie der Grenzwert. Das Modul [`auto_explain`](https://www.postgresql.org/docs/current/auto-explain.html) schreibt ab seinem eigenen Grenzwert zusätzlich den Plan dazu:
+
+  ```ini
+  # postgresql.conf
+  shared_preload_libraries = 'pg_stat_statements,auto_explain'  # Neustart nötig
+  log_min_duration_statement = 500ms      # jede Anweisung ab 500 ms ins Log
+  auto_explain.log_min_duration = 2s      # ab 2 s auch den Plan
+  log_lock_waits = on                     # wer länger als deadlock_timeout auf eine Sperre wartet
+  ```
+
+  Ohne Erweiterung zählt PostgreSQL je Tabelle mit, wie sie gelesen wird. [`pg_stat_user_tables`](https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-ALL-TABLES-VIEW) zeigt sequenzielle Scans und Index-Scans. Das läuft auch im Browser:
+
+  ```postgres run
+  CREATE TABLE buchungen (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    raum_id     int NOT NULL,
+    mitglied_id int NOT NULL,
+    beginn      timestamptz NOT NULL
+  );
+  INSERT INTO buchungen (raum_id, mitglied_id, beginn)
+  SELECT 1 + g % 30, 1 + g % 400, '2026-03-02 08:00+01'::timestamptz + g * interval '30 minutes'
+  FROM generate_series(1, 5000) AS g;
+
+  -- Messung beginnt: ausstehende Zähler übertragen, dann alle auf null
+  DO $$ BEGIN PERFORM pg_stat_force_next_flush(); END $$;
+  SELECT pg_stat_reset();
+
+  -- Die Startseite eines Mitglieds, dreimal geladen, dazu ein Zugriff per Primärschlüssel
+  SELECT count(*) FROM buchungen WHERE mitglied_id = 17;
+  SELECT count(*) FROM buchungen WHERE mitglied_id = 17;
+  SELECT count(*) FROM buchungen WHERE mitglied_id = 17;
+  SELECT * FROM buchungen WHERE id = 42;
+
+  -- Zähler sofort übertragen, sonst kommen sie mit kurzer Verzögerung an
+  DO $$ BEGIN PERFORM pg_stat_force_next_flush(); END $$;
+  SELECT relname, seq_scan, seq_tup_read, idx_scan, idx_tup_fetch
+  FROM pg_stat_user_tables;
+  ```
+
+  Die Zähler kommen nicht sofort an: Jeder Serverprozess überträgt sie erst, wenn er untätig wird, und höchstens einmal pro Sekunde ([Viewing Statistics](https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-STATS-VIEWS)). Im Browser erzwingt `pg_stat_force_next_flush()` das sofort. Die Funktion ist eingebaut, aber nicht dokumentiert; PostgreSQL nutzt sie in seinen eigenen Tests. Auf einem Server wartest du eine Sekunde.
+
+  `seq_tup_read / seq_scan` ergibt 5 000: Jeder Aufruf der Startseite liest die ganze Tabelle, um 13 Buchungen zu finden. Steht eine Tabelle oben, wenn du nach `seq_tup_read` sortierst, ist sie ein Kandidat für einen Index. Was gerade läuft, zeigt `pg_stat_activity`, eine Zeile je Verbindung mit Zustand und aktueller Anweisung.
+
+  > [!TIP] Konfiguration zuletzt
+  > `shared_buffers` und `work_mem` sind selten die erste Ursache. Für `shared_buffers` nennt die Doku auf einem eigenen Datenbankserver 25 % des Arbeitsspeichers als Startwert ([shared_buffers](https://www.postgresql.org/docs/current/runtime-config-resource.html#GUC-SHARED-BUFFERS)). [`work_mem`](https://www.postgresql.org/docs/current/runtime-config-resource.html#GUC-WORK-MEM) gilt je Sortier- oder Hash-Schritt, nicht je Verbindung: Eine Abfrage kann es mehrfach belegen, viele Verbindungen gleichzeitig ebenso. Statt den globalen Wert zu erhöhen, setze für den Monatsbericht `SET LOCAL work_mem = '64MB'` in seiner Transaktion.
+
+  ## Paginierung und count(*): weniger Zeilen lesen
+
+  Die Buchungsliste blättert mit `LIMIT 20 OFFSET n`. Die Doku sagt dazu: Die übersprungenen Zeilen muss der Server trotzdem berechnen ([LIMIT und OFFSET](https://www.postgresql.org/docs/current/queries-limit.html#QUERIES-LIMIT)). Seite 76 liest 1 520 Zeilen und wirft 1 500 weg. Keyset-Paginierung setzt dagegen an der letzten Zeile der vorigen Seite an. Die Schreibweise mit Zeilenvergleich kennst du aus [Abfragen](/postgres/abfragen); hier geht es darum, was der Plan daraus macht:
+
+  ```postgres run
+  CREATE TABLE buchungen (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    raum_id     int NOT NULL,
+    mitglied_id int NOT NULL,
+    beginn      timestamptz NOT NULL
+  );
+  INSERT INTO buchungen (raum_id, mitglied_id, beginn)
+  SELECT 1 + g % 12, 1 + g % 400,
+         '2026-01-05 08:00+01'::timestamptz + (g / 8) * interval '1 day' + (g % 8) * interval '1 hour'
+  FROM generate_series(0, 1999) AS g;
+  CREATE INDEX ON buchungen (beginn, id);
+  ANALYZE buchungen;
+
+  -- Seite 76 mit OFFSET
+  EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT id, beginn, raum_id FROM buchungen
+  ORDER BY beginn, id
+  LIMIT 20 OFFSET 1500;
+
+  -- Dieselbe Seite mit Keyset: weiter nach der letzten Zeile von Seite 75
+  EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT id, beginn, raum_id FROM buchungen
+  WHERE (beginn, id) > ('2026-07-11 11:00+02', 1500)
+  ORDER BY beginn, id
+  LIMIT 20;
+  ```
+
+  Beide Pläne nutzen denselben Index. Mit `OFFSET` liefert der Index-Scan 1 520 Zeilen (`actual rows=1520.00`), mit Keyset 20, denn die Bedingung steht als `Index Cond` im Plan: Der Scan beginnt direkt an der richtigen Stelle. Der Aufwand wächst mit `OFFSET` linear mit der Seitennummer, mit Keyset bleibt er gleich. Die Bedingung als Zeilenvergleich `(beginn, id) > (…)` zu schreiben, ist dabei wichtig. Ausgeschrieben als `beginn > … OR (beginn = … AND id > …)` erkennt PostgreSQL 18 sie nicht als Startpunkt im Index und filtert wieder rund 1 500 Zeilen weg. Der Preis von Keyset: Man kann nicht direkt zu Seite 37 springen. Für „Weitere laden“ und endloses Scrollen ist das kein Verlust.
+
+  ### Warum count(*) teuer ist
+
+  Die zweite Abfrage jeder Listenseite zählt: „1 234 Buchungen“. PostgreSQL führt keinen Zähler je Tabelle mit. Wegen MVCC kann jede Transaktion eine andere Zahl sehen, also prüft `count(*)` jede Zeilenversion auf Sichtbarkeit, auf einem Index nur dann ohne Tabellenzugriff, wenn die Visibility Map aktuell ist – die Liste der Seiten, deren Zeilen für alle sichtbar sind. Bei 50 Millionen Check-ins dauert das, bei jedem Seitenaufruf. Oft reicht eine Schätzung: `reltuples` aus [`pg_class`](https://www.postgresql.org/docs/current/catalog-pg-class.html) für die ganze Tabelle, die Zeilenschätzung des Planers für eine gefilterte Menge oder eine Zählung mit Obergrenze:
+
+  ```postgres run
+  CREATE TABLE checkins (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    mitglied_id int NOT NULL,
+    standort_id int NOT NULL,
+    zeitpunkt   timestamptz NOT NULL
+  );
+  INSERT INTO checkins (mitglied_id, standort_id, zeitpunkt)
+  SELECT 1 + g % 500, 1 + g % 3, '2026-01-01 08:00+01'::timestamptz + g * interval '7 minutes'
+  FROM generate_series(1, 20000) AS g;
+  ANALYZE checkins;
+  -- Nach der letzten Statistik: die ersten zwei Januarwochen werden archiviert
+  DELETE FROM checkins WHERE zeitpunkt < '2026-01-15';
+
+  -- Exakt: liest jede Zeile
+  SELECT count(*) FROM checkins;
+
+  -- Geschätzt: eine Zeile aus dem Katalog, Stand des letzten ANALYZE oder VACUUM
+  SELECT reltuples::bigint AS geschaetzt
+  FROM pg_class
+  WHERE oid = 'checkins'::regclass;
+
+  -- Geschätzt mit Filter: was der Planer erwartet
+  CREATE FUNCTION zeilen_schaetzen(abfrage text) RETURNS bigint
+  LANGUAGE plpgsql AS $$
+  DECLARE plan jsonb;
+  BEGIN
+    EXECUTE 'EXPLAIN (FORMAT JSON) ' || abfrage INTO plan;
+    RETURN (plan -> 0 -> 'Plan' ->> 'Plan Rows')::bigint;
+  END $$;
+  SELECT zeilen_schaetzen('SELECT * FROM checkins WHERE zeitpunkt >= ''2026-02-01''') AS geschaetzt,
+         (SELECT count(*) FROM checkins WHERE zeitpunkt >= '2026-02-01') AS exakt;
+
+  -- „Mehr als 1 000“ reicht oft: höchstens 1 001 Zeilen lesen
+  SELECT count(*) AS bis_1001
+  FROM (SELECT 1 FROM checkins WHERE standort_id = 2 LIMIT 1001) AS t;
+  ```
+
+  `reltuples` steht noch auf 20 000, obwohl nur 17 189 Zeilen übrig sind: Die Zahl ist so aktuell wie das letzte `ANALYZE` oder `VACUUM`. Bei einer Tabelle, die noch nie analysiert oder gevacuumt wurde, steht dort seit PostgreSQL 14 `-1` für „unbekannt“. Für die Kopfzeile „ca. 17 000 Check-ins“ ist das gut genug. Ob es eine nächste Seite gibt, beantwortest du ohne Zählung: Hole 21 Zeilen statt 20.
+
+  > [!INTERVIEW] „Warum ist `SELECT count(*)` auf einer großen Tabelle langsam?“
+  > PostgreSQL speichert keine Zeilenzahl, weil jede Transaktion wegen MVCC eine andere Menge sichtbarer Zeilen sieht. `count(*)` muss deshalb jede Zeilenversion prüfen, über die Tabelle oder einen Index, und das wächst linear mit der Tabelle. Wenn die Oberfläche keine exakte Zahl braucht, nehme ich `reltuples` aus `pg_class` oder die Schätzung des Planers. Für „gibt es mehr?“ hole ich eine Zeile mehr als angezeigt. Eine exakte Zahl, die oft gebraucht wird, pflege ich als Zähler oder in einer Materialized View.
+
+  ## Batching: Roundtrips und Transaktionen sparen
+
+  Jede Anweisung, die die App schickt, kostet einen Roundtrip übers Netz und das Parsen und Planen auf dem Server. Im Autocommit ist sie außerdem eine eigene Transaktion, und jeder Commit wartet, bis das WAL auf der Platte ist. 1 000 Check-ins in einer Schleife sind also 1 000 Roundtrips und 1 000 Commits. Ein Batch erledigt dieselbe Arbeit mit einer Anweisung:
+
+  ```postgres run
+  CREATE TABLE checkins (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    mitglied_id int NOT NULL,
+    standort_id int NOT NULL,
+    zeitpunkt   timestamptz NOT NULL
+  );
+
+  -- Eine Anweisung für beliebig viele Zeilen. In der App sind die Arrays drei Parameter: $1, $2, $3
+  INSERT INTO checkins (mitglied_id, standort_id, zeitpunkt)
+  SELECT *
+  FROM unnest(
+    ARRAY[17, 4, 23, 8]::int[],
+    ARRAY[1, 1, 3, 2]::int[],
+    ARRAY['2026-03-02 08:55', '2026-03-02 09:01', '2026-03-02 09:03', '2026-03-02 09:04']::timestamptz[]
+  )
+  RETURNING id, mitglied_id, zeitpunkt;
+
+  -- Viele Zeilen, jede mit eigenem Wert: ein UPDATE mit einer Wertetabelle
+  CREATE TABLE raeume (id int PRIMARY KEY, name text NOT NULL, preis_pro_stunde numeric(8,2) NOT NULL);
+  INSERT INTO raeume VALUES (1, 'Atelier', 12), (2, 'Loft', 30), (3, 'Box 1', 5);
+
+  UPDATE raeume AS r
+  SET preis_pro_stunde = neu.preis
+  FROM (VALUES (1, 13.50), (3, 6.00)) AS neu (id, preis)
+  WHERE r.id = neu.id
+  RETURNING r.id, r.name, old.preis_pro_stunde AS vorher, new.preis_pro_stunde AS nachher;
+  ```
+
+  `unnest` mit mehreren Arrays macht aus ihnen Zeilen, Element für Element. Gegenüber einem mehrzeiligen `VALUES (…), (…), …` hat das einen Vorteil: Der SQL-Text bleibt bei jeder Batchgröße gleich. Das ergibt einen Eintrag in `pg_stat_statements` statt hundert und ein Prepared Statement, das wiederverwendet wird. `RETURNING old.…` und `new.…` gibt es seit PostgreSQL 18; davor liefert `RETURNING` nur die neuen Werte. Für Zehntausende Zeilen ist [`COPY`](https://www.postgresql.org/docs/current/populate.html#POPULATE-COPY-FROM) gebaut: eine Anweisung, deutlich weniger Aufwand je Zeile als `INSERT`. So sieht das in Python mit psycopg 3 aus:
+
+  ```python
+  # Langsam (Verbindung mit autocommit=True): ein Roundtrip und ein Commit je Check-in
+  for c in checkins:
+      conn.execute(
+          "INSERT INTO checkins (mitglied_id, standort_id, zeitpunkt) VALUES (%s, %s, %s)",
+          (c.mitglied_id, c.standort_id, c.zeitpunkt),
+      )
+
+  # Ein Roundtrip, eine Transaktion, immer derselbe SQL-Text
+  conn.execute(
+      """INSERT INTO checkins (mitglied_id, standort_id, zeitpunkt)
+         SELECT * FROM unnest(%s::int[], %s::int[], %s::timestamptz[])""",
+      ([c.mitglied_id for c in checkins], [c.standort_id for c in checkins], [c.zeitpunkt for c in checkins]),
+  )
+
+  # Für den nächtlichen Import: COPY
+  with conn.cursor().copy("COPY checkins (mitglied_id, standort_id, zeitpunkt) FROM STDIN") as copy:
+      for c in checkins:
+          copy.write_row((c.mitglied_id, c.standort_id, c.zeitpunkt))
+  ```
+
+  `cur.executemany(…)` ist seit psycopg 3.1 schneller, weil es die Anweisungen im Pipeline-Modus schickt, ohne auf jede Antwort zu warten. Der Server führt trotzdem jede Zeile als eigene Anweisung aus. ORMs haben eigene Batch-Wege: In SQLAlchemy 2 wird `session.execute(insert(Checkin), liste)` zu einem gebündelten [Bulk-INSERT](https://docs.sqlalchemy.org/en/21/orm/queryguide/dml.html#orm-bulk-insert-statements), Prisma bietet [`createMany`](https://www.prisma.io/docs/orm/reference/prisma-client-reference#createmany). Wie ORMs Massenänderungen Objekt für Objekt erzeugen, zeigt [ORM und SQL](/postgres/orm-und-sql).
+
+  Für sehr große Änderungen gilt die Gegenrichtung: Fünf Millionen alte Check-ins mit einem einzigen `DELETE` zu löschen, ergibt eine Transaktion, die minutenlang läuft, Zeilen sperrt, viel WAL schreibt und VACUUM für die ganze Zeit aufhält. Lösche in Portionen zu einigen Tausend Zeilen, jede Portion in einer eigenen kurzen Transaktion, mit einer kleinen Pause dazwischen. Dasselbe gilt für Backfills bei Migrationen ([Migrationen](/postgres/migrationen)).
+
+  ## Verbindungen: Pooling und Timeouts
+
+  PostgreSQL startet für jede Verbindung einen eigenen Serverprozess. `max_connections` steht standardmäßig auf 100. Viele Verbindungen kosten Speicher und Verwaltung, auch wenn sie nichts tun. Die App hält deshalb einen Pool offener Verbindungen und verleiht sie für die Dauer einer Anfrage. Die Rechnung macht man je Prozess: Ein SQLAlchemy-Pool mit `pool_size=5` und `max_overflow=10` erlaubt 15 Verbindungen, bei 4 Pods mit je 4 Worker-Prozessen also 240. Der Server erlaubt 100.
+
+  Ein externer Pooler wie [PgBouncer](https://www.pgbouncer.org/features.html) löst das. Die Apps verbinden sich mit PgBouncer, und er hält wenige echte Serververbindungen. Im Modus `pool_mode = transaction` bekommt ein Client eine Serververbindung nur für die Dauer einer Transaktion. 240 Clients, von denen in jedem Moment 15 eine Transaktion offen haben, brauchen 15 Serververbindungen. Der Preis: Alles, was an der Sitzung hängt, geht verloren. Ein `SET statement_timeout` gilt auf irgendeiner Serververbindung; nur wenige Parameter wie `TimeZone` oder `application_name` führt PgBouncer selbst nach. Advisory Locks auf Sitzungsebene, `LISTEN`, `PREPARE`, Cursor mit `WITH HOLD` und temporäre Tabellen, die über die Transaktion hinaus leben, funktionieren nicht ([Featuretabelle](https://www.pgbouncer.org/features.html)). Prepared Statements auf Protokollebene, wie Treiber sie anlegen, unterstützt PgBouncer seit Version 1.21, wenn `max_prepared_statements` größer als 0 ist; seit 1.24 ist 200 der Standardwert.
+
+  Timeouts begrenzen den Schaden, wenn doch etwas hängt ([Client Connection Defaults](https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-STATEMENT-TIMEOUT)):
+
+  | Einstellung | bricht ab, wenn … | typischer Fehler | SQLSTATE |
+  | --- | --- | --- | --- |
+  | `statement_timeout` | eine Anweisung länger läuft | `canceling statement due to statement timeout` | `57014` |
+  | `lock_timeout` | eine Anweisung länger auf eine Sperre wartet | `canceling statement due to lock timeout` | `55P03` |
+  | `idle_in_transaction_session_timeout` | eine offene Transaktion zu lange untätig ist (beendet die Sitzung) | `terminating connection due to idle-in-transaction timeout` | `25P03` |
+  | `transaction_timeout` (seit PostgreSQL 17) | eine ganze Transaktion länger dauert (beendet die Sitzung) | `terminating connection due to transaction timeout` | `25P04` |
+
+  Die ersten beiden brechen nur die Anweisung ab, die Verbindung bleibt nutzbar; die App bekommt einen Fehler und rollt die Transaktion zurück. Die beiden anderen beenden die Verbindung, der Pool muss sie ersetzen. `idle_session_timeout` beendet sogar Sitzungen ohne offene Transaktion; für Verbindungen über einen Pooler warnt die Doku davor ([idle_session_timeout](https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-IDLE-SESSION-TIMEOUT)). Für `statement_timeout` und `lock_timeout` rät die Doku davon ab, sie global in `postgresql.conf` zu setzen, weil sie dann für jede Sitzung gelten, auch für Wartung und Migrationen. Setze sie für die Rolle der App oder für eine einzelne Transaktion:
+
+  ```postgres run
+  -- Für eine Transaktion: gilt bis COMMIT oder ROLLBACK
+  BEGIN;
+  SET LOCAL statement_timeout = '3s';
+  SET LOCAL lock_timeout = '500ms';
+  SHOW lock_timeout;
+  COMMIT;
+  SHOW lock_timeout;
+
+  -- Für die Rolle der App: gilt für jede neue Sitzung dieser Rolle
+  CREATE ROLE deskwerk_app LOGIN;
+  ALTER ROLE deskwerk_app SET statement_timeout = '5s';
+  ALTER ROLE deskwerk_app SET idle_in_transaction_session_timeout = '30s';
+
+  SELECT r.rolname, s.setconfig
+  FROM pg_db_role_setting AS s
+  JOIN pg_roles AS r ON r.oid = s.setrole;
+  ```
+
+  `SET LOCAL` passt auch zu PgBouncer im Transaktionsmodus, denn es endet mit der Transaktion. Im Browser kannst du die Werte setzen und lesen; abbrechen kann PGlite eine laufende Anweisung nicht.
+
+  > [!PRAXIS] Die Verbindungs-Konfiguration bei Deskwerk
+  > Die App-Rolle hat `statement_timeout = 5s` und `idle_in_transaction_session_timeout = 30s`, die Rolle für den nächtlichen Bericht 10 Minuten. Migrationen setzen `SET LOCAL lock_timeout = '2s'` und versuchen es bei einem Abbruch später erneut. PgBouncer läuft im Transaktionsmodus mit 20 Serververbindungen je Datenbank und Benutzer. Im Code-Review fällt auf: ein `SET` ohne `LOCAL`, ein HTTP-Aufruf innerhalb einer Transaktion, ein Pool je Request statt je Prozess.
+
+  ## VACUUM, Bloat und HOT-Updates
+
+  Ein `UPDATE` überschreibt in PostgreSQL keine Zeile. Es schreibt eine neue Version und markiert die alte als gelöscht; ein `DELETE` markiert nur ([Isolation und Sperren](/postgres/isolation-sperren) erklärt, warum). Auch ein zurückgerolltes `INSERT` hinterlässt Zeilen, die niemand mehr sieht. Diese toten Zeilen belegen Platz, bis VACUUM ihn zur Wiederverwendung freigibt:
+
+  ```postgres run
+  CREATE TABLE buchungen (
+    id     bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    status text NOT NULL DEFAULT 'bestaetigt',
+    preis  numeric(8,2)
+  );
+  INSERT INTO buchungen (preis) SELECT 25 FROM generate_series(1, 10000);
+
+  -- Ein Fünftel wird storniert: 2 000 neue Versionen, 2 000 alte bleiben als tote Zeilen liegen
+  UPDATE buchungen SET status = 'storniert' WHERE id <= 2000;
+  DO $$ BEGIN PERFORM pg_stat_force_next_flush(); END $$;
+  SELECT n_live_tup, n_dead_tup, pg_size_pretty(pg_table_size('buchungen')) AS groesse
+  FROM pg_stat_user_tables WHERE relname = 'buchungen';
+
+  -- VACUUM gibt den Platz zur Wiederverwendung frei, die Datei bleibt so groß
+  VACUUM buchungen;
+  SELECT n_live_tup, n_dead_tup, pg_size_pretty(pg_table_size('buchungen')) AS groesse
+  FROM pg_stat_user_tables WHERE relname = 'buchungen';
+
+  -- VACUUM FULL schreibt die Tabelle neu und sperrt sie dabei komplett
+  VACUUM FULL buchungen;
+  SELECT pg_size_pretty(pg_table_size('buchungen')) AS groesse;
+  ```
+
+  Nach `VACUUM` ist `n_dead_tup` null, aber die Tabelle ist nicht kleiner, sogar um 8 kB größer: VACUUM hat die Visibility Map angelegt, die `pg_table_size` mitzählt. VACUUM gibt Platz nur an das Betriebssystem zurück, wenn am Ende der Datei ganze Seiten frei werden ([Recovering Disk Space](https://www.postgresql.org/docs/current/routine-vacuuming.html#VACUUM-FOR-SPACE-RECOVERY)). Neue Zeilen füllen die Lücken. Wächst eine Tabelle trotzdem ständig über ihre Nutzdaten hinaus, heißt das **Bloat**: Es entstehen mehr tote Zeilen, als VACUUM aufräumt.
+
+  Im Betrieb startet der Autovacuum-Daemon VACUUM und ANALYZE von selbst. Eine Tabelle ist dran, wenn die Zahl toter Zeilen `autovacuum_vacuum_threshold + autovacuum_vacuum_scale_factor * reltuples` übersteigt, standardmäßig 50 + 20 % der Zeilen ([Autovacuum](https://www.postgresql.org/docs/current/routine-vacuuming.html#AUTOVACUUM)). Seit PostgreSQL 18 deckelt `autovacuum_vacuum_max_threshold` den Wert, standardmäßig bei 100 Millionen. Bei 50 Millionen Check-ins wartet Autovacuum also auf 10 Millionen tote Zeilen. Für große, viel geänderte Tabellen setzt man deshalb eigene Werte: `ALTER TABLE checkins SET (autovacuum_vacuum_scale_factor = 0.01);`. Tabellen, in die fast nur eingefügt wird, haben kaum tote Zeilen; für sie gibt es seit PostgreSQL 13 eine eigene Schwelle für eingefügte Zeilen (`autovacuum_vacuum_insert_threshold`, `autovacuum_vacuum_insert_scale_factor`). Auch dort braucht es VACUUM, denn es pflegt die Visibility Map für Index-Only Scans und friert alte Zeilen ein, bevor die Transaktionsnummern umlaufen (Wraparound, [Preventing Transaction ID Wraparound Failures](https://www.postgresql.org/docs/current/routine-vacuuming.html#VACUUM-FOR-WRAPAROUND)).
+
+  Der häufigste Grund für Bloat ist aber kein Einstellungsproblem. VACUUM darf nur Zeilen entfernen, die keine offene Transaktion mehr sehen kann. Eine Transaktion, die seit drei Stunden offen ist, etwa eine vergessene Verbindung „idle in transaction“, kann das Aufräumen in der ganzen Datenbank aufhalten. Genau dagegen hilft `idle_in_transaction_session_timeout`; wer die alten Transaktionen sind, zeigt `pg_stat_activity` mit `xact_start` und `backend_xmin`.
+
+  > [!WARNING] VACUUM FULL sperrt die Tabelle
+  > `VACUUM FULL` braucht eine `ACCESS EXCLUSIVE`-Sperre: Während es die Tabelle neu schreibt, kann niemand lesen oder schreiben, bei großen Tabellen minutenlang. Es braucht außerdem Platz für eine vollständige Kopie. Im laufenden Betrieb ist es fast nie die richtige Antwort; regelmäßiges normales VACUUM ist es.
+
+  ### HOT-Updates
+
+  Jede neue Zeilenversion braucht normalerweise auch neue Einträge in allen Indexen der Tabelle. Ein **HOT-Update** (Heap-Only Tuple) spart sie sich. Das geht, wenn das `UPDATE` keine indizierte Spalte ändert und die neue Version auf dieselbe Seite passt wie die alte ([HOT](https://www.postgresql.org/docs/current/storage-hot.html#STORAGE-HOT)). Spalten, die nur in BRIN-Indexen stehen, verhindern HOT seit PostgreSQL 16 nicht mehr. Platz auf den Seiten lässt du mit einem `fillfactor` unter 100 frei:
+
+  ```postgres run
+  CREATE TABLE buchungen_voll (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    raum_id int NOT NULL, status text NOT NULL DEFAULT 'bestaetigt'
+  );
+  CREATE TABLE buchungen_luft (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    raum_id int NOT NULL, status text NOT NULL DEFAULT 'bestaetigt'
+  ) WITH (fillfactor = 90);
+  CREATE INDEX ON buchungen_voll (raum_id);
+  CREATE INDEX ON buchungen_luft (raum_id);
+  INSERT INTO buchungen_voll (raum_id) SELECT 1 + g % 20 FROM generate_series(1, 2000) AS g;
+  INSERT INTO buchungen_luft (raum_id) SELECT 1 + g % 20 FROM generate_series(1, 2000) AS g;
+
+  -- Jede zehnte Buchung storniert: status steht in keinem Index
+  UPDATE buchungen_voll SET status = 'storniert' WHERE id % 10 = 0;
+  UPDATE buchungen_luft SET status = 'storniert' WHERE id % 10 = 0;
+  -- Jede zwanzigste in einen anderen Raum verlegt: raum_id steht im Index
+  UPDATE buchungen_luft SET raum_id = 21 WHERE id % 20 = 1;
+  DO $$ BEGIN PERFORM pg_stat_force_next_flush(); END $$;
+
+  SELECT relname, n_tup_upd, n_tup_hot_upd
+  FROM pg_stat_user_tables
+  ORDER BY relname;
+  ```
+
+  In der vollen Tabelle war kein Update HOT, in der mit 10 % Luft alle 200 Stornierungen. Die Raumwechsel waren es nicht, weil `raum_id` indiziert ist. Ohne `fillfactor` gibt es im Betrieb trotzdem HOT-Updates, sobald VACUUM auf den Seiten wieder Platz geschaffen hat; ein kleinerer `fillfactor` macht sie nur von Anfang an wahrscheinlicher. Daraus folgt eine Abwägung für [Indexe](/postgres/indexe): Ein Index auf eine Spalte, die ständig geändert wird, verhindert HOT-Updates.
+
+  ## Große Tabellen: Partitionierung und Vorberechnen
+
+  Deskwerk speichert jeden Check-in, etwa 100 000 im Monat, und muss sie zwei Jahre aufbewahren. Fast jede Abfrage fragt nach einem Zeitraum. Das passt zur Partitionierung nach Bereich: Die Tabelle `checkins` wird zu einer Hülle, die Zeilen liegen in einer Tabelle je Monat:
+
+  ```postgres run
+  CREATE TABLE checkins (
+    id          bigint GENERATED ALWAYS AS IDENTITY,
+    mitglied_id int NOT NULL,
+    standort_id int NOT NULL,
+    zeitpunkt   timestamptz NOT NULL,
+    PRIMARY KEY (id, zeitpunkt)  -- der Partitionsschlüssel muss dazugehören
+  ) PARTITION BY RANGE (zeitpunkt);
+  CREATE TABLE checkins_2026_03 PARTITION OF checkins
+    FOR VALUES FROM ('2026-03-01') TO ('2026-04-01');
+  CREATE TABLE checkins_2026_04 PARTITION OF checkins
+    FOR VALUES FROM ('2026-04-01') TO ('2026-05-01');
+
+  INSERT INTO checkins (mitglied_id, standort_id, zeitpunkt)
+  SELECT 1 + g % 300, 1 + g % 3, '2026-03-01 07:00'::timestamptz + (g % 61) * interval '1 day'
+  FROM generate_series(1, 6000) AS g;
+  ANALYZE checkins;
+
+  SELECT tableoid::regclass AS partition, count(*) FROM checkins GROUP BY 1 ORDER BY 1;
+
+  -- Partition Pruning: nur die April-Partition wird gelesen
+  EXPLAIN (COSTS OFF)
+  SELECT count(*) FROM checkins
+  WHERE zeitpunkt >= '2026-04-01' AND zeitpunkt < '2026-04-08';
+
+  -- Ein Monat fällt aus der Aufbewahrungsfrist: abhängen und löschen statt DELETE
+  ALTER TABLE checkins DETACH PARTITION checkins_2026_03;
+  DROP TABLE checkins_2026_03;
+  SELECT count(*) FROM checkins;
+  ```
+
+  Die Grenzen sind halboffen: `FROM` gehört zur Partition, `TO` nicht. Weil die Spalte `timestamptz` ist, gelten sie in der Zeitzone der Sitzung, hier Mitternacht in Berlin. Der Plan liest nur `checkins_2026_04`; das heißt **Partition Pruning** ([Partition Pruning](https://www.postgresql.org/docs/current/ddl-partitioning.html#DDL-PARTITION-PRUNING)). Es klappt nur, wenn die Bedingung direkt auf dem Partitionsschlüssel steht. Mit `date_trunc('month', zeitpunkt) = …` liest der Plan wieder alle Partitionen. Der größte Gewinn liegt oft beim Aufräumen: `DROP TABLE` auf einen alten Monat dauert Millisekunden und hinterlässt keine toten Zeilen, ein `DELETE` über 100 000 Zeilen erzeugt 100 000.
+
+  Partitionierung hat Kosten. Primärschlüssel und Unique-Constraints müssen den Partitionsschlüssel enthalten. Abfragen ohne Bedingung auf `zeitpunkt` lesen alle Partitionen. Neue Monate muss jemand rechtzeitig anlegen, sonst scheitert jedes `INSERT` mit `no partition of relation "checkins" found for row`. Eine `DEFAULT`-Partition fängt solche Zeilen auf. Die Doku nennt als Faustregel, dass sich Partitionierung lohnt, wenn die Tabelle größer wäre als der Arbeitsspeicher des Servers. Für Deskwerk mit 100 000 Check-ins im Monat ist das ein Grenzfall: Die Tabelle passt jahrelang in den Speicher, und für die Abfragen reicht ein Index auf `zeitpunkt`. Das stärkste Argument ist hier das billige Löschen nach Ablauf der Aufbewahrungsfrist.
+
+  ### Vorberechnen: Materialized View oder Cache
+
+  Das Dashboard „Auslastung je Standort und Monat“ fragt jede Minute dieselbe teure Aggregation ab. Eine Materialized View speichert das Ergebnis als Tabelle, `REFRESH MATERIALIZED VIEW CONCURRENTLY` aktualisiert es, ohne Leser zu blockieren, und braucht dafür einen Unique-Index auf der View ([PostgreSQL-Features](/postgres/postgres-features)). Ein App-Cache wie Redis lohnt sich für einzelne heiße Schlüssel, etwa die Raumliste eines Standorts. Beide liefern Daten von gestern, wenn niemand aktualisiert, und beide verdecken eine schlechte Abfrage nur. Vorberechnen kommt deshalb nach dem Messen und Reparieren, nicht davor.
+
+  ## Häufige Fehler
+
+  - **Nach Gefühl optimieren.** Die Abfrage, über die sich jemand beschwert, ist nicht die, die den Server auslastet. `pg_stat_statements` nach `total_exec_time` sortieren.
+  - **Viele schnelle Abfragen übersehen.** 0,05 ms je Aufruf sehen harmlos aus. Bei Millionen Aufrufen und einem Roundtrip je Aufruf ist das ein N+1-Problem in der App.
+  - **Tiefe Seiten mit `OFFSET`.** Der Aufwand wächst mit der Seitennummer. Keyset-Paginierung mit `(beginn, id) > ($1, $2)` und passendem Index.
+  - **`count(*)` auf jeder Listenseite.** Schätzung aus `reltuples` oder dem Plan, Zählung mit Obergrenze, `LIMIT n + 1` für „weitere laden“.
+  - **Schleife mit Einzel-`INSERT` im Autocommit.** Ein Commit je Zeile. Ein Batch mit `unnest`, eine Transaktion um die Schleife oder `COPY`.
+  - **Ein riesiges `DELETE` oder `UPDATE`.** Lange Sperren, viel WAL, Bloat auf einmal. In Portionen mit eigenen Transaktionen.
+  - **`too many clients already`.** Pools je Prozess multiplizieren sich. Pool-Größe nachrechnen, PgBouncer davor.
+  - **`SET` hinter PgBouncer im Transaktionsmodus.** Die Einstellung landet auf einer zufälligen Serververbindung. `SET LOCAL` in der Transaktion oder `ALTER ROLE … SET`.
+  - **Tabelle wächst trotz Autovacuum.** Meist hält eine Sitzung „idle in transaction“ das Aufräumen auf. `pg_stat_activity` prüfen, `idle_in_transaction_session_timeout` setzen.
+  - **Partitioniert, aber nicht schneller.** Die Abfragen filtern nicht direkt auf den Partitionsschlüssel, oder die Tabelle war gar nicht groß genug.
+
+  ## Zusammenfassung
+
+  - Erst messen, dann ändern: Symptom beziffern, teuerste Abfragen nach Gesamtzeit finden, Plan lesen, eine Änderung, erneut messen.
+  - `pg_stat_statements` zeigt die Last je Abfrage, das Log mit `log_min_duration_statement` einzelne langsame Fälle, `pg_stat_user_tables` die Zugriffe je Tabelle.
+  - `OFFSET` liest alle übersprungenen Zeilen. Keyset-Paginierung liest nur die Seite.
+  - `count(*)` prüft jede Zeilenversion. `reltuples` und die Planerschätzung sind billig und für Anzeigen oft genau genug.
+  - Batches mit `unnest`, `UPDATE … FROM` oder `COPY` sparen Roundtrips und Commits; große Änderungen laufen in kurzen Portionen.
+  - Jede Verbindung ist ein Prozess. Pools je Prozess nachrechnen, PgBouncer im Transaktionsmodus ohne Sitzungszustand nutzen, Timeouts je Rolle oder mit `SET LOCAL` setzen.
+  - `UPDATE` und `DELETE` hinterlassen tote Zeilen. VACUUM gibt den Platz zur Wiederverwendung frei, lange offene Transaktionen verhindern das. HOT-Updates sparen Index-Einträge.
+  - Partitionierung nach Monat lohnt sich für sehr große Tabellen mit Zeitfiltern und macht das Löschen alter Daten billig.
+exercises:
+  - id: wo-zuerst-ansetzen
+    type: choice
+    title: Welche Abfrage zuerst?
+    prompt: |
+      Das ist ein Ausschnitt aus `pg_stat_statements` der Deskwerk-Datenbank nach einer Woche, sortiert nach `total_exec_time`. Welche Aussagen stimmen? Mehrere Antworten sind richtig.
+    lang: text
+    code: |2
+        calls  | gesamt_ms | mittel_ms |  rows   | query
+      ---------+-----------+-----------+---------+--------------------------------------------
+        412360 |   1195844 |      2.90 | 8247200 | SELECT b.id, b.beginn, … FROM buchungen AS b
+            31 |    260412 |   8400.39 |    3720 | SELECT m.id, m.name, sum(b.preis) AS umsatz …
+       2913551 |    145671 |      0.05 | 2913551 | SELECT id, name, standort_id FROM raeume …
+         95210 |     38084 |      0.40 |   95210 | INSERT INTO checkins (mitglied_id, …)
+    options:
+      - text: Wer die Buchungsliste im Mittel um 1 ms beschleunigt, spart mehr Serverzeit, als der Monatsbericht insgesamt verbraucht.
+        correct: true
+        why: 412 360 Aufrufe × 1 ms sind rund 412 000 ms, der Monatsbericht kostet insgesamt 260 412 ms.
+      - text: Der Monatsbericht ist die langsamste Abfrage, deshalb bringt seine Optimierung am meisten.
+        correct: false
+        why: Er ist der langsamste Einzelfall, läuft aber nur 31-mal. Für die Last des Servers zählt die Gesamtzeit. Wartet ein Nutzer auf ihn, ist das ein eigenes Problem, das eher ein Timeout oder eine Materialized View löst.
+      - text: Die Abfrage auf `raeume` sieht nach einem N+1-Problem aus.
+        correct: true
+        why: Millionen Aufrufe, je genau eine Zeile, winzige Mittelzeit – das typische Muster, wenn ein ORM für jede Buchung den Raum einzeln nachlädt.
+      - text: Die 145 671 ms der `raeume`-Abfrage sind die gesamte Zeit, die die App auf diese Abfrage gewartet hat.
+        correct: false
+        why: "`pg_stat_statements` misst nur die Ausführung im Server. Der Roundtrip über das Netz kommt bei jedem der 2,9 Millionen Aufrufe dazu und taucht hier nicht auf."
+      - text: In `query` stehen die echten Werte des letzten Aufrufs, etwa die `mitglied_id`.
+        correct: false
+        why: Gleiche Anweisungen mit verschiedenen Werten werden zusammengefasst und mit Platzhaltern wie `$1` gezeigt. Einzelne Aufrufe mit Parametern findest du im Log mit `log_min_duration_statement`.
+    explanation: |
+      `total_exec_time` ist Aufrufe mal Mittelzeit und zeigt, was den Server insgesamt beschäftigt. Deshalb sortiert man danach. Die Buchungsliste ist der klare erste Kandidat, obwohl jeder einzelne Aufruf schnell ist. Die `raeume`-Abfrage ist für den Server billig, für die App aber teuer, weil jeder Aufruf einen Roundtrip kostet; die Lösung liegt im ORM-Code, nicht in der Datenbank. Der Monatsbericht ist ein anderes Problem: selten, aber für den Wartenden lang.
+    resources:
+      - title: PostgreSQL · pg_stat_statements – Spalten
+        url: https://www.postgresql.org/docs/current/pgstatstatements.html#PGSTATSTATEMENTS-COLUMNS
+
+  - id: pgbouncer-transaktionsmodus
+    type: choice
+    title: Was geht hinter PgBouncer schief?
+    prompt: |
+      Deskwerk stellt PgBouncer mit `pool_mode = transaction` vor die Datenbank. Welche Stellen im Code der App verhalten sich danach nicht mehr wie erwartet? Mehrere Antworten sind richtig.
+    options:
+      - text: Direkt nach dem Verbinden läuft einmal `SET statement_timeout = '5s'`, danach gilt der Timeout für alle Abfragen dieser Verbindung.
+        correct: true
+        why: Das `SET` landet auf der Serververbindung, die gerade zugeteilt war. Die nächste Transaktion kann auf einer anderen laufen, ohne Timeout, und eine fremde Sitzung erbt ihn. Besser `ALTER ROLE … SET` oder `SET LOCAL` in jeder Transaktion.
+      - text: Ein Job nimmt mit `SELECT pg_advisory_lock(42)` eine Sperre, arbeitet in mehreren Transaktionen und gibt sie mit `pg_advisory_unlock(42)` frei.
+        correct: true
+        why: Advisory Locks auf Sitzungsebene hängen an der Serververbindung. Das `unlock` kann auf einer anderen Verbindung ankommen, die Sperre bleibt dann bei einer Verbindung, die längst ein anderer Client nutzt.
+      - text: Ein Dienst wartet mit `LISTEN buchung_geaendert` auf Benachrichtigungen.
+        correct: true
+        why: "`LISTEN` gehört zur Sitzung. Nach der Transaktion ist die Serververbindung wieder im Pool, und die Benachrichtigungen erreichen den Client nicht. PgBouncer führt `LISTEN` im Transaktionsmodus als nicht unterstützt."
+      - text: In einer Transaktion setzt der Monatsbericht `SET LOCAL work_mem = '64MB'`.
+        correct: false
+        why: "`SET LOCAL` gilt nur bis zum Ende der Transaktion, und so lange hält der Client dieselbe Serververbindung. Das ist genau das Muster, das im Transaktionsmodus funktioniert."
+      - text: Eine Transaktion nimmt `pg_advisory_xact_lock(42)` und arbeitet dann weiter.
+        correct: false
+        why: Diese Sperre endet mit der Transaktion und braucht keine Sitzung darüber hinaus.
+    explanation: |
+      Im Transaktionsmodus gehört eine Serververbindung einem Client nur für die Dauer einer Transaktion. Alles, was länger leben soll – Einstellungen per `SET`, Advisory Locks auf Sitzungsebene, `LISTEN`, Prepared Statements per `PREPARE` –, landet auf einer Verbindung, die danach ein anderer Client bekommt. Was mit der Transaktion endet, funktioniert weiter. Die Featuretabelle von PgBouncer listet jedes Merkmal mit „Yes“ oder „Never“.
+    resources:
+      - title: PgBouncer · SQL feature map for pooling modes
+        url: https://www.pgbouncer.org/features.html
+
+  - id: schaetzung-nach-delete
+    type: output
+    title: Wie viele Zeilen glaubt der Katalog?
+    prompt: |
+      Was gibt das Skript aus? Schreibe die Ausgabe wie `psql -At`: Werte durch `|` getrennt, `NULL` leer, `t`/`f`, keine Kopfzeile. Autovacuum läuft hier nicht dazwischen.
+    lang: postgres
+    code: |
+      CREATE TABLE checkins (
+        id        int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        zeitpunkt timestamptz NOT NULL
+      );
+      SELECT reltuples FROM pg_class WHERE relname = 'checkins';
+      INSERT INTO checkins (zeitpunkt)
+      SELECT '2026-03-02 08:00+01'::timestamptz + g * interval '10 minutes'
+      FROM generate_series(1, 3000) AS g;
+      SELECT reltuples FROM pg_class WHERE relname = 'checkins';
+      ANALYZE checkins;
+      DELETE FROM checkins WHERE id <= 1200;
+      SELECT reltuples::bigint, (SELECT count(*) FROM checkins) FROM pg_class WHERE relname = 'checkins';
+      VACUUM checkins;
+      SELECT reltuples::bigint FROM pg_class WHERE relname = 'checkins';
+    expected: |
+      -1
+      -1
+      3000|1800
+      1800
+    hints:
+      - Wer schreibt `reltuples`? Ein `INSERT` gehört nicht dazu.
+      - "`-1` bedeutet: Die Tabelle wurde noch nie analysiert oder gevacuumt."
+    explanation: |
+      `reltuples` ist eine Schätzung für den Planer und wird nur von `VACUUM`, `ANALYZE` und einigen DDL-Befehlen wie `CREATE INDEX` aktualisiert. Nach dem Anlegen und nach dem `INSERT` steht dort `-1` für „unbekannt“. `ANALYZE` setzt 3 000, das `DELETE` ändert daran nichts, während `count(*)` die 1 800 sichtbaren Zeilen zählt. Erst `VACUUM` trägt 1 800 ein. Für eine Anzeige „ca. 1 800 Check-ins“ reicht die Schätzung, eine exakte Zahl ist sie nie.
+    resources:
+      - title: PostgreSQL · pg_class (reltuples)
+        url: https://www.postgresql.org/docs/current/catalog-pg-class.html
+
+  - id: tote-zeilen-zaehlen
+    type: output
+    title: Wie viele tote Zeilen?
+    prompt: |
+      Was gibt das Skript aus? Schreibe die Ausgabe wie `psql -At`: Werte durch `|` getrennt, `NULL` leer, `t`/`f`, keine Kopfzeile. Autovacuum läuft hier nicht dazwischen, und `pg_stat_force_next_flush()` sorgt dafür, dass die Zähler sofort in `pg_stat_user_tables` stehen.
+    lang: postgres
+    code: |
+      CREATE TABLE buchungen (
+        id     int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        status text NOT NULL DEFAULT 'bestaetigt',
+        preis  numeric(8,2)
+      );
+      INSERT INTO buchungen (preis) SELECT 20 FROM generate_series(1, 500);
+      UPDATE buchungen SET status = 'storniert' WHERE id <= 100;
+      UPDATE buchungen SET preis = 20 WHERE id > 400;
+      DELETE FROM buchungen WHERE id > 450;
+      BEGIN;
+      INSERT INTO buchungen (preis) SELECT 25 FROM generate_series(1, 30);
+      ROLLBACK;
+      -- Statistiken sofort übertragen, sonst kommen sie mit kurzer Verzögerung an
+      DO $$ BEGIN PERFORM pg_stat_force_next_flush(); END $$;
+      SELECT n_live_tup, n_dead_tup FROM pg_stat_user_tables WHERE relname = 'buchungen';
+      VACUUM buchungen;
+      SELECT n_live_tup, n_dead_tup FROM pg_stat_user_tables WHERE relname = 'buchungen';
+    expected: |
+      450|280
+      450|0
+    hints:
+      - Das zweite `UPDATE` setzt den Preis auf den Wert, den er schon hat. Entsteht trotzdem eine neue Version?
+      - Das `DELETE` trifft Zeilen, die das zweite `UPDATE` gerade neu geschrieben hat. Die alten Versionen sind schon tot.
+      - Was bleibt von 30 Zeilen, deren Transaktion zurückgerollt wurde?
+    explanation: |
+      Jede geänderte Zeile hinterlässt eine tote Version: 100 aus der Stornierung und 100 aus dem zweiten `UPDATE` – PostgreSQL schreibt eine neue Version, auch wenn sich der Wert nicht ändert. Das `DELETE` markiert 50 der neuen Versionen als gelöscht, macht 250. Die 30 Zeilen des zurückgerollten `INSERT` stehen schon in der Tabelle und sind für niemanden sichtbar, zusammen 280. Lebendig sind 450. `VACUUM` gibt den Platz aller 280 frei, `n_dead_tup` fällt auf 0. Daraus folgen zwei Praxisregeln: Updates, die nichts ändern, im Code vermeiden (`WHERE preis IS DISTINCT FROM 20`), und häufig abgebrochene Transaktionen sind auch ein Bloat-Problem.
+    resources:
+      - title: PostgreSQL · pg_stat_all_tables
+        url: https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-ALL-TABLES-VIEW
+      - title: PostgreSQL · Recovering Disk Space
+        url: https://www.postgresql.org/docs/current/routine-vacuuming.html#VACUUM-FOR-SPACE-RECOVERY
+
+  - id: partition-und-zeitzone
+    type: output
+    title: In welche Partition?
+    prompt: |
+      Die Sitzung läuft mit `TimeZone = 'Europe/Berlin'`. Was gibt das Skript aus? Schreibe die Ausgabe wie `psql -At`: Werte durch `|` getrennt, `NULL` leer, keine Kopfzeile.
+    lang: postgres
+    code: |
+      CREATE TABLE checkins (
+        mitglied_id int NOT NULL,
+        zeitpunkt   timestamptz NOT NULL
+      ) PARTITION BY RANGE (zeitpunkt);
+      CREATE TABLE checkins_2026_03 PARTITION OF checkins
+        FOR VALUES FROM ('2026-03-01') TO ('2026-04-01');
+      CREATE TABLE checkins_2026_04 PARTITION OF checkins
+        FOR VALUES FROM ('2026-04-01') TO ('2026-05-01');
+      CREATE TABLE checkins_rest PARTITION OF checkins DEFAULT;
+      INSERT INTO checkins (mitglied_id, zeitpunkt) VALUES
+        (1, '2026-03-31 23:30'),
+        (2, '2026-03-31 23:30+00'),
+        (3, '2026-04-01 00:15+02'),
+        (4, '2026-02-28 23:59:59'),
+        (5, '2026-04-30 22:30+00');
+      SELECT tableoid::regclass, mitglied_id FROM checkins ORDER BY mitglied_id;
+    expected: |
+      checkins_2026_03|1
+      checkins_2026_04|2
+      checkins_2026_04|3
+      checkins_rest|4
+      checkins_rest|5
+    hints:
+      - Die Grenzen `'2026-04-01'` sind `timestamptz` und werden in der Zeitzone der Sitzung gelesen. Ende März gilt in Berlin Sommerzeit (`+02`).
+      - "`23:30+00` ist in Berlin 1:30 Uhr am nächsten Tag."
+    explanation: |
+      Die Partitionsgrenzen sind Zeitpunkte: `'2026-04-01'` bedeutet Mitternacht in Berlin, also `2026-03-31 22:00 UTC`. Check-in 1 hat keine Zeitzone und gilt als Berliner Zeit, liegt also im März. Check-in 2 ist um 23:30 UTC, in Berlin schon 1:30 Uhr am 1. April. Check-in 3 ist ausdrücklich in Berliner Sommerzeit und gehört zum April. Check-in 4 liegt vor jeder Partition, Check-in 5 ist in Berlin der 1. Mai um 0:30 Uhr; beide landen in der Default-Partition. Ohne sie wären beide `INSERT`s mit `no partition of relation "checkins" found for row` gescheitert. `tableoid::regclass` zeigt, in welcher Partition eine Zeile liegt.
+    resources:
+      - title: PostgreSQL · Declarative Partitioning
+        url: https://www.postgresql.org/docs/current/ddl-partitioning.html#DDL-PARTITIONING-DECLARATIVE
+
+  - id: timeouts-setzen
+    type: gap
+    title: Timeouts an der richtigen Stelle
+    prompt: |
+      Ergänze die Lücken. Die Migration soll höchstens 2 Sekunden auf ihre Sperre warten, und zwar nur in dieser Transaktion. Für die Rolle der App gilt: keine Anweisung länger als 5 Sekunden, und eine Sitzung, die mit offener Transaktion 30 Sekunden untätig ist, wird beendet. Der Monatsbericht darf ausnahmsweise 60 Sekunden laufen, aber nur in seiner Transaktion.
+    lang: postgres
+    code: |
+      -- Migration
+      BEGIN;
+      SET ⟦LOCAL⟧ ⟦lock_timeout⟧ = '2s';
+      ALTER TABLE buchungen ADD COLUMN notiz text;
+      COMMIT;
+
+      -- Rolle der App, gilt für jede neue Sitzung
+      ⟦ALTER ROLE⟧ deskwerk_app SET statement_timeout = '5s';
+      ALTER ROLE deskwerk_app SET ⟦idle_in_transaction_session_timeout⟧ = '30s';
+
+      -- Monatsbericht
+      BEGIN;
+      ⟦SET LOCAL statement_timeout = '60s'⟧;
+      SELECT standort_id, count(*) FROM checkins GROUP BY standort_id;
+      COMMIT;
+    gaps:
+      - label: Nur diese Transaktion
+        hint: Ohne dieses Wort gilt die Einstellung für den Rest der Sitzung.
+      - label: Warten auf Sperren
+        hint: Gesucht ist der Timeout, der nur das Warten auf eine Sperre begrenzt, nicht die Laufzeit.
+      - label: Für eine Rolle
+        hint: Einstellungen, die jede neue Sitzung eines Benutzers bekommt, setzt man am Benutzer selbst.
+        accept: ["ALTER USER"]
+      - label: Untätig in der Transaktion
+        hint: Der Name beschreibt den Zustand, den `pg_stat_activity` als `idle in transaction` zeigt.
+      - label: Ausnahme für den Bericht
+        hint: Eine ganze Anweisung, die nur bis zum `COMMIT` gilt.
+        accept:
+          - "SET LOCAL statement_timeout = '1min'"
+          - "SET LOCAL statement_timeout = 60000"
+          - "SET LOCAL statement_timeout = '60000'"
+          - "SET LOCAL statement_timeout = '60000ms'"
+          - "SET LOCAL statement_timeout = '60 s'"
+          - "SET LOCAL statement_timeout TO '60s'"
+          - "SET LOCAL statement_timeout TO '1min'"
+          - "SET LOCAL statement_timeout TO 60000"
+          - "SET LOCAL statement_timeout TO '60000ms'"
+          - "SELECT set_config('statement_timeout', '60s', true)"
+    explanation: |
+      `SET LOCAL` gilt bis zum Ende der Transaktion und passt deshalb auch zu PgBouncer im Transaktionsmodus. `lock_timeout` begrenzt nur das Warten auf Sperren: Die Migration bricht nach 2 Sekunden ab, statt hinter einer langen Transaktion zu warten und dabei alle anderen Anfragen hinter sich aufzustauen. `ALTER ROLE … SET` speichert Einstellungen am Benutzer; sie gelten ab der nächsten Sitzung. `idle_in_transaction_session_timeout` beendet die Sitzung und gibt damit Sperren frei und lässt VACUUM wieder aufräumen. Der Bericht hebt den Rollenwert nur für seine eigene Transaktion an.
+    resources:
+      - title: PostgreSQL · lock_timeout
+        url: https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-LOCK-TIMEOUT
+      - title: PostgreSQL · idle_in_transaction_session_timeout
+        url: https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-IDLE-IN-TRANSACTION-SESSION-TIMEOUT
+
+  - id: loeschen-in-portionen
+    type: order
+    title: Alte Check-ins in Portionen löschen
+    prompt: |
+      Ein nächtlicher Job löscht alle Check-ins vor 2025 aus der nicht partitionierten Tabelle, ohne die Datenbank lange zu blockieren. `LOESCHE_ALTE` enthält `DELETE FROM checkins WHERE id IN (SELECT id FROM checkins WHERE zeitpunkt < %s LIMIT 5000)`. Jede Portion soll in einer eigenen Transaktion laufen. Die erste Portion startet sofort. Nach jeder Portion, die etwas gelöscht hat, wartet der Job eine halbe Sekunde; nach der ersten leeren endet er ohne Pause. Bring die Zeilen in die richtige Reihenfolge.
+    lang: python
+    lines: |
+      grenze = datetime(2025, 1, 1, tzinfo=ZoneInfo("Europe/Berlin"))
+      while True:
+          with conn.transaction():
+              cur = conn.execute(LOESCHE_ALTE, (grenze,))
+          if cur.rowcount == 0:
+              break
+          time.sleep(0.5)
+    hints:
+      - Die Grenze ändert sich während der Schleife nicht.
+      - Das `execute` gehört in den `with`-Block, die Prüfung und die Pause danach – nach dem Commit.
+    explanation: |
+      `conn.transaction()` committet am Ende des `with`-Blocks. So hält jede Portion ihre Sperren nur für 5 000 Zeilen und nur für Millisekunden, das WAL fällt in kleinen Stücken an, und Autovacuum kann zwischendurch aufräumen. Ein einziges `DELETE` über Millionen Zeilen wäre eine lange Transaktion, die genau das verhindert. Die Pause lässt dem normalen Betrieb Luft. Die Schleife endet, sobald eine Portion nichts mehr löscht. Bei einer partitionierten Tabelle entfiele all das: `DROP TABLE` auf die alten Monate.
+    resources:
+      - title: psycopg · Transaktionen mit conn.transaction()
+        url: https://www.psycopg.org/psycopg3/docs/basic/transactions.html#transaction-contexts
+
+  - id: geschaetzte-zeilen
+    type: sql
+    lang: postgres
+    title: Ungefähr, aber sofort
+    prompt: |
+      Die Admin-Übersicht zeigt für die Tabellen `buchungen`, `checkins` und `raeume` die ungefähre Zeilenzahl. Sie soll keine Tabelle zählen, sondern die Schätzung aus dem Katalog lesen. Hat PostgreSQL für eine Tabelle noch keine Schätzung, steht dort `NULL`.
+
+      Spalten: `tabelle` (Tabellenname als Text) und `zeilen_ca` (Schätzung als `bigint`). Sortierung: `tabelle` aufsteigend.
+    schema: |
+      CREATE TABLE raeume (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name text NOT NULL);
+      CREATE TABLE checkins (
+        id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        mitglied_id int NOT NULL,
+        zeitpunkt timestamptz NOT NULL
+      );
+      CREATE TABLE buchungen (
+        id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        raum_id int NOT NULL,
+        beginn timestamptz NOT NULL
+      );
+      INSERT INTO raeume (name) SELECT 'Raum ' || g FROM generate_series(1, 12) AS g;
+      INSERT INTO checkins (mitglied_id, zeitpunkt)
+      SELECT 1 + g % 300, '2026-01-01 08:00+01'::timestamptz + g * interval '9 minutes'
+      FROM generate_series(1, 8000) AS g;
+      INSERT INTO buchungen (raum_id, beginn)
+      SELECT 1 + g % 12, '2026-01-05 08:00+01'::timestamptz + g * interval '2 hours'
+      FROM generate_series(1, 3000) AS g;
+      ANALYZE raeume;
+      ANALYZE checkins;
+      DELETE FROM checkins WHERE zeitpunkt < '2026-01-08';
+    starter: |
+      SELECT 'checkins' AS tabelle, count(*) AS zeilen_ca
+      FROM checkins;
+    solution: |
+      SELECT relname::text AS tabelle,
+             CASE WHEN reltuples < 0 THEN NULL ELSE reltuples::bigint END AS zeilen_ca
+      FROM pg_class
+      WHERE oid IN ('buchungen'::regclass, 'checkins'::regclass, 'raeume'::regclass)
+      ORDER BY tabelle;
+    ordered: true
+    hints:
+      - Die Schätzung steht in `pg_class.reltuples`. Den Tabellennamen findest du in `relname`.
+      - "`'checkins'::regclass` liefert die OID der Tabelle; damit vermeidest du Verwechslungen mit Indexen wie `checkins_pkey`."
+      - "`reltuples` ist `-1`, solange die Tabelle nie analysiert wurde: `CASE WHEN reltuples < 0 THEN NULL ELSE reltuples::bigint END` oder `nullif(reltuples, -1)::bigint`."
+    explanation: |
+      Eine Zeile aus `pg_class` zu lesen kostet dasselbe, egal wie groß die Tabelle ist. Die Werte sind aber Schätzungen vom Stand des letzten `ANALYZE` oder `VACUUM`: `checkins` zeigt 8 000, obwohl danach Check-ins gelöscht wurden, und `buchungen` wurde nie analysiert, also `NULL` statt `-1`. Im Betrieb hält Autovacuum die Werte einigermaßen aktuell. `relname` hat den Typ `name`; der Cast nach `text` macht daraus einen gewöhnlichen String. Ein Filter nur auf `relname` ist in einer Datenbank mit mehreren Schemas mehrdeutig, `::regclass` folgt dem `search_path` wie jede Abfrage der App.
+    resources:
+      - title: PostgreSQL · pg_class
+        url: https://www.postgresql.org/docs/current/catalog-pg-class.html
+      - title: PostgreSQL · Object Identifier Types (regclass)
+        url: https://www.postgresql.org/docs/current/datatype-oid.html
+
+  - id: checkins-im-batch
+    type: sql
+    lang: postgres
+    title: Ein Batch vom Drehkreuz
+    prompt: |
+      Das Drehkreuz in Plagwitz (`standort_id = 1`) schickt die Check-ins gesammelt als zwei Arrays: Mitglieder `ARRAY[4, 17, 23, 9]` und Zeitpunkte `ARRAY['2026-03-02 08:52', '2026-03-02 08:55', '2026-03-02 09:01', '2026-03-02 09:03']`. Nach einem Netzwerkfehler schickt es Check-ins erneut; die Unique-Constraint auf `(mitglied_id, zeitpunkt)` kennt solche Doppelten. Bisher fügt die App jeden Check-in in einer Schleife einzeln ein.
+
+      Schreibe **eine** Anweisung, die alle Check-ins des Batches einfügt, bereits vorhandene ohne Fehler überspringt und die neu eingefügten zurückgibt. Spalten: `mitglied_id` und `zeitpunkt`. Die Reihenfolge ist egal.
+    schema: |
+      CREATE TABLE checkins (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        mitglied_id int NOT NULL,
+        standort_id int NOT NULL,
+        zeitpunkt   timestamptz NOT NULL,
+        UNIQUE (mitglied_id, zeitpunkt)
+      );
+      INSERT INTO checkins (mitglied_id, standort_id, zeitpunkt) VALUES
+        (12, 1, '2026-03-02 08:41'),
+        (31, 3, '2026-03-02 08:47'),
+        (4,  1, '2026-03-02 08:52');
+    starter: |
+      INSERT INTO checkins (mitglied_id, standort_id, zeitpunkt)
+      VALUES (17, 1, '2026-03-02 08:55')
+      RETURNING mitglied_id, zeitpunkt;
+    solution: |
+      INSERT INTO checkins (mitglied_id, standort_id, zeitpunkt)
+      SELECT m, 1, z
+      FROM unnest(
+        ARRAY[4, 17, 23, 9],
+        ARRAY['2026-03-02 08:52', '2026-03-02 08:55', '2026-03-02 09:01', '2026-03-02 09:03']::timestamptz[]
+      ) AS t (m, z)
+      ON CONFLICT (mitglied_id, zeitpunkt) DO NOTHING
+      RETURNING mitglied_id, zeitpunkt;
+    hints:
+      - "`unnest` mit zwei Arrays liefert Zeilen mit zwei Spalten: `FROM unnest(a, b) AS t (m, z)`. Die Zeitpunkte brauchen einen Cast nach `timestamptz[]`."
+      - "`INSERT … SELECT m, 1, z FROM unnest(…)` setzt den Standort als Konstante dazu."
+      - "`ON CONFLICT (mitglied_id, zeitpunkt) DO NOTHING` überspringt den doppelten Check-in von Mitglied 4, `RETURNING` liefert nur die eingefügten Zeilen."
+    explanation: |
+      `unnest` mit mehreren Arrays macht aus ihnen Zeilen, Element für Element. In der App sind die Arrays zwei Parameter (`$1`, `$2`), und der SQL-Text bleibt gleich, ob der Batch 4 oder 400 Check-ins enthält: ein Roundtrip, eine Transaktion, ein Eintrag in `pg_stat_statements`. `ON CONFLICT … DO NOTHING` macht den Batch idempotent; ohne es würde der Check-in von Mitglied 4 den ganzen Batch mit `unique_violation` scheitern lassen. `RETURNING` liefert die drei neuen Check-ins. Ein mehrzeiliges `VALUES` liefert dasselbe Ergebnis und ist ebenfalls ein Batch, ändert aber seinen Text mit jeder Batchgröße.
+    resources:
+      - title: PostgreSQL · unnest mit mehreren Arrays
+        url: https://www.postgresql.org/docs/current/functions-array.html#ARRAY-FUNCTIONS-TABLE
+      - title: PostgreSQL · INSERT … ON CONFLICT
+        url: https://www.postgresql.org/docs/current/sql-insert.html#SQL-ON-CONFLICT
+
+  - id: zahlungen-in-einem-update
+    type: sql
+    lang: postgres
+    title: Der Kontoauszug in einem UPDATE
+    prompt: |
+      Der Bankimport liefert zwei Arrays: Rechnungsnummern `ARRAY[101, 102, 104, 109]` und Zahlungszeitpunkte `ARRAY['2026-03-03 10:15', '2026-03-03 10:15', '2026-03-04 09:02', '2026-03-04 09:02']`. Bisher setzt die App `bezahlt_am` mit einem `UPDATE` je Rechnung.
+
+      Schreibe **eine** Anweisung, die für jede Rechnung aus dem Import `bezahlt_am` auf ihren Zahlungszeitpunkt setzt – aber nur, wenn sie noch nicht bezahlt ist. Ein bereits eingetragenes Zahlungsdatum bleibt unverändert, unbekannte Nummern werden ignoriert. Gib die geänderten Rechnungen zurück. Spalten: `id`, `betrag`, `bezahlt_am`. Die Reihenfolge ist egal.
+    schema: |
+      CREATE TABLE rechnungen (
+        id          bigint PRIMARY KEY,
+        mitglied_id int NOT NULL,
+        monat       date NOT NULL,
+        betrag      numeric(10,2) NOT NULL,
+        bezahlt_am  timestamptz,
+        UNIQUE (mitglied_id, monat)
+      );
+      INSERT INTO rechnungen VALUES
+        (101, 4,  '2026-02-01', 189.00, NULL),
+        (102, 17, '2026-02-01',  64.50, NULL),
+        (103, 23, '2026-02-01', 240.00, NULL),
+        (104, 9,  '2026-02-01', 120.00, '2026-02-28 16:40'),
+        (105, 31, '2026-02-01',  89.00, NULL),
+        (106, 12, '2026-02-01', 189.00, '2026-02-27 11:05');
+    starter: |
+      UPDATE rechnungen
+      SET bezahlt_am = '2026-03-03 10:15'
+      WHERE id = 101
+      RETURNING id, betrag, bezahlt_am;
+    solution: |
+      UPDATE rechnungen AS r
+      SET bezahlt_am = z.bezahlt_am
+      FROM unnest(
+        ARRAY[101, 102, 104, 109]::bigint[],
+        ARRAY['2026-03-03 10:15', '2026-03-03 10:15', '2026-03-04 09:02', '2026-03-04 09:02']::timestamptz[]
+      ) AS z (rechnung_id, bezahlt_am)
+      WHERE r.id = z.rechnung_id
+        AND r.bezahlt_am IS NULL
+      RETURNING r.id, r.betrag, r.bezahlt_am;
+    hints:
+      - "`UPDATE … FROM` verbindet die Tabelle mit einer zweiten Quelle, hier einer Tabelle aus `unnest(…) AS z (rechnung_id, bezahlt_am)`."
+      - Die Verknüpfung steht im `WHERE`, zusammen mit der Bedingung, dass die Rechnung noch offen ist.
+      - "`WHERE r.id = z.rechnung_id AND r.bezahlt_am IS NULL`, danach `RETURNING r.id, r.betrag, r.bezahlt_am`."
+    explanation: |
+      `UPDATE … FROM` verbindet jede Rechnung mit ihrer Zeile aus dem Import und setzt den Wert daraus. Rechnung 104 ist schon bezahlt und bleibt dank `r.bezahlt_am IS NULL` unverändert, Nummer 109 hat keinen Partner und ändert nichts. Geändert werden 101 und 102, und das in einem Roundtrip und einer Transaktion statt vier. Die Bedingung auf `bezahlt_am` gehört in die Datenbank, nicht in eine vorherige Abfrage der App: So kann zwischen Prüfen und Schreiben niemand dazwischenkommen. Ohne Alias wäre `bezahlt_am` mehrdeutig, weil beide Quellen eine Spalte dieses Namens haben.
+    resources:
+      - title: PostgreSQL · UPDATE … FROM
+        url: https://www.postgresql.org/docs/current/sql-update.html
+
+  - id: keyset-statt-offset
+    type: sql
+    lang: postgres
+    title: Seite 76 ohne 1 500 Zeilen
+    prompt: |
+      Die Buchungsliste zeigt 20 Buchungen je Seite, sortiert nach `beginn` und bei Gleichstand nach `id`. Die letzte Zeile der vorigen Seite hatte `beginn = '2026-07-11 11:00+02'` und `id = 1500`. Mehrere Buchungen können denselben `beginn` haben. Die bisherige Abfrage holt die nächste Seite mit `OFFSET 1500` und liest dafür 1 520 Zeilen.
+
+      Lege die Abfrage für die nächste Seite als Sicht an: `CREATE VIEW naechste_seite AS …` mit den Spalten `id`, `beginn` und `raum_id`. Sie soll dieselben 20 Buchungen liefern und dabei in keinem Planknoten mehr als 21 Zeilen lesen (gelieferte plus weggefilterte). Der Index auf `(beginn, id)` existiert schon. Die Prüfung vergleicht Anzahl, kleinste und größte `id` und die Summe der `id`s der Sicht und die gelesenen Zeilen laut `EXPLAIN ANALYZE`.
+    schema: |
+      CREATE TABLE buchungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        raum_id     int NOT NULL,
+        mitglied_id int NOT NULL,
+        beginn      timestamptz NOT NULL
+      );
+      INSERT INTO buchungen (raum_id, mitglied_id, beginn)
+      SELECT 1 + g % 12, 1 + g % 400,
+             '2026-01-05 08:00+01'::timestamptz + (g / 8) * interval '1 day' + (g % 8) * interval '1 hour'
+      FROM generate_series(0, 1999) AS g;
+      -- nachgetragen: Buchung 2001 mit demselben Beginn wie 1500, Buchung 2002 im Februar
+      INSERT INTO buchungen (raum_id, mitglied_id, beginn) VALUES
+        (5, 77, '2026-07-11 11:00+02'),
+        (8, 123, '2026-02-02 08:30+01');
+      -- umgebucht: Buchung 300 beginnt jetzt am 11. Juli um 12:30 Uhr
+      UPDATE buchungen SET beginn = '2026-07-11 12:30+02' WHERE id = 300;
+      CREATE INDEX buchungen_beginn_id ON buchungen (beginn, id);
+      ANALYZE buchungen;
+    starter: |
+      CREATE VIEW naechste_seite AS
+      SELECT id, beginn, raum_id
+      FROM buchungen
+      ORDER BY beginn, id
+      LIMIT 20 OFFSET 1500;
+    solution: |
+      CREATE VIEW naechste_seite AS
+      SELECT id, beginn, raum_id
+      FROM buchungen
+      WHERE (beginn, id) > ('2026-07-11 11:00+02', 1500)
+      ORDER BY beginn, id
+      LIMIT 20;
+    check: |
+      CREATE FUNCTION pg_temp.gelesene_zeilen(abfrage text) RETURNS numeric
+      LANGUAGE plpgsql AS $$
+      DECLARE plan jsonb;
+      BEGIN
+        EXECUTE 'EXPLAIN (ANALYZE, TIMING OFF, SUMMARY OFF, BUFFERS OFF, FORMAT JSON) ' || abfrage INTO plan;
+        RETURN (SELECT max((knoten ->> 'Actual Rows')::numeric + coalesce((knoten ->> 'Rows Removed by Filter')::numeric, 0))
+                FROM jsonb_path_query(plan, 'strict $.** ? (exists (@."Actual Rows"))') AS knoten);
+      END $$;
+      SELECT count(*) AS zeilen,
+             min(id) AS kleinste_id,
+             max(id) AS groesste_id,
+             sum(id) AS summe_ids,
+             pg_temp.gelesene_zeilen('SELECT * FROM naechste_seite') <= 21 AS liest_hoechstens_21
+      FROM naechste_seite;
+    hints:
+      - Statt Zeilen zu überspringen, fängst du hinter der letzten gesehenen Zeile an. Welche Bedingung beschreibt „nach (`beginn`, `id`) der letzten Zeile“? `beginn > …` allein verliert Buchungen mit demselben Beginn.
+      - "`beginn > '2026-07-11 11:00+02' OR (beginn = … AND id > 1500)` liefert die richtigen Zeilen, aber PostgreSQL kann damit nicht im Index einsteigen. Probiere den Zeilenvergleich."
+      - "`WHERE (beginn, id) > ('2026-07-11 11:00+02', 1500) ORDER BY beginn, id LIMIT 20`, ohne `OFFSET`."
+    explanation: |
+      Der Zeilenvergleich `(beginn, id) > (…)` vergleicht wie ein Wörterbuch: erst `beginn`, bei Gleichstand `id`. Er passt genau zur Sortierung und zum Index auf `(beginn, id)`, deshalb steht er im Plan als `Index Cond`, und der Scan beginnt direkt hinter der letzten Zeile. Er liest 20 Zeilen, egal auf welcher Seite. Die nachgetragene Buchung 2001 mit demselben Beginn wie 1500 steht als erste auf der neuen Seite, die umgebuchte 300 an ihrem neuen Platz. `WHERE beginn > '2026-07-11 11:00+02'` allein würde 2001 überspringen: Ohne die `id` als zweites Kriterium gehen bei Gleichstand Zeilen verloren. `WHERE id > 1500` passt nicht zur Sortierung nach `beginn` und holt die Februar-Buchung 2002 auf die Seite. Mit `OFFSET 1500` liefert der Scan 1 520 Zeilen und wirft 1 500 weg. Die ausgeschriebene Form mit `OR` liefert dieselben Zeilen, landet aber als `Filter` im Plan: Der Scan startet am Anfang des Index und verwirft 1 500 Zeilen. Die Prüfung zählt deshalb gelieferte und weggefilterte Zeilen. In der App sind die beiden Werte Parameter: `WHERE (beginn, id) > ($1, $2)`.
+    resources:
+      - title: PostgreSQL · LIMIT und OFFSET
+        url: https://www.postgresql.org/docs/current/queries-limit.html#QUERIES-LIMIT
+      - title: PostgreSQL · Row Constructor Comparison
+        url: https://www.postgresql.org/docs/current/functions-comparisons.html#ROW-WISE-COMPARISON
+
+  - id: monatsbericht-ohne-pruning
+    type: bug
+    title: Der Bericht liest alle Partitionen
+    prompt: |
+      Seit `checkins` nach Monat partitioniert ist (24 Partitionen für 2025 und 2026), ist der Monatsbericht langsamer als vorher. `EXPLAIN` zeigt ein `Append` über alle 24 Partitionen. Das Ergebnis stimmt. Finde die Zeile, die das Partition Pruning verhindert, und schreibe sie so, dass PostgreSQL nur die März-Partition liest.
+    lang: postgres
+    code: |
+      -- Monatsbericht: Check-ins je Standort im März 2026
+      SELECT s.name AS standort,
+             count(*) AS checkins,
+             count(DISTINCT c.mitglied_id) AS mitglieder
+      FROM checkins AS c
+      JOIN standorte AS s ON s.id = c.standort_id
+      WHERE date_trunc('month', c.zeitpunkt) = '2026-03-01'
+      GROUP BY s.name
+      ORDER BY s.name;
+    lines: [7]
+    fix:
+      - line: 7
+        answers:
+          - "WHERE c.zeitpunkt >= '2026-03-01' AND c.zeitpunkt < '2026-04-01'"
+          - "WHERE c.zeitpunkt < '2026-04-01' AND c.zeitpunkt >= '2026-03-01'"
+          - "WHERE c.zeitpunkt >= '2026-03-01'::timestamptz AND c.zeitpunkt < '2026-04-01'::timestamptz"
+          - "WHERE c.zeitpunkt >= timestamptz '2026-03-01' AND c.zeitpunkt < timestamptz '2026-04-01'"
+          - "WHERE c.zeitpunkt >= '2026-03-01 00:00' AND c.zeitpunkt < '2026-04-01 00:00'"
+          - "WHERE c.zeitpunkt >= '2026-03-01 00:00:00' AND c.zeitpunkt < '2026-04-01 00:00:00'"
+          - "WHERE '2026-03-01' <= c.zeitpunkt AND c.zeitpunkt < '2026-04-01'"
+          - "WHERE c.zeitpunkt >= '2026-03-01+01' AND c.zeitpunkt < '2026-04-01+02'"
+          - "WHERE c.zeitpunkt >= '2026-03-01 00:00+01' AND c.zeitpunkt < '2026-04-01 00:00+02'"
+    hints:
+      - Pruning vergleicht die Bedingung mit den Partitionsgrenzen. Dafür muss die Bedingung direkt auf dem Partitionsschlüssel stehen.
+      - Schreibe den Monat als halboffenes Intervall auf `c.zeitpunkt`.
+    explanation: |
+      Die Partitionen sind über Bereiche von `zeitpunkt` definiert. PostgreSQL kann eine Partition nur ausschließen, wenn es aus der Bedingung ablesen kann, welche Werte von `zeitpunkt` infrage kommen. `date_trunc('month', c.zeitpunkt)` ist ein Ausdruck über der Spalte, den der Planer nicht auf die Grenzen zurückrechnet, also prüft er jede Zeile in jeder Partition. Das halboffene Intervall `>= '2026-03-01' AND < '2026-04-01'` trifft genau die Grenzen der März-Partition, und das `Append` schrumpft auf einen Scan. `BETWEEN '2026-03-01' AND '2026-04-01'` wäre falsch: Es schließt Check-ins um Mitternacht des 1. April ein. Dieselbe Umformung hilft einem Index auf `zeitpunkt`.
+    resources:
+      - title: PostgreSQL · Partition Pruning
+        url: https://www.postgresql.org/docs/current/ddl-partitioning.html#DDL-PARTITION-PRUNING
+
+  - id: pgbouncer-konfiguration-erklaeren
+    type: explain
+    title: Eine PgBouncer-Konfiguration erklären
+    prompt: |
+      Die Deskwerk-App läuft in 6 Pods mit je 4 Worker-Prozessen. Jeder Prozess hat einen SQLAlchemy-Pool mit `pool_size=5` und `max_overflow=5` und verbindet sich mit PgBouncer statt direkt mit PostgreSQL. PostgreSQL läuft mit `max_connections = 100`. Erkläre einer neuen Kollegin, was diese `pgbouncer.ini` bewirkt, warum die Zahlen zusammenpassen und worauf die App deshalb achten muss.
+    lang: ini
+    code: |
+      [databases]
+      deskwerk = host=db.intern port=5432 dbname=deskwerk
+
+      [pgbouncer]
+      listen_port = 6432
+      pool_mode = transaction
+      max_client_conn = 500
+      default_pool_size = 20
+      max_prepared_statements = 200
+    points:
+      - Die App öffnet bis zu 6 × 4 × 10 = 240 Verbindungen zu PgBouncer; `max_client_conn = 500` erlaubt das.
+      - PgBouncer hält je Benutzer und Datenbank höchstens 20 Serververbindungen offen, weit unter `max_connections = 100`, mit Reserve für Migrationen, Wartung und Monitoring.
+      - "`pool_mode = transaction` gibt einem Client eine Serververbindung nur für die Dauer einer Transaktion; sind alle 20 belegt, wartet der Client, deshalb müssen Transaktionen kurz sein."
+      - Sitzungszustand funktioniert nicht – `SET` ohne `LOCAL`, Advisory Locks auf Sitzungsebene, `LISTEN` –, Einstellungen gehören an die Rolle oder per `SET LOCAL` in die Transaktion.
+      - "`max_prepared_statements` erlaubt Prepared Statements auf Protokollebene, die Treiber wie psycopg nach mehreren Ausführungen anlegen."
+    explanation: |
+      PgBouncer steht zwischen App und Datenbank und nimmt auf Port 6432 Verbindungen an. Die App kann bis zu 240 davon öffnen: 6 Pods mal 4 Prozesse mal 10 Verbindungen je Pool. Direkt an PostgreSQL wären das 240 Serverprozesse bei erlaubten 100. PgBouncer bündelt sie auf höchstens 20 echte Verbindungen je Benutzer und Datenbank. Das reicht, weil im Transaktionsmodus eine Serververbindung nur während einer Transaktion belegt ist, und die meisten Client-Verbindungen sind gerade untätig. Hält eine Transaktion ihre Verbindung lange, etwa während eines HTTP-Aufrufs, warten bald alle anderen in der Schlange von PgBouncer. Weil die Serververbindung nach jeder Transaktion wechseln kann, darf die App keinen Sitzungszustand voraussetzen: Timeouts setzt die Rolle (`ALTER ROLE … SET`) oder `SET LOCAL`, Sperren über mehrere Transaktionen gehen nicht mit `pg_advisory_lock`. `max_prepared_statements` lässt PgBouncer die Prepared Statements der Treiber verfolgen; seit PgBouncer 1.24 ist 200 ohnehin der Standardwert, die Zeile macht ihn sichtbar. psycopg 3 bereitet eine Abfrage vor, sobald sie öfter als fünfmal auf derselben Verbindung lief (`prepare_threshold`).
+    resources:
+      - title: PgBouncer · Konfiguration (pool_mode, default_pool_size, max_prepared_statements)
+        url: https://www.pgbouncer.org/config.html
+      - title: PostgreSQL · max_connections
+        url: https://www.postgresql.org/docs/current/runtime-config-connection.html#GUC-MAX-CONNECTIONS
+
+  - id: checkins-partitionieren
+    type: sql
+    lang: postgres
+    title: Check-ins nach Monat partitionieren
+    prompt: |
+      Die Tabelle `checkins` soll vor dem nächsten Jahr partitioniert werden. Baue sie um:
+
+      - Danach heißt die Tabelle weiter `checkins`, ist nach `zeitpunkt` per Range partitioniert und hat dieselben Spalten.
+      - Je eine Partition für Januar, Februar und März 2026, mit Monatsgrenzen um Mitternacht Berliner Zeit, dazu eine Default-Partition.
+      - Alle bisherigen Check-ins stehen darin, mit unveränderter `id`.
+      - Ein neuer Check-in ohne `id` bekommt eine `id`, die größer ist als alle vorhandenen.
+
+      Die Prüfung sieht nach: ob `checkins` partitioniert ist und nach welchem Schlüssel, die Zahl der Partitionen, Zahl und Summe der `id`s, ob jeder Monat vollständig in einer eigenen Partition liegt, wie viele Partitionen eine Abfrage auf Februar liest, ob ein Check-in vom Mai 2026 angenommen wird und ob ein neuer Check-in eine größere `id` bekommt. Was mit der alten Tabelle passiert, prüft sie nicht.
+    schema: |
+      CREATE TABLE checkins (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        mitglied_id int NOT NULL,
+        standort_id int NOT NULL,
+        zeitpunkt   timestamptz NOT NULL
+      );
+      INSERT INTO checkins (mitglied_id, standort_id, zeitpunkt)
+      SELECT 1 + g % 40, 1 + g % 3, '2026-01-02 07:50'::timestamptz + g * interval '5 hours 7 minutes'
+      FROM generate_series(0, 395) AS g;
+      INSERT INTO checkins (mitglied_id, standort_id, zeitpunkt) VALUES
+        (11, 2, '2026-01-31 23:40'),
+        (12, 2, '2026-02-01 00:30'),
+        (13, 1, '2026-02-28 23:59:59'),
+        (14, 3, '2026-03-01 00:00');
+    starter: |
+      -- ALTER TABLE checkins RENAME TO …
+    solution: |
+      ALTER TABLE checkins RENAME TO checkins_alt;
+
+      CREATE TABLE checkins (
+        id          bigint GENERATED ALWAYS AS IDENTITY,
+        mitglied_id int NOT NULL,
+        standort_id int NOT NULL,
+        zeitpunkt   timestamptz NOT NULL,
+        PRIMARY KEY (id, zeitpunkt)
+      ) PARTITION BY RANGE (zeitpunkt);
+      CREATE TABLE checkins_2026_01 PARTITION OF checkins FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+      CREATE TABLE checkins_2026_02 PARTITION OF checkins FOR VALUES FROM ('2026-02-01') TO ('2026-03-01');
+      CREATE TABLE checkins_2026_03 PARTITION OF checkins FOR VALUES FROM ('2026-03-01') TO ('2026-04-01');
+      CREATE TABLE checkins_rest PARTITION OF checkins DEFAULT;
+
+      INSERT INTO checkins (id, mitglied_id, standort_id, zeitpunkt)
+      OVERRIDING SYSTEM VALUE
+      SELECT id, mitglied_id, standort_id, zeitpunkt FROM checkins_alt;
+
+      SELECT setval(pg_get_serial_sequence('checkins', 'id'), (SELECT max(id) FROM checkins));
+      DROP TABLE checkins_alt;
+    check: |
+      CREATE FUNCTION pg_temp.partitionen_im_plan(abfrage text) RETURNS bigint
+      LANGUAGE plpgsql AS $$
+      DECLARE plan jsonb;
+      BEGIN
+        EXECUTE 'EXPLAIN (COSTS OFF, FORMAT JSON) ' || abfrage INTO plan;
+        RETURN (SELECT count(*) FROM jsonb_path_query(plan, 'strict $.**."Relation Name"'));
+      END $$;
+      WITH neu AS (
+        INSERT INTO checkins (mitglied_id, standort_id, zeitpunkt)
+        VALUES (7, 2, '2026-03-30 18:00')
+        RETURNING id
+      )
+      SELECT c.relkind = 'p' AS partitioniert,
+             pg_get_partkeydef(c.oid) AS schluessel,
+             (SELECT count(*) FROM pg_partition_tree('checkins') WHERE isleaf) AS partitionen,
+             (SELECT count(*) FROM checkins) AS zeilen,
+             (SELECT sum(id) FROM checkins) AS summe_ids,
+             (SELECT bool_and(n = 1) AND count(DISTINCT p) = 3
+              FROM (SELECT date_trunc('month', zeitpunkt) AS monat,
+                           count(DISTINCT tableoid) AS n,
+                           min(tableoid::regclass::text) AS p
+                    FROM checkins
+                    GROUP BY 1) AS m) AS ein_monat_je_partition,
+             pg_temp.partitionen_im_plan($$SELECT * FROM checkins WHERE zeitpunkt >= '2026-02-01' AND zeitpunkt < '2026-03-01'$$) AS partitionen_fuer_februar,
+             lp.versuch($$INSERT INTO checkins (mitglied_id, standort_id, zeitpunkt) VALUES (1, 1, '2026-05-04 09:00')$$) AS mai,
+             (SELECT id FROM neu) > (SELECT max(id) FROM checkins) AS neue_id_groesser
+      FROM pg_class AS c
+      WHERE c.oid = 'checkins'::regclass;
+    hints:
+      - "Eine bestehende Tabelle lässt sich nicht in eine partitionierte umwandeln. Benenne die alte um, lege `checkins` neu mit `PARTITION BY RANGE (zeitpunkt)` an und kopiere die Daten mit `INSERT … SELECT`."
+      - "Der Primärschlüssel einer partitionierten Tabelle muss den Partitionsschlüssel enthalten: `PRIMARY KEY (id, zeitpunkt)`. Bei `GENERATED ALWAYS` brauchst du zum Kopieren der `id`s `OVERRIDING SYSTEM VALUE`."
+      - "Die Identity der neuen Tabelle beginnt bei 1. `SELECT setval(pg_get_serial_sequence('checkins', 'id'), (SELECT max(id) FROM checkins));` setzt sie hinter die höchste `id`. Grenzen ohne Zeitzone, etwa `FROM ('2026-02-01') TO ('2026-03-01')`, gelten in Berliner Zeit."
+    explanation: |
+      PostgreSQL kann eine normale Tabelle nicht nachträglich partitionieren, deshalb entsteht eine neue: umbenennen, partitioniert neu anlegen, kopieren, Identity weiterzählen lassen, alte Tabelle entfernen. Der Primärschlüssel enthält `zeitpunkt`, weil jede Partition ihre Eindeutigkeit nur selbst prüfen kann. `OVERRIDING SYSTEM VALUE` übernimmt die alten `id`s, `setval` sorgt dafür, dass die nächste `id` 401 ist und nicht 1. Die Grenzen sind `timestamptz` und gelten in der Zeitzone der Sitzung. Wer sie in UTC schreibt, verschiebt den Check-in vom 1. Februar um 0:30 Uhr in den Januar und den vom 1. März um Mitternacht in den Februar; dann liegt ein Monat in zwei Partitionen, und die Februar-Abfrage liest zwei statt einer. Die Default-Partition nimmt den Mai-Check-in an, bis jemand die Partition für Mai anlegt. In Produktion liefe das in einer Transaktion mit `lock_timeout`, bei großen Tabellen in Etappen ([Migrationen](/postgres/migrationen)).
+    resources:
+      - title: PostgreSQL · Declarative Partitioning
+        url: https://www.postgresql.org/docs/current/ddl-partitioning.html#DDL-PARTITIONING-DECLARATIVE
+      - title: PostgreSQL · Partitioning Limitations
+        url: https://www.postgresql.org/docs/current/ddl-partitioning.html#DDL-PARTITIONING-DECLARATIVE-LIMITATIONS
+      - title: PostgreSQL · INSERT – OVERRIDING SYSTEM VALUE
+        url: https://www.postgresql.org/docs/current/sql-insert.html

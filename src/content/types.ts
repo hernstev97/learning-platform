@@ -41,11 +41,16 @@ export type ExplainExercise = ExerciseBase & { type: 'explain'; lang: string; co
 export type SqlValue = string | number | null;
 /** Build-time preview of a table the exercise's schema creates: the first rows (`cells` as the sqlite3 shell prints them) and the total row count. */
 export type SqlTable = { name: string; columns: string[]; rows: SqlValue[][]; cells: string[][]; total: number };
+/** `sqlite`: SQLite in Pyodide (src/python). `postgres`: PostgreSQL in PGlite (src/pg). */
+export type SqlEngine = 'sqlite' | 'postgres';
 /**
- * Write a query; it runs in the browser (SQLite in Pyodide) against a fresh database built from `schema` and must return
- * the same columns and rows as `solution`. Row order only counts when `ordered` is set.
+ * Write a query; it runs in the browser against a fresh database built from `schema` and must return the same columns
+ * and rows as `solution`. Row order only counts when `ordered` is set. With `check` (PostgreSQL only) the learner writes
+ * any statements (DDL, DML, transactions); then `check` runs and its result is compared with its result after `solution`.
  */
-export type SqlExercise = ExerciseBase & { type: 'sql'; lang: 'sql'; schema: string; tables: SqlTable[]; starter: string; solution: string; ordered: boolean };
+export type SqlExercise = ExerciseBase & {
+  type: 'sql'; lang: 'sql' | 'postgres'; engine: SqlEngine; schema: string; tables: SqlTable[]; starter: string; solution: string; ordered: boolean; check: string | null;
+};
 
 /** One check of a scenario: a bash script run as root in the VM, passed when it exits with 0. */
 export type ScenarioCheck = { name: string; run: string };

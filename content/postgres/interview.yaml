@@ -1,0 +1,911 @@
+cards:
+  # Relationen und Abfragen: Das relationale Modell
+  - id: null-dreiwertig
+    module: relationales-modell
+    q: "`SELECT * FROM buchungen WHERE preis <> 50` liefert keine Buchungen ohne Preis. Warum, und wie schreibst du es richtig?"
+    a: |
+      Weil SQL mit drei Wahrheitswerten rechnet. `NULL <> 50` ist nicht wahr, sondern unbekannt, und `WHERE` behält nur Zeilen, für die die Bedingung wahr ist. `NULL` heißt „Wert unbekannt“ – ob ein unbekannter Preis 50 ist, weiß niemand.
+
+      Wenn Buchungen ohne Preis dazugehören sollen, schreibe ich `WHERE preis IS DISTINCT FROM 50`. Das behandelt `NULL` wie einen normalen Wert. Ausführlich wäre es `WHERE preis <> 50 OR preis IS NULL`.
+
+      Dieselbe Logik wirkt an anderen Stellen andersherum: `CHECK (preis >= 0)` lässt `NULL` durch, weil ein Check nur bei „falsch“ scheitert. Wer keinen fehlenden Preis will, braucht zusätzlich `NOT NULL`. Und `count(preis)` zählt nur Zeilen mit Preis, `count(*)` alle.
+    tags: [null, grundlagen]
+    level: 1
+  - id: identity-oder-uuid
+    module: relationales-modell
+    q: Identity-Spalte oder UUID als Primärschlüssel – wie entscheidest du?
+    a: |
+      Standard ist für mich `bigint GENERATED ALWAYS AS IDENTITY`. Der Schlüssel ist klein (8 Byte), fortlaufend und damit freundlich zum B-Baum, und Menschen können ihn am Telefon vorlesen.
+
+      Eine UUID nehme ich, wenn IDs außerhalb der Datenbank entstehen müssen – im Client, der offline Buchungen anlegt, oder in mehreren Diensten, deren Daten später zusammenkommen – oder wenn fortlaufende IDs nichts verraten sollen, etwa wie viele Rechnungen es gibt. Dann `uuidv7()`, das es seit PostgreSQL 18 eingebaut gibt: Die Werte beginnen mit einem Zeitstempel und landen deshalb im Index meist am rechten Rand, statt ihn wie zufällige v4-UUIDs über alle Seiten zu verteilen.
+
+      Unabhängig davon ist der Surrogatschlüssel nur die technische Identität. Fachliche Eindeutigkeit wie die E-Mail eines Mitglieds sichere ich zusätzlich mit `UNIQUE`.
+    tags: [schlüssel, typen]
+    level: 2
+  - id: schema-review-typen
+    module: relationales-modell
+    q: |
+      Code-Review: Was änderst du an dieser Tabelle?
+
+      ```postgres
+      CREATE TABLE rechnungen (
+        id          serial PRIMARY KEY,
+        mitglied    varchar(255),
+        monat       varchar(7),          -- '2026-03'
+        betrag      float,
+        bezahlt_am  timestamp
+      );
+      ```
+    a: |
+      Fast jede Spalte. `betrag float` rechnet binär und rundet: Aus 0,1 + 0,2 wird nicht genau 0,3. Für Geld nehme ich `numeric(10,2)` oder ganze Cent als `bigint`.
+
+      `bezahlt_am timestamp` speichert eine Wanduhrzeit ohne Zone. Ob 09:00 Berlin oder UTC war, weiß später niemand, und um die Zeitumstellung wird es mehrdeutig. Für Zeitpunkte gehört `timestamptz` hin.
+
+      `monat varchar(7)` erlaubt `'2026-13'` und `'März'`. Besser `date` mit dem ersten Tag des Monats und `CHECK (extract(day FROM monat) = 1)`.
+
+      `mitglied varchar(255)` ist vermutlich ein Name statt eines Verweises. Richtig ist `mitglied_id int NOT NULL REFERENCES mitglieder (id)`. Die 255 ist eine Gewohnheit aus MySQL; in PostgreSQL ist `text` gleich schnell.
+
+      Außerdem fehlen `NOT NULL` und `UNIQUE (mitglied_id, monat)`, und statt `serial` nehme ich eine Identity-Spalte. Das Schema ist der Vertrag, den keine App-Version brechen kann. Jede Regel, die hier fehlt, muss jeder Codepfad selbst einhalten.
+    tags: [review, typen, schema]
+    level: 1
+  - id: mengen-ohne-reihenfolge
+    module: relationales-modell
+    q: In der Testumgebung kommen die Buchungen immer nach `id` sortiert, in Produktion plötzlich nicht mehr. Die Abfrage hat kein `ORDER BY`. Was ist los?
+    a: |
+      Nichts Ungewöhnliches. Eine Tabelle ist eine Menge von Zeilen, ohne Reihenfolge. Ohne `ORDER BY` liefert PostgreSQL die Zeilen in der Reihenfolge, die der Plan gerade ergibt. In einer kleinen, frisch befüllten Tabelle ist das zufällig die Einfügereihenfolge.
+
+      In Produktion ändern sich die Bedingungen. Ein `UPDATE` legt eine neue Zeilenversion an einer anderen Stelle im Heap an, der Planer wählt einen Index oder einen Hash Join, oder ein synchronisierter Seq Scan beginnt mitten in der Tabelle. Die Reihenfolge wechselt dann ohne jede Codeänderung.
+
+      Die Lösung ist ein ausdrückliches `ORDER BY` mit eindeutigem Ende, etwa `ORDER BY beginn, id`. Dasselbe gilt für `LIMIT` ohne `ORDER BY`: Welche Zeilen kommen, ist dann nicht festgelegt. Im Review markiere ich jedes `LIMIT` und jede Listenabfrage ohne Sortierung.
+    tags: [grundlagen, sortierung]
+    level: 1
+
+  # Relationen und Abfragen: Abfragen für Anwendungen
+  - id: count-nach-left-join
+    module: abfragen
+    q: |
+      Code-Review: Mitglieder ohne Buchung sollen 0 zeigen, zeigen aber 1. Warum?
+
+      ```postgres
+      SELECT m.name, count(*) AS buchungen
+      FROM mitglieder m
+      LEFT JOIN buchungen b ON b.mitglied_id = m.id
+      GROUP BY m.id, m.name;
+      ```
+    a: |
+      Der `LEFT JOIN` behält ein Mitglied ohne Buchung als eine Zeile, deren Spalten aus `buchungen` alle `NULL` sind. `count(*)` zählt Zeilen, also 1. Richtig ist `count(b.id)`: Das zählt nur Werte, die nicht `NULL` sind, für dieses Mitglied also 0.
+
+      Bei Summen ist es ähnlich: `sum(b.preis)` liefert für das Mitglied `NULL`, nicht 0. Für die Anzeige schreibe ich `coalesce(sum(b.preis), 0)`.
+
+      Zwei weitere Fallen prüfe ich bei solchen Listen. Eine Bedingung wie `b.status = 'bestaetigt'` gehört ins `ON`, nicht ins `WHERE`, sonst fallen die Mitglieder ohne Buchung wieder heraus. Und wenn ein zweiter 1:n-Join dazukommt, etwa Check-ins, multiplizieren sich die Zeilen. Dann verdichte ich vorher je Tabelle.
+    tags: [review, aggregation, joins]
+    level: 1
+  - id: offset-langsam
+    module: abfragen
+    q: Die Buchungsliste im Admin-Bereich wird mit jeder Seite langsamer, ab Seite 500 dauert sie Sekunden. Was ist die Ursache, und was schlägst du vor?
+    a: |
+      Vermutlich `LIMIT 20 OFFSET 10000`. `OFFSET` überspringt nicht, es liest die 10 000 Zeilen in Sortierreihenfolge und wirft sie weg. Die Arbeit wächst also mit der Seitenzahl. Dazu kommt, dass Zeilen doppelt erscheinen oder fehlen, wenn zwischen zwei Seitenaufrufen jemand bucht.
+
+      Ich schlage Keyset-Paginierung vor: Die App merkt sich Sortierwert und `id` der letzten Zeile und fragt `WHERE (beginn, id) > ($1, $2) ORDER BY beginn, id LIMIT 20`. Mit einem Index auf `(beginn, id)` springt PostgreSQL direkt an die Stelle, jede Seite ist gleich schnell, und neue Buchungen verschieben nichts.
+
+      Der Preis: Man kann nicht direkt auf Seite 500 springen, sondern nur vor und zurück. Für eine Liste mit „Mehr laden“ oder eine API mit Cursor passt das. Wenn das Produkt Seitenzahlen braucht, prüfe ich, ob die Nutzer überhaupt so weit blättern, oder biete einen Filter nach Datum an.
+    tags: [paginierung, performance]
+    level: 2
+  - id: sortierung-tiebreaker
+    module: abfragen
+    q: Ein Nutzer meldet, dass eine Buchung auf Seite 2 und Seite 3 der Liste auftaucht und eine andere nirgends. Sortiert wird nach `beginn`. Woran liegt es?
+    a: |
+      `beginn` ist nicht eindeutig. Viele Buchungen beginnen um 09:00. Bei Gleichstand ist die Reihenfolge nicht festgelegt und kann sich zwischen zwei Abfragen ändern, etwa weil der Planer einen anderen Weg wählt. Mit `LIMIT`/`OFFSET` landet dieselbe Zeile dann auf zwei Seiten, eine andere auf keiner.
+
+      Die Lösung ist ein Tiebreaker, der die Sortierung eindeutig macht: `ORDER BY beginn, id`. Bei Keyset-Paginierung ist das ohnehin Pflicht, weil `WHERE (beginn, id) > (…)` nur mit einem eindeutigen Schlüssel funktioniert. Der passende Index ist `(beginn, id)`.
+
+      Im Code-Review achte ich auf jedes `ORDER BY` vor einem `LIMIT`, dessen letzte Spalte nicht eindeutig ist. Im ORM gilt dasselbe: `order_by(Buchung.beginn, Buchung.id)`.
+    tags: [sortierung, paginierung]
+    level: 1
+  - id: maerz-filtern
+    module: abfragen
+    q: Wie schreibst du den Filter „alle Buchungen, die im März 2026 beginnen“? `beginn` ist `timestamptz`, Deskwerk sitzt in Leipzig.
+    a: |
+      Mit einem halboffenen Intervall in der Zeitzone, die fachlich gilt:
+
+      ```postgres
+      WHERE beginn >= timestamptz '2026-03-01 00:00 Europe/Berlin'
+        AND beginn <  timestamptz '2026-04-01 00:00 Europe/Berlin'
+      ```
+
+      `BETWEEN '2026-03-01' AND '2026-03-31'` ist falsch: Die Obergrenze ist der 31. März um 00:00, alles danach an diesem Tag fehlt. Ein halboffenes Intervall mit `<` auf den Monatsersten hat dieses Problem nicht, und Monate schließen lückenlos aneinander an.
+
+      Die Zeitzone gehört ausdrücklich hinein. Ohne Angabe nimmt PostgreSQL die `TimeZone` der Sitzung. Läuft die App in UTC, beginnt der März dann um 01:00 deutscher Zeit, und eine Buchung um 00:30 am 1. März zählt zum Februar. Die Sommerzeit Ende März ändert am Filter nichts, aber Dauern: Der 29. März 2026 hat nur 23 Stunden.
+
+      Außerdem bleibt die Bedingung so indexfreundlich. `date_trunc('month', beginn) = '2026-03-01'` wendet eine Funktion auf die Spalte an, und ein normaler Index auf `beginn` hilft nicht mehr.
+    tags: [zeit, zeitzonen, filter]
+    level: 2
+
+  # Relationen und Abfragen: Unterabfragen und CTEs
+  - id: not-in-null
+    module: unterabfragen-ctes
+    q: "`SELECT … FROM mitglieder WHERE id NOT IN (SELECT geworben_von FROM mitglieder)` liefert nie eine Zeile. Warum?"
+    a: |
+      Weil `geworben_von` bei Mitgliedern ohne Empfehlung `NULL` ist. `id NOT IN (1, 2, NULL)` bedeutet `id <> 1 AND id <> 2 AND id <> NULL`, und der letzte Teil ist immer unbekannt. Das ganze `AND` wird damit nie wahr, und die Abfrage liefert nichts. Sie liefert auch keinen Fehler, und das macht den Fehler gefährlich.
+
+      Ich schreibe Anti-Joins deshalb mit `NOT EXISTS`:
+
+      ```postgres
+      SELECT m.* FROM mitglieder m
+      WHERE NOT EXISTS (SELECT 1 FROM mitglieder w WHERE w.geworben_von = m.id);
+      ```
+
+      `NOT EXISTS` fragt nur, ob eine passende Zeile existiert, und `NULL` stört dabei nicht. PostgreSQL plant es außerdem als Anti-Join, was meist mindestens so schnell ist. `IN` mit Unterabfrage ist dagegen unproblematisch, weil ein Treffer genügt. Die Grundlagen stehen im Data-Kurs unter [Joins](/data/sql-joins).
+    tags: [null, unterabfragen]
+    level: 2
+  - id: top-n-je-mitglied
+    module: unterabfragen-ctes
+    q: Für das Dashboard brauchst du je Mitglied die drei letzten Buchungen. Welche Möglichkeiten gibt es in PostgreSQL?
+    a: |
+      Drei übliche Wege. Mit `LATERAL` läuft eine Unterabfrage je Mitglied:
+
+      ```postgres
+      SELECT m.name, b.beginn
+      FROM mitglieder m
+      CROSS JOIN LATERAL (
+        SELECT beginn FROM buchungen
+        WHERE mitglied_id = m.id
+        ORDER BY beginn DESC LIMIT 3
+      ) b;
+      ```
+
+      Mit einem Index auf `(mitglied_id, beginn)` liest das je Mitglied nur drei Indexeinträge. Das ist ideal, wenn die Mitglieder ohnehin gefiltert sind, etwa auf eine Seite der Liste.
+
+      Die zweite Variante ist eine Fensterfunktion: `row_number() OVER (PARTITION BY mitglied_id ORDER BY beginn DESC)` in einer Unterabfrage, außen `WHERE rn <= 3`. Sie liest alle Buchungen und ist gut, wenn ohnehin alle Mitglieder gebraucht werden. Mehr dazu im Data-Kurs unter [Fensterfunktionen](/data/sql-fensterfunktionen). Für genau eine Zeile je Gruppe gibt es drittens `DISTINCT ON (mitglied_id) … ORDER BY mitglied_id, beginn DESC`.
+
+      Mitglieder ohne Buchung fallen bei `CROSS JOIN LATERAL` weg. Wenn sie erscheinen sollen, schreibe ich `LEFT JOIN LATERAL (…) b ON true`.
+    tags: [lateral, top-n]
+    level: 2
+  - id: cte-optimierung
+    module: unterabfragen-ctes
+    q: Ein Kollege sagt, CTEs seien in PostgreSQL langsam, weil sie eine Optimierungsschranke sind. Stimmt das?
+    a: |
+      Das stimmte bis PostgreSQL 11. Dort wurde jede CTE einzeln ausgewertet und ihr Ergebnis zwischengespeichert. Eine Bedingung der Hauptabfrage konnte nicht in die CTE hineinwandern, und ein Index wurde dann womöglich nicht genutzt.
+
+      Seit PostgreSQL 12 bettet der Planer eine CTE in die Hauptabfrage ein, wenn sie nicht rekursiv ist, keine Seiteneffekte hat und nur einmal referenziert wird. Sie verhält sich dann wie eine Unterabfrage. Mit `WITH x AS MATERIALIZED (…)` erzwingt man das alte Verhalten, etwa wenn eine teure Berechnung sonst mehrfach liefe; `NOT MATERIALIZED` erzwingt das Einbetten auch bei mehrfacher Nutzung.
+
+      Für mich sind CTEs deshalb in erster Linie ein Mittel für Lesbarkeit: Schritte mit Namen statt verschachtelter Unterabfragen. Ob eine konkrete Abfrage schnell ist, zeigt `EXPLAIN`, nicht die Schreibweise. Datenverändernde und rekursive CTEs werden weiterhin immer getrennt ausgewertet.
+    tags: [cte, planer]
+    level: 2
+
+  # Relationen und Abfragen: Daten ändern
+  - id: upsert-statt-pruefen
+    module: daten-aendern
+    q: |
+      Code-Review: Die Monatsrechnung soll angelegt oder aktualisiert werden. Was ist das Problem?
+
+      ```python
+      rechnung = session.scalar(
+          select(Rechnung).where(Rechnung.mitglied_id == mid, Rechnung.monat == monat)
+      )
+      if rechnung is None:
+          session.add(Rechnung(mitglied_id=mid, monat=monat, betrag=betrag))
+      else:
+          rechnung.betrag = betrag
+      session.commit()
+      ```
+    a: |
+      Zwischen dem `SELECT` und dem `INSERT` liegt eine Lücke. Laufen zwei Abrechnungsläufe gleichzeitig, sehen beide „keine Rechnung“ und fügen beide ein. Mit `UNIQUE (mitglied_id, monat)` scheitert der zweite mit `23505`, ohne Constraint gibt es zwei Rechnungen. Das ist ein klassisches „erst prüfen, dann handeln“.
+
+      Ein Upsert erledigt Prüfung und Schreiben atomar in einer Anweisung:
+
+      ```postgres
+      INSERT INTO rechnungen (mitglied_id, monat, betrag)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (mitglied_id, monat) DO UPDATE SET betrag = EXCLUDED.betrag
+      RETURNING id;
+      ```
+
+      In SQLAlchemy geht das mit `insert()` aus `sqlalchemy.dialects.postgresql` und `.on_conflict_do_update(…)`. Voraussetzung ist der Unique-Constraint. Ohne ihn weiß PostgreSQL nicht, was ein Konflikt ist. Bezahlte Rechnungen schütze ich mit `… DO UPDATE SET … WHERE rechnungen.bezahlt_am IS NULL`.
+    tags: [review, upsert, nebenläufigkeit]
+    level: 2
+  - id: massenimport-langsam
+    module: daten-aendern
+    q: Ein nächtlicher Import schreibt 50 000 Check-ins aus dem Zutrittssystem und braucht zwölf Minuten. Wie machst du ihn schneller?
+    a: |
+      Zuerst schaue ich, wie geschrieben wird. Meist ist es eine Schleife mit einem `INSERT` und oft einem `COMMIT` je Zeile. Dann kostet jede Zeile eine Netzwerk-Rundreise und jedes `COMMIT` einen Schreibvorgang auf die Platte. Die Datenbank selbst ist dabei selten der Engpass.
+
+      Die Abhilfe in Stufen: alles in einer Transaktion. Dann mehrzeilige `INSERT`s, also `executemany` mit Batches oder `INSERT … SELECT * FROM unnest($1::int[], $2::int[], $3::timestamptz[])`, das tausende Zeilen mit drei Parametern schreibt. Am schnellsten ist `COPY`, in psycopg über `cursor.copy("COPY checkins (…) FROM STDIN")`. Das ist das Protokoll für Massenimporte.
+
+      Danach kommen die Tabellen selbst. Viele Indexe und Trigger verlangsamen jeden Insert. Bei einer Erstbefüllung lohnt es sich, Indexe danach anzulegen. Wenn der Import wiederholt laufen darf, mache ich ihn mit einem Unique-Schlüssel und `ON CONFLICT DO NOTHING` idempotent. Zum Schluss `ANALYZE`, damit der Planer die neuen Zahlen kennt.
+    tags: [batch, performance, import]
+    level: 2
+  - id: merge-oder-on-conflict
+    module: daten-aendern
+    q: Wann nimmst du `MERGE`, wann `INSERT … ON CONFLICT`?
+    a: |
+      `ON CONFLICT` ist für Upserts auf einen eindeutigen Schlüssel gebaut: einfügen oder, wenn der Schlüssel existiert, ändern oder nichts tun. Es ist auch bei gleichzeitigen Aufrufen atomar. Kommt zwischen Prüfung und Einfügen eine andere Transaktion dazwischen, wird daraus das `UPDATE`.
+
+      `MERGE` (seit PostgreSQL 15, mit `RETURNING` seit 17) gleicht eine ganze Quelle mit einer Zieltabelle ab und kann je Fall verschieden reagieren: einfügen, ändern oder löschen, mit Bedingungen je Zweig. Typisch ist die Synchronisation einer Raumliste aus einem Import, bei der fehlende Räume deaktiviert werden. `merge_action()` sagt in `RETURNING`, was mit jeder Zeile passiert ist.
+
+      Den Unterschied unter Last nenne ich ausdrücklich. `MERGE` folgt den normalen Isolationsregeln, und fügen zwei Sitzungen gleichzeitig denselben Schlüssel ein, kann eine mit `23505` scheitern. Die PostgreSQL-Doku empfiehlt dafür selbst `ON CONFLICT`. Für den Upsert im Request-Pfad nehme ich deshalb `ON CONFLICT`, für Abgleiche im Batch `MERGE`.
+    tags: [upsert, merge]
+    level: 2
+  - id: update-ohne-where
+    module: daten-aendern
+    q: Du hast in der Produktionsdatenbank `UPDATE buchungen SET status = 'storniert'` ausgeführt und das `WHERE` vergessen. Was jetzt – und wie verhinderst du das künftig?
+    a: |
+      Sofort Bescheid geben, nicht vertuschen. Wenn ich in einer offenen Transaktion war, also nach `BEGIN`, rolle ich mit `ROLLBACK` zurück, und nichts ist passiert. In psql mit Autocommit ist die Änderung dagegen festgeschrieben. Ein Rückgängig gibt es dann nicht.
+
+      Die Wiederherstellung hängt am Backup-Konzept. Mit Point-in-Time-Recovery lässt sich eine Kopie der Datenbank auf den Zeitpunkt kurz vor dem Fehler herstellen. Aus ihr kopiere ich die alten Statuswerte gezielt zurück, statt die ganze Produktion zurückzusetzen, denn seitdem sind neue Buchungen entstanden. Gibt es ein Audit-Log mit alten Werten, geht es auch daraus. Danach folgt ein kurzes Postmortem ohne Schuldzuweisung.
+
+      Zur Vorbeugung: in Produktion nur mit `BEGIN` arbeiten und die gemeldete Zeilenzahl (`UPDATE 48213`) prüfen, bevor ich `COMMIT` tippe. Die Bedingung schreibe ich zuerst als `SELECT count(*) … WHERE …`. psql kann `\set AUTOCOMMIT off`. Datenkorrekturen gehören wie Migrationen in ein Skript mit Review. Und mein Alltagszugang hat keine Schreibrechte auf Produktion.
+    tags: [betrieb, fehler, transaktionen]
+    level: 2
+
+  # Datenmodell und Integrität: Constraints
+  - id: doppelbuchung-gleichzeitig
+    module: constraints
+    q: Zwei Mitglieder buchen gleichzeitig denselben Raum für überlappende Zeiten. Die App prüft vorher, ob der Raum frei ist. Trotzdem entstehen Doppelbuchungen. Wie löst du das?
+    a: |
+      Die Prüfung in der App ist ein „erst prüfen, dann einfügen“. Beide Requests lesen „frei“, bevor einer von beiden geschrieben hat, und beide fügen ein. Auch eine Transaktion ändert daran unter Read Committed nichts, denn keine der beiden sieht die noch nicht festgeschriebene Zeile der anderen.
+
+      Die robuste Lösung ist ein Exclusion Constraint in der Datenbank:
+
+      ```postgres
+      CREATE EXTENSION IF NOT EXISTS btree_gist;
+      ALTER TABLE buchungen ADD CONSTRAINT keine_doppelbuchung
+        EXCLUDE USING gist (raum_id WITH =, tstzrange(beginn, ende) WITH &&)
+        WHERE (status = 'bestaetigt');
+      ```
+
+      Er verbietet zwei bestätigte Buchungen desselben Raums mit überlappenden Zeiträumen, auch bei gleichzeitigen Transaktionen: Die zweite wartet auf die erste und scheitert dann mit SQLSTATE `23P01`. Die App fängt genau diesen Code ab und antwortet mit 409 „Raum in diesem Zeitraum belegt“. Die Vorabprüfung bleibt für eine freundliche Meldung im Formular, ist aber nicht mehr die Sicherung.
+
+      Halboffene Ranges `[)` sorgen dafür, dass 9–10 und 10–11 Uhr nicht kollidieren. Alternativen wären `SELECT … FOR UPDATE` auf die Raumzeile oder Serializable mit Retry. Beides funktioniert nur, wenn jeder Codepfad daran denkt.
+    tags: [nebenläufigkeit, exclusion, szenario]
+    level: 2
+  - id: constraint-oder-app
+    module: constraints
+    q: Wir validieren alles in Pydantic. Wozu noch Constraints in der Datenbank?
+    a: |
+      Weil die App nicht der einzige Weg in die Datenbank ist und weil sie Race Conditions nicht verhindern kann. Neben der API schreiben ein Prisma-Dienst, Migrationsskripte, Datenkorrekturen in psql und der nächste Import, der in drei Jahren entsteht. Ein Constraint gilt für alle diese Wege.
+
+      Manche Regeln kann nur die Datenbank sicher prüfen: Eindeutigkeit, Verweise und Überschneidungen. „E-Mail noch frei?“ in Pydantic ist bei zwei gleichzeitigen Registrierungen wertlos. `UNIQUE` liefert garantiert `23505`.
+
+      Die Arbeitsteilung, die ich vorschlage: Die App validiert für gute Fehlermeldungen, früh und mit Kontext. Die Datenbank sichert die Invarianten mit `NOT NULL`, `CHECK`, `UNIQUE`, `REFERENCES` und `EXCLUDE`. Die App übersetzt deren SQLSTATE in HTTP-Antworten: `23505` und `23P01` in 409, `23503` bei einem unbekannten Verweis in 422. Regeln, die externe Daten brauchen, etwa „Mitglied hat bezahlt“, bleiben in der App.
+    tags: [integrität, architektur]
+    level: 1
+  - id: mitglied-loeschen-langsam
+    module: constraints
+    q: Das Löschen eines einzelnen Mitglieds dauert mehrere Sekunden und blockiert zwischendurch Buchungen. Woran denkst du zuerst?
+    a: |
+      An einen fehlenden Index auf der Fremdschlüsselspalte. `buchungen.mitglied_id REFERENCES mitglieder (id)` legt nur auf der Seite von `mitglieder` einen Index an, nämlich den Primärschlüssel. Beim `DELETE FROM mitglieder` muss PostgreSQL prüfen, ob noch Buchungen darauf verweisen. Ohne Index auf `buchungen.mitglied_id` ist das ein Seq Scan über alle Buchungen, und zwar für jede referenzierende Tabelle: Buchungen, Rechnungen, Check-ins.
+
+      Belegen kann ich das mit `EXPLAIN (ANALYZE)` auf dem `DELETE` in einer Transaktion mit `ROLLBACK`. Die Zeit der FK-Prüfung steht dort unter `Trigger for constraint …`. Abhilfe ist `CREATE INDEX CONCURRENTLY ON buchungen (mitglied_id)`, der hilft auch Joins.
+
+      Dann die fachliche Frage: Soll das überhaupt gehen? Mit `ON DELETE RESTRICT` oder dem Standard `NO ACTION` scheitert das Löschen, solange Buchungen existieren. Das ist für Abrechnungsdaten richtig. `CASCADE` würde Rechnungen mitlöschen, die aufbewahrt werden müssen. Oft ist die Antwort, personenbezogene Daten zu anonymisieren, statt die Zeile zu löschen.
+    tags: [fremdschlüssel, index, szenario]
+    level: 2
+  - id: unique-und-null
+    module: constraints
+    q: Auf `mitglieder (email)` liegt `UNIQUE`. Trotzdem gibt es `Lena.Wagner@example.org` und `lena.wagner@example.org`, und nach dem Soft Delete kann sich niemand mit derselben Adresse neu anmelden. Wie baust du die Regel richtig?
+    a: |
+      `UNIQUE` vergleicht exakt, Groß- und Kleinschreibung zählen also. Und er gilt für alle Zeilen, auch die als gelöscht markierten. Beides löst ein partieller Unique-Index auf einem Ausdruck:
+
+      ```postgres
+      CREATE UNIQUE INDEX mitglieder_email_aktiv
+        ON mitglieder (lower(email)) WHERE geloescht_am IS NULL;
+      ```
+
+      Damit ist jede Adresse unabhängig von der Schreibweise nur einmal unter den aktiven Mitgliedern erlaubt. Abfragen müssen dann `WHERE lower(email) = lower($1)` schreiben, sonst nutzen sie den Index nicht. Eine Alternative ist der Typ `citext` aus der gleichnamigen Erweiterung.
+
+      Zur Vollständigkeit: `NULL` gilt bei `UNIQUE` als verschieden von jedem anderen `NULL`, mehrere Zeilen ohne E-Mail wären also erlaubt. Seit PostgreSQL 15 ändert `UNIQUE NULLS NOT DISTINCT` das. Hier ist `email` ohnehin `NOT NULL`.
+    tags: [unique, soft-delete, index]
+    level: 2
+
+  # Datenmodell und Integrität: Normalisierung
+  - id: anomalien-buchungsliste
+    module: normalisierung
+    q: Deskwerk hat Buchungen bisher in einer Tabelle mit den Spalten Datum, Raum, Standort, Stundenpreis, Mitglied, E-Mail geführt. Welche Probleme erwartest du?
+    a: |
+      Die drei klassischen Anomalien. Änderungsanomalie: Der Stundenpreis des Ateliers steht in jeder Buchungszeile. Wird er erhöht und nicht überall angepasst, hat derselbe Raum zwei Preise. Dasselbe gilt für die E-Mail eines Mitglieds. Einfügeanomalie: Ein neuer Raum existiert erst, wenn ihn jemand bucht, denn ohne Buchung gibt es keine Zeile. Löschanomalie: Wird die einzige Buchung eines Mitglieds gelöscht, ist auch seine E-Mail weg.
+
+      Die Ursache sind funktionale Abhängigkeiten, die nicht vom Schlüssel der Tabelle ausgehen: Raum → Standort, Raum → Stundenpreis, Mitglied → E-Mail. Jede dieser Tatsachen steht so vielfach.
+
+      Ich zerlege in `standorte`, `raeume`, `mitglieder` und `buchungen` mit Fremdschlüsseln. Migriert wird mit `INSERT … SELECT DISTINCT` in die neuen Tabellen und einem Join zurück, um die IDs zu setzen. Vorher zähle ich die Widersprüche, etwa denselben Raum mit zwei Standorten, denn die muss jemand fachlich entscheiden.
+    tags: [normalisierung, anomalien]
+    level: 1
+  - id: normalformen-erklaeren
+    module: normalisierung
+    q: Erkläre 1NF, 2NF und 3NF an einem Beispiel.
+    a: |
+      1NF: Jede Spalte enthält einen atomaren Wert, keine Listen wie `'Atelier, Loft'` und keine Wiederholungsgruppen wie `raum1`, `raum2`, `raum3`. Sonst kann man nicht sauber filtern, joinen oder Constraints setzen.
+
+      2NF betrifft zusammengesetzte Schlüssel. Jede Nicht-Schlüsselspalte hängt vom ganzen Schlüssel ab. In `teilnahmen (buchung_id, mitglied_id, mitglied_name)` hängt der Name nur von `mitglied_id` ab und gehört in `mitglieder`.
+
+      3NF: Keine Nicht-Schlüsselspalte hängt von einer anderen Nicht-Schlüsselspalte ab. In `raeume (id, standort_id, standort_name)` folgt der Name aus `standort_id`, nicht aus dem Raum. Die Kurzformel: Jede Spalte hängt vom Schlüssel ab, vom ganzen Schlüssel und von nichts außer dem Schlüssel. BCNF verschärft das für Fälle mit mehreren überlappenden Kandidatenschlüsseln. Die kommen in der Praxis selten vor.
+
+      Dazu sage ich, dass Normalisierung ein Werkzeug ist. Ein `jsonb` mit Geräteeinstellungen verletzt formal 1NF und ist trotzdem in Ordnung, solange niemand danach joinen oder es mit Constraints prüfen muss.
+    tags: [normalisierung, grundlagen]
+    level: 1
+  - id: preis-snapshot
+    module: normalisierung
+    q: In `buchungen` steht ein `preis`, obwohl er sich aus Raumpreis und Dauer berechnen lässt. Ist das ein Normalisierungsfehler?
+    a: |
+      Nein. Es ist eine andere Tatsache. `raeume.preis_pro_stunde` ist der aktuelle Listenpreis, `buchungen.preis` der Preis, der zum Buchungszeitpunkt vereinbart wurde. Wird der Atelierpreis im Mai erhöht, darf sich keine Märzrechnung ändern. Rabatte, Tarife und Aktionen kommen dazu, und die Rechnung muss später reproduzierbar sein. Der Snapshot hängt also von der Buchung ab, nicht vom Raum.
+
+      Echte Redundanz wäre dagegen `buchungen.raum_name`. Der Name folgt aus `raum_id` und soll sich bei einer Umbenennung überall ändern. Wenn auf der Rechnung trotzdem der damalige Name stehen soll, ist auch das ein Snapshot, dann aber bewusst auf `rechnungspositionen` und nicht aus Bequemlichkeit.
+
+      Bewusste Denormalisierung gibt es außerdem für Lesegeschwindigkeit: Zählerspalten oder materialisierte Sichten. Dann dokumentiere ich, wer die Kopie aktuell hält – ein Trigger, die Transaktion, die die Quelle ändert, oder ein `REFRESH` –, und akzeptiere, dass sie kurz veralten kann.
+    tags: [normalisierung, denormalisierung]
+    level: 2
+
+  # Datenmodell und Integrität: Datenmodellierung
+  - id: teams-n-m
+    module: datenmodellierung
+    q: Mitglieder können mehreren Teams angehören, mit einer Rolle je Team (Admin oder Mitglied) und einem Eintrittsdatum. Wie modellierst du das?
+    a: |
+      Als n:m-Beziehung mit einer Verbindungstabelle, die eigene Attribute trägt:
+
+      ```postgres
+      CREATE TABLE team_mitgliedschaften (
+        team_id     int NOT NULL REFERENCES teams (id) ON DELETE CASCADE,
+        mitglied_id int NOT NULL REFERENCES mitglieder (id),
+        rolle       text NOT NULL CHECK (rolle IN ('admin', 'mitglied')),
+        seit        date NOT NULL,
+        PRIMARY KEY (team_id, mitglied_id)
+      );
+      CREATE INDEX ON team_mitgliedschaften (mitglied_id);
+      ```
+
+      Der zusammengesetzte Primärschlüssel verhindert doppelte Mitgliedschaften und ist zugleich der Index für „Mitglieder eines Teams“. Der zweite Index bedient „Teams eines Mitglieds“. Rolle und Eintrittsdatum gehören zur Beziehung, nicht zu Team oder Mitglied.
+
+      Im ORM ist das in SQLAlchemy ein eigenes Modell (Association Object), nicht nur `secondary=`, weil die Beziehung Attribute hat. In Prisma ist es eine explizite Relationstabelle. Fachliche Regeln wie „jedes Team hat mindestens einen Admin“ lassen sich nicht als einfacher Constraint ausdrücken. Die prüfe ich in der Transaktion, die die Rolle ändert, mit einer Sperre auf die Teamzeile.
+    tags: [modellierung, beziehungen]
+    level: 1
+  - id: soft-delete-kosten
+    module: datenmodellierung
+    q: Das Produktteam möchte, dass gelöschte Räume wiederhergestellt werden können, und schlägt `geloescht_am` vor. Was gibst du zu bedenken?
+    a: |
+      Soft Delete ist schnell gebaut, kostet aber dauerhaft. Jede Abfrage braucht `WHERE geloescht_am IS NULL`. Wird es einmal vergessen, tauchen gelöschte Räume in der Buchungsauswahl auf. Abhilfe sind eine View `aktive_raeume`, ein globaler Filter im ORM oder Row-Level Security, und jede davon hat eigene Tücken.
+
+      Constraints passen nicht mehr. `UNIQUE (standort_id, name)` verhindert, dass ein neuer Raum „Loft“ angelegt wird, solange ein gelöschter so heißt. Daraus wird ein partieller Unique-Index mit `WHERE geloescht_am IS NULL`. Fremdschlüssel schützen nicht davor, dass neue Buchungen auf einen gelöschten Raum zeigen.
+
+      Ich frage deshalb, wofür die Wiederherstellung gebraucht wird. Geht es um Versehen, reicht oft ein Archiv oder ein Audit-Log mit dem alten Zustand. Geht es um Historie, hilft ein Status wie `aktiv`/`stillgelegt`, der fachlich etwas bedeutet. Bei Personendaten kommt die DSGVO dazu: „gelöscht“ muss dort tatsächlich gelöscht oder anonymisiert heißen.
+    tags: [modellierung, soft-delete]
+    level: 2
+  - id: enum-lookup-check
+    module: datenmodellierung
+    q: Für `raeume.art` gibt es drei Werte. Nimmst du einen `CHECK`, einen Enum-Typ oder eine Lookup-Tabelle?
+    a: |
+      Kommt darauf an, wie stabil die Liste ist und ob die Werte eigene Daten haben.
+
+      `CHECK (art IN ('schreibtisch', 'meetingraum', 'telefonbox'))` ist mein Standard für kurze, selten geänderte Listen. Er ist leicht zu lesen, und eine Änderung ist eine kleine Migration: Constraint ersetzen, bei großen Tabellen mit `NOT VALID` und `VALIDATE`.
+
+      Ein Enum-Typ (`CREATE TYPE raumart AS ENUM (…)`) spart etwas Platz und sortiert in Definitionsreihenfolge. Werte hinzufügen geht mit `ALTER TYPE … ADD VALUE`, entfernen oder umbenennen ist mühsam. Und manche ORMs und Migrationswerkzeuge behandeln Enums umständlich.
+
+      Eine Lookup-Tabelle `raumarten (code, bezeichnung, sortierung, aktiv)` nehme ich, wenn die Werte Attribute haben, fachlich gepflegt werden oder in der Oberfläche übersetzt erscheinen. Der Fremdschlüssel sichert dann die Gültigkeit. Für Deskwerk mit drei stabilen Werten reicht ein `CHECK`.
+    tags: [modellierung, typen]
+    level: 2
+  - id: tarif-historie
+    module: datenmodellierung
+    q: Mitglieder wechseln den Tarif. Die Abrechnung für März muss den Tarif kennen, der im März galt. Wie modellierst du das?
+    a: |
+      Mit einer Historientabelle statt einer überschriebenen Spalte. Jede Zeile beschreibt einen Gültigkeitszeitraum:
+
+      ```postgres
+      CREATE TABLE mitglied_tarife (
+        mitglied_id int NOT NULL REFERENCES mitglieder (id),
+        tarif       text NOT NULL CHECK (tarif IN ('flex', 'fix', 'team')),
+        gueltig     daterange NOT NULL,
+        EXCLUDE USING gist (mitglied_id WITH =, gueltig WITH &&)
+      );
+      ```
+
+      Der Exclusion Constraint (mit `btree_gist`) verhindert, dass sich zwei Tarife eines Mitglieds überschneiden. Seit PostgreSQL 18 lässt sich dasselbe als `PRIMARY KEY (mitglied_id, gueltig WITHOUT OVERLAPS)` schreiben. Der aktuelle Tarif hat eine offene Obergrenze, etwa `[2026-03-15,)`. Abgefragt wird mit `gueltig @> date '2026-03-20'`.
+
+      Mit zwei Spalten `gueltig_von` und `gueltig_bis` ginge es auch. Dann muss ich Überschneidungen und Lücken selbst prüfen und überall halboffen vergleichen. Ein Tarifwechsel ist eine Transaktion: alte Zeile oben schließen, neue einfügen. `mitglieder.tarif` kann als bequeme Kopie bleiben, wenn klar ist, dass die Historie die Quelle ist.
+    tags: [modellierung, historisierung, ranges]
+    level: 3
+
+  # Datenmodell und Integrität: PostgreSQL-Features
+  - id: jsonb-oder-spalten
+    module: postgres-features
+    q: Wann speicherst du etwas als `jsonb`, wann als eigene Spalten?
+    a: |
+      Spalten für alles, wonach gefiltert, sortiert, gejoint oder was mit Constraints gesichert wird, und für alles, was jede Zeile hat. Dort bringt PostgreSQL Typen, `NOT NULL`, Fremdschlüssel, Statistiken für den Planer und kompakte Speicherung.
+
+      `jsonb` für Daten, deren Struktur variiert oder der App gehört: Benachrichtigungseinstellungen eines Mitglieds, Rohdaten eines Webhooks, Metadaten im Audit-Log. Abfragen gehen trotzdem, etwa `einstellungen @> '{"newsletter": true}'`, und ein GIN-Index macht sie schnell. Entscheidend ist, dass niemand Regeln über diese Felder in der Datenbank erzwingen muss.
+
+      Das Warnsignal ist JSON als Ersatz für Modellierung: Fremdschlüssel in JSON, Beträge in JSON, oder ein Feld, das in jeder zweiten Abfrage mit `->>` herausgezogen und gecastet wird. Dann ziehe ich es als Spalte heraus, gern als generierte Spalte, solange der Code noch ins JSON schreibt. Und ich nehme immer `jsonb`, nicht `json`: `json` speichert nur den Text.
+    tags: [jsonb, modellierung]
+    level: 2
+  - id: zeitraum-als-range
+    module: postgres-features
+    q: Warum würdest du Buchungszeiten als `tstzrange` speichern oder ableiten statt nur als `beginn` und `ende`?
+    a: |
+      Weil Zeitraumlogik dann kurz, richtig und indizierbar wird. Die Überschneidung zweier Buchungen ist `a && b`, statt `a.beginn < b.ende AND b.beginn < a.ende`, und genau diese Bedingung wird von Hand oft falsch geschrieben, mit `<=` statt `<`. `tstzrange(beginn, ende)` ist standardmäßig halboffen `[)`: 9–10 Uhr und 10–11 Uhr berühren sich, überlappen aber nicht.
+
+      Vor allem braucht der Exclusion Constraint gegen Doppelbuchungen einen Range-Ausdruck. Mit einem GiST-Index werden auch Abfragen wie „welche Räume sind zwischen 14 und 16 Uhr belegt?“ schnell.
+
+      Ich behalte meist `beginn` und `ende` als Spalten, weil ORMs und Berichte damit leichter umgehen, und nutze den Range als Ausdruck im Constraint oder als generierte Spalte mit `STORED`. Funktionen wie `lower()`, `upper()`, `@>` für „enthält Zeitpunkt“ und `range_agg` für zusammengefasste Belegung gibt es dazu.
+    tags: [ranges, zeit]
+    level: 2
+  - id: materialized-view-dashboard
+    module: postgres-features
+    q: Das Auslastungs-Dashboard rechnet bei jedem Aufruf über alle Buchungen und braucht vier Sekunden. Was hältst du von einer Materialized View?
+    a: |
+      Sie passt, wenn die Zahlen etwas veraltet sein dürfen. Eine Materialized View speichert das Ergebnis der Abfrage, das Dashboard liest dann eine kleine Tabelle. Ein Job frischt sie etwa alle fünf Minuten mit `REFRESH MATERIALIZED VIEW CONCURRENTLY auslastung` auf. `CONCURRENTLY` blockiert die Leser nicht, braucht aber einen Unique-Index auf der View und rechnet trotzdem jedes Mal alles neu.
+
+      Vorher prüfe ich zwei Dinge. Erstens, ob die Abfrage selbst schlecht ist: `EXPLAIN (ANALYZE)` zeigt vielleicht einen fehlenden Index oder einen Fan-out-Join. Zweitens, wie frisch die Daten sein müssen. Muss eine neue Buchung sofort erscheinen, ist eine Zählertabelle, die die Buchungstransaktion mitpflegt, die bessere Wahl. Sie kostet dafür Komplexität und Sperrkonkurrenz auf der Zählerzeile.
+
+      Gegenüber einem Cache in Redis hat die View den Vorteil, dass sie in derselben Datenbank liegt, mit SQL abfragbar ist und keine zweite Invalidierungslogik braucht.
+    tags: [materialized-view, performance]
+    level: 2
+  - id: raumsuche-volltext
+    module: postgres-features
+    q: Die Raumsuche nutzt `WHERE beschreibung ILIKE '%' || $1 || '%'`. Sie ist langsam und findet „Whiteboard“ nicht bei der Suche nach „Whiteboards“. Was schlägst du vor?
+    a: |
+      Das sind zwei Probleme mit zwei Werkzeugen. Für die Geschwindigkeit: `ILIKE` mit führendem `%` kann keinen B-Baum nutzen. Mit der Erweiterung `pg_trgm` und einem GIN-Index `USING gin (beschreibung gin_trgm_ops)` wird dieselbe Abfrage indizierbar. Dazu kommt unscharfe Suche über Ähnlichkeit, was bei Tippfehlern in Namen hilft.
+
+      Für Wortformen ist die Volltextsuche gebaut: `to_tsvector('german', beschreibung) @@ websearch_to_tsquery('german', $1)`. Die deutsche Konfiguration reduziert Wörter auf ihren Stamm, ignoriert Stoppwörter und versteht Eingaben wie `beamer -lärm`. Ein GIN-Index auf dem Ausdruck oder auf einer gespeicherten generierten `tsvector`-Spalte macht sie schnell, und `ts_rank` sortiert nach Relevanz.
+
+      Für eine Raumsuche über ein paar hundert Beschreibungen reicht PostgreSQL damit völlig. Eine eigene Suchmaschine wie Elasticsearch lohnt sich erst bei großen Textmengen, Facetten oder Anforderungen an Relevanz, die über `ts_rank` hinausgehen.
+    tags: [volltext, pg-trgm, suche]
+    level: 2
+
+  # Transaktionen und Anwendung: Transaktionen
+  - id: acid-buchung-rechnung
+    module: transaktionen
+    q: Erkläre ACID an einer Buchung, die gleichzeitig eine Rechnungsposition anlegt.
+    a: |
+      Atomarität: Buchung und Rechnungsposition entstehen zusammen oder gar nicht. Scheitert das Einfügen der Position, rollt `ROLLBACK` auch die Buchung zurück. Es gibt also keine Buchung, die nie abgerechnet wird.
+
+      Konsistenz: Nach dem `COMMIT` gelten alle Constraints wieder. Der Exclusion Constraint verhindert die Doppelbuchung, der Fremdschlüssel eine Position ohne Rechnung. Was die Datenbank nicht kennt, etwa „Summe der Positionen = Rechnungsbetrag“, muss die Transaktion selbst einhalten.
+
+      Isolation: Gleichzeitige Buchungen sehen die halb fertige Arbeit der anderen nicht. Wie streng das ist, legt die Isolationsstufe fest. Standard ist Read Committed: Jede Anweisung sieht, was vor ihrem Start festgeschrieben war.
+
+      Dauerhaftigkeit: Meldet `COMMIT` Erfolg, steht die Änderung im Write-Ahead-Log auf der Platte und übersteht einen Absturz. In der App heißt das, die Bestätigungsmail erst nach dem `COMMIT` zu verschicken.
+    tags: [acid, grundlagen]
+    level: 1
+  - id: transaction-aborted
+    module: transaktionen
+    q: Im Log steht bei jeder Anfrage `current transaction is aborted, commands ignored until end of transaction block`. Was ist passiert?
+    a: |
+      Diese Meldung (SQLSTATE `25P02`) ist eine Folge, nicht die Ursache. Vorher ist in derselben Transaktion eine Anweisung gescheitert, etwa an einem Unique-Constraint. In PostgreSQL ist die Transaktion danach unbrauchbar, jede weitere Anweisung wird abgelehnt, bis ein `ROLLBACK` kommt. Die Ursache steht weiter oben im Log.
+
+      Dass es bei jeder Anfrage auftritt, deutet auf ein Verbindungs- oder Session-Leck hin. Die App hat den Fehler abgefangen, aber die Transaktion nicht zurückgerollt und die Verbindung oder die SQLAlchemy-Session weiterverwendet. Typisch ist ein `except IntegrityError: pass` ohne `session.rollback()` oder eine globale Session statt einer je Request.
+
+      Die Abhilfe: Transaktionen mit Kontextmanagern führen (`with Session(engine) as s, s.begin():`), die bei Ausnahmen selbst zurückrollen, und je Request eine eigene Session verwenden. Will ich nach einem erwarteten Fehler in derselben Transaktion weitermachen, setze ich vorher einen Savepoint, etwa mit `session.begin_nested()`, und rolle nur bis dorthin zurück.
+    tags: [transaktionen, fehler, orm]
+    level: 2
+  - id: http-in-transaktion
+    module: transaktionen
+    q: |
+      Code-Review: Was ist hier problematisch?
+
+      ```python
+      with Session(engine) as session, session.begin():
+          buchung = Buchung(raum_id=raum_id, mitglied_id=mid, beginn=beginn, ende=ende)
+          session.add(buchung)
+          session.flush()
+          zahlung = zahlungsdienst.belaste(mid, betrag)   # HTTP, 200–3000 ms
+          buchung.zahlung_id = zahlung.id
+      ```
+    a: |
+      Der HTTP-Aufruf liegt mitten in der Transaktion. Solange der Zahlungsdienst antwortet, bleibt die Transaktion offen. Sie hält Zeilensperren und eine Verbindung aus dem Pool, und sie hält `VACUUM` vom Aufräumen ab. Ist der Dienst langsam, laufen Pool und Sperren voll, und andere Buchungen warten. Die Verbindung steht dabei als „idle in transaction“ in `pg_stat_activity`.
+
+      Dazu kommt ein Konsistenzproblem. Scheitert nach der Belastung das `COMMIT`, ist das Geld abgebucht, aber die Buchung existiert nicht. Eine Datenbanktransaktion kann einen externen Aufruf nicht zurückrollen.
+
+      Ich trenne die Schritte: Buchung mit Status `ausstehend` anlegen und committen. Dann die Zahlung mit einem Idempotency-Key aufrufen, der die Buchungs-ID enthält. Danach in einer zweiten kurzen Transaktion den Status setzen. Was dazwischen scheitert, räumt ein Job auf, der ausstehende Buchungen prüft. Robuster ist eine Outbox-Tabelle: Die Transaktion schreibt nur den Auftrag, ein Worker führt ihn aus. Als Netz darunter dient `idle_in_transaction_session_timeout`.
+    tags: [review, transaktionen, architektur]
+    level: 2
+  - id: id-luecken
+    module: transaktionen
+    q: Die Buchhaltung fragt, warum bei den Rechnungs-IDs 1041 und 1043 existieren, aber 1042 fehlt. Was antwortest du?
+    a: |
+      Die ID kommt aus einer Sequenz, und Sequenzen sind absichtlich nicht transaktional. `nextval()` vergibt eine Nummer sofort und für immer, auch wenn die Transaktion danach zurückgerollt wird. Nur so können viele Transaktionen gleichzeitig Nummern ziehen, ohne aufeinander zu warten. Eine Rechnung, deren Anlage an einem Constraint scheiterte, hinterlässt also eine Lücke. Gelöscht wurde nichts.
+
+      Ein technischer Schlüssel darf Lücken haben, er soll nur eindeutig sein. Wenn die Buchhaltung eine lückenlose fortlaufende Rechnungsnummer braucht, ist das eine eigene fachliche Spalte, nicht der Primärschlüssel.
+
+      Dafür gibt es eine Zählertabelle je Nummernkreis. Die Rechnungstransaktion erhöht den Zähler mit `UPDATE nummernkreise SET letzte = letzte + 1 WHERE kreis = 'rechnung' RETURNING letzte` und schreibt die Rechnung in derselben Transaktion. Rollt sie zurück, rollt auch der Zähler zurück. Der Preis: Alle Rechnungen eines Kreises warten aufeinander. Für ein paar tausend Rechnungen im Monat ist das kein Problem.
+    tags: [sequenzen, transaktionen]
+    level: 2
+
+  # Transaktionen und Anwendung: Isolation und Sperren
+  - id: mvcc-leser-schreiber
+    module: isolation-sperren
+    q: Was ist MVCC, und was bedeutet es für eine Anwendung?
+    a: |
+      Multiversion Concurrency Control. Ein `UPDATE` überschreibt die Zeile nicht, sondern legt eine neue Version an und markiert die alte als beendet. Jede Version trägt die Transaktions-IDs, die sie angelegt (`xmin`) und beendet (`xmax`) haben. Eine Transaktion sieht anhand ihres Schnappschusses genau die Versionen, die für sie gültig sind.
+
+      Für die Anwendung heißt das: Leser blockieren keine Schreiber, und Schreiber blockieren keine Leser. Ein langer Bericht hält die Buchungsseite nicht auf. Nur zwei Schreiber auf dieselbe Zeile warten aufeinander.
+
+      Die Kosten: Alte Versionen bleiben liegen, bis `VACUUM` sie entfernt. Viele Updates erzeugen Bloat. Und eine lange offene Transaktion, etwa eine Verbindung „idle in transaction“, hält alle Versionen fest, die sie noch sehen könnte. Deshalb sind lange Transaktionen in PostgreSQL ein Betriebsproblem und nicht nur ein Stilproblem.
+    tags: [mvcc, grundlagen]
+    level: 2
+  - id: guthaben-lost-update
+    module: isolation-sperren
+    q: |
+      Code-Review: Mitglieder haben Prepaid-Guthaben. Bei gleichzeitigen Buchungen stimmt der Stand manchmal nicht. Warum?
+
+      ```python
+      mitglied = session.get(Mitglied, mid)
+      if mitglied.guthaben < preis:
+          raise ZuWenigGuthaben()
+      mitglied.guthaben = mitglied.guthaben - preis
+      session.commit()
+      ```
+    a: |
+      Das ist ein Lost Update. Zwei Requests lesen beide 100 €, rechnen in Python 100 − 30 und 100 − 20 und schreiben 70 und 80 zurück. Der zweite überschreibt den ersten, eine Abbuchung ist verloren. Unter Read Committed meldet PostgreSQL dabei keinen Fehler.
+
+      Drei Lösungen. Die beste ist ein atomares Update, das Prüfung und Rechnung in die Datenbank verlegt:
+
+      ```postgres
+      UPDATE mitglieder SET guthaben = guthaben - $1
+      WHERE id = $2 AND guthaben >= $1
+      RETURNING guthaben;
+      ```
+
+      Kommt keine Zeile zurück, reicht das Guthaben nicht. Zweitens eine pessimistische Sperre: `select(Mitglied).where(…).with_for_update()` sperrt die Zeile bis zum Commit, der zweite Request wartet und liest danach den neuen Stand. Drittens optimistisches Locking mit einer `version`-Spalte, in SQLAlchemy über `version_id_col`. Bei einem Konflikt kommt `StaleDataError`, und die App versucht es erneut.
+
+      Eine `CHECK (guthaben >= 0)` gehört zusätzlich dazu, als letzte Sicherung.
+    tags: [review, lost-update, sperren]
+    level: 2
+  - id: write-skew-repeatable-read
+    module: isolation-sperren
+    q: Ein Kollege will Doppelbuchungen verhindern, indem er die Buchungstransaktion auf Repeatable Read stellt und darin prüft, ob der Raum frei ist. Reicht das?
+    a: |
+      Nein. Das ist ein Write Skew:
+
+      ```text
+      T1: BEGIN ISOLATION LEVEL REPEATABLE READ
+      T2: BEGIN ISOLATION LEVEL REPEATABLE READ
+      T1: SELECT count(*) … überlappend → 0
+      T2: SELECT count(*) … überlappend → 0
+      T1: INSERT Buchung 10–11 Uhr; COMMIT
+      T2: INSERT Buchung 10:30–11:30 Uhr; COMMIT   -- beide erfolgreich
+      ```
+
+      Repeatable Read gibt jeder Transaktion einen festen Schnappschuss. Beide sehen „frei“, und weil sie verschiedene Zeilen schreiben, gibt es keinen Konflikt, den PostgreSQL erkennen könnte. Fehler `40001` gibt es auf dieser Stufe nur, wenn beide dieselbe Zeile ändern.
+
+      Serializable würde helfen. Dort verfolgt PostgreSQL Lese-Schreib-Abhängigkeiten und bricht eine der beiden mit `40001` ab. Die App muss dann die ganze Transaktion wiederholen. Für genau diese Regel ist ein Exclusion Constraint einfacher und sicherer. Er gilt unabhängig von Isolationsstufe und Codepfad. Serializable nehme ich für Regeln, die sich nicht als Constraint ausdrücken lassen, etwa „höchstens 20 Buchungen je Standort und Tag“.
+    tags: [write-skew, isolation, nebenläufigkeit]
+    level: 3
+  - id: job-queue-worker
+    module: isolation-sperren
+    q: Deskwerk verschickt Erinnerungsmails über eine Tabelle `jobs`. Mit drei Worker-Prozessen gehen Mails doppelt raus. Wie baust du die Abholung?
+    a: |
+      Die Worker lesen vermutlich `SELECT … WHERE status = 'offen' LIMIT 10` und setzen den Status danach. Dazwischen holen sich die anderen dieselben Jobs. Die Abholung muss sperren und gleichzeitig andere Worker nicht warten lassen:
+
+      ```postgres
+      WITH naechste AS (
+        SELECT id FROM jobs
+        WHERE status = 'offen'
+        ORDER BY erstellt_am, id
+        LIMIT 10
+        FOR UPDATE SKIP LOCKED
+      )
+      UPDATE jobs j SET status = 'laeuft', worker = $1, versuche = versuche + 1
+      FROM naechste WHERE j.id = naechste.id
+      RETURNING j.id, j.art;
+      ```
+
+      `FOR UPDATE` sperrt die Zeilen, `SKIP LOCKED` überspringt, was ein anderer Worker gerade hält. Jeder bekommt also andere Jobs, ohne zu blockieren. Ein partieller Index auf `(erstellt_am, id) WHERE status = 'offen'` hält die Suche schnell.
+
+      Zum Rest der Queue gehört: Die Mail wird nach diesem kurzen Commit verschickt, nicht in einer offenen Transaktion. Jobs, die zu lange auf `laeuft` stehen, setzt ein Aufräumjob zurück. Nach mehreren Fehlversuchen landen sie als `fehlgeschlagen` mit Fehlermeldung in der Tabelle. Der Mailversand selbst braucht einen Idempotenzschlüssel, denn „genau einmal“ gibt es über Systemgrenzen nicht.
+    tags: [skip-locked, queue, sperren]
+    level: 2
+  - id: deadlock-im-log
+    module: isolation-sperren
+    q: Im Log tauchen mehrmals am Tag `deadlock detected` auf. Wie gehst du vor?
+    a: |
+      Zuerst lese ich die vollständige Meldung. Sie nennt beide Prozesse, die Sperren, auf die sie gewartet haben, und die Anweisungen. Daraus ergibt sich fast immer das Muster: Zwei Transaktionen sperren dieselben Zeilen in umgekehrter Reihenfolge.
+
+      ```text
+      T1: UPDATE raeume … WHERE id = 1   -- sperrt Raum 1
+      T2: UPDATE raeume … WHERE id = 2   -- sperrt Raum 2
+      T1: UPDATE raeume … WHERE id = 2   -- wartet auf T2
+      T2: UPDATE raeume … WHERE id = 1   -- wartet auf T1 → Deadlock, eine bricht ab
+      ```
+
+      PostgreSQL erkennt das nach `deadlock_timeout` und bricht eine Transaktion mit `40P01` ab. Die andere läuft weiter.
+
+      Die Abhilfe ist eine feste Sperrreihenfolge, etwa immer nach `id` sortiert: `SELECT … WHERE id = ANY($1) ORDER BY id FOR UPDATE` vor den Updates. Bei Massen-Updates aus der App sortiere ich die Liste vor dem Schreiben. Fremdschlüssel und Trigger nehmen ebenfalls Sperren, auch das steht in der Meldung. Dazu helfen kurze Transaktionen und ein Retry für `40P01` in der App: Ein Deadlock ist ein Konflikt, kein Datenverlust, und die Wiederholung gelingt meist.
+    tags: [deadlock, sperren, szenario]
+    level: 2
+
+  # Transaktionen und Anwendung: ORM und SQL
+  - id: n-plus-eins-review
+    module: orm-und-sql
+    q: |
+      Code-Review: Die Übersicht „Buchungen dieser Woche“ braucht bei 300 Buchungen zwei Sekunden. Was siehst du?
+
+      ```python
+      buchungen = session.scalars(
+          select(Buchung).where(Buchung.beginn >= wochenstart)
+      ).all()
+      return [
+          {"raum": b.raum.name, "mitglied": b.mitglied.name, "beginn": b.beginn}
+          for b in buchungen
+      ]
+      ```
+    a: |
+      Ein N+1-Problem. Die erste Abfrage lädt 300 Buchungen. Jeder Zugriff auf `b.raum` und `b.mitglied` löst per Lazy Loading eine eigene Abfrage aus, soweit das Objekt nicht schon in der Identity Map der Session liegt. Im ungünstigen Fall sind das 601 Rundreisen. Jede einzelne ist schnell, zusammen dauern sie Sekunden. Sichtbar wird das mit `echo=True` oder im APM als lange Liste gleicher Abfragen mit anderer ID.
+
+      Die Lösung ist Eager Loading:
+
+      ```python
+      select(Buchung)
+          .where(Buchung.beginn >= wochenstart)
+          .options(joinedload(Buchung.raum), joinedload(Buchung.mitglied))
+      ```
+
+      Für n:1-Beziehungen wie hier passt `joinedload`, das per `JOIN` in derselben Abfrage lädt. Für 1:n-Sammlungen nehme ich `selectinload`, das eine zweite Abfrage mit `WHERE id IN (…)` schickt und den Fan-out vermeidet. Wenn nur drei Spalten gebraucht werden, ist ein `select(Raum.name, Mitglied.name, Buchung.beginn).join(…)` noch schlanker. Damit es nicht wiederkommt, setze ich in Tests `lazy="raise"` oder `raiseload("*")` und lasse einen Test die Zahl der Abfragen prüfen.
+    tags: [review, n-plus-1, orm]
+    level: 2
+  - id: injection-review
+    module: orm-und-sql
+    q: |
+      Code-Review: Die Suche nutzt das ORM, aber für die Sortierung Raw SQL. Was fällt dir auf?
+
+      ```python
+      sql = text(
+          f"SELECT * FROM raeume WHERE name ILIKE '%{suche}%' ORDER BY {sortierung}"
+      )
+      return session.execute(sql).all()
+      ```
+    a: |
+      Zwei SQL-Injections. `suche` und `sortierung` kommen aus dem Request und landen per f-String im SQL-Text. Mit `suche = "x' OR '1'='1"` liefert die Abfrage alles, mit passender Eingabe auch Daten aus anderen Tabellen. Dass der Rest der App ein ORM nutzt, schützt hier nicht.
+
+      Werte gehören als Parameter gebunden:
+
+      ```python
+      sql = text("SELECT * FROM raeume WHERE name ILIKE :muster ORDER BY name")
+      session.execute(sql, {"muster": f"%{suche}%"})
+      ```
+
+      Der Wert geht dann getrennt vom SQL-Text zum Server und wird nie als Code gelesen. Das ist das Prinzip von Prepared Statements und `$1`-Platzhaltern.
+
+      Bezeichner wie Spaltennamen lassen sich nicht als Parameter binden. Für `sortierung` nehme ich eine Allowlist: `{"name": Raum.name, "preis": Raum.preis_pro_stunde}`. Unbekannte Werte führen zu 400. Muss ein Bezeichner dynamisch sein, gibt es in psycopg `sql.Identifier`. Escapen von Hand ist keine Lösung, und eine Datenbankrolle der App ohne Rechte auf fremde Tabellen begrenzt den Schaden zusätzlich.
+    tags: [review, sicherheit, sql-injection]
+    level: 2
+  - id: session-flush-wann
+    module: orm-und-sql
+    q: Wann schickt SQLAlchemy SQL an die Datenbank – schon bei `session.add()`?
+    a: |
+      Nein. `add()` nimmt das Objekt nur in die Session auf. Die Session ist eine Unit of Work: Sie sammelt neue, geänderte und gelöschte Objekte und schickt das SQL dafür beim Flush. Geflusht wird bei `commit()`, bei `flush()` und durch Autoflush vor jeder Abfrage, damit die Abfrage die eigenen Änderungen sieht.
+
+      Gelesen wird beim Ausführen eines `select()`, bei `session.get()` nur, wenn das Objekt nicht schon in der Identity Map liegt, und beim ersten Zugriff auf eine noch nicht geladene Beziehung (Lazy Loading). Die Identity Map sorgt dafür, dass dieselbe Zeile in einer Session genau ein Python-Objekt ist.
+
+      Praktisch folgt daraus dreierlei. Die ID eines neuen Objekts gibt es erst nach dem Flush, weil PostgreSQL sie per `RETURNING` liefert. Ein Constraint-Fehler kommt erst beim Flush, also oft an einer ganz anderen Codezeile als dem `add()`. Und nach `commit()` sind alle Objekte standardmäßig abgelaufen (`expire_on_commit`). Der nächste Attributzugriff lädt neu, außerhalb der Session gibt es dann `DetachedInstanceError`.
+    tags: [orm, sqlalchemy, unit-of-work]
+    level: 2
+  - id: raw-sql-wann
+    module: orm-und-sql
+    q: Wann schreibst du Raw SQL statt ORM-Abfragen?
+    a: |
+      Das ORM nehme ich für das Alltägliche: Objekte laden, ändern, speichern, einfache Listen mit Filtern. Dort spart es Code, kennt die Beziehungen und hält Typen und Modelle an einer Stelle.
+
+      SQL schreibe ich, wenn die Abfrage selbst die Logik ist: Berichte mit Aggregation, `FILTER` und Fensterfunktionen, rekursive CTEs, Upserts mit Bedingungen, `FOR UPDATE SKIP LOCKED`, Massen-Updates und -Löschungen, die sonst Objekt für Objekt liefen. SQLAlchemy Core deckt vieles davon ab. Wird der Ausdruck dort unlesbarer als das SQL, nehme ich `text()` mit gebundenen Parametern. Bei Prisma heißt das `$queryRaw` mit Tagged Template.
+
+      Wichtig ist mir, dass Raw SQL nicht im Code verstreut ist. Es gehört in eine Repository-Funktion mit Typen für das Ergebnis und einen Integrationstest gegen echtes PostgreSQL. Und ich prüfe das generierte SQL des ORM genauso wie handgeschriebenes, mit Logging und `EXPLAIN`. Es ist kein „ORM gegen SQL“: Das ORM erzeugt SQL, und ich muss beides lesen können.
+    tags: [orm, architektur]
+    level: 1
+
+  # Performance und Betrieb: Indexe
+  - id: index-spaltenreihenfolge
+    module: indexe
+    q: Die häufigste Abfrage ist `WHERE raum_id = $1 AND beginn >= $2 ORDER BY beginn`. Index auf `(beginn, raum_id)` oder `(raum_id, beginn)`?
+    a: |
+      `(raum_id, beginn)`. Ein B-Baum ist nach der ersten Spalte sortiert, innerhalb gleicher Werte nach der zweiten. Mit `raum_id` vorne liegen alle Einträge eines Raums nebeneinander und dort nach `beginn` sortiert. PostgreSQL springt zu `(raum, $2)` und liest ab da vorwärts. Die Treffer kommen schon in der richtigen Reihenfolge, ein `Sort`-Knoten entfällt, und mit `LIMIT` bricht der Scan früh ab.
+
+      Mit `beginn` vorne müsste der Scan alle Buchungen ab `$2` aus allen Räumen durchgehen und `raum_id` einzeln prüfen. Die Faustregel: Gleichheitsbedingungen vorne, Bereichsbedingung und Sortierung danach.
+
+      Seit PostgreSQL 18 kann ein Skip Scan einen mehrspaltigen Index auch ohne Bedingung auf der ersten Spalte nutzen, wenn diese wenige verschiedene Werte hat. Das ist eine Optimierung für Randfälle, kein Grund, die Reihenfolge nicht bewusst zu wählen. Belegen würde ich die Wahl mit `EXPLAIN (ANALYZE)` vorher und nachher.
+    tags: [index, mehrspaltig]
+    level: 2
+  - id: index-wird-nicht-genutzt
+    module: indexe
+    q: Du hast einen Index auf `mitglieder (email)` angelegt, aber `EXPLAIN` zeigt weiter einen Seq Scan. Woran kann es liegen?
+    a: |
+      Ich gehe die üblichen Ursachen durch. Erstens eine Funktion auf der Spalte: `WHERE lower(email) = …` passt nicht zu einem Index auf `email`. Dafür braucht es einen Ausdrucksindex auf `lower(email)`. Zweitens ein Typunterschied: Wird die Spalte gecastet, etwa `email::citext` oder `id::text = $1`, steht der Cast auf der Indexseite. Drittens `LIKE '%@example.org'` mit führendem Platzhalter. Das kann ein B-Baum nicht, dafür braucht es `pg_trgm`. Selbst `LIKE 'anna%'` nutzt einen normalen Index nur bei der Sortierung `C`; auf einem Server mit `de_DE.UTF-8` oder ICU braucht er die Operatorklasse `text_pattern_ops`.
+
+      Viertens kann der Seq Scan richtig sein. Die Tabelle ist klein, oder die Bedingung trifft einen großen Teil der Zeilen. Dann ist es billiger, alles am Stück zu lesen, als tausende Mal zwischen Index und Heap zu springen. In der Testdatenbank mit 50 Mitgliedern ist das fast immer so.
+
+      Fünftens veraltete Statistik nach einem großen Import. `ANALYZE mitglieder` behebt das. Zum Testen, ob der Index überhaupt passt, setze ich in einer Sitzung `SET enable_seqscan = off` und schaue, ob ein Index-Plan entsteht. Das ist nur zur Diagnose, nie als Einstellung im Betrieb.
+    tags: [index, planer, szenario]
+    level: 2
+  - id: nicht-alles-indizieren
+    module: indexe
+    q: Warum legst du nicht auf jede Spalte einen Index?
+    a: |
+      Weil jeder Index Schreibarbeit, Speicher und Planungszeit kostet. Jedes `INSERT` schreibt in jeden Index der Tabelle, jedes `DELETE` hinterlässt dort tote Einträge. Ein `UPDATE` auf eine indizierte Spalte verhindert außerdem HOT-Updates: Statt nur die Heap-Seite anzufassen, bekommen alle Indexe einen neuen Eintrag. Auf einer Tabelle wie `checkins` mit vielen Schreibzugriffen merkt man das deutlich.
+
+      Dazu kommt, dass Indexe auf einzelnen Spalten oft nicht das sind, was Abfragen brauchen. `WHERE raum_id = $1 AND beginn >= $2 ORDER BY beginn` profitiert von einem Index auf `(raum_id, beginn)`, nicht von zwei einzelnen.
+
+      Ich lege Indexe deshalb nach den tatsächlichen Abfragen an: Fremdschlüssel, die häufigsten Filter und Sortierungen aus `pg_stat_statements`, Unique-Regeln. Regelmäßig prüfe ich `pg_stat_user_indexes` auf Indexe mit `idx_scan = 0` und entferne sie nach Rücksprache. Unique-Indexe und solche für seltene, aber wichtige Abfragen wie den Monatsabschluss bleiben.
+    tags: [index, kosten]
+    level: 1
+  - id: covering-index-only
+    module: indexe
+    q: Was ist ein Index-Only Scan, und wann hilft ein `INCLUDE`?
+    a: |
+      Bei einem normalen Index Scan findet PostgreSQL die Treffer im Index und holt dann jede Zeile aus dem Heap. Stehen alle benötigten Spalten schon im Index, kann es den Heap auslassen. Das ist ein Index-Only Scan. Für die Liste „Buchungen eines Mitglieds mit Preis“ reicht dann `CREATE INDEX ON buchungen (mitglied_id, beginn) INCLUDE (preis)`. `preis` ist Nutzlast, kein Suchschlüssel, und vergrößert den Baum nur auf der Blattebene.
+
+      Ein Haken ist MVCC. Ob eine Zeilenversion sichtbar ist, steht nur im Heap. PostgreSQL spart sich den Zugriff nur für Seiten, die in der Visibility Map als „alles sichtbar“ markiert sind, und die pflegt `VACUUM`. Im Plan zeigt `Heap Fetches`, wie oft es trotzdem in den Heap musste. Bei Tabellen mit vielen frischen Änderungen bringt der Covering Index deshalb weniger.
+
+      Ich setze `INCLUDE` gezielt für sehr häufige, schmale Abfragen ein, nicht als Standard. Jede zusätzliche Spalte macht den Index größer und verhindert HOT-Updates, wenn sie sich oft ändert.
+    tags: [index, index-only-scan]
+    level: 3
+
+  # Performance und Betrieb: Query-Pläne
+  - id: plan-lesen
+    module: query-plaene
+    q: |
+      Wie liest du diesen Plan, und was schlägst du vor?
+
+      ```text
+      Limit (actual rows=5.00 loops=1)
+        ->  Sort (actual rows=5.00 loops=1)
+              Sort Key: beginn DESC
+              Sort Method: quicksort  Memory: 17kB
+              ->  Seq Scan on buchungen (actual rows=10.00 loops=1)
+                    Filter: (mitglied_id = 42)
+                    Rows Removed by Filter: 19990
+      ```
+    a: |
+      Von innen nach außen. Ganz innen liest ein Seq Scan alle 20 000 Buchungen und verwirft 19 990, weil nur zehn zu Mitglied 42 gehören. Darüber sortiert ein `Sort` die zehn Treffer nach `beginn` absteigend, im Speicher per Quicksort. Das ist billig. Das `Limit` gibt die ersten fünf aus. Die Arbeit steckt also im Scan: 2 000-mal mehr Zeilen gelesen, als es Treffer gibt.
+
+      Ein Index auf `(mitglied_id, beginn)` löst beides. PostgreSQL springt zu den Einträgen von Mitglied 42, liest sie rückwärts, also schon nach `beginn DESC` sortiert, und hört nach fünf auf. Der Plan wird zu `Limit → Index Scan Backward using …` mit `Index Cond: (mitglied_id = 42)`.
+
+      Zum Lesen gehört auch, was hier fehlt. Ohne Kosten sehe ich keine Schätzung; um Fehlschätzungen zu finden, lasse ich die Kosten an und vergleiche `rows` mit `actual rows`. `loops=1` heißt, dass nichts wiederholt läuft. In größeren Plänen suche ich zuerst den Knoten mit der meisten Zeit und den größten Abstand zwischen geschätzten und echten Zeilen.
+    tags: [explain, plan]
+    level: 2
+  - id: schaetzung-daneben
+    module: query-plaene
+    q: Im Plan schätzt PostgreSQL `rows=3`, tatsächlich sind es 40 000, und ein Nested Loop läuft 40 000-mal. Was ist passiert, und was tust du?
+    a: |
+      Der Planer hat die Zeilenzahl um den Faktor 10 000 unterschätzt. Für drei äußere Zeilen ist ein Nested Loop mit Index innen ideal, für 40 000 wäre ein Hash Join viel billiger. Nach meiner Erfahrung stecken hinter den meisten schlechten Plänen falsche Schätzungen.
+
+      Die üblichen Gründe: Die Statistik ist veraltet, etwa nach einem großen Import, bevor Autovacuum `ANALYZE` lief. Dann hilft `ANALYZE buchungen`. Oder die Bedingungen sind korreliert. Der Planer multipliziert Wahrscheinlichkeiten, als wären Spalten unabhängig, etwa bei `mitglied_id = 42 AND standort_id = 1` in `checkins`, obwohl Mitglied 42 fast immer in Plagwitz eincheckt. Dafür gibt es erweiterte Statistiken mit `CREATE STATISTICS … (dependencies) ON mitglied_id, standort_id FROM checkins` und danach `ANALYZE`. Auch Funktionen oder Ausdrücke in Bedingungen kann er schlecht schätzen. Ein Ausdrucksindex bringt eigene Statistiken mit.
+
+      Selten hilft es, für schiefe Verteilungen das Statistikziel einer Spalte zu erhöhen (`ALTER TABLE … ALTER COLUMN … SET STATISTICS 1000`). Pläne mit Optionen wie `enable_nestloop = off` zu erzwingen, nutze ich nur zur Diagnose.
+    tags: [explain, statistik, planer]
+    level: 3
+  - id: join-algorithmen
+    module: query-plaene
+    q: Nested Loop, Hash Join, Merge Join – wann wählt PostgreSQL welchen?
+    a: |
+      Nested Loop geht für jede Zeile der äußeren Seite die innere durch, idealerweise per Index. Er ist die beste Wahl, wenn außen wenige Zeilen sind, etwa eine Seite mit 20 Buchungen und je ein Indexzugriff auf `raeume`. Er wird teuer, wenn außen viele Zeilen sind und innen kein Index hilft.
+
+      Hash Join baut aus der kleineren Seite eine Hashtabelle im Speicher und prüft jede Zeile der größeren dagegen. Er passt für große, ungeordnete Mengen mit Gleichheitsbedingung, etwa einen Monatsbericht über alle Buchungen mit allen Räumen. Passt die Hashtabelle nicht in `work_mem`, wird in Teilen gearbeitet (`Batches` > 1 im Plan).
+
+      Merge Join läuft zwei nach dem Join-Schlüssel sortierte Eingaben im Gleichschritt durch. Er lohnt sich, wenn beide Seiten ohnehin sortiert vorliegen, etwa aus Indexen, oder das Ergebnis danach sortiert gebraucht wird.
+
+      Der Planer wählt nach geschätzten Kosten. Ein unpassender Algorithmus ist deshalb meist ein Symptom falscher Zeilenschätzungen und kein Grund, Join-Arten abzuschalten.
+    tags: [explain, joins]
+    level: 2
+
+  # Performance und Betrieb: Performance
+  - id: buchungsseite-langsam
+    module: performance
+    q: Die Buchungsseite ist seit dem Deployment gestern langsam, p95 von 200 ms auf 3 Sekunden. Wie gehst du vor?
+    a: |
+      Erst eingrenzen, dann ändern. Ich vergleiche, was sich mit dem Deployment geändert hat: Code-Diff, Migrationen, neue Indexe oder gelöschte, Konfiguration. Gleichzeitig prüfe ich, ob nur diese Seite betroffen ist oder alles. Wenn alles langsam ist, schaue ich auf Datenbanklast, Sperren und Verbindungen statt auf eine einzelne Abfrage.
+
+      Dann messe ich, wo die Zeit hingeht. Das APM oder die SQL-Logs des ORM zeigen, ob es eine langsame Abfrage ist oder viele schnelle. Eine neue Beziehung im Template, die per Lazy Loading lädt, ist ein Klassiker: plötzlich 200 Abfragen statt drei. In `pg_stat_statements` sortiere ich nach `total_exec_time` und vergleiche mit dem Stand vor dem Deployment. In `pg_stat_activity` schaue ich nach wartenden Sperren und nach Verbindungen „idle in transaction“.
+
+      Für die verdächtige Abfrage kommt `EXPLAIN (ANALYZE, BUFFERS)` mit echten Parametern. Typische Befunde nach einem Deployment: ein neuer Filter ohne passenden Index, eine Funktion oder ein Cast auf einer indizierten Spalte, eine Migration ohne anschließendes `ANALYZE`, ein Index, der mit `CONCURRENTLY` gescheitert und ungültig geblieben ist.
+
+      Wenn es dringend ist, rolle ich die App zurück oder schalte das Feature ab. Die Ursache behebe ich danach mit Beleg, also mit Plan und Messung vorher und nachher.
+    tags: [szenario, performance, debugging]
+    level: 2
+  - id: pool-erschoepft
+    module: orm-und-sql
+    q: Unter Last melden die API-Server `QueuePool limit of size 5 overflow 10 reached`, die Datenbank ist aber kaum ausgelastet. Was ist los?
+    a: |
+      Der Engpass ist der Connection Pool der App, nicht PostgreSQL. Alle Verbindungen sind ausgeliehen, neue Requests warten, bis eine frei wird. Wenn die Datenbank dabei kaum arbeitet, halten die Requests ihre Verbindungen zu lange, ohne Abfragen zu schicken.
+
+      Typische Ursachen: externe HTTP-Aufrufe oder langsame Berechnungen innerhalb einer offenen Session oder Transaktion. Sessions, die nicht geschlossen werden, etwa ohne `with` oder ohne Dependency mit `yield` in FastAPI. Hintergrund-Tasks, die sich eine Session teilen. In `pg_stat_activity` zeigt sich das als viele Verbindungen im Zustand `idle in transaction`.
+
+      Die Lösung ist, Verbindungen nur für die Dauer der Datenbankarbeit zu halten, nicht den Pool zu vergrößern. Mehr Verbindungen helfen nur bis zur Grenze der Datenbank. Jede PostgreSQL-Verbindung ist ein Prozess, und bei vielen App-Instanzen summiert sich `pool_size` schnell über `max_connections`. Dafür gibt es PgBouncer im Transaction Mode davor. Als Schutz setze ich `pool_timeout` in der App und `idle_in_transaction_session_timeout` in der Datenbank.
+    tags: [connection-pool, szenario, betrieb]
+    level: 2
+  - id: count-teuer
+    module: performance
+    q: Die Mitgliederliste zeigt „1–20 von 1 284 377 Check-ins“, und allein das `count(*)` dauert eine Sekunde. Warum ist `count(*)` in PostgreSQL so langsam, und was tust du?
+    a: |
+      Weil PostgreSQL keine Zeilenzahl je Tabelle speichert. Wegen MVCC sieht jede Transaktion eine andere Menge gültiger Zeilen, und welche gültig ist, steht im Heap. `count(*)` muss deshalb alle Zeilen oder zumindest einen ganzen Index lesen. Ein Index-Only Scan hilft nur, wenn die Visibility Map aktuell ist.
+
+      Die erste Frage ist, ob die exakte Zahl gebraucht wird. Für „von ungefähr 1,3 Mio.“ reicht die Schätzung des Planers aus `pg_class.reltuples`, die `ANALYZE` und Autovacuum pflegen. Für gefilterte Listen kann man die Schätzung aus `EXPLAIN` nehmen. Oder man zählt nur bis zu einer Grenze: `SELECT count(*) FROM (SELECT 1 FROM checkins WHERE … LIMIT 1001) s` und zeigt „mehr als 1 000“.
+
+      Wird die exakte Zahl oft gebraucht, etwa für die Abrechnung, pflege ich einen Zähler in einer eigenen Tabelle, per Trigger oder in der schreibenden Transaktion. Dabei achte ich auf Sperrkonkurrenz auf der Zählerzeile. Bei Paginierung mit Keyset entfällt die Gesamtzahl oft ganz.
+    tags: [count, performance, mvcc]
+    level: 2
+  - id: tabelle-waechst-bloat
+    module: performance
+    q: Die Tabelle `jobs` hat nie mehr als ein paar tausend Zeilen, ist aber auf 8 GB gewachsen, und Abfragen darauf werden langsamer. Was vermutest du?
+    a: |
+      Bloat. Jeder Job wird mehrfach aktualisiert (`offen` → `laeuft` → `erledigt`) und später gelöscht. Wegen MVCC entsteht bei jedem `UPDATE` eine neue Zeilenversion, die alte bleibt als tote Zeile liegen. `VACUUM` gibt ihren Platz zur Wiederverwendung frei. Kommt es nicht hinterher, wächst die Datei, und jeder Scan liest Seiten voller toter Zeilen.
+
+      Die Diagnose: `pg_stat_user_tables` zeigt `n_dead_tup` und `last_autovacuum`. Läuft Autovacuum, aber es räumt nichts ab, hält meist etwas den Horizont fest. Das sind lange laufende oder „idle in transaction“-Verbindungen in `pg_stat_activity` (Spalte `backend_xmin`), vergessene Replication Slots oder Prepared Transactions. Tote Zeilen, die eine laufende Transaktion noch sehen könnte, darf `VACUUM` nicht entfernen.
+
+      Abhilfe: die Ursache des festgehaltenen Horizonts beseitigen und Autovacuum für diese Tabelle aggressiver einstellen, etwa `ALTER TABLE jobs SET (autovacuum_vacuum_scale_factor = 0.01)`. Um den Platz an das Dateisystem zurückzugeben, braucht es `VACUUM FULL`, das die Tabelle exklusiv sperrt. Im laufenden Betrieb gibt es dafür Werkzeuge wie `pg_repack`. Weniger Indexe auf häufig geänderten Spalten erlauben außerdem HOT-Updates.
+    tags: [vacuum, bloat, betrieb]
+    level: 3
+
+  # Performance und Betrieb: Migrationen
+  - id: migration-blockiert-alles
+    module: migrationen
+    q: Während einer Migration mit `ALTER TABLE buchungen ADD COLUMN notiz text` hingen plötzlich alle Requests, obwohl das `ADD COLUMN` nur Millisekunden dauert. Warum?
+    a: |
+      Wegen der Sperrwarteschlange. `ADD COLUMN` braucht eine `ACCESS EXCLUSIVE`-Sperre, sehr kurz, aber exklusiv. Lief gerade eine lange Abfrage auf `buchungen`, etwa ein Bericht oder eine Transaktion „idle in transaction“, musste das `ALTER TABLE` warten. Alle Anfragen, die danach kamen, auch einfache `SELECT`s, stellten sich hinter dem wartenden `ALTER TABLE` an, denn ihre Sperren sind mit `ACCESS EXCLUSIVE` unverträglich. Die Tabelle war damit für alle blockiert, bis der Bericht fertig war.
+
+      Die Abhilfe ist ein `lock_timeout` in jeder Migration, etwa `SET lock_timeout = '3s'`. Bekommt die Migration die Sperre nicht schnell, bricht sie ab, statt den Betrieb aufzuhalten, und wird später mit Retry erneut versucht. Zusätzlich prüfe ich vorher in `pg_stat_activity`, ob lange Transaktionen laufen, und setze `statement_timeout` und `idle_in_transaction_session_timeout` für die App-Rollen, damit es solche Transaktionen gar nicht erst gibt.
+
+      Die Operation selbst war harmlos. Seit PostgreSQL 11 schreibt `ADD COLUMN` auch mit nicht volatilem Default die Tabelle nicht neu. Gefährlich war nur das Warten.
+    tags: [migrationen, sperren, szenario]
+    level: 3
+  - id: spalte-umbenennen
+    module: migrationen
+    q: "`mitglieder.name` soll in `vorname` und `nachname` aufgeteilt werden – ohne Ausfall, bei laufendem Betrieb mit mehreren App-Instanzen. Wie gehst du vor?"
+    a: |
+      Mit Expand and Contract über mehrere Deployments, weil während eines Rolling Deployments alte und neue App-Version gleichzeitig laufen.
+
+      1. **Expand:** `vorname` und `nachname` als nullable Spalten anlegen. Das geht schnell, ohne Rewrite.
+      2. **Doppelt schreiben:** Die neue App-Version schreibt bei jeder Änderung `name` und die neuen Spalten und liest weiter `name`.
+      3. **Backfill:** Bestehende Zeilen in Batches von einigen tausend nachziehen, mit `COMMIT` dazwischen, idempotent und wiederaufsetzbar. Namen, die sich nicht eindeutig aufteilen lassen, landen in einer Liste für die Fachseite.
+      4. **Umstellen:** Die App liest die neuen Spalten. `NOT NULL` kommt per `NOT VALID` und `VALIDATE` dazu.
+      5. **Contract:** Die App schreibt `name` nicht mehr, und das ORM-Modell kennt die Spalte nicht mehr. Erst im Deployment danach folgt `DROP COLUMN name`.
+
+      Jeder Schritt ist für sich rückrollbar, weil die vorige App-Version mit dem Schema weiterhin funktioniert. Ein `RENAME COLUMN` wäre zwar schnell, aber die alte App-Version würde sofort mit „column does not exist“ scheitern.
+    tags: [migrationen, expand-contract]
+    level: 3
+  - id: not-null-nachruesten
+    module: migrationen
+    q: "`buchungen.preis` soll `NOT NULL` werden. Die Tabelle hat 40 Millionen Zeilen. Was spricht gegen `ALTER TABLE buchungen ALTER COLUMN preis SET NOT NULL`, und wie machst du es?"
+    a: |
+      `SET NOT NULL` prüft alle 40 Millionen Zeilen unter einer `ACCESS EXCLUSIVE`-Sperre. Solange der Scan läuft, kann niemand die Tabelle lesen oder schreiben.
+
+      Seit PostgreSQL 18 geht es in zwei Schritten:
+
+      ```postgres
+      SET lock_timeout = '3s';
+      ALTER TABLE buchungen ADD CONSTRAINT buchungen_preis_nn NOT NULL preis NOT VALID;
+      ALTER TABLE buchungen VALIDATE CONSTRAINT buchungen_preis_nn;
+      ```
+
+      Der erste Schritt sperrt nur kurz und gilt sofort für neue und geänderte Zeilen. Die Validierung liest die Tabelle unter `SHARE UPDATE EXCLUSIVE`, Lesen und Schreiben laufen weiter. In älteren Versionen nimmt man dafür `CHECK (preis IS NOT NULL) NOT VALID`, dann `VALIDATE`, dann `SET NOT NULL`. Das überspringt den Scan, weil der gültige Check beweist, dass es keine `NULL` gibt. Danach wird der Check gelöscht.
+
+      Vor allem muss vorher der Backfill erledigt sein, in Batches, sonst scheitert die Validierung. Und die App muss schon überall einen Preis schreiben, bevor der Constraint kommt.
+    tags: [migrationen, constraints]
+    level: 3
+  - id: migration-zurueckrollen
+    module: migrationen
+    q: Wie sieht bei dir die Rollback-Strategie für Schema-Migrationen aus?
+    a: |
+      Ich plane so, dass ich selten zurückrollen muss, und repariere im Zweifel vorwärts. Jede Migration ist rückwärtskompatibel: Die aktuell laufende App-Version funktioniert mit dem neuen Schema. Dann ist die Reihenfolge immer erst Migration, dann Code. Geht mit dem neuen Code etwas schief, rolle ich nur die App zurück, und das Schema darf bleiben.
+
+      Destruktive Schritte wie `DROP COLUMN` oder `DROP TABLE` kommen in ein eigenes, späteres Deployment, wenn sicher ist, dass nichts sie mehr braucht. Down-Migrationen in Alembic schreibe ich für die Entwicklung. In Produktion sind sie bei Datenänderungen oft nicht verlustfrei, und ein `downgrade` unter Last ist selbst ein Risiko.
+
+      Damit eine Migration gar nicht erst halb hängen bleibt, hilft transaktionales DDL: Bis auf Ausnahmen wie `CREATE INDEX CONCURRENTLY` läuft sie in PostgreSQL ganz oder gar nicht. Dazu kommen ein `lock_timeout`, ein Testlauf gegen eine Kopie mit realistischer Datenmenge und die Prüfung in der CI, dass Migrationen vorwärts von leer bis aktuell durchlaufen. Wenn trotzdem etwas schiefgeht, schreibe ich eine neue Migration, die den Fehler behebt, statt die Historie umzuschreiben.
+    tags: [migrationen, deployment]
+    level: 2
+
+  # Ohne Modul: Praxis und Verhalten
+  - id: fremdes-schema-einarbeiten
+    q: Du kommst in ein Team mit einer gewachsenen Datenbank von 200 Tabellen. Wie arbeitest du dich ein?
+    a: |
+      Von den Abläufen her, nicht alphabetisch. Ich frage nach den drei, vier wichtigsten Geschäftsvorgängen, bei Deskwerk etwa Buchen, Abrechnen und Einchecken, und verfolge je einen durch Code und Datenbank. Mit eingeschaltetem SQL-Logging sehe ich, welche Tabellen und Abfragen dabei tatsächlich vorkommen.
+
+      Parallel lese ich das Schema dort, wo es Regeln verrät: Fremdschlüssel, Unique- und Check-Constraints, Trigger. `\d tabelle` in psql zeigt das kompakt. Aus den Fremdschlüsseln lasse ich mir ein ER-Diagramm erzeugen und markiere die zentralen Tabellen. `pg_stat_user_tables` zeigt, welche Tabellen groß und viel beschrieben sind und welche tot.
+
+      Was ich finde, schreibe ich auf, etwa eine Seite „Datenmodell Buchung“ im Wiki. Offene Fragen sammle ich für jemanden aus dem Team, statt Annahmen zu treffen. In den ersten Wochen nehme ich mir kleine Aufgaben, die eine Migration oder eine neue Abfrage enthalten, und lasse sie gründlich reviewen. So lerne ich die Konventionen des Teams.
+    tags: [praxis, einarbeitung]
+    level: 1
+  - id: datenbankproblem-erzaehlen
+    q: Erzähl von einem Datenbankproblem, das du gelöst hast.
+    a: |
+      Die Frage zielt auf Vorgehen und Verantwortung, nicht auf ein spektakuläres Problem. Ich antworte nach dem Muster Situation, Aufgabe, Handlung, Ergebnis und nenne Zahlen.
+
+      Ein Beispiel aus einem eigenen Projekt: „In meinem Buchungs-Backend wurde die Übersicht mit 10 000 Testbuchungen langsam, rund 1,8 Sekunden. Im SQL-Log sah ich 400 fast gleiche Abfragen, ein N+1 über die Raumbeziehung. Ich habe `selectinload` ergänzt, danach waren es zwei Abfragen. `EXPLAIN` zeigte dann einen Seq Scan beim Filter nach Woche. Ein Index auf `(beginn, id)` brachte die Seite unter 50 ms, auch mit einer Million generierter Buchungen. Zum Schluss habe ich einen Test ergänzt, der die Zahl der Abfragen begrenzt, damit das N+1 nicht zurückkommt.“
+
+      Wichtig ist, ehrlich zu sein, was man selbst getan hat und was das Team. Gut kommt auch an, was man daraus gelernt hat: messen vor dem Ändern, Belege im Pull Request, eine Regel für künftige Reviews. Ohne Berufserfahrung ist ein Portfolio-Projekt mit echten Messwerten eine vollwertige Antwort.
+    tags: [praxis, verhalten]
+    level: 1

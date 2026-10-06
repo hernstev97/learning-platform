@@ -1,0 +1,1087 @@
+id: indexe
+title: Indexe
+level: 2
+minutes: 170
+summary: Warum eine Abfrage nach einem Jahr Betrieb langsam wird und welcher Index sie wieder schnell macht – B-Baum und Selektivität, Spaltenreihenfolge, partielle und Ausdrucksindexe, Covering Index, GIN und GiST, und was jeder Index beim Schreiben kostet.
+goals:
+  - Du erklärst, wie PostgreSQL eine Zeile über Heap und B-Baum findet und warum ein Seq Scan oft die richtige Wahl ist.
+  - Du legst zusammengesetzte Indexe in der passenden Spaltenreihenfolge an – Gleichheit vor Bereich – und nutzt sie für `ORDER BY … LIMIT`.
+  - Du setzt partielle Indexe, Ausdrucksindexe, Unique-Indexe und Covering Indexe mit `INCLUDE` gezielt ein.
+  - Du wählst GIN für JSONB und Teilwortsuche mit `pg_trgm` und GiST für Zeiträume.
+  - Du wägst den Nutzen eines Index gegen seine Kosten beim Schreiben ab und findest Fremdschlüssel ohne Index.
+resources:
+  - title: PostgreSQL · Indexes (Kapitel 11)
+    url: https://www.postgresql.org/docs/current/indexes.html
+  - title: PostgreSQL · Multicolumn Indexes
+    url: https://www.postgresql.org/docs/current/indexes-multicolumn.html
+  - title: PostgreSQL · Index-Only Scans and Covering Indexes
+    url: https://www.postgresql.org/docs/current/indexes-index-only-scans.html
+  - title: PostgreSQL · CREATE INDEX
+    url: https://www.postgresql.org/docs/current/sql-createindex.html
+lesson: |
+  Im ersten Monat lädt die Seite „Meine Buchungen“ der Deskwerk-App in wenigen Millisekunden. Ein Jahr später ist sie spürbar langsamer, und im Monitoring steht ganz oben dieselbe Abfrage: `SELECT … FROM buchungen WHERE mitglied_id = $1 ORDER BY beginn DESC LIMIT 10`. Am Code hat sich nichts geändert, an den Daten schon. Aus 300 Buchungen sind 20 000 geworden, und PostgreSQL liest für jeden Seitenaufruf jede einzelne davon.
+
+  Ein **Index** ist eine zusätzliche, sortierte Datenstruktur, über die PostgreSQL passende Zeilen findet, ohne die ganze Tabelle zu lesen. Von selbst entstehen nur die Indexe, die PostgreSQL für Primärschlüssel, Unique- und Exclusion-Constraints anlegt. SQLAlchemy und Prisma fügen keine weiteren hinzu, solange du sie nicht deklarierst – alle anderen musst du entwerfen. Dieses Modul zeigt, welcher Index welcher Abfrage hilft und was er kostet. Wie man Pläne im Detail liest, vertieft [Query-Pläne](/postgres/query-plaene). Die Blöcke legen jeweils dieselben 20 000 Buchungen an: 30 Räume, 2 000 Mitglieder mit je 10 Buchungen, jede 20. Buchung storniert.
+
+  ## Heap und Index: wie PostgreSQL eine Zeile findet
+
+  Eine Tabelle liegt als **Heap** auf der Platte: eine Folge von Seiten zu je 8 kB, in die PostgreSQL neue Zeilen dort schreibt, wo Platz ist ([Database Page Layout](https://www.postgresql.org/docs/current/storage-page-layout.html)). Sortiert ist dabei nichts. Jede Zeilenversion hat eine Adresse, die Systemspalte `ctid`: Seite und Position auf der Seite. Ohne Index bleibt nur der **Seq Scan**: alle Seiten lesen und jede Zeile gegen die Bedingung prüfen.
+
+  ```postgres run
+  CREATE TABLE buchungen (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    raum_id     int NOT NULL,
+    mitglied_id int NOT NULL,
+    beginn      timestamptz NOT NULL,
+    ende        timestamptz NOT NULL,
+    status      text NOT NULL DEFAULT 'bestaetigt',
+    preis       numeric(8,2)
+  );
+  -- 20 000 Buchungen ab Januar 2026: 30 Räume, 2 000 Mitglieder mit je 10 Buchungen, jede 20. storniert
+  INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, status, preis)
+  SELECT i % 30 + 1, i * 7 % 2000 + 1,
+         timestamptz '2026-01-02 08:00+01' + i / 60 * interval '1 day' + i % 10 * interval '1 hour',
+         timestamptz '2026-01-02 10:00+01' + i / 60 * interval '1 day' + i % 10 * interval '1 hour',
+         CASE WHEN i % 20 = 0 THEN 'storniert' ELSE 'bestaetigt' END,
+         (i % 5 + 1) * 12.50
+  FROM generate_series(1, 20000) AS i;
+  ANALYZE buchungen;
+
+  SELECT ctid, id, raum_id, mitglied_id, beginn FROM buchungen ORDER BY id LIMIT 3;
+  SELECT relpages, reltuples FROM pg_class WHERE relname = 'buchungen';
+
+  EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT * FROM buchungen WHERE mitglied_id = 42;
+
+  CREATE INDEX buchungen_mitglied_idx ON buchungen (mitglied_id);
+
+  EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT * FROM buchungen WHERE mitglied_id = 42;
+  ```
+
+  `EXPLAIN` zeigt, wie PostgreSQL eine Abfrage ausführen will. Mit `ANALYZE` führt es sie aus und zählt mit; die übrigen Optionen blenden Kosten und Zeiten aus, damit die Ausgabe bei jedem Lauf gleich ist. Die Tabelle belegt 199 Seiten, und der erste Plan liest sie alle, um 10 von 20 000 Zeilen zu finden:
+
+  ```text
+  Seq Scan on buchungen (actual rows=10.00 loops=1)
+    Filter: (mitglied_id = 42)
+    Rows Removed by Filter: 19990
+  ```
+
+  Der Index ist ein **B-Baum** ([B-Tree Structure](https://www.postgresql.org/docs/current/btree.html#BTREE-STRUCTURE)). Seine Blattseiten enthalten für jede Zeile ein Paar aus Schlüssel und `ctid`, sortiert nach dem Schlüssel und untereinander verkettet. Darüber liegen innere Seiten, die nur die Grenzen der Seiten darunter kennen, ganz oben eine Wurzel. Mit den echten Adressen dieser Daten sieht der Weg zu Mitglied 42 so aus:
+
+  ```text
+  Wurzel                     [ …  |  …  |  … ]
+                                    │
+  Innere Seite               [ …  |  …  |  … ]
+                                    │
+  Blattseite    ⇄ [ … 41→(195,25) | 42→(8,55) | 42→(28,35) | … | 42→(186,77) | 43→(0,6) … ] ⇄
+                                       │
+  Heap                       Seite 8, Position 55
+  ```
+
+  Die Suche läuft von der Wurzel über eine innere Seite zum Blatt, liest dort die zehn Einträge für 42 und holt die Zeilen über ihre `ctid` aus dem Heap. Ein Blatt fasst einige hundert Einträge, deshalb bleibt der Baum flach: Auch Millionen Zeilen passen in drei oder vier Ebenen. Der Aufwand wächst logarithmisch mit der Tabelle, der des Seq Scans linear. Der zweite Plan zeigt eine Variante dieses Wegs, den **Bitmap Scan**: Erst sammelt der `Bitmap Index Scan` alle passenden Adressen, dann liest der `Bitmap Heap Scan` jede betroffene Seite genau einmal (`Heap Blocks: exact=10`). Ein Index Scan im engeren Sinn holt die Zeilen dagegen einzeln in Indexreihenfolge.
+
+  `PRIMARY KEY` und `UNIQUE` legen ihren B-Baum selbst an, hier `buchungen_pkey`. Ein Fremdschlüssel bekommt keinen; dazu mehr bei den Kosten.
+
+  ## Wann ein Index hilft: Selektivität
+
+  Ein Index lohnt sich, wenn die Bedingung einen kleinen Teil der Tabelle auswählt. Diesen Anteil nennt man **Selektivität**. Der Grund liegt im Zugriffsmuster: Ein Seq Scan liest Seite für Seite am Stück, ein Index Scan springt für jede Zeile an eine andere Stelle im Heap. Der Planer bewertet eine zufällig gelesene Seite standardmäßig viermal so teuer wie eine der Reihe nach gelesene (`random_page_cost = 4`, `seq_page_cost = 1`, siehe [Planner Cost Constants](https://www.postgresql.org/docs/current/runtime-config-query.html#RUNTIME-CONFIG-QUERY-CONSTANTS)). Er rechnet die möglichen Pläne durch und nimmt den billigsten.
+
+  ```postgres run
+  CREATE TABLE buchungen (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    raum_id     int NOT NULL,
+    mitglied_id int NOT NULL,
+    beginn      timestamptz NOT NULL,
+    ende        timestamptz NOT NULL,
+    status      text NOT NULL DEFAULT 'bestaetigt',
+    preis       numeric(8,2)
+  );
+  INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, status, preis)
+  SELECT i % 30 + 1, i * 7 % 2000 + 1,
+         timestamptz '2026-01-02 08:00+01' + i / 60 * interval '1 day' + i % 10 * interval '1 hour',
+         timestamptz '2026-01-02 10:00+01' + i / 60 * interval '1 day' + i % 10 * interval '1 hour',
+         CASE WHEN i % 20 = 0 THEN 'storniert' ELSE 'bestaetigt' END,
+         (i % 5 + 1) * 12.50
+  FROM generate_series(1, 20000) AS i;
+  ANALYZE buchungen;
+  CREATE INDEX buchungen_mitglied_idx ON buchungen (mitglied_id);
+
+  EXPLAIN SELECT * FROM buchungen WHERE mitglied_id = 42;      -- 10 Zeilen
+  EXPLAIN SELECT * FROM buchungen WHERE mitglied_id <= 600;    -- 6 000 Zeilen
+  EXPLAIN SELECT * FROM buchungen WHERE mitglied_id <= 1000;   -- 10 000 Zeilen
+
+  -- Nur zum Vergleich: Seq Scan und Bitmap Scan verbieten
+  SET enable_seqscan = off;
+  SET enable_bitmapscan = off;
+  EXPLAIN SELECT * FROM buchungen WHERE mitglied_id <= 1000;
+  ```
+
+  Die oberste Zeile jedes Plans mit ihren Gesamtkosten (die zweite Zahl hinter `cost=`, in Einheiten einer sequenziell gelesenen Seite):
+
+  ```text
+  Bitmap Heap Scan on buchungen  (cost=4.37..37.76 rows=10 width=48)
+  Bitmap Heap Scan on buchungen  (cost=78.79..352.79 rows=6000 width=48)
+  Seq Scan on buchungen  (cost=0.00..449.00 rows=10000 width=48)
+  Index Scan using buchungen_mitglied_idx on buchungen  (cost=0.29..1023.14 rows=10000 width=48)
+  ```
+
+  Für zehn Zeilen kostet der Weg über den Index weniger als ein Zehntel des Seq Scans. Bei der halben Tabelle ist der Index Scan mehr als doppelt so teuer wie alles zu lesen, und der Planer nimmt zu Recht den Seq Scan. Woher er die Zeilenzahlen kennt, bevor er die Abfrage ausführt, steht in [Query-Pläne](/postgres/query-plaene): aus der Statistik, die `ANALYZE` sammelt. Mit denselben Zahlen erklärt sich ein Index auf `status`: Er hilft bei der Suche nach den 5 % stornierten Buchungen, bei `status = 'bestaetigt'` (95 %) ignoriert der Planer ihn.
+
+  > [!MERKE]
+  > Ein Seq Scan ist kein Fehler. Er ist der billigste Plan, wenn die Abfrage einen großen Teil der Tabelle braucht oder die Tabelle klein ist. Verdächtig ist ein Seq Scan, der wenige Zeilen liefert und viele verwirft (`Rows Removed by Filter`).
+
+  ## Zusammengesetzte Indexe und Sortierung
+
+  Ein Index über mehrere Spalten ist sortiert wie ein Telefonbuch: erst nach der ersten Spalte, bei gleichem Wert nach der zweiten. Für den Raumkalender von Deskwerk heißt das: Ein Index auf `(raum_id, beginn)` enthält alle Buchungen von Raum 1 in zeitlicher Reihenfolge, dann alle von Raum 2 und so weiter. Daraus folgt die Regel aus der Dokumentation ([Multicolumn Indexes](https://www.postgresql.org/docs/current/indexes-multicolumn.html)): Gleichheitsbedingungen auf den vorderen Spalten und eine Bereichsbedingung auf der ersten Spalte ohne Gleichheit begrenzen den gelesenen Abschnitt. Kurz: **Gleichheit vor Bereich.**
+
+  ```postgres run
+  CREATE TABLE buchungen (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    raum_id     int NOT NULL,
+    mitglied_id int NOT NULL,
+    beginn      timestamptz NOT NULL,
+    ende        timestamptz NOT NULL,
+    status      text NOT NULL DEFAULT 'bestaetigt',
+    preis       numeric(8,2)
+  );
+  INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, status, preis)
+  SELECT i % 30 + 1, i * 7 % 2000 + 1,
+         timestamptz '2026-01-02 08:00+01' + i / 60 * interval '1 day' + i % 10 * interval '1 hour',
+         timestamptz '2026-01-02 10:00+01' + i / 60 * interval '1 day' + i % 10 * interval '1 hour',
+         CASE WHEN i % 20 = 0 THEN 'storniert' ELSE 'bestaetigt' END,
+         (i % 5 + 1) * 12.50
+  FROM generate_series(1, 20000) AS i;
+  ANALYZE buchungen;
+
+  -- Die letzten fünf Buchungen von Raum 7, noch ohne passenden Index
+  EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT id, mitglied_id, beginn FROM buchungen
+  WHERE raum_id = 7 ORDER BY beginn DESC LIMIT 5;
+
+  CREATE INDEX buchungen_raum_beginn_idx ON buchungen (raum_id, beginn);
+
+  -- 1. Dieselbe Abfrage mit Index
+  EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT id, mitglied_id, beginn FROM buchungen
+  WHERE raum_id = 7 ORDER BY beginn DESC LIMIT 5;
+
+  -- 2. Belegung von Raum 7 in einer Woche: Gleichheit vorn, Bereich dahinter
+  EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT id, mitglied_id, beginn FROM buchungen
+  WHERE raum_id = 7 AND beginn >= '2026-03-02' AND beginn < '2026-03-09';
+
+  -- 3. Alle Buchungen eines Tages: nur die zweite Spalte
+  EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT id, raum_id, beginn FROM buchungen
+  WHERE beginn >= '2026-03-02' AND beginn < '2026-03-03';
+  ```
+
+  Ohne Index liest PostgreSQL alle 667 Buchungen von Raum 7 und sortiert sie, um fünf zu behalten (erster Plan). Mit dem Index liegen die Buchungen von Raum 7 schon nach `beginn` sortiert vor, PostgreSQL liest den Abschnitt von hinten und hört nach fünf Einträgen auf (zweiter Plan):
+
+  ```text
+  Limit (actual rows=5.00 loops=1)
+    ->  Sort (actual rows=5.00 loops=1)
+          Sort Key: beginn DESC
+          Sort Method: top-N heapsort  Memory: 17kB
+          ->  Seq Scan on buchungen (actual rows=667.00 loops=1)
+                Filter: (raum_id = 7)
+                Rows Removed by Filter: 19333
+
+  Limit (actual rows=5.00 loops=1)
+    ->  Index Scan Backward using buchungen_raum_beginn_idx on buchungen (actual rows=5.00 loops=1)
+          Index Cond: (raum_id = 7)
+          Index Searches: 1
+  ```
+
+  Ein B-Baum lässt sich in beide Richtungen lesen, deshalb braucht `ORDER BY beginn DESC` keinen absteigenden Index. `DESC` in der Indexdefinition zählt erst bei gemischten Richtungen wie `ORDER BY raum_id, beginn DESC` ([Indexes and ORDER BY](https://www.postgresql.org/docs/current/indexes-ordering.html)). Dasselbe Muster trägt die Keyset-Paginierung aus [Abfragen](/postgres/abfragen): `WHERE (beginn, id) < ($1, $2) ORDER BY beginn DESC, id DESC LIMIT 20` braucht einen Index, der genau so sortiert ist.
+
+  Abfrage 2 liest genau einen zusammenhängenden Abschnitt des Index: 14 Einträge, `Index Searches: 1`. Abfrage 3 hat keine Bedingung auf `raum_id`. Bis PostgreSQL 17 hätte der Planer hier den ganzen Index oder die ganze Tabelle gelesen. Seit PostgreSQL 18 kann ein B-Baum die erste Spalte **überspringen** (Skip Scan): Er sucht den Tag für jeden der 30 Räume einzeln, der Plan zählt `Index Searches: 31`. Das lohnt sich nur bei wenigen verschiedenen Werten in der vorderen Spalte. Mit einem Index auf `(mitglied_id, beginn)` und 2 000 Mitgliedern wählt der Planer für Abfrage 3 einen Seq Scan.
+
+  > [!INTERVIEW] „In welcher Reihenfolge legst du die Spalten eines zusammengesetzten Index an?“
+  > Nach den Abfragen, nicht nach dem Schema. Spalten mit Gleichheitsbedingung kommen nach vorn, danach die Spalte mit der Bereichsbedingung oder der Sortierung. Für „Buchungen von Raum 7 im März, nach Beginn sortiert“ ist das `(raum_id, beginn)`: Der Index liefert einen zusammenhängenden, schon sortierten Abschnitt. Umgekehrt, `(beginn, raum_id)`, müsste er alle Räume im März durchgehen. Ein Index auf `(a, b)` ersetzt außerdem einen Index auf `(a)` allein.
+
+  ### Covering Index und Index-Only Scan
+
+  Braucht eine Abfrage nur Spalten, die im Index stehen, kann PostgreSQL den Heap ganz auslassen: ein **Index-Only Scan**. Spalten, nach denen nicht gesucht wird, nimmst du mit `INCLUDE` auf. Sie stehen dann nur in den Blattseiten und bestimmen die Sortierung nicht ([Index-Only Scans and Covering Indexes](https://www.postgresql.org/docs/current/indexes-index-only-scans.html)).
+
+  ```postgres run
+  CREATE TABLE buchungen (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    raum_id     int NOT NULL,
+    mitglied_id int NOT NULL,
+    beginn      timestamptz NOT NULL,
+    ende        timestamptz NOT NULL,
+    status      text NOT NULL DEFAULT 'bestaetigt',
+    preis       numeric(8,2)
+  );
+  INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, status, preis)
+  SELECT i % 30 + 1, i * 7 % 2000 + 1,
+         timestamptz '2026-01-02 08:00+01' + i / 60 * interval '1 day' + i % 10 * interval '1 hour',
+         timestamptz '2026-01-02 10:00+01' + i / 60 * interval '1 day' + i % 10 * interval '1 hour',
+         CASE WHEN i % 20 = 0 THEN 'storniert' ELSE 'bestaetigt' END,
+         (i % 5 + 1) * 12.50
+  FROM generate_series(1, 20000) AS i;
+  ANALYZE buchungen;
+  CREATE INDEX buchungen_mitglied_beginn_idx ON buchungen (mitglied_id, beginn) INCLUDE (ende);
+
+  EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT beginn, ende FROM buchungen WHERE mitglied_id = 42;
+
+  VACUUM buchungen;
+
+  EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT beginn, ende FROM buchungen WHERE mitglied_id = 42;
+
+  EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT beginn, ende, status FROM buchungen WHERE mitglied_id = 42;
+  ```
+
+  Vor `VACUUM` wählt der Planer einen Bitmap Scan, danach `Index Only Scan using buchungen_mitglied_beginn_idx` mit `Heap Fetches: 0`. Der Grund ist MVCC: Ein Indexeintrag weiß nicht, ob seine Zeilenversion für die laufende Transaktion sichtbar ist. Das steht nur im Heap und in der **Visibility Map**, die `VACUUM` pflegt. Ist eine Seite dort als „alles sichtbar“ markiert, spart sich PostgreSQL den Heap-Zugriff; sonst zählt er als `Heap Fetches`. Auf Tabellen mit vielen Änderungen bringt ein Index-Only Scan deshalb weniger, als der Name verspricht. Die dritte Abfrage braucht `status`, das nicht im Index steht, und fällt zurück auf den Bitmap Scan.
+
+  ## Partielle Indexe, Ausdrucksindexe und Unique-Indexe
+
+  Ein **partieller Index** enthält nur die Zeilen, die eine Bedingung erfüllen ([Partial Indexes](https://www.postgresql.org/docs/current/indexes-partial.html)). Der monatliche Mahnlauf sucht offene Rechnungen, und offen sind wenige: hier die 2 000 Oktoberrechnungen und 40 vergessene aus dem März.
+
+  ```postgres run
+  CREATE TABLE rechnungen (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    mitglied_id int NOT NULL,
+    monat       date NOT NULL,
+    betrag      numeric(10,2) NOT NULL,
+    bezahlt_am  timestamptz
+  );
+  -- 2 000 Mitglieder × 10 Monate; offen sind alle Rechnungen für Oktober und die Märzrechnungen jedes 50. Mitglieds
+  INSERT INTO rechnungen (mitglied_id, monat, betrag, bezahlt_am)
+  SELECT m, date '2026-01-01' + (k - 1) * interval '1 month', 89.00,
+         CASE WHEN k = 10 OR (k = 3 AND m % 50 = 0) THEN NULL
+              ELSE timestamptz '2026-01-10 12:00+01' + (k - 1) * interval '1 month' END
+  FROM generate_series(1, 2000) AS m, generate_series(1, 10) AS k;
+
+  CREATE INDEX rechnungen_monat_idx ON rechnungen (monat);
+  CREATE INDEX rechnungen_offen_idx ON rechnungen (monat) WHERE bezahlt_am IS NULL;
+  ANALYZE rechnungen;
+
+  SELECT c.relname AS index, i.indpred IS NOT NULL AS partiell, c.reltuples AS eintraege,
+         pg_size_pretty(pg_relation_size(c.oid)) AS groesse
+  FROM pg_index AS i JOIN pg_class AS c ON c.oid = i.indexrelid
+  WHERE i.indrelid = 'rechnungen'::regclass AND NOT i.indisprimary
+  ORDER BY c.relname;
+
+  -- Mahnlauf: offene Rechnungen vor Oktober
+  EXPLAIN (COSTS OFF)
+  SELECT mitglied_id, monat, betrag FROM rechnungen
+  WHERE bezahlt_am IS NULL AND monat < '2026-10-01';
+  ```
+
+  Der partielle Index hat 2 040 statt 20 000 Einträge und belegt 32 kB statt 160 kB, und der Mahnlauf nutzt ihn. Benutzen darf der Planer ihn nur, wenn er aus dem `WHERE` der Abfrage beweisen kann, dass die Indexbedingung gilt. Fehlt `bezahlt_am IS NULL` in der Abfrage, kommt der partielle Index nicht infrage. Ein partieller **Unique**-Index setzt Regeln durch, die nur für einen Teil der Zeilen gelten, etwa „E-Mail eindeutig unter den nicht gelöschten Mitgliedern“ beim Soft Delete aus [Datenmodellierung](/postgres/datenmodellierung).
+
+  Ein **Ausdrucksindex** indiziert das Ergebnis eines Ausdrucks statt einer Spalte ([Indexes on Expressions](https://www.postgresql.org/docs/current/indexes-expressional.html)). Der Login von Deskwerk vergleicht E-Mail-Adressen ohne Rücksicht auf Groß- und Kleinschreibung:
+
+  ```postgres run fails
+  CREATE TABLE mitglieder (
+    id    int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email text NOT NULL,
+    name  text NOT NULL
+  );
+  INSERT INTO mitglieder (email, name)
+  SELECT 'Mitglied' || i || '@Example.org', 'Mitglied ' || i FROM generate_series(1, 2000) AS i;
+  CREATE UNIQUE INDEX mitglieder_email_lower_idx ON mitglieder (lower(email));
+  ANALYZE mitglieder;
+
+  EXPLAIN (COSTS OFF) SELECT id FROM mitglieder WHERE lower(email) = lower('MITGLIED42@example.org');
+  EXPLAIN (COSTS OFF) SELECT id FROM mitglieder WHERE email = 'mitglied42@example.org';
+  INSERT INTO mitglieder (email, name) VALUES ('mitglied42@EXAMPLE.ORG', 'Doppelt');
+  ```
+
+  Die erste Abfrage nutzt den Index, die zweite liest die ganze Tabelle: Der Index kennt nur `lower(email)`, und genau dieser Ausdruck muss in der Abfrage stehen. Weil der Index `UNIQUE` ist, scheitert das letzte `INSERT` mit `duplicate key value violates unique constraint "mitglieder_email_lower_idx"` – zwei Konten für dieselbe Adresse in anderer Schreibweise sind jetzt ausgeschlossen. Ein Upsert nennt den Ausdruck als Konfliktziel: `ON CONFLICT ((lower(email))) DO NOTHING`. Der Ausdruck muss `IMMUTABLE` sein, also bei gleicher Eingabe immer dasselbe liefern. `CREATE INDEX ON buchungen ((beginn::date))` scheitert deshalb mit `functions in index expression must be marked IMMUTABLE`: Welcher Tag zu einem `timestamptz` gehört, hängt von der Zeitzone der Sitzung ab.
+
+  Ein `UNIQUE`-Constraint ist intern ein Unique-Index. Für einfache Spalten nimmst du den Constraint, weil er im Schema als Regel sichtbar ist; für Ausdrücke und Teilmengen geht nur der Index. Was `NULL` in eindeutigen Spalten bedeutet, behandelt [Constraints](/postgres/constraints).
+
+  ## GIN und GiST: Indexe für JSONB, Text und Zeiträume
+
+  Ein B-Baum beantwortet Fragen nach Ordnung: `=`, `<`, `>`, `BETWEEN`, `IN`, `IS NULL` und `LIKE 'präfix%'`. Letzteres geht nur bei der Sortierung `C` oder mit der Operatorklasse `text_pattern_ops`. PGlite im Browser nutzt `C`. Läuft ein Server mit `de_DE.UTF-8`, `en_US.UTF-8` oder einer ICU-Sortierung – der Normalfall in Produktion –, braucht die Präfixsuche einen Index wie `ON mitglieder (email text_pattern_ops)`. Fragen der Art „enthält“ beantwortet ein B-Baum nicht. Dafür gibt es **GIN**, einen invertierten Index: Für jedes Element – einen Schlüssel in JSONB, einen Wert in einem Array, eine Buchstabenfolge – speichert er die Liste der Zeilen, die es enthalten ([GIN](https://www.postgresql.org/docs/current/indexes-types.html#INDEXES-TYPES-GIN)). Die Erweiterung `pg_trgm` zerlegt Text in Trigramme, Folgen aus drei Zeichen, und macht so `ILIKE '%krüg%'` indizierbar.
+
+  ```postgres run
+  CREATE EXTENSION pg_trgm;
+  CREATE TABLE mitglieder (
+    id            int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name          text NOT NULL,
+    einstellungen jsonb NOT NULL DEFAULT '{}'
+  );
+  INSERT INTO mitglieder (name, einstellungen)
+  SELECT (ARRAY['Anna','Jonas','Lea','Paul','Mia','Felix','Emma','Noah'])[i % 8 + 1] || ' '
+         || (ARRAY['Schulz','Becker','Wolf','Krüger','Hoffmann','Lehmann','Müller'])[i % 7 + 1] || ' ' || i,
+         jsonb_build_object('newsletter', i % 10 = 0, 'sprache', CASE WHEN i % 4 = 0 THEN 'en' ELSE 'de' END)
+  FROM generate_series(1, 5000) AS i;
+  CREATE INDEX mitglieder_name_trgm_idx ON mitglieder USING gin (name gin_trgm_ops);
+  CREATE INDEX mitglieder_einstellungen_idx ON mitglieder USING gin (einstellungen);
+  ANALYZE mitglieder;
+
+  EXPLAIN (COSTS OFF) SELECT id, name FROM mitglieder WHERE name ILIKE '%krüg%';
+  EXPLAIN (COSTS OFF) SELECT id, name FROM mitglieder WHERE einstellungen @> '{"newsletter": true}';
+  EXPLAIN (COSTS OFF) SELECT id, name FROM mitglieder WHERE einstellungen @> '{"sprache": "de"}';
+  ```
+
+  Die ersten beiden Abfragen laufen über ihren GIN-Index. Die dritte trifft 75 % der Mitglieder, und auch hier gilt die Selektivität: Seq Scan. GIN-Indexe sind groß und beim Schreiben teurer als ein B-Baum, weil eine Zeile viele Einträge erzeugt.
+
+  **GiST** ist ein Baum für Daten, die sich überlappen oder enthalten können: Zeiträume, Geometrie, Volltext. Ein Index `USING gist (tstzrange(beginn, ende))` beantwortet „Welche Buchungen überschneiden sich mit 10 bis 11 Uhr?“ mit dem Operator `&&`. Der wichtigste Einsatz bei Deskwerk ist der Exclusion Constraint gegen Doppelbuchungen aus [Constraints](/postgres/constraints); er legt seinen GiST-Index selbst an.
+
+  ## Was Indexe kosten
+
+  Jeder Index ist eine Kopie eines Teils der Tabelle. PostgreSQL schreibt bei jedem `INSERT` in jeden Index, ebenso bei jedem `UPDATE`, das kein HOT-Update ist – auch in Indexe, deren Spalten sich nicht geändert haben. Ein `DELETE` lässt die Indexeinträge zunächst stehen; VACUUM räumt sie später auf und hat dadurch mehr Arbeit.
+
+  ```postgres run
+  CREATE TABLE buchungen (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    raum_id     int NOT NULL,
+    mitglied_id int NOT NULL,
+    beginn      timestamptz NOT NULL,
+    ende        timestamptz NOT NULL,
+    status      text NOT NULL DEFAULT 'bestaetigt',
+    preis       numeric(8,2)
+  );
+  INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, status, preis)
+  SELECT i % 30 + 1, i * 7 % 2000 + 1,
+         timestamptz '2026-01-02 08:00+01' + i / 60 * interval '1 day' + i % 10 * interval '1 hour',
+         timestamptz '2026-01-02 10:00+01' + i / 60 * interval '1 day' + i % 10 * interval '1 hour',
+         CASE WHEN i % 20 = 0 THEN 'storniert' ELSE 'bestaetigt' END,
+         (i % 5 + 1) * 12.50
+  FROM generate_series(1, 20000) AS i;
+  CREATE INDEX buchungen_mitglied_beginn_idx ON buchungen (mitglied_id, beginn);
+  CREATE INDEX buchungen_raum_beginn_idx ON buchungen (raum_id, beginn);
+  CREATE INDEX buchungen_status_idx ON buchungen (status);
+
+  SELECT relname AS objekt, pg_size_pretty(pg_relation_size(oid)) AS groesse
+  FROM pg_class
+  WHERE relname LIKE 'buchungen%' AND relkind IN ('r', 'i')
+  ORDER BY pg_relation_size(oid) DESC, relname;
+
+  SELECT pg_size_pretty(pg_table_size('buchungen')) AS tabelle,
+         pg_size_pretty(pg_indexes_size('buchungen')) AS indexe;
+  ```
+
+  Vier Indexe belegen zusammen 1 744 kB, mehr als die Tabelle mit 1 624 kB. Jede neue Buchung schreibt fünf Einträge: einen in den Heap, vier in die Indexe. Indexe konkurrieren außerdem mit den Tabellen um den Arbeitsspeicher.
+
+  > [!DEEP] HOT-Updates
+  > Ändert ein `UPDATE` keine indizierte Spalte und hat die Seite noch Platz, schreibt PostgreSQL die neue Zeilenversion auf dieselbe Seite und lässt alle Indexe unberührt: ein **Heap-Only Tuple** ([HOT](https://www.postgresql.org/docs/current/storage-hot.html)). Ein Index auf `status` kostet deshalb mehr als seinen Platz: Jede Stornierung ändert eine indizierte Spalte und ist kein HOT-Update mehr.
+
+  Drei Folgen für die Praxis:
+
+  - **Fremdschlüssel bekommen keinen Index.** Löschst du ein Mitglied, muss PostgreSQL in `buchungen` nach Zeilen mit dieser `mitglied_id` suchen – ohne Index per Seq Scan, für jedes gelöschte Mitglied. Die Dokumentation hält es deshalb oft für sinnvoll, die referenzierenden Spalten zu indizieren ([Foreign Keys](https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-FK)). Ein Index, der mit der Spalte beginnt, genügt: `(mitglied_id, beginn)` deckt den Fremdschlüssel `mitglied_id` ab.
+  - **Unbenutzte Indexe finden.** `pg_stat_user_indexes` zählt je Index die Zugriffe seit dem letzten Zurücksetzen der Statistik (Abfrage unten). Ein Index mit `idx_scan = 0` nach Wochen Betrieb ist ein Kandidat zum Löschen – außer er sichert Eindeutigkeit. Prüfe alle Server, auch Replikate, denn jeder zählt für sich.
+  - **Indexe im laufenden Betrieb anlegen.** `CREATE INDEX` sperrt die Tabelle für Schreibzugriffe, bis der Index fertig ist. `CREATE INDEX CONCURRENTLY` lässt Schreiben weiterlaufen, braucht dafür zwei Durchläufe über die Tabelle und darf nicht in einer Transaktion stehen ([Building Indexes Concurrently](https://www.postgresql.org/docs/current/sql-createindex.html#SQL-CREATEINDEX-CONCURRENTLY)). Wie das in einer Migration aussieht, zeigt [Migrationen](/postgres/migrationen).
+
+  ```postgres
+  SELECT relname AS tabelle, indexrelname AS index, idx_scan,
+         pg_size_pretty(pg_relation_size(indexrelid)) AS groesse
+  FROM pg_stat_user_indexes
+  ORDER BY idx_scan, pg_relation_size(indexrelid) DESC;
+  ```
+
+  > [!PRAXIS] Indexe im ORM-Modell deklarieren
+  > Indexe gehören in dieselbe Migration wie die Tabelle, nicht in eine spätere Notfallaktion. In SQLAlchemy 2 stehen sie in `__table_args__`, PostgreSQL-Optionen tragen das Präfix `postgresql_`. In Prisma heißt das Gegenstück `@@index([mitgliedId, beginn])`. Was das ORM-Schema nicht ausdrücken kann, schreibst du als SQL in die Migration. Im Code-Review lohnt bei jeder neuen Abfrage die Frage: Welcher Index trägt sie?
+
+  ```python
+  from sqlalchemy import Index, func, text
+
+  class Buchung(Base):
+      __tablename__ = "buchungen"
+      __table_args__ = (
+          Index("buchungen_mitglied_beginn_idx", "mitglied_id", "beginn"),
+          Index("buchungen_storniert_idx", "raum_id", postgresql_where=text("status = 'storniert'")),
+      )
+      # … Spalten wie im Schema
+
+  Index("mitglieder_email_lower_idx", func.lower(Mitglied.email), unique=True)
+  ```
+
+  ## Häufige Fehler
+
+  - **Index auf jede Spalte „zur Sicherheit“.** Jeder Index kostet bei jedem Schreiben. Indexe entstehen aus konkreten Abfragen, nicht aus dem Schema.
+  - **Falsche Spaltenreihenfolge.** `(beginn, raum_id)` für `WHERE raum_id = $1 AND beginn >= $2` liest die Einträge aller Räume im Zeitraum. Gleichheit vor Bereich.
+  - **Funktion auf der Spalte.** `WHERE lower(email) = …` nutzt keinen Index auf `email`, `WHERE beginn::date = …` keinen auf `beginn`. Entweder die Abfrage umschreiben (halboffener Bereich) oder einen Ausdrucksindex mit genau diesem Ausdruck anlegen.
+  - **Doppelte Indexe.** `(raum_id)` neben `(raum_id, beginn)` ist überflüssig. Ebenso ein eigener Index auf eine Spalte, die schon einen Primärschlüssel oder `UNIQUE` hat.
+  - **Fremdschlüssel ohne Index.** `DELETE` auf der Elterntabelle und Joins über den Fremdschlüssel lesen die ganze Kindtabelle.
+  - **Index-Only Scan erwartet, Heap Fetches bekommen.** Ohne aktuelle Visibility Map muss PostgreSQL doch in den Heap. Autovacuum hält sie aktuell.
+  - **`CREATE INDEX` ohne `CONCURRENTLY` in Produktion.** Alle Schreibzugriffe auf die Tabelle warten, bis der Index fertig ist.
+
+  ## Zusammenfassung
+
+  - Eine Tabelle ist ein unsortierter Heap, ein B-Baum ein sortierter Baum aus Schlüssel und `ctid`. Die Suche darin ist logarithmisch, ein Seq Scan linear.
+  - Der Planer wählt nach Kosten. Bei großen Anteilen der Tabelle ist ein Seq Scan billiger als jeder Index.
+  - Zusammengesetzte Indexe: Gleichheit vor Bereich. `(a, b)` ersetzt `(a)`. Ein passender Index macht `ORDER BY … LIMIT` ohne Sortieren möglich, in beide Richtungen.
+  - Seit PostgreSQL 18 kann ein Skip Scan eine vordere Spalte mit wenigen Werten überspringen. Er ersetzt keine passende Spaltenreihenfolge.
+  - `INCLUDE` macht einen Index zum Covering Index. Ob der Index-Only Scan den Heap auslässt, hängt von der Visibility Map ab.
+  - Partielle Indexe sind klein und gelten nur, wenn die Abfrage ihre Bedingung enthält. Ausdrucksindexe gelten nur für genau ihren Ausdruck.
+  - GIN für „enthält“ (JSONB, Arrays, `pg_trgm`), GiST für Überlappung (Zeiträume, Exclusion Constraints).
+  - Indexe kosten Schreibzeit, Platz und HOT-Updates. Fremdschlüssel brauchen meist einen, unbenutzte Indexe gehören weg.
+exercises:
+  - id: zusammengesetzt-aussagen
+    type: choice
+    title: Was kann der Raumkalender-Index?
+    prompt: |
+      Auf `buchungen` (20 000 Zeilen, 30 Räume) liegt neben dem Primärschlüssel nur dieser Index. Welche Aussagen stimmen? Mehrere Antworten richtig.
+    lang: postgres
+    code: |
+      CREATE INDEX buchungen_raum_beginn_idx ON buchungen (raum_id, beginn);
+    options:
+      - text: "`WHERE raum_id = 7 AND beginn >= '2026-03-02' AND beginn < '2026-03-09'` liest genau einen zusammenhängenden Abschnitt des Index."
+        correct: true
+        why: Gleichheit auf der ersten Spalte, Bereich auf der zweiten. Im Index stehen alle Buchungen von Raum 7 nach `beginn` sortiert hintereinander, die Woche ist ein Stück davon.
+      - text: "`WHERE raum_id = 7 ORDER BY beginn DESC LIMIT 5` kommt ohne Sort-Knoten aus, obwohl der Index aufsteigend sortiert ist."
+        correct: true
+        why: Ein B-Baum lässt sich rückwärts lesen (`Index Scan Backward`). PostgreSQL hört nach fünf Einträgen auf.
+      - text: "`WHERE beginn >= '2026-03-02' AND beginn < '2026-03-03'` kann diesen Index nie nutzen, weil `beginn` nicht die erste Spalte ist."
+        correct: false
+        why: Seit PostgreSQL 18 kann ein Skip Scan die erste Spalte überspringen und je Raum einzeln suchen. Bei 30 Räumen wählt der Planer genau das. Die Spalte vorn ist der Normalfall, aber keine harte Grenze.
+      - text: Ein zusätzlicher Index auf `(raum_id)` allein macht `WHERE raum_id = 7` deutlich schneller.
+        correct: false
+        why: "`(raum_id, beginn)` ist nach `raum_id` sortiert und bedient diese Bedingung schon. Ein zweiter Index wäre nur etwas kleiner, kostet aber bei jedem Schreiben."
+    explanation: |
+      Ein zusammengesetzter Index ist sortiert wie ein Telefonbuch: erst nach `raum_id`, innerhalb eines Raums nach `beginn`. Eine Gleichheit auf der ersten Spalte und ein Bereich auf der zweiten treffen deshalb einen zusammenhängenden, schon sortierten Abschnitt – auch rückwärts gelesen. Eine Bedingung nur auf der zweiten Spalte ist der Grenzfall: Bis PostgreSQL 17 blieb dafür nur, den ganzen Index oder die Tabelle zu lesen, seit Version 18 kann ein Skip Scan helfen, wenn die erste Spalte wenige verschiedene Werte hat. Ein Index auf `(raum_id)` neben `(raum_id, beginn)` ist überflüssig.
+    resources:
+      - title: PostgreSQL · Multicolumn Indexes
+        url: https://www.postgresql.org/docs/current/indexes-multicolumn.html
+      - title: PostgreSQL · Indexes and ORDER BY
+        url: https://www.postgresql.org/docs/current/indexes-ordering.html
+
+  - id: seq-scan-trotz-index
+    type: choice
+    title: Der Index wird ignoriert
+    prompt: |
+      Auf `buchungen` liegt ein Index auf `status`. Von 20 000 Buchungen sind 19 000 `'bestaetigt'` und 1 000 `'storniert'`. Ein Kollege schickt diesen Plan mit dem Kommentar „PostgreSQL ignoriert unseren Index“. Welche Aussagen stimmen? Mehrere Antworten richtig.
+    lang: text
+    code: |
+      EXPLAIN SELECT * FROM buchungen WHERE status = 'bestaetigt';
+
+      Seq Scan on buchungen  (cost=0.00..449.00 rows=19000 width=48)
+        Filter: (status = 'bestaetigt'::text)
+    options:
+      - text: Die Abfrage braucht 95 % der Zeilen. Sie über den Index einzeln aus dem Heap zu holen, wäre teurer, als alle Seiten der Reihe nach zu lesen.
+        correct: true
+        why: Der Planer vergleicht die Kosten. Bei großen Anteilen gewinnt der Seq Scan, weil er jede Seite genau einmal und sequenziell liest.
+      - text: Für `status = 'storniert'` kann der Planer denselben Index sehr wohl nutzen.
+        correct: true
+        why: "5 % der Zeilen sind selektiv genug: Der Planer wählt dafür einen Index Scan (`cost=0.29..176.29` gegen 449 für den Seq Scan)."
+      - text: Der Index ist beschädigt und muss mit `REINDEX` neu aufgebaut werden.
+        correct: false
+        why: Ein beschädigter Index ist selten und zeigt sich anders, etwa mit falschen Ergebnissen oder Fehlermeldungen. Hier ist die Entscheidung des Planers richtig.
+      - text: Die Anwendung sollte `SET enable_seqscan = off` setzen, damit der Index genutzt wird.
+        correct: false
+        why: Die `enable_*`-Schalter sind zum Experimentieren gedacht. Die erzwungene Variante wäre hier langsamer, und der Schalter verschlechtert andere Abfragen derselben Sitzung.
+    explanation: |
+      Ein Index lohnt sich bei selektiven Bedingungen. Der Planer kennt aus der Statistik die Verteilung von `status` (95 % zu 5 %) und schätzt 19 000 Zeilen. Sie über den Index zu holen, hieße zusätzlich 19 000 Indexeinträge zu lesen und trotzdem fast jede der 199 Heap-Seiten anzufassen. Der Seq Scan liest nur die 199 Seiten, einmal am Stück. Für die seltenen Stornierungen ist derselbe Index dagegen nützlich. Ein Index auf einer Spalte mit zwei Werten lohnt sich daher nur für den seltenen Wert – und dann besser als partieller Index.
+    resources:
+      - title: PostgreSQL · Examining Index Usage
+        url: https://www.postgresql.org/docs/current/indexes-examine.html
+      - title: PostgreSQL · Planner Cost Constants
+        url: https://www.postgresql.org/docs/current/runtime-config-query.html#RUNTIME-CONFIG-QUERY-CONSTANTS
+
+  - id: plan-mit-zusammengesetztem-index
+    type: output
+    title: Drei Abfragen, ein Index
+    prompt: |
+      Die Hilfsfunktion `knoten` führt `EXPLAIN (COSTS OFF)` aus und gibt nur die Knoten des Plans zurück, von oben nach unten und ohne Einrückung. Bedingungszeilen wie `Index Cond:` lässt sie weg. Was gibt das Skript aus? Ausgabe wie `psql -At`: eine Zeile je Ergebniszeile, keine Kopfzeile.
+
+      Zur Erinnerung: Jedes Mitglied hat 10 Buchungen, verteilt über das ganze Jahr. Für wenige verstreute Zeilen wählt der Planer einen Bitmap Scan.
+    lang: postgres
+    code: |
+      CREATE TABLE buchungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        raum_id     int NOT NULL,
+        mitglied_id int NOT NULL,
+        beginn      timestamptz NOT NULL,
+        ende        timestamptz NOT NULL,
+        status      text NOT NULL DEFAULT 'bestaetigt',
+        preis       numeric(8,2)
+      );
+      INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, status, preis)
+      SELECT i % 30 + 1, i * 7 % 2000 + 1,
+             timestamptz '2026-01-02 08:00+01' + i / 60 * interval '1 day' + i % 10 * interval '1 hour',
+             timestamptz '2026-01-02 10:00+01' + i / 60 * interval '1 day' + i % 10 * interval '1 hour',
+             CASE WHEN i % 20 = 0 THEN 'storniert' ELSE 'bestaetigt' END,
+             (i % 5 + 1) * 12.50
+      FROM generate_series(1, 20000) AS i;
+      ANALYZE buchungen;
+
+      CREATE FUNCTION knoten(abfrage text) RETURNS SETOF text LANGUAGE plpgsql AS $$
+      DECLARE zeile text;
+      BEGIN
+        FOR zeile IN EXECUTE 'EXPLAIN (COSTS OFF) ' || abfrage LOOP
+          zeile := ltrim(zeile, ' ->');
+          IF zeile !~ '^[A-Z][A-Za-z ]*: ' THEN RETURN NEXT zeile; END IF;
+        END LOOP;
+      END $$;
+
+      CREATE INDEX buchungen_mitglied_beginn_idx ON buchungen (mitglied_id, beginn);
+
+      -- 1. Meine Buchungen: die fünf neuesten von Mitglied 42
+      SELECT knoten($$SELECT * FROM buchungen WHERE mitglied_id = 42 ORDER BY beginn DESC LIMIT 5$$);
+      -- 2. Alle Buchungen eines Tages
+      SELECT knoten($$SELECT * FROM buchungen WHERE beginn >= '2026-03-02' AND beginn < '2026-03-03'$$);
+      -- 3. Die ersten fünf Buchungen zweier Mitglieder zusammen
+      SELECT knoten($$SELECT * FROM buchungen WHERE mitglied_id IN (42, 43) ORDER BY beginn LIMIT 5$$);
+    expected: |
+      Limit
+      Index Scan Backward using buchungen_mitglied_beginn_idx on buchungen
+      Seq Scan on buchungen
+      Limit
+      Sort
+      Bitmap Heap Scan on buchungen
+      Bitmap Index Scan on buchungen_mitglied_beginn_idx
+    hints:
+      - Für Abfrage 1 liegen die Buchungen von Mitglied 42 im Index schon nach `beginn` sortiert. In welcher Richtung muss PostgreSQL lesen?
+      - Abfrage 2 hat keine Bedingung auf `mitglied_id`. Ein Skip Scan lohnt sich nur bei wenigen verschiedenen Werten in der ersten Spalte – hier sind es 2 000.
+      - In Abfrage 3 ist jedes Mitglied für sich sortiert, aber sind es die Buchungen beider zusammen?
+    explanation: |
+      Abfrage 1 ist der Idealfall: Gleichheit auf `mitglied_id`, Sortierung nach der zweiten Spalte. PostgreSQL liest den Abschnitt von Mitglied 42 rückwärts und hört nach fünf Einträgen auf, ein Sort-Knoten fehlt. Abfrage 2 filtert nur auf der zweiten Spalte. Mit 2 000 verschiedenen Mitgliedern vorn wären 2 000 Suchen im Index nötig, der Seq Scan ist billiger. Abfrage 3 trifft zwei Abschnitte des Index, jeder für sich nach `beginn` sortiert, zusammen aber nicht. PostgreSQL holt die 20 Zeilen per Bitmap Scan und sortiert sie danach.
+    resources:
+      - title: PostgreSQL · Indexes and ORDER BY
+        url: https://www.postgresql.org/docs/current/indexes-ordering.html
+
+  - id: ausdruck-und-partiell
+    type: output
+    title: Passt der Index zur Abfrage?
+    prompt: |
+      `knoten` gibt wieder nur die Knoten des Plans zurück. Was gibt das Skript aus? Ausgabe wie `psql -At`: eine Zeile je Ergebniszeile, keine Kopfzeile.
+    lang: postgres
+    code: |
+      CREATE FUNCTION knoten(abfrage text) RETURNS SETOF text LANGUAGE plpgsql AS $$
+      DECLARE zeile text;
+      BEGIN
+        FOR zeile IN EXECUTE 'EXPLAIN (COSTS OFF) ' || abfrage LOOP
+          zeile := ltrim(zeile, ' ->');
+          IF zeile !~ '^[A-Z][A-Za-z ]*: ' THEN RETURN NEXT zeile; END IF;
+        END LOOP;
+      END $$;
+
+      CREATE TABLE mitglieder (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, email text NOT NULL);
+      INSERT INTO mitglieder (email) SELECT 'Mitglied' || i || '@Example.org' FROM generate_series(1, 2000) AS i;
+      CREATE UNIQUE INDEX mitglieder_email_lower_idx ON mitglieder (lower(email));
+
+      CREATE TABLE rechnungen (
+        id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        mitglied_id int NOT NULL, monat date NOT NULL, betrag numeric(10,2) NOT NULL, bezahlt_am timestamptz
+      );
+      -- 10 Monate je Mitglied, offen ist nur die Oktoberrechnung
+      INSERT INTO rechnungen (mitglied_id, monat, betrag, bezahlt_am)
+      SELECT m, date '2026-01-01' + (k - 1) * interval '1 month', 89.00,
+             CASE WHEN k < 10 THEN timestamptz '2026-01-10 12:00+01' + (k - 1) * interval '1 month' END
+      FROM generate_series(1, 2000) AS m, generate_series(1, 10) AS k;
+      CREATE INDEX rechnungen_offen_idx ON rechnungen (mitglied_id) WHERE bezahlt_am IS NULL;
+      ANALYZE;
+
+      SELECT knoten($$SELECT id FROM mitglieder WHERE email = 'mitglied42@example.org'$$);
+      SELECT knoten($$SELECT id FROM mitglieder WHERE lower(email) = 'mitglied42@example.org'$$);
+      SELECT knoten($$SELECT * FROM rechnungen WHERE mitglied_id = 42 AND bezahlt_am IS NULL$$);
+      SELECT knoten($$SELECT * FROM rechnungen WHERE mitglied_id = 42$$);
+    expected: |
+      Seq Scan on mitglieder
+      Index Scan using mitglieder_email_lower_idx on mitglieder
+      Index Scan using rechnungen_offen_idx on rechnungen
+      Seq Scan on rechnungen
+    hints:
+      - Ein Ausdrucksindex enthält die Werte von `lower(email)`, nicht die von `email`.
+      - Ein partieller Index darf nur genutzt werden, wenn jede gesuchte Zeile sicher darin steht. Steht das in Abfrage 4 fest?
+    explanation: |
+      Der Index auf `lower(email)` kennt nur die kleingeschriebenen Adressen. Abfrage 1 vergleicht die Spalte selbst und kann ihn nicht nutzen; Abfrage 2 verwendet genau den indizierten Ausdruck. Der partielle Index enthält nur offene Rechnungen. Abfrage 3 verlangt `bezahlt_am IS NULL`, also liegt jede gesuchte Zeile im Index. Abfrage 4 sucht auch bezahlte Rechnungen von Mitglied 42, die im Index fehlen – der Planer darf ihn nicht verwenden und liest die Tabelle. Für diese Abfrage bräuchte es einen Index auf `mitglied_id` ohne Bedingung, etwa den aus `UNIQUE (mitglied_id, monat)`.
+    resources:
+      - title: PostgreSQL · Partial Indexes
+        url: https://www.postgresql.org/docs/current/indexes-partial.html
+      - title: PostgreSQL · Indexes on Expressions
+        url: https://www.postgresql.org/docs/current/indexes-expressional.html
+
+  - id: index-definitionen
+    type: gap
+    title: Vier Abfragen, vier Indexe
+    prompt: |
+      Ergänze die Indexdefinitionen so, dass jeder Index die Abfrage im Kommentar darüber trägt.
+    lang: postgres
+    code: |
+      -- Meine Buchungen: WHERE mitglied_id = $1 ORDER BY beginn DESC LIMIT 10
+      CREATE INDEX buchungen_mitglied_beginn_idx ON buchungen (⟦mitglied_id, beginn⟧);
+
+      -- Login: WHERE lower(email) = lower($1), keine zweite Adresse in anderer Schreibweise
+      CREATE ⟦UNIQUE⟧ INDEX mitglieder_email_lower_idx ON mitglieder (⟦lower(email)⟧);
+
+      -- Mahnlauf: WHERE bezahlt_am IS NULL AND monat < $1, der Index enthält nur offene Rechnungen
+      CREATE INDEX rechnungen_offen_idx ON rechnungen (monat) ⟦WHERE bezahlt_am IS NULL⟧;
+
+      -- Raumkalender ohne Zugriff auf den Heap: SELECT beginn, ende WHERE raum_id = $1 AND beginn >= $2
+      CREATE INDEX buchungen_raum_beginn_idx ON buchungen (raum_id, beginn) ⟦INCLUDE⟧ (ende);
+    gaps:
+      - label: Spalten für „Meine Buchungen“
+        hint: Erst die Spalte mit Gleichheit, dann die Sortierspalte.
+        accept: ["mitglied_id, beginn DESC", "mitglied_id, beginn ASC", "mitglied_id DESC, beginn DESC"]
+      - label: Eindeutigkeit
+        hint: Der Index soll Dubletten in anderer Schreibweise verhindern.
+      - label: Indizierter Ausdruck
+        hint: Genau der Ausdruck, der in der Abfrage steht.
+        accept: ["(lower(email))"]
+      - label: Bedingung des Index
+        hint: Ein partieller Index endet mit einer Klausel, die auch in Abfragen vorkommt.
+        accept: ["WHERE (bezahlt_am IS NULL)"]
+      - label: Zusätzliche Spalte
+        hint: Schlüsselwort für Spalten, die nur in den Blattseiten stehen und nicht sortiert werden.
+    explanation: |
+      „Meine Buchungen“ braucht Gleichheit vor Sortierung; `beginn DESC` ist ebenfalls richtig, aber nicht nötig, weil ein B-Baum rückwärts gelesen werden kann. Der Login-Index muss genau `lower(email)` enthalten, sonst passt er nicht zur Abfrage, und `UNIQUE` verhindert `Anna@…` neben `anna@…`. Der Mahnlauf-Index ist partiell und bleibt klein, weil bezahlte Rechnungen nicht hineinkommen. `INCLUDE (ende)` legt `ende` in die Blattseiten, ohne die Sortierung zu verändern, damit ein Index-Only Scan möglich wird.
+    resources:
+      - title: PostgreSQL · CREATE INDEX
+        url: https://www.postgresql.org/docs/current/sql-createindex.html
+
+  - id: meine-buchungen-index
+    type: sql
+    lang: postgres
+    title: Meine Buchungen ohne Sortieren
+    prompt: |
+      Die Seite „Meine Buchungen“ zeigt die zehn neuesten Buchungen eines Mitglieds:
+
+      ```postgres
+      SELECT id, raum_id, beginn, ende FROM buchungen
+      WHERE mitglied_id = $1 ORDER BY beginn DESC LIMIT 10;
+      ```
+
+      In der Tabelle stehen 20 000 Buchungen von 200 Mitgliedern, je 100 pro Mitglied. Lege einen Index an, mit dem PostgreSQL diese Abfrage ohne Seq Scan und ohne Sort-Knoten ausführt. Die Prüfabfrage untersucht den Plan für Mitglied 42 mit den Hilfsfunktionen aus dem Schema: ob ein Knoten `Index Scan` (auch `Index Scan Backward`) vorkommt, ob ein Sort-Knoten vorkommt, ob ein Seq Scan vorkommt und ob der verwendete Index mit der Spalte der Gleichheitsbedingung beginnt (`erste_indexspalten`). Nur dann steuert er die Einträge von Mitglied 42 direkt an.
+    schema: |
+      CREATE TABLE buchungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        raum_id     int NOT NULL,
+        mitglied_id int NOT NULL,
+        beginn      timestamptz NOT NULL,
+        ende        timestamptz NOT NULL,
+        status      text NOT NULL DEFAULT 'bestaetigt',
+        preis       numeric(8,2)
+      );
+      INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, status, preis)
+      SELECT i % 30 + 1, i * 7 % 200 + 1,
+             timestamptz '2026-01-02 08:00+01' + i / 60 * interval '1 day' + i % 10 * interval '1 hour',
+             timestamptz '2026-01-02 10:00+01' + i / 60 * interval '1 day' + i % 10 * interval '1 hour',
+             CASE WHEN i % 20 = 0 THEN 'storniert' ELSE 'bestaetigt' END,
+             (i % 5 + 1) * 12.50
+      FROM generate_series(1, 20000) AS i;
+      ANALYZE buchungen;
+      -- Hilfsfunktion: die Knoten des Plans ohne Einrückung und ohne Bedingungszeilen
+      CREATE FUNCTION plan_knoten(abfrage text) RETURNS SETOF text LANGUAGE plpgsql AS $$
+      DECLARE zeile text;
+      BEGIN
+        FOR zeile IN EXECUTE 'EXPLAIN (COSTS OFF) ' || abfrage LOOP
+          zeile := ltrim(zeile, ' ->');
+          IF zeile !~ '^[A-Z][A-Za-z ]*: ' THEN RETURN NEXT zeile; END IF;
+        END LOOP;
+      END $$;
+      -- Hilfsfunktion: die erste Spalte jedes Index, den der Plan verwendet
+      CREATE FUNCTION erste_indexspalten(abfrage text) RETURNS SETOF name LANGUAGE plpgsql AS $$
+      DECLARE zeile text;
+      BEGIN
+        FOR zeile IN EXECUTE 'EXPLAIN (COSTS OFF) ' || abfrage LOOP
+          IF zeile ~ '(using|Bitmap Index Scan on) ' THEN
+            RETURN QUERY
+              SELECT a.attname
+              FROM pg_index AS i
+              JOIN pg_attribute AS a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0]
+              WHERE i.indexrelid = substring(zeile from '(?:using|Bitmap Index Scan on) (\S+)')::regclass;
+          END IF;
+        END LOOP;
+      END $$;
+    starter: |
+      -- CREATE INDEX …
+    solution: |
+      CREATE INDEX buchungen_mitglied_beginn_idx ON buchungen (mitglied_id, beginn);
+    check: |
+      SELECT bool_or(knoten LIKE 'Index%Scan%') AS index_scan,
+             bool_or(knoten LIKE '%Sort%') AS sort_knoten,
+             bool_or(knoten LIKE 'Seq Scan%') AS seq_scan,
+             (SELECT bool_and(spalte = 'mitglied_id')
+              FROM erste_indexspalten($$SELECT id, raum_id, beginn, ende FROM buchungen
+                                        WHERE mitglied_id = 42 ORDER BY beginn DESC LIMIT 10$$) AS spalte) AS index_beginnt_mit_mitglied_id
+      FROM plan_knoten($$SELECT id, raum_id, beginn, ende FROM buchungen
+                         WHERE mitglied_id = 42 ORDER BY beginn DESC LIMIT 10$$) AS knoten;
+    hints:
+      - Ein Index nur auf `mitglied_id` findet die Zeilen, aber nicht in der gewünschten Reihenfolge. Probier es aus und schau dir `SELECT plan_knoten(…)` an.
+      - Die Sortierspalte muss im Index direkt hinter der Spalte mit der Gleichheitsbedingung stehen.
+      - "`CREATE INDEX … ON buchungen (mitglied_id, beginn);`"
+    explanation: |
+      Mit `(mitglied_id, beginn)` liegen die Buchungen eines Mitglieds im Index nach Beginn sortiert hintereinander. PostgreSQL liest den Abschnitt von Mitglied 42 rückwärts (`Index Scan Backward`) und bricht nach zehn Einträgen ab, sortiert wird nichts. Ein Index nur auf `mitglied_id` liefert alle 100 Buchungen des Mitglieds per Bitmap Scan, danach sortiert ein Sort-Knoten alle 100, um zehn zu behalten – bei einem Vielbucher mit 3 000 Buchungen entsprechend mehr. Hätte jedes Mitglied nur zehn Buchungen, wäre der Unterschied klein, und der Planer dürfte zu Recht den Bitmap Scan mit Sortieren wählen. `(mitglied_id, beginn DESC)` besteht die Prüfung ebenso. Ein Index nur auf `beginn` vermeidet zwar Seq Scan und Sort-Knoten: PostgreSQL liest ihn rückwärts und verwirft per `Filter` alle Buchungen anderer Mitglieder, bis zehn passende gefunden sind. Bei einem Mitglied, das lange nicht gebucht hat, ist das fast die ganze Tabelle – deshalb prüft die Prüfabfrage die erste Indexspalte. Der Index deckt nebenbei den Fremdschlüssel auf `mitglied_id` ab.
+    resources:
+      - title: PostgreSQL · Indexes and ORDER BY
+        url: https://www.postgresql.org/docs/current/indexes-ordering.html
+
+  - id: email-ohne-dubletten
+    type: sql
+    lang: postgres
+    title: Eine Adresse, ein Konto
+    prompt: |
+      `mitglieder.email` ist `UNIQUE`, aber nur mit exakter Schreibweise: `Jonas.Becker1@example.org` und `JONAS.BECKER1@EXAMPLE.ORG` gelten als verschieden. Der Login sucht mit `WHERE lower(email) = lower($1)` und liest dabei die ganze Tabelle.
+
+      Lege **einen** Index an, der beides löst. Die Prüfabfrage versucht, die vorhandene Adresse in Großbuchstaben und eine neue Adresse einzufügen (`lp.versuch` rollt beides zurück und meldet `ok` oder den Fehlernamen), und prüft, ob der Plan der Login-Abfrage einen Index Scan enthält.
+    schema: |
+      CREATE TABLE mitglieder (
+        id    int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        email text NOT NULL UNIQUE,
+        name  text NOT NULL
+      );
+      INSERT INTO mitglieder (email, name)
+      SELECT (ARRAY['Anna','Jonas','Lea','Paul','Mia','Felix','Emma','Noah'])[i % 8 + 1] || '.'
+             || (ARRAY['Schulz','Becker','Wolf','Krause','Hoffmann','Lehmann','Yilmaz'])[i % 7 + 1] || i || '@example.org',
+             (ARRAY['Anna','Jonas','Lea','Paul','Mia','Felix','Emma','Noah'])[i % 8 + 1] || ' '
+             || (ARRAY['Schulz','Becker','Wolf','Krause','Hoffmann','Lehmann','Yilmaz'])[i % 7 + 1]
+      FROM generate_series(1, 2000) AS i;
+      ANALYZE mitglieder;
+      -- Hilfsfunktion: die Knoten des Plans ohne Einrückung und ohne Bedingungszeilen
+      CREATE FUNCTION plan_knoten(abfrage text) RETURNS SETOF text LANGUAGE plpgsql AS $$
+      DECLARE zeile text;
+      BEGIN
+        FOR zeile IN EXECUTE 'EXPLAIN (COSTS OFF) ' || abfrage LOOP
+          zeile := ltrim(zeile, ' ->');
+          IF zeile !~ '^[A-Z][A-Za-z ]*: ' THEN RETURN NEXT zeile; END IF;
+        END LOOP;
+      END $$;
+    starter: |
+      -- CREATE … INDEX …
+    solution: |
+      CREATE UNIQUE INDEX mitglieder_email_lower_idx ON mitglieder (lower(email));
+    check: |
+      SELECT lp.versuch($$INSERT INTO mitglieder (email, name) VALUES ('JONAS.BECKER1@EXAMPLE.ORG', 'Jonas Becker')$$) AS gleiche_adresse_gross,
+             lp.versuch($$INSERT INTO mitglieder (email, name) VALUES ('neu@example.org', 'Lea Neumann')$$) AS neue_adresse,
+             (SELECT bool_or(knoten LIKE 'Index%Scan%')
+              FROM plan_knoten($$SELECT id FROM mitglieder WHERE lower(email) = lower('Jonas.Becker1@Example.org')$$) AS knoten) AS login_mit_index;
+    hints:
+      - Ein Index auf `email` hilft der Login-Abfrage nicht, weil sie `lower(email)` vergleicht.
+      - Ein Ausdrucksindex steht in eigenen Klammern innerhalb der Spaltenliste, und `UNIQUE` macht ihn zur Regel.
+      - "`CREATE UNIQUE INDEX … ON mitglieder (lower(email));`"
+    explanation: |
+      Der Unique-Index auf `lower(email)` speichert jede Adresse kleingeschrieben und lässt jeden Wert nur einmal zu. Damit scheitert die Großschreibvariante mit `unique_violation`, eine neue Adresse geht durch. Weil die Login-Abfrage genau diesen Ausdruck verwendet, findet sie ihre Zeile über den Index. In einer echten Datenbank prüfst du vorher mit `GROUP BY lower(email) HAVING count(*) > 1`, ob es schon Dubletten gibt – sonst scheitert `CREATE UNIQUE INDEX`. Danach kann der alte `UNIQUE`-Constraint auf `email` entfallen, er ist schwächer als der neue Index. Eine Alternative ist der Typ `citext` aus der gleichnamigen Erweiterung.
+    resources:
+      - title: PostgreSQL · Indexes on Expressions
+        url: https://www.postgresql.org/docs/current/indexes-expressional.html
+      - title: PostgreSQL · Unique Indexes
+        url: https://www.postgresql.org/docs/current/indexes-unique.html
+
+  - id: mahnlauf-partiell
+    type: sql
+    lang: postgres
+    title: Ein kleiner Index für den Mahnlauf
+    prompt: |
+      Der Mahnlauf läuft jeden Monat:
+
+      ```postgres
+      SELECT mitglied_id, monat, betrag FROM rechnungen
+      WHERE bezahlt_am IS NULL AND monat < $1
+      ORDER BY monat;
+      ```
+
+      Von 20 000 Rechnungen sind 2 040 offen. Lege einen Index an, den der Mahnlauf nutzt und der **nur offene Rechnungen** enthält. Die Prüfabfrage untersucht den Plan für `$1 = '2026-10-01'` mit der Hilfsfunktion `plan_indexe` (siehe Schema), die die Namen der im Plan verwendeten Indexe liefert. Sie meldet, ob ein Index genutzt wird und wie viele Einträge (`pg_class.reltuples`) der größte davon hat.
+    schema: |
+      CREATE TABLE rechnungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        mitglied_id int NOT NULL,
+        monat       date NOT NULL,
+        betrag      numeric(10,2) NOT NULL,
+        bezahlt_am  timestamptz,
+        UNIQUE (mitglied_id, monat)
+      );
+      -- 2 000 Mitglieder × 10 Monate; offen sind alle Rechnungen für Oktober und die Märzrechnungen jedes 50. Mitglieds
+      INSERT INTO rechnungen (mitglied_id, monat, betrag, bezahlt_am)
+      SELECT m, date '2026-01-01' + (k - 1) * interval '1 month', 89.00,
+             CASE WHEN k = 10 OR (k = 3 AND m % 50 = 0) THEN NULL
+                  ELSE timestamptz '2026-01-10 12:00+01' + (k - 1) * interval '1 month' END
+      FROM generate_series(1, 2000) AS m, generate_series(1, 10) AS k;
+      ANALYZE rechnungen;
+      -- Hilfsfunktion: die Indexe, die der Plan einer Abfrage verwendet
+      CREATE FUNCTION plan_indexe(abfrage text) RETURNS SETOF regclass LANGUAGE plpgsql AS $$
+      DECLARE zeile text;
+      BEGIN
+        FOR zeile IN EXECUTE 'EXPLAIN (COSTS OFF) ' || abfrage LOOP
+          IF zeile ~ '(using|Index Scan on) ' THEN
+            RETURN NEXT substring(zeile from '(?:using|Index Scan on) (\S+)')::regclass;
+          END IF;
+        END LOOP;
+      END $$;
+    starter: |
+      -- CREATE INDEX …
+    solution: |
+      CREATE INDEX rechnungen_offen_idx ON rechnungen (monat) WHERE bezahlt_am IS NULL;
+    check: |
+      SELECT count(*) > 0 AS mahnlauf_mit_index,
+             max(c.reltuples) AS eintraege
+      FROM plan_indexe($$SELECT mitglied_id, monat, betrag FROM rechnungen
+                         WHERE bezahlt_am IS NULL AND monat < '2026-10-01' ORDER BY monat$$) AS x
+      JOIN pg_class AS c ON c.oid = x;
+    hints:
+      - Ein Index enthält nur einen Teil der Zeilen, wenn seine Definition mit einer `WHERE`-Klausel endet.
+      - Die Bedingung des Index muss sich aus dem `WHERE` der Abfrage ergeben. Naheliegend ist genau `bezahlt_am IS NULL`.
+      - "`CREATE INDEX … ON rechnungen (monat) WHERE bezahlt_am IS NULL;`"
+    explanation: |
+      Der partielle Index enthält nur die 2 040 offenen Rechnungen und ist entsprechend klein. Der Planer darf ihn nutzen, weil die Abfrage `bezahlt_am IS NULL` verlangt, also jede gesuchte Zeile darin liegt. Mit `monat` als Schlüssel liefert er die Zeilen schon in der Reihenfolge von `ORDER BY monat`. Ein voller Index auf `monat` hätte 20 000 Einträge und würde bei jeder bezahlten Rechnung mitgepflegt. Wird eine Rechnung bezahlt, fällt ihr Eintrag aus dem partiellen Index – er wächst nicht mit der Historie.
+    resources:
+      - title: PostgreSQL · Partial Indexes
+        url: https://www.postgresql.org/docs/current/indexes-partial.html
+
+  - id: mitgliedersuche-trigramm
+    type: sql
+    lang: postgres
+    title: Suche nach Namensteilen
+    prompt: |
+      Am Empfang tippt das Team einen Teil des Namens, die App sucht mit `WHERE name ILIKE '%' || $1 || '%'`. Ein B-Baum hilft bei einem Platzhalter am Anfang nicht.
+
+      Mache die Suche indizierbar. Erweiterungen dürfen angelegt werden. Die Prüfabfrage untersucht den Plan für den Suchbegriff `krüg` mit der Hilfsfunktion `plan_knoten`: ob ein Index-Scan-Knoten (auch `Bitmap Index Scan`) vorkommt und ob ein Seq Scan vorkommt.
+    schema: |
+      CREATE TABLE mitglieder (
+        id   int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        name text NOT NULL
+      );
+      INSERT INTO mitglieder (name)
+      SELECT (ARRAY['Anna','Jonas','Lea','Paul','Mia','Felix','Emma','Noah'])[i % 8 + 1] || ' '
+             || (ARRAY['Schulz','Becker','Wolf','Krüger','Hoffmann','Lehmann','Müller'])[i % 7 + 1] || ' ' || i
+      FROM generate_series(1, 5000) AS i;
+      ANALYZE mitglieder;
+      -- Hilfsfunktion: die Knoten des Plans ohne Einrückung und ohne Bedingungszeilen
+      CREATE FUNCTION plan_knoten(abfrage text) RETURNS SETOF text LANGUAGE plpgsql AS $$
+      DECLARE zeile text;
+      BEGIN
+        FOR zeile IN EXECUTE 'EXPLAIN (COSTS OFF) ' || abfrage LOOP
+          zeile := ltrim(zeile, ' ->');
+          IF zeile !~ '^[A-Z][A-Za-z ]*: ' THEN RETURN NEXT zeile; END IF;
+        END LOOP;
+      END $$;
+    starter: |
+      -- CREATE EXTENSION …
+    solution: |
+      CREATE EXTENSION pg_trgm;
+      CREATE INDEX mitglieder_name_trgm_idx ON mitglieder USING gin (name gin_trgm_ops);
+    check: |
+      SELECT bool_or(knoten ~ 'Index (Only )?Scan') AS mit_index,
+             bool_or(knoten LIKE 'Seq Scan%') AS seq_scan
+      FROM plan_knoten($$SELECT id, name FROM mitglieder WHERE name ILIKE '%krüg%'$$) AS knoten;
+    hints:
+      - Die Erweiterung heißt `pg_trgm`. Sie zerlegt Text in Folgen aus drei Zeichen.
+      - Der Index braucht die Methode `gin` und die Operatorklasse `gin_trgm_ops` hinter dem Spaltennamen.
+      - "`CREATE EXTENSION pg_trgm;` und `CREATE INDEX … ON mitglieder USING gin (name gin_trgm_ops);`"
+    explanation: |
+      `pg_trgm` zerlegt jeden Namen kleingeschrieben in Trigramme: aus „Krüger“ werden `krü`, `rüg`, `üge`, `ger` und die mit Leerzeichen aufgefüllten Ränder wie ` kr` und `er `. Der GIN-Index speichert je Trigramm die Zeilen, die es enthalten. Für `ILIKE '%krüg%'` sucht PostgreSQL die Zeilen, die alle Trigramme des Suchbegriffs enthalten, und prüft die Kandidaten danach im Heap nach (`Recheck Cond`). Ein GiST-Index mit `gist_trgm_ops` besteht die Prüfung ebenfalls; GIN ist beim Suchen meist schneller, GiST beim Schreiben. Suchbegriffe mit weniger als drei Zeichen kann der Index kaum einschränken.
+    resources:
+      - title: PostgreSQL · pg_trgm – Index Support
+        url: https://www.postgresql.org/docs/current/pgtrgm.html#PGTRGM-INDEX
+      - title: PostgreSQL · GIN Indexes
+        url: https://www.postgresql.org/docs/current/indexes-types.html#INDEXES-TYPES-GIN
+
+  - id: fremdschluessel-ohne-index
+    type: sql
+    lang: postgres
+    title: Fremdschlüssel ohne Index finden
+    prompt: |
+      Vor dem Go-live willst du wissen, welche Fremdschlüsselspalten keinen passenden Index haben. Ein Index passt, wenn die Spalte seine **erste** Spalte ist. Alle Fremdschlüssel im Schema bestehen aus genau einer Spalte.
+
+      Schreibe eine Katalogabfrage über `pg_constraint` (Fremdschlüssel haben `contype = 'f'`, die Spaltennummern stehen in `conkey`), `pg_attribute` und `pg_index` (die Spaltennummern stehen in `indkey`, das erste Element ist `indkey[0]`).
+
+      Spalten: `tabelle` (Tabellenname als Text) und `spalte` (Name der Fremdschlüsselspalte). Sortierung: `tabelle`, dann `spalte`.
+    schema: |
+      CREATE TABLE standorte (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name text NOT NULL UNIQUE);
+      CREATE TABLE raeume (
+        id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        standort_id int NOT NULL REFERENCES standorte (id),
+        name text NOT NULL,
+        UNIQUE (standort_id, name)
+      );
+      CREATE TABLE mitglieder (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, email text NOT NULL UNIQUE);
+      CREATE TABLE buchungen (
+        id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        raum_id int NOT NULL REFERENCES raeume (id),
+        mitglied_id int NOT NULL REFERENCES mitglieder (id),
+        beginn timestamptz NOT NULL
+      );
+      CREATE INDEX buchungen_mitglied_beginn_idx ON buchungen (mitglied_id, beginn);
+      CREATE TABLE rechnungen (
+        id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        mitglied_id int NOT NULL REFERENCES mitglieder (id),
+        monat date NOT NULL,
+        UNIQUE (mitglied_id, monat)
+      );
+      CREATE TABLE checkins (
+        id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        mitglied_id int NOT NULL REFERENCES mitglieder (id),
+        standort_id int NOT NULL REFERENCES standorte (id),
+        zeitpunkt timestamptz NOT NULL
+      );
+      CREATE INDEX checkins_zeitpunkt_mitglied_idx ON checkins (zeitpunkt, mitglied_id);
+      INSERT INTO standorte (name) VALUES ('Plagwitz'), ('Südvorstadt'), ('Zentrum');
+      INSERT INTO raeume (standort_id, name) VALUES (1, 'Atelier'), (2, 'Loft'), (3, 'Box 1');
+      INSERT INTO mitglieder (email) VALUES ('anna.schulz@example.org'), ('jonas.becker@example.org');
+    starter: |
+      SELECT conrelid::regclass::text AS tabelle, conname
+      FROM pg_constraint
+      WHERE contype = 'f';
+    solution: |
+      SELECT c.conrelid::regclass::text AS tabelle, a.attname AS spalte
+      FROM pg_constraint AS c
+      JOIN pg_attribute AS a ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
+      WHERE c.contype = 'f'
+        AND NOT EXISTS (
+          SELECT 1
+          FROM pg_index AS i
+          WHERE i.indrelid = c.conrelid
+            AND i.indkey[0] = c.conkey[1]
+        )
+      ORDER BY tabelle, spalte;
+    ordered: true
+    hints:
+      - "`conkey` ist ein Array, das bei 1 beginnt (`conkey[1]`); `indkey` ist ein `int2vector`, der bei 0 beginnt (`indkey[0]`). Beide enthalten Spaltennummern (`attnum`)."
+      - Den Spaltennamen liefert `pg_attribute` über `attrelid = c.conrelid AND attnum = c.conkey[1]`.
+      - "Gesucht sind Fremdschlüssel, für die `NOT EXISTS (SELECT 1 FROM pg_index AS i WHERE i.indrelid = c.conrelid AND i.indkey[0] = c.conkey[1])` gilt."
+    explanation: |
+      `pg_constraint` liefert alle Fremdschlüssel mit Tabelle (`conrelid`) und Spaltennummern (`conkey`), `pg_attribute` übersetzt die Nummer in einen Namen. Der Anti-Join mit `NOT EXISTS` behält die Fremdschlüssel, für die kein Index der Tabelle mit dieser Spalte beginnt. Ergebnis: `buchungen.raum_id`, `checkins.mitglied_id` und `checkins.standort_id`. `buchungen.mitglied_id` ist durch `(mitglied_id, beginn)` gedeckt, `rechnungen.mitglied_id` und `raeume.standort_id` durch ihre `UNIQUE`-Constraints. Der Index `(zeitpunkt, mitglied_id)` zählt nicht, weil `mitglied_id` dort an zweiter Stelle steht. Bei mehrspaltigen Fremdschlüsseln müsste die Abfrage alle Spalten von `conkey` mit dem Anfang von `indkey` vergleichen.
+    resources:
+      - title: PostgreSQL · pg_constraint
+        url: https://www.postgresql.org/docs/current/catalog-pg-constraint.html
+      - title: PostgreSQL · pg_index
+        url: https://www.postgresql.org/docs/current/catalog-pg-index.html
+      - title: PostgreSQL · Foreign Keys
+        url: https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-FK
+
+  - id: migration-index-falsch
+    type: bug
+    title: Die Migration hilft nur halb
+    prompt: |
+      Nach dieser Migration ist der Mahnlauf schnell. Der Raumkalender liest laut `EXPLAIN (ANALYZE, BUFFERS)` aber die Indexeinträge **aller** Räume der Woche, nicht nur die von Raum 7, und der Login macht weiter einen Seq Scan. Finde die beiden fehlerhaften Zeilen und korrigiere sie. Namen und Eindeutigkeit bleiben, wie sie sind.
+    lang: postgres
+    code: |
+      -- Raumkalender: WHERE raum_id = $1 AND beginn >= $2 AND beginn < $3 ORDER BY beginn
+      CREATE INDEX buchungen_kalender_idx ON buchungen (beginn, raum_id);
+      -- Login: WHERE lower(email) = lower($1)
+      CREATE UNIQUE INDEX mitglieder_email_idx ON mitglieder (email);
+      -- Mahnlauf: WHERE bezahlt_am IS NULL AND monat < $1
+      CREATE INDEX rechnungen_offen_idx ON rechnungen (monat) WHERE bezahlt_am IS NULL;
+    lines: [2, 4]
+    fix:
+      - line: 2
+        answers:
+          - "CREATE INDEX buchungen_kalender_idx ON buchungen (raum_id, beginn);"
+      - line: 4
+        answers:
+          - "CREATE UNIQUE INDEX mitglieder_email_idx ON mitglieder (lower(email));"
+          - "CREATE UNIQUE INDEX mitglieder_email_idx ON mitglieder ((lower(email)));"
+    hints:
+      - Im Raumkalender steht eine Bedingung mit Gleichheit und eine mit Bereich. Welche gehört nach vorn?
+      - Vergleicht der Login die Spalte `email` oder einen Ausdruck?
+    explanation: |
+      `(beginn, raum_id)` ist zuerst nach Beginn sortiert. Für eine Woche liest PostgreSQL alle Einträge dieses Zeitraums, egal welcher Raum, und prüft `raum_id` erst im Index – bei 30 Räumen dreißigmal mehr Einträge als nötig. `(raum_id, beginn)` legt die Buchungen von Raum 7 nach Beginn sortiert hintereinander, die Woche ist ein zusammenhängender Abschnitt, und `ORDER BY beginn` kostet nichts mehr. Der Login vergleicht `lower(email)`; ein Index auf `email` passt dazu nicht. Erst der Ausdrucksindex auf `lower(email)` trägt die Abfrage und verhindert als `UNIQUE` zugleich Dubletten in anderer Schreibweise.
+    resources:
+      - title: PostgreSQL · Multicolumn Indexes
+        url: https://www.postgresql.org/docs/current/indexes-multicolumn.html
+
+  - id: index-review
+    type: explain
+    title: Fünf Indexe im Code-Review
+    prompt: |
+      Auf `buchungen` (20 000 Zeilen, täglich rund 300 neue, Stornierungen setzen `status`) liegen neben dem Primärschlüssel diese Indexe. Im Review schlägt jemand vor, aufzuräumen. Erkläre, welche Indexe überflüssig oder fraglich sind, warum, und was ein überflüssiger Index kostet. Sag auch, wie du vor dem Löschen vorgehst.
+    lang: postgres
+    code: |
+      CREATE INDEX buchungen_raum_idx            ON buchungen (raum_id);
+      CREATE INDEX buchungen_raum_beginn_idx     ON buchungen (raum_id, beginn);
+      CREATE INDEX buchungen_status_idx          ON buchungen (status);
+      CREATE INDEX buchungen_mitglied_idx        ON buchungen (mitglied_id);
+      CREATE INDEX buchungen_mitglied_beginn_idx ON buchungen (mitglied_id, beginn);
+    points:
+      - "`buchungen_raum_idx` und `buchungen_mitglied_idx` sind überflüssig: Ihre Spalte ist die erste Spalte eines zusammengesetzten Index, der dieselben Abfragen und Fremdschlüsselprüfungen bedient."
+      - "`buchungen_status_idx` ist fraglich: zwei Werte, 95 % `bestaetigt`. Nützlich höchstens für die seltenen Stornierungen, dann besser als partieller Index."
+      - Jeder Index kostet bei jedem `INSERT` und jedem Update ohne HOT einen Schreibvorgang, dazu Platz, Cache und Arbeit für VACUUM; ein Index auf `status` macht jede Stornierung zu einem Update ohne HOT.
+      - Vor dem Löschen `pg_stat_user_indexes.idx_scan` auf allen Servern prüfen und mit `DROP INDEX CONCURRENTLY` entfernen.
+    explanation: |
+      Zwei Indexe sind Präfixe anderer: `(raum_id)` steckt in `(raum_id, beginn)`, `(mitglied_id)` in `(mitglied_id, beginn)`. Jede Abfrage und jede Fremdschlüsselprüfung, die nur die erste Spalte braucht, kann den zusammengesetzten Index nutzen; der kleinere spart kaum etwas. Der Index auf `status` hilft nur bei `status = 'storniert'`, für `'bestaetigt'` nimmt der Planer ohnehin den Seq Scan. Braucht eine Abfrage die Stornierungen, ist `CREATE INDEX … ON buchungen (raum_id) WHERE status = 'storniert'` kleiner und gezielter. Jeder überflüssige Index wird bei jeder neuen Buchung mitgeschrieben, belegt Platz und Arbeitsspeicher, und weil `status` indiziert ist, kann keine Stornierung ein HOT-Update sein. Vor dem Löschen prüfe ich in `pg_stat_user_indexes`, ob die Indexe seit Wochen nicht benutzt wurden – auf Primärserver und Replikaten, weil jeder für sich zählt – und lösche dann mit `DROP INDEX CONCURRENTLY`, damit keine Schreibzugriffe blockieren.
+    resources:
+      - title: PostgreSQL · Heap-Only Tuples (HOT)
+        url: https://www.postgresql.org/docs/current/storage-hot.html
+      - title: PostgreSQL · pg_stat_all_indexes
+        url: https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-ALL-INDEXES-VIEW
+
+  - id: indexstrategie-buchungsseite
+    type: sql
+    lang: postgres
+    title: Zwei Indexe für vier Abfragen
+    prompt: |
+      Vor dem Start der neuen Buchungsseite stehen vier Abfragen fest. Auf `buchungen` (20 000 Buchungen, 30 Räume, 200 Mitglieder mit je 100 Buchungen) liegt bisher nur der Primärschlüssel.
+
+      1. Raumkalender: `WHERE raum_id = $1 AND beginn >= $2 AND beginn < $3`
+      2. Nächste freie Zeiten: `WHERE raum_id = $1 AND beginn >= $2 ORDER BY beginn LIMIT 5`
+      3. Meine Buchungen: `WHERE mitglied_id = $1 ORDER BY beginn DESC LIMIT 10`
+      4. Jahresumsatz eines Raums: `SELECT count(*), sum(preis) … WHERE raum_id = $1`
+
+      Lege **höchstens zwei** Indexe an, sodass keine der vier Abfragen einen Seq Scan braucht und die Abfragen 2 und 3 ohne Sort-Knoten auskommen. Die Prüfabfrage untersucht die Pläne mit konkreten Werten (Raum 7, Mitglied 42) und meldet je Abfrage, ob ein Seq Scan und ob ein Sort-Knoten vorkommt, ob jeder verwendete Index mit der Spalte der Gleichheitsbedingung beginnt (`index_passt`, Hilfsfunktion `erste_indexspalten`) und ob höchstens zwei Indexe neben dem Primärschlüssel existieren.
+    schema: |
+      CREATE TABLE buchungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        raum_id     int NOT NULL,
+        mitglied_id int NOT NULL,
+        beginn      timestamptz NOT NULL,
+        ende        timestamptz NOT NULL,
+        status      text NOT NULL DEFAULT 'bestaetigt',
+        preis       numeric(8,2)
+      );
+      INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, status, preis)
+      SELECT i % 30 + 1, i * 7 % 200 + 1,
+             timestamptz '2026-01-02 08:00+01' + i / 60 * interval '1 day' + i % 10 * interval '1 hour',
+             timestamptz '2026-01-02 10:00+01' + i / 60 * interval '1 day' + i % 10 * interval '1 hour',
+             CASE WHEN i % 20 = 0 THEN 'storniert' ELSE 'bestaetigt' END,
+             (i % 5 + 1) * 12.50
+      FROM generate_series(1, 20000) AS i;
+      ANALYZE buchungen;
+      -- Hilfsfunktion: die Knoten des Plans ohne Einrückung und ohne Bedingungszeilen
+      CREATE FUNCTION plan_knoten(abfrage text) RETURNS SETOF text LANGUAGE plpgsql AS $$
+      DECLARE zeile text;
+      BEGIN
+        FOR zeile IN EXECUTE 'EXPLAIN (COSTS OFF) ' || abfrage LOOP
+          zeile := ltrim(zeile, ' ->');
+          IF zeile !~ '^[A-Z][A-Za-z ]*: ' THEN RETURN NEXT zeile; END IF;
+        END LOOP;
+      END $$;
+      -- Hilfsfunktion: die erste Spalte jedes Index, den der Plan verwendet
+      CREATE FUNCTION erste_indexspalten(abfrage text) RETURNS SETOF name LANGUAGE plpgsql AS $$
+      DECLARE zeile text;
+      BEGIN
+        FOR zeile IN EXECUTE 'EXPLAIN (COSTS OFF) ' || abfrage LOOP
+          IF zeile ~ '(using|Bitmap Index Scan on) ' THEN
+            RETURN QUERY
+              SELECT a.attname
+              FROM pg_index AS i
+              JOIN pg_attribute AS a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0]
+              WHERE i.indexrelid = substring(zeile from '(?:using|Bitmap Index Scan on) (\S+)')::regclass;
+          END IF;
+        END LOOP;
+      END $$;
+    starter: |
+      -- höchstens zwei CREATE INDEX …
+    solution: |
+      CREATE INDEX buchungen_raum_beginn_idx ON buchungen (raum_id, beginn);
+      CREATE INDEX buchungen_mitglied_beginn_idx ON buchungen (mitglied_id, beginn);
+    check: |
+      WITH abfragen (nr, gleichheit, sql) AS (
+        VALUES
+          (1, 'raum_id', $$SELECT id, mitglied_id, beginn, ende FROM buchungen
+                           WHERE raum_id = 7 AND beginn >= '2026-03-02' AND beginn < '2026-03-09'$$),
+          (2, 'raum_id', $$SELECT id, beginn, ende FROM buchungen
+                           WHERE raum_id = 7 AND beginn >= '2026-06-01' ORDER BY beginn LIMIT 5$$),
+          (3, 'mitglied_id', $$SELECT id, raum_id, beginn, ende FROM buchungen
+                               WHERE mitglied_id = 42 ORDER BY beginn DESC LIMIT 10$$),
+          (4, 'raum_id', $$SELECT count(*), sum(preis) FROM buchungen WHERE raum_id = 7$$)
+      )
+      SELECT a.nr AS abfrage,
+             bool_or(k LIKE 'Seq Scan%') AS seq_scan,
+             bool_or(k LIKE '%Sort%') AS sort_knoten,
+             (SELECT bool_and(spalte = a.gleichheit) FROM erste_indexspalten(a.sql) AS spalte) AS index_passt,
+             (SELECT count(*) <= 2 FROM pg_index
+              WHERE indrelid = 'buchungen'::regclass AND NOT indisprimary) AS hoechstens_zwei_indexe
+      FROM abfragen AS a, plan_knoten(a.sql) AS k
+      GROUP BY a.nr, a.gleichheit, a.sql
+      ORDER BY a.nr;
+    hints:
+      - Die Abfragen 1, 2 und 4 haben dieselbe Gleichheitsspalte. Kann ein Index alle drei bedienen?
+      - Für Abfrage 3 muss die Sortierspalte direkt hinter `mitglied_id` stehen.
+      - "`(raum_id, beginn)` und `(mitglied_id, beginn)`."
+    explanation: |
+      `(raum_id, beginn)` trägt die Abfragen 1, 2 und 4: Gleichheit auf dem Raum, Bereich und Sortierung auf dem Beginn. Abfrage 2 liest ab dem 1. Juni vorwärts und hört nach fünf Einträgen auf, Abfrage 4 braucht nur die erste Spalte. `(mitglied_id, beginn)` trägt Abfrage 3, rückwärts gelesen, und deckt zugleich einen Fremdschlüssel auf `mitglied_id` ab – Löschungen in `mitglieder` müssten sonst `buchungen` ganz lesen. Ein Index nur auf `mitglied_id` würde Abfrage 3 einen Sort-Knoten bescheren. Ein Index `(beginn, raum_id)` würde für Abfrage 1 alle Räume der Woche lesen und Abfrage 4 gar nicht tragen, `(raum_id)` allein bräuchte für Abfrage 2 einen Sort-Knoten. Zwei Indexe für vier Abfragen – das ist das Ziel jeder Indexplanung: so wenige wie möglich, jeder mit einer klaren Aufgabe. Ein Index auf `(beginn)` neben einem auf `(raum_id)` vermeidet zwar Seq Scan und Sort-Knoten, aber für Abfrage 2 und 3 liest PostgreSQL dann rückwärts oder vorwärts durch alle Buchungen und verwirft per `Filter` die anderer Räume und Mitglieder. Deshalb prüft `index_passt`, ob der verwendete Index mit der Gleichheitsspalte beginnt.
+    resources:
+      - title: PostgreSQL · Multicolumn Indexes
+        url: https://www.postgresql.org/docs/current/indexes-multicolumn.html
+      - title: PostgreSQL · Combining Multiple Indexes
+        url: https://www.postgresql.org/docs/current/indexes-bitmap-scans.html

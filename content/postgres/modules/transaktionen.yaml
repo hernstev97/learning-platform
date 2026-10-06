@@ -1,0 +1,886 @@
+id: transaktionen
+title: Transaktionen
+level: 2
+minutes: 140
+summary: Mehrere Änderungen als Einheit schreiben – mit BEGIN, COMMIT und ROLLBACK, Savepoints, transaktionalem DDL und Transaktionsgrenzen in psycopg, SQLAlchemy und Prisma, die kurz bleiben und keine Verbindung blockieren.
+goals:
+  - Du erklärst ACID an einer Buchung mit Rechnungsbetrag und sagst, welche Eigenschaft welchen Fehler verhindert.
+  - Du steuerst Transaktionen mit `BEGIN`, `COMMIT` und `ROLLBACK` und erkennst, wann ein Treiber im Autocommit arbeitet und wann er still eine Transaktion öffnet.
+  - Du erkennst eine abgebrochene Transaktion (SQLSTATE 25P02) und nimmst mit `SAVEPOINT` und `ROLLBACK TO SAVEPOINT` gezielt Teilschritte zurück.
+  - Du nutzt transaktionales DDL für Migrationen und weißt, was ein `ROLLBACK` nicht zurücknimmt.
+  - Du setzt Transaktionsgrenzen in psycopg, SQLAlchemy und Prisma so, dass keine Sitzung „idle in transaction“ hängen bleibt.
+resources:
+  - title: PostgreSQL · Tutorial – Transactions
+    url: https://www.postgresql.org/docs/current/tutorial-transactions.html#TUTORIAL-TRANSACTIONS
+  - title: PostgreSQL · SAVEPOINT
+    url: https://www.postgresql.org/docs/current/sql-savepoint.html#SQL-SAVEPOINT
+  - title: psycopg 3 · Transactions management
+    url: https://www.psycopg.org/psycopg3/docs/basic/transactions.html#transactions-management
+  - title: SQLAlchemy 2.1 · Transactions and Connection Management
+    url: https://docs.sqlalchemy.org/en/21/orm/session_transaction.html#managing-transactions
+lesson: |
+  Montag, 9:02 Uhr: Jana Krüger bucht in der Deskwerk-App das Loft in Plagwitz für zwei Stunden. Der Buchungsdienst schreibt zwei Dinge – die Buchung in `buchungen` und den Betrag auf ihre Monatsrechnung in `rechnungen`. Zwischen beiden Anweisungen startet Kubernetes den Pod neu. Ohne Transaktion steht danach eine Buchung in der Datenbank, die nie abgerechnet wird. Niemand bemerkt es, bis die Buchhaltung im April die Umsätze abgleicht.
+
+  Eine **Transaktion** fasst mehrere Anweisungen zu einer Einheit zusammen: Entweder wirken alle oder keine. Dieses Modul zeigt, wie PostgreSQL das umsetzt, wie sich Fehler innerhalb einer Transaktion verhalten und wo Transaktionen in Python- und TypeScript-Code beginnen und enden. Was passiert, wenn zwei Transaktionen *gleichzeitig* dieselben Zeilen anfassen, ist Thema von [Isolation und Sperren](/postgres/isolation-sperren).
+
+  ## ACID am Beispiel einer Buchung
+
+  Die vier Buchstaben beschreiben, was eine Transaktion garantiert:
+
+  | Eigenschaft | Bedeutung | Bei Deskwerk |
+  | --- | --- | --- |
+  | **A**tomicity | Alle Änderungen wirken oder keine. | Buchung und Rechnungsbetrag entstehen gemeinsam oder gar nicht. |
+  | **C**onsistency | Nach dem Commit gelten alle Constraints. | Ein negativer Preis verletzt den `CHECK` – die Transaktion kann nicht committen. |
+  | **I**solation | Gleichzeitige Transaktionen stören sich nur so weit, wie die Isolationsstufe erlaubt. | Zwei Buchungen gleichzeitig: siehe nächstes Modul. |
+  | **D**urability | Was committet ist, übersteht einen Absturz. | PostgreSQL schreibt die Änderung vor der Antwort `COMMIT` ins Write-Ahead-Log ([WAL](https://www.postgresql.org/docs/current/wal-intro.html#WAL-INTRO)). |
+
+  Das „C“ ist schwächer, als es klingt: Die Datenbank kennt nur die Regeln, die als Constraint im Schema stehen ([Constraints](/postgres/constraints)). Eine Regel, die nur im Anwendungscode lebt, schützt keine Transaktion. Und das „I“ heißt in PostgreSQL standardmäßig *Read Committed*, nicht „als liefe jede Transaktion allein“.
+
+  So sieht die Buchung als Transaktion aus. `BEGIN` öffnet sie, `COMMIT` schreibt beide Änderungen fest ([Tutorial · Transactions](https://www.postgresql.org/docs/current/tutorial-transactions.html#TUTORIAL-TRANSACTIONS)). Den Rechnungsbetrag erhöht ein Upsert, wie du ihn aus [Daten ändern](/postgres/daten-aendern) kennst:
+
+  ```postgres run
+  CREATE TABLE mitglieder (
+    id   int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name text NOT NULL
+  );
+  CREATE TABLE raeume (
+    id               int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name             text NOT NULL,
+    preis_pro_stunde numeric(8,2) NOT NULL
+  );
+  CREATE TABLE buchungen (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    raum_id     int NOT NULL REFERENCES raeume (id),
+    mitglied_id int NOT NULL REFERENCES mitglieder (id),
+    beginn      timestamptz NOT NULL,
+    ende        timestamptz NOT NULL,
+    preis       numeric(8,2) CHECK (preis >= 0),
+    CHECK (ende > beginn)
+  );
+  CREATE TABLE rechnungen (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    mitglied_id int NOT NULL REFERENCES mitglieder (id),
+    monat       date NOT NULL,
+    betrag      numeric(10,2) NOT NULL,
+    UNIQUE (mitglied_id, monat)
+  );
+  INSERT INTO mitglieder (name) VALUES ('Jana Krüger'), ('Murat Yıldız');
+  INSERT INTO raeume (name, preis_pro_stunde) VALUES ('Loft', 24.00), ('Box 1', 6.00);
+
+  BEGIN;
+  INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, preis)
+  VALUES (1, 1, '2026-03-02 09:00', '2026-03-02 11:00', 48.00)
+  RETURNING id, preis;
+  INSERT INTO rechnungen (mitglied_id, monat, betrag)
+  VALUES (1, '2026-03-01', 48.00)
+  ON CONFLICT (mitglied_id, monat)
+  DO UPDATE SET betrag = rechnungen.betrag + EXCLUDED.betrag;
+  COMMIT;
+
+  SELECT mitglied_id, monat, betrag FROM rechnungen;
+  ```
+
+  Stirbt der Prozess nach dem ersten `INSERT`, kommt kein `COMMIT` an. PostgreSQL verwirft die offene Transaktion, sobald die Verbindung abreißt, und die Buchung hat es nie gegeben.
+
+  > [!INTERVIEW] „Was bedeutet ACID?“
+  > Atomarität: alle Änderungen einer Transaktion oder keine. Konsistenz: Nach dem Commit gelten alle Constraints des Schemas. Isolation: Gleichzeitige Transaktionen sehen sich nur so weit, wie die Isolationsstufe erlaubt – in PostgreSQL ist der Standard Read Committed. Dauerhaftigkeit: Ein bestätigter Commit steht im WAL und übersteht einen Absturz. Als Beispiel nenne ich etwas Konkretes, etwa Buchung und Rechnungsbetrag, die nur gemeinsam Sinn ergeben.
+
+  ## BEGIN, COMMIT, ROLLBACK und Autocommit
+
+  Ohne `BEGIN` läuft jede Anweisung in ihrer eigenen Transaktion, die PostgreSQL nach der Anweisung sofort committet. Das heißt **Autocommit** und ist das Verhalten von psql und dem Server ([BEGIN](https://www.postgresql.org/docs/current/sql-begin.html#SQL-BEGIN)). Auch eine einzelne Anweisung ist atomar: Ein `UPDATE` über 500 Zeilen, das bei Zeile 312 an einem `CHECK` scheitert, ändert keine einzige Zeile.
+
+  Nach `BEGIN` gilt die Transaktion, bis `COMMIT` oder `ROLLBACK` kommt. Innerhalb siehst du deine eigenen Änderungen, andere Sitzungen sehen sie erst nach dem Commit:
+
+  ```postgres run
+  CREATE TABLE buchungen (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    mitglied_id int NOT NULL,
+    beginn      timestamptz NOT NULL,
+    preis       numeric(8,2)
+  );
+  INSERT INTO buchungen (mitglied_id, beginn, preis) VALUES
+    (1, '2026-03-02 09:00', 48.00),
+    (2, '2026-03-02 10:00', 3.00);
+
+  BEGIN;
+  DELETE FROM buchungen WHERE mitglied_id = 2;
+  SELECT count(*) AS sichtbar_in_der_transaktion FROM buchungen;
+  ROLLBACK;
+
+  SELECT count(*) AS nach_rollback FROM buchungen;
+  ```
+
+  In der Transaktion zählt `count(*)` eine Zeile, nach dem `ROLLBACK` wieder zwei. Das ist der sichere Weg, eine heikle Änderung auszuprobieren: `BEGIN`, ändern, mit `SELECT` prüfen, dann bewusst `COMMIT` oder `ROLLBACK`.
+
+  Treiber machen es unterschiedlich. psycopg 3 folgt der Python-DB-API und öffnet **beim ersten `execute` still eine Transaktion**, auch für ein `SELECT`. Ohne `commit()` bleibt sie offen, und beim Schließen der Verbindung gehen die Änderungen verloren ([psycopg · Transactions management](https://www.psycopg.org/psycopg3/docs/basic/transactions.html#transactions-management)). Eine JDBC-Verbindung steht dagegen standardmäßig auf Autocommit, und Prisma schickt jede Abfrage außerhalb von `$transaction` als eigene Transaktion. Wer zwischen Sprachen wechselt, sollte für jeden Treiber wissen, welches Verhalten gilt.
+
+  ## Ein Fehler bricht die ganze Transaktion ab
+
+  Was passiert, wenn mitten in der Transaktion eine Anweisung scheitert? Der Block läuft nach einem Fehler weiter, so wie eine interaktive psql-Sitzung. Führe ihn aus:
+
+  ```postgres run continue
+  CREATE TABLE buchungen (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    raum_id     int NOT NULL,
+    mitglied_id int NOT NULL,
+    beginn      timestamptz NOT NULL,
+    ende        timestamptz NOT NULL,
+    preis       numeric(8,2) CHECK (preis >= 0)
+  );
+
+  BEGIN;
+  INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, preis)
+  VALUES (1, 1, '2026-03-03 09:00', '2026-03-03 10:00', 24.00);
+  INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, preis)
+  VALUES (2, 2, '2026-03-03 09:00', '2026-03-03 10:00', -6.00);
+  SELECT count(*) FROM buchungen;
+  COMMIT;
+
+  SELECT count(*) AS gespeichert FROM buchungen;
+  ```
+
+  In psql verrät der Prompt diesen Zustand: `deskwerk=*#` heißt „in einer Transaktion“, `deskwerk=!#` „in einer abgebrochenen Transaktion“ ([psql · %x](https://www.postgresql.org/docs/current/app-psql.html#APP-PSQL-PROMPTING-X)).
+
+  Nach dem Fehler ist die Transaktion **abgebrochen**. PostgreSQL lehnt jede weitere Anweisung mit SQLSTATE `25P02` (`in_failed_sql_transaction`) ab, bis die Transaktion endet ([Error Codes](https://www.postgresql.org/docs/current/errcodes-appendix.html#ERRCODES-TABLE)). Selbst `COMMIT` hilft nicht: PostgreSQL antwortet mit `ROLLBACK`, und auch die erste, fehlerfreie Buchung ist weg – `gespeichert` ist 0. Einige andere Datenbanken nehmen in diesem Fall nur die gescheiterte Anweisung zurück und lassen den Rest der Transaktion weiterlaufen. PostgreSQL nimmt immer alles zurück.
+
+  In der Anwendung zeigt sich das als Folgefehler. psycopg wirft `InFailedSqlTransaction`, sobald Code einen Fehler abfängt, weitermacht und dieselbe Verbindung weiterbenutzt. Die Ursache steht eine Zeile weiter oben im Log.
+
+  > [!PRAXIS] Die vergiftete Verbindung im Pool
+  > Ein Klassiker in Code-Reviews: Ein Worker hält eine Verbindung für alle Jobs. Ein Job fängt `IntegrityError` ab, loggt ihn und macht ohne `rollback()` weiter. Ab jetzt scheitert jeder Job auf dieser Verbindung mit `current transaction is aborted` – an Stellen, die mit dem Fehler nichts zu tun haben. Verbindungspools wie `psycopg_pool` und der Pool von SQLAlchemy rollen eine zurückgegebene Verbindung zurück, eine selbst gehaltene Verbindung tut das nicht. Kontextmanager (`with conn.transaction():`, `with session.begin():`) rollen bei einer Exception automatisch zurück. Deshalb gehören Transaktionen in einen `with`-Block statt in Paare aus `commit()` und `rollback()`.
+
+  ## SAVEPOINT: Teilschritte zurücknehmen
+
+  Manchmal soll nur ein Teil zurück. Ein **Savepoint** ist eine Markierung innerhalb der Transaktion. `ROLLBACK TO SAVEPOINT` setzt den Zustand auf diese Markierung zurück, die Transaktion selbst läuft weiter ([SAVEPOINT](https://www.postgresql.org/docs/current/sql-savepoint.html#SQL-SAVEPOINT)). Hier probiert die Buchhaltung einen Rabatt aus, verwirft ihn und gibt stattdessen 10 %:
+
+  ```postgres run
+  CREATE TABLE buchungen (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    mitglied_id int NOT NULL,
+    beginn      timestamptz NOT NULL,
+    preis       numeric(8,2)
+  );
+
+  BEGIN;
+  INSERT INTO buchungen (mitglied_id, beginn, preis)
+  VALUES (1, '2026-03-04 09:00', 72.00);
+  SAVEPOINT vor_rabatt;
+  UPDATE buchungen SET preis = preis * 0.5 WHERE mitglied_id = 1;
+  SELECT id, preis FROM buchungen ORDER BY id;
+  ROLLBACK TO SAVEPOINT vor_rabatt;
+  UPDATE buchungen SET preis = preis * 0.9 WHERE id = 1;
+  COMMIT;
+
+  SELECT id, preis FROM buchungen ORDER BY id;
+  ```
+
+  Das `INSERT` vor dem Savepoint bleibt erhalten, der halbe Preis verschwindet, am Ende stehen 64.80. Savepoints retten auch eine Transaktion nach einem Fehler: Ein `ROLLBACK TO SAVEPOINT` holt sie aus dem abgebrochenen Zustand zurück. So überspringt ein Import einzelne kaputte Zeilen, ohne die guten zu verlieren:
+
+  ```postgres run continue
+  CREATE TABLE mitglieder (id int PRIMARY KEY, name text NOT NULL);
+  CREATE TABLE buchungen (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    mitglied_id int NOT NULL REFERENCES mitglieder (id),
+    beginn      timestamptz NOT NULL,
+    preis       numeric(8,2)
+  );
+  INSERT INTO mitglieder VALUES (1, 'Jana Krüger'), (2, 'Murat Yıldız');
+
+  BEGIN;
+  INSERT INTO buchungen (mitglied_id, beginn, preis) VALUES (1, '2026-03-05 09:00', 24.00);
+  SAVEPOINT zeile_2;
+  INSERT INTO buchungen (mitglied_id, beginn, preis) VALUES (9, '2026-03-05 09:00', 6.00);
+  ROLLBACK TO SAVEPOINT zeile_2;
+  INSERT INTO buchungen (mitglied_id, beginn, preis) VALUES (2, '2026-03-05 11:00', 6.00);
+  COMMIT;
+
+  SELECT id, mitglied_id, preis FROM buchungen ORDER BY id;
+  ```
+
+  Die Zeile mit dem unbekannten Mitglied 9 verschwindet, die Transaktion läuft nach `ROLLBACK TO SAVEPOINT` weiter, und beide guten Zeilen werden committet. Die Lücke bei `id` 2 kennst du gleich: Auch die gescheiterte Zeile hat schon einen Wert aus der Sequenz verbraucht.
+
+  Für große Importe ist ein Savepoint je Zeile trotzdem nicht die erste Wahl, denn jede Zeile kostet zwei zusätzliche Anweisungen. Prüfe die Daten vorher, etwa mit einem `JOIN` gegen `mitglieder`. Doppelte Schlüssel kann die Datenbank selbst überspringen (`ON CONFLICT DO NOTHING`), verletzte Fremdschlüssel nicht. `RELEASE SAVEPOINT` gibt einen Savepoint frei, ohne etwas zurückzunehmen. Treiber und ORMs nutzen Savepoints für verschachtelte Transaktionen: In psycopg erzeugt ein `conn.transaction()` innerhalb eines anderen einen Savepoint, in SQLAlchemy tut das `session.begin_nested()`.
+
+  > [!DEEP] psql rettet dich mit Savepoints
+  > Mit `\set ON_ERROR_ROLLBACK interactive` setzt psql vor jede Anweisung in einer Transaktion still einen Savepoint und rollt bei einem Fehler nur bis dorthin zurück ([psql · ON_ERROR_ROLLBACK](https://www.postgresql.org/docs/current/app-psql.html#APP-PSQL-VARIABLES-ON-ERROR-ROLLBACK)). Für Tippfehler in langen Admin-Sitzungen ist das bequem. In Skripten gilt die Einstellung mit `interactive` nicht.
+
+  ## Transaktionales DDL und was kein ROLLBACK zurücknimmt
+
+  In PostgreSQL sind auch `CREATE TABLE`, `ALTER TABLE` und `CREATE INDEX` Teil der Transaktion. Eine Migration, die auf halbem Weg scheitert, hinterlässt kein halb umgebautes Schema:
+
+  ```postgres run
+  CREATE TABLE buchungen (
+    id     bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    beginn timestamptz NOT NULL
+  );
+
+  BEGIN;
+  ALTER TABLE buchungen ADD COLUMN status text NOT NULL DEFAULT 'bestaetigt';
+  CREATE INDEX ON buchungen (status);
+  SELECT column_name FROM information_schema.columns
+  WHERE table_name = 'buchungen' AND column_name = 'status';
+  ROLLBACK;
+
+  SELECT count(*) AS spalten_namens_status FROM information_schema.columns
+  WHERE table_name = 'buchungen' AND column_name = 'status';
+  SELECT count(*) AS indexe FROM pg_indexes WHERE tablename = 'buchungen';
+  ```
+
+  Spalte und Index sind nach dem `ROLLBACK` verschwunden, übrig ist nur der Index des Primärschlüssels. Alembic nutzt das: Auf PostgreSQL läuft ein `alembic upgrade` standardmäßig in einer einzigen Transaktion ([Alembic · begin_transaction](https://alembic.sqlalchemy.org/en/latest/api/runtime.html#alembic.runtime.environment.EnvironmentContext.begin_transaction)). MySQL kann das nicht: Dort committet fast jede DDL-Anweisung implizit ([MySQL · Implicit Commit](https://dev.mysql.com/doc/refman/8.4/en/implicit-commit.html)).
+
+  Einige Befehle verweigern eine Transaktion ganz, etwa `VACUUM` und `CREATE INDEX CONCURRENTLY`. Nach `BEGIN` antwortet PostgreSQL mit `ERROR:  CREATE INDEX CONCURRENTLY cannot run inside a transaction block` ([CREATE INDEX · Building Indexes Concurrently](https://www.postgresql.org/docs/current/sql-createindex.html#SQL-CREATEINDEX-CONCURRENTLY)). Wie man solche Schritte in Migrationen einsetzt, zeigt [Schema-Migrationen](/postgres/migrationen).
+
+  Und eines nimmt kein `ROLLBACK` zurück: **Sequenzen**. Identity-Spalten holen ihre Werte mit `nextval` aus einer Sequenz, und ein einmal vergebener Wert bleibt vergeben, damit gleichzeitige Transaktionen nicht aufeinander warten müssen ([Sequence Functions](https://www.postgresql.org/docs/current/functions-sequence.html#FUNCTIONS-SEQUENCE)):
+
+  ```postgres run
+  CREATE TABLE buchungen (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    mitglied_id int NOT NULL,
+    preis       numeric(8,2)
+  );
+
+  BEGIN;
+  INSERT INTO buchungen (mitglied_id, preis) VALUES (1, 24.00) RETURNING id;
+  ROLLBACK;
+
+  INSERT INTO buchungen (mitglied_id, preis) VALUES (1, 24.00) RETURNING id;
+  ```
+
+  Die zweite Buchung bekommt die `2`, die `1` ist verloren. Lücken entstehen auch durch gescheiterte Inserts und `ON CONFLICT`. IDs sind deshalb Schlüssel, keine Zähler.
+
+  > [!WARNING] Lückenlose Nummern nicht aus einer Sequenz
+  > Soll eine Rechnungsnummer lückenlos fortlaufen, taugt dafür keine Sequenz und keine Identity-Spalte. Nimm eine Zählertabelle, die du in derselben Transaktion wie die Rechnung hochzählst: `UPDATE nummernkreise SET letzte_nummer = letzte_nummer + 1 WHERE jahr = 2026 RETURNING letzte_nummer`. Rollt die Transaktion zurück, rollt der Zähler mit. Der Preis: Gleichzeitige Rechnungen warten an dieser Zeile aufeinander.
+
+  ## Transaktionen in der Anwendung
+
+  In der Deskwerk-App schreibt niemand `BEGIN` von Hand. Die Transaktionsgrenze steckt im Treiber oder ORM, und dort sollte sie sichtbar sein. Für psycopg 3 beschreibt die Dokumentation das Muster, das „mehrere erfahrene Entwickler“ bevorzugen: eine Autocommit-Verbindung und `with conn.transaction():` genau dort, wo mehrere Anweisungen zusammengehören ([psycopg · Transaction contexts](https://www.psycopg.org/psycopg3/docs/basic/transactions.html#transaction-contexts)):
+
+  ```python
+  import psycopg
+
+  with psycopg.connect(DSN, autocommit=True) as conn:
+      with conn.transaction():  # BEGIN … COMMIT, bei Exception ROLLBACK
+          buchung_id = conn.execute(
+              "INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, preis)"
+              " VALUES (%s, %s, %s, %s, %s) RETURNING id",
+              (raum_id, mitglied_id, beginn, ende, preis),
+          ).fetchone()[0]
+          conn.execute(
+              "INSERT INTO rechnungen (mitglied_id, monat, betrag) VALUES (%s, %s, %s)"
+              " ON CONFLICT (mitglied_id, monat)"
+              " DO UPDATE SET betrag = rechnungen.betrag + EXCLUDED.betrag",
+              (mitglied_id, monat, preis),
+          )
+  ```
+
+  SQLAlchemy 2 öffnet die Transaktion beim ersten Zugriff selbst („autobegin“). Ein `with session.begin():` macht die Grenze ausdrücklich: Am Ende des Blocks folgt `COMMIT`, bei einer Exception `ROLLBACK` ([SQLAlchemy · Managing Transactions](https://docs.sqlalchemy.org/en/21/orm/session_transaction.html#managing-transactions)). Im Webdienst ist das meist ein Block pro Request:
+
+  ```python
+  from sqlalchemy.orm import Session
+
+  def buchen(engine, anfrage: BuchungAnfrage) -> int:
+      with Session(engine) as session, session.begin():
+          buchung = Buchung(**anfrage.model_dump())
+          session.add(buchung)
+          session.flush()  # schickt das INSERT, liefert buchung.id
+          rechnung_erhoehen(session, buchung.mitglied_id, buchung.beginn, buchung.preis)
+          return buchung.id
+  ```
+
+  Der TypeScript-Dienst nutzt Prisma ORM 7. Eine interaktive Transaktion bekommt einen Client `tx`. Jede Abfrage darin muss über `tx` laufen, sonst landet sie außerhalb der Transaktion. Nach 5 Sekunden bricht Prisma die Transaktion standardmäßig ab (`timeout`), auf eine freie Verbindung wartet sie höchstens 2 Sekunden (`maxWait`, [Prisma · Interactive transactions](https://www.prisma.io/docs/orm/v7/prisma-client/queries/transactions#interactive-transactions)). Prisma ORM 8 nennt die Methode `db.transaction(async (tx) => …)` und kennt weder `timeout` noch `maxWait` oder `isolationLevel`: Die Transaktion bleibt offen, solange der Callback läuft ([Prisma ORM 8 · Transactions](https://www.prisma.io/docs/orm/fundamentals/transactions)). Eine Obergrenze setzt dann PostgreSQL selbst, dazu gleich mehr.
+
+  ```typescript
+  const buchung = await prisma.$transaction(async (tx) => {
+    const neu = await tx.buchung.create({ data: anfrage });
+    await tx.rechnung.upsert({
+      where: { mitgliedId_monat: { mitgliedId: neu.mitgliedId, monat } },
+      create: { mitgliedId: neu.mitgliedId, monat, betrag: neu.preis },
+      update: { betrag: { increment: neu.preis } },
+    });
+    return neu;
+  });
+  await bestaetigungSenden(buchung); // erst nach dem Commit
+  ```
+
+  ### Transaktionen kurz halten
+
+  Eine offene Transaktion belegt eine Verbindung aus dem Pool, hält die Sperren aller geänderten Zeilen und hindert `VACUUM` daran, alte Zeilenversionen aufzuräumen. Deshalb gehören **keine HTTP-Aufrufe, Mails oder Benutzereingaben** in eine Transaktion. Ein Zahlungsanbieter, der drei Sekunden antwortet, hält sonst drei Sekunden lang die Rechnungszeile gesperrt. Und wenn die Zahlung durchgeht, der Commit danach aber scheitert, ist das Geld abgebucht und die Buchung weg – ein externer Aufruf lässt sich nicht zurückrollen.
+
+  Eine Sitzung, die eine Transaktion offen hat und auf den Client wartet, zeigt `pg_stat_activity` als `idle in transaction` ([pg_stat_activity](https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-ACTIVITY-VIEW)). Hier hat die API eine Preisänderung an Raum 2 nicht committet, und eine zweite Änderung aus dem Admin-Bereich wartet seit zwei Sekunden auf die Zeilensperre:
+
+  ```text
+  deskwerk=# SELECT pid, application_name, state, wait_event_type,
+  deskwerk-#        date_trunc('second', now() - xact_start) AS dauer, query
+  deskwerk-# FROM pg_stat_activity
+  deskwerk-# WHERE datname = 'deskwerk' AND pid <> pg_backend_pid()
+  deskwerk-# ORDER BY xact_start;
+   pid | application_name |        state        | wait_event_type |  dauer   |                          query
+  -----+------------------+---------------------+-----------------+----------+----------------------------------------------------------
+   400 | deskwerk-api     | idle in transaction | Client          | 00:00:08 | UPDATE raeume SET preis_pro_stunde = 26.00 WHERE id = 2;
+   398 | deskwerk-admin   | active              | Lock            | 00:00:02 | UPDATE raeume SET preis_pro_stunde = 28.00 WHERE id = 2;
+  (2 rows)
+  ```
+
+  `query` zeigt bei `idle in transaction` die *letzte* Anweisung, nicht die, die gerade läuft. Als Sicherheitsnetz beendet `idle_in_transaction_session_timeout` solche Sitzungen nach einer Frist ([idle_in_transaction_session_timeout](https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-IDLE-IN-TRANSACTION-SESSION-TIMEOUT)). Seit PostgreSQL 17 begrenzt `transaction_timeout` die Gesamtdauer einer Transaktion ([transaction_timeout](https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-TRANSACTION-TIMEOUT)).
+
+  > [!MERKE]
+  > Eine Transaktion umfasst so viel, wie fachlich zusammengehört, und so wenig Zeit wie möglich. Erst rechnen und fremde Dienste fragen, dann eine kurze Transaktion schreiben, danach Mails verschicken.
+
+  ## Häufige Fehler
+
+  - **`current transaction is aborted, commands ignored until end of transaction block`.** Eine frühere Anweisung ist gescheitert. Die Ursache steht weiter oben im Log. `ROLLBACK` oder ein `ROLLBACK TO SAVEPOINT` macht die Verbindung wieder nutzbar.
+  - **Änderungen sind nach dem Skript weg.** psycopg hat still eine Transaktion geöffnet, und niemand hat committet. Verbindung als Kontextmanager nutzen oder `autocommit=True` mit `conn.transaction()`.
+  - **`ROLLBACK` statt `ROLLBACK TO SAVEPOINT`.** Das nimmt die ganze Transaktion zurück. Die folgenden Anweisungen laufen im Autocommit, und `COMMIT` meldet `WARNING:  there is no transaction in progress`.
+  - **HTTP-Aufruf in der Transaktion.** Verbindungen und Sperren bleiben belegt, Seiteneffekte lassen sich nicht zurückrollen. Externe Aufrufe vor oder nach der Transaktion.
+  - **Abfrage über `prisma` statt `tx` im Callback.** Sie läuft auf einer anderen Verbindung, committet sofort und rollt nicht mit zurück.
+  - **Lückenlose Nummern aus einer Sequenz.** Sequenzen sind nicht transaktional. Zählertabelle in derselben Transaktion verwenden.
+  - **`CREATE INDEX CONCURRENTLY` in einer Migration mit Transaktion.** PostgreSQL verweigert es (`cannot run inside a transaction block`). Diese Migration braucht einen Schritt ohne Transaktion.
+
+  ## Zusammenfassung
+
+  - Eine Transaktion macht mehrere Änderungen atomar: `BEGIN`, dann `COMMIT` oder `ROLLBACK`. Ohne `BEGIN` ist jede Anweisung eine eigene Transaktion.
+  - Nach einem Fehler ist die Transaktion abgebrochen (SQLSTATE 25P02). Jede weitere Anweisung scheitert, und `COMMIT` antwortet mit `ROLLBACK`.
+  - `SAVEPOINT` und `ROLLBACK TO SAVEPOINT` nehmen einen Teil zurück und retten die Transaktion nach einem Fehler.
+  - DDL ist in PostgreSQL transaktional. Ausnahmen wie `CREATE INDEX CONCURRENTLY` und `VACUUM` laufen nur außerhalb einer Transaktion.
+  - Sequenzen sind nicht transaktional. Lücken in IDs sind normal, lückenlose Nummern brauchen eine Zählertabelle.
+  - psycopg öffnet ohne Autocommit still eine Transaktion. Transaktionsgrenzen gehören in `with`-Blöcke: `conn.transaction()`, `session.begin()`, `prisma.$transaction`.
+  - Transaktionen kurz halten: kein HTTP, keine Mails, keine Benutzereingaben darin. `idle in transaction` in `pg_stat_activity` ist ein Warnsignal.
+exercises:
+  - id: acid-zuordnen
+    type: choice
+    title: Was garantiert die Transaktion?
+    prompt: |
+      Der Buchungsdienst schreibt eine Buchung und erhöht in derselben Transaktion den Monatsbetrag in `rechnungen`. PostgreSQL läuft mit den Standardeinstellungen. Welche Aussagen stimmen?
+    options:
+      - text: Stürzt der Dienst nach dem `INSERT` in `buchungen`, aber vor dem `COMMIT` ab, gibt es danach weder Buchung noch Rechnungsbetrag.
+        correct: true
+        why: Das ist Atomarität. Ohne `COMMIT` verwirft PostgreSQL die offene Transaktion, sobald die Verbindung abreißt.
+      - text: Verletzt die Buchung einen `CHECK`-Constraint, kann die Transaktion nicht committen.
+        correct: true
+        why: Konsistenz im Sinne von ACID heißt, dass nach dem Commit alle Constraints des Schemas gelten. Die gescheiterte Anweisung bricht die Transaktion ab, `COMMIT` wird zum `ROLLBACK`.
+      - text: Hat der Client die Antwort `COMMIT` bekommen, übersteht die Buchung auch einen Stromausfall des Servers.
+        correct: true
+        why: Dauerhaftigkeit. PostgreSQL schreibt die Änderung vor der Bestätigung ins WAL und spielt es nach einem Absturz wieder ein.
+      - text: Zwei gleichzeitige Buchungstransaktionen verhalten sich immer so, als liefen sie nacheinander.
+        correct: false
+        why: Das garantiert nur die Isolationsstufe Serializable. Der Standard in PostgreSQL ist Read Committed, dort sind Anomalien wie Lost Updates möglich.
+      - text: Eine Geschäftsregel aus dem Python-Code, etwa „höchstens zehn Buchungen pro Tag“, schützt die Transaktion automatisch mit.
+        correct: false
+        why: PostgreSQL kennt nur die Regeln, die als Constraint im Schema stehen. Eine Prüfung im Anwendungscode ist keine Garantie der Datenbank.
+    explanation: |
+      ACID beschreibt, was eine Transaktion zusagt: alles oder nichts (Atomarität), gültige Constraints nach dem Commit (Konsistenz), kontrollierte Sichtbarkeit zwischen gleichzeitigen Transaktionen (Isolation) und Bestand nach der Bestätigung (Dauerhaftigkeit). Die beiden falschen Aussagen sind typische Überschätzungen. Isolation ist in PostgreSQL standardmäßig Read Committed und nicht „wie nacheinander“, und Konsistenz reicht nur so weit wie die Constraints im Schema.
+    resources:
+      - title: PostgreSQL · Tutorial – Transactions
+        url: https://www.postgresql.org/docs/current/tutorial-transactions.html#TUTORIAL-TRANSACTIONS
+      - title: PostgreSQL · Reliability and the Write-Ahead Log
+        url: https://www.postgresql.org/docs/current/wal-intro.html#WAL-INTRO
+
+  - id: migration-in-transaktion
+    type: order
+    title: Eine Migration, alles oder nichts
+    prompt: |
+      Die Migration führt eine Spalte `netto` ein, füllt sie aus dem Bruttopreis und macht sie zur Pflichtspalte. Sie soll vollständig oder gar nicht wirken. **Bevor** du `NOT NULL` setzt, willst du sehen, wie viele Zeilen noch keinen Nettopreis haben. Bring die Zeilen in die richtige Reihenfolge.
+    lang: postgres
+    lines: |
+      BEGIN;
+      ALTER TABLE buchungen ADD COLUMN netto numeric(8,2);
+      UPDATE buchungen SET netto = round(preis / 1.19, 2);
+      SELECT count(*) FROM buchungen WHERE netto IS NULL;
+      ALTER TABLE buchungen ALTER COLUMN netto SET NOT NULL;
+      COMMIT;
+    hints:
+      - Eine Spalte lässt sich erst befüllen, wenn es sie gibt.
+      - "`SET NOT NULL` scheitert, solange eine Zeile `NULL` enthält. Die Kontrolle kommt davor."
+    explanation: |
+      `BEGIN` steht vor der ersten Änderung, damit auch das `ALTER TABLE` zur Transaktion gehört – in PostgreSQL ist DDL transaktional. Danach Spalte anlegen, befüllen, prüfen, `NOT NULL` setzen. Liefert die Kontrolle eine Zahl größer null (etwa Buchungen ohne Preis), scheitert `SET NOT NULL`, die Transaktion ist abgebrochen und `COMMIT` antwortet mit `ROLLBACK`. Das Schema bleibt dann unverändert, statt mit einer halb befüllten Spalte zurückzubleiben.
+    resources:
+      - title: PostgreSQL · ALTER TABLE
+        url: https://www.postgresql.org/docs/current/sql-altertable.html
+
+  - id: nach-dem-rollback
+    type: output
+    title: Was übersteht das ROLLBACK?
+    prompt: |
+      Was gibt das Skript aus? Ausgabe wie `psql -At`: Werte durch `|`, `NULL` leer, `t`/`f`. Die Ergebnisse beider Abfragen stehen direkt untereinander.
+    lang: postgres
+    code: |
+      CREATE TABLE checkins (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        mitglied_id int NOT NULL,
+        standort    text NOT NULL
+      );
+      INSERT INTO checkins (mitglied_id, standort) VALUES (1, 'Plagwitz');
+
+      BEGIN;
+      INSERT INTO checkins (mitglied_id, standort) VALUES (2, 'Zentrum'), (3, 'Zentrum');
+      SELECT count(*) FROM checkins;
+      ROLLBACK;
+
+      INSERT INTO checkins (mitglied_id, standort) VALUES (4, 'Südvorstadt');
+      SELECT id, mitglied_id, standort FROM checkins ORDER BY id;
+    expected: |
+      3
+      1|1|Plagwitz
+      4|4|Südvorstadt
+    hints:
+      - Innerhalb der Transaktion sieht die Sitzung ihre eigenen, noch nicht committeten Zeilen.
+      - Welche Werte hat die Identity-Spalte für die beiden zurückgerollten Check-ins schon vergeben?
+    explanation: |
+      Innerhalb der Transaktion zählt `count(*)` auch die beiden eigenen, noch nicht committeten Zeilen: 3. Das `ROLLBACK` entfernt sie wieder. Die Identity-Spalte hat aber die Werte 2 und 3 aus ihrer Sequenz schon vergeben, und `nextval` wird nicht zurückgerollt. Der nächste Check-in bekommt deshalb die 4. Lücken in IDs sind in PostgreSQL normal.
+    resources:
+      - title: PostgreSQL · Sequence Functions
+        url: https://www.postgresql.org/docs/current/functions-sequence.html#FUNCTIONS-SEQUENCE
+
+  - id: savepoint-vorhersagen
+    type: output
+    title: Zwei Savepoints, ein Rücksprung
+    prompt: |
+      Was gibt das Skript aus? Ausgabe wie `psql -At`: Werte durch `|`, `NULL` leer, `t`/`f`.
+    lang: postgres
+    code: |
+      CREATE TABLE rechnungen (mitglied_id int PRIMARY KEY, betrag numeric(10,2) NOT NULL);
+      INSERT INTO rechnungen VALUES (1, 100.00), (2, 40.00);
+
+      BEGIN;
+      UPDATE rechnungen SET betrag = betrag + 10;
+      SAVEPOINT a;
+      UPDATE rechnungen SET betrag = betrag * 2 WHERE mitglied_id = 1;
+      SAVEPOINT b;
+      DELETE FROM rechnungen WHERE mitglied_id = 2;
+      ROLLBACK TO SAVEPOINT a;
+      UPDATE rechnungen SET betrag = betrag - 5 WHERE mitglied_id = 2;
+      COMMIT;
+
+      SELECT mitglied_id, betrag FROM rechnungen ORDER BY mitglied_id;
+    expected: |
+      1|110.00
+      2|45.00
+    hints:
+      - "`ROLLBACK TO SAVEPOINT a` nimmt alles zurück, was **nach** `SAVEPOINT a` geschah – auch das, was nach `SAVEPOINT b` kam."
+    explanation: |
+      Das erste `UPDATE` vor `SAVEPOINT a` bleibt: 110 und 50. Der Rücksprung auf `a` nimmt die Verdopplung von Mitglied 1 und das Löschen von Mitglied 2 zurück, denn beides lag nach `a`. Savepoint `b` verschwindet dabei mit. Danach zieht das letzte `UPDATE` 5 von Mitglied 2 ab: 45.00. `COMMIT` schreibt diesen Zustand fest. Savepoints sind ein Stapel: Wer zu einem älteren zurückspringt, verliert alle jüngeren.
+    resources:
+      - title: PostgreSQL · ROLLBACK TO SAVEPOINT
+        url: https://www.postgresql.org/docs/current/sql-rollback-to.html
+
+  - id: ddl-zurueckrollen
+    type: output
+    title: Die Migration, die es nie gab
+    prompt: |
+      Was gibt das Skript aus? Ausgabe wie `psql -At`: Werte durch `|`, `NULL` leer, `t`/`f`. Die Ergebnisse aller Abfragen stehen direkt untereinander.
+    lang: postgres
+    code: |
+      CREATE TABLE mitglieder (id int PRIMARY KEY, name text NOT NULL);
+      INSERT INTO mitglieder VALUES (1, 'Jana Krüger');
+
+      BEGIN;
+      ALTER TABLE mitglieder ADD COLUMN tarif text NOT NULL DEFAULT 'flex';
+      CREATE TABLE tarife (name text PRIMARY KEY);
+      INSERT INTO mitglieder VALUES (2, 'Murat Yıldız', 'fix');
+      SELECT count(*) FROM mitglieder;
+      ROLLBACK;
+
+      INSERT INTO mitglieder VALUES (3, 'Lena Hoffmann');
+      SELECT to_regclass('tarife') IS NULL AS tarife_fehlt,
+             count(*) AS spalten
+      FROM information_schema.columns
+      WHERE table_name = 'mitglieder';
+      SELECT id, name FROM mitglieder ORDER BY id;
+    expected: |
+      2
+      t|2
+      1|Jana Krüger
+      3|Lena Hoffmann
+    hints:
+      - In PostgreSQL gehören auch `ALTER TABLE` und `CREATE TABLE` zur Transaktion.
+      - "`to_regclass` liefert `NULL`, wenn es keine Tabelle dieses Namens gibt."
+    explanation: |
+      In der Transaktion gibt es zwei Mitglieder. Das `ROLLBACK` nimmt alles zurück: die neue Spalte `tarif`, die Tabelle `tarife` und Murat Yıldız. Danach hat `mitglieder` wieder genau zwei Spalten (`id`, `name`), und das `INSERT` mit zwei Werten funktioniert. Mit Spalte `tarif` wäre es auch gegangen, weil sie einen Default hat. In MySQL wäre das `ALTER TABLE` dagegen sofort committet worden.
+    resources:
+      - title: MySQL · Statements That Cause an Implicit Commit
+        url: https://dev.mysql.com/doc/refman/8.4/en/implicit-commit.html
+
+  - id: commit-nach-fehler
+    type: choice
+    title: COMMIT nach dem Fehler
+    prompt: |
+      Eine psql-Sitzung, die nach Fehlern weiterläuft. Was antwortet PostgreSQL auf das letzte `COMMIT`, und was steht danach in `buchungen` (vorher leer)?
+    lang: text
+    code: |
+      deskwerk=# BEGIN;
+      BEGIN
+      deskwerk=*# INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, preis)
+      deskwerk-*# VALUES (1, 1, '2026-03-03 09:00', '2026-03-03 10:00', 24.00);
+      INSERT 0 1
+      deskwerk=*# INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, preis)
+      deskwerk-*# VALUES (2, 2, '2026-03-03 09:00', '2026-03-03 10:00', -6.00);
+      ERROR:  new row for relation "buchungen" violates check constraint "buchungen_preis_check"
+      deskwerk=!# SELECT count(*) FROM buchungen;
+      ERROR:  current transaction is aborted, commands ignored until end of transaction block
+      deskwerk=!# COMMIT;
+    options:
+      - text: PostgreSQL antwortet `ROLLBACK`. Die Tabelle ist leer.
+        correct: true
+        why: Nach dem Fehler ist die Transaktion abgebrochen. `COMMIT` beendet sie, kann aber nichts mehr festschreiben – auch die erste, fehlerfreie Buchung nicht.
+      - text: PostgreSQL antwortet `COMMIT`. Die erste Buchung ist gespeichert, nur die fehlerhafte fehlt.
+        correct: false
+        why: So verhalten sich Datenbanken, die nur die gescheiterte Anweisung zurücknehmen. PostgreSQL nimmt die ganze Transaktion zurück, wenn kein Savepoint gesetzt war.
+      - text: "`COMMIT` scheitert mit `current transaction is aborted`. Die Sitzung bleibt im Fehlerzustand."
+        correct: false
+        why: "`COMMIT` und `ROLLBACK` sind die beiden Anweisungen, die eine abgebrochene Transaktion annimmt. Sie beenden sie."
+      - text: Die Antwort hängt davon ab, ob seit dem Fehler eine weitere Anweisung kam.
+        correct: false
+        why: Die abgebrochene Transaktion lehnt Anweisungen ab, ändert dadurch aber nichts. Ab dem Fehler ist nur noch das Ende der Transaktion möglich.
+    explanation: |
+      Der `!` im Prompt zeigt den Zustand: abgebrochene Transaktion, SQLSTATE 25P02. PostgreSQL lehnt jede Anweisung ab, bis die Transaktion endet, und `COMMIT` endet sie mit einem `ROLLBACK`. Für die Anwendung heißt das: Nach einer Exception in einer Transaktion ist sie verloren. Rette sie mit einem Savepoint vor der riskanten Anweisung oder wiederhole sie von vorn.
+    resources:
+      - title: PostgreSQL · psql – Prompting (%x)
+        url: https://www.postgresql.org/docs/current/app-psql.html#APP-PSQL-PROMPTING-X
+      - title: PostgreSQL · Error Codes
+        url: https://www.postgresql.org/docs/current/errcodes-appendix.html#ERRCODES-TABLE
+
+  - id: transaktionen-in-python
+    type: gap
+    title: Transaktionsgrenzen in psycopg und SQLAlchemy
+    prompt: |
+      Ergänze beide Funktionen. `checkins_importieren` arbeitet mit einer Autocommit-Verbindung und schreibt alle Check-ins einer Datei in **einer** Transaktion. `buchen` legt die Buchung an und löst einen Gutschein ein. Ist der Gutschein ungültig, wird **nur die Einlösung** zurückgenommen, die Buchung bleibt und wird committet.
+    lang: python
+    code: |
+      import psycopg
+      from sqlalchemy.orm import Session
+
+      def checkins_importieren(dsn, zeilen):
+          with psycopg.connect(dsn, ⟦autocommit=True⟧) as conn:
+              with ⟦conn.transaction()⟧:
+                  for zeile in zeilen:
+                      conn.execute(
+                          "INSERT INTO checkins (mitglied_id, standort_id, zeitpunkt) VALUES (%s, %s, %s)",
+                          zeile,
+                      )
+
+      def buchen(engine, anfrage, gutschein_code):
+          with Session(engine) as session, ⟦session.begin()⟧:
+              buchung = Buchung(**anfrage)
+              session.add(buchung)
+              try:
+                  with ⟦session.begin_nested()⟧:
+                      gutschein_einloesen(session, buchung, gutschein_code)
+              except GutscheinUngueltig:
+                  buchung.gutschein = None
+    gaps:
+      - label: Verbindungsmodus
+        hint: Ein Schlüsselwortargument von `connect`, damit nicht schon das erste `execute` still eine Transaktion öffnet.
+      - label: Transaktionsblock in psycopg
+        hint: Eine Methode der Verbindung, die als Kontextmanager `BEGIN` und `COMMIT` sendet.
+      - label: Transaktion der Session
+        hint: Der Block committet am Ende und rollt bei einer Exception zurück.
+      - label: Savepoint in SQLAlchemy
+        hint: Eine Methode der Session, die `SAVEPOINT` sendet.
+    explanation: |
+      Mit `autocommit=True` öffnet psycopg keine Transaktion von selbst. `conn.transaction()` setzt die Grenze dann genau um den Import: `BEGIN` beim Eintritt, `COMMIT` am Ende, `ROLLBACK` bei einer Exception. Ohne Autocommit öffnet jedes `execute` still eine Transaktion. Läuft vor dem Block eine Abfrage, etwa ein `SELECT` zur Kontrolle, setzt `conn.transaction()` darin nur einen Savepoint, und das `COMMIT` hängt wieder an dir. In SQLAlchemy macht `session.begin()` den Request zur Transaktion. `session.begin_nested()` setzt einen Savepoint: Wirft `gutschein_einloesen` eine Exception, rollt SQLAlchemy nur bis dorthin zurück, und die äußere Transaktion mit der Buchung bleibt intakt.
+    resources:
+      - title: psycopg 3 · Transaction contexts
+        url: https://www.psycopg.org/psycopg3/docs/basic/transactions.html#transaction-contexts
+      - title: SQLAlchemy 2.1 · Using SAVEPOINT
+        url: https://docs.sqlalchemy.org/en/21/orm/session_transaction.html#using-savepoint
+
+  - id: rechnungsnummer-ohne-luecke
+    type: sql
+    lang: postgres
+    title: Die nächste Rechnungsnummer
+    prompt: |
+      Rechnungsnummern müssen je Jahr lückenlos fortlaufen. Bisher holt die App sie mit `nextval('rechnungsnummer_seq')`, und nach einem abgebrochenen Rechnungslauf heute Morgen fehlt eine Nummer. Ab jetzt führt die Tabelle `nummernkreise` den Zähler: `letzte_nummer` ist die zuletzt vergebene Nummer des Jahres.
+
+      Schreibe **eine** Anweisung, die die nächste Nummer für 2026 vergibt (den Zähler also dauerhaft weiterzählt) und sie zurückgibt. Spalte: `nummer`.
+    schema: |
+      CREATE SEQUENCE rechnungsnummer_seq;
+      SELECT setval('rechnungsnummer_seq', 41);
+      CREATE TABLE nummernkreise (
+        jahr          int PRIMARY KEY,
+        letzte_nummer int NOT NULL
+      );
+      INSERT INTO nummernkreise VALUES (2025, 388), (2026, 41);
+
+      -- Der abgebrochene Rechnungslauf von heute Morgen
+      BEGIN;
+      SELECT nextval('rechnungsnummer_seq');
+      UPDATE nummernkreise SET letzte_nummer = letzte_nummer + 1 WHERE jahr = 2026;
+      ROLLBACK;
+    starter: |
+      SELECT nextval('rechnungsnummer_seq') AS nummer;
+    solution: |
+      UPDATE nummernkreise
+      SET letzte_nummer = letzte_nummer + 1
+      WHERE jahr = 2026
+      RETURNING letzte_nummer AS nummer;
+    hints:
+      - Die Sequenz hat die 42 schon im abgebrochenen Lauf vergeben. Was ist mit dem Zähler in `nummernkreise` passiert?
+      - Ein `UPDATE` kann den neuen Wert mit `RETURNING` zurückgeben.
+      - "`UPDATE nummernkreise SET letzte_nummer = … WHERE jahr = 2026 RETURNING …` – denk an den Spaltennamen `nummer`."
+    explanation: |
+      Der abgebrochene Lauf hat aus der Sequenz die 42 geholt. `nextval` wird nicht zurückgerollt, die Startabfrage liefert also 43, und die 42 fehlt für immer. Das `UPDATE` auf `nummernkreise` wurde dagegen mit zurückgerollt, der Zähler steht weiter bei 41. Das `UPDATE … RETURNING` zählt hoch und liefert die 42 in einer Anweisung. Weil das `UPDATE` die Zeile sperrt, wartet eine zweite Rechnung bis zum Commit der ersten und bekommt dann die 43. Lückenlosigkeit kostet also Parallelität. Läuft das `UPDATE` in der Transaktion, die auch die Rechnung schreibt, verschwindet die Nummer bei einem Rollback mit der Rechnung.
+    resources:
+      - title: PostgreSQL · Sequence Functions
+        url: https://www.postgresql.org/docs/current/functions-sequence.html#FUNCTIONS-SEQUENCE
+      - title: PostgreSQL · UPDATE (RETURNING)
+        url: https://www.postgresql.org/docs/current/sql-update.html
+
+  - id: rabatt-mit-savepoint
+    type: sql
+    lang: postgres
+    title: Den Rabatt zurücknehmen, die Buchung behalten
+    prompt: |
+      Das Skript legt eine neue Buchung an und probiert dann 20 % Frühjahrsrabatt auf alle Buchungen ab dem 1. März aus. Die Stichprobe zeigt: Der Rabatt ist falsch kalkuliert. Ändere das Skript so, dass **nur der Rabatt** zurückgenommen wird, die neue Buchung erhalten bleibt und die Transaktion am Ende **committet** ist.
+
+      Geprüft werden alle Buchungen mit `id` und `preis` und ob danach noch eine Transaktion mit Änderungen offen ist (`abgeschlossen`).
+    schema: |
+      CREATE TABLE buchungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        raum_id     int NOT NULL,
+        mitglied_id int NOT NULL,
+        beginn      timestamptz NOT NULL,
+        ende        timestamptz NOT NULL,
+        preis       numeric(8,2) NOT NULL
+      );
+      INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, preis) VALUES
+        (1, 1, '2026-02-24 09:00', '2026-02-24 11:00', 48.00),
+        (2, 2, '2026-03-03 10:00', '2026-03-03 12:00', 36.00),
+        (4, 1, '2026-03-05 14:00', '2026-03-05 14:30', 3.00);
+    starter: |
+      BEGIN;
+      INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, preis)
+      VALUES (2, 3, '2026-03-12 14:00', '2026-03-12 16:00', 36.00);
+      UPDATE buchungen SET preis = preis * 0.8 WHERE beginn >= '2026-03-01';
+      SELECT id, preis FROM buchungen ORDER BY id;
+      -- Rabatt falsch: zurücknehmen, Buchung behalten
+      COMMIT;
+    solution: |
+      BEGIN;
+      INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, preis)
+      VALUES (2, 3, '2026-03-12 14:00', '2026-03-12 16:00', 36.00);
+      SAVEPOINT vor_rabatt;
+      UPDATE buchungen SET preis = preis * 0.8 WHERE beginn >= '2026-03-01';
+      SELECT id, preis FROM buchungen ORDER BY id;
+      ROLLBACK TO SAVEPOINT vor_rabatt;
+      COMMIT;
+    check: |
+      SELECT id, preis, pg_current_xact_id_if_assigned() IS NULL AS abgeschlossen
+      FROM buchungen
+      ORDER BY id;
+    hints:
+      - Du brauchst eine Markierung zwischen dem `INSERT` und dem `UPDATE`.
+      - "`ROLLBACK` ohne Zusatz beendet die ganze Transaktion. Es gibt eine Form, die nur bis zu einer Markierung zurückspringt."
+      - "`SAVEPOINT vor_rabatt;` vor das `UPDATE`, `ROLLBACK TO SAVEPOINT vor_rabatt;` vor das `COMMIT`."
+    explanation: |
+      Der Savepoint zwischen `INSERT` und `UPDATE` trennt, was bleiben soll, von dem, was zurück soll. `ROLLBACK TO SAVEPOINT vor_rabatt` stellt die alten Preise wieder her und lässt die Transaktion offen, `COMMIT` schreibt danach die neue Buchung fest. Ein `ROLLBACK` ohne `TO` hätte auch die Buchung verworfen. Fehlt das `COMMIT`, sieht die Prüfabfrage zwar die richtigen Preise, aber nur, weil sie in derselben offenen Transaktion läuft. `abgeschlossen` ist dann `f`: `pg_current_xact_id_if_assigned()` liefert nur eine Transaktionsnummer, solange eine Transaktion mit Änderungen offen ist.
+    resources:
+      - title: PostgreSQL · SAVEPOINT
+        url: https://www.postgresql.org/docs/current/sql-savepoint.html#SQL-SAVEPOINT
+      - title: PostgreSQL · Transaction ID and Snapshot Information Functions
+        url: https://www.postgresql.org/docs/current/functions-info.html#FUNCTIONS-PG-SNAPSHOT
+
+  - id: haengende-transaktionen
+    type: sql
+    lang: postgres
+    title: Wer hält die Transaktion offen?
+    prompt: |
+      Seit 9:45 Uhr häufen sich Timeouts beim Buchen. Das Betriebsteam hat um 10:00 Uhr eine Momentaufnahme von `pg_stat_activity` in die Tabelle `aktivitaet` kopiert. Finde alle Sitzungen, die **untätig in einer offenen Transaktion** warten (dazu gehört auch der Zustand nach einem Fehler) und deren Transaktion zum Zeitpunkt der Aufnahme **seit mehr als 5 Minuten** offen ist.
+
+      Spalten: `pid`, `application_name` und `offen_seit` (Dauer der Transaktion bis `2026-03-02 10:00:00+01` als `interval`). Sortierung: am längsten offen zuerst.
+    schema: |
+      CREATE TABLE aktivitaet (
+        pid              int PRIMARY KEY,
+        application_name text NOT NULL,
+        state            text,
+        xact_start       timestamptz,
+        state_change     timestamptz,
+        query            text
+      );
+      INSERT INTO aktivitaet VALUES
+        (4101, 'deskwerk-api',   'active',                        '2026-03-02 09:59:58+01', '2026-03-02 09:59:58+01', 'SELECT b.id, r.name FROM buchungen AS b JOIN raeume AS r …'),
+        (4102, 'deskwerk-api',   'idle in transaction',           '2026-03-02 09:41:12+01', '2026-03-02 09:41:13+01', 'UPDATE raeume SET preis_pro_stunde = 26.00 WHERE id = 2'),
+        (4103, 'deskwerk-api',   'idle',                          NULL,                     '2026-03-02 09:58:00+01', 'COMMIT'),
+        (4104, 'abrechnung',     'idle in transaction',           '2026-03-02 09:57:30+01', '2026-03-02 09:57:31+01', 'SELECT sum(preis) FROM buchungen WHERE …'),
+        (4105, 'deskwerk-admin', 'idle in transaction (aborted)', '2026-03-02 08:12:00+01', '2026-03-02 08:12:05+01', 'INSERT INTO raeume (standort_id, name, art, plaetze) …'),
+        (4106, 'deskwerk-api',   'active',                        '2026-03-02 09:52:00+01', '2026-03-02 09:52:00+01', 'UPDATE raeume SET plaetze = 10 WHERE id = 2'),
+        (4107, 'psql',           'idle in transaction',           '2026-03-02 07:30:00+01', '2026-03-02 09:59:00+01', 'SELECT count(*) FROM checkins'),
+        (4108, 'deskwerk-worker', 'idle',                         NULL,                     '2026-03-02 09:30:00+01', 'LISTEN jobs');
+    starter: |
+      SELECT pid, application_name, state, xact_start
+      FROM aktivitaet
+      WHERE state = 'idle in transaction';
+    solution: |
+      SELECT pid,
+             application_name,
+             timestamptz '2026-03-02 10:00:00+01' - xact_start AS offen_seit
+      FROM aktivitaet
+      WHERE state IN ('idle in transaction', 'idle in transaction (aborted)')
+        AND xact_start < timestamptz '2026-03-02 10:00:00+01' - interval '5 minutes'
+      ORDER BY offen_seit DESC;
+    ordered: true
+    hints:
+      - Nach einem Fehler heißt der Zustand `idle in transaction (aborted)`.
+      - "`xact_start` ist der Beginn der Transaktion, `state_change` nur der letzte Wechsel des Zustands. Gefragt ist die Dauer der Transaktion."
+      - "`timestamptz '2026-03-02 10:00:00+01' - xact_start AS offen_seit`, gefiltert mit `> interval '5 minutes'`, sortiert mit `DESC`."
+    explanation: |
+      Untätig in einer Transaktion sind die Zustände `idle in transaction` und `idle in transaction (aborted)`. Wer nur auf den ersten filtert, übersieht die Admin-Sitzung, die seit 8:12 Uhr nach einem Fehler hängt. Die psql-Sitzung 4107 hat erst um 9:59 Uhr ihre letzte Abfrage geschickt, ihre Transaktion läuft aber seit 7:30 Uhr. Für Sperren und `VACUUM` zählt die Dauer der Transaktion, deshalb `xact_start` und nicht `state_change`. Sitzung 4106 ist `active`: Sie wartet vermutlich auf die Sperre, die 4102 seit 9:41 Uhr auf Raum 2 hält, und ist ein Opfer, kein Verursacher. Ergebnis: 4107 (2:30 Stunden), 4105 (1:48 Stunden), 4102 (18:48 Minuten).
+    wiki: |
+      `pg_stat_activity` zeigt eine Zeile je Serverprozess. `state` ist unter anderem `active` (führt gerade eine Anweisung aus), `idle` (wartet ohne Transaktion), `idle in transaction` und `idle in transaction (aborted)`. `xact_start` ist der Beginn der aktuellen Transaktion, `NULL` ohne Transaktion. `query` zeigt bei untätigen Sitzungen die zuletzt ausgeführte Anweisung.
+    resources:
+      - title: PostgreSQL · pg_stat_activity
+        url: https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-ACTIVITY-VIEW
+      - title: PostgreSQL · idle_in_transaction_session_timeout
+        url: https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-IDLE-IN-TRANSACTION-SESSION-TIMEOUT
+
+  - id: rollback-statt-rollback-to
+    type: bug
+    title: Die Buchung vom 9. März fehlt
+    prompt: |
+      Das Skript soll eine Buchung anlegen, einen Rabatt von 50 % testen, ihn verwerfen und stattdessen 10 % geben. Nach dem Lauf fehlt die neue Buchung vom 9. März. Die **ältere** Buchung von Mitglied 4 hat trotzdem 10 % Rabatt bekommen, und psql meldet beim `COMMIT`: `WARNING:  there is no transaction in progress`. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: postgres
+    code: |
+      BEGIN;
+      INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, preis)
+      VALUES (1, 4, '2026-03-09 09:00', '2026-03-09 13:00', 96.00);
+      SAVEPOINT vor_rabatt;
+      UPDATE buchungen SET preis = preis * 0.5 WHERE mitglied_id = 4;
+      SELECT id, preis FROM buchungen WHERE mitglied_id = 4;
+      ROLLBACK;
+      UPDATE buchungen SET preis = preis * 0.9 WHERE mitglied_id = 4;
+      COMMIT;
+    lines: [7]
+    fix:
+      - line: 7
+        answers:
+          - ROLLBACK TO SAVEPOINT vor_rabatt;
+          - ROLLBACK TO vor_rabatt;
+          - ROLLBACK TRANSACTION TO SAVEPOINT vor_rabatt;
+          - ROLLBACK WORK TO SAVEPOINT vor_rabatt;
+          - ROLLBACK TRANSACTION TO vor_rabatt;
+          - ROLLBACK WORK TO vor_rabatt;
+    hints:
+      - Welche Transaktion ist nach Zeile 7 noch offen?
+      - Die Warnung beim `COMMIT` sagt, dass es zu diesem Zeitpunkt keine Transaktion mehr gab.
+    explanation: |
+      Ein `ROLLBACK` ohne `TO` beendet die ganze Transaktion: Die neue Buchung und der Savepoint sind weg. Das folgende `UPDATE` läuft im Autocommit, trifft nur noch die alte Buchung von Mitglied 4 und wird sofort festgeschrieben. Das `COMMIT` findet keine Transaktion mehr und warnt. `ROLLBACK TO SAVEPOINT vor_rabatt` nimmt nur das `UPDATE` mit 50 % zurück. Die Transaktion mit der neuen Buchung läuft weiter, und das 10-%-Update trifft beide Buchungen.
+    resources:
+      - title: PostgreSQL · ROLLBACK TO SAVEPOINT
+        url: https://www.postgresql.org/docs/current/sql-rollback-to.html
+
+  - id: zahlung-in-der-transaktion
+    type: explain
+    title: Bezahlen mitten in der Transaktion
+    prompt: |
+      Im Code-Review liegt diese Funktion des Buchungsdienstes. Sie funktioniert im Test. Erkläre, welche Probleme sie unter Last und bei Störungen macht, und wie du sie umbauen würdest.
+    lang: python
+    code: |
+      def buchen_und_bezahlen(engine, anfrage):
+          with Session(engine) as session, session.begin():
+              buchung = Buchung(**anfrage, status="bestaetigt")
+              session.add(buchung)
+              session.flush()
+              rechnung_erhoehen(session, buchung.mitglied_id, buchung.beginn, buchung.preis)
+              zahlung = zahlungsanbieter.belasten(       # HTTP, 0,3 bis 30 Sekunden
+                  kunde=buchung.mitglied_id, betrag=buchung.preis
+              )
+              buchung.zahlungs_id = zahlung.id
+          bestaetigung_senden(buchung)
+    points:
+      - Während des HTTP-Aufrufs bleibt die Transaktion offen. Die Verbindung ist belegt, und die Rechnungszeile bleibt gesperrt, andere Buchungen desselben Mitglieds warten.
+      - Die Sitzung steht in dieser Zeit als `idle in transaction` in `pg_stat_activity`. Bei langsamen Antworten läuft der Connection-Pool leer.
+      - "Scheitert nach erfolgreicher Zahlung der Commit (oder stürzt der Prozess ab), ist das Geld abgebucht, aber die Buchung existiert nicht. Ein externer Aufruf lässt sich nicht zurückrollen."
+      - "Umbau: Buchung in einer kurzen Transaktion mit Status `ausstehend` anlegen, außerhalb der Transaktion bezahlen (mit Idempotenzschlüssel) und in einer zweiten kurzen Transaktion bestätigen."
+    explanation: |
+      Die Funktion hält eine Transaktion offen, während sie auf einen fremden Dienst wartet. Solange `belasten` läuft, gehört die Verbindung diesem Request, und das Upsert auf `rechnungen` hat die Rechnungszeile des Mitglieds gesperrt. Jede andere Buchung dieses Mitglieds wartet. Bei 30 Sekunden Antwortzeit und zwanzig Verbindungen im Pool steht der Dienst. In `pg_stat_activity` sieht man das als `idle in transaction`. Schlimmer ist der Fehlerfall: Belastet der Anbieter erfolgreich und scheitert danach der Commit, etwa an einem Constraint oder einem Neustart, ist die Zahlung durch und die Buchung zurückgerollt. Ich würde die Buchung in einer kurzen Transaktion mit Status `ausstehend` schreiben, danach ohne offene Transaktion den Anbieter rufen, mit einem Idempotenzschlüssel aus der Buchungs-ID, damit ein Retry nicht doppelt abbucht. Eine zweite kurze Transaktion setzt `bestaetigt` und die `zahlungs_id`. Ausstehende Buchungen ohne Zahlung räumt ein Job auf. Als Sicherheitsnetz setze ich `idle_in_transaction_session_timeout`.
+    resources:
+      - title: PostgreSQL · idle_in_transaction_session_timeout
+        url: https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-IDLE-IN-TRANSACTION-SESSION-TIMEOUT
+
+  - id: monatsabschluss
+    type: sql
+    lang: postgres
+    title: Der Monatsabschluss für März
+    prompt: |
+      Schreibe den Monatsabschluss für März 2026 als **eine committete Transaktion**:
+
+      1. Lege für jedes Mitglied mit mindestens einer abzurechnenden Buchung eine Rechnung an: `monat` ist `2026-03-01`, `betrag` die Summe der Preise.
+      2. Markiere genau diese Buchungen mit `abgerechnet = true`.
+
+      Abzurechnen sind Buchungen mit `status = 'bestaetigt'`, die noch nicht abgerechnet sind und im März 2026 **beginnen** (deutsche Zeit, die Sitzung läuft in `Europe/Berlin`). Geprüft werden für jede Buchung `abgerechnet` und der Betrag der März-Rechnung ihres Mitglieds sowie, ob am Ende keine Transaktion mehr offen ist.
+    schema: |
+      CREATE TABLE mitglieder (
+        id    int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        name  text NOT NULL,
+        tarif text NOT NULL DEFAULT 'flex'
+      );
+      CREATE TABLE buchungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        raum_id     int NOT NULL,
+        mitglied_id int NOT NULL REFERENCES mitglieder (id),
+        beginn      timestamptz NOT NULL,
+        ende        timestamptz NOT NULL,
+        status      text NOT NULL DEFAULT 'bestaetigt',
+        preis       numeric(8,2) NOT NULL,
+        abgerechnet boolean NOT NULL DEFAULT false,
+        CHECK (ende > beginn)
+      );
+      CREATE TABLE rechnungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        mitglied_id int NOT NULL REFERENCES mitglieder (id),
+        monat       date NOT NULL,
+        betrag      numeric(10,2) NOT NULL,
+        UNIQUE (mitglied_id, monat)
+      );
+      INSERT INTO mitglieder (name, tarif) VALUES
+        ('Jana Krüger', 'flex'), ('Murat Yıldız', 'flex'), ('Lena Hoffmann', 'fix'),
+        ('Tobias Brandt', 'flex'), ('Aylin Demir', 'team');
+      INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, status, preis, abgerechnet) VALUES
+        (1, 1, '2026-02-26 09:00', '2026-02-26 11:00', 'bestaetigt',  48.00, true),
+        (1, 1, '2026-03-02 09:00', '2026-03-02 11:00', 'bestaetigt',  48.00, false),
+        (4, 1, '2026-03-17 14:00', '2026-03-17 14:30', 'bestaetigt',   3.00, false),
+        (2, 2, '2026-03-05 10:00', '2026-03-05 12:00', 'storniert',   36.00, false),
+        (2, 2, '2026-03-31 23:30', '2026-04-01 00:30', 'bestaetigt',  18.00, false),
+        (3, 3, '2026-03-10 08:00', '2026-03-10 18:00', 'bestaetigt', 120.00, false),
+        (3, 3, '2026-04-01 00:30', '2026-04-01 02:00', 'bestaetigt',  27.00, false),
+        (2, 4, '2026-03-12 09:00', '2026-03-12 10:00', 'storniert',   18.00, false);
+      INSERT INTO rechnungen (mitglied_id, monat, betrag) VALUES (1, '2026-02-01', 48.00);
+    starter: |
+      BEGIN;
+      -- 1. Rechnungen für März anlegen
+
+      -- 2. Buchungen als abgerechnet markieren
+
+    solution: |
+      BEGIN;
+      INSERT INTO rechnungen (mitglied_id, monat, betrag)
+      SELECT mitglied_id, date '2026-03-01', sum(preis)
+      FROM buchungen
+      WHERE status = 'bestaetigt'
+        AND NOT abgerechnet
+        AND beginn >= '2026-03-01' AND beginn < '2026-04-01'
+      GROUP BY mitglied_id;
+      UPDATE buchungen
+      SET abgerechnet = true
+      WHERE status = 'bestaetigt'
+        AND NOT abgerechnet
+        AND beginn >= '2026-03-01' AND beginn < '2026-04-01';
+      COMMIT;
+    check: |
+      SELECT b.id,
+             b.abgerechnet,
+             r.betrag AS rechnung_maerz,
+             pg_current_xact_id_if_assigned() IS NULL AS abgeschlossen
+      FROM buchungen AS b
+      LEFT JOIN rechnungen AS r ON r.mitglied_id = b.mitglied_id AND r.monat = '2026-03-01'
+      ORDER BY b.id;
+    ordered: true
+    hints:
+      - Das `INSERT` braucht keine Schleife. `INSERT INTO rechnungen (…) SELECT … GROUP BY mitglied_id` legt alle Rechnungen in einer Anweisung an.
+      - "Halboffenes Intervall: `beginn >= '2026-03-01' AND beginn < '2026-04-01'`. Die Literale gelten in der Zeitzone der Sitzung, also deutscher Zeit."
+      - Das `UPDATE` braucht dieselbe Bedingung wie das `INSERT`, sonst markierst du andere Buchungen, als du abrechnest. Am Ende `COMMIT`.
+    explanation: |
+      Beide Schritte gehören in eine Transaktion: Scheitert das `UPDATE`, darf keine Rechnung übrig bleiben, sonst rechnet der nächste Lauf dieselben Buchungen noch einmal ab. Das `INSERT … SELECT` legt alle Rechnungen in einer Anweisung an, das `UPDATE` markiert dieselbe Menge. Die Fallen: Buchung 1 ist schon im Februar abgerechnet, die stornierten Buchungen 4 und 8 zählen nicht, Buchung 5 beginnt am 31. März um 23:30 Uhr deutscher Zeit und gehört in den März, Buchung 7 beginnt am 1. April um 0:30 Uhr und nicht. Tobias Brandt hat nur eine Stornierung und bekommt keine Rechnung. Ergebnis: Jana Krüger 51.00, Murat Yıldız 18.00, Lena Hoffmann 120.00. Die Prüfung sieht nur das Ergebnis und ob die Transaktion committet ist. Ob beide Schritte in derselben Transaktion lagen, kann sie nicht erkennen – das gehört in dein Code-Review.
+    resources:
+      - title: PostgreSQL · INSERT (mit SELECT)
+        url: https://www.postgresql.org/docs/current/sql-insert.html
+      - title: PostgreSQL · Tutorial – Transactions
+        url: https://www.postgresql.org/docs/current/tutorial-transactions.html#TUTORIAL-TRANSACTIONS

@@ -1,6 +1,6 @@
 # learn.kiumu.app
 
-Private Lernplattform für Kotlin & Android, Rust, Linux, Python, Automation mit Python, Git, Data Analysis mit Excel, SQL und Python sowie Testing & Softwarequalität. Live: [learn.kiumu.app](https://learn.kiumu.app) · Privates Repository: [hernstev97/learning-platform](https://github.com/hernstev97/learning-platform)
+Private Lernplattform für Kotlin & Android, Rust, Linux, Python, Automation mit Python, Git, Data Analysis mit Excel, SQL und Python, Testing & Softwarequalität sowie SQL & PostgreSQL für Anwendungsentwickler. Live: [learn.kiumu.app](https://learn.kiumu.app) · Privates Repository: [hernstev97/learning-platform](https://github.com/hernstev97/learning-platform)
 
 Die Plattform ist kein Nachschlagewerk. Jedes Modul besteht aus einer Lektion, die ein Denkmodell aufbaut und auf die offizielle Dokumentation verweist, und aus 10–14 Übungen in fester Reihenfolge: verstehen → vorhersagen → schreiben → Fehler finden → erklären → anwenden. Jeder Bereich hat Interview-Karteikarten mit Wiederholung, Projekte und ein Abschlussprojekt, das wie eine Take-Home-Aufgabe im Bewerbungsprozess geschnitten ist.
 
@@ -20,15 +20,17 @@ pnpm dev            # http://127.0.0.1:5180
 | Befehl | Zweck |
 | --- | --- |
 | `pnpm content:check [bereich[/modul]]` | Inhalte validieren (Pflichtfelder, IDs, Lücken, Richtwerte) |
-| `pnpm verify [bereich[/modul]]` | Python-Übungen und -Beispiele ausführen (auch pandas, pytest und Hypothesis), SQL mit der SQLite des Browsers prüfen, Rust kompilieren, TypeScript-Ausgaben mit Node prüfen, Ausgaben vergleichen, Git-Labore durchspielen |
+| `pnpm verify [bereich[/modul]]` | Python-Übungen und -Beispiele ausführen (auch pandas, pytest und Hypothesis), SQL mit der SQLite und dem PostgreSQL des Browsers prüfen, Rust kompilieren, TypeScript-Ausgaben mit Node prüfen, Ausgaben vergleichen, Git-Labore durchspielen |
 | `pnpm links [bereich]` | Alle externen Links und Anker prüfen |
 | `pnpm test` | Unit-Tests (Prüflogik, Speicher, Bear-Rekonstruktion, Inhalte) |
 | `pnpm lint`, `pnpm typecheck` | ESLint und strikte TypeScript-Prüfung einschließlich Backend |
 | `pnpm test:convex:e2e` | Echte lokale Convex-Verbindung und mehrere Browsersitzungen; Setup in docs/CONVEX.md |
-| `pnpm test:e2e` | Browser-Tests aller Lernbereiche, elf Übungsarten, Python-, pytest- und SQL-Laufzeit, Linux-VM in Übung und Lektion, Lernstand und Bear-Track |
+| `pnpm test:e2e` | Browser-Tests aller Lernbereiche, elf Übungsarten, Python-, pytest-, SQLite- und PostgreSQL-Laufzeit, Linux-VM in Übung und Lektion, Lernstand und Bear-Track |
 | `pnpm test:pwa:e2e` | Produktionsbuild mit Service Worker: Installierbarkeit und Offline-Lesen |
 | `pnpm build` | TypeScript prüfen und statisch nach `dist/` bauen |
 | `pnpm bear:build`, `pnpm bear:check` | Bear-Track aus dem gepinnten Snapshot erzeugen bzw. prüfen |
+| `pnpm pg:run datei.sql` | SQL in einem frischen PostgreSQL wie im Browser ausführen (`-e 'SELECT …'`, `--tuples` für erwartete Ausgaben) |
+| `pnpm pg:try bereich/modul/übung datei.sql` | Eine Antwort gegen eine PostgreSQL-Übung prüfen, mit demselben Urteil wie im Browser |
 | `pnpm screenshots /pfad@390 …` | Screenshots gegen den laufenden Dev-Server |
 
 `CONTENT_LENIENT=1 pnpm dev` überspringt ungültige oder fehlende Module statt abzubrechen – praktisch, während man an Inhalten schreibt. Der Produktionsbuild ist immer strikt.
@@ -42,6 +44,7 @@ tooling/content.ts         Lädt, validiert und normalisiert alle Inhalte (Build
 tooling/markdown.ts        Markdown → HTML zur Build-Zeit (Callouts, Codeblöcke, Inhaltsverzeichnis)
 tooling/search-index.ts    Suchindex zur Build-Zeit (Klartext je Modul, Abschnitt, Begriff, Projekt und Karte)
 tooling/vite-plugins.ts    Inhalte als virtuelle Module (ein Chunk pro Bereich), Pyodide und Linux-VM selbst gehostet
+tooling/pg-*.ts            PostgreSQL unter Node: Tabellenvorschau beim Build (zwischengespeichert), pnpm pg:run
 tooling/vm/                Debian-Image samt GRUB-Bootplatte bauen (pnpm vm:build), Szenarien und vm-Blöcke darin prüfen (pnpm vm:verify), Skripte ausprobieren (pnpm vm:run)
 tooling/verify-code.ts     Führt Musterlösungen und Beispiele aus
 tooling/fixtures/          Beispielbereich mit jeder Übungsart (Tests, Vorlage)
@@ -55,6 +58,7 @@ src/exercises/             Die elf Übungsarten
 src/ui/search.ts           Suchdialog mit Tastaturbedienung
 src/pages/                 Startseite, Bereich, Lektion, Übung, Karten, Wiederholen, Projekte, Nachschlageseiten, Daten
 src/python/                Pyodide-Worker und Harness für Python, pytest und SQLite (dieselbe Harness nutzt pnpm verify), Liste der Test-Pakete
+src/pg/                    PostgreSQL 18 (PGlite) im Worker: frische Datenbank je Lauf, Ausgabe wie psql (dieselbe Engine nutzen pnpm verify und der Build)
 src/vm/                    Linux-VM im Browser (v86): Laden, Snapshot, Steuerkanal, Prüfungen, Terminal in Übungen und Lektionen
 vendor/pyodide/            Zusätzliche Pyodide-Pakete (tzdata, beautifulsoup4, PyYAML, pandas mit numpy, pytest, Hypothesis)
 vendor/vm/                 Gebautes Debian-Image samt Snapshot für die Linux-VM
@@ -81,6 +85,7 @@ Das Design (hell oder dunkel) folgt der Systemeinstellung, bis es über den Scha
 - **Selbst geschriebene Tests:** laufen mit echtem pytest 9.0 (und Hypothesis 6.168) im Browser, gegen die richtige Implementierung und gegen fehlerhafte Varianten. Gelöst ist die Übung, wenn die Tests die richtige Fassung bestehen und jede fehlerhafte rot werden lassen. Lektionsblöcke mit `python pytest` zeigen den echten Bericht von pytest.
 - **Linux-Szenarien:** ein echtes Debian 12 mit systemd läuft in v86 (x86-Emulator in WebAssembly), ohne Netzwerk. Es bootet über GRUB von einer emulierten Platte, `sudo reboot` startet also wirklich neu. Geprüft wird der Zustand der VM mit Shell-Befehlen, nicht der Weg dorthin. Dieselbe VM steht in Linux-Lektionen als Terminal bereit: Beispiele mit „Im Terminal“ laufen dort, `pnpm vm:verify` führt sie vorher aus.
 - **SQL-Abfragen:** laufen wirklich – SQLite 3.39 in Pyodide, gegen eine frische Datenbank je Lauf. Verglichen wird das Ergebnis mit dem der Musterlösung (Spalten, Werte, bei Bedarf Reihenfolge), nicht der Text der Abfrage.
+- **PostgreSQL:** ein echtes PostgreSQL 18 (PGlite, WebAssembly) im Worker, einmalig rund 5 MB. Abfragen werden wie bei SQLite über ihr Ergebnis geprüft. Für DDL, Datenänderungen und Transaktionen läuft nach den Anweisungen des Lernenden eine Prüfabfrage, deren Ergebnis mit dem nach der Musterlösung verglichen wird; Constraints werden über ihr Verhalten geprüft, nicht über Namen. Grenze: eine einzige Sitzung, Sperrkonflikte zwischen zwei Transaktionen lassen sich nicht ausführen.
 - **Excel-Formeln und Power Query:** tokenweiser Vergleich wie bei Lückencode; deutsche und englische Funktionsnamen und `;`/`,` gelten als gleich. Excel selbst läuft nicht.
 - **Ausgabe vorhersagen:** zeilenweiser Vergleich; die erwarteten Ausgaben stammen aus echten Läufen (`pnpm verify`).
 - **Praxis- und Erklär-Übungen:** Selbstkontrolle über Checklisten; Rust-Entwürfe lassen sich im offiziellen Playground ausführen.

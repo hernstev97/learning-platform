@@ -1,0 +1,922 @@
+id: isolation-sperren
+title: Isolation und Sperren
+level: 3
+minutes: 180
+summary: Was gleichzeitige Transaktionen voneinander sehen und wie du Lost Updates, Write Skew und Deadlocks verhinderst – mit MVCC, Isolationsstufen, atomaren Updates, Zeilensperren, optimistischem Locking, SKIP LOCKED und Advisory Locks.
+goals:
+  - Du erklärst MVCC mit `xmin` und `xmax` und begründest, warum Leser in PostgreSQL keine Schreiber blockieren.
+  - Du sagst für Read Committed, Repeatable Read und Serializable vorher, was eine Transaktion von gleichzeitigen Änderungen sieht und welche Fehler die Anwendung behandeln muss.
+  - Du erkennst Lost Updates in Read-Modify-Write-Code und behebst sie mit atomaren Updates, `SELECT … FOR UPDATE` oder einer `version`-Spalte.
+  - Du verhinderst Write Skew wie Doppelbuchungen mit Constraints, Sperren auf einer Elternzeile oder Serializable mit Wiederholung bei SQLSTATE 40001.
+  - Du baust Job-Warteschlangen mit `FOR UPDATE SKIP LOCKED`, setzt Advisory Locks und `lock_timeout` gezielt ein und vermeidest Deadlocks durch eine feste Sperrreihenfolge.
+resources:
+  - title: PostgreSQL · Transaction Isolation
+    url: https://www.postgresql.org/docs/current/transaction-iso.html#TRANSACTION-ISO
+  - title: PostgreSQL · Explicit Locking
+    url: https://www.postgresql.org/docs/current/explicit-locking.html#EXPLICIT-LOCKING
+  - title: PostgreSQL · SELECT – The Locking Clause
+    url: https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE
+  - title: PostgreSQL · Serialization Failure Handling
+    url: https://www.postgresql.org/docs/current/mvcc-serialization-failure-handling.html#MVCC-SERIALIZATION-FAILURE-HANDLING
+lesson: |
+  Freitag, 9:00 Uhr: Jana Krüger bucht am Handy eine Telefonbox für 12 Euro, gleichzeitig zieht der Abrechnungsdienst 20 Euro Monatspauschale von ihrem Prepaid-Guthaben ab. Beide Vorgänge lesen 50 Euro, rechnen und schreiben zurück. Am Ende stehen 30 Euro auf dem Konto statt 18. Kein Fehler im Log, kein Test schlägt fehl, denn jeder Test läuft allein. Das ist ein **Lost Update**, und er ist der häufigste Nebenläufigkeitsfehler in Webanwendungen.
+
+  [Transaktionen](/postgres/transaktionen) machen mehrere Änderungen atomar. Dieses Modul behandelt das „I“ aus ACID: Was sieht eine Transaktion von anderen, die zur selben Zeit laufen, und wie verhindert man, dass sie sich gegenseitig Änderungen überschreiben?
+
+  > [!NOTE] Eine Sitzung im Browser, zwei Fenster auf deinem Rechner
+  > Das PostgreSQL im Browser hat genau **eine** Sitzung. Alles, was eine Transaktion allein zeigt – `xmin`, Isolationsstufen, `FOR UPDATE`, Advisory Locks –, kannst du hier ausführen. Warten auf Sperren, Deadlocks und Serialisierungsfehler brauchen zwei gleichzeitige Sitzungen. Sie stehen deshalb als Zeitleiste da: `A>` und `B>` sind zwei psql-Fenster, die Ergebnisse stammen aus echten Läufen gegen PostgreSQL 18 und sind auf die Werte gekürzt. Zum Nachspielen startest du `docker run --name deskwerk-pg -e POSTGRES_PASSWORD=geheim -d postgres:18` und öffnest in zwei Terminals `docker exec -it deskwerk-pg psql -U postgres`. Mit `\set PROMPT1 'A %/%R%x%# '` beschriftest du die Fenster.
+
+  ## MVCC: Jede Änderung schreibt eine neue Zeilenversion
+
+  PostgreSQL überschreibt bei einem `UPDATE` keine Zeile. Es schreibt eine **neue Version** und markiert die alte als ungültig. Dieses Verfahren heißt Multiversion Concurrency Control, kurz **MVCC** ([MVCC Introduction](https://www.postgresql.org/docs/current/mvcc-intro.html#MVCC-INTRO)). Zwei versteckte Systemspalten machen es sichtbar: `xmin` ist die Nummer der Transaktion, die die Version geschrieben hat, `xmax` die der Transaktion, die sie gelöscht oder ersetzt hat, sonst `0` ([System Columns](https://www.postgresql.org/docs/current/ddl-system-columns.html#DDL-SYSTEM-COLUMNS-XMIN)). `ctid` ist die physische Position der Version in der Tabelle.
+
+  ```postgres run
+  CREATE TABLE raeume (
+    id               int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name             text NOT NULL,
+    preis_pro_stunde numeric(8,2) NOT NULL
+  );
+  INSERT INTO raeume (name, preis_pro_stunde) VALUES ('Atelier', 18.00), ('Loft', 24.00);
+  SELECT ctid, xmin, xmax, id, name, preis_pro_stunde FROM raeume;
+
+  BEGIN;
+  UPDATE raeume SET preis_pro_stunde = 28.00 WHERE id = 2;
+  SELECT ctid, xmin, xmax, id, name, preis_pro_stunde FROM raeume;
+  ROLLBACK;
+
+  SELECT ctid, xmin, xmax, id, name, preis_pro_stunde FROM raeume;
+  ```
+
+  Die Transaktionsnummern sind bei dir vielleicht andere, das Muster ist dasselbe. Nach dem `UPDATE` sieht die Transaktion eine neue Version des Lofts an Position `(0,3)` mit ihrer eigenen Nummer in `xmin`. Nach dem `ROLLBACK` ist wieder die alte Version an `(0,2)` sichtbar – mit gesetztem `xmax`. Die Transaktion, die sie ersetzen wollte, ist abgebrochen, deshalb gilt die alte Version weiter. Ob eine Version sichtbar ist, entscheidet PostgreSQL bei jedem Lesen anhand eines **Snapshots**: Welche Transaktionen waren beim Start des Snapshots schon committet?
+
+  Daraus folgt die wichtigste Eigenschaft von MVCC: **Leser blockieren keine Schreiber, und Schreiber blockieren keine Leser.** Ein `SELECT` liest die Version, die zu seinem Snapshot passt, und muss nicht warten. Bei normalen Lese- und Schreibzugriffen warten nur Schreiber, die *dieselbe Zeile* ändern oder sperren wollen. Die Kehrseite: Alte Versionen bleiben liegen, bis `VACUUM` sie aufräumt. Lange offene Transaktionen verhindern das (mehr in [Performance](/postgres/performance)).
+
+  ## Isolationsstufen: was eine Transaktion von anderen sieht
+
+  Der SQL-Standard definiert vier Isolationsstufen über Phänomene, die in ihnen nicht auftreten dürfen. PostgreSQL setzt drei davon um. Read Uncommitted verhält sich wie Read Committed:
+
+  | Stufe | Dirty Read | Non-repeatable Read | Phantom | Serialisierungsanomalie |
+  | --- | --- | --- | --- | --- |
+  | Read Committed (Standard) | nein | möglich | möglich | möglich |
+  | Repeatable Read | nein | nein | nein (in PostgreSQL) | möglich |
+  | Serializable | nein | nein | nein | nein |
+
+  Ein **Non-repeatable Read** liegt vor, wenn dieselbe Abfrage in einer Transaktion beim zweiten Mal einen geänderten Wert liefert. Bei einem **Phantom** kommen beim zweiten Mal Zeilen hinzu oder fallen weg. Der entscheidende Unterschied liegt im Snapshot. In **Read Committed** bekommt jede *Anweisung* einen neuen Snapshot ([Transaction Isolation · Read Committed](https://www.postgresql.org/docs/current/transaction-iso.html#XACT-READ-COMMITTED)). In **Repeatable Read** gilt ein Snapshot für die ganze *Transaktion*, genommen bei ihrer ersten Abfrage oder Datenänderung, nicht schon bei `BEGIN` ([Repeatable Read](https://www.postgresql.org/docs/current/transaction-iso.html#XACT-REPEATABLE-READ)). Das Loft kostet am Anfang 24.00:
+
+  ```text
+  A> BEGIN;                                                   -- Read Committed
+  A> SELECT preis_pro_stunde FROM raeume WHERE id = 2;
+     24.00
+  B> BEGIN;
+  B> UPDATE raeume SET preis_pro_stunde = 28.00 WHERE id = 2;
+     UPDATE 1
+  A> SELECT preis_pro_stunde FROM raeume WHERE id = 2;
+     24.00                                                    -- B hat noch nicht committet, A wartet nicht
+  B> COMMIT;
+  A> SELECT preis_pro_stunde FROM raeume WHERE id = 2;
+     28.00                                                    -- neuer Snapshot: Non-repeatable Read
+  A> COMMIT;
+  A> BEGIN ISOLATION LEVEL REPEATABLE READ;
+  A> SELECT preis_pro_stunde FROM raeume WHERE id = 2;
+     28.00
+  B> UPDATE raeume SET preis_pro_stunde = 30.00 WHERE id = 2;  -- Autocommit
+     UPDATE 1
+  A> SELECT preis_pro_stunde FROM raeume WHERE id = 2;
+     28.00                                                    -- A sieht weiter seinen Snapshot
+  A> COMMIT;
+  ```
+
+  Die Stufe setzt du bei `BEGIN` oder mit `SET TRANSACTION` als erste Anweisung der Transaktion ([SET TRANSACTION](https://www.postgresql.org/docs/current/sql-set-transaction.html#SQL-SET-TRANSACTION)). Kommt `SET TRANSACTION` nach einer Abfrage, antwortet PostgreSQL mit `SET TRANSACTION ISOLATION LEVEL must be called before any query`.
+
+  ```postgres run
+  SHOW transaction_isolation;
+
+  BEGIN ISOLATION LEVEL REPEATABLE READ;
+  SHOW transaction_isolation;
+  COMMIT;
+
+  BEGIN;
+  SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+  SELECT current_setting('transaction_isolation') AS stufe;
+  COMMIT;
+  ```
+
+  Eine Besonderheit von Read Committed macht vieles sicherer, als es aussieht. Trifft ein `UPDATE` auf eine Zeile, die eine andere Transaktion gerade ändert, **wartet** es auf deren Ende. Committet die andere, prüft PostgreSQL die `WHERE`-Bedingung an der *neuen* Version erneut und ändert diese. Dasselbe gilt für `DELETE` und `SELECT … FOR UPDATE`. Ein `UPDATE … SET guthaben = guthaben - 12` rechnet deshalb immer mit dem aktuellen Wert.
+
+  ## Lost Update: lesen, rechnen, zurückschreiben
+
+  Der Fehler vom Anfang entsteht, wenn die Anwendung einen Wert liest, im Code rechnet und das Ergebnis als festen Wert zurückschreibt. Ein ORM macht genau das, wenn du `mitglied.guthaben -= preis` schreibst und committest: Es schickt `UPDATE … SET guthaben = 38.00`.
+
+  ```text
+  A> BEGIN;                                                   -- Buchung über 12.00
+  B> BEGIN;                                                   -- Monatspauschale 20.00
+  A> SELECT guthaben FROM mitglieder WHERE id = 7;
+     50.00
+  B> SELECT guthaben FROM mitglieder WHERE id = 7;
+     50.00
+  A> UPDATE mitglieder SET guthaben = 38.00 WHERE id = 7;
+     UPDATE 1
+  B> UPDATE mitglieder SET guthaben = 30.00 WHERE id = 7;
+     … wartet auf A …
+  A> COMMIT;
+  B> UPDATE 1
+  B> COMMIT;
+  A> SELECT guthaben FROM mitglieder WHERE id = 7;
+     30.00                                                    -- die Buchung über 12.00 ist verloren
+  ```
+
+  B wartet zwar auf A, schreibt danach aber seinen vorher berechneten Wert. Read Committed schützt nur Anweisungen, die selbst rechnen. Vier Lösungen, je nach Fall:
+
+  **1. Atomares UPDATE.** Lass die Datenbank rechnen und prüfe die Bedingung im selben Schritt. Gleichzeitige Abbuchungen warten aufeinander und rechnen jeweils mit dem aktuellen Wert. In der Zeitleiste oben würde B nach dem Warten 18.00 schreiben.
+
+  ```postgres run
+  CREATE TABLE mitglieder (
+    id       int PRIMARY KEY,
+    name     text NOT NULL,
+    guthaben numeric(8,2) NOT NULL CHECK (guthaben >= 0)
+  );
+  INSERT INTO mitglieder VALUES (3, 'Murat Yıldız', 10.00), (7, 'Jana Krüger', 50.00);
+
+  UPDATE mitglieder SET guthaben = guthaben - 12.00
+  WHERE id = 7 AND guthaben >= 12.00
+  RETURNING id, guthaben;
+
+  UPDATE mitglieder SET guthaben = guthaben - 12.00
+  WHERE id = 3 AND guthaben >= 12.00
+  RETURNING id, guthaben;
+  ```
+
+  Die zweite Abbuchung liefert keine Zeile: Murats Guthaben reicht nicht. Die Anwendung wertet die Zahl der geänderten Zeilen aus, statt vorher zu lesen.
+
+  **2. `SELECT … FOR UPDATE`.** Muss die Anwendung zwischen Lesen und Schreiben selbst rechnen, etwa mit Tarifregeln aus Python, sperrt sie die Zeile beim Lesen ([Row-Level Locks](https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-ROWS)). Ein zweites `FOR UPDATE` wartet dann, bis die erste Transaktion endet, und liest danach den neuen Wert. Normale `SELECT`s ohne `FOR UPDATE` warten nicht.
+
+  ```text
+  A> BEGIN;
+  B> BEGIN;
+  A> SELECT guthaben FROM mitglieder WHERE id = 7 FOR UPDATE;
+     50.00
+  B> SELECT guthaben FROM mitglieder WHERE id = 7 FOR UPDATE;
+     … wartet auf A …
+  A> UPDATE mitglieder SET guthaben = 38.00 WHERE id = 7;
+  A> COMMIT;
+  B> 38.00                                                    -- B liest erst jetzt, mit dem neuen Wert
+  B> UPDATE mitglieder SET guthaben = 18.00 WHERE id = 7;
+  B> COMMIT;
+  ```
+
+  **3. Optimistisches Locking.** Bei Formularen liegen zwischen Lesen und Speichern Minuten. Eine Sperre so lange zu halten, verbietet sich. Stattdessen bekommt die Tabelle eine Spalte `version`. Das `UPDATE` verlangt die Version, die das Formular geladen hat, und erhöht sie:
+
+  ```postgres run
+  CREATE TABLE buchungen (
+    id      bigint PRIMARY KEY,
+    raum_id int NOT NULL,
+    beginn  timestamptz NOT NULL,
+    ende    timestamptz NOT NULL,
+    version int NOT NULL DEFAULT 1
+  );
+  INSERT INTO buchungen VALUES (12, 2, '2026-03-02 09:00', '2026-03-02 10:00', 3);
+
+  -- Jana Krüger und das Front Office haben beide Version 3 geladen.
+  -- Jana speichert zuerst:
+  UPDATE buchungen SET ende = '2026-03-02 10:30', version = version + 1
+  WHERE id = 12 AND version = 3
+  RETURNING id, ende, version;
+
+  -- Das Front Office speichert danach mit seiner Version 3:
+  UPDATE buchungen SET ende = '2026-03-02 11:00', version = version + 1
+  WHERE id = 12 AND version = 3
+  RETURNING id, ende, version;
+  ```
+
+  Das zweite `UPDATE` trifft keine Zeile, und die Anwendung meldet „Die Buchung wurde inzwischen geändert“ (HTTP 409). Laufen beide gleichzeitig, wartet das zweite auf das erste, prüft `version = 3` an der neuen Version und meldet `UPDATE 0`. SQLAlchemy erledigt das mit `version_id_col` und wirft `StaleDataError` ([SQLAlchemy · Configuring a Version Counter](https://docs.sqlalchemy.org/en/21/orm/versioning.html#simple-version-counting)). In Prisma schreibst du `updateMany({ where: { id, version }, data: { …, version: { increment: 1 } } })` und prüfst `count`.
+
+  **4. Repeatable Read.** Will B in Repeatable Read eine Zeile ändern, die A nach dem Start von Bs Snapshot geändert hat, wartet B wie oben auf A. Committet A, bricht PostgreSQL B ab: `ERROR:  could not serialize access due to concurrent update`. Der Lost Update ist verhindert, aber die Anwendung muss die Transaktion wiederholen.
+
+  > [!MERKE]
+  > Rechnen in der Datenbank (`SET x = x - 12`) schlägt Rechnen in der Anwendung. Wo die Anwendung rechnen muss: kurz `FOR UPDATE` sperren. Wo ein Mensch dazwischen nachdenkt: `version`-Spalte.
+
+  ## Write Skew: prüfen und einfügen in zwei Transaktionen
+
+  Tückischer ist ein Fehler, bei dem zwei Transaktionen *verschiedene* Zeilen schreiben. Das Loft ist am 2. März ab 10 Uhr frei. Zwei Mitglieder buchen gleichzeitig, die App prüft jeweils, ob sich eine Buchung überschneidet, und fügt dann ein. In Repeatable Read gehen beide Buchungen durch: Jede Transaktion sieht in ihrem Snapshot das Loft frei, und weil beide neue Zeilen schreiben, gibt es keine Zeile, um die sie konkurrieren. Diese Anomalie heißt **Write Skew**. Erst **Serializable** erkennt das Muster ([Serializable](https://www.postgresql.org/docs/current/transaction-iso.html#XACT-SERIALIZABLE)):
+
+  ```text
+  A> BEGIN ISOLATION LEVEL SERIALIZABLE;
+  B> BEGIN ISOLATION LEVEL SERIALIZABLE;
+  A> SELECT count(*) FROM buchungen WHERE raum_id = 2
+       AND beginn < '2026-03-02 12:00' AND ende > '2026-03-02 10:00';
+     0
+  B> SELECT count(*) FROM buchungen WHERE raum_id = 2
+       AND beginn < '2026-03-02 11:30' AND ende > '2026-03-02 10:30';
+     0
+  A> INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende)
+       VALUES (2, 7, '2026-03-02 10:00', '2026-03-02 12:00');
+     INSERT 0 1
+  B> INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende)
+       VALUES (2, 9, '2026-03-02 10:30', '2026-03-02 11:30');
+     INSERT 0 1
+  A> COMMIT;
+     COMMIT
+  B> COMMIT;
+     ERROR:  could not serialize access due to read/write dependencies among transactions
+     DETAIL:  Reason code: Canceled on identification as a pivot, during commit attempt.
+     HINT:  The transaction might succeed if retried.
+  ```
+
+  Serializable wartet nicht länger als Repeatable Read. Es führt Buch darüber, wer was gelesen hat, und bricht eine Transaktion ab, wenn kein serieller Ablauf zum Ergebnis passt. Der Fehler hat immer SQLSTATE `40001` (`serialization_failure`). Die Anwendung muss dann die **ganze Transaktion** wiederholen, inklusive der Prüfung ([Serialization Failure Handling](https://www.postgresql.org/docs/current/mvcc-serialization-failure-handling.html#MVCC-SERIALIZATION-FAILURE-HANDLING)). Im TypeScript-Dienst mit Prisma ORM 7 meldet sich derselbe Konflikt als Fehler `P2034` ([Prisma · Transaction timing issues](https://www.prisma.io/docs/orm/v7/prisma-client/queries/transactions#transaction-timing-issues)):
+
+  ```typescript
+  async function buchenMitWiederholung(anfrage: BuchungAnfrage, versuche = 5) {
+    for (let versuch = 1; ; versuch++) {
+      try {
+        return await prisma.$transaction(
+          async (tx) => {
+            const konflikte = await tx.buchung.count({ where: ueberschneidung(anfrage) });
+            if (konflikte > 0) throw new RaumBelegt(anfrage.raumId);
+            return tx.buchung.create({ data: anfrage });
+          },
+          { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+        );
+      } catch (fehler) {
+        const konflikt = fehler instanceof Prisma.PrismaClientKnownRequestError && fehler.code === "P2034";
+        if (!konflikt || versuch === versuche) throw fehler;
+        await new Promise((r) => setTimeout(r, 20 * 2 ** versuch)); // kurz warten, dann neu
+      }
+    }
+  }
+  ```
+
+  Serializable ist nicht die einzige Lösung, und oft nicht die beste:
+
+  - **Constraint:** Ein Exclusion Constraint über `raum_id` und `tstzrange(beginn, ende)` macht Doppelbuchungen für *jede* Sitzung unmöglich, auch für ein vergessenes Admin-Skript ([Constraints](/postgres/constraints)). Wo die Regel als Constraint ausdrückbar ist, ist das die erste Wahl.
+  - **Elternzeile sperren:** `SELECT id FROM raeume WHERE id = 2 FOR UPDATE` vor der Prüfung. Alle Buchungen desselben Raums laufen dann nacheinander, andere Räume bleiben parallel. Die zweite Transaktion wartet und sieht in Read Committed danach die erste Buchung.
+  - **Serializable mit Wiederholung:** schützt auch Regeln, die sich schlecht als Constraint schreiben lassen, etwa „höchstens zwei Meetingräume pro Team und Tag“.
+
+  > [!INTERVIEW] „Wie verhinderst du Doppelbuchungen?“
+  > „Erst prüfen, dann einfügen“ ist bei gleichzeitigen Anfragen eine Race Condition, auch in einer Transaktion, weil keine der beiden die Zeile der anderen sieht. Meine erste Wahl ist ein Exclusion Constraint auf Raum und Zeitraum, dann schützt die Datenbank die Regel für jeden Client. Geht das nicht, sperre ich die Raumzeile mit `FOR UPDATE`, sodass Buchungen pro Raum nacheinander laufen, oder nutze Serializable und wiederhole bei SQLSTATE 40001 die ganze Transaktion.
+
+  ## Sperren gezielt einsetzen: SKIP LOCKED, NOWAIT und Advisory Locks
+
+  Deskwerk erzeugt Rechnungs-PDFs und Erinnerungsmails über eine Tabelle `jobs`, die mehrere Worker abarbeiten. Mit `FOR UPDATE` allein würden alle Worker auf denselben ältesten Job warten. `SKIP LOCKED` überspringt gesperrte Zeilen und nimmt die nächste freie ([The Locking Clause](https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE)):
+
+  ```postgres run
+  CREATE TABLE jobs (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    art         text NOT NULL,
+    status      text NOT NULL DEFAULT 'offen',
+    erstellt_am timestamptz NOT NULL
+  );
+  INSERT INTO jobs (art, status, erstellt_am) VALUES
+    ('erinnerung_mail', 'erledigt', '2026-03-02 07:00'),
+    ('rechnung_pdf',    'offen',    '2026-03-02 08:00'),
+    ('rechnung_pdf',    'offen',    '2026-03-02 08:01'),
+    ('erinnerung_mail', 'offen',    '2026-03-02 08:05');
+
+  BEGIN;
+  WITH naechster AS (
+    SELECT id FROM jobs
+    WHERE status = 'offen'
+    ORDER BY erstellt_am
+    LIMIT 1
+    FOR UPDATE SKIP LOCKED
+  )
+  UPDATE jobs SET status = 'laeuft'
+  FROM naechster
+  WHERE jobs.id = naechster.id
+  RETURNING jobs.id, jobs.art;
+  COMMIT;
+
+  SELECT id, status FROM jobs ORDER BY id;
+  ```
+
+  Hält Worker A Job 2 gesperrt, bekommt Worker B mit derselben Abfrage sofort Job 3, ohne zu warten. Im echten Lauf mit zwei Sitzungen ist genau das passiert. `SKIP LOCKED` liefert bewusst eine unvollständige Sicht und taugt deshalb nur für warteschlangenartige Tabellen, nicht für Berichte.
+
+  Wer lieber sofort einen Fehler will als zu warten, schreibt `FOR UPDATE NOWAIT`: Ist die Zeile gesperrt, kommt `ERROR:  could not obtain lock on row in relation "raeume"`. In einer Transaktion begrenzt `SET LOCAL lock_timeout = '2s'` jedes einzelne Warten auf eine Sperre. Wartet eine Anweisung länger, bricht sie mit `canceling statement due to lock timeout` ab ([lock_timeout](https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-LOCK-TIMEOUT)). Beide Fehler haben SQLSTATE `55P03` (`lock_not_available`).
+
+  Neben `FOR UPDATE` gibt es drei schwächere Zeilensperren ([Row-Level Locks](https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-ROWS)). „Schlüssel“ meint hier Spalten mit einem Unique-Index, auf den ein Fremdschlüssel zeigen kann:
+
+  | Sperre | Wer sie nimmt | Blockiert |
+  | --- | --- | --- |
+  | `FOR UPDATE` | `DELETE`, `UPDATE` einer Schlüsselspalte, `SELECT … FOR UPDATE` | alle vier |
+  | `FOR NO KEY UPDATE` | jedes andere `UPDATE` | alle außer `FOR KEY SHARE` |
+  | `FOR SHARE` | `SELECT … FOR SHARE` | `FOR UPDATE`, `FOR NO KEY UPDATE` |
+  | `FOR KEY SHARE` | Fremdschlüssel-Prüfung beim Einfügen einer Buchung (auf der Raumzeile) | nur `FOR UPDATE` |
+
+  Ein gewöhnliches `UPDATE raeume SET preis_pro_stunde = …` blockiert deshalb keine neuen Buchungen für den Raum, ein `DELETE` des Raums schon. Für Anwendungscode reicht fast immer `FOR UPDATE`. Die Sperrstufen ganzer Tabellen, die bei DDL zählen, behandelt [Migrationen](/postgres/migrationen).
+
+  **Advisory Locks** sperren keine Zeile, sondern eine Zahl, deren Bedeutung die Anwendung festlegt ([Advisory Locks](https://www.postgresql.org/docs/current/explicit-locking.html#ADVISORY-LOCKS)). Der Monatsabschluss eines Standorts soll nie zweimal gleichzeitig laufen, egal auf welchem Server der Cronjob startet. Der Schlüssel `(1, 3)` steht hier für „Monatsabschluss, Standort 3“:
+
+  ```postgres run
+  BEGIN;
+  SELECT pg_try_advisory_xact_lock(1, 3) AS abschluss_zentrum;
+  SELECT locktype, classid, objid, mode, granted
+  FROM pg_locks
+  WHERE locktype = 'advisory' AND pid = pg_backend_pid();
+  COMMIT;
+
+  SELECT count(*) AS advisory_nach_commit
+  FROM pg_locks
+  WHERE locktype = 'advisory' AND pid = pg_backend_pid();
+  ```
+
+  `pg_try_advisory_xact_lock` liefert `f`, wenn eine andere Sitzung die Sperre hält, statt zu warten. Die Sperre endet mit der Transaktion. Die Varianten ohne `_xact` gelten für die ganze Sitzung und überleben sogar ein `ROLLBACK`. Sie müssen ausdrücklich mit `pg_advisory_unlock` freigegeben werden. Mit einem Connection Pool ist das gefährlich: Die Verbindung geht mit der Sperre zurück in den Pool.
+
+  ## Deadlocks: zwei Transaktionen warten aufeinander
+
+  Zwei Mitglieder eines Team-Tarifs übertragen gleichzeitig Guthaben: A von Jana (7) an Murat (3), B von Murat an Jana. Jede Transaktion sperrt zuerst ihre Quelle, dann das Ziel:
+
+  ```text
+  A> BEGIN;
+  B> BEGIN;
+  A> UPDATE mitglieder SET guthaben = guthaben - 10 WHERE id = 7;
+     UPDATE 1
+  B> UPDATE mitglieder SET guthaben = guthaben - 5 WHERE id = 3;
+     UPDATE 1
+  A> UPDATE mitglieder SET guthaben = guthaben + 10 WHERE id = 3;
+     … wartet auf B …
+  B> UPDATE mitglieder SET guthaben = guthaben + 5 WHERE id = 7;
+     … wartet auf A …
+  A> ERROR:  deadlock detected
+     DETAIL:  Process 262 waits for ShareLock on transaction 794; blocked by process 263.
+     Process 263 waits for ShareLock on transaction 793; blocked by process 262.
+     HINT:  See server log for query details.
+     CONTEXT:  while updating tuple (0,1) in relation "mitglieder"
+  B> UPDATE 1
+  ```
+
+  Keine der beiden kann weiter. Nach `deadlock_timeout` (Standard eine Sekunde) prüft PostgreSQL, ob ein Zyklus vorliegt, bricht eine der Transaktionen mit SQLSTATE `40P01` (`deadlock_detected`) ab, und die andere läuft weiter ([Deadlocks](https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-DEADLOCKS)). Welche es trifft, lässt sich nicht vorhersagen. Die Abhilfe: **Sperren immer in derselben Reihenfolge nehmen**, etwa beide Zeilen vorab mit `SELECT … WHERE id IN (3, 7) ORDER BY id FOR UPDATE`. Dann wartet B schon beim ersten Zugriff auf A, und es entsteht kein Zyklus. Wie Serialisierungsfehler sind Deadlocks ein Grund, die ganze Transaktion zu wiederholen.
+
+  > [!PRAXIS] Wer blockiert wen?
+  > Hängen Requests, ist die erste Frage im Betrieb: Wer wartet auf wen? `SELECT pid, pg_blocking_pids(pid), wait_event_type, state, query FROM pg_stat_activity WHERE wait_event_type = 'Lock'` zeigt die Wartenden und die Prozesse, die sie blockieren. Oft ist der Verursacher eine Sitzung `idle in transaction`, die eine Zeile gesperrt hat und vergessen wurde. Deskwerk setzt deshalb für die API `lock_timeout` und `idle_in_transaction_session_timeout` auf wenige Sekunden. Lieber eine schnelle Fehlermeldung mit Retry als ein Request, der eine Minute hängt.
+
+  ## Häufige Fehler
+
+  - **Read-Modify-Write im ORM.** `obj.zaehler += 1` schreibt einen festen Wert und verliert gleichzeitige Änderungen. Atomares `UPDATE … SET zaehler = zaehler + 1` oder `FOR UPDATE`.
+  - **„Erst prüfen, dann einfügen“ ohne Schutz.** Zwei Transaktionen prüfen gleichzeitig und fügen beide ein. Constraint, Sperre auf der Elternzeile oder Serializable.
+  - **Serializable ohne Retry.** SQLSTATE `40001` landet als HTTP 500 beim Nutzer. Die ganze Transaktion wiederholen, mit Obergrenze und kurzer Pause.
+  - **Nur die letzte Anweisung wiederholen.** Nach `40001` oder `40P01` ist die Transaktion abgebrochen. Neu beginnen, inklusive aller Lesezugriffe und Entscheidungen.
+  - **Sperre über eine Benutzereingabe halten.** `FOR UPDATE` beim Öffnen eines Formulars blockiert andere minutenlang. Für Formulare optimistisches Locking.
+  - **Uneinheitliche Sperrreihenfolge.** Transaktionen, die dieselben Zeilen in verschiedener Reihenfolge sperren, erzeugen Deadlocks. Nach Primärschlüssel sortiert sperren.
+  - **Session-Advisory-Lock im Pool.** Ohne `pg_advisory_unlock` bleibt die Sperre an der Verbindung hängen. In Webanwendungen `pg_advisory_xact_lock` verwenden.
+  - **`SET TRANSACTION` zu spät.** Nach der ersten Abfrage kommt `must be called before any query`. Die Stufe bei `BEGIN` oder als erste Anweisung setzen.
+
+  ## Zusammenfassung
+
+  - MVCC schreibt bei jeder Änderung eine neue Zeilenversion (`xmin`, `xmax`). Leser blockieren keine Schreiber. Warten müssen Schreiber, die dieselbe Zeile ändern oder sperren wollen.
+  - Read Committed nimmt je Anweisung einen neuen Snapshot, Repeatable Read einen je Transaktion. Serializable erkennt zusätzlich Anomalien zwischen Transaktionen.
+  - Lost Updates entstehen durch Lesen, Rechnen in der Anwendung und Zurückschreiben. Abhilfe: atomares `UPDATE`, `SELECT … FOR UPDATE` oder eine `version`-Spalte.
+  - Write Skew (zwei Buchungen prüfen gleichzeitig und fügen beide ein) verhindern Constraints, Sperren auf einer Elternzeile oder Serializable.
+  - Repeatable Read und Serializable können mit SQLSTATE `40001` abbrechen, Deadlocks mit `40P01`. Die Anwendung wiederholt dann die ganze Transaktion.
+  - `FOR UPDATE SKIP LOCKED` verteilt Jobs auf mehrere Worker, `NOWAIT` und `lock_timeout` begrenzen das Warten (`55P03`).
+  - Advisory Locks sperren anwendungsdefinierte Schlüssel. In Webanwendungen die transaktionsgebundene Variante verwenden.
+  - Deadlocks vermeidest du mit einer festen Sperrreihenfolge.
+exercises:
+  - id: anomalien-je-stufe
+    type: choice
+    title: Was kann in welcher Stufe passieren?
+    prompt: |
+      Welche Aussagen über die Isolationsstufen in PostgreSQL stimmen?
+    options:
+      - text: In Read Committed kann dieselbe Abfrage in einer Transaktion zweimal verschiedene Werte liefern, wenn dazwischen eine andere Transaktion committet.
+        correct: true
+        why: Jede Anweisung bekommt in Read Committed einen neuen Snapshot. Das ist ein Non-repeatable Read und in der Standardstufe erlaubt.
+      - text: In Repeatable Read sieht eine Transaktion bei jeder Abfrage den Stand vom Zeitpunkt ihrer ersten Abfrage, dazu ihre eigenen Änderungen.
+        correct: true
+        why: Der Snapshot entsteht bei der ersten Anweisung, die keine Transaktionssteuerung ist (also nicht bei `BEGIN`), und gilt bis zum Ende der Transaktion. Was andere danach committen, bleibt unsichtbar.
+      - text: In Repeatable Read können zwei Transaktionen nach einer Prüfung beide eine Buchung für denselben Zeitraum einfügen, ohne dass ein Fehler kommt.
+        correct: true
+        why: Das ist Write Skew. Jede sieht in ihrem Snapshot den Raum frei, und weil beide neue Zeilen schreiben, konkurrieren sie um keine Zeile. Erst Serializable erkennt das.
+      - text: In Read Committed kann eine Transaktion Änderungen lesen, die eine andere noch nicht committet hat.
+        correct: false
+        why: Dirty Reads gibt es in PostgreSQL in keiner Stufe, auch nicht in Read Uncommitted, das sich wie Read Committed verhält.
+      - text: Serializable verhindert Anomalien, indem es Transaktionen, die dieselben Tabellen lesen, nacheinander ausführt.
+        correct: false
+        why: Serializable blockiert nicht mehr als Repeatable Read. Es verfolgt Lese- und Schreibabhängigkeiten und bricht eine Transaktion mit SQLSTATE 40001 ab, wenn kein serieller Ablauf zum Ergebnis passt.
+    explanation: |
+      Der Kern ist der Snapshot: neu je Anweisung in Read Committed, einer je Transaktion in Repeatable Read und Serializable. Daraus folgen Non-repeatable Reads in Read Committed. Repeatable Read verhindert sie, aber nicht Write Skew, weil zwei Transaktionen auf Grundlage veralteter Snapshots verschiedene Zeilen schreiben dürfen. Serializable erkennt solche Muster nachträglich und bricht ab, statt vorher zu sperren. Dirty Reads gibt es in PostgreSQL nie.
+    resources:
+      - title: PostgreSQL · Transaction Isolation
+        url: https://www.postgresql.org/docs/current/transaction-iso.html#TRANSACTION-ISO
+
+  - id: retry-schleife
+    type: order
+    title: Wiederholen, bis es passt
+    prompt: |
+      `buchen_mit_wiederholung` soll eine Buchung in einer Serializable-Transaktion anlegen und sie bei einem Serialisierungsfehler bis zu fünfmal **komplett** wiederholen, mit wachsender Pause. Danach gibt sie auf. `conn` ist eine psycopg-Verbindung mit `autocommit=True`. Bring die Zeilen in die richtige Reihenfolge.
+    lang: python
+    lines: |
+      def buchen_mit_wiederholung(conn, anfrage):
+          for versuch in range(5):
+              try:
+                  with conn.transaction():
+                      conn.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+                      return buchung_anlegen(conn, anfrage)
+              except psycopg.errors.SerializationFailure:
+                  time.sleep(0.05 * 2 ** versuch)
+          raise BuchungKonflikt("Raum ist gerade stark gefragt, bitte erneut versuchen")
+    hints:
+      - "`SET TRANSACTION` muss die erste Anweisung der Transaktion sein."
+      - Der Fehler kann auch erst beim `COMMIT` am Ende des `with`-Blocks kommen. Wo muss das `try` deshalb stehen?
+    explanation: |
+      Jeder Versuch öffnet mit `conn.transaction()` eine neue Transaktion. Weil die Verbindung im Autocommit läuft, sendet psycopg dabei `BEGIN`, und `SET TRANSACTION` ist die erste Anweisung darin. `return` verlässt den Block ohne Exception, also committet psycopg. Das `try` umschließt den ganzen `with`-Block, denn ein Serialisierungsfehler kann auch beim `COMMIT` in `__exit__` auftreten. Wiederholt wird die ganze Funktion `buchung_anlegen` mit allen Lesezugriffen, nicht nur die letzte Anweisung. Erst nach fünf Fehlschlägen endet die Schleife, und `raise` meldet den Konflikt.
+    resources:
+      - title: PostgreSQL · Serialization Failure Handling
+        url: https://www.postgresql.org/docs/current/mvcc-serialization-failure-handling.html#MVCC-SERIALIZATION-FAILURE-HANDLING
+      - title: psycopg 3 · Transaction contexts
+        url: https://www.psycopg.org/psycopg3/docs/basic/transactions.html#transaction-contexts
+
+  - id: xmax-nach-rollback
+    type: output
+    title: Spuren eines Rollbacks
+    prompt: |
+      Was gibt das Skript aus? Ausgabe wie `psql -At`: Werte durch `|`, `NULL` leer, `t`/`f`. Die Ergebnisse beider Abfragen stehen direkt untereinander.
+    lang: postgres
+    code: |
+      CREATE TABLE raeume (id int PRIMARY KEY, name text NOT NULL, plaetze int NOT NULL);
+      INSERT INTO raeume VALUES (1, 'Loft', 8), (2, 'Atelier', 12), (3, 'Box 1', 1);
+
+      BEGIN;
+      UPDATE raeume SET plaetze = 10 WHERE id = 1;
+      DELETE FROM raeume WHERE id = 3;
+      SELECT count(*) FROM raeume;
+      ROLLBACK;
+
+      SELECT id, plaetze, xmax <> '0'::xid AS xmax_gesetzt FROM raeume ORDER BY id;
+    expected: |
+      2
+      1|8|t
+      2|12|f
+      3|1|t
+    hints:
+      - In der Transaktion sieht die Sitzung ihre eigene Löschung.
+      - "Ein `UPDATE` oder `DELETE` trägt seine Transaktionsnummer in `xmax` der alten Version ein. Wird das durch ein `ROLLBACK` gelöscht?"
+    explanation: |
+      In der Transaktion ist Box 1 gelöscht, `count(*)` liefert 2. Nach dem `ROLLBACK` sind wieder alle drei Räume mit den alten Werten sichtbar. Das `UPDATE` und das `DELETE` haben aber in `xmax` der alten Versionen von Loft und Box 1 die Nummer ihrer Transaktion eingetragen, und die bleibt stehen. Sichtbar sind die Versionen trotzdem, weil PostgreSQL beim Lesen prüft, ob die Transaktion in `xmax` committet hat. Sie ist abgebrochen. `xmax` ungleich 0 heißt also nicht „gelöscht“, sondern „eine Transaktion hat diese Version angefasst“. Das Atelier hat niemand angefasst.
+    resources:
+      - title: PostgreSQL · System Columns (xmin, xmax)
+        url: https://www.postgresql.org/docs/current/ddl-system-columns.html#DDL-SYSTEM-COLUMNS-XMAX
+
+  - id: plaetze-reservieren
+    type: output
+    title: Die letzten Plätze im Workshop
+    prompt: |
+      Vier Anmeldungen zu einem Workshop kommen nacheinander an. Was gibt das Skript aus? Ausgabe wie `psql -At`: Werte durch `|`, `NULL` leer, `t`/`f`. Abfragen ohne Ergebniszeile erscheinen nicht.
+    lang: postgres
+    code: |
+      CREATE TABLE veranstaltungen (
+        id           int PRIMARY KEY,
+        titel        text NOT NULL,
+        plaetze_frei int NOT NULL CHECK (plaetze_frei >= 0)
+      );
+      INSERT INTO veranstaltungen VALUES (1, 'Workshop SQL für Gründerinnen', 5);
+
+      UPDATE veranstaltungen SET plaetze_frei = plaetze_frei - 2
+      WHERE id = 1 AND plaetze_frei >= 2 RETURNING plaetze_frei;
+      UPDATE veranstaltungen SET plaetze_frei = plaetze_frei - 2
+      WHERE id = 1 AND plaetze_frei >= 2 RETURNING plaetze_frei;
+      UPDATE veranstaltungen SET plaetze_frei = plaetze_frei - 2
+      WHERE id = 1 AND plaetze_frei >= 2 RETURNING plaetze_frei;
+      UPDATE veranstaltungen SET plaetze_frei = plaetze_frei - 1
+      WHERE id = 1 AND plaetze_frei >= 1 RETURNING plaetze_frei;
+      SELECT plaetze_frei FROM veranstaltungen;
+    expected: |
+      3
+      1
+      0
+      0
+    hints:
+      - Nach zwei Anmeldungen zu je zwei Plätzen ist noch ein Platz frei. Was macht die Bedingung `plaetze_frei >= 2` mit der dritten?
+    explanation: |
+      Die ersten beiden Anmeldungen ziehen je zwei Plätze ab: 3, dann 1. Die dritte findet keine Zeile mit `plaetze_frei >= 2` und ändert nichts. `RETURNING` liefert dann keine Zeile, und die Anwendung weiß ohne zusätzliches `SELECT`, dass die Anmeldung abgelehnt ist. Die vierte will einen Platz und bekommt den letzten. Prüfung und Änderung stecken in derselben Anweisung. Deshalb bleibt das auch bei gleichzeitigen Anmeldungen richtig: Die zweite wartet auf die erste und prüft die Bedingung danach am neuen Wert. Der `CHECK` ist das Sicherheitsnetz, falls Code die Bedingung vergisst.
+    resources:
+      - title: PostgreSQL · Read Committed (UPDATE prüft WHERE erneut)
+        url: https://www.postgresql.org/docs/current/transaction-iso.html#XACT-READ-COMMITTED
+
+  - id: snapshot-zeitleiste
+    type: output
+    title: Fünf Mal derselbe Preis?
+    prompt: |
+      Zwei psql-Sitzungen arbeiten gleichzeitig mit dem Loft (`id = 2`), das am Anfang 24.00 kostet. B arbeitet außerhalb von `BEGIN` im Autocommit. Welche Werte liefern die fünf markierten Abfragen von A? Schreibe sie untereinander, so wie psql sie ausgibt (`28.00`).
+
+      Hinweis: Diese Übung braucht zwei Sitzungen und läuft deshalb nicht im Browser. Die Lösung stammt aus einem Lauf mit PostgreSQL 18.
+    lang: text
+    code: |
+      A> BEGIN ISOLATION LEVEL REPEATABLE READ;
+      B> UPDATE raeume SET preis_pro_stunde = 28.00 WHERE id = 2;
+      A> SELECT preis_pro_stunde FROM raeume WHERE id = 2;   -- ①
+      B> UPDATE raeume SET preis_pro_stunde = 30.00 WHERE id = 2;
+      A> SELECT preis_pro_stunde FROM raeume WHERE id = 2;   -- ②
+      A> COMMIT;
+      A> BEGIN;
+      A> SELECT preis_pro_stunde FROM raeume WHERE id = 2;   -- ③
+      B> BEGIN;
+      B> UPDATE raeume SET preis_pro_stunde = 32.00 WHERE id = 2;
+      A> SELECT preis_pro_stunde FROM raeume WHERE id = 2;   -- ④
+      B> COMMIT;
+      A> SELECT preis_pro_stunde FROM raeume WHERE id = 2;   -- ⑤
+      A> COMMIT;
+    expected: |
+      28.00
+      28.00
+      30.00
+      30.00
+      32.00
+    verify: false
+    hints:
+      - In Repeatable Read entsteht der Snapshot nicht bei `BEGIN`, sondern bei der ersten Abfrage.
+      - Das zweite `BEGIN` von A ohne Angabe läuft in Read Committed. Was hat B zum Zeitpunkt von ④ committet?
+    explanation: |
+      ① liefert 28.00, obwohl B erst nach `BEGIN` geändert hat: Repeatable Read nimmt den Snapshot bei der ersten Abfrage der Transaktion, und da war Bs Autocommit-Update schon festgeschrieben. ② bleibt bei 28.00, denn der Snapshot gilt für die ganze Transaktion. Die neue Transaktion von A läuft in Read Committed und sieht bei ③ den Stand 30.00. Bei ④ hat B noch nicht committet, A sieht weiter 30.00 und wartet nicht. Nach Bs Commit bekommt ⑤ einen neuen Snapshot und liefert 32.00.
+    resources:
+      - title: PostgreSQL · Repeatable Read
+        url: https://www.postgresql.org/docs/current/transaction-iso.html#XACT-REPEATABLE-READ
+
+  - id: umbuchung-sperren
+    type: gap
+    title: Guthaben umbuchen, ohne Deadlock
+    prompt: |
+      Im Team-Tarif überträgt Jana Krüger (7) 10 Euro Guthaben an Murat Yıldız (3). Gleichzeitig können Übertragungen in die Gegenrichtung laufen. Ergänze die Transaktion: Die Wartezeit auf Sperren ist **nur für diese Transaktion** auf zwei Sekunden begrenzt, und beide Zeilen werden **vor** der ersten Änderung gesperrt, in einer Reihenfolge, die nicht von der Richtung der Übertragung abhängt.
+    lang: postgres
+    code: |
+      BEGIN;
+      SET ⟦LOCAL⟧ lock_timeout = '2s';
+      SELECT id, guthaben
+      FROM mitglieder
+      WHERE id IN (7, 3)
+      ORDER BY ⟦id⟧
+      ⟦FOR UPDATE⟧;
+      UPDATE mitglieder SET guthaben = guthaben - 10.00 WHERE id = 7;
+      UPDATE mitglieder SET guthaben = guthaben + 10.00 WHERE id = 3;
+      COMMIT;
+    gaps:
+      - label: Gültigkeit der Einstellung
+        hint: Ohne dieses Wort gilt die Einstellung für den Rest der Sitzung, also auch für die nächste Transaktion auf dieser Pool-Verbindung.
+      - label: Sperrreihenfolge
+        hint: Eine Reihenfolge, die für beide Richtungen der Übertragung gleich ist.
+        accept: ["id ASC", "id DESC", "1", "1 ASC", "1 DESC"]
+      - label: Sperre
+        hint: Die Zeilen sollen für andere Schreiber bis zum Ende der Transaktion gesperrt sein.
+        accept: ["FOR NO KEY UPDATE"]
+    explanation: |
+      `SET LOCAL` gilt nur bis zum Ende der Transaktion. Ein `SET` ohne `LOCAL` bliebe auf der Verbindung stehen und würde im Pool den nächsten Request treffen. `ORDER BY id FOR UPDATE` sperrt beide Zeilen in Reihenfolge der IDs, denn PostgreSQL sperrt die Zeilen erst nach dem Sortieren (im Plan steht `LockRows` über `Sort`). Die Gegenrichtung 3 → 7 sperrt ebenfalls zuerst die 3. Die zweite Übertragung wartet also schon beim ersten Zugriff, statt eine Zeile zu halten, die die erste braucht. So entsteht kein Deadlock. Absteigend sortiert ginge es genauso, solange alle Transaktionen dieselbe Reihenfolge nutzen. `FOR NO KEY UPDATE` reicht hier auch, weil kein Schlüssel geändert wird.
+    resources:
+      - title: PostgreSQL · Deadlocks
+        url: https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-DEADLOCKS
+      - title: PostgreSQL · SET (LOCAL)
+        url: https://www.postgresql.org/docs/current/sql-set.html
+
+  - id: checkins-zaehlen
+    type: sql
+    lang: postgres
+    title: Check-ins zählen, ohne einen zu verlieren
+    prompt: |
+      Das Drehkreuz meldet zwei Check-ins vom 2. März 2026: einen in Zentrum (`standort_id = 3`, für den Tag gibt es schon eine Zeile) und einen in Plagwitz (`standort_id = 1`, noch keine Zeile für den Tag). Bisher liest die App `anzahl`, rechnet in Python und schreibt den neuen Wert zurück. Dabei gehen bei Andrang Check-ins verloren.
+
+      Zähle beide Check-ins mit je **einer** Anweisung, die den Zähler in der Datenbank erhöht und die Zeile anlegt, wenn es sie noch nicht gibt. Geprüft wird der Inhalt von `checkins_pro_tag`.
+    schema: |
+      CREATE TABLE standorte (id int PRIMARY KEY, name text NOT NULL UNIQUE);
+      INSERT INTO standorte VALUES (1, 'Plagwitz'), (2, 'Südvorstadt'), (3, 'Zentrum');
+      CREATE TABLE checkins_pro_tag (
+        standort_id int NOT NULL REFERENCES standorte (id),
+        tag         date NOT NULL,
+        anzahl      int NOT NULL CHECK (anzahl > 0),
+        PRIMARY KEY (standort_id, tag)
+      );
+      INSERT INTO checkins_pro_tag VALUES
+        (1, '2026-03-01', 37), (3, '2026-03-01', 52), (2, '2026-03-02', 18), (3, '2026-03-02', 41);
+    starter: |
+      -- Bisher: SELECT anzahl … liefert 41, Python rechnet 41 + 1
+      UPDATE checkins_pro_tag SET anzahl = 42 WHERE standort_id = 3 AND tag = '2026-03-02';
+      UPDATE checkins_pro_tag SET anzahl = 1 WHERE standort_id = 1 AND tag = '2026-03-02';
+    solution: |
+      INSERT INTO checkins_pro_tag (standort_id, tag, anzahl)
+      VALUES (3, '2026-03-02', 1)
+      ON CONFLICT (standort_id, tag) DO UPDATE SET anzahl = checkins_pro_tag.anzahl + 1;
+      INSERT INTO checkins_pro_tag (standort_id, tag, anzahl)
+      VALUES (1, '2026-03-02', 1)
+      ON CONFLICT (standort_id, tag) DO UPDATE SET anzahl = checkins_pro_tag.anzahl + 1;
+    check: |
+      SELECT standort_id, tag, anzahl
+      FROM checkins_pro_tag
+      ORDER BY standort_id, tag;
+    hints:
+      - Ein `UPDATE` legt keine Zeile an. Welche Anweisung fügt ein und erhöht bei einem Konflikt?
+      - "`INSERT … ON CONFLICT (standort_id, tag) DO UPDATE SET anzahl = checkins_pro_tag.anzahl + 1`."
+    explanation: |
+      `INSERT … ON CONFLICT … DO UPDATE` fügt die Zeile mit `anzahl = 1` ein oder erhöht den vorhandenen Zähler in der Datenbank. In Read Committed garantiert PostgreSQL, dass jede Zeile entweder eingefügt oder geändert wird, auch wenn ein gleichzeitiger Check-in die Zeile gerade anlegt. Die Startanweisungen schreiben feste Werte aus der Anwendung: Zwei gleichzeitige Check-ins lesen beide 41 und schreiben beide 42. Das zweite `UPDATE` trifft außerdem keine Zeile, weil es für Plagwitz am 2. März noch keine gibt. Im `DO UPDATE` muss `anzahl` mit dem Tabellennamen qualifiziert sein: Ein nacktes `SET anzahl = anzahl + 1` scheitert mit `column reference "anzahl" is ambiguous`, weil auch `EXCLUDED` eine Spalte `anzahl` hat. Die Prüfung sieht nur den Tabelleninhalt. Dass deine Anweisungen auch bei Andrang richtig zählen, liegt an ihrer Form: Die Datenbank rechnet, nicht die App.
+    resources:
+      - title: PostgreSQL · INSERT – ON CONFLICT
+        url: https://www.postgresql.org/docs/current/sql-insert.html#SQL-ON-CONFLICT
+      - title: PostgreSQL · Read Committed
+        url: https://www.postgresql.org/docs/current/transaction-iso.html#XACT-READ-COMMITTED
+
+  - id: formular-optimistisch
+    type: sql
+    lang: postgres
+    title: Drei Formulare, eine veraltete Version
+    prompt: |
+      Das Front Office hat drei Buchungen im Formular bearbeitet und speichert sie gesammelt. Jede Änderung bringt die `version` mit, die das Formular beim Laden gesehen hat:
+
+      | id | gelesene Version | neues Ende |
+      | --- | --- | --- |
+      | 21 | 2 | 2026-03-09 10:30 |
+      | 22 | 4 | 2026-03-09 16:00 |
+      | 23 | 1 | 2026-03-10 09:00 |
+
+      Schreibe **ein** `UPDATE`, das nur Änderungen übernimmt, deren gelesene Version noch aktuell ist, dabei `version` um 1 erhöht und die gespeicherten Buchungen zurückgibt. Spalten: `id`, `ende`, `version`.
+    schema: |
+      CREATE TABLE buchungen (
+        id          bigint PRIMARY KEY,
+        raum_id     int NOT NULL,
+        mitglied_id int NOT NULL,
+        beginn      timestamptz NOT NULL,
+        ende        timestamptz NOT NULL,
+        version     int NOT NULL DEFAULT 1
+      );
+      INSERT INTO buchungen VALUES
+        (21, 2, 7, '2026-03-09 09:00', '2026-03-09 10:00', 2),
+        (22, 1, 3, '2026-03-09 13:00', '2026-03-09 15:00', 5),
+        (23, 4, 9, '2026-03-10 08:00', '2026-03-10 08:30', 1),
+        (24, 2, 7, '2026-03-11 09:00', '2026-03-11 10:00', 1);
+    starter: |
+      UPDATE buchungen AS b
+      SET ende = f.ende
+      FROM (VALUES
+        (21, 2, timestamptz '2026-03-09 10:30'),
+        (22, 4, timestamptz '2026-03-09 16:00'),
+        (23, 1, timestamptz '2026-03-10 09:00')
+      ) AS f (id, version, ende)
+      WHERE b.id = f.id
+      RETURNING b.id, b.ende, b.version;
+    solution: |
+      UPDATE buchungen AS b
+      SET ende = f.ende,
+          version = b.version + 1
+      FROM (VALUES
+        (21, 2, timestamptz '2026-03-09 10:30'),
+        (22, 4, timestamptz '2026-03-09 16:00'),
+        (23, 1, timestamptz '2026-03-10 09:00')
+      ) AS f (id, version, ende)
+      WHERE b.id = f.id
+        AND b.version = f.version
+      RETURNING b.id, b.ende, b.version;
+    hints:
+      - Buchung 22 steht in der Datenbank schon bei Version 5. Das Formular kennt nur Version 4.
+      - "Zwei Ergänzungen: `version = b.version + 1` im `SET` und `AND b.version = f.version` im `WHERE`."
+    explanation: |
+      Das `UPDATE … FROM (VALUES …)` verbindet jede Zeile mit ihrer Formularänderung. `b.version = f.version` lässt nur Änderungen durch, deren Version seit dem Laden unverändert ist. Buchung 22 hat inzwischen jemand anderes auf Version 5 gebracht, ihre Änderung fällt weg und erscheint nicht im `RETURNING`. Die Anwendung erkennt den Konflikt daran, dass id 22 im Ergebnis fehlt, und zeigt dem Front Office den aktuellen Stand. `version = b.version + 1` sorgt dafür, dass auch dieses Speichern ältere Formulare ungültig macht. Ohne Versionsprüfung hätte das Startskript die Änderung an Buchung 22 still überschrieben, ein Lost Update über Minuten.
+    resources:
+      - title: SQLAlchemy 2.1 · Configuring a Version Counter
+        url: https://docs.sqlalchemy.org/en/21/orm/versioning.html#simple-version-counting
+      - title: PostgreSQL · UPDATE (FROM)
+        url: https://www.postgresql.org/docs/current/sql-update.html
+
+  - id: jobs-abholen
+    type: sql
+    lang: postgres
+    title: Der nächste Worker holt sich Arbeit
+    prompt: |
+      `worker-2` holt sich die **zwei ältesten offenen** Jobs (`status = 'offen'`, kleinstes `erstellt_am` zuerst) und markiert sie für sich: `status = 'laeuft'`, `worker = 'worker-2'`, `versuche` um 1 erhöht. Andere Worker laufen gleichzeitig. Jobs, die gerade ein anderer Worker sperrt, sollen übersprungen werden, statt zu warten.
+
+      Schreibe **eine** Anweisung, die die Jobs abholt und `id`, `art`, `status`, `worker` und `versuche` der abgeholten Jobs zurückgibt.
+    schema: |
+      CREATE TABLE jobs (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        art         text NOT NULL,
+        status      text NOT NULL DEFAULT 'offen',
+        worker      text,
+        versuche    int NOT NULL DEFAULT 0,
+        erstellt_am timestamptz NOT NULL
+      );
+      INSERT INTO jobs (art, status, worker, versuche, erstellt_am) VALUES
+        ('rechnung_pdf',    'erledigt',       'worker-1', 1, '2026-03-02 07:58'),
+        ('erinnerung_mail', 'laeuft',         'worker-1', 1, '2026-03-02 08:00'),
+        ('rechnung_pdf',    'offen',          NULL,       0, '2026-03-02 08:04'),
+        ('rechnung_pdf',    'fehlgeschlagen', 'worker-3', 3, '2026-03-02 07:30'),
+        ('erinnerung_mail', 'offen',          NULL,       0, '2026-03-02 08:02'),
+        ('rechnung_pdf',    'offen',          NULL,       1, '2026-03-02 08:10'),
+        ('export_csv',      'offen',          NULL,       0, '2026-03-02 08:02');
+    starter: |
+      SELECT id, art, status, worker, versuche
+      FROM jobs
+      WHERE status = 'offen'
+      ORDER BY erstellt_am
+      LIMIT 2
+      FOR UPDATE SKIP LOCKED;
+    solution: |
+      WITH naechste AS (
+        SELECT id
+        FROM jobs
+        WHERE status = 'offen'
+        ORDER BY erstellt_am, id
+        LIMIT 2
+        FOR UPDATE SKIP LOCKED
+      )
+      UPDATE jobs
+      SET status = 'laeuft', worker = 'worker-2', versuche = versuche + 1
+      FROM naechste
+      WHERE jobs.id = naechste.id
+      RETURNING jobs.id, jobs.art, jobs.status, jobs.worker, jobs.versuche;
+    hints:
+      - Das `SELECT … FOR UPDATE SKIP LOCKED` findet und sperrt die richtigen Jobs, ändert sie aber nicht. Pack es in einen CTE.
+      - "`UPDATE jobs SET … FROM naechste WHERE jobs.id = naechste.id RETURNING jobs.id, jobs.art, jobs.status, jobs.worker, jobs.versuche`."
+    explanation: |
+      Der CTE wählt die zwei ältesten offenen Jobs und sperrt sie. `SKIP LOCKED` überspringt Zeilen, die ein anderer Worker gerade gesperrt hat, sodass sich mehrere Worker nicht gegenseitig blockieren und keiner einen Job doppelt bekommt. Das `UPDATE` markiert genau diese Zeilen, `RETURNING` liefert sie an den Worker. Weil das Abholen eine kurze, eigene Anweisung ist, ist die Sperre nach dem Commit wieder frei, und der Status `laeuft` hält andere Worker fern. Stürzt ein Worker ab, bleibt der Job auf `laeuft` stehen; ein Aufräumjob setzt solche Jobs nach einer Frist zurück. Der Job von 7:30 Uhr ist `fehlgeschlagen` und zählt nicht. Ergebnis: Job 5 und Job 7, beide von 8:02 Uhr, jetzt `laeuft` bei `worker-2` mit `versuche = 1`. Ob `SKIP LOCKED` in deiner Anweisung steht, kann die Prüfung in einer einzelnen Sitzung nicht erkennen – das gehört ins Code-Review.
+    resources:
+      - title: PostgreSQL · SELECT – The Locking Clause (SKIP LOCKED)
+        url: https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE
+
+  - id: lost-update-orm
+    type: bug
+    title: Das Drehkreuz zählt mehr als die Datenbank
+    prompt: |
+      Am Freitag zählte das Drehkreuz in Zentrum 412 Check-ins, `standorte.checkins_heute` stand abends bei 377. Im Test mit einem einzelnen Check-in stimmt der Zähler immer. Mehrere Instanzen der API rufen die Funktion gleichzeitig auf. Finde die Zeile, in der Check-ins verloren gehen, und korrigiere sie so, dass **PostgreSQL selbst hochzählt**.
+    lang: python
+    code: |
+      def checkin_zaehlen(engine, standort_id: int, zeitpunkt) -> None:
+          with Session(engine) as session, session.begin():
+              standort = session.get(Standort, standort_id)
+              standort.checkins_heute = standort.checkins_heute + 1
+              session.add(Checkin(standort_id=standort_id, zeitpunkt=zeitpunkt))
+    lines: [4]
+    fix:
+      - line: 4
+        answers:
+          - standort.checkins_heute = Standort.checkins_heute + 1
+          - standort.checkins_heute = 1 + Standort.checkins_heute
+          - session.execute(update(Standort).where(Standort.id == standort_id).values(checkins_heute=Standort.checkins_heute + 1))
+          - session.execute(update(Standort).values(checkins_heute=Standort.checkins_heute + 1).where(Standort.id == standort_id))
+    hints:
+      - Welchen Wert schickt SQLAlchemy im `UPDATE`, wenn zwei Requests gleichzeitig 376 gelesen haben?
+      - SQLAlchemy erlaubt, einem Attribut einen SQL-Ausdruck zuzuweisen. Ein Ausdruck über die Spalte entsteht aus der Klasse, nicht aus dem Objekt.
+    explanation: |
+      `standort.checkins_heute + 1` rechnet in Python mit dem Wert, den `session.get` gelesen hat. SQLAlchemy schickt dann `UPDATE standorte SET checkins_heute = 377`. Zwei gleichzeitige Requests lesen beide 376 und schreiben beide 377, ein klassischer Lost Update. `Standort.checkins_heute + 1` ist dagegen ein SQL-Ausdruck über die Spalte. SQLAlchemy schickt `SET checkins_heute = checkins_heute + 1`, und PostgreSQL rechnet beim Schreiben mit dem aktuellen Wert, auch wenn ein anderer Request gerade gezählt hat. Nach dem Flush ist das Attribut abgelaufen und wird bei Bedarf neu geladen. Gleichwertig ist ein ORM-`UPDATE` mit `session.execute(update(Standort).where(…).values(checkins_heute=Standort.checkins_heute + 1))`. Eine Alternative ist `session.get(Standort, standort_id, with_for_update=True)` in Zeile 3. Das sperrt die Zeile beim Lesen, lässt Check-ins desselben Standorts aber aufeinander warten, solange die Transaktion läuft.
+    resources:
+      - title: SQLAlchemy 2.1 · Embedding SQL Insert/Update Expressions into a Flush
+        url: https://docs.sqlalchemy.org/en/21/orm/persistence_techniques.html#embedding-sql-insert-update-expressions-into-a-flush
+
+  - id: write-skew-erklaeren
+    type: explain
+    title: Zwei Buchungen, beide geprüft
+    prompt: |
+      Diese Zeitleiste stammt aus einem echten Lauf mit zwei Sitzungen. Am Ende ist das Loft am 2. März von 10:30 bis 11:30 doppelt gebucht, obwohl beide Transaktionen vorher geprüft haben und in Repeatable Read liefen. Erkläre, warum keine Prüfung angeschlagen hat, was Serializable hier ändern würde und wie du das Problem dauerhaft löst.
+    lang: text
+    code: |
+      A> BEGIN ISOLATION LEVEL REPEATABLE READ;
+      B> BEGIN ISOLATION LEVEL REPEATABLE READ;
+      A> SELECT count(*) FROM buchungen WHERE raum_id = 2
+           AND beginn < '2026-03-02 12:00' AND ende > '2026-03-02 10:00';
+         0
+      B> SELECT count(*) FROM buchungen WHERE raum_id = 2
+           AND beginn < '2026-03-02 11:30' AND ende > '2026-03-02 10:30';
+         0
+      A> INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende)
+           VALUES (2, 7, '2026-03-02 10:00', '2026-03-02 12:00');
+         INSERT 0 1
+      B> INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende)
+           VALUES (2, 9, '2026-03-02 10:30', '2026-03-02 11:30');
+         INSERT 0 1
+      A> COMMIT;
+      B> COMMIT;
+    points:
+      - Jede Transaktion prüft gegen ihren eigenen Snapshot. Die Buchung der anderen ist darin nicht sichtbar, weil sie beim Prüfen noch nicht committet war.
+      - Beide fügen neue, verschiedene Zeilen ein. Es gibt keine gemeinsame Zeile, auf deren Sperre eine warten müsste, deshalb blockiert nichts und kein Fehler entsteht (Write Skew).
+      - "In Serializable bricht PostgreSQL eine der beiden spätestens beim Commit mit SQLSTATE 40001 ab. Die Anwendung muss die ganze Transaktion wiederholen, inklusive der Prüfung."
+      - "Dauerhafte Lösung: ein Exclusion Constraint auf `raum_id` und `tstzrange(beginn, ende)`, der für jeden Client gilt. Alternativ die Raumzeile mit `FOR UPDATE` sperren, bevor geprüft wird."
+    explanation: |
+      Beide Transaktionen prüfen, ob sich eine Buchung überschneidet, und jede sieht dabei nur ihren Snapshot. Darin fehlt die Buchung der anderen, denn die ist zum Zeitpunkt der Prüfung noch nicht committet. Danach schreiben beide eine neue Zeile. Es gibt keine Zeile, die beide ändern wollen, also wartet niemand, und auch Repeatable Read meldet nichts. Repeatable Read schützt vor Konflikten auf derselben Zeile, nicht vor Entscheidungen auf Grundlage veralteter Lesezugriffe. Das ist Write Skew. Serializable verfolgt, wer was gelesen hat. Es erkennt, dass kein serieller Ablauf beide Buchungen erlaubt hätte, und bricht eine der beiden ab, in diesem Ablauf B beim Commit mit `could not serialize access due to read/write dependencies among transactions`. Dann muss die App die ganze Transaktion wiederholen. Dauerhaft löse ich es in der Datenbank: Ein Exclusion Constraint `EXCLUDE USING gist (raum_id WITH =, tstzrange(beginn, ende) WITH &&)` lehnt die zweite Buchung ab, egal welcher Client sie schreibt. Ohne Constraint sperre ich vor der Prüfung die Raumzeile mit `SELECT … FROM raeume WHERE id = 2 FOR UPDATE`, dann laufen Buchungen desselben Raums nacheinander.
+    resources:
+      - title: PostgreSQL · Serializable Isolation Level
+        url: https://www.postgresql.org/docs/current/transaction-iso.html#XACT-SERIALIZABLE
+      - title: PostgreSQL · Data Consistency Checks at the Application Level
+        url: https://www.postgresql.org/docs/current/applevel-consistency.html#APPLEVEL-CONSISTENCY
+
+  - id: deadlock-im-log
+    type: explain
+    title: Ein Deadlock im Serverlog
+    prompt: |
+      Nachts findet das Monitoring diesen Eintrag im Log von PostgreSQL. Prozess 262 und 263 sind zwei Requests der API, die Guthaben zwischen Mitgliedern eines Teams übertragen. Erkläre, was passiert ist, was die beiden Requests davon gemerkt haben und wie du den Code änderst.
+    lang: text
+    code: |
+      2026-10-06 12:30:04.967 CEST [262] ERROR:  deadlock detected
+      2026-10-06 12:30:04.967 CEST [262] DETAIL:  Process 262 waits for ShareLock on transaction 794; blocked by process 263.
+      	Process 263 waits for ShareLock on transaction 793; blocked by process 262.
+      	Process 262: UPDATE mitglieder SET guthaben = guthaben + 10 WHERE id = 3;
+      	Process 263: UPDATE mitglieder SET guthaben = guthaben + 5 WHERE id = 7;
+      2026-10-06 12:30:04.967 CEST [262] HINT:  See server log for query details.
+      2026-10-06 12:30:04.967 CEST [262] CONTEXT:  while updating tuple (0,1) in relation "mitglieder"
+      2026-10-06 12:30:04.967 CEST [262] STATEMENT:  UPDATE mitglieder SET guthaben = guthaben + 10 WHERE id = 3;
+    points:
+      - 262 hatte Mitglied 7 gesperrt und wollte 3, 263 hatte 3 gesperrt und wollte 7. Jeder wartete auf das Ende der Transaktion des anderen, ein Zyklus.
+      - PostgreSQL erkennt den Zyklus nach `deadlock_timeout` und bricht eine Transaktion ab (hier 262, SQLSTATE 40P01). Die andere läuft weiter und committet.
+      - Der Request von 262 bekommt einen Fehler, seine ganze Transaktion ist zurückgerollt. Ohne Retry sieht der Nutzer einen Fehler.
+      - "Abhilfe: beide Zeilen zu Beginn in fester Reihenfolge sperren (`WHERE id IN (3, 7) ORDER BY id FOR UPDATE`) und bei 40P01 die ganze Transaktion wiederholen."
+    explanation: |
+      Die beiden Transaktionen haben dieselben zwei Zeilen in umgekehrter Reihenfolge gesperrt. 262 hat zuerst Mitglied 7 geändert und hält dessen Zeilensperre, 263 hält die von Mitglied 3. Danach will jeder die Zeile des anderen. „Waits for ShareLock on transaction 794“ heißt: 262 wartet auf das Ende der Transaktion 794, die die Zeile gesperrt hat. Nach `deadlock_timeout`, standardmäßig einer Sekunde, findet PostgreSQL den Zyklus und bricht 262 mit `deadlock detected` (SQLSTATE 40P01) ab. Damit fällt die Sperre auf Mitglied 7 weg, 263 läuft weiter und committet. Der Request hinter 262 bekommt eine Exception, seine Übertragung ist komplett zurückgerollt. Ich würde in der Übertragung zuerst beide Zeilen mit `SELECT … WHERE id IN (quelle, ziel) ORDER BY id FOR UPDATE` sperren. Dann sperren alle Übertragungen in derselben Reihenfolge, und die zweite wartet schon beim ersten Zugriff. Zusätzlich fängt der Code `40P01` ab und wiederholt die Transaktion, weil Deadlocks auch an anderen Stellen entstehen können.
+    resources:
+      - title: PostgreSQL · Deadlocks
+        url: https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-DEADLOCKS
+      - title: PostgreSQL · deadlock_timeout
+        url: https://www.postgresql.org/docs/current/runtime-config-locks.html#GUC-DEADLOCK-TIMEOUT
+
+  - id: werkzeug-waehlen
+    type: choice
+    title: Welches Werkzeug für welchen Fall?
+    prompt: |
+      Das Team plant die Nebenläufigkeit in der Deskwerk-App. Welche Zuordnungen sind sinnvoll?
+    options:
+      - text: "Tageszähler für Check-ins: `UPDATE … SET anzahl = anzahl + 1` bzw. ein Upsert, ohne vorheriges Lesen."
+        correct: true
+        why: Die Datenbank rechnet mit dem aktuellen Wert. Gleichzeitige Check-ins warten kurz aufeinander, keiner geht verloren.
+      - text: "Profil im Formular bearbeiten: beim Öffnen des Formulars `SELECT … FOR UPDATE`, beim Speichern `COMMIT`."
+        correct: false
+        why: Die Transaktion bliebe offen, solange das Formular offen ist, mit gesperrter Zeile und belegter Verbindung. Für Formulare passt optimistisches Locking mit einer `version`-Spalte.
+      - text: "Mehrere Worker arbeiten `jobs` ab: `SELECT … FOR UPDATE SKIP LOCKED` in einer kurzen Transaktion."
+        correct: true
+        why: Jeder Worker bekommt einen freien Job, ohne auf andere zu warten, und kein Job wird doppelt abgeholt.
+      - text: "Keine Doppelbuchung eines Raums: Exclusion Constraint über Raum und Zeitraum."
+        correct: true
+        why: Der Constraint gilt für jede Sitzung und jeden Client. Gleichzeitige Inserts, die sich überschneiden, scheitern mit SQLSTATE 23P01.
+      - text: "Der Monatsabschluss darf nur einmal gleichzeitig laufen: `pg_advisory_lock` auf Sitzungsebene, weil er bei einem `ROLLBACK` automatisch frei wird."
+        correct: false
+        why: Sitzungs-Advisory-Locks überleben ein `ROLLBACK` und bleiben bis `pg_advisory_unlock` oder zum Ende der Verbindung. Automatisch mit der Transaktion endet nur `pg_advisory_xact_lock`.
+    explanation: |
+      Jedes Werkzeug passt zu einem Muster. Rechnen in der Datenbank für Zähler und Salden. Kurze Zeilensperren, wenn die Anwendung zwischen Lesen und Schreiben rechnen muss. `SKIP LOCKED` für Warteschlangen. Optimistisches Locking, wenn ein Mensch zwischen Lesen und Speichern Zeit braucht. Constraints für Regeln, die für alle Clients gelten müssen. Bei Advisory Locks entscheidet die Lebensdauer: Die Sitzungsvariante überlebt Transaktionen und `ROLLBACK`, in einem Connection Pool hängt sie dann an einer fremden Anfrage.
+    resources:
+      - title: PostgreSQL · Advisory Locks
+        url: https://www.postgresql.org/docs/current/explicit-locking.html#ADVISORY-LOCKS
+      - title: PostgreSQL · Advisory Lock Functions
+        url: https://www.postgresql.org/docs/current/functions-admin.html#FUNCTIONS-ADVISORY-LOCKS
+
+  - id: doppelbuchung-ausschliessen
+    type: sql
+    lang: postgres
+    title: Die Race Condition hat schon zugeschlagen
+    prompt: |
+      Am 9. März ist das Loft (`raum_id = 2`) doppelt vergeben: Zwei **bestätigte** Buchungen überschneiden sich, entstanden durch zwei gleichzeitige Requests. Räume diese Daten auf und sorge dafür, dass es nie wieder passiert – in **einer Transaktion**, die am Ende committet ist:
+
+      1. Storniere von den beiden überlappenden Buchungen die **später angelegte** (größere `id`): `status = 'storniert'`.
+      2. Schließe für alle Sitzungen aus, dass sich zwei **bestätigte** Buchungen desselben Raums zeitlich überschneiden. Zeiträume sind halboffen: Eine Buchung bis 12:00 und eine ab 12:00 überschneiden sich nicht. Stornierte Buchungen blockieren nichts.
+
+      Geprüft werden der Status aller Buchungen, Probe-Inserts (überlappend, direkt danach, storniert überlappend, anderer Raum) und ob die Transaktion abgeschlossen ist.
+    schema: |
+      CREATE TABLE raeume (
+        id   int PRIMARY KEY,
+        name text NOT NULL
+      );
+      CREATE TABLE buchungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        raum_id     int NOT NULL REFERENCES raeume (id),
+        mitglied_id int NOT NULL,
+        beginn      timestamptz NOT NULL,
+        ende        timestamptz NOT NULL,
+        status      text NOT NULL DEFAULT 'bestaetigt',
+        CHECK (ende > beginn)
+      );
+      INSERT INTO raeume VALUES (2, 'Loft'), (4, 'Atelier');
+      INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, status) VALUES
+        (2, 4, '2026-03-09 09:00', '2026-03-09 10:00', 'bestaetigt'),
+        (2, 7, '2026-03-09 10:00', '2026-03-09 12:00', 'bestaetigt'),
+        (2, 9, '2026-03-09 10:30', '2026-03-09 11:30', 'bestaetigt'),
+        (2, 3, '2026-03-09 13:00', '2026-03-09 15:00', 'storniert'),
+        (2, 5, '2026-03-09 14:00', '2026-03-09 15:00', 'bestaetigt'),
+        (4, 9, '2026-03-09 10:30', '2026-03-09 11:30', 'bestaetigt');
+    starter: |
+      BEGIN;
+      -- 1. Überschneidung finden und die spätere Buchung stornieren
+
+      -- 2. Doppelbuchungen für alle Sitzungen ausschließen
+
+      COMMIT;
+    solution: |
+      BEGIN;
+      UPDATE buchungen AS spaeter
+      SET status = 'storniert'
+      FROM buchungen AS frueher
+      WHERE spaeter.raum_id = frueher.raum_id
+        AND spaeter.id > frueher.id
+        AND spaeter.status = 'bestaetigt'
+        AND frueher.status = 'bestaetigt'
+        AND tstzrange(spaeter.beginn, spaeter.ende) && tstzrange(frueher.beginn, frueher.ende);
+      CREATE EXTENSION IF NOT EXISTS btree_gist;
+      ALTER TABLE buchungen ADD CONSTRAINT keine_doppelbuchung
+        EXCLUDE USING gist (raum_id WITH =, tstzrange(beginn, ende) WITH &&)
+        WHERE (status = 'bestaetigt');
+      COMMIT;
+    check: |
+      SELECT (SELECT string_agg(id || ':' || status, ', ' ORDER BY id) FROM buchungen) AS buchungen,
+             lp.versuch($$INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende) VALUES (2, 8, '2026-03-09 11:30', '2026-03-09 12:30')$$) AS ueberschneidung,
+             lp.versuch($$INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende) VALUES (2, 8, '2026-03-09 12:00', '2026-03-09 13:00')$$) AS direkt_danach,
+             lp.versuch($$INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, status) VALUES (2, 8, '2026-03-09 11:00', '2026-03-09 12:00', 'storniert')$$) AS storniert_ueberlappend,
+             lp.versuch($$INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende) VALUES (4, 8, '2026-03-09 09:00', '2026-03-09 10:30')$$) AS anderer_raum,
+             now() = statement_timestamp() AS abgeschlossen;
+    hints:
+      - "Finde die Überschneidung mit einem Self-Join: gleicher Raum, beide bestätigt, `tstzrange(a.beginn, a.ende) && tstzrange(b.beginn, b.ende)`, `a.id < b.id`."
+      - Ein Exclusion Constraint auf `raum_id` (mit `=`) und dem Zeitraum (mit `&&`) braucht für `=` auf `int` in einem GiST-Index die Erweiterung `btree_gist`.
+      - "`EXCLUDE USING gist (raum_id WITH =, tstzrange(beginn, ende) WITH &&) WHERE (status = 'bestaetigt')`. Ohne das Stornieren vorher scheitert er an den vorhandenen Daten."
+    explanation: |
+      Die Überschneidung liegt zwischen Buchung 2 (10:00–12:00) und Buchung 3 (10:30–11:30), also wird 3 storniert. Buchung 5 überschneidet sich nur mit der stornierten 4 und bleibt, Buchung 6 liegt im Atelier. Erst danach lässt sich der Exclusion Constraint anlegen, vorher scheitert er mit `could not create exclusion constraint`. Weil beides in einer Transaktion steht, bleibt bei einem Fehler auch die Stornierung ungeschehen, und das Schema ist nie halb umgebaut. `tstzrange(beginn, ende)` ist standardmäßig halboffen `[)`, deshalb ist die Buchung ab 12:00 erlaubt. `WHERE (status = 'bestaetigt')` nimmt Stornierungen aus. Der Constraint löst das Problem aus diesem Modul an der Wurzel: Er gilt auch für zwei gleichzeitige Transaktionen. Die zweite wartet auf die erste und scheitert nach deren Commit mit `exclusion_violation` (SQLSTATE 23P01). `abgeschlossen` vergleicht Transaktionsbeginn und Anweisungsbeginn. Beide sind nur gleich, wenn die Prüfabfrage eine eigene Transaktion ist, also keine von dir mehr offen war.
+    resources:
+      - title: PostgreSQL · Exclusion Constraints
+        url: https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-EXCLUSION
+      - title: PostgreSQL · btree_gist
+        url: https://www.postgresql.org/docs/current/btree-gist.html

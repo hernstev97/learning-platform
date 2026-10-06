@@ -1,0 +1,1081 @@
+id: orm-und-sql
+title: SQL hinter dem ORM
+level: 2
+minutes: 150
+summary: Sehen, welches SQL SQLAlchemy und Prisma erzeugen, N+1 im Log erkennen und beheben, Eingaben nur als Parameter übergeben und wissen, wann die Session schreibt, wie lange Transaktion und Verbindung offen sind und wann Raw SQL die bessere Wahl ist.
+goals:
+  - Du schaltest das SQL-Logging in SQLAlchemy und Prisma ein und liest das erzeugte SQL samt Parametern.
+  - Du erkennst N+1 im Log, sagst die Zahl der Abfragen vorher und behebst es mit `selectinload`, `joinedload` oder `include`.
+  - Du übergibst Eingaben nur als gebundene Parameter und findest SQL-Injection in `text()`, `$queryRawUnsafe` und dynamischem `ORDER BY`.
+  - Du erklärst, wann die Session flusht und committet, und hältst Transaktion und Verbindung im Web-Request kurz.
+  - Du schreibst das SQL, das ein ORM-Aufruf schicken sollte – Liste mit Join, Zählung, Massen-Update, Upsert – selbst.
+resources:
+  - title: SQLAlchemy 2.1 · Relationship Loading Techniques
+    url: https://docs.sqlalchemy.org/en/21/orm/queryguide/relationships.html
+  - title: SQLAlchemy 2.1 · Session Basics – Flushing
+    url: https://docs.sqlalchemy.org/en/21/orm/session_basics.html#flushing
+  - title: Prisma ORM 7 · Logging
+    url: https://www.prisma.io/docs/orm/v7/prisma-client/observability-and-logging/logging
+  - title: Prisma ORM 7 · Raw queries – SQL injection prevention
+    url: https://www.prisma.io/docs/orm/v7/prisma-client/using-raw-sql/raw-queries#sql-injection-prevention
+  - title: PostgreSQL · PREPARE
+    url: https://www.postgresql.org/docs/current/sql-prepare.html
+lesson: |
+  Die Mitgliederübersicht im Verwaltungsbereich der Deskwerk-App lädt seit dem Umzug in die Cloud spürbar langsam. Der Code ist drei Zeilen lang: Mitglieder laden, je Mitglied die Zahl der Buchungen anzeigen. Erst das SQL-Log zeigt, was passiert: Für 60 Mitglieder schickt die App 61 Abfragen an PostgreSQL. Seit die Datenbank nicht mehr auf demselben Rechner läuft, kostet jede davon eine Netzwerkrunde. Das ORM hat getan, was der Code verlangt – nur nicht das, was gemeint war.
+
+  Ein **ORM** (Object-Relational Mapper) bildet Klassen auf Tabellen ab und übersetzt Methodenaufrufe in SQL. PostgreSQL sieht davon nur das SQL. Wer verstehen will, warum eine Seite langsam ist, warum ein Pentest eine Lücke findet oder warum der Connection Pool leerläuft, muss dieses SQL lesen können. Diese Lektion zeigt es an beiden Diensten von Deskwerk: dem Python-Backend mit SQLAlchemy 2.1 (die 2.0-API mit `select()`, `Mapped` und `Session`) und psycopg 3, und dem TypeScript-Dienst mit Prisma ORM 7.10. Alle Logs in dieser Lektion stammen aus echten Läufen gegen PostgreSQL 18, gekürzt um Zeitstempel und das Präfix `INFO sqlalchemy.engine.Engine`.
+
+  ## SQL sichtbar machen: Logging in SQLAlchemy und Prisma
+
+  Das Modell der Buchungen in SQLAlchemy, gekürzt auf das Nötige (`Raum` ist analog gemappt):
+
+  ```python
+  from datetime import datetime
+  from decimal import Decimal
+
+  from sqlalchemy import DateTime, ForeignKey, create_engine, func, select
+  from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship
+
+
+  class Base(DeclarativeBase):
+      pass
+
+
+  class Mitglied(Base):
+      __tablename__ = "mitglieder"
+      id: Mapped[int] = mapped_column(primary_key=True)
+      email: Mapped[str]
+      name: Mapped[str]
+      tarif: Mapped[str]
+      buchungen: Mapped[list["Buchung"]] = relationship(back_populates="mitglied")
+
+
+  class Buchung(Base):
+      __tablename__ = "buchungen"
+      id: Mapped[int] = mapped_column(primary_key=True)
+      raum_id: Mapped[int] = mapped_column(ForeignKey("raeume.id"))
+      mitglied_id: Mapped[int] = mapped_column(ForeignKey("mitglieder.id"))
+      beginn: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+      ende: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+      status: Mapped[str] = mapped_column(server_default="bestaetigt")
+      preis: Mapped[Decimal | None]
+      raum: Mapped["Raum"] = relationship()
+      mitglied: Mapped[Mitglied] = relationship(back_populates="buchungen")
+
+
+  engine = create_engine("postgresql+psycopg://deskwerk@db/deskwerk", echo=True)
+
+  with Session(engine) as session:
+      stmt = (
+          select(Buchung)
+          .where(Buchung.mitglied_id == 1, Buchung.status == "bestaetigt")
+          .order_by(Buchung.beginn.desc())
+          .limit(20)
+      )
+      buchungen = session.scalars(stmt).all()
+  ```
+
+  `echo=True` schreibt jede Anweisung mit ihren Parametern ins Log ([SQLAlchemy · Configuring Logging](https://docs.sqlalchemy.org/en/21/core/engines.html#configuring-logging)):
+
+  ```text
+  BEGIN (implicit)
+  SELECT buchungen.id, buchungen.raum_id, buchungen.mitglied_id, buchungen.beginn, buchungen.ende, buchungen.status, buchungen.preis
+  FROM buchungen
+  WHERE buchungen.mitglied_id = %(mitglied_id_1)s::INTEGER AND buchungen.status = %(status_1)s::VARCHAR ORDER BY buchungen.beginn DESC
+   LIMIT %(param_1)s::INTEGER
+  [generated in 0.00034s] {'mitglied_id_1': 1, 'status_1': 'bestaetigt', 'param_1': 20}
+  ROLLBACK
+  ```
+
+  Vier Dinge stehen in diesem Log. Die Session beginnt beim ersten Zugriff selbst eine Transaktion (`BEGIN (implicit)`) und rollt sie am Ende des `with`-Blocks zurück, weil nichts committet wurde – auch Lesen läuft in einer Transaktion. Das ORM listet jede gemappte Spalte auf, statt `SELECT *` zu schicken. Statt der Werte stehen Platzhalter im SQL: `%(mitglied_id_1)s` ist das Format von psycopg, `::INTEGER` ein Typ-Cast, den SQLAlchemy für psycopg ergänzt. Mit dem Treiber asyncpg stünde dort `$1::INTEGER`. Die Werte stehen getrennt daneben. Und `[generated in …]` heißt, dass SQLAlchemy die Anweisung gerade aus dem Python-Ausdruck übersetzt hat; beim zweiten Aufruf steht dort `[cached since …]`. Das ist SQLAlchemys Übersetzungs-Cache, kein Prepared Statement in PostgreSQL.
+
+  In Prisma ORM 7 schaltet `log: ["query"]` dasselbe ein ([Prisma · Logging](https://www.prisma.io/docs/orm/v7/prisma-client/observability-and-logging/logging)). Das Modell `Buchung` ist dort mit `@@map("buchungen")` auf die Tabelle gemappt, das Feld `mitgliedId` mit `@map("mitglied_id")`:
+
+  ```typescript
+  import { PrismaPg } from "@prisma/adapter-pg";
+  import { PrismaClient } from "./generated/prisma/client";
+
+  const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL });
+  const prisma = new PrismaClient({ adapter, log: ["query"] });
+
+  const buchungen = await prisma.buchung.findMany({
+    where: { mitgliedId: 1, status: "bestaetigt" },
+    orderBy: { beginn: "desc" },
+    take: 20,
+  });
+  ```
+
+  ```text
+  prisma:query SELECT "public"."buchungen"."id", "public"."buchungen"."raum_id", "public"."buchungen"."mitglied_id", "public"."buchungen"."beginn", "public"."buchungen"."ende", "public"."buchungen"."status", "public"."buchungen"."preis" FROM "public"."buchungen" WHERE ("public"."buchungen"."mitglied_id" = $1 AND "public"."buchungen"."status" = $2) ORDER BY "public"."buchungen"."beginn" DESC LIMIT $3 OFFSET $4
+  ```
+
+  Prisma qualifiziert jeden Namen mit Schema und Tabelle, nutzt die Platzhalter `$1` bis `$4` von PostgreSQL und hängt ein `OFFSET` an, auch ohne `skip`. Die Werte zeigt dieses Log nicht; mit `log: [{ emit: "event", level: "query" }]` und `prisma.$on("query", (e) => …)` bekommst du sie als `e.params`.
+
+  Wer eine Anweisung aus dem Log untersuchen will, setzt die Werte ein und führt sie selbst aus, in psql oder hier:
+
+  ```postgres run
+  CREATE TABLE buchungen (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    raum_id     int NOT NULL,
+    mitglied_id int NOT NULL,
+    beginn      timestamptz NOT NULL,
+    ende        timestamptz NOT NULL,
+    status      text NOT NULL DEFAULT 'bestaetigt',
+    preis       numeric(8,2)
+  );
+  INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, status, preis) VALUES
+    (1, 1, '2026-03-02 09:00+01', '2026-03-02 11:00+01', 'bestaetigt', 70),
+    (3, 1, '2026-03-03 14:00+01', '2026-03-03 15:00+01', 'bestaetigt', 48),
+    (2, 2, '2026-03-02 10:00+01', '2026-03-02 10:30+01', 'bestaetigt', 3),
+    (4, 1, '2026-03-05 09:00+01', '2026-03-05 12:00+01', 'storniert', 90);
+
+  -- aus dem SQLAlchemy-Log, Platzhalter durch die Werte ersetzt
+  SELECT buchungen.id, buchungen.raum_id, buchungen.mitglied_id, buchungen.beginn, buchungen.ende, buchungen.status, buchungen.preis
+  FROM buchungen
+  WHERE buchungen.mitglied_id = 1::INTEGER AND buchungen.status = 'bestaetigt'::VARCHAR ORDER BY buchungen.beginn DESC
+   LIMIT 20::INTEGER;
+  ```
+
+  > [!TIP] Logging in Produktion
+  > `echo=True` ist für die Entwicklung. In Produktion stellst du den Logger `sqlalchemy.engine` gezielt auf `INFO` oder setzt [`hide_parameters=True`](https://docs.sqlalchemy.org/en/21/core/engines.html#sqlalchemy.create_engine.params.hide_parameters), damit E-Mail-Adressen und Namen nicht im Log landen. Auf Seiten der Datenbank schreibt [`log_statement`](https://www.postgresql.org/docs/current/runtime-config-logging.html#GUC-LOG-STATEMENT) jede Anweisung ins Serverlog; [Performance](/postgres/performance) zeigt, wie du langsame Abfragen gezielt findest.
+
+  ## N+1: viele kleine Abfragen statt einer
+
+  Die Mitgliederübersicht vom Anfang sieht so aus:
+
+  ```python
+  with Session(engine) as session:
+      for mitglied in session.scalars(select(Mitglied).order_by(Mitglied.id)):
+          print(mitglied.name, len(mitglied.buchungen))
+  ```
+
+  ```text
+  SELECT mitglieder.id, mitglieder.email, mitglieder.name, mitglieder.tarif
+  FROM mitglieder ORDER BY mitglieder.id
+  [generated in 0.00019s] {}
+  SELECT buchungen.id, buchungen.raum_id, buchungen.mitglied_id, buchungen.beginn, buchungen.ende, buchungen.status, buchungen.preis
+  FROM buchungen
+  WHERE %(param_1)s::INTEGER = buchungen.mitglied_id
+  [generated in 0.00030s] {'param_1': 1}
+  SELECT buchungen.id, buchungen.raum_id, buchungen.mitglied_id, buchungen.beginn, buchungen.ende, buchungen.status, buchungen.preis
+  FROM buchungen
+  WHERE %(param_1)s::INTEGER = buchungen.mitglied_id
+  [cached since 0.002696s ago] {'param_1': 2}
+  …
+  ```
+
+  Eine `relationship()` lädt standardmäßig **lazy**: Der erste Zugriff auf `mitglied.buchungen` löst eine eigene Abfrage aus. Eine Abfrage für die Liste plus eine je Mitglied ergibt N+1 Abfragen. Jede einzelne ist schnell, aber jede kostet eine Runde zwischen App und Datenbank, und ihre Zahl wächst mit den Daten. Im Log erkennst du N+1 an derselben Anweisung mit wechselndem Parameter und `[cached since …]`. Bei einer Beziehung in die andere Richtung (`buchung.raum`, n:1) schickt SQLAlchemy keine Abfrage, wenn der Raum mit diesem Primärschlüssel schon in der Session geladen ist ([SQLAlchemy · Lazy Loading](https://docs.sqlalchemy.org/en/21/orm/queryguide/relationships.html#lazy-loading)). Dort wächst die Zahl mit den verschiedenen Räumen, nicht mit den Buchungen.
+
+  Die Lösung heißt **Eager Loading**: Du sagst beim Laden, welche Beziehungen du brauchst.
+
+  ```python
+  from sqlalchemy.orm import joinedload, selectinload
+
+  mitglieder = select(Mitglied).options(selectinload(Mitglied.buchungen)).order_by(Mitglied.id)
+  buchungen = select(Buchung).options(joinedload(Buchung.raum)).where(Buchung.mitglied_id == 1)
+  ```
+
+  ```text
+  SELECT mitglieder.id, mitglieder.email, mitglieder.name, mitglieder.tarif
+  FROM mitglieder ORDER BY mitglieder.id
+  SELECT buchungen.mitglied_id, buchungen.id, buchungen.raum_id, buchungen.beginn, buchungen.ende, buchungen.status, buchungen.preis
+  FROM buchungen
+  WHERE buchungen.mitglied_id IN (%(primary_keys_1)s::INTEGER, %(primary_keys_2)s::INTEGER, %(primary_keys_3)s::INTEGER)
+
+  SELECT buchungen.id, buchungen.raum_id, buchungen.mitglied_id, buchungen.beginn, buchungen.ende, buchungen.status, buchungen.preis, raeume_1.id AS id_1, raeume_1.standort_id, raeume_1.name, raeume_1.art, raeume_1.plaetze, raeume_1.preis_pro_stunde
+  FROM buchungen LEFT OUTER JOIN raeume AS raeume_1 ON raeume_1.id = buchungen.raum_id
+  WHERE buchungen.mitglied_id = %(mitglied_id_1)s::INTEGER
+  ```
+
+  `selectinload` schickt eine zweite Abfrage mit allen Primärschlüsseln der ersten in einer `IN`-Liste, in Blöcken zu höchstens 500. Aus 61 Abfragen werden zwei, egal wie viele Mitglieder es gibt. `joinedload` holt die Beziehung per `LEFT OUTER JOIN` in derselben Abfrage. Die Dokumentation nennt `selectinload` für Sammlungen (1:n, n:m) in der Regel die beste Wahl und `joinedload` für n:1-Beziehungen die allgemeinste; gibt es nur wenige verschiedene Zielobjekte, kommt eine n:1-Beziehung dank Identity Map auch mit wenigen Lazy Loads aus ([SQLAlchemy · What Kind of Loading to Use?](https://docs.sqlalchemy.org/en/21/orm/queryguide/relationships.html#what-kind-of-loading-to-use)). Ein Join auf eine Sammlung wiederholt die Daten der Elternzeile je Kindzeile und verträgt sich schlecht mit `LIMIT`. Den `LEFT OUTER JOIN` wählt SQLAlchemy, solange du nicht `innerjoin=True` angibst – sonst verschwänden Zeilen ohne Partner.
+
+  In Prisma heißt Eager Loading `include`. Prisma ORM 7 schickt dafür standardmäßig ebenfalls eine zweite Abfrage mit `IN`:
+
+  ```typescript
+  const liste = await prisma.buchung.findMany({
+    where: { mitgliedId: 1 },
+    include: { raum: true },
+    orderBy: { beginn: "asc" },
+  });
+  ```
+
+  ```text
+  prisma:query SELECT "public"."buchungen"."id", "public"."buchungen"."raum_id", "public"."buchungen"."mitglied_id", "public"."buchungen"."beginn", "public"."buchungen"."ende", "public"."buchungen"."status", "public"."buchungen"."preis" FROM "public"."buchungen" WHERE "public"."buchungen"."mitglied_id" = $1 ORDER BY "public"."buchungen"."beginn" ASC OFFSET $2
+  prisma:query SELECT "public"."raeume"."id", "public"."raeume"."standort_id", "public"."raeume"."name", "public"."raeume"."art", "public"."raeume"."plaetze", "public"."raeume"."preis_pro_stunde" FROM "public"."raeume" WHERE "public"."raeume"."id" IN ($1,$2) OFFSET $3
+  ```
+
+  Schaltest du im Generator die Preview-Funktion `relationJoins` ein, wird `relationLoadStrategy: "join"` zum Standard. Dann entsteht eine einzige Abfrage mit `LEFT JOIN LATERAL`, die den Raum als `JSONB_BUILD_OBJECT` liefert; `relationLoadStrategy: "query"` erzwingt wieder die zwei Abfragen ([Prisma · Relation load strategies](https://www.prisma.io/docs/orm/v7/prisma-client/queries/relation-queries#relation-load-strategies-preview)).
+
+  Auf SQL heruntergebrochen sind das drei Formen derselben Frage. Führe den Block aus und vergleiche, was jede Variante liefert:
+
+  ```postgres run
+  CREATE TABLE mitglieder (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name text NOT NULL);
+  CREATE TABLE buchungen (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    mitglied_id int NOT NULL REFERENCES mitglieder (id),
+    beginn      timestamptz NOT NULL
+  );
+  INSERT INTO mitglieder (name) VALUES ('Jana Richter'), ('Mehmet Yılmaz'), ('Lea Hoffmann');
+  INSERT INTO buchungen (mitglied_id, beginn) VALUES
+    (1, '2026-03-02 09:00+01'), (1, '2026-03-03 14:00+01'), (2, '2026-03-02 10:00+01');
+
+  -- Lazy Loading: eine Abfrage je Mitglied, hier die für Mitglied 1
+  SELECT id, beginn FROM buchungen WHERE mitglied_id = 1;
+
+  -- selectinload / include: alle Buchungen der geladenen Mitglieder auf einmal
+  SELECT mitglied_id, id, beginn FROM buchungen WHERE mitglied_id IN (1, 2, 3) ORDER BY mitglied_id, id;
+
+  -- joinedload: eine Abfrage, die Mitgliedsdaten wiederholen sich je Buchung
+  SELECT m.id, m.name, b.id AS buchung_id, b.beginn
+  FROM mitglieder AS m
+  LEFT JOIN buchungen AS b ON b.mitglied_id = m.id
+  ORDER BY m.id, b.id;
+  ```
+
+  Lea Hoffmann hat keine Buchung. In der `IN`-Variante fehlt sie im Ergebnis, das ORM hängt ihr eine leere Liste an. Im Join erscheint sie mit `NULL` in den Buchungsspalten – genau dafür braucht `joinedload` den äußeren Join.
+
+  > [!PRAXIS] N+1 im Test fangen
+  > Im Deskwerk-Backend zählt ein Test die Abfragen je Endpunkt: Ein Listener auf das SQLAlchemy-Ereignis `before_cursor_execute` erhöht einen Zähler, und der Test legt erst drei, dann dreißig Mitglieder an. Bleibt die Zahl gleich, ist der Endpunkt frei von N+1. In Views, die keine Lazy Loads auslösen dürfen, steht zusätzlich `raiseload("*")` in den Optionen: Jeder vergessene Zugriff wirft dann sofort einen Fehler statt still eine Abfrage zu schicken ([SQLAlchemy · raiseload](https://docs.sqlalchemy.org/en/21/orm/queryguide/relationships.html#preventing-unwanted-lazy-loads-using-raiseload)).
+
+  ## Parameterbindung statt String-Verkettung
+
+  Für die Suche im Verwaltungsbereich hat jemand Raw SQL mit einem f-String gebaut:
+
+  ```python
+  from sqlalchemy import text
+
+  # unsicher: die Eingabe wird Teil des SQL-Textes
+  zeilen = session.execute(text(f"SELECT id, name FROM mitglieder WHERE email = '{email}'")).all()
+
+  # sicher: die Eingabe ist ein gebundener Parameter
+  zeilen = session.execute(text("SELECT id, name FROM mitglieder WHERE email = :email"), {"email": email}).all()
+  ```
+
+  Gibt jemand `x' OR '1'='1` ein, entsteht in der ersten Variante `WHERE email = 'x' OR '1'='1'` – eine Bedingung, die für jede Zeile wahr ist. Das ist **SQL-Injection**: Die Eingabe ändert die Struktur der Abfrage. In der zweiten Variante schickt psycopg den SQL-Text mit Platzhalter und den Wert getrennt ([psycopg · Server-side binding](https://www.psycopg.org/psycopg3/docs/basic/from_pg2.html#server-side-binding)). So sieht dieselbe Eingabe im Serverlog von PostgreSQL aus (mit `log_statement = 'all'`):
+
+  ```text
+  LOG:  execute <unnamed>: SELECT id, name FROM mitglieder WHERE email = $1
+  DETAIL:  Parameters: $1 = 'x'' OR ''1''=''1'
+  ```
+
+  Aus `:email` ist `$1` geworden, und der Angriffstext steht nur in der Parameterzeile. Die verdoppelten Hochkommas sind die Schreibweise des Logs für einen Text, der selbst Hochkommas enthält. Das Protokoll von PostgreSQL trennt beides: Die Nachricht *Parse* enthält den SQL-Text mit `$1`, die Nachricht *Bind* die Werte ([PostgreSQL · Extended Query](https://www.postgresql.org/docs/current/protocol-flow.html#PROTOCOL-FLOW-EXT-QUERY)). Ein Wert wird nie als SQL gelesen, egal welche Anführungszeichen er enthält. `<unnamed>` heißt: Die Anweisung wird nach der Ausführung verworfen. Läuft dieselbe Anweisung auf einer Verbindung öfter als fünfmal, legt psycopg sie als benanntes Prepared Statement an (`prepare_threshold`, [psycopg · Prepared statements](https://www.psycopg.org/psycopg3/docs/advanced/prepare.html)); im Log steht dann `execute _pg3_0`, und PostgreSQL spart sich das erneute Parsen. Auf SQL-Ebene entspricht das [`PREPARE`](https://www.postgresql.org/docs/current/sql-prepare.html) und `EXECUTE`:
+
+  ```postgres run
+  CREATE TABLE mitglieder (
+    id    int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email text NOT NULL UNIQUE,
+    name  text NOT NULL
+  );
+  INSERT INTO mitglieder (email, name) VALUES
+    ('jana.richter@example.org', 'Jana Richter'),
+    ('mehmet.yilmaz@example.org', 'Mehmet Yılmaz'),
+    ('lea.hoffmann@example.org', 'Lea Hoffmann');
+
+  PREPARE mitglied_nach_email(text) AS
+    SELECT id, name FROM mitglieder WHERE email = $1;
+
+  EXECUTE mitglied_nach_email('jana.richter@example.org');
+  EXECUTE mitglied_nach_email($$x' OR '1'='1$$);
+
+  -- Das hätte die f-String-Variante geschickt:
+  SELECT id, name FROM mitglieder WHERE email = 'x' OR '1'='1';
+  ```
+
+  `$$…$$` ist ein Dollar-Quoting: Alles dazwischen ist Text, auch die Hochkommas. Als Parameter findet der Angriffstext kein Mitglied, als Teil des SQL-Textes liefert er alle drei.
+
+  Prisma macht es an einer Stelle besonders leicht, das zu verwechseln. `$queryRaw` ist ein Tagged Template: Jedes `${…}` wird zu einem Platzhalter `$1`. `$queryRawUnsafe` nimmt dagegen einen fertigen String, und ein Template-String mit `${…}` setzt die Eingabe vorher in den Text ein ([Prisma · Raw queries](https://www.prisma.io/docs/orm/v7/prisma-client/using-raw-sql/raw-queries#sql-injection-prevention)):
+
+  ```typescript
+  // sicher: Prisma schickt "… WHERE email = $1" und den Wert getrennt
+  const treffer = await prisma.$queryRaw`SELECT id, name FROM mitglieder WHERE email = ${email}`;
+
+  // unsicher: der Wert landet im SQL-Text
+  const anzahl = await prisma.$queryRawUnsafe(`SELECT count(*)::int AS n FROM mitglieder WHERE name = '${name}'`);
+  ```
+
+  ```text
+  prisma:query SELECT count(*)::int AS n FROM mitglieder WHERE name = 'x' OR '1'='1'
+  ```
+
+  Parameter ersetzen nur **Werte**. Tabellen- und Spaltennamen, `ASC` oder `DESC` lassen sich nicht binden. Wer die Sortierspalte aus der URL als Parameter übergibt, sortiert nach einem konstanten Text, also gar nicht:
+
+  ```postgres run
+  CREATE TABLE mitglieder (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name text NOT NULL);
+  INSERT INTO mitglieder (name) VALUES ('Jana Richter'), ('Mehmet Yılmaz'), ('Lea Hoffmann');
+
+  PREPARE sortiert(text) AS SELECT name FROM mitglieder ORDER BY $1;
+  EXECUTE sortiert('name');
+  ```
+
+  Für solche Fälle gehört eine feste Liste erlaubter Spalten in die App, etwa ein Dictionary von Parameterwert auf Spalte. In SQL-Funktionen setzt [`format('%I', …)`](https://www.postgresql.org/docs/current/functions-string.html#FUNCTIONS-STRING-FORMAT) einen Bezeichner korrekt gequotet ein.
+
+  > [!WARNING] Injection gibt es auch mit ORM
+  > Das ORM bindet Parameter, solange du seine API benutzt. Die Lücken entstehen an den Ausgängen: `text(f"…")`, `$queryRawUnsafe` mit Template-String, `Prisma.raw()`, `order_by(text(eingabe))`. Im Code-Review lohnt eine Suche nach genau diesen Stellen.
+
+  ## Session und Unit of Work: wann das SQL zur Datenbank geht
+
+  Eine SQLAlchemy-`Session` ist eine **Unit of Work**: Sie sammelt Änderungen an Objekten und schickt sie gebündelt. Dazu führt sie eine **Identity Map**: Jede Zeile gibt es in einer Session höchstens einmal als Objekt.
+
+  ```python
+  with Session(engine) as session:
+      mitglied = session.get(Mitglied, 2)
+      session.get(Mitglied, 2) is mitglied        # True, keine zweite Abfrage
+      mitglied.tarif = "fix"                       # noch kein SQL
+      session.add(Buchung(raum_id=1, mitglied_id=2, beginn=beginn, ende=ende, preis=Decimal("35.00")))
+      anzahl = session.scalar(select(func.count()).select_from(Buchung).where(Buchung.mitglied_id == 2))
+      session.commit()
+      print(mitglied.tarif)
+  ```
+
+  ```text
+  BEGIN (implicit)
+  SELECT mitglieder.id, mitglieder.email, mitglieder.name, mitglieder.tarif
+  FROM mitglieder
+  WHERE mitglieder.id = %(pk_1)s::INTEGER
+  UPDATE mitglieder SET tarif=%(tarif)s::VARCHAR WHERE mitglieder.id = %(mitglieder_id)s::INTEGER
+  INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, preis) VALUES (%(raum_id)s::INTEGER, %(mitglied_id)s::INTEGER, %(beginn)s::TIMESTAMP WITH TIME ZONE, %(ende)s::TIMESTAMP WITH TIME ZONE, %(preis)s) RETURNING buchungen.id, buchungen.status
+  SELECT count(*) AS count_1
+  FROM buchungen
+  WHERE buchungen.mitglied_id = %(mitglied_id_1)s::INTEGER
+  COMMIT
+  BEGIN (implicit)
+  SELECT mitglieder.id, mitglieder.email, mitglieder.name, mitglieder.tarif
+  FROM mitglieder
+  WHERE mitglieder.id = %(pk_1)s::INTEGER
+  ```
+
+  Das zweite `get` findet das Objekt in der Identity Map. Zuweisung und `add` erzeugen noch kein SQL. Erst vor der nächsten Abfrage **flusht** die Session: Sie schickt UPDATE und INSERT, damit `count(*)` die neue Buchung mitzählt ([SQLAlchemy · Flushing](https://docs.sqlalchemy.org/en/21/orm/session_basics.html#flushing)). Das INSERT endet mit `RETURNING buchungen.id, buchungen.status`: So erfährt das ORM die generierte ID und den Default, den die Datenbank für `status` eingesetzt hat (im Modell als `server_default` deklariert). `commit()` flusht, was noch offen ist, und schickt `COMMIT`. Danach gelten alle geladenen Objekte als veraltet; der Zugriff auf `mitglied.tarif` lädt die Zeile in einer neuen Transaktion nach.
+
+  Daraus folgen zwei typische Fallen. **Massen-Updates Objekt für Objekt**: Wer Buchungen lädt und in einer Schleife `b.preis = …` setzt, bekommt beim Flush je Objekt ein `UPDATE … WHERE buchungen.id = …`. SQLAlchemy schickt sie gebündelt per `executemany`, PostgreSQL führt trotzdem jede Anweisung einzeln aus, nachdem alle Zeilen erst in die App geladen wurden. `session.execute(update(Buchung).where(…).values(preis=Buchung.preis * Decimal("1.1")))` wird dagegen zu einem einzigen `UPDATE … WHERE buchungen.raum_id = …` ([SQLAlchemy · ORM UPDATE with WHERE](https://docs.sqlalchemy.org/en/21/orm/queryguide/dml.html#orm-update-and-delete-with-custom-where-criteria)). **Zählen über eine Beziehung**: `len(mitglied.buchungen)` lädt alle Buchungen als Objekte, nur um sie zu zählen. Prisma kennt keine Unit of Work und keine Identity Map; jeder Aufruf schickt sofort sein SQL. `updateMany` wird zu einem UPDATE, und `_count` lässt die Datenbank zählen – mit einem `LEFT JOIN` auf eine Unterabfrage mit `COUNT(*) … GROUP BY` und `COALESCE(…, 0)`.
+
+  Was beides in SQL bedeutet:
+
+  ```postgres run
+  CREATE TABLE mitglieder (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name text NOT NULL);
+  CREATE TABLE buchungen (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    raum_id     int NOT NULL,
+    mitglied_id int NOT NULL REFERENCES mitglieder (id),
+    preis       numeric(8,2)
+  );
+  INSERT INTO mitglieder (name) VALUES ('Jana Richter'), ('Mehmet Yılmaz'), ('Lea Hoffmann');
+  INSERT INTO buchungen (raum_id, mitglied_id, preis) VALUES (1, 1, 70), (3, 1, 48), (1, 2, 35);
+
+  -- eine Anweisung für alle betroffenen Zeilen statt einer je Objekt
+  UPDATE buchungen SET preis = round(preis * 1.1, 2) WHERE raum_id = 1 RETURNING id, preis;
+
+  -- zählen in der Datenbank statt len(mitglied.buchungen)
+  SELECT m.name, count(b.id) AS buchungen
+  FROM mitglieder AS m
+  LEFT JOIN buchungen AS b ON b.mitglied_id = m.id
+  GROUP BY m.id, m.name
+  ORDER BY m.id;
+  ```
+
+  ## Transaktionen und Connection Pool im Web-Request
+
+  Vom ersten SQL einer Session bis zu `commit()`, `rollback()` oder `close()` gehört ihr eine Verbindung aus dem Pool, und auf dieser Verbindung ist eine Transaktion offen. Für einen Web-Request heißt die Regel deshalb: eine Session je Request, eine Transaktion je Anwendungsfall, und beides kurz.
+
+  ```python
+  SessionLocal = sessionmaker(engine)
+
+
+  def buchung_stornieren(buchung_id: int) -> None:
+      with SessionLocal.begin() as session:  # COMMIT am Ende, ROLLBACK bei Exception, dann close()
+          buchung = session.get(Buchung, buchung_id)
+          buchung.status = "storniert"
+  ```
+
+  Was innerhalb des Blocks passiert, hält die Transaktion offen. Ein HTTP-Aufruf an den Zahlungsdienst mitten darin hält die Verbindung und alle Zeilensperren fest, so lange der Dienst braucht. PostgreSQL zeigt solche Verbindungen in [`pg_stat_activity`](https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-ACTIVITY-VIEW) mit dem Zustand `idle in transaction`. So sah es aus, als drei Sessions eine Buchung gelesen, aber weder committet noch geschlossen hatten:
+
+  ```text
+   pid |        state        | transaktion_seit |              letzte_abfrage
+  -----+---------------------+------------------+------------------------------------------
+   346 | idle in transaction | 00:00:00.068149  | SELECT buchungen.id, buchungen.raum_id,
+   347 | idle in transaction | 00:00:00.062584  | SELECT buchungen.id, buchungen.raum_id,
+   348 | idle in transaction | 00:00:00.056811  | SELECT buchungen.id, buchungen.raum_id,
+  ```
+
+  Der Pool ist begrenzt. SQLAlchemy hält standardmäßig 5 Verbindungen und erlaubt 10 zusätzliche; ist alles vergeben, wartet der nächste Request 30 Sekunden und bricht dann ab mit `QueuePool limit of size 5 overflow 10 reached, connection timed out, timeout 30.00` ([SQLAlchemy · pool_size](https://docs.sqlalchemy.org/en/21/core/engines.html#sqlalchemy.create_engine.params.pool_size)). Prisma ORM 7 nutzt den Pool des Treibers: Mit `@prisma/adapter-pg` sind es 10 Verbindungen (`max`) ohne Zeitlimit beim Warten (`connectionTimeoutMillis: 0`); den Parameter `connection_limit` in der URL aus Prisma 6 gibt es dort nicht mehr ([Prisma · Connection pool](https://www.prisma.io/docs/orm/v7/prisma-client/setup-and-configuration/databases-connections/connection-pool#postgresql-using-the-pg-driver-adapter)). Ist der Pool erschöpft, warten Requests also unbegrenzt, bis du im Adapter ein `connectionTimeoutMillis` setzt. Interaktive Transaktionen mit `prisma.$transaction(async (tx) => …)` brechen nach 5 Sekunden ab (`timeout`). Alle Pools aller App-Instanzen zusammen müssen unter [`max_connections`](https://www.postgresql.org/docs/current/runtime-config-connection.html#GUC-MAX-CONNECTIONS) bleiben, standardmäßig 100. Wie Transaktionen selbst funktionieren, steht in [Transaktionen](/postgres/transaktionen); [`idle_in_transaction_session_timeout`](https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-IDLE-IN-TRANSACTION-SESSION-TIMEOUT) beendet vergessene Transaktionen serverseitig.
+
+  ## Wann Raw SQL die bessere Wahl ist
+
+  Ein ORM spart Code für das, was eine App ständig tut: einzelne Objekte laden, ändern, speichern, Listen mit Filtern. Raw SQL ist besser, wenn die Frage mengenorientiert ist: Berichte mit CTEs und Fensterfunktionen (siehe [Fensterfunktionen und Analysemuster](/data/sql-fensterfunktionen)), Massenänderungen, Upserts, Warteschlangen mit `FOR UPDATE SKIP LOCKED` (siehe [Isolation und Sperren](/postgres/isolation-sperren)). Beide ORMs bieten dafür einen Mittelweg. SQLAlchemy hat für PostgreSQL `insert(…).on_conflict_do_update(…)`, Prisma gibt `upsert` als `INSERT … ON CONFLICT … DO UPDATE` an die Datenbank weiter, wenn das `where` genau ein eindeutiges Feld (oder einen zusammengesetzten Schlüssel) mit demselben Wert wie in `create` nennt und nichts verschachtelt gelesen oder geschrieben wird ([Prisma · Database upserts](https://www.prisma.io/docs/orm/v7/reference/prisma-client-reference#database-upserts)). Für alles Weitere gibt es `text()` mit `:name`-Parametern und `$queryRaw` als Tagged Template.
+
+  Ein typischer Fall ist der Zähler. Mit dem ORM liest der Code die Zeile, erhöht in Python und schreibt zurück – zwei gleichzeitige Check-ins lesen denselben Wert, und einer geht verloren. Ein [Upsert](https://www.postgresql.org/docs/current/sql-insert.html#SQL-ON-CONFLICT) erledigt Anlegen und Erhöhen in einer Anweisung:
+
+  ```postgres run
+  CREATE TABLE tagesstatistik (
+    standort_id int  NOT NULL,
+    tag         date NOT NULL,
+    checkins    int  NOT NULL,
+    PRIMARY KEY (standort_id, tag)
+  );
+  INSERT INTO tagesstatistik VALUES (1, '2026-03-02', 17);
+
+  INSERT INTO tagesstatistik (standort_id, tag, checkins)
+  VALUES (1, '2026-03-02', 1), (2, '2026-03-02', 1)
+  ON CONFLICT (standort_id, tag) DO UPDATE SET checkins = tagesstatistik.checkins + EXCLUDED.checkins
+  RETURNING standort_id, tag, checkins;
+  ```
+
+  `EXCLUDED` ist die Zeile, die eingefügt werden sollte. Für Standort 1 gab es den Tag schon, er steigt auf 18; Standort 2 wird neu angelegt. Wie das unter Last ohne Lost Update bleibt, behandelt [Isolation und Sperren](/postgres/isolation-sperren).
+
+  > [!INTERVIEW] „Woher weißt du, was dein ORM an die Datenbank schickt?“
+  > Ich schalte das SQL-Logging ein – in SQLAlchemy `echo=True` oder den Logger `sqlalchemy.engine`, in Prisma `log: ["query"]` – und sehe mir die Anweisungen eines Requests an. Wiederholt sich dieselbe Abfrage mit wechselndem Parameter, ist es N+1; das behebe ich mit `selectinload` oder `joinedload` beziehungsweise `include` und sichere es mit einem Test ab, der die Abfragen zählt. Langsame einzelne Abfragen kopiere ich mit eingesetzten Werten in psql und lese den Plan mit `EXPLAIN`. Eingaben gehen nur als gebundene Parameter in Raw SQL.
+
+  ## Häufige Fehler
+
+  - **Eine Liste schickt N+1 Abfragen.** Lazy Loading in einer Schleife. Im Log steht dieselbe Anweisung mit wechselndem Parameter. `selectinload`, `joinedload` oder `include` verwenden.
+  - **`len(mitglied.buchungen)` für eine Zahl.** Lädt alle Zeilen als Objekte. `func.count()` oder Prismas `_count` zählen in der Datenbank.
+  - **Massen-Update in einer Schleife.** Je Objekt ein UPDATE. `update(…).where(…)` oder `updateMany` schicken eines.
+  - **`text(f"…")` oder `$queryRawUnsafe` mit `${…}`.** SQL-Injection. Platzhalter verwenden: `:name` mit Parameter-Dictionary, `$queryRaw` als Tagged Template.
+  - **Sortierspalte aus der URL als Parameter oder als `text()`.** Als Parameter wirkt sie nicht, als Text ist sie eine Lücke. Feste Liste erlaubter Spalten.
+  - **`QueuePool limit … reached, connection timed out`.** Sessions werden nicht geschlossen oder Transaktionen bleiben offen. `with SessionLocal.begin() as session:` und keine langsamen Aufrufe in der Transaktion.
+  - **`joinedload` auf eine Sammlung.** Der Join vervielfacht Zeilen. SQLAlchemy 2.x verlangt deshalb `.unique()` auf dem Ergebnis (`session.scalars(stmt).unique().all()`), sonst kommt `InvalidRequestError: The unique() method must be invoked on this Result …`. Ein `LIMIT` setzt SQLAlchemy in eine Unterabfrage; in selbst geschriebenem SQL musst du das selbst tun. Meist ist `selectinload` die bessere Wahl.
+  - **`Mapped[datetime]` ohne `DateTime(timezone=True)`.** Das ORM hält die Spalte für `timestamp` ohne Zeitzone und castet Parameter entsprechend; Alembic würde sie auch so anlegen.
+
+  ## Zusammenfassung
+
+  - Ein ORM ist ein SQL-Generator. Logging einschalten (`echo=True`, `log: ["query"]`) und lesen, was es schickt.
+  - Lazy Loading in Schleifen erzeugt N+1. `selectinload` (zweite Abfrage mit `IN`) für Sammlungen, `joinedload` (`LEFT OUTER JOIN`) für n:1, in Prisma `include`.
+  - Werte gehen als gebundene Parameter getrennt vom SQL-Text zur Datenbank (`$1`, Parse/Bind). Bezeichner lassen sich nicht binden, sie brauchen eine feste Liste.
+  - Die Session sammelt Änderungen und flusht vor Abfragen und beim Commit; `RETURNING` liefert dem ORM IDs und Defaults.
+  - Zählen und Massenänderungen gehören in die Datenbank: `count(*)`, ein UPDATE für alle Zeilen.
+  - Eine Session hält ab der ersten Abfrage eine Verbindung und eine Transaktion. Kurz halten, keine HTTP-Aufrufe darin, Pools unter `max_connections` dimensionieren.
+  - Raw SQL für Berichte, Upserts und PostgreSQL-Funktionen – immer mit Platzhaltern.
+exercises:
+  - id: wie-viele-abfragen
+    type: choice
+    title: Wie oft fragt die Schleife?
+    prompt: |
+      Am Montag gibt es 30 Buchungen. Sie verteilen sich auf 6 verschiedene Räume und 12 verschiedene Mitglieder. `Buchung.raum` und `Buchung.mitglied` sind wie in der Lektion mit `relationship()` ohne weitere Optionen gemappt, die Session ist frisch. Wie viele SELECT-Anweisungen schickt dieser Code insgesamt?
+    lang: python
+    code: |
+      with Session(engine) as session:
+          stmt = (
+              select(Buchung)
+              .where(Buchung.beginn >= montag, Buchung.beginn < dienstag)
+              .order_by(Buchung.beginn)
+          )
+          for buchung in session.scalars(stmt):
+              print(buchung.raum.name, buchung.mitglied.name)
+    options:
+      - text: "1"
+        correct: false
+        why: Ohne `joinedload` oder `selectinload` lädt die erste Abfrage nur die Spalten von `buchungen`. Räume und Mitglieder kommen erst beim Zugriff.
+      - text: "19"
+        correct: true
+        why: Eine Abfrage für die Buchungen, dann je Raum und je Mitglied eine Lazy-Load-Abfrage beim ersten Zugriff. Danach findet SQLAlchemy das Objekt per Primärschlüssel in der Identity Map und fragt nicht erneut – 1 + 6 + 12.
+      - text: "31"
+        correct: false
+        why: Das wäre eine Abfrage je Buchung für nur eine der beiden Beziehungen. Hier werden zwei Beziehungen gelesen.
+      - text: "61"
+        correct: false
+        why: So viele wären es, wenn jeder Zugriff eine Abfrage auslöste. Bei n:1-Beziehungen prüft SQLAlchemy vorher die Identity Map; bereits geladene Räume und Mitglieder kosten keine Abfrage.
+    hints:
+      - Wie oft muss SQLAlchemy einen Raum laden, der schon in der Session ist?
+    explanation: |
+      Die erste Abfrage lädt nur Buchungen. Beim ersten Zugriff auf `buchung.raum` lädt SQLAlchemy den Raum per Primärschlüssel nach. Bei einer einfachen n:1-Beziehung schaut es vorher in die Identity Map der Session: Ist der Raum mit dieser ID schon geladen, gibt es kein SQL. Die Zahl der Abfragen wächst deshalb mit den verschiedenen Räumen und Mitgliedern, hier 1 + 6 + 12 = 19. Bei Sammlungen (`mitglied.buchungen`) gibt es diese Abkürzung nicht – dort kostet jedes Mitglied eine Abfrage. `joinedload(Buchung.raum)` und `joinedload(Buchung.mitglied)` machen aus 19 Abfragen eine.
+    resources:
+      - title: SQLAlchemy 2.1 · Lazy Loading
+        url: https://docs.sqlalchemy.org/en/21/orm/queryguide/relationships.html#lazy-loading
+
+  - id: autoflush-reihenfolge
+    type: order
+    title: In welcher Reihenfolge steht es im Log?
+    prompt: |
+      Dieser Code läuft mit `echo=True`. Bring die Zeilen, die im Log erscheinen, in die richtige Reihenfolge.
+
+      ```python
+      with Session(engine) as session:
+          mitglied = session.get(Mitglied, 2)
+          mitglied.tarif = "fix"
+          session.add(Buchung(raum_id=1, mitglied_id=2, beginn=beginn, ende=ende, preis=Decimal("35.00")))
+          anzahl = session.scalar(select(func.count()).select_from(Buchung).where(Buchung.mitglied_id == 2))
+          session.commit()
+      ```
+    lang: postgres
+    lines: |
+      BEGIN (implicit)
+      SELECT mitglieder.id, mitglieder.email, mitglieder.name, mitglieder.tarif FROM mitglieder WHERE mitglieder.id = %(pk_1)s::INTEGER
+      UPDATE mitglieder SET tarif=%(tarif)s::VARCHAR WHERE mitglieder.id = %(mitglieder_id)s::INTEGER
+      INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, preis) VALUES (…) RETURNING buchungen.id, buchungen.status
+      SELECT count(*) AS count_1 FROM buchungen WHERE buchungen.mitglied_id = %(mitglied_id_1)s::INTEGER
+      COMMIT
+    alternatives:
+      - [1, 2, 4, 3, 5, 6]
+    hints:
+      - Wann beginnt die Session ihre Transaktion – beim Erzeugen oder beim ersten SQL?
+      - Die Zählung soll die neue Buchung mitzählen. Was muss vorher passiert sein?
+    explanation: |
+      Die Session beginnt die Transaktion erst mit dem ersten SQL (`BEGIN (implicit)`), dann lädt `get` das Mitglied. Die Zuweisung an `tarif` und `add` schicken nichts; die Session merkt sich die Änderungen. Vor dem `SELECT count(*)` flusht sie automatisch, damit die Abfrage den aktuellen Stand der Session sieht: UPDATE und INSERT laufen vor der Zählung. SQLAlchemy sortiert die Anweisungen eines Flushs nach den Abhängigkeiten der Tabellen; im echten Lauf stand das UPDATE der Elterntabelle zuerst, für die Aufgabe gelten beide Reihenfolgen. `commit()` findet nichts mehr zu flushen und schickt nur noch `COMMIT`.
+    resources:
+      - title: SQLAlchemy 2.1 · Session Basics – Flushing
+        url: https://docs.sqlalchemy.org/en/21/orm/session_basics.html#flushing
+      - title: SQLAlchemy 2.1 · Auto Begin
+        url: https://docs.sqlalchemy.org/en/21/orm/session_basics.html#auto-begin
+
+  - id: parameter-oder-text
+    type: output
+    title: Drei Mal dieselbe Suche
+    prompt: |
+      Was gibt das Skript aus? Ausgabe wie `psql -At`: eine Zeile je Ergebniszeile, Werte durch `|` getrennt, `NULL` leer, `t`/`f`. Die Ergebnisse der drei Abfragen stehen direkt untereinander.
+    lang: postgres
+    code: |
+      CREATE TABLE mitglieder (
+        id    int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        email text NOT NULL UNIQUE,
+        name  text NOT NULL
+      );
+      INSERT INTO mitglieder (email, name) VALUES
+        ('jana.richter@example.org', 'Jana Richter'),
+        ('mehmet.yilmaz@example.org', 'Mehmet Yılmaz'),
+        ('lea.hoffmann@example.org', 'Lea Hoffmann');
+
+      PREPARE anzahl_mit_email(text) AS
+        SELECT count(*) FROM mitglieder WHERE email = $1;
+
+      EXECUTE anzahl_mit_email('jana.richter@example.org');
+      EXECUTE anzahl_mit_email($$' OR ''='$$);
+      SELECT count(*) FROM mitglieder WHERE email = '' OR ''='';
+    expected: |
+      1
+      0
+      3
+    hints:
+      - "`$$…$$` ist ein Text in Dollar-Quoting. Welchen Wert bekommt `$1` im zweiten `EXECUTE`?"
+      - Die letzte Abfrage ist das, was eine App mit String-Verkettung aus derselben Eingabe gebaut hätte. Für welche Zeilen ist `'' = ''` wahr?
+    explanation: |
+      Das erste `EXECUTE` findet Jana Richter. Im zweiten ist `$1` der Text `' OR ''='` – ein seltsamer Wert, aber nur ein Wert. Keine E-Mail-Adresse lautet so, also 0. Die dritte Abfrage zeigt, was entsteht, wenn die App denselben Text zwischen zwei Hochkommas in den SQL-Text klebt: `WHERE email = '' OR ''=''`. Das `OR` gehört jetzt zur Abfrage, `'' = ''` ist für jede Zeile wahr, und die Suche liefert alle drei Mitglieder. Gebundene Parameter verhindern genau das, weil SQL-Text und Werte getrennt bei PostgreSQL ankommen.
+    resources:
+      - title: PostgreSQL · PREPARE
+        url: https://www.postgresql.org/docs/current/sql-prepare.html
+      - title: PostgreSQL · Dollar-Quoted String Constants
+        url: https://www.postgresql.org/docs/current/sql-syntax-lexical.html#SQL-SYNTAX-DOLLAR-QUOTING
+
+  - id: limit-und-join
+    type: output
+    title: Zwei Mitglieder pro Seite
+    prompt: |
+      Die Mitgliederliste zeigt zwei Mitglieder pro Seite, jedes mit allen Buchungen. Die erste Abfrage hat jemand von Hand geschrieben, die zweite entspricht dem, was SQLAlchemy für `joinedload(Mitglied.buchungen)` mit `.limit(2)` erzeugt. Was geben beide aus? Ausgabe wie `psql -At`: Werte durch `|` getrennt, `NULL` leer; die Ergebnisse stehen direkt untereinander.
+    lang: postgres
+    code: |
+      CREATE TABLE mitglieder (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name text NOT NULL);
+      CREATE TABLE buchungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        mitglied_id int NOT NULL REFERENCES mitglieder (id)
+      );
+      INSERT INTO mitglieder (name) VALUES ('Jana Richter'), ('Mehmet Yılmaz'), ('Lea Hoffmann');
+      INSERT INTO buchungen (mitglied_id) VALUES (1), (1), (2);
+
+      SELECT m.name, b.id
+      FROM mitglieder AS m
+      LEFT JOIN buchungen AS b ON b.mitglied_id = m.id
+      ORDER BY m.id, b.id
+      LIMIT 2;
+
+      SELECT m.name, b.id
+      FROM (SELECT id, name FROM mitglieder ORDER BY id LIMIT 2) AS m
+      LEFT JOIN buchungen AS b ON b.mitglied_id = m.id
+      ORDER BY m.id, b.id;
+    expected: |
+      Jana Richter|1
+      Jana Richter|2
+      Jana Richter|1
+      Jana Richter|2
+      Mehmet Yılmaz|3
+    hints:
+      - Worauf wirkt `LIMIT 2` in der ersten Abfrage – auf Mitglieder oder auf Zeilen des Joins?
+      - Wie viele Zeilen erzeugt Jana Richter im Join?
+    explanation: |
+      `LIMIT` begrenzt Zeilen des Ergebnisses, nicht Mitglieder. Nach dem Join hat Jana Richter zwei Zeilen, und die erste Abfrage endet nach ihr – Mehmet Yılmaz fehlt auf Seite 1, obwohl er dorthin gehört. Die zweite Abfrage begrenzt zuerst die Mitglieder in einer Unterabfrage und verbindet erst dann. Genau so baut SQLAlchemy die Abfrage, wenn `joinedload` auf eine Sammlung und `limit()` zusammenkommen: `FROM (SELECT … FROM mitglieder ORDER BY mitglieder.id LIMIT …) AS anon_1 LEFT OUTER JOIN buchungen …`. Für Seiten mit Sammlungen ist `selectinload` meist einfacher: Die erste Abfrage begrenzt die Mitglieder, die zweite holt deren Buchungen.
+    resources:
+      - title: SQLAlchemy 2.1 · The Zen of Joined Eager Loading
+        url: https://docs.sqlalchemy.org/en/21/orm/queryguide/relationships.html#the-zen-of-joined-eager-loading
+      - title: PostgreSQL · LIMIT und OFFSET
+        url: https://www.postgresql.org/docs/current/queries-limit.html
+
+  - id: buchungsliste-mit-join
+    type: sql
+    lang: postgres
+    title: „Meine Buchungen“ in einer Abfrage
+    prompt: |
+      Die Seite „Meine Buchungen“ zeigt für Jana Richter (`mitglied_id = 1`) ihre **bestätigten** Buchungen mit Raum- und Standortname. Bisher lädt die App die Buchungen und dann je Buchung Raum und Standort einzeln. Schreibe die eine Abfrage, die alles liefert.
+
+      Spalten: `id`, `beginn`, `raum` (Name des Raums), `standort` (Name des Standorts), `preis`. Sortierung: `beginn` aufsteigend, bei gleichem Beginn `id` aufsteigend.
+    schema: |
+      CREATE TABLE standorte (
+        id    int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        name  text NOT NULL UNIQUE,
+        stadt text NOT NULL DEFAULT 'Leipzig'
+      );
+      CREATE TABLE raeume (
+        id               int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        standort_id      int NOT NULL REFERENCES standorte (id),
+        name             text NOT NULL,
+        art              text NOT NULL CHECK (art IN ('schreibtisch', 'meetingraum', 'telefonbox')),
+        plaetze          int NOT NULL CHECK (plaetze > 0),
+        preis_pro_stunde numeric(8,2) NOT NULL CHECK (preis_pro_stunde >= 0),
+        UNIQUE (standort_id, name)
+      );
+      CREATE TABLE mitglieder (
+        id    int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        email text NOT NULL UNIQUE,
+        name  text NOT NULL,
+        tarif text NOT NULL DEFAULT 'flex'
+      );
+      CREATE TABLE buchungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        raum_id     int NOT NULL REFERENCES raeume (id),
+        mitglied_id int NOT NULL REFERENCES mitglieder (id),
+        beginn      timestamptz NOT NULL,
+        ende        timestamptz NOT NULL,
+        status      text NOT NULL DEFAULT 'bestaetigt',
+        preis       numeric(8,2),
+        CHECK (ende > beginn)
+      );
+      INSERT INTO standorte (name) VALUES ('Plagwitz'), ('Südvorstadt'), ('Zentrum');
+      INSERT INTO raeume (standort_id, name, art, plaetze, preis_pro_stunde) VALUES
+        (1, 'Atelier', 'meetingraum', 8, 35),
+        (1, 'Box 1', 'telefonbox', 1, 6),
+        (2, 'Loft', 'meetingraum', 12, 48),
+        (3, 'Studio', 'meetingraum', 6, 30),
+        (3, 'Box 2', 'telefonbox', 1, 6);
+      INSERT INTO mitglieder (email, name, tarif) VALUES
+        ('jana.richter@example.org', 'Jana Richter', 'fix'),
+        ('mehmet.yilmaz@example.org', 'Mehmet Yılmaz', 'flex'),
+        ('lea.hoffmann@example.org', 'Lea Hoffmann', 'team');
+      INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, status, preis) VALUES
+        (3, 1, '2026-03-03 14:00+01', '2026-03-03 15:00+01', 'bestaetigt', 48),
+        (1, 1, '2026-03-02 09:00+01', '2026-03-02 11:00+01', 'bestaetigt', 70),
+        (2, 1, '2026-03-02 09:00+01', '2026-03-02 09:30+01', 'bestaetigt', 3),
+        (4, 1, '2026-03-05 10:00+01', '2026-03-05 12:00+01', 'storniert', 60),
+        (1, 2, '2026-03-02 13:00+01', '2026-03-02 14:00+01', 'bestaetigt', 35),
+        (3, 3, '2026-03-04 09:00+01', '2026-03-04 12:00+01', 'bestaetigt', 144),
+        (5, 1, '2026-03-30 08:00+02', '2026-03-30 08:30+02', 'bestaetigt', NULL),
+        (4, 2, '2026-03-30 09:00+02', '2026-03-30 10:00+02', 'storniert', 30);
+    starter: |
+      SELECT id, raum_id, beginn, preis
+      FROM buchungen
+      WHERE mitglied_id = 1;
+    solution: |
+      SELECT b.id, b.beginn, r.name AS raum, s.name AS standort, b.preis
+      FROM buchungen AS b
+      JOIN raeume AS r ON r.id = b.raum_id
+      JOIN standorte AS s ON s.id = r.standort_id
+      WHERE b.mitglied_id = 1
+        AND b.status = 'bestaetigt'
+      ORDER BY b.beginn, b.id;
+    ordered: true
+    hints:
+      - Von `buchungen` führt `raum_id` zu `raeume`, von dort `standort_id` zu `standorte`. Beide Joins gehen in Richtung „1“.
+      - Buchung 2 und 3 beginnen gleichzeitig. Ohne zweites Sortierkriterium ist ihre Reihenfolge nicht festgelegt.
+      - "`JOIN raeume AS r ON r.id = b.raum_id JOIN standorte AS s ON s.id = r.standort_id`, dann `WHERE b.mitglied_id = 1 AND b.status = 'bestaetigt'` und `ORDER BY b.beginn, b.id`."
+    explanation: |
+      Das ist die Abfrage, die `joinedload(Buchung.raum).joinedload(Raum.standort)` oder in Prisma `include: { raum: { include: { standort: true } } }` mit Join-Strategie im Kern erzeugt: zwei n:1-Joins, deshalb kein Fan-out, genau eine Zeile je Buchung. Ein `INNER JOIN` reicht, weil `raum_id` und `standort_id` `NOT NULL` sind und Fremdschlüssel haben – jede Buchung findet ihren Raum. Die Gratisbuchung in Box 2 hat `NULL` als Preis und bleibt trotzdem im Ergebnis; nur die stornierte Buchung 4 fällt weg. Buchung 2 und 3 beginnen beide am 2. März um 9 Uhr, erst `id` macht die Reihenfolge eindeutig.
+    resources:
+      - title: PostgreSQL · Joined Tables
+        url: https://www.postgresql.org/docs/current/queries-table-expressions.html#QUERIES-JOIN
+      - title: SQLAlchemy 2.1 · Joined Eager Loading
+        url: https://docs.sqlalchemy.org/en/21/orm/queryguide/relationships.html#joined-eager-loading
+
+  - id: zaehlen-statt-laden
+    type: sql
+    lang: postgres
+    title: Zählen statt len()
+    prompt: |
+      Die Mitgliederübersicht zeigt je Mitglied die Zahl der **bestätigten** Buchungen, die im **März 2026** beginnen (Berliner Zeit). Bisher steht dort `len(m.buchungen)` – das lädt alle Buchungen jedes Mitglieds und zählt auch stornierte und andere Monate. Schreibe die eine Abfrage, die die Datenbank zählen lässt. Mitglieder ohne passende Buchung erscheinen mit `0`.
+
+      Spalten: `name`, `buchungen`. Sortierung: `buchungen` absteigend, bei Gleichstand `name` aufsteigend.
+    schema: |
+      CREATE TABLE mitglieder (
+        id    int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        email text NOT NULL UNIQUE,
+        name  text NOT NULL
+      );
+      CREATE TABLE buchungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        raum_id     int NOT NULL,
+        mitglied_id int NOT NULL REFERENCES mitglieder (id),
+        beginn      timestamptz NOT NULL,
+        ende        timestamptz NOT NULL,
+        status      text NOT NULL DEFAULT 'bestaetigt'
+      );
+      INSERT INTO mitglieder (email, name) VALUES
+        ('jana.richter@example.org', 'Jana Richter'),
+        ('mehmet.yilmaz@example.org', 'Mehmet Yılmaz'),
+        ('lea.hoffmann@example.org', 'Lea Hoffmann'),
+        ('tobias.krueger@example.org', 'Tobias Krüger');
+      INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, status) VALUES
+        (1, 1, '2026-03-02 09:00+01', '2026-03-02 11:00+01', 'bestaetigt'),
+        (3, 1, '2026-03-03 14:00+01', '2026-03-03 15:00+01', 'bestaetigt'),
+        (3, 1, '2026-03-05 14:00+01', '2026-03-05 15:00+01', 'storniert'),
+        (2, 1, '2026-02-28 23:30+01', '2026-03-01 00:30+01', 'bestaetigt'),
+        (1, 2, '2026-03-01 00:15+01', '2026-03-01 01:00+01', 'bestaetigt'),
+        (4, 2, '2026-03-31 23:30+02', '2026-04-01 00:30+02', 'bestaetigt'),
+        (4, 4, '2026-04-01 00:30+02', '2026-04-01 01:30+02', 'bestaetigt'),
+        (5, 3, '2026-03-12 10:00+01', '2026-03-12 11:00+01', 'storniert'),
+        (2, 4, '2026-03-30 08:00+02', '2026-03-30 08:30+02', 'bestaetigt');
+    starter: |
+      SELECT m.name, count(*) AS buchungen
+      FROM mitglieder AS m
+      JOIN buchungen AS b ON b.mitglied_id = m.id
+      GROUP BY m.id, m.name;
+    solution: |
+      SELECT m.name, count(b.id) AS buchungen
+      FROM mitglieder AS m
+      LEFT JOIN buchungen AS b
+        ON b.mitglied_id = m.id
+       AND b.status = 'bestaetigt'
+       AND b.beginn >= '2026-03-01'
+       AND b.beginn < '2026-04-01'
+      GROUP BY m.id, m.name
+      ORDER BY buchungen DESC, m.name;
+    ordered: true
+    hints:
+      - Lea Hoffmann hat im März nur eine stornierte Buchung. Damit sie mit `0` erscheint, darf der Statusfilter sie nicht aus dem Ergebnis werfen.
+      - Bedingungen an die rechte Tabelle eines `LEFT JOIN` gehören ins `ON`. Zähle eine Spalte der rechten Tabelle, nicht `*`.
+      - "Halboffenes Intervall: `b.beginn >= '2026-03-01' AND b.beginn < '2026-04-01'`. Die Literale gelten in der Zeitzone der Sitzung, hier `Europe/Berlin`."
+    explanation: |
+      Das ist das SQL hinter Prismas `_count` mit Filter oder hinter `select(Mitglied.name, func.count(Buchung.id)).outerjoin(…)`: Die Datenbank zählt, die App bekommt eine Zeile je Mitglied. `LEFT JOIN` hält Mitglieder ohne passende Buchung im Ergebnis, `count(b.id)` zählt für sie 0 statt 1. Status und Zeitraum stehen im `ON`, sonst würden Lea Hoffmann (nur storniert) und jedes Mitglied ohne März-Buchung wieder verschwinden. Das halboffene Intervall `>= '2026-03-01' AND < '2026-04-01'` erwischt die Grenzfälle: Mehmet Yılmaz' Buchungen um 0:15 Uhr am 1. März und um 23:30 Uhr am 31. März zählen, Tobias Krügers Buchung um 0:30 Uhr am 1. April nicht, Janas Buchung, die am 28. Februar um 23:30 Uhr beginnt, auch nicht. Rechnest du die Grenzen versehentlich in UTC, verschieben sich genau diese Fälle. Ein `BETWEEN '2026-03-01' AND '2026-03-31'` verliert alles, was am 31. März nach Mitternacht beginnt. Ergebnis: Jana Richter 2, Mehmet Yılmaz 2, Tobias Krüger 1, Lea Hoffmann 0.
+    resources:
+      - title: PostgreSQL · Aggregate Functions (count)
+        url: https://www.postgresql.org/docs/current/functions-aggregate.html
+      - title: Prisma ORM 7 · Count relations
+        url: https://www.prisma.io/docs/orm/v7/prisma-client/queries/aggregation-grouping-summarizing#count-relations
+
+  - id: preise-in-einer-anweisung
+    type: sql
+    lang: postgres
+    title: Neue Preise ohne Schleife
+    prompt: |
+      Der Stundenpreis des Lofts steigt zum 1. April 2026 auf 52,00 Euro; `raeume` enthält den neuen Preis schon. Alle **bestätigten** Loft-Buchungen, die **am oder nach dem 1. April 2026** (Berliner Zeit) beginnen, sollen neu berechnet werden: `preis` = Dauer in Stunden × Stundenpreis des Raums, auf zwei Nachkommastellen gerundet. Das Python-Backend lädt bisher jede Buchung und setzt `b.preis` einzeln. Schreibe stattdessen **eine** `UPDATE`-Anweisung, die die geänderten Buchungen zurückgibt.
+
+      Rückgabe mit `RETURNING`: Spalten `id` und `preis`. Die Reihenfolge der Zeilen spielt keine Rolle.
+    schema: |
+      CREATE TABLE raeume (
+        id               int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        name             text NOT NULL,
+        preis_pro_stunde numeric(8,2) NOT NULL
+      );
+      CREATE TABLE buchungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        raum_id     int NOT NULL REFERENCES raeume (id),
+        mitglied_id int NOT NULL,
+        beginn      timestamptz NOT NULL,
+        ende        timestamptz NOT NULL,
+        status      text NOT NULL DEFAULT 'bestaetigt',
+        preis       numeric(8,2)
+      );
+      INSERT INTO raeume (name, preis_pro_stunde) VALUES ('Atelier', 35), ('Loft', 52), ('Studio', 30);
+      INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, status, preis) VALUES
+        (2, 1, '2026-03-12 09:00+01', '2026-03-12 10:00+01', 'bestaetigt', 48),
+        (2, 2, '2026-03-31 23:30+02', '2026-04-01 00:30+02', 'bestaetigt', 48),
+        (2, 3, '2026-04-01 00:00+02', '2026-04-01 01:00+02', 'bestaetigt', 48),
+        (2, 1, '2026-04-07 09:00+02', '2026-04-07 10:30+02', 'bestaetigt', 72),
+        (2, 2, '2026-04-09 14:00+02', '2026-04-09 14:45+02', 'bestaetigt', 36),
+        (2, 3, '2026-04-10 09:00+02', '2026-04-10 12:00+02', 'storniert', 144),
+        (1, 1, '2026-04-07 09:00+02', '2026-04-07 11:00+02', 'bestaetigt', 70),
+        (3, 2, '2026-04-14 13:00+02', '2026-04-14 15:00+02', 'bestaetigt', 60);
+    starter: |
+      SELECT b.id, b.preis
+      FROM buchungen AS b
+      WHERE b.raum_id = 2;
+    solution: |
+      UPDATE buchungen AS b
+      SET preis = round(extract(epoch FROM b.ende - b.beginn) / 3600 * r.preis_pro_stunde, 2)
+      FROM raeume AS r
+      WHERE r.id = b.raum_id
+        AND r.name = 'Loft'
+        AND b.status = 'bestaetigt'
+        AND b.beginn >= '2026-04-01'
+      RETURNING b.id, b.preis;
+    hints:
+      - "`UPDATE buchungen AS b … FROM raeume AS r WHERE r.id = b.raum_id` verbindet die Tabellen wie ein Join."
+      - "`extract(epoch FROM b.ende - b.beginn)` liefert die Dauer in Sekunden."
+      - "`SET preis = round(extract(epoch FROM b.ende - b.beginn) / 3600 * r.preis_pro_stunde, 2)`, gefiltert auf Loft, `bestaetigt` und `b.beginn >= '2026-04-01'`; am Ende `RETURNING b.id, b.preis`."
+    explanation: |
+      `UPDATE … FROM` verbindet die zu ändernden Zeilen mit einer zweiten Tabelle; die Bedingung im `WHERE` wirkt wie ein Join. So rechnet die Datenbank alle Preise in einer Anweisung, ohne dass eine Zeile in die App wandert. `RETURNING` gibt zurück, was sich geändert hat – das braucht die App für Benachrichtigungen, und SQLAlchemy nutzt es, um geladene Objekte nachzuziehen. Die Fallen: Die Buchung, die am 31. März um 23:30 Uhr beginnt, bleibt beim alten Preis; die um Mitternacht des 1. April beginnende zählt dazu. Die Stornierung und die Buchungen in Atelier und Studio bleiben unverändert. Ergebnis: Buchung 3 kostet 52.00, Buchung 4 (90 Minuten) 78.00, Buchung 5 (45 Minuten) 39.00.
+    resources:
+      - title: PostgreSQL · UPDATE
+        url: https://www.postgresql.org/docs/current/sql-update.html
+      - title: SQLAlchemy 2.1 · ORM UPDATE and DELETE with Custom WHERE Criteria
+        url: https://docs.sqlalchemy.org/en/21/orm/queryguide/dml.html#orm-update-and-delete-with-custom-where-criteria
+
+  - id: checkins-upsert
+    type: sql
+    lang: postgres
+    title: Zählen ohne Lesen
+    prompt: |
+      Bei jedem Check-in erhöht der Prisma-Dienst den Tageszähler des Standorts. Bisher liest er die Zeile mit `findUnique`, rechnet in TypeScript `+ 1` und schreibt mit `update` zurück – oder legt sie mit `create` an, wenn es sie noch nicht gibt. Bei zwei gleichzeitigen Check-ins geht dabei einer verloren.
+
+      Ersetze das durch **eine** Anweisung, die für den 2. März 2026 je einen Check-in an Standort 1 und an Standort 3 verbucht: Gibt es die Zeile, steigt `checkins` um 1, sonst entsteht sie mit `1`. Rückgabe mit `RETURNING`: Spalten `standort_id`, `tag`, `checkins`. Die Reihenfolge spielt keine Rolle.
+    schema: |
+      CREATE TABLE tagesstatistik (
+        standort_id int  NOT NULL,
+        tag         date NOT NULL,
+        checkins    int  NOT NULL CHECK (checkins >= 0),
+        PRIMARY KEY (standort_id, tag)
+      );
+      INSERT INTO tagesstatistik VALUES
+        (1, '2026-03-01', 12),
+        (1, '2026-03-02', 17),
+        (2, '2026-03-02', 9);
+    starter: |
+      SELECT standort_id, tag, checkins
+      FROM tagesstatistik
+      WHERE tag = '2026-03-02';
+    solution: |
+      INSERT INTO tagesstatistik (standort_id, tag, checkins)
+      VALUES (1, '2026-03-02', 1), (3, '2026-03-02', 1)
+      ON CONFLICT (standort_id, tag) DO UPDATE
+        SET checkins = tagesstatistik.checkins + EXCLUDED.checkins
+      RETURNING standort_id, tag, checkins;
+    hints:
+      - Das Konfliktziel ist der Primärschlüssel `(standort_id, tag)`.
+      - "`EXCLUDED.checkins` ist der Wert, der eingefügt werden sollte. Auf die bestehende Zeile greifst du mit dem Tabellennamen zu."
+      - "`ON CONFLICT (standort_id, tag) DO UPDATE SET checkins = tagesstatistik.checkins + EXCLUDED.checkins RETURNING standort_id, tag, checkins`."
+    explanation: |
+      `INSERT … ON CONFLICT … DO UPDATE` entscheidet je Zeile in der Datenbank, ob eingefügt oder erhöht wird, und das atomar: Zwei gleichzeitige Check-ins warten aufeinander, statt denselben alten Wert zu lesen. Standort 1 steigt von 17 auf 18, Standort 3 bekommt seine erste Zeile mit 1; Standort 2 und der 1. März bleiben unberührt. Prismas `upsert` mit `where: { standortId_tag: … }` und `update: { checkins: { increment: 1 } }` schickt für eine Zeile genau so ein `INSERT … ON CONFLICT … DO UPDATE`, weil es die Bedingungen für einen Database Upsert erfüllt. `MERGE` liefert hier dasselbe Ergebnis, hat aber diese Garantie nicht: Fügt eine zweite Sitzung die Zeile gleichzeitig ein, scheitert `MERGE` mit `unique_violation`, während `ON CONFLICT` auf die fremde Zeile umschwenkt und sie erhöht. Für mehrere Zeilen in einer Anweisung ist `$queryRaw` mit genau diesem SQL der direkte Weg.
+    resources:
+      - title: PostgreSQL · INSERT – ON CONFLICT Clause
+        url: https://www.postgresql.org/docs/current/sql-insert.html#SQL-ON-CONFLICT
+      - title: SQLAlchemy 2.1 · ORM “upsert” Statements
+        url: https://docs.sqlalchemy.org/en/21/orm/queryguide/dml.html#orm-upsert-statements
+
+  - id: lade-optionen-ergaenzen
+    type: gap
+    title: Logging, Eager Loading und Zählen
+    prompt: |
+      Ergänze das Repository des Deskwerk-Backends. Die Engine soll jede SQL-Anweisung ins Log schreiben. `buchungen_mit_raum` soll den Raum **im selben SELECT per Join** laden, `mitglieder_mit_buchungen` die Buchungen **in einer zweiten Abfrage mit `IN`**. `anzahl_buchungen` soll in der Datenbank zählen.
+    lang: python
+    code: |
+      engine = create_engine(DATABASE_URL, ⟦echo=True⟧)
+
+
+      def buchungen_mit_raum(session: Session, mitglied_id: int) -> list[Buchung]:
+          stmt = (
+              select(Buchung)
+              .options(⟦joinedload⟧(Buchung.raum))
+              .where(Buchung.mitglied_id == mitglied_id)
+              .order_by(Buchung.beginn)
+          )
+          return list(session.scalars(stmt))
+
+
+      def mitglieder_mit_buchungen(session: Session) -> list[Mitglied]:
+          stmt = select(Mitglied).options(⟦selectinload(Mitglied.buchungen)⟧).order_by(Mitglied.id)
+          return list(session.scalars(stmt))
+
+
+      def anzahl_buchungen(session: Session, mitglied_id: int) -> int:
+          stmt = select(⟦func.count()⟧).select_from(Buchung).where(Buchung.mitglied_id == mitglied_id)
+          return session.scalar(stmt)
+    gaps:
+      - label: SQL-Logging
+        hint: Ein Schlüsselwort-Argument von `create_engine`, das ausgeführte Anweisungen ausgibt.
+        accept: ["echo='debug'"]
+      - label: Laden per Join
+        hint: Die Ladestrategie, die einen `LEFT OUTER JOIN` in dieselbe Abfrage einbaut.
+      - label: Laden per IN
+        hint: Die Ladestrategie mit zweiter Abfrage, angewandt auf die Beziehung `Mitglied.buchungen`.
+      - label: Zählen
+        hint: Die SQL-Funktion `count` über das `func`-Objekt.
+        accept: ["func.count(Buchung.id)", "func.count(Buchung.mitglied_id)", "func.count('*')"]
+    explanation: |
+      `echo=True` gibt jede Anweisung mit ihren Parametern aus. `joinedload(Buchung.raum)` baut einen `LEFT OUTER JOIN raeume` ein – die richtige Wahl für eine n:1-Beziehung, weil jede Buchung genau einen Raum hat und keine Zeilen vervielfacht werden. `selectinload(Mitglied.buchungen)` schickt nach der Mitgliederabfrage eine zweite mit `WHERE buchungen.mitglied_id IN (…)`; für Sammlungen ist das die empfohlene Strategie, weil die erste Abfrage unverändert bleibt und `LIMIT` darin weiter Mitglieder zählt. `select(func.count()).select_from(Buchung)` wird zu `SELECT count(*) AS count_1 FROM buchungen WHERE …` und lädt keine einzige Buchung.
+    resources:
+      - title: SQLAlchemy 2.1 · Select IN loading
+        url: https://docs.sqlalchemy.org/en/21/orm/queryguide/relationships.html#select-in-loading
+
+  - id: suche-mit-unsafe
+    type: bug
+    title: Die Suche findet zu viel
+    prompt: |
+      Ein Pentest meldet: Sucht man im Prisma-Dienst nach `' OR ''='`, liefert `sucheMitglieder` alle Mitglieder; mit `' UNION SELECT …` lassen sich andere Tabellen auslesen. Finde die Zeile mit der Lücke und korrigiere sie so, dass die Eingabe als Parameter an PostgreSQL geht. Das Muster mit `%` bleibt.
+    lang: typescript
+    code: |
+      export async function sucheMitglieder(begriff: string) {
+        const muster = `%${begriff}%`;
+        return prisma.$queryRawUnsafe<{ id: number; name: string }[]>(
+          `SELECT id, name FROM mitglieder WHERE name ILIKE '${muster}' ORDER BY name`,
+        );
+      }
+    lines: [4]
+    fix:
+      - line: 4
+        answers:
+          - "`SELECT id, name FROM mitglieder WHERE name ILIKE $1 ORDER BY name`, muster,"
+          - "`SELECT id, name FROM mitglieder WHERE name ILIKE $1 ORDER BY name`, muster"
+          - "\"SELECT id, name FROM mitglieder WHERE name ILIKE $1 ORDER BY name\", muster,"
+          - "\"SELECT id, name FROM mitglieder WHERE name ILIKE $1 ORDER BY name\", muster"
+    hints:
+      - In welcher Zeile wird die Eingabe Teil des SQL-Textes?
+      - "`$queryRawUnsafe(sql, ...werte)` nimmt Werte als weitere Argumente und bindet sie an `$1`, `$2` …"
+    explanation: |
+      Der Template-String in Zeile 4 setzt `muster` in den SQL-Text ein, bevor Prisma ihn sieht – mit `' OR ''='` endet das Hochkomma vorzeitig und `OR` wird Teil der Bedingung. `$queryRawUnsafe` bindet nur Werte, die als weitere Argumente kommen: Mit `ILIKE $1` und `muster` als zweitem Argument geht der Text getrennt als Parameter an PostgreSQL. Gleichwertig und lesbarer ist ``prisma.$queryRaw`SELECT … WHERE name ILIKE ${muster} ORDER BY name` `` als Tagged Template. Ein Rest bleibt: `%` und `_` in der Eingabe wirken in `ILIKE` weiter als Platzhalter – das ist keine Injection, aber eine Suche nach `%` findet alles. Wer das nicht will, maskiert sie vorher.
+    resources:
+      - title: Prisma ORM 7 · $queryRawUnsafe
+        url: https://www.prisma.io/docs/orm/v7/prisma-client/using-raw-sql/raw-queries#queryrawunsafe
+      - title: Prisma ORM 7 · Parameterized queries
+        url: https://www.prisma.io/docs/orm/v7/prisma-client/using-raw-sql/raw-queries#parameterized-queries
+
+  - id: sortierung-aus-der-url
+    type: bug
+    title: Sortieren nach Belieben
+    prompt: |
+      `GET /buchungen?sortierung=beginn` gibt die Buchungen eines Mitglieds sortiert zurück. Ein Sicherheitsscan schickt `sortierung=(CASE WHEN (SELECT tarif FROM mitglieder WHERE id = 7) = 'fix' THEN beginn ELSE preis END)` und kann an der Reihenfolge ablesen, welchen Tarif Mitglied 7 hat. Finde die Zeile mit der Lücke und korrigiere sie. Erlaubt sind nur die Sortierungen aus `SPALTEN`.
+    lang: python
+    code: |
+      SPALTEN = {"beginn": Buchung.beginn, "preis": Buchung.preis, "raum": Buchung.raum_id}
+
+
+      def buchungen_sortiert(session: Session, mitglied_id: int, sortierung: str) -> list[Buchung]:
+          stmt = (
+              select(Buchung)
+              .where(Buchung.mitglied_id == mitglied_id)
+              .order_by(text(sortierung))
+          )
+          return list(session.scalars(stmt))
+    lines: [8]
+    fix:
+      - line: 8
+        answers:
+          - ".order_by(SPALTEN[sortierung])"
+          - ".order_by(SPALTEN.get(sortierung, Buchung.beginn))"
+          - ".order_by(SPALTEN[sortierung].asc())"
+    hints:
+      - Welche Zeile übernimmt Text aus der URL unverändert ins SQL?
+      - Ein Spaltenname lässt sich nicht als Parameter binden. Was steht schon fertig im Code?
+    explanation: |
+      `text(sortierung)` übernimmt die Eingabe als SQL-Text in das `ORDER BY`. Damit kann ein Angreifer beliebige Ausdrücke einschleusen, auch Unterabfragen, und Daten über die Sortierung auslesen. Ein gebundener Parameter hilft hier nicht: `ORDER BY $1` sortiert nach einem konstanten Wert. Die Lösung ist eine feste Zuordnung von erlaubten Werten zu Spalten, wie sie `SPALTEN` schon enthält. `SPALTEN[sortierung]` wirft bei unbekannten Werten einen `KeyError`, den der Endpunkt in ein HTTP 400 übersetzt; `SPALTEN.get(…, Buchung.beginn)` fällt stattdessen auf eine Standardsortierung zurück.
+    resources:
+      - title: SQLAlchemy 2.1 · text()
+        url: https://docs.sqlalchemy.org/en/21/core/sqlelement.html#sqlalchemy.sql.expression.text
+      - title: PostgreSQL · SELECT – ORDER BY
+        url: https://www.postgresql.org/docs/current/sql-select.html#SQL-ORDERBY
+
+  - id: log-lesen
+    type: explain
+    title: Was steht in diesem Log?
+    prompt: |
+      Ein Kollege schickt dir dieses Log der Seite „Standorte“ mit der Frage, warum sie langsam ist. Erkläre, welcher Code es vermutlich erzeugt hat, was das Problem ist, wie viele Abfragen bei 40 Räumen entstehen und wie du es behebst – einschließlich des SQL, das danach im Log stehen sollte.
+    lang: text
+    code: |
+      BEGIN (implicit)
+      SELECT raeume.id, raeume.standort_id, raeume.name, raeume.art, raeume.plaetze, raeume.preis_pro_stunde
+      FROM raeume ORDER BY raeume.name
+      [generated in 0.00012s] {}
+      SELECT buchungen.id, buchungen.raum_id, buchungen.mitglied_id, buchungen.beginn, buchungen.ende, buchungen.status, buchungen.preis
+      FROM buchungen
+      WHERE %(param_1)s::INTEGER = buchungen.raum_id
+      [generated in 0.00009s] {'param_1': 1}
+      SELECT buchungen.id, buchungen.raum_id, buchungen.mitglied_id, buchungen.beginn, buchungen.ende, buchungen.status, buchungen.preis
+      FROM buchungen
+      WHERE %(param_1)s::INTEGER = buchungen.raum_id
+      [cached since 0.001087s ago] {'param_1': 2}
+      SELECT buchungen.id, buchungen.raum_id, buchungen.mitglied_id, buchungen.beginn, buchungen.ende, buchungen.status, buchungen.preis
+      FROM buchungen
+      WHERE %(param_1)s::INTEGER = buchungen.raum_id
+      [cached since 0.001577s ago] {'param_1': 3}
+      SELECT buchungen.id, buchungen.raum_id, buchungen.mitglied_id, buchungen.beginn, buchungen.ende, buchungen.status, buchungen.preis
+      FROM buchungen
+      WHERE %(param_1)s::INTEGER = buchungen.raum_id
+      [cached since 0.002064s ago] {'param_1': 4}
+      ROLLBACK
+    points:
+      - Der Code lädt alle Räume und greift dann in einer Schleife auf eine lazy geladene Sammlung wie `raum.buchungen` zu.
+      - Das ist N+1 – dieselbe Anweisung wiederholt sich mit wechselndem Parameter (`cached since`); bei 40 Räumen sind es 41 Abfragen.
+      - "Abhilfe ist `selectinload(Raum.buchungen)` (oder `include` in Prisma); dann folgt auf die Raumabfrage genau eine zweite mit `WHERE buchungen.raum_id IN (…)`."
+      - Braucht die Seite nur Zahlen, ist eine Abfrage mit `LEFT JOIN`, `count` und `GROUP BY` besser als das Laden aller Buchungen.
+    explanation: |
+      Die erste Abfrage lädt alle Räume, sortiert nach Name. Danach kommt für jeden Raum dieselbe Anweisung `… WHERE %(param_1)s::INTEGER = buchungen.raum_id` mit einer anderen Raum-ID; `cached since` zeigt, dass SQLAlchemy sie nur einmal übersetzt und dann wiederverwendet hat. Das ist das Muster eines Lazy Loads einer Sammlung, etwa `for raum in raeume: len(raum.buchungen)` im Code oder im Template. Bei 40 Räumen sind das 41 Abfragen, und mit jedem neuen Raum eine mehr. Mit `select(Raum).options(selectinload(Raum.buchungen))` stehen nur noch zwei Anweisungen im Log: die Raumabfrage und `SELECT … FROM buchungen WHERE buchungen.raum_id IN (…)`. Zeigt die Seite nur, wie viele Buchungen ein Raum hat, lädt man besser gar keine Buchungsobjekte, sondern lässt die Datenbank mit `LEFT JOIN … GROUP BY` zählen.
+    resources:
+      - title: SQLAlchemy 2.1 · Preventing unwanted lazy loads using raiseload
+        url: https://docs.sqlalchemy.org/en/21/orm/queryguide/relationships.html#preventing-unwanted-lazy-loads-using-raiseload
+
+  - id: http-in-der-transaktion
+    type: explain
+    title: Bezahlen mit offener Transaktion
+    prompt: |
+      An Monatsenden hängt das Deskwerk-Backend minutenlang, im Log stehen `QueuePool limit of size 5 overflow 10 reached` und Timeouts des Zahlungsdienstes. Erkläre, was dieser Endpunkt mit Verbindung, Transaktion und Sperre macht, warum das an Monatsenden kippt und wie du ihn umbaust.
+    lang: python
+    code: |
+      @app.post("/rechnungen/{rechnung_id}/bezahlen")
+      def bezahlen(rechnung_id: int):
+          with SessionLocal.begin() as session:
+              rechnung = session.get(Rechnung, rechnung_id, with_for_update=True)
+              zahlung = zahlungsdienst.belasten(rechnung.mitglied_id, rechnung.betrag)  # HTTP, 0,2 bis 30 s
+              rechnung.bezahlt_am = datetime.now(timezone.utc)
+              session.add(Zahlung(rechnung_id=rechnung.id, referenz=zahlung.referenz))
+    points:
+      - "`session.get(…, with_for_update=True)` beginnt die Transaktion, nimmt eine Verbindung aus dem Pool und sperrt die Rechnungszeile mit `SELECT … FOR UPDATE`."
+      - Während des HTTP-Aufrufs bleiben Verbindung, Transaktion und Zeilensperre bestehen; die Verbindung steht in `pg_stat_activity` als `idle in transaction`.
+      - Ist der Zahlungsdienst langsam, sind schnell alle 15 Verbindungen belegt, und auch Requests ohne Bezug zur Zahlung warten 30 Sekunden auf den Pool.
+      - Scheitert der Commit nach erfolgreicher Belastung, ist Geld abgebucht, aber nichts gespeichert. Der Aufruf gehört aus der Transaktion heraus, abgesichert mit Status und Idempotenzschlüssel.
+    explanation: |
+      `SessionLocal.begin()` öffnet noch nichts; erst `session.get(…, with_for_update=True)` holt eine Verbindung aus dem Pool, beginnt die Transaktion und schickt `SELECT … FOR UPDATE`. Ab hier sind Verbindung und Zeilensperre belegt, bis der `with`-Block mit `COMMIT` endet. Dazwischen wartet der Code auf den Zahlungsdienst – in `pg_stat_activity` steht die Verbindung als `idle in transaction`. An Monatsenden bezahlen viele gleichzeitig, der Dienst antwortet langsam, und nach 15 hängenden Zahlungen ist der Pool leer: Jeder weitere Request, auch „Meine Buchungen“, wartet 30 Sekunden und scheitert. Dazu kommt ein Konsistenzproblem: Belastung und Commit sind nicht atomar. Besser in drei Schritten: In einer kurzen Transaktion die Rechnung auf „Zahlung läuft“ setzen und einen Idempotenzschlüssel speichern, dann ohne offene Transaktion den Zahlungsdienst mit diesem Schlüssel aufrufen, dann in einer zweiten kurzen Transaktion `bezahlt_am` und die Referenz speichern. Bricht etwas dazwischen ab, kann ein Hintergrundjob mit demselben Schlüssel nachfragen, ohne doppelt abzubuchen.
+    resources:
+      - title: SQLAlchemy 2.1 · When do I construct a Session, when do I commit it, and when do I close it?
+        url: https://docs.sqlalchemy.org/en/21/orm/session_basics.html#when-do-i-construct-a-session-when-do-i-commit-it-and-when-do-i-close-it
+      - title: PostgreSQL · idle_in_transaction_session_timeout
+        url: https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-IDLE-IN-TRANSACTION-SESSION-TIMEOUT
+
+  - id: standortuebersicht-umbauen
+    type: practice
+    title: Die Standortübersicht reparieren
+    prompt: |
+      Der Prisma-Dienst liefert für das Dashboard je Raum eines Standorts die Zahl der bestätigten Buchungen und den Umsatz daraus. Bei Plagwitz mit 25 Räumen und 8 000 Buchungen braucht der Endpunkt mehrere Sekunden.
+
+      ```typescript
+      export async function standortUebersicht(standortId: number) {
+        const raeume = await prisma.raum.findMany({ where: { standortId }, orderBy: { name: "asc" } });
+        const zeilen = [];
+        for (const raum of raeume) {
+          const buchungen = await prisma.buchung.findMany({ where: { raumId: raum.id } });
+          const bestaetigt = buchungen.filter((b) => b.status === "bestaetigt");
+          const umsatz = bestaetigt.reduce((summe, b) => summe + Number(b.preis ?? 0), 0);
+          zeilen.push({ raum: raum.name, buchungen: bestaetigt.length, umsatz });
+        }
+        return zeilen;
+      }
+      ```
+
+      Schreibe die Funktion so um, dass die Datenbank zählt und summiert und der Endpunkt unabhängig von der Zahl der Räume genau eine Abfrage schickt. Räume ohne Buchung erscheinen mit 0. Gib den Umsatz als exakten Dezimalwert zurück, nicht als `number`.
+    lang: typescript
+    starter: |
+      export async function standortUebersicht(standortId: number) {
+        // eine Abfrage, Zählung und Summe in PostgreSQL
+      }
+    solution: |
+      import { Prisma } from "./generated/prisma/client";
+
+      type Zeile = { raum: string; buchungen: number; umsatz: Prisma.Decimal };
+
+      export async function standortUebersicht(standortId: number): Promise<Zeile[]> {
+        return prisma.$queryRaw<Zeile[]>`
+          SELECT r.name AS raum,
+                 count(b.id)::int AS buchungen,
+                 coalesce(sum(b.preis), 0) AS umsatz
+          FROM raeume AS r
+          LEFT JOIN buchungen AS b
+            ON b.raum_id = r.id
+           AND b.status = 'bestaetigt'
+          WHERE r.standort_id = ${standortId}
+          GROUP BY r.id, r.name
+          ORDER BY r.name`;
+      }
+    checklist:
+      - Der Endpunkt schickt genau eine Abfrage, egal wie viele Räume der Standort hat.
+      - Der Statusfilter steht im `ON` des `LEFT JOIN`, und gezählt wird `b.id` – Räume ohne bestätigte Buchung erscheinen mit 0.
+      - Die Standort-ID geht als Parameter in die Abfrage (`${standortId}` im Tagged Template von `$queryRaw`), nicht per String-Verkettung.
+      - "`count` ist auf `int` gecastet oder wird als `bigint` behandelt; der Umsatz bleibt `Prisma.Decimal` statt `Number(…)`."
+      - Die Sortierung nach Raumname steht im SQL, nicht im TypeScript.
+    explanation: |
+      Der ursprüngliche Code hat zwei Probleme: N+1 (eine Abfrage für die Räume, dann eine je Raum) und zu viele Daten – er lädt alle 8 000 Buchungen mit allen Spalten in den Dienst, um sie dort zu filtern und zu summieren. Eine Abfrage mit `LEFT JOIN` und `GROUP BY` lässt PostgreSQL beides erledigen und schickt 25 Zeilen zurück. Bei `$queryRaw` liefert PostgreSQL `count(*)` als `bigint`, das Prisma als JavaScript-`BigInt` (`8n`) zurückgibt; der Cast `::int` macht daraus eine normale Zahl. Summen über `numeric` kommen als `Prisma.Decimal` an – `Number(…)` würde Cent-Beträge in Gleitkommazahlen verwandeln. Eine reine ORM-Lösung ist `prisma.buchung.groupBy({ by: ["raumId"], _count: { _all: true }, _sum: { preis: true }, … })` plus eine Raumabfrage; sie braucht zwei Abfragen und liefert Räume ohne Buchung nicht mit, die musst du im Code ergänzen.
+    resources:
+      - title: Prisma ORM 7 · Raw query type mapping
+        url: https://www.prisma.io/docs/orm/v7/prisma-client/using-raw-sql/raw-queries#raw-query-type-mapping
+      - title: Prisma ORM 7 · Aggregation, grouping, and summarizing
+        url: https://www.prisma.io/docs/orm/v7/prisma-client/queries/aggregation-grouping-summarizing

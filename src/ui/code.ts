@@ -1,9 +1,10 @@
-// Adds copy buttons, Rust Playground links, Python, pytest and SQL run buttons and "Im Terminal" for Linux commands to
-// rendered code blocks.
+// Adds copy buttons, Rust Playground links, Python, pytest, SQLite and PostgreSQL run buttons and "Im Terminal" for
+// Linux commands to rendered code blocks.
+import { onPgState, pgNotice, runPgScript } from '../pg/runner.ts';
 import { onRunnerState, runnerNotice, runPytest, runSnippet, runSqlScript, type SqlResultSet } from '../python/runner.ts';
 import { vmCommands } from '../vm/commands.ts';
 import { $$, escape, icons } from './dom.ts';
-import { rowCount, sqlTableMarkup } from './sql-table.ts';
+import { pgResultsMarkup, rowCount, sqlTableMarkup } from './sql-table.ts';
 
 export const playgroundUrl = (code: string) => `https://play.rust-lang.org/?version=stable&mode=debug&edition=2024&code=${encodeURIComponent(code)}`;
 
@@ -92,7 +93,7 @@ export function enhanceCode(root: ParentNode, terminal?: (commands: string) => v
       bar.append(link);
     }
     const language = block.dataset.run;
-    if (language === 'python' || language === 'pytest' || language === 'sql') {
+    if (language === 'python' || language === 'pytest' || language === 'sql' || language === 'postgres') {
       const editor = block.querySelector<HTMLTextAreaElement>('textarea')!;
       const original = editor.value;
       autosize(editor, 2);
@@ -115,7 +116,11 @@ export function enhanceCode(root: ParentNode, terminal?: (commands: string) => v
         output.className = 'run-output';
         output.textContent = 'Läuft …';
         try {
-          if (language === 'sql') {
+          if (language === 'postgres') {
+            const result = await runPgScript(editor.value, block.dataset.continue !== undefined);
+            output.classList.toggle('error', !!result.error);
+            output.innerHTML = pgResultsMarkup(result.results, result.error);
+          } else if (language === 'sql') {
             const result = await runSqlScript(editor.value);
             output.classList.toggle('error', !!result.error);
             output.innerHTML = sqlOutputMarkup(result.results, result.error);
@@ -137,7 +142,9 @@ export function enhanceCode(root: ParentNode, terminal?: (commands: string) => v
       run.addEventListener('click', execute);
       editorKeys(editor, execute);
       // Only the block that is running (or queued) shows the loading notice; other blocks keep their results.
-      cleanups.push(onRunnerState((state) => { if ((state === 'loading' || state === 'packages') && run.disabled) output.textContent = runnerNotice(state, ''); }));
+      cleanups.push(language === 'postgres'
+        ? onPgState((state) => { if (state === 'loading' && run.disabled) output.textContent = pgNotice(state, ''); })
+        : onRunnerState((state) => { if ((state === 'loading' || state === 'packages') && run.disabled) output.textContent = runnerNotice(state, ''); }));
       bar.append(reset, run);
     } else {
       bar.append(copyButton(() => codeOf(block)));

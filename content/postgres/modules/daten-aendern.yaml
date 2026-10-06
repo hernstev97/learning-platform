@@ -1,0 +1,1032 @@
+id: daten-aendern
+title: Daten ändern – RETURNING, Upsert und MERGE
+level: 2
+minutes: 150
+summary: Schreiben wie eine Anwendung – Zeilen anlegen und die erzeugten Werte mit RETURNING zurückbekommen, über mehrere Tabellen ändern und löschen, Upserts mit ON CONFLICT, Abgleiche mit MERGE und Datenumzüge in einer einzigen Anweisung statt in einer Schleife.
+goals:
+  - Du legst Zeilen mehrzeilig, mit `DEFAULT` und per `INSERT … SELECT` an und holst erzeugte Werte mit `RETURNING` zurück, so wie es ein ORM tut.
+  - Du änderst und löschst mit Bezug auf andere Tabellen (`UPDATE … FROM`, `DELETE … USING`) und sicherst Massenänderungen mit einer Transaktion ab.
+  - Du schreibst Upserts mit `ON CONFLICT … DO UPDATE` und `DO NOTHING` und erklärst, warum sie einen passenden Unique-Index brauchen und auch bei gleichzeitigen Zugriffen funktionieren.
+  - Du gleichst Tabellen mit `MERGE` ab und wählst begründet zwischen `MERGE` und `ON CONFLICT`.
+  - Du verschiebst und migrierst Daten mit datenverändernden CTEs und ersetzt Schleifen in der Anwendung durch eine Anweisung.
+resources:
+  - title: PostgreSQL · Returning Data from Modified Rows
+    url: https://www.postgresql.org/docs/current/dml-returning.html
+  - title: PostgreSQL · INSERT mit ON CONFLICT
+    url: https://www.postgresql.org/docs/current/sql-insert.html#SQL-ON-CONFLICT
+  - title: PostgreSQL · MERGE
+    url: https://www.postgresql.org/docs/current/sql-merge.html
+  - title: PostgreSQL · Data-Modifying Statements in WITH
+    url: https://www.postgresql.org/docs/current/queries-with.html#QUERIES-WITH-MODIFYING
+lesson: |
+  Der Abrechnungsjob von Deskwerk läuft am Ersten jedes Monats. Die erste Fassung war eine Python-Schleife: je Mitglied die Buchungen des Vormonats laden, summieren, nachsehen, ob es schon eine Rechnung gibt, dann `INSERT` oder `UPDATE`. Bei 900 Mitgliedern waren das rund 2 700 Abfragen. Als der Job nach einem Absturz neu gestartet wurde, liefen kurz zwei Instanzen gleichzeitig, und eine brach mit `duplicate key value violates unique constraint` ab. Halb abgerechnet, halb nicht.
+
+  Dieselbe Arbeit erledigt eine einzige Anweisung: `INSERT … SELECT … ON CONFLICT … DO UPDATE … RETURNING`. Dieses Modul baut sie Stück für Stück auf. Es geht um die Anweisungen, mit denen eine Anwendung schreibt, und um das, was ein ORM dafür an SQL erzeugt. Wie mehrere Anweisungen zu einer Einheit werden, behandelt [Transaktionen](/postgres/transaktionen), was bei gleichzeitigen Änderungen passiert, [Isolation und Sperren](/postgres/isolation-sperren).
+
+  ## INSERT und RETURNING: anlegen und zurückbekommen
+
+  Ein `INSERT` kann mehrere Zeilen auf einmal anlegen. Spalten, die du weglässt, bekommen ihren Standardwert, ebenso Spalten, für die du das Schlüsselwort `DEFAULT` schreibst. Mit `RETURNING` liefert die Anweisung die angelegten Zeilen zurück wie ein `SELECT`, einschließlich der Werte, die erst die Datenbank erzeugt hat ([PostgreSQL · Returning Data](https://www.postgresql.org/docs/current/dml-returning.html)):
+
+  ```postgres run
+  CREATE TABLE mitglieder (
+    id          int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email       text NOT NULL UNIQUE,
+    name        text NOT NULL,
+    tarif       text NOT NULL DEFAULT 'flex',
+    erstellt_am timestamptz NOT NULL DEFAULT now()
+  );
+
+  INSERT INTO mitglieder (email, name, tarif) VALUES
+    ('anna.schulz@example.org',  'Anna Schulz',  'fix'),
+    ('jonas.becker@example.org', 'Jonas Becker', DEFAULT)
+  RETURNING id, email, tarif;
+
+  INSERT INTO mitglieder (email, name)
+  VALUES ('leonie.wagner@example.org', 'Leonie Wagner')
+  RETURNING id, erstellt_am;
+  ```
+
+  Genau so arbeitet ein ORM. Legst du in SQLAlchemy ein `Mitglied` an und rufst `session.flush()` auf, schickt es ein `INSERT … RETURNING mitglieder.id` und trägt die ID ins Objekt ein; für viele Objekte bündelt es die Zeilen in mehrzeilige `INSERT`s ([SQLAlchemy · insertmanyvalues](https://docs.sqlalchemy.org/en/21/core/connections.html#engine-insertmanyvalues)). Auch Prismas `create` gibt den angelegten Datensatz samt ID zurück. Ohne `RETURNING` bräuchte die Anwendung eine zweite Abfrage und wüsste nicht sicher, welche Zeile ihre ist.
+
+  Zwei Details zu Standardwerten. Ein ausdrückliches `NULL` ist kein Weglassen: `INSERT … (tarif) VALUES (NULL)` setzt nicht `'flex'`, sondern scheitert an `NOT NULL`. Und eine Spalte mit `GENERATED ALWAYS AS IDENTITY` lehnt eigene Werte ab: `cannot insert a non-DEFAULT value into column "id"`. Für Datenimporte gibt es `OVERRIDING SYSTEM VALUE` ([PostgreSQL · INSERT](https://www.postgresql.org/docs/current/sql-insert.html)).
+
+  Statt `VALUES` darf jede Abfrage die Zeilen liefern. Der Abrechnungslauf wird damit zu einer Anweisung:
+
+  ```postgres run
+  CREATE TABLE buchungen (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    mitglied_id int NOT NULL,
+    beginn      timestamptz NOT NULL,
+    status      text NOT NULL DEFAULT 'bestaetigt',
+    preis       numeric(8,2)
+  );
+  CREATE TABLE rechnungen (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    mitglied_id int NOT NULL,
+    monat       date NOT NULL,
+    betrag      numeric(10,2) NOT NULL,
+    bezahlt_am  timestamptz,
+    UNIQUE (mitglied_id, monat)
+  );
+  INSERT INTO buchungen (mitglied_id, beginn, status, preis) VALUES
+    (1, '2026-03-02 09:00', 'bestaetigt', 96.00),
+    (1, '2026-03-09 14:00', 'bestaetigt',  3.00),
+    (2, '2026-03-04 10:00', 'storniert',  90.00),
+    (2, '2026-03-12 10:00', 'bestaetigt', 45.00),
+    (3, '2026-04-02 09:00', 'bestaetigt', 32.00);
+
+  INSERT INTO rechnungen (mitglied_id, monat, betrag)
+  SELECT mitglied_id, date '2026-03-01', sum(preis)
+  FROM buchungen
+  WHERE status = 'bestaetigt'
+    AND beginn >= '2026-03-01' AND beginn < '2026-04-01'
+  GROUP BY mitglied_id
+  RETURNING id, mitglied_id, betrag;
+  ```
+
+  Mitglied 1 bekommt 99.00, Mitglied 2 nur 45.00, weil die stornierte Buchung nicht zählt, Mitglied 3 nichts, weil seine Buchung im April liegt. Die Datenbank rechnet, die Anwendung bekommt das Ergebnis zurück.
+
+  > [!MERKE]
+  > `INSERT`, `UPDATE`, `DELETE` und `MERGE` können mit `RETURNING` Zeilen liefern wie ein `SELECT`. Seit PostgreSQL 18 auch den alten und den neuen Stand einer Zeile: `RETURNING old.preis, new.preis`.
+
+  ## UPDATE und DELETE über mehrere Tabellen
+
+  Ein `UPDATE` darf in `SET` mit dem alten Wert rechnen. `SET preis_pro_stunde = preis_pro_stunde * 1.05` liest und schreibt in einem Schritt, ohne dass die Anwendung den Wert vorher lädt. Das ist auch die Antwort auf das „Lost Update“, wenn zwei Prozesse gleichzeitig einen Zähler erhöhen ([Isolation und Sperren](/postgres/isolation-sperren)).
+
+  Braucht die Änderung Werte aus einer anderen Tabelle, nennt `UPDATE … FROM` diese Tabelle, und das `WHERE` verbindet sie mit dem Ziel wie ein Join ([PostgreSQL · UPDATE](https://www.postgresql.org/docs/current/sql-update.html)). Das Gegenstück beim Löschen heißt `DELETE … USING`.
+
+  ```postgres run
+  CREATE TABLE raeume (
+    id               int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name             text NOT NULL,
+    art              text NOT NULL,
+    preis_pro_stunde numeric(8,2) NOT NULL
+  );
+  CREATE TABLE buchungen (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    raum_id     int NOT NULL REFERENCES raeume (id),
+    mitglied_id int NOT NULL,
+    beginn      timestamptz NOT NULL,
+    ende        timestamptz NOT NULL,
+    status      text NOT NULL DEFAULT 'bestaetigt',
+    preis       numeric(8,2)
+  );
+  INSERT INTO raeume (name, art, preis_pro_stunde) VALUES
+    ('Atelier', 'meetingraum', 32.00), ('Loft', 'meetingraum', 45.00), ('Box 1', 'telefonbox', 6.00);
+  INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende) VALUES
+    (1, 1, '2026-03-02 09:00', '2026-03-02 12:00'),
+    (3, 2, '2026-03-02 14:00', '2026-03-02 14:30'),
+    (2, 1, '2026-04-07 10:00', '2026-04-07 12:00');
+
+  -- Preise erhöhen und alten wie neuen Wert zurückbekommen
+  UPDATE raeume
+  SET preis_pro_stunde = preis_pro_stunde * 1.05
+  WHERE art = 'meetingraum'
+  RETURNING name, old.preis_pro_stunde AS vorher, new.preis_pro_stunde AS nachher;
+
+  -- Fehlende Preise der März-Buchungen aus dem Raumpreis berechnen
+  UPDATE buchungen AS b
+  SET preis = r.preis_pro_stunde * extract(epoch FROM b.ende - b.beginn) / 3600
+  FROM raeume AS r
+  WHERE r.id = b.raum_id
+    AND b.preis IS NULL
+    AND b.beginn < '2026-04-01'
+  RETURNING b.id, r.name, b.preis;
+  ```
+
+  Das Atelier kostet nach der Erhöhung 33.60 je Stunde, die dreistündige Buchung also 100.80. `numeric(8,2)` rundet beim Speichern auf zwei Stellen. Die Dauer kommt aus der Differenz zweier `timestamptz`; das ist auch über die Sommerzeitumstellung hinweg die echte Dauer.
+
+  Eine Regel macht `UPDATE … FROM` gefährlich: Jede Zielzeile sollte auf höchstens eine Zeile der anderen Tabellen treffen. Trifft sie mehrere, nimmt PostgreSQL eine davon, und welche, ist laut Dokumentation „not readily predictable“. Fehlt die Verknüpfung im `WHERE` ganz, trifft jede Zielzeile jede Zeile der anderen Tabelle, und das `UPDATE` ändert alles.
+
+  ```postgres run
+  CREATE TABLE mitglieder (id int PRIMARY KEY, email text NOT NULL UNIQUE);
+  CREATE TABLE buchungen (
+    id          bigint PRIMARY KEY,
+    mitglied_id int NOT NULL REFERENCES mitglieder (id),
+    beginn      timestamptz NOT NULL,
+    status      text NOT NULL DEFAULT 'bestaetigt'
+  );
+  INSERT INTO mitglieder VALUES (1, 'anna.schulz@example.org'), (2, 'tim.hoffmann@example.org');
+  INSERT INTO buchungen VALUES
+    (101, 1, '2026-03-02 09:00', 'bestaetigt'),
+    (102, 2, '2026-03-20 10:00', 'bestaetigt'),
+    (103, 2, '2026-04-14 10:00', 'bestaetigt'),
+    (104, 2, '2026-04-21 10:00', 'bestaetigt');
+
+  -- Tim kündigt zum 31. März: künftige Buchungen löschen
+  DELETE FROM buchungen AS b
+  USING mitglieder AS m
+  WHERE m.id = b.mitglied_id
+    AND m.email = 'tim.hoffmann@example.org'
+    AND b.beginn >= '2026-04-01'
+  RETURNING b.id, b.beginn;
+
+  -- Die Falle: UPDATE ohne WHERE, abgefangen durch eine Transaktion
+  BEGIN;
+  UPDATE buchungen SET status = 'storniert';
+  ROLLBACK;
+  SELECT status, count(*) FROM buchungen GROUP BY status;
+  ```
+
+  Die Befehlsmeldung `UPDATE 2` ist dein Frühwarnsystem: Erwartet war eine Zeile, betroffen sind alle. Innerhalb einer Transaktion macht `ROLLBACK` das rückgängig.
+
+  > [!WARNING] UPDATE und DELETE ohne WHERE
+  > Ein vergessenes `WHERE` oder eine fehlende Join-Bedingung in `UPDATE … FROM` ändert die ganze Tabelle, und mit Autocommit ist das sofort endgültig. Für Änderungen von Hand: erst dasselbe `WHERE` in einem `SELECT count(*)` prüfen, dann in `BEGIN` ausführen, die Zahl in der Meldung vergleichen und erst dann `COMMIT`. In psql sorgt `\set AUTOCOMMIT off` dafür, dass jede Änderung in einer offenen Transaktion landet, die erst dein `COMMIT` abschließt.
+
+  ## Upsert mit ON CONFLICT
+
+  „Anlegen, falls es das noch nicht gibt, sonst ändern“ heißt **Upsert**. In PostgreSQL ist das `INSERT … ON CONFLICT` ([PostgreSQL · ON CONFLICT](https://www.postgresql.org/docs/current/sql-insert.html#SQL-ON-CONFLICT)). Das Konfliktziel in Klammern nennt die Spalten eines Unique-Index oder Unique-Constraints. Verletzt eine neue Zeile ihn, führt PostgreSQL statt eines Fehlers die Alternative aus: `DO NOTHING` überspringt die Zeile, `DO UPDATE SET …` ändert die vorhandene. Die vorgeschlagene Zeile heißt dort `EXCLUDED`, die vorhandene trägt den Tabellennamen. Ein `WHERE` am Ende begrenzt, welche vorhandenen Zeilen geändert werden.
+
+  ```postgres run
+  CREATE TABLE rechnungen (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    mitglied_id int NOT NULL,
+    monat       date NOT NULL,
+    betrag      numeric(10,2) NOT NULL,
+    bezahlt_am  timestamptz,
+    UNIQUE (mitglied_id, monat)
+  );
+  INSERT INTO rechnungen (mitglied_id, monat, betrag, bezahlt_am) VALUES
+    (1, '2026-03-01', 96.00, NULL),
+    (2, '2026-03-01', 64.00, '2026-04-02 10:15');
+
+  -- Abrechnungslauf für März, zum zweiten Mal
+  INSERT INTO rechnungen (mitglied_id, monat, betrag) VALUES
+    (1, '2026-03-01', 112.00),
+    (2, '2026-03-01', 70.00),
+    (3, '2026-03-01', 18.00)
+  ON CONFLICT (mitglied_id, monat) DO UPDATE
+    SET betrag = EXCLUDED.betrag
+    WHERE rechnungen.bezahlt_am IS NULL
+  RETURNING id, mitglied_id, old.betrag AS vorher, new.betrag AS nachher;
+
+  SELECT id, mitglied_id, betrag FROM rechnungen ORDER BY id;
+  ```
+
+  ```text
+  id|mitglied_id|vorher|nachher
+  1|1|96.00|112.00
+  5|3||18.00
+  ```
+
+  Mitglied 1 hatte eine offene Rechnung, sie wird auf 112.00 gesetzt. Die Rechnung von Mitglied 2 ist bezahlt, das `WHERE` schützt sie, und `RETURNING` liefert für sie keine Zeile. Mitglied 3 ist neu; `old.betrag` ist bei einer eingefügten Zeile `NULL`, daran erkennst du seit PostgreSQL 18, ob ein Upsert eingefügt oder geändert hat. Die neue Rechnung hat die ID 5, nicht 3: Jede vorgeschlagene Zeile hat einen Wert aus der Identity-Sequenz gezogen, auch die beiden, die in den Konflikt liefen. Lücken in IDs sind normal und kein Fehler.
+
+  Das Konfliktziel muss zu einem Unique-Index passen, genau mit diesen Spalten oder Ausdrücken. Bei Deskwerk ist die E-Mail-Adresse ohne Groß- und Kleinschreibung eindeutig, über einen Ausdrucksindex:
+
+  ```postgres run fails
+  CREATE TABLE mitglieder (
+    id    int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email text NOT NULL,
+    name  text NOT NULL
+  );
+  CREATE UNIQUE INDEX mitglieder_email_lower ON mitglieder (lower(email));
+
+  INSERT INTO mitglieder (email, name)
+  VALUES ('Anna.Schulz@example.org', 'Anna Schulz')
+  ON CONFLICT (email) DO NOTHING;
+  ```
+
+  Die Meldung `there is no unique or exclusion constraint matching the ON CONFLICT specification` heißt: Zu `(email)` gibt es keinen Unique-Index. Richtig ist `ON CONFLICT (lower(email))`. Ein zweiter Fehler betrifft mehrzeilige Upserts: Haben zwei Zeilen derselben Anweisung denselben Schlüssel, bricht PostgreSQL mit `ON CONFLICT DO UPDATE command cannot affect row a second time` ab – auch wenn es die Zeile vorher noch nicht gab. Eine Anweisung darf dieselbe Zeile nicht zweimal ändern. Entferne Duplikate vorher, etwa mit `DISTINCT ON` oder `GROUP BY`.
+
+  Der wichtigste Grund für `ON CONFLICT` ist Nebenläufigkeit. Das Muster „erst nachsehen, dann einfügen“ hat eine Lücke zwischen den beiden Schritten. Zwei Instanzen des Abrechnungsjobs in zwei Sitzungen:
+
+  ```text
+  Sitzung A                                      Sitzung B
+  SELECT … WHERE mitglied_id = 7 AND monat = …
+    → keine Zeile
+                                                 SELECT … WHERE mitglied_id = 7 AND monat = …
+                                                   → keine Zeile
+  INSERT INTO rechnungen … → INSERT 0 1
+                                                 INSERT INTO rechnungen … → wartet auf A
+  COMMIT
+                                                 ERROR:  duplicate key value violates unique
+                                                 constraint "rechnungen_mitglied_id_monat_key"
+  ```
+
+  Beide haben richtig nachgesehen, und trotzdem scheitert B. Mit `ON CONFLICT (mitglied_id, monat) DO UPDATE` wartet B ebenfalls auf A und ändert danach die Zeile, die A angelegt hat. Die Dokumentation garantiert für `DO UPDATE` ein atomares Ergebnis, Einfügen oder Ändern, „even under high concurrency“. Der Unique-Index ist dabei kein Detail: Er ist der Mechanismus, über den die Sitzungen voneinander erfahren.
+
+  > [!PRAXIS] Upserts aus dem ORM
+  > Prismas `upsert` sieht atomar aus, ist es aber nur unter Bedingungen: Prisma schickt ein echtes `INSERT … ON CONFLICT`, wenn `where` genau ein eindeutiges Feld nennt, `create` dafür denselben Wert setzt, nichts verschachtelt geschrieben oder gelesen wird und nur ein Modell betroffen ist. Sonst liest Prisma zuerst und schreibt dann, und bei gleichzeitigen Aufrufen kommt der Fehler P2002 ([Prisma · Database upserts](https://www.prisma.io/docs/orm/reference/prisma-client-reference#database-upserts)). In SQLAlchemy schreibst du den Upsert ausdrücklich mit dem PostgreSQL-Dialekt ([SQLAlchemy · INSERT … ON CONFLICT](https://docs.sqlalchemy.org/en/21/dialects/postgresql.html#insert-on-conflict-upsert)). Im Code-Review bei Deskwerk gilt: Jeder Upsert nennt sein Konfliktziel, und es gibt einen Test, der denselben Datensatz zweimal schreibt.
+
+  ```python
+  from sqlalchemy.dialects.postgresql import insert
+
+  stmt = insert(Rechnung).values(mitglied_id=7, monat=date(2026, 3, 1), betrag=betrag)
+  stmt = stmt.on_conflict_do_update(
+      index_elements=[Rechnung.mitglied_id, Rechnung.monat],
+      set_={"betrag": stmt.excluded.betrag},
+      where=Rechnung.bezahlt_am.is_(None),
+  ).returning(Rechnung.id)
+  rechnung_id = session.execute(stmt).scalar_one_or_none()  # None: bezahlt, nicht geändert
+  ```
+
+  ## MERGE: Tabellen abgleichen
+
+  `MERGE` gibt es seit PostgreSQL 15 ([PostgreSQL · MERGE](https://www.postgresql.org/docs/current/sql-merge.html)). Es verbindet eine Quelle mit einer Zieltabelle und entscheidet je Zeile, was passiert: `WHEN MATCHED` für Paare, `WHEN NOT MATCHED` für Quellzeilen ohne Ziel. Seit PostgreSQL 17 kommen `WHEN NOT MATCHED BY SOURCE` für Zielzeilen ohne Quelle und `RETURNING` mit der Funktion `merge_action()` dazu. Die Buchhaltung liefert die Tarifliste als Import, und die Tabelle `tarife` soll danach genau so aussehen:
+
+  ```postgres run
+  CREATE TABLE tarife (
+    code        text PRIMARY KEY,
+    name        text NOT NULL,
+    monatspreis numeric(8,2) NOT NULL
+  );
+  CREATE TABLE tarif_import (code text, name text, monatspreis numeric(8,2));
+  INSERT INTO tarife VALUES
+    ('flex', 'Flex', 89.00), ('fix', 'Fixplatz', 249.00), ('nacht', 'Nachteule', 59.00);
+  INSERT INTO tarif_import VALUES
+    ('flex', 'Flex', 99.00), ('fix', 'Fixplatz', 249.00), ('team', 'Team (5 Plätze)', 990.00);
+
+  MERGE INTO tarife AS t
+  USING tarif_import AS i ON i.code = t.code
+  WHEN MATCHED AND (t.name, t.monatspreis) IS DISTINCT FROM (i.name, i.monatspreis) THEN
+    UPDATE SET name = i.name, monatspreis = i.monatspreis
+  WHEN NOT MATCHED THEN
+    INSERT (code, name, monatspreis) VALUES (i.code, i.name, i.monatspreis)
+  WHEN NOT MATCHED BY SOURCE THEN
+    DELETE
+  RETURNING merge_action() AS aktion, t.code, old.monatspreis AS vorher, new.monatspreis AS nachher;
+  ```
+
+  Das Ergebnis meldet drei Aktionen: `UPDATE` für `flex` (89.00 → 99.00), `INSERT` für `team` und `DELETE` für `nacht`. `fix` ist unverändert, die Bedingung am ersten `WHEN` lässt es aus, und es erscheint nicht. Je Zeile führt `MERGE` höchstens einen `WHEN`-Zweig aus, den ersten, dessen Bedingung zutrifft.
+
+  `MERGE` ist kein Ersatz für `ON CONFLICT`. Fügt eine andere Sitzung gleichzeitig dieselbe Zeile ein, scheitert `MERGE` an einem Unique-Index, wo `ON CONFLICT` geändert hätte ([PostgreSQL · Read Committed und MERGE](https://www.postgresql.org/docs/current/transaction-iso.html#XACT-READ-COMMITTED)); die Dokumentation von `MERGE` verweist für diesen Fall ausdrücklich auf `INSERT … ON CONFLICT`. Faustregel: Upsert einzelner Datensätze aus der Anwendung mit `ON CONFLICT`, Abgleich ganzer Tabellen in einem Job mit `MERGE`.
+
+  ## Datenverändernde CTEs, Batches und TRUNCATE
+
+  Ein CTE darf auch `INSERT`, `UPDATE`, `DELETE` oder `MERGE` enthalten. Mit `RETURNING` gibt er die geänderten Zeilen an die nächste Anweisung weiter ([PostgreSQL · Data-Modifying Statements in WITH](https://www.postgresql.org/docs/current/queries-with.html#QUERIES-WITH-MODIFYING)). Alte Stornierungen ins Archiv verschieben ist damit eine Anweisung, und sie gelingt ganz oder gar nicht:
+
+  ```postgres run
+  CREATE TABLE buchungen (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    raum_id     int NOT NULL,
+    mitglied_id int NOT NULL,
+    beginn      timestamptz NOT NULL,
+    ende        timestamptz NOT NULL,
+    status      text NOT NULL DEFAULT 'bestaetigt'
+  );
+  CREATE TABLE buchungen_archiv (LIKE buchungen);
+  INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, status) VALUES
+    (1, 1, '2026-02-03 09:00', '2026-02-03 11:00', 'storniert'),
+    (2, 2, '2026-02-10 14:00', '2026-02-10 15:00', 'bestaetigt'),
+    (1, 3, '2026-03-12 10:00', '2026-03-12 12:00', 'storniert'),
+    (3, 1, '2026-04-08 09:00', '2026-04-08 10:00', 'storniert');
+
+  WITH verschoben AS (
+    DELETE FROM buchungen
+    WHERE status = 'storniert' AND ende < '2026-04-01'
+    RETURNING *
+  )
+  INSERT INTO buchungen_archiv
+  SELECT * FROM verschoben
+  RETURNING id, status;
+
+  SELECT (SELECT count(*) FROM buchungen)        AS aktiv,
+         (SELECT count(*) FROM buchungen_archiv) AS archiv;
+  ```
+
+  Alle Teile einer solchen Anweisung sehen denselben Schnappschuss der Daten. Sie sehen ihre gegenseitigen Änderungen nicht; der einzige Weg, Ergebnisse weiterzugeben, ist `RETURNING`. Ein `SELECT * FROM buchungen` in der äußeren Anweisung würde deshalb noch die gelöschten Zeilen zeigen. Datenverändernde CTEs laufen immer genau einmal und vollständig, auch wenn niemand ihr Ergebnis liest.
+
+  Dieselbe Denkweise ersetzt Schleifen in der Anwendung. Neue Preise für 5 000 Buchungen als 5 000 `UPDATE`s bedeuten 5 000 Anweisungen, die geplant und ausgeführt werden; ohne Pipeline auch 5 000 Rundreisen über das Netz. Als Arrays übergeben, ist es eine Anweisung:
+
+  ```python
+  # Vorher: eine Anweisung je Buchung
+  for buchung_id, preis in neue_preise:
+      cur.execute("UPDATE buchungen SET preis = %s WHERE id = %s", (preis, buchung_id))
+
+  # Nachher: eine Anweisung für alle
+  ids = [buchung_id for buchung_id, _ in neue_preise]
+  preise = [preis for _, preis in neue_preise]
+  cur.execute(
+      """
+      UPDATE buchungen AS b
+      SET preis = n.preis
+      FROM unnest(%s::bigint[], %s::numeric[]) AS n(id, preis)
+      WHERE b.id = n.id
+      """,
+      (ids, preise),
+  )
+  ```
+
+  Sehr große Änderungen teilst du dagegen bewusst in Stücke von einigen tausend Zeilen. Ein einzelnes `UPDATE` über Millionen Zeilen hält lange Sperren und erzeugt viele tote Zeilenversionen auf einmal. Die Dokumentation zeigt dafür ein Muster mit CTE und `LIMIT` ([PostgreSQL · UPDATE in Batches](https://www.postgresql.org/docs/current/sql-update.html#UPDATE-LIMIT)), [Migrationen](/postgres/migrationen) wendet es beim Backfill an.
+
+  Um eine Tabelle ganz zu leeren, gibt es `TRUNCATE` ([PostgreSQL · TRUNCATE](https://www.postgresql.org/docs/current/sql-truncate.html)). Es löscht nicht Zeile für Zeile, sondern gibt den Speicher sofort frei. Dafür nimmt es eine `ACCESS EXCLUSIVE`-Sperre, die selbst Lesezugriffe blockiert, löst keine `ON DELETE`-Trigger aus und verweigert sich, wenn andere Tabellen per Fremdschlüssel auf die Tabelle verweisen und nicht mitgeleert werden. In Tests, deren Code selbst committet, räumt `TRUNCATE buchungen, mitglieder RESTART IDENTITY` zwischen zwei Tests schnell auf ([Integrationstests](/testing/integrationstests)). In Produktion ist für einen Teil der Zeilen `DELETE` richtig.
+
+  > [!INTERVIEW] „Wie schreibst du einen Upsert, und warum nicht erst SELECT, dann INSERT?“
+  > Mit `INSERT … ON CONFLICT (spalten) DO UPDATE SET … = EXCLUDED.…`. Das Konfliktziel braucht einen Unique-Index auf genau diese Spalten. „Erst prüfen, dann einfügen“ hat eine Race Condition: Zwei Anfragen sehen beide keine Zeile, beide fügen ein, eine scheitert am Unique-Constraint oder, ohne Constraint, entsteht ein Duplikat. `ON CONFLICT` entscheidet atomar in der Datenbank. Mit `RETURNING` bekomme ich die Zeile direkt zurück, seit PostgreSQL 18 mit `old` und `new` auch, ob eingefügt oder geändert wurde. Für den Abgleich ganzer Tabellen nehme ich `MERGE`.
+
+  ## Häufige Fehler
+
+  - **`null value in column "tarif" … violates not-null constraint`, obwohl es einen Standardwert gibt.** Die Anwendung schickt ausdrücklich `NULL`. Spalte weglassen, `DEFAULT` schreiben oder `coalesce(…, 'flex')`.
+  - **`cannot insert a non-DEFAULT value into column "id"`.** Die Spalte ist `GENERATED ALWAYS AS IDENTITY`. ID weglassen; für Importe `OVERRIDING SYSTEM VALUE`.
+  - **`UPDATE … FROM` ändert alle Zeilen.** Die Join-Bedingung zwischen Ziel und Quelle fehlt im `WHERE`. Die Zahl in der Befehlsmeldung prüfen, Änderungen von Hand in einer Transaktion.
+  - **`UPDATE … FROM` liefert zufällige Werte.** Eine Zielzeile trifft mehrere Quellzeilen. Quelle vorher auf eine Zeile je Ziel verdichten.
+  - **`there is no unique or exclusion constraint matching the ON CONFLICT specification`.** Das Konfliktziel passt zu keinem Unique-Index, etwa `(email)` statt `(lower(email))`, oder der Index fehlt ganz.
+  - **`ON CONFLICT DO UPDATE command cannot affect row a second time`.** Zwei Zeilen derselben Anweisung treffen denselben Schlüssel. Vorher deduplizieren.
+  - **`RETURNING` nach `ON CONFLICT DO NOTHING` liefert keine Zeile.** Übersprungene Zeilen werden nicht zurückgegeben. Braucht die Anwendung die vorhandene ID, liest sie sie danach oder nutzt `DO UPDATE` mit einem harmlosen `SET` – das schreibt allerdings jedes Mal eine neue Zeilenversion.
+  - **Ein `SELECT` neben einem datenverändernden CTE zeigt alte Daten.** Alle Teile sehen denselben Schnappschuss. Ergebnisse über `RETURNING` weiterreichen.
+  - **`cannot truncate a table referenced in a foreign key constraint`.** Abhängige Tabellen im selben `TRUNCATE` nennen oder `CASCADE` – aber nur, wenn du weißt, was dabei mitgeleert wird.
+
+  ## Zusammenfassung
+
+  - `INSERT` legt mehrere Zeilen auf einmal an, aus `VALUES` oder aus einer Abfrage. Weggelassene Spalten und `DEFAULT` bekommen den Standardwert, ausdrückliches `NULL` nicht.
+  - `RETURNING` macht aus jeder Änderung eine Abfrage. ORMs holen so erzeugte IDs; seit PostgreSQL 18 gibt es `old` und `new`.
+  - `UPDATE … FROM` und `DELETE … USING` ändern mit Bezug auf andere Tabellen. Die Verknüpfung gehört ins `WHERE`, und jede Zielzeile sollte höchstens eine Quellzeile treffen.
+  - `ON CONFLICT` braucht einen Unique-Index, der genau zum Konfliktziel passt, und entscheidet auch bei gleichzeitigen Zugriffen atomar.
+  - `MERGE` gleicht Tabellen ab, seit PostgreSQL 17 mit `NOT MATCHED BY SOURCE` und `RETURNING merge_action()`. Für nebenläufige Upserts bleibt `ON CONFLICT` die bessere Wahl.
+  - Datenverändernde CTEs verschieben Daten in einer Anweisung. Alle Teile sehen denselben Schnappschuss.
+  - Eine Anweisung für viele Zeilen statt einer Schleife; sehr große Änderungen in Batches.
+  - Massenänderungen von Hand immer in `BEGIN … COMMIT`, nach einem Blick auf die Zahl der betroffenen Zeilen.
+exercises:
+  - id: truncate-oder-delete
+    type: choice
+    title: Tabellen leeren
+    prompt: |
+      Die Integrationstests von Deskwerk leeren vor jedem Test die Tabellen mit der Anweisung unten. `buchungen.mitglied_id` verweist per Fremdschlüssel auf `mitglieder`. Welche Aussagen stimmen?
+    lang: postgres
+    code: |
+      TRUNCATE buchungen, mitglieder RESTART IDENTITY;
+    options:
+      - text: "`TRUNCATE mitglieder` allein würde scheitern, auch wenn `buchungen` schon leer ist – die verweisende Tabelle muss mitgeleert werden oder `CASCADE` dabeistehen."
+        correct: true
+        why: PostgreSQL prüft bei `TRUNCATE` keine Zeilen, sondern nur, ob ein Fremdschlüssel auf die Tabelle zeigt. Die Meldung lautet `cannot truncate a table referenced in a foreign key constraint`.
+      - text: "`RESTART IDENTITY` setzt die Identity-Sequenzen zurück; der nächste Test bekommt wieder `id` 1."
+        correct: true
+        why: Ohne die Option (Standard ist `CONTINUE IDENTITY`) zählen die IDs weiter. Für Tests, die feste IDs erwarten, ist das Zurücksetzen praktisch.
+      - text: "`TRUNCATE` lässt sich nicht zurückrollen, weil es keine Zeilen einzeln löscht."
+        correct: false
+        why: "`TRUNCATE` ist in PostgreSQL transaktionssicher. In `BEGIN … ROLLBACK` sind die Daten danach wieder da."
+      - text: "`TRUNCATE` löst die `ON DELETE`-Trigger aus, die Löschungen ins Audit-Log schreiben."
+        correct: false
+        why: "`TRUNCATE` löst keine `ON DELETE`-Trigger aus, nur eigene `ON TRUNCATE`-Trigger. Wer sich auf Lösch-Trigger verlässt, muss `DELETE` verwenden."
+      - text: Für das nächtliche Aufräumen alter Check-ins in Produktion ist `TRUNCATE checkins` die bessere Wahl als `DELETE … WHERE zeitpunkt < …`, weil es schneller ist.
+        correct: false
+        why: "`TRUNCATE` leert immer die ganze Tabelle und nimmt eine `ACCESS EXCLUSIVE`-Sperre, die auch Lesezugriffe blockiert. Für einen Teil der Zeilen im laufenden Betrieb ist `DELETE` richtig."
+    explanation: |
+      `TRUNCATE` gibt den Speicher einer Tabelle sofort frei, statt jede Zeile als gelöscht zu markieren. Deshalb ist es schnell, aber auch grob: immer die ganze Tabelle, eine Sperre, die alle anderen Zugriffe blockiert, keine `ON DELETE`-Trigger, und Fremdschlüssel werden nicht zeilenweise geprüft, sondern pauschal – eine verweisende Tabelle muss im selben Befehl stehen. Transaktionssicher ist es trotzdem. Für Tests mit `RESTART IDENTITY` ist das ideal, für Aufräumjobs in Produktion nicht.
+    resources:
+      - title: PostgreSQL · TRUNCATE
+        url: https://www.postgresql.org/docs/current/sql-truncate.html
+
+  - id: archivieren-ordnen
+    type: order
+    title: Stornierungen ins Archiv
+    prompt: |
+      Die Anweisung soll stornierte Buchungen, die vor dem 1. April 2026 endeten, aus `buchungen` löschen und dieselben Zeilen in `buchungen_archiv` einfügen – in einer einzigen Anweisung. Bring die Zeilen in die richtige Reihenfolge.
+    lang: postgres
+    lines: |
+      WITH verschoben AS (
+        DELETE FROM buchungen
+        WHERE status = 'storniert' AND ende < '2026-04-01'
+        RETURNING *
+      )
+      INSERT INTO buchungen_archiv
+      SELECT * FROM verschoben;
+    hints:
+      - Welcher Teil liefert die Zeilen, welcher nimmt sie entgegen? Der liefernde Teil steht im CTE.
+      - "`RETURNING` steht am Ende der Anweisung, deren Zeilen es zurückgibt."
+    explanation: |
+      Der CTE `verschoben` enthält das `DELETE`; `RETURNING *` macht die gelöschten Zeilen zu seinem Ergebnis. Die Hauptanweisung fügt genau diese Zeilen ins Archiv ein. `WITH` gehört zur obersten Anweisung, hier zum `INSERT` – datenverändernde CTEs sind nur dort erlaubt. Beides läuft in einer Anweisung und damit atomar: Scheitert das Einfügen, bleiben auch die Buchungen erhalten.
+    resources:
+      - title: PostgreSQL · Data-Modifying Statements in WITH
+        url: https://www.postgresql.org/docs/current/queries-with.html#QUERIES-WITH-MODIFYING
+
+  - id: upsert-ids-vorhersagen
+    type: output
+    title: Welche IDs kommen zurück?
+    prompt: |
+      Was geben die beiden letzten Anweisungen aus? Ausgabe wie `psql -At`: eine Zeile je Ergebniszeile, Werte durch `|` getrennt, keine Befehlsmeldungen.
+    lang: postgres
+    code: |
+      CREATE TABLE checkin_tage (
+        id          int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        mitglied_id int NOT NULL,
+        tag         date NOT NULL,
+        UNIQUE (mitglied_id, tag)
+      );
+      INSERT INTO checkin_tage (mitglied_id, tag) VALUES
+        (1, '2026-03-02'), (2, '2026-03-02');
+
+      INSERT INTO checkin_tage (mitglied_id, tag) VALUES
+        (1, '2026-03-02'), (1, '2026-03-03')
+      ON CONFLICT DO NOTHING
+      RETURNING id, mitglied_id, tag;
+
+      INSERT INTO checkin_tage (mitglied_id, tag) VALUES (2, '2026-03-03')
+      RETURNING id;
+    expected: |
+      4|1|2026-03-03
+      5
+    hints:
+      - "`RETURNING` liefert nur eingefügte oder geänderte Zeilen, keine übersprungenen."
+      - Wann zieht PostgreSQL den nächsten Wert aus der Identity-Sequenz – bevor oder nachdem es den Konflikt bemerkt?
+    explanation: |
+      Die ersten beiden Zeilen bekommen die IDs 1 und 2. Im Upsert zieht jede vorgeschlagene Zeile zuerst einen Wert aus der Sequenz, denn der Standardwert wird berechnet, bevor PostgreSQL den Konflikt prüfen kann. `(1, '2026-03-02')` bekommt so die 3, läuft in den Konflikt und wird übersprungen; `RETURNING` liefert dafür nichts. `(1, '2026-03-03')` wird mit der 4 eingefügt. Die nächste Anweisung bekommt die 5. Die 3 bleibt eine Lücke – Sequenzen sind nicht transaktional und geben Werte nie zurück.
+    resources:
+      - title: PostgreSQL · INSERT mit ON CONFLICT
+        url: https://www.postgresql.org/docs/current/sql-insert.html#SQL-ON-CONFLICT
+
+  - id: cte-schnappschuss
+    type: output
+    title: Vor oder nach der Preiserhöhung?
+    prompt: |
+      Was geben die beiden Abfragen aus? Ausgabe wie `psql -At`: eine Zeile je Ergebniszeile, Werte durch `|` getrennt, `NULL` als leerer Wert, keine Befehlsmeldungen.
+    lang: postgres
+    code: |
+      CREATE TABLE raeume (
+        id               int PRIMARY KEY,
+        name             text NOT NULL,
+        art              text NOT NULL,
+        preis_pro_stunde numeric(8,2) NOT NULL
+      );
+      INSERT INTO raeume VALUES
+        (1, 'Atelier', 'meetingraum', 32.00),
+        (2, 'Box 1',   'telefonbox',   6.00),
+        (3, 'Loft',    'meetingraum', 45.00);
+
+      WITH erhoeht AS (
+        UPDATE raeume
+        SET preis_pro_stunde = preis_pro_stunde + 5
+        WHERE art = 'meetingraum'
+        RETURNING id, preis_pro_stunde
+      )
+      SELECT r.name, r.preis_pro_stunde, e.preis_pro_stunde
+      FROM raeume AS r
+      LEFT JOIN erhoeht AS e ON e.id = r.id
+      ORDER BY r.id;
+
+      SELECT name, preis_pro_stunde FROM raeume ORDER BY id;
+    expected: |
+      Atelier|32.00|37.00
+      Box 1|6.00|
+      Loft|45.00|50.00
+      Atelier|37.00
+      Box 1|6.00
+      Loft|50.00
+    hints:
+      - Der CTE und die Hauptabfrage laufen mit demselben Schnappschuss der Daten. Sieht die Hauptabfrage die Änderung des CTE in `raeume`?
+      - Was sieht sie über `erhoeht`?
+    explanation: |
+      Alle Teile einer Anweisung mit datenveränderndem CTE sehen denselben Schnappschuss, der vor der Anweisung galt. `FROM raeume` zeigt deshalb die alten Preise, obwohl das `UPDATE` im selben Moment läuft. Die neuen Werte kommen nur über `RETURNING` in `erhoeht` an. Box 1 wurde nicht geändert und hat keinen Partner in `erhoeht`, daher `NULL`. Die zweite Abfrage ist eine neue Anweisung mit neuem Schnappschuss und sieht die erhöhten Preise.
+    resources:
+      - title: PostgreSQL · Data-Modifying Statements in WITH
+        url: https://www.postgresql.org/docs/current/queries-with.html#QUERIES-WITH-MODIFYING
+
+  - id: anmeldungen-uebernehmen
+    type: sql
+    lang: postgres
+    title: Anmeldungen werden Mitglieder
+    prompt: |
+      Das Anmeldeformular der Website schreibt in `anmeldungen`. Übernimm mit **einem `INSERT`** alle **bestätigten** Anmeldungen als Mitglieder:
+
+      - `email` ohne Leerzeichen am Rand und in Kleinbuchstaben,
+      - `name` unverändert,
+      - `tarif` aus der Anmeldung; wer keinen gewählt hat, bekommt den Standardtarif der Tabelle `mitglieder` (`flex`),
+      - wer mit dieser E-Mail-Adresse schon Mitglied ist, wird übersprungen.
+
+      Gib mit `RETURNING` die Spalten `email`, `name` und `tarif` der neu angelegten Mitglieder zurück. Sortierung beliebig.
+    schema: |
+      CREATE TABLE mitglieder (
+        id          int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        email       text NOT NULL UNIQUE,
+        name        text NOT NULL,
+        tarif       text NOT NULL DEFAULT 'flex',
+        erstellt_am timestamptz NOT NULL DEFAULT now()
+      );
+      CREATE TABLE anmeldungen (
+        id         int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        email      text NOT NULL,
+        name       text NOT NULL,
+        tarif      text,
+        bestaetigt boolean NOT NULL DEFAULT false
+      );
+      INSERT INTO mitglieder (email, name, tarif) VALUES
+        ('anna.schulz@example.org', 'Anna Schulz', 'fix');
+      INSERT INTO anmeldungen (email, name, tarif, bestaetigt) VALUES
+        ('  Jonas.Becker@Example.org ', 'Jonas Becker',  'fix',  true),
+        ('leonie.wagner@example.org',   'Leonie Wagner', NULL,   true),
+        ('mehmet.yilmaz@example.org',   'Mehmet Yilmaz', 'team', false),
+        ('Anna.Schulz@example.org',     'Anna Schulz',   'flex', true),
+        ('sophie.krueger@example.org',  'Sophie Krüger', NULL,   true);
+    starter: |
+      INSERT INTO mitglieder (email, name, tarif)
+      SELECT email, name, tarif
+      FROM anmeldungen
+      RETURNING email, name, tarif;
+    solution: |
+      INSERT INTO mitglieder (email, name, tarif)
+      SELECT lower(trim(a.email)), a.name, coalesce(a.tarif, 'flex')
+      FROM anmeldungen AS a
+      WHERE a.bestaetigt
+      ON CONFLICT (email) DO NOTHING
+      RETURNING email, name, tarif;
+    hints:
+      - Der Startcode scheitert an `NOT NULL`. Ein ausdrückliches `NULL` löst den Standardwert nicht aus. Womit ersetzt du fehlende Tarife?
+      - "`lower(trim(email))` normalisiert die Adresse. Danach kollidiert Annas Anmeldung mit ihrer vorhandenen Adresse."
+      - "`… WHERE a.bestaetigt ON CONFLICT (email) DO NOTHING RETURNING email, name, tarif`. Alternativ `AND NOT EXISTS (SELECT 1 FROM mitglieder AS m WHERE m.email = lower(trim(a.email)))`."
+    explanation: |
+      `INSERT … SELECT` übernimmt alle passenden Anmeldungen in einer Anweisung. Der Standardwert einer Spalte greift nur, wenn die Spalte fehlt oder `DEFAULT` dasteht – ein `NULL` aus der Abfrage ist ein Wert und verletzt `NOT NULL`. `coalesce(a.tarif, 'flex')` setzt den Standardtarif ausdrücklich. Nach `lower(trim(…))` ist Annas Adresse dieselbe wie die vorhandene; `ON CONFLICT (email) DO NOTHING` überspringt sie, und `RETURNING` liefert nur echte Neuanlagen. Mehmet ist nicht bestätigt. Ergebnis: Jonas mit `fix`, Leonie und Sophie mit `flex`.
+    resources:
+      - title: PostgreSQL · INSERT
+        url: https://www.postgresql.org/docs/current/sql-insert.html
+      - title: PostgreSQL · Returning Data from Modified Rows
+        url: https://www.postgresql.org/docs/current/dml-returning.html
+
+  - id: preise-nachtragen
+    type: sql
+    lang: postgres
+    title: Fehlende Buchungspreise nachtragen
+    prompt: |
+      Nach einem Fehler im Buchungsdienst fehlt bei einigen Buchungen der Preis. Trage ihn mit **einem `UPDATE`** nach, für alle **bestätigten** Buchungen mit `preis IS NULL`:
+
+      - Preis = `preis_pro_stunde` des Raums × tatsächliche Dauer in Stunden,
+      - Mitglieder im Tarif `team` zahlen 20 % weniger,
+      - auf Cent runden (das übernimmt die Spalte `numeric(8,2)` beim Speichern).
+
+      Stornierte Buchungen und Buchungen mit Preis bleiben unverändert. Gib mit `RETURNING` die Spalten `id` und `preis` der geänderten Buchungen zurück. Sortierung beliebig.
+    schema: |
+      CREATE TABLE raeume (
+        id               int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        name             text NOT NULL,
+        preis_pro_stunde numeric(8,2) NOT NULL
+      );
+      CREATE TABLE mitglieder (
+        id    int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        name  text NOT NULL,
+        tarif text NOT NULL DEFAULT 'flex'
+      );
+      CREATE TABLE buchungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        raum_id     int NOT NULL REFERENCES raeume (id),
+        mitglied_id int NOT NULL REFERENCES mitglieder (id),
+        beginn      timestamptz NOT NULL,
+        ende        timestamptz NOT NULL,
+        status      text NOT NULL DEFAULT 'bestaetigt',
+        preis       numeric(8,2),
+        CHECK (ende > beginn)
+      );
+      INSERT INTO raeume (name, preis_pro_stunde) VALUES
+        ('Atelier', 32.00), ('Loft', 45.00), ('Box 1', 6.00);
+      INSERT INTO mitglieder (name, tarif) VALUES
+        ('Anna Schulz', 'flex'), ('Jonas Becker', 'team'), ('Leonie Wagner', 'fix');
+      INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, status, preis) VALUES
+        (1, 1, '2026-03-02 09:00', '2026-03-02 12:00', 'bestaetigt', NULL),
+        (3, 2, '2026-03-02 14:00', '2026-03-02 14:45', 'bestaetigt', NULL),
+        (2, 2, '2026-03-04 10:00', '2026-03-04 11:30', 'bestaetigt', NULL),
+        (2, 3, '2026-03-05 09:00', '2026-03-05 10:00', 'storniert',  NULL),
+        (1, 1, '2026-03-09 13:00', '2026-03-09 15:00', 'bestaetigt', 64.00),
+        (3, 3, '2026-03-29 01:30', '2026-03-29 03:30', 'bestaetigt', NULL);
+    starter: |
+      SELECT b.id, b.preis
+      FROM buchungen AS b
+      WHERE b.preis IS NULL;
+    solution: |
+      UPDATE buchungen AS b
+      SET preis = r.preis_pro_stunde
+                  * extract(epoch FROM b.ende - b.beginn) / 3600
+                  * CASE WHEN m.tarif = 'team' THEN 0.8 ELSE 1 END
+      FROM raeume AS r, mitglieder AS m
+      WHERE r.id = b.raum_id
+        AND m.id = b.mitglied_id
+        AND b.status = 'bestaetigt'
+        AND b.preis IS NULL
+      RETURNING b.id, b.preis;
+    hints:
+      - "`UPDATE buchungen AS b … FROM raeume AS r, mitglieder AS m WHERE …` – beide Tabellen müssen im `WHERE` mit `b` verbunden sein."
+      - Die Dauer in Stunden ist `extract(epoch FROM b.ende - b.beginn) / 3600`. Wie viele Stunden vergehen bei der Buchung in der Nacht vom 28. auf den 29. März zwischen Beginn und Ende?
+      - "Den Rabatt bekommst du mit `CASE WHEN m.tarif = 'team' THEN 0.8 ELSE 1 END` als Faktor."
+    explanation: |
+      `UPDATE … FROM` verbindet die Buchung mit ihrem Raum und ihrem Mitglied; jede Buchung trifft genau einen Raum und ein Mitglied, also ist das Ergebnis eindeutig. Die Differenz zweier `timestamptz` ist die echte Dauer: Die Buchung von 1:30 bis 3:30 am 29. März überspannt die Umstellung auf Sommerzeit und dauert eine Stunde, nicht zwei – 6.00 statt 12.00. Jonas zahlt als Team-Mitglied 80 %: 0,75 h × 6.00 × 0,8 = 3.60 und 1,5 h × 45.00 × 0,8 = 54.00. Annas Buchung kostet 96.00. Die stornierte Buchung und die mit Preis bleiben unverändert und erscheinen nicht in `RETURNING`.
+    resources:
+      - title: PostgreSQL · UPDATE (FROM-Klausel)
+        url: https://www.postgresql.org/docs/current/sql-update.html
+      - title: PostgreSQL · Date/Time Functions (extract, epoch)
+        url: https://www.postgresql.org/docs/current/functions-datetime.html#FUNCTIONS-DATETIME-EXTRACT
+
+  - id: abrechnung-maerz
+    type: sql
+    lang: postgres
+    title: Der Abrechnungslauf für März
+    prompt: |
+      Schreibe den Abrechnungslauf für März 2026 als **eine** Anweisung. Je Mitglied mit mindestens einer **bestätigten** Buchung, die im März beginnt (Ortszeit Leipzig), soll es eine Rechnung über die Summe der Buchungspreise geben (`monat = '2026-03-01'`).
+
+      - Gibt es für das Mitglied noch keine März-Rechnung, wird sie angelegt.
+      - Gibt es eine **unbezahlte** (`bezahlt_am IS NULL`), wird ihr Betrag auf die neue Summe gesetzt.
+      - **Bezahlte** Rechnungen bleiben unverändert.
+
+      Gib mit `RETURNING` die Spalten `mitglied_id` und `betrag` aller angelegten oder geänderten Rechnungen zurück. Sortierung beliebig.
+    schema: |
+      CREATE TABLE mitglieder (
+        id   int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        name text NOT NULL
+      );
+      CREATE TABLE buchungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        mitglied_id int NOT NULL REFERENCES mitglieder (id),
+        beginn      timestamptz NOT NULL,
+        ende        timestamptz NOT NULL,
+        status      text NOT NULL DEFAULT 'bestaetigt',
+        preis       numeric(8,2)
+      );
+      CREATE TABLE rechnungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        mitglied_id int NOT NULL REFERENCES mitglieder (id),
+        monat       date NOT NULL,
+        betrag      numeric(10,2) NOT NULL,
+        bezahlt_am  timestamptz,
+        UNIQUE (mitglied_id, monat)
+      );
+      INSERT INTO mitglieder (name) VALUES
+        ('Anna Schulz'), ('Jonas Becker'), ('Leonie Wagner'), ('Mehmet Yilmaz'), ('Sophie Krüger');
+      INSERT INTO buchungen (mitglied_id, beginn, ende, status, preis) VALUES
+        (1, '2026-03-02 09:00', '2026-03-02 12:00', 'bestaetigt', 96.00),
+        (1, '2026-03-16 09:00', '2026-03-16 10:00', 'bestaetigt', 32.00),
+        (2, '2026-03-04 10:00', '2026-03-04 11:30', 'bestaetigt', 54.00),
+        (2, '2026-03-02 14:00', '2026-03-02 14:45', 'bestaetigt',  3.60),
+        (3, '2026-03-12 10:00', '2026-03-12 11:00', 'storniert',  45.00),
+        (4, '2026-02-26 09:00', '2026-02-26 11:00', 'bestaetigt', 12.00),
+        (4, '2026-03-19 09:00', '2026-03-19 10:00', 'bestaetigt',  6.00),
+        (5, '2026-03-31 23:00', '2026-04-01 01:00', 'bestaetigt', 12.00),
+        (5, '2026-04-01 00:00', '2026-04-01 01:00', 'bestaetigt',  6.00);
+      INSERT INTO rechnungen (mitglied_id, monat, betrag, bezahlt_am) VALUES
+        (1, '2026-03-01', 96.00, NULL),
+        (2, '2026-03-01', 54.00, '2026-04-02 09:30'),
+        (4, '2026-02-01', 12.00, NULL);
+    starter: |
+      INSERT INTO rechnungen (mitglied_id, monat, betrag)
+      SELECT mitglied_id, date '2026-03-01', sum(preis)
+      FROM buchungen
+      WHERE status = 'bestaetigt'
+      GROUP BY mitglied_id
+      RETURNING mitglied_id, betrag;
+    solution: |
+      INSERT INTO rechnungen (mitglied_id, monat, betrag)
+      SELECT mitglied_id, date '2026-03-01', sum(preis)
+      FROM buchungen
+      WHERE status = 'bestaetigt'
+        AND beginn >= '2026-03-01'
+        AND beginn <  '2026-04-01'
+      GROUP BY mitglied_id
+      ON CONFLICT (mitglied_id, monat) DO UPDATE
+        SET betrag = EXCLUDED.betrag
+        WHERE rechnungen.bezahlt_am IS NULL
+      RETURNING mitglied_id, betrag;
+    hints:
+      - Der Startcode scheitert an `rechnungen_mitglied_id_monat_key` und rechnet außerdem Februar und April mit. Begrenze zuerst den Monat mit einem halboffenen Intervall.
+      - "Der Konflikt entsteht am Unique-Constraint `(mitglied_id, monat)`. `ON CONFLICT (mitglied_id, monat) DO UPDATE SET betrag = EXCLUDED.betrag`."
+      - Bezahlte Rechnungen schützt ein `WHERE` am Ende des `DO UPDATE`. Darin heißt die vorhandene Zeile `rechnungen`.
+    explanation: |
+      `INSERT … SELECT` berechnet die Summen je Mitglied, `ON CONFLICT` entscheidet je Zeile zwischen Anlegen und Ändern. `EXCLUDED.betrag` ist die neu berechnete Summe, `rechnungen.bezahlt_am` gehört zur vorhandenen Rechnung. Ergebnis: Anna 128.00 (offene Rechnung geändert), Mehmet 6.00 (neu; die Februar-Rechnung ist ein anderer Monat, die Februar-Buchung zählt nicht), Sophie 12.00 (neu; ihre Buchung beginnt am 31. März, die vom 1. April um 0:00 zählt nicht – mit `BETWEEN '2026-03-01' AND '2026-04-01'` wäre sie dabei, weil `BETWEEN` beide Grenzen einschließt). Jonas' Rechnung ist bezahlt und bleibt bei 54.00, obwohl die neue Summe 57.60 wäre – `RETURNING` liefert für ihn nichts. Leonie hat nur storniert. Die Anweisung lässt sich beliebig oft wiederholen und läuft auch dann korrekt, wenn zwei Instanzen des Jobs gleichzeitig starten.
+    resources:
+      - title: PostgreSQL · INSERT mit ON CONFLICT
+        url: https://www.postgresql.org/docs/current/sql-insert.html#SQL-ON-CONFLICT
+
+  - id: raumpreise-abgleichen
+    type: sql
+    lang: postgres
+    title: Die neue Preisliste übernehmen
+    prompt: |
+      Das Controlling liefert die Preisliste ab April in `preisliste_april`. Gleiche die Tabelle `raumpreise` mit **einem `MERGE`** daran ab:
+
+      - Räume mit **geändertem** Preis bekommen den neuen Preis und `gueltig_ab = '2026-04-01'`.
+      - Räume, die es in `raumpreise` noch nicht gibt, werden mit `gueltig_ab = '2026-04-01'` angelegt.
+      - Räume, die in der Preisliste fehlen, werden aus `raumpreise` gelöscht.
+      - Räume mit **unverändertem** Preis werden nicht angefasst.
+
+      Gib mit `RETURNING` die Spalten `aktion` (Ergebnis von `merge_action()`), `raum_id`, `preis_pro_stunde` und `gueltig_ab` zurück (bei gelöschten Zeilen die alten Werte). Sortierung beliebig.
+    schema: |
+      CREATE TABLE raumpreise (
+        raum_id          int PRIMARY KEY,
+        preis_pro_stunde numeric(8,2) NOT NULL,
+        gueltig_ab       date NOT NULL
+      );
+      CREATE TABLE preisliste_april (
+        raum_id          int PRIMARY KEY,
+        preis_pro_stunde numeric(8,2) NOT NULL
+      );
+      INSERT INTO raumpreise VALUES
+        (1, 32.00, '2026-01-01'),
+        (2, 45.00, '2026-01-01'),
+        (3,  6.00, '2026-01-01'),
+        (4, 38.00, '2026-01-01'),
+        (5,  5.50, '2026-01-01');
+      INSERT INTO preisliste_april VALUES
+        (1, 34.00),
+        (2, 45.00),
+        (3,  6.50),
+        (5,  5.50),
+        (6, 29.00);
+    starter: |
+      SELECT p.raum_id, p.preis_pro_stunde
+      FROM preisliste_april AS p;
+    solution: |
+      MERGE INTO raumpreise AS z
+      USING preisliste_april AS p ON p.raum_id = z.raum_id
+      WHEN MATCHED AND z.preis_pro_stunde <> p.preis_pro_stunde THEN
+        UPDATE SET preis_pro_stunde = p.preis_pro_stunde, gueltig_ab = '2026-04-01'
+      WHEN NOT MATCHED THEN
+        INSERT (raum_id, preis_pro_stunde, gueltig_ab)
+        VALUES (p.raum_id, p.preis_pro_stunde, '2026-04-01')
+      WHEN NOT MATCHED BY SOURCE THEN
+        DELETE
+      RETURNING merge_action() AS aktion, z.raum_id, z.preis_pro_stunde, z.gueltig_ab;
+    hints:
+      - "`MERGE INTO raumpreise AS z USING preisliste_april AS p ON p.raum_id = z.raum_id` und dann drei `WHEN`-Zweige."
+      - Unveränderte Preise schließt eine Zusatzbedingung am `WHEN MATCHED` aus. Zielzeilen ohne Quellzeile erreichst du mit `WHEN NOT MATCHED BY SOURCE`.
+      - "Beide Tabellen haben `raum_id` und `preis_pro_stunde`. Qualifiziere sie im `RETURNING` mit dem Alias der Zieltabelle: `RETURNING merge_action() AS aktion, z.raum_id, z.preis_pro_stunde, z.gueltig_ab`."
+    explanation: |
+      `MERGE` verbindet Preisliste und Zieltabelle und ordnet jede Zeile einem Fall zu. Raum 1 und 3 haben neue Preise (`UPDATE`), Raum 6 ist neu (`INSERT`), Raum 4 fehlt in der Liste (`DELETE`, zurückgegeben mit den alten Werten 38.00 und `2026-01-01`). Raum 2 und 5 sind gepaart, aber die Bedingung `z.preis_pro_stunde <> p.preis_pro_stunde` ist falsch, also läuft kein Zweig, und sie erscheinen nicht im Ergebnis. Ohne diese Bedingung würden sie ihr `gueltig_ab` verlieren. `merge_action()` und `RETURNING` für `MERGE` gibt es seit PostgreSQL 17, ebenso `WHEN NOT MATCHED BY SOURCE`. Für Spalten der Zieltabelle liefert `RETURNING` bei `DELETE` die alten, sonst die neuen Werte.
+    resources:
+      - title: PostgreSQL · MERGE
+        url: https://www.postgresql.org/docs/current/sql-merge.html
+
+  - id: stornierte-archivieren
+    type: sql
+    lang: postgres
+    title: Altlasten ins Archiv
+    prompt: |
+      Verschiebe alle **stornierten** Buchungen, die **vor dem 1. April 2026** endeten, von `buchungen` nach `buchungen_archiv`. Alle Spalten werden unverändert übernommen, `archiviert_am` füllt sein Standardwert. Danach dürfen die Zeilen nicht mehr in `buchungen` stehen. Andere Buchungen bleiben, wo sie sind. Am besten gelingt das in einer einzigen Anweisung.
+
+      Die Prüfabfrage vergleicht die IDs in beiden Tabellen und Status und Mitglied der archivierten Zeilen.
+    schema: |
+      CREATE TABLE buchungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        raum_id     int NOT NULL,
+        mitglied_id int NOT NULL,
+        beginn      timestamptz NOT NULL,
+        ende        timestamptz NOT NULL,
+        status      text NOT NULL DEFAULT 'bestaetigt'
+      );
+      CREATE TABLE buchungen_archiv (
+        id            bigint PRIMARY KEY,
+        raum_id       int NOT NULL,
+        mitglied_id   int NOT NULL,
+        beginn        timestamptz NOT NULL,
+        ende          timestamptz NOT NULL,
+        status        text NOT NULL,
+        archiviert_am timestamptz NOT NULL DEFAULT now()
+      );
+      INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, status) VALUES
+        (1, 1, '2026-02-03 09:00', '2026-02-03 11:00', 'storniert'),
+        (2, 2, '2026-02-10 14:00', '2026-02-10 15:00', 'bestaetigt'),
+        (1, 3, '2026-03-12 10:00', '2026-03-12 12:00', 'storniert'),
+        (3, 1, '2026-03-31 23:00', '2026-04-01 00:30', 'storniert'),
+        (2, 4, '2026-03-31 21:00', '2026-03-31 23:59', 'storniert'),
+        (3, 2, '2026-04-08 09:00', '2026-04-08 10:00', 'storniert'),
+        (1, 5, '2026-03-20 15:00', '2026-03-20 17:00', 'bestaetigt');
+    starter: |
+      -- WITH verschoben AS (…)
+      -- INSERT INTO buchungen_archiv …
+    solution: |
+      WITH verschoben AS (
+        DELETE FROM buchungen
+        WHERE status = 'storniert'
+          AND ende < '2026-04-01'
+        RETURNING id, raum_id, mitglied_id, beginn, ende, status
+      )
+      INSERT INTO buchungen_archiv (id, raum_id, mitglied_id, beginn, ende, status)
+      SELECT id, raum_id, mitglied_id, beginn, ende, status
+      FROM verschoben;
+    check: |
+      SELECT (SELECT string_agg(id::text, ',' ORDER BY id) FROM buchungen) AS aktiv,
+             (SELECT string_agg(id || ':' || status || ':' || mitglied_id, ',' ORDER BY id)
+                FROM buchungen_archiv) AS archiv;
+    hints:
+      - "Ein CTE mit `DELETE … RETURNING …` liefert die gelöschten Zeilen, die Hauptanweisung fügt sie ins Archiv ein."
+      - "`buchungen_archiv` hat eine Spalte mehr. Nennst du die Zielspalten im `INSERT` ausdrücklich, bekommt `archiviert_am` sicher seinen Standardwert."
+      - Die Grenze ist `ende < '2026-04-01'`, gelesen in Leipziger Ortszeit. Endet eine Buchung um 0:30 am 1. April, gehört sie nicht dazu.
+    explanation: |
+      Der datenverändernde CTE löscht die Zeilen und gibt sie mit `RETURNING` an das `INSERT` weiter. Beides ist eine Anweisung und damit atomar – zwei getrennte Anweisungen ohne Transaktion könnten Zeilen verlieren, wenn die zweite scheitert. Archiviert werden die Buchungen 1, 3 und 5. Buchung 4 beginnt zwar im März, endet aber am 1. April um 0:30 und bleibt; Buchung 6 liegt im April, 2 und 7 sind bestätigt. Ohne Spaltenliste ordnet PostgreSQL die Werte nach Position den ersten Spalten des Archivs zu. `INSERT INTO buchungen_archiv SELECT * FROM verschoben` klappt hier nur, weil die sechs Spalten in derselben Reihenfolge stehen und `archiviert_am` die letzte ist. Mit ausdrücklich genannten Zielspalten bleibt die Anweisung richtig, auch wenn sich eine der Tabellen ändert.
+    resources:
+      - title: PostgreSQL · Data-Modifying Statements in WITH
+        url: https://www.postgresql.org/docs/current/queries-with.html#QUERIES-WITH-MODIFYING
+
+  - id: kuendigung-aufraeumen
+    type: gap
+    title: Kündigung zum Monatsende
+    prompt: |
+      Tim Hoffmann kündigt zum 31. März. Seine Buchungen ab dem 1. April sollen gelöscht werden, und die Anwendung braucht IDs und Beginn der gelöschten Buchungen, um ihm eine Bestätigung zu schicken. Ergänze die Lücken.
+    lang: postgres
+    code: |
+      DELETE FROM buchungen AS b
+      ⟦USING⟧ mitglieder AS m
+      WHERE ⟦m.id = b.mitglied_id⟧
+        AND m.email = 'tim.hoffmann@example.org'
+        AND b.beginn >= '2026-04-01'
+      ⟦RETURNING⟧ b.id, b.beginn;
+    gaps:
+      - label: Weitere Tabelle
+        hint: Bei `DELETE` heißt das Gegenstück zu `UPDATE … FROM` anders.
+      - label: Verknüpfung
+        hint: Ohne diese Bedingung trifft jede Buchung jedes Mitglied.
+        accept: ["b.mitglied_id = m.id", "m.id = mitglied_id", "mitglied_id = m.id"]
+      - label: Gelöschte Zeilen zurückgeben
+        hint: Dasselbe Schlüsselwort wie bei `INSERT` und `UPDATE`.
+    explanation: |
+      `DELETE … USING` nimmt weitere Tabellen in die Anweisung auf, das `WHERE` verbindet sie mit dem Ziel. Die Bedingung `m.id = b.mitglied_id` ist entscheidend: Ohne sie stünde jede Buchung mit Tims Mitgliedszeile in Verbindung, und alle Buchungen ab April würden gelöscht – von allen Mitgliedern. `RETURNING` gibt die gelöschten Zeilen mit ihren alten Werten zurück, die Anwendung braucht keine zweite Abfrage. Gleichwertig wäre `WHERE b.mitglied_id = (SELECT id FROM mitglieder WHERE email = …)`.
+    resources:
+      - title: PostgreSQL · DELETE
+        url: https://www.postgresql.org/docs/current/sql-delete.html
+
+  - id: alle-storniert
+    type: bug
+    title: Ein Wasserschaden, drei Standorte storniert
+    prompt: |
+      In der Südvorstadt (`standort_id = 2`) ist am 16. März ein Wasserrohr gebrochen. Ein Kollege storniert alle Buchungen dieses Tages an diesem Standort. `RETURNING` meldet 41 Zeilen, erwartet waren 9 – auch Buchungen in Plagwitz und im Zentrum sind jetzt storniert. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: postgres
+    code: |
+      UPDATE buchungen AS b
+      SET status = 'storniert'
+      FROM raeume AS r
+      WHERE r.standort_id = 2
+        AND b.beginn >= '2026-03-16'
+        AND b.beginn <  '2026-03-17'
+      RETURNING b.id, b.raum_id;
+    lines: [4]
+    fix:
+      - line: 4
+        answers:
+          - "WHERE r.id = b.raum_id AND r.standort_id = 2"
+          - "WHERE b.raum_id = r.id AND r.standort_id = 2"
+          - "WHERE r.standort_id = 2 AND r.id = b.raum_id"
+          - "WHERE r.standort_id = 2 AND b.raum_id = r.id"
+    hints:
+      - Welche Zeilen von `raeume` erfüllen das `WHERE`, und mit welchen Buchungen werden sie verbunden?
+      - "`UPDATE … FROM` ist ein Join. Wo steht seine Join-Bedingung?"
+    explanation: |
+      `UPDATE … FROM raeume` verbindet jede Buchung mit jeder Zeile von `raeume`, die das `WHERE` erfüllt. Ohne `r.id = b.raum_id` ist das jeder Raum der Südvorstadt, und zwar für jede Buchung des Tages, egal wo sie stattfindet. Also wird jede Buchung vom 16. März storniert. Die Join-Bedingung gehört ins `WHERE`; dann trifft jede Buchung genau ihren eigenen Raum, und nur Räume mit `standort_id = 2` bleiben übrig. Schutz für solche Änderungen von Hand: in `BEGIN` ausführen, die Zahl in der Meldung mit der Erwartung vergleichen, erst dann `COMMIT`.
+    resources:
+      - title: PostgreSQL · UPDATE (FROM-Klausel)
+        url: https://www.postgresql.org/docs/current/sql-update.html
+
+  - id: upsert-ohne-passenden-index
+    type: bug
+    title: Der Upsert findet seinen Index nicht
+    prompt: |
+      E-Mail-Adressen sind bei Deskwerk ohne Rücksicht auf Groß- und Kleinschreibung eindeutig. Der Upsert für den Tarifwechsel bricht aber ab mit:
+
+      ```text
+      ERROR:  there is no unique or exclusion constraint matching the ON CONFLICT specification
+      ```
+
+      Finde die fehlerhafte Zeile und korrigiere sie, ohne den Index zu ändern.
+    lang: postgres
+    code: |
+      CREATE UNIQUE INDEX mitglieder_email_lower ON mitglieder (lower(email));
+
+      INSERT INTO mitglieder (email, name, tarif)
+      VALUES ('Anna.Schulz@example.org', 'Anna Schulz', 'fix')
+      ON CONFLICT (email) DO UPDATE
+      SET tarif = EXCLUDED.tarif
+      RETURNING id, tarif;
+    lines: [5]
+    fix:
+      - line: 5
+        answers:
+          - "ON CONFLICT (lower(email)) DO UPDATE"
+          - "ON CONFLICT ((lower(email))) DO UPDATE"
+    hints:
+      - Welche Spalten oder Ausdrücke enthält der einzige Unique-Index?
+      - Das Konfliktziel darf auch Ausdrücke enthalten, in derselben Schreibweise wie im Index.
+    explanation: |
+      PostgreSQL sucht zum Konfliktziel einen Unique-Index mit genau diesen Spalten oder Ausdrücken. Der Index steht auf `lower(email)`, nicht auf `email` – für `(email)` gibt es keinen, also bricht die Anweisung ab, bevor sie eine Zeile anfasst. `ON CONFLICT (lower(email))` trifft den Index. `ON CONSTRAINT mitglieder_email_lower` hilft nicht: Es funktioniert nur mit Constraints, und ein per `CREATE UNIQUE INDEX` angelegter Index ist keiner – PostgreSQL meldet `constraint "mitglieder_email_lower" for table "mitglieder" does not exist`. Ein zusätzlicher Unique-Constraint auf `email` wäre keine Lösung: `Anna.Schulz@…` und `anna.schulz@…` wären dafür verschieden, und der Upsert würde trotzdem am Ausdrucksindex scheitern.
+    resources:
+      - title: PostgreSQL · INSERT mit ON CONFLICT
+        url: https://www.postgresql.org/docs/current/sql-insert.html#SQL-ON-CONFLICT
+
+  - id: zaehler-upsert-erklaeren
+    type: explain
+    title: Der Check-in-Zähler im Code-Review
+    prompt: |
+      Bisher hat der Check-in-Dienst die Tagesauslastung so gezählt: `SELECT checkins …`, in Python `+ 1`, dann `UPDATE` oder, falls es noch keine Zeile gab, `INSERT`. Der Pull Request ersetzt das durch die Anweisung unten. Erkläre im Review, was sie tut, welche Voraussetzung sie im Schema hat und warum sie das alte Verfahren schlägt, wenn morgens um neun 30 Mitglieder gleichzeitig einchecken.
+    lang: postgres
+    code: |
+      -- Schema: PRIMARY KEY (standort_id, tag)
+      INSERT INTO auslastung (standort_id, tag, checkins)
+      VALUES (2, date '2026-03-02', 1)
+      ON CONFLICT (standort_id, tag) DO UPDATE
+      SET checkins = auslastung.checkins + 1
+      RETURNING checkins;
+    points:
+      - Gibt es für Standort und Tag noch keine Zeile, wird sie mit 1 angelegt; sonst wird der vorhandene Zähler um 1 erhöht. `RETURNING` liefert den neuen Stand ohne zweite Abfrage.
+      - Das Konfliktziel `(standort_id, tag)` braucht einen Unique-Index oder Primärschlüssel mit genau diesen Spalten – hier den Primärschlüssel.
+      - "`auslastung.checkins` ist die vorhandene Zeile; `auslastung.checkins + 1` rechnet in der Datenbank, nicht mit einem vorher gelesenen Wert."
+      - Das alte Lesen-Rechnen-Schreiben verliert bei gleichzeitigen Check-ins Erhöhungen (Lost Update), und zwei gleichzeitige erste Check-ins scheitern am Primärschlüssel. Der Upsert entscheidet atomar, gleichzeitige Aufrufe warten aufeinander.
+      - Eine Anweisung statt zwei oder drei spart Rundreisen zur Datenbank.
+    explanation: |
+      Die Anweisung versucht, eine Zeile mit Zähler 1 einzufügen. Gibt es für Standort 2 und den Tag schon eine, greift `ON CONFLICT` am Primärschlüssel `(standort_id, tag)`, und statt eines Fehlers erhöht `DO UPDATE` den vorhandenen Zähler – `auslastung.checkins` meint die gespeicherte Zeile, nicht einen Wert, den die Anwendung vorher gelesen hat. `RETURNING checkins` gibt den neuen Stand zurück. Voraussetzung ist ein Unique-Index genau auf dem Konfliktziel; ohne ihn bricht PostgreSQL mit „no unique or exclusion constraint matching“ ab. Das alte Verfahren hatte zwei Fehler unter Last: Zwei Anfragen lesen beide 41, schreiben beide 42, eine Erhöhung ist verloren. Und gibt es noch keine Zeile, sehen beide „keine Zeile“, beide fügen ein, eine scheitert am Primärschlüssel. Der Upsert lässt die Datenbank entscheiden: Gleichzeitige Aufrufe warten auf die Sperre der Zeile und rechnen dann mit dem aktuellen Wert. Mehr zu den Anomalien in [Isolation und Sperren](/postgres/isolation-sperren).
+    resources:
+      - title: PostgreSQL · INSERT mit ON CONFLICT
+        url: https://www.postgresql.org/docs/current/sql-insert.html#SQL-ON-CONFLICT
+
+  - id: tarif-migration
+    type: sql
+    lang: postgres
+    title: Tarife als eigene Tabelle
+    prompt: |
+      Bisher steht der Tarif als freier Text in `mitglieder.tarif`, und über die Jahre sind Varianten wie `' Flex'`, `'FIX'` oder der Altname `'fixplatz'` entstanden. Die neue Tabelle `tarife` steht schon im Schema. Migriere die Daten:
+
+      1. Lege in `mitglieder` die Spalte `tarif_code` an, die per Fremdschlüssel auf `tarife (code)` verweist und den Standardwert `'flex'` hat.
+      2. Fülle sie aus `tarif`: Leerzeichen am Rand und Groß-/Kleinschreibung zählen nicht, `fixplatz` bedeutet `fix`, ein fehlender Tarif (`NULL`) bedeutet `flex`.
+      3. Mache `tarif_code` zur Pflichtspalte (`NOT NULL`).
+      4. Entferne die alte Spalte `tarif`.
+
+      Die Prüfabfrage zeigt die Zuordnung je E-Mail-Adresse, ob `tarif` noch existiert, und probiert drei Einfügungen: mit unbekanntem Tarif, ohne Tarif und mit ausdrücklichem `NULL`.
+    schema: |
+      CREATE TABLE tarife (
+        code        text PRIMARY KEY,
+        name        text NOT NULL,
+        monatspreis numeric(8,2) NOT NULL
+      );
+      INSERT INTO tarife VALUES
+        ('flex', 'Flex', 99.00), ('fix', 'Fixplatz', 249.00), ('team', 'Team (5 Plätze)', 990.00);
+      CREATE TABLE mitglieder (
+        id    int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        email text NOT NULL UNIQUE,
+        name  text NOT NULL,
+        tarif text
+      );
+      INSERT INTO mitglieder (email, name, tarif) VALUES
+        ('anna.schulz@example.org',    'Anna Schulz',   'fix'),
+        ('jonas.becker@example.org',   'Jonas Becker',  ' Flex'),
+        ('leonie.wagner@example.org',  'Leonie Wagner', 'FIX'),
+        ('mehmet.yilmaz@example.org',  'Mehmet Yilmaz', 'team '),
+        ('sophie.krueger@example.org', 'Sophie Krüger', NULL),
+        ('tim.hoffmann@example.org',   'Tim Hoffmann',  'fixplatz'),
+        ('clara.neumann@example.org',  'Clara Neumann', 'Team');
+    starter: |
+      ALTER TABLE mitglieder
+        ADD COLUMN tarif_code text REFERENCES tarife (code) DEFAULT 'flex';
+
+      -- UPDATE mitglieder SET tarif_code = …
+    solution: |
+      ALTER TABLE mitglieder
+        ADD COLUMN tarif_code text REFERENCES tarife (code) DEFAULT 'flex';
+
+      UPDATE mitglieder
+      SET tarif_code = CASE lower(trim(tarif))
+                         WHEN 'fixplatz' THEN 'fix'
+                         ELSE coalesce(lower(trim(tarif)), 'flex')
+                       END;
+
+      ALTER TABLE mitglieder ALTER COLUMN tarif_code SET NOT NULL;
+      ALTER TABLE mitglieder DROP COLUMN tarif;
+    check: |
+      SELECT (SELECT string_agg(m.email || '=' || coalesce(to_jsonb(m) ->> 'tarif_code', '?'), ', ' ORDER BY m.id)
+                FROM mitglieder AS m) AS zuordnung,
+             (SELECT count(*)
+                FROM information_schema.columns
+               WHERE table_name = 'mitglieder' AND column_name = 'tarif') AS alte_spalte,
+             lp.versuch($$INSERT INTO mitglieder (email, name, tarif_code) VALUES ('neu1@example.org', 'Neu', 'gold')$$) AS unbekannter_tarif,
+             lp.versuch($$INSERT INTO mitglieder (email, name) VALUES ('neu2@example.org', 'Neu')$$) AS ohne_tarif,
+             lp.versuch($$INSERT INTO mitglieder (email, name, tarif_code) VALUES ('neu3@example.org', 'Neu', NULL)$$) AS null_tarif;
+    hints:
+      - "Mit `DEFAULT 'flex'` bekommen beim Anlegen der Spalte alle vorhandenen Zeilen `'flex'`. Danach überschreibt ein `UPDATE` sie mit dem richtigen Wert."
+      - "`lower(trim(tarif))` normalisiert die Schreibweise. `fixplatz` und `NULL` brauchen eine Sonderbehandlung, etwa mit `CASE` und `coalesce`."
+      - "`ALTER TABLE mitglieder ALTER COLUMN tarif_code SET NOT NULL;` und `ALTER TABLE mitglieder DROP COLUMN tarif;`. Ein Wert, der nicht in `tarife` steht, würde schon beim `UPDATE` am Fremdschlüssel scheitern."
+    explanation: |
+      Die Migration hat die typische Reihenfolge: Spalte anlegen, Daten füllen, Regel verschärfen, Altes entfernen. Der Fremdschlüssel prüft schon beim `UPDATE` jede Zeile – hätte die Normalisierung einen Fall übersehen, etwa `fixplatz`, bräche das `UPDATE` mit `foreign_key_violation` ab, statt Unsinn zu speichern. `SET NOT NULL` gelingt nur, wenn keine Zeile mehr `NULL` enthält; Sophies fehlender Tarif muss deshalb vorher `flex` werden. Danach lehnt die Tabelle unbekannte Tarife und ausdrückliches `NULL` ab, neue Mitglieder ohne Angabe bekommen `flex`. In einer laufenden Anwendung kämen Sperren und Deployment-Reihenfolge dazu – die alte App-Version liest noch `tarif`. Wie man das ohne Ausfall macht (Expand and Contract), zeigt [Migrationen](/postgres/migrationen).
+    resources:
+      - title: PostgreSQL · ALTER TABLE
+        url: https://www.postgresql.org/docs/current/sql-altertable.html
+      - title: PostgreSQL · UPDATE
+        url: https://www.postgresql.org/docs/current/sql-update.html

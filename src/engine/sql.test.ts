@@ -27,4 +27,10 @@ describe('SQL results', () => {
     expect(compareSql(expected, result(['region', 'umsatz'], [['Nord', 160.5], ['Süd', 80], ['Süd', 80]]), false).ok).toBe(false);
     expect(compareSql(expected, result([], [], 'OperationalError: no such column: betrag'), false)).toEqual({ ok: false, message: 'OperationalError: no such column: betrag' });
   });
+  it('names the columns of a check query that differ', () => {
+    const rules = result(['negativ', 'ohne_preis'], [['check_violation', 'ok']]);
+    expect(compareSql(rules, result(['negativ', 'ohne_preis'], [['ok', 'ok']]), false, true).message)
+      .toBe('Nach deinen Anweisungen weicht die Prüfabfrage in der Spalte „negativ“ ab. Lies im Prompt nach, welche Regel das prüft.');
+    expect(compareSql(rules, result(['negativ', 'ohne_preis'], [['ok', 'check_violation']]), false, true).message).toContain('in den Spalten „negativ“, „ohne_preis“ ab');
+  });
 });

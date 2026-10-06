@@ -80,3 +80,29 @@ test('with an unreachable backend the signed-in browser can switch to offline re
   await expect(page.locator('#sync-notice')).toContainText('Offline-Modus');
   await expect(page.locator('#read')).toBeChecked();
 });
+
+test('PostgreSQL is cached on first use and then runs offline', async ({ page, context }) => {
+  test.setTimeout(120_000);
+  const postgres = Object.values(loadContent(['postgres']).areas.postgres.modules).find((module) => module.lesson.includes('data-run="postgres"'))!;
+  await installed(page);
+  await page.evaluate((value) => localStorage.setItem('learn-offline:snapshot:v1', JSON.stringify(value)), copy);
+  // Not precached: PGlite's runtime (about 16 MB) only loads when PostgreSQL code runs.
+  expect(await page.evaluate(async () => (await caches.keys()).some((name) => name.startsWith('learn-pglite-')))).toBe(false);
+  await page.goto(`/postgres/${postgres.id}`);
+  await page.getByRole('button', { name: 'Offline weiterlesen' }).click();
+  const run = async () => {
+    const block = page.locator('.codeblock[data-run="postgres"]').first();
+    await block.getByRole('button', { name: 'Ausführen' }).click();
+    await expect(block.locator('.run-output')).not.toHaveText(/^(Läuft …|PostgreSQL wird geladen)/, { timeout: 90_000 });
+    await expect(block.locator('.run-output')).not.toHaveClass(/error/);
+  };
+  await run();
+  await expect.poll(() => page.evaluate(async () => {
+    const name = (await caches.keys()).find((key) => key.startsWith('learn-pglite-'));
+    return name ? (await (await caches.open(name)).keys()).map((request) => new URL(request.url).pathname.split('/').pop()!.replace(/-[\w-]+\./, '.')).sort() : [];
+  })).toEqual(expect.arrayContaining(['initdb.wasm', 'pglite.data', 'pglite.wasm']));
+  await context.setOffline(true);
+  await page.reload();
+  await expect(page.locator('#sync-notice')).toContainText('Offline-Modus');
+  await run();
+});

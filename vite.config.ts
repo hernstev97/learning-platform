@@ -11,4 +11,6 @@ export default defineConfig(({ command, mode }) => ({
   // The largest chunk is the search index (every area as plain text), loaded only when search is first opened.
   build: { target: 'es2022', chunkSizeWarningLimit: 4000 },
   worker: { format: 'es' },
+  // PGlite locates its files relative to its own module; prebundling would move the module away from them.
+  optimizeDeps: { exclude: ['@electric-sql/pglite'] },
 }));

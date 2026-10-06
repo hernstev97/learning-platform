@@ -1,7 +1,8 @@
 // Loads, validates and normalises everything under content/.
 // Used by the Vite plugin (dev + build), by `pnpm content:check`, by `pnpm verify` and by the tests.
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { parse as parseYaml } from 'yaml';
@@ -10,7 +11,7 @@ import { escape, languageOf } from '../src/engine/highlight.ts';
 import { vmCommands } from '../src/vm/commands.ts';
 import { shuffledOrder, tokens } from '../src/engine/answers.ts';
 import type {
-  Area, AreaSummary, Card, Catalog, Exercise, GlossaryEntry, Level, Module, ModuleSummary, Project, Resource, SqlTable, SqlValue, TopicSummary, TrackSummary,
+  Area, AreaSummary, Card, Catalog, Exercise, GlossaryEntry, Level, Module, ModuleSummary, Project, Resource, SqlExercise, SqlTable, SqlValue, TopicSummary, TrackSummary,
 } from '../src/content/types.ts';
 
 export const ROOT = join(import.meta.dirname, '..');
@@ -149,6 +150,39 @@ function sqlTables(schema: string): { tables: SqlTable[]; error: string | null }
   }
 }
 
+/** `sql` exercises in PostgreSQL whose table previews are still missing; filled at the end of loadContent. */
+type PendingTables = { exercise: SqlExercise; issue: Omit<Issue, 'message'> };
+let pendingTables: PendingTables[] = [];
+const PG_CACHE = join(ROOT, 'node_modules/.cache/pg-tables');
+/** Changes with PGlite and with the code that builds the previews, so a cached preview never outlives either. */
+const pgCacheVersion = () => createHash('sha256')
+  .update(existsSync(join(ROOT, 'node_modules/@electric-sql/pglite/package.json')) ? readFileSync(join(ROOT, 'node_modules/@electric-sql/pglite/package.json')) : '')
+  .update(readFileSync(join(ROOT, 'src/pg/engine.ts'))).update(readFileSync(join(ROOT, 'tooling/pg-tables.ts'))).digest('hex').slice(0, 12);
+
+/**
+ * Previews for PostgreSQL schemas, built with the browser's PostgreSQL (PGlite) in a child process: content loads
+ * synchronously, PGlite only asynchronously. Every schema is cached under node_modules/.cache/pg-tables, so only new
+ * or changed schemas start PostgreSQL (about a second, plus a few milliseconds per schema).
+ */
+function pgTables(pending: PendingTables[], errors: Issue[]): void {
+  if (!pending.length) return;
+  const version = pgCacheVersion();
+  const key = (schema: string) => join(PG_CACHE, `${createHash('sha256').update(version).update(schema).digest('hex').slice(0, 24)}.json`);
+  const missing = [...new Set(pending.map((p) => p.exercise.schema).filter((schema) => !existsSync(key(schema))))];
+  if (missing.length) {
+    const output = execFileSync(process.execPath, ['--disable-warning=ExperimentalWarning', join(ROOT, 'tooling/pg-tables.ts')], { input: JSON.stringify(missing), maxBuffer: 256 * 1024 * 1024, encoding: 'utf8' });
+    const results = JSON.parse(output) as { tables: SqlTable[]; error: string | null }[];
+    mkdirSync(PG_CACHE, { recursive: true });
+    missing.forEach((schema, i) => writeFileSync(key(schema), JSON.stringify(results[i])));
+  }
+  for (const { exercise, issue } of pending) {
+    const { tables, error } = JSON.parse(readFileSync(key(exercise.schema), 'utf8')) as { tables: SqlTable[]; error: string | null };
+    if (error) errors.push({ ...issue, message: `"schema" lässt sich nicht ausführen:\n${error}` });
+    else if (!tables.length) errors.push({ ...issue, message: '"schema" legt keine Tabelle an' });
+    exercise.tables = tables;
+  }
+}
+
 /**
  * Drops alternatives the comparison already treats as equal (`count(*)` next to `COUNT(*)` in SQL, `SUMIFS` next to
  * `SUMMEWENNS` in Excel), so the solution does not list them. Fingerprints keep using the authored list: removing an
@@ -175,7 +209,7 @@ const BY_TYPE: Record<string, string[]> = {
   practice: ['lang', 'starter', 'solution', 'checklist', 'verify'],
   bug: ['lang', 'code', 'lines', 'fix', 'verify'],
   explain: ['lang', 'code', 'points'],
-  sql: ['schema', 'starter', 'solution', 'ordered', 'verify'],
+  sql: ['lang', 'schema', 'starter', 'solution', 'ordered', 'check', 'verify'],
   scenario: ['setup', 'checks', 'solution'],
 };
 
@@ -195,7 +229,8 @@ function exercise(raw: Obj, moduleId: string, where: string, report: Reporter): 
     id: `${moduleId}/${id}`, module: moduleId, title: f.str('title'), prompt: block(f.str('prompt')), explanation: block(f.str('explanation')),
     wiki, hints, resources: resources(raw.resources, where, report), source: null,
   };
-  const lang = (required = true) => { const value = f.str('lang', required); return value.toLowerCase(); };
+  // `postgresql` and `pgsql` are spellings of `postgres`: SQL that runs in PostgreSQL (PGlite) instead of SQLite.
+  const lang = (required = true) => { const value = f.str('lang', required).toLowerCase(); return ['postgresql', 'pgsql'].includes(value) ? 'postgres' : value; };
   switch (type) {
     case 'gap': {
       const language = lang();
@@ -301,15 +336,28 @@ function exercise(raw: Obj, moduleId: string, where: string, report: Reporter): 
       return { ...base, type, lang: lang(), code, points, fingerprint: fingerprint([type, code, points]) };
     }
     case 'sql': {
+      const language = lang(false) || 'sql';
+      if (language !== 'sql' && language !== 'postgres') report.error(where, '"lang" muss sql (SQLite) oder postgres (PostgreSQL) sein');
+      const engine = language === 'postgres' ? 'postgres' : 'sqlite';
       const schema = trimCode(f.str('schema'));
       const solution = trimCode(f.str('solution'));
+      const check = raw.check === undefined ? null : trimCode(f.str('check'));
+      if (check !== null && engine !== 'postgres') report.error(where, '"check" gibt es nur mit lang: postgres');
       if (raw.ordered !== undefined && typeof raw.ordered !== 'boolean') report.error(where, '"ordered" muss true oder false sein');
       const ordered = raw.ordered === true;
-      if (ordered && !/\border\s+by\b/i.test(solution)) report.error(where, '"ordered: true" verlangt eine Lösung mit ORDER BY');
-      const { tables, error } = schema ? sqlTables(schema) : { tables: [], error: null };
-      if (error) report.error(where, `"schema" lässt sich nicht ausführen: ${error}`);
-      else if (schema && !tables.length) report.error(where, '"schema" legt keine Tabelle an');
-      return { ...base, type, lang: 'sql', schema, tables, starter: trimCode(f.str('starter', false)), solution, ordered, fingerprint: fingerprint([type, schema, solution, ordered]) };
+      if (ordered && !/\border\s+by\b/i.test(check ?? solution)) report.error(where, `"ordered: true" verlangt ${check === null ? 'eine Lösung' : 'eine Prüfabfrage'} mit ORDER BY`);
+      const sqlExercise: SqlExercise = {
+        ...base, type, lang: language === 'postgres' ? 'postgres' : 'sql', engine, schema, tables: [], starter: trimCode(f.str('starter', false)), solution, ordered, check,
+        // Exercises in SQLite keep their fingerprint from before PostgreSQL existed.
+        fingerprint: fingerprint(engine === 'sqlite' ? [type, schema, solution, ordered] : [type, engine, schema, solution, ordered, check]),
+      };
+      if (engine === 'sqlite') {
+        const { tables, error } = schema ? sqlTables(schema) : { tables: [], error: null };
+        if (error) report.error(where, `"schema" lässt sich nicht ausführen: ${error}`);
+        else if (schema && !tables.length) report.error(where, '"schema" legt keine Tabelle an');
+        sqlExercise.tables = tables;
+      } else if (schema) pendingTables.push({ exercise: sqlExercise, issue: { file: rel(report.file), where } });
+      return sqlExercise;
     }
     case 'scenario': {
       const checks = f.list<Obj>('checks', true).map((check, i) => {
@@ -597,6 +645,7 @@ export function loadContent(only?: string[], root = CONTENT, options: { allowMis
   const raw: RawExercise[] = [];
   const areas: Record<string, Area> = {};
   const summaries: AreaSummary[] = [];
+  pendingTables = [];
   for (const name of readdirSync(root).sort()) {
     if (only?.length && !only.includes(name)) continue;
     const dir = join(root, name);
@@ -607,6 +656,8 @@ export function loadContent(only?: string[], root = CONTENT, options: { allowMis
     areas[loaded.summary.id] = loaded.area;
     summaries.push(loaded.summary);
   }
+  pgTables(pendingTables, sink.errors);
+  pendingTables = [];
   summaries.sort((a, b) => ((a as any).order - (b as any).order) || a.id.localeCompare(b.id));
   for (const s of summaries) delete (s as any).order;
   return { catalog: { areas: summaries, builtAt: new Date().toISOString() }, areas, errors: sink.errors, warnings: sink.warnings, raw };

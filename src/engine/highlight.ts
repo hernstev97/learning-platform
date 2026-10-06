@@ -49,6 +49,14 @@ const LANGUAGES: Record<string, Language> = {
     rules: [[/--[^\n]*/y, 'comment'], [/'(?:[^']|'')*'?/y, 'string'], number],
     keywords: words(`select from where insert into values update set delete create table index view drop alter add primary key foreign references not null unique default and or in is like between join left right inner outer on group by order having limit offset as distinct count sum avg min max case when then else end begin commit rollback transaction integer text real blob varchar`),
   },
+  // PostgreSQL: dollar-quoted bodies, E'…' strings, quoted identifiers, ::casts and the keywords of DDL, transactions and EXPLAIN.
+  postgres: {
+    rules: [
+      [/--[^\n]*/y, 'comment'], [/\/\*[\s\S]*?(?:\*\/|$)/y, 'comment'], [/\$([A-Za-z_]\w*)?\$[\s\S]*?(?:\$\1\$|$)/y, 'string'],
+      [/[eE]'(?:\\.|''|[^'\\])*'?/y, 'string'], [/'(?:[^']|'')*'?/y, 'string'], [/"(?:[^"]|"")*"?/y, 'key'], [/::[A-Za-z_]\w*(?:\[\])?/y, 'type'], [/\$\d+/y, 'variable'], number,
+    ],
+    keywords: words(`select from where insert into values update set delete create table index view drop alter add column primary key foreign references not null unique default check constraint and or in is like ilike similar between join left right full inner outer cross lateral natural using on group by order having limit offset fetch first next rows only as distinct case when then else end begin commit rollback savepoint release transaction start isolation level read write committed repeatable serializable for share nowait skip locked returning conflict do nothing with recursive materialized union all except intersect exists any some explain analyze buffers verbose costs format vacuum cascade restrict concurrently if replace function procedure language returns return trigger execute declare raise notice exception perform loop schema extension sequence identity generated always stored type enum domain grant revoke owner to partition range list hash include asc desc nulls filter over window partition lock tablespace comment truncate copy deferrable initially deferred immediate valid validate exclude gist gin btree brin true false unknown integer int bigint smallint numeric decimal real double precision text varchar char boolean bool date time timestamp timestamptz interval uuid jsonb json bytea serial bigserial tstzrange daterange int4range array zone at`),
+  },
   xml: {
     rules: [[/<!--[\s\S]*?(?:-->|$)/y, 'comment'], [/<\/?[A-Za-z][\w:.-]*/y, 'keyword'], [/\/?>/y, 'keyword'], [/"[^"\n]*"?/y, 'string'], [/[A-Za-z_][\w:.-]*(?==)/y, 'key']],
     keywords: words(''),
@@ -95,6 +103,7 @@ const ALIASES: Record<string, string> = {
   kt: 'kotlin', kts: 'kotlin', gradle: 'kotlin', java: 'kotlin', groovy: 'kotlin', rs: 'rust', py: 'python', python3: 'python',
   bash: 'shell', sh: 'shell', zsh: 'shell', fish: 'shell', terminal: 'shell', yml: 'yaml', jsonc: 'json', docker: 'dockerfile',
   containerfile: 'dockerfile', systemd: 'ini', service: 'ini', conf: 'ini', cfg: 'ini', html: 'xml', svg: 'xml', pycon: 'python',
+  postgresql: 'postgres', pgsql: 'postgres', plpgsql: 'postgres',
   xlsx: 'excel', formula: 'excel', m: 'powerquery', pq: 'powerquery', tsv: 'csv',
   ts: 'typescript', tsx: 'typescript', mts: 'typescript', cts: 'typescript', js: 'javascript', jsx: 'javascript', mjs: 'javascript', cjs: 'javascript',
 };
@@ -132,7 +141,7 @@ function highlightCode(code: string, name: string): string {
       const word = id[0];
       const after = code.slice(position + word.length).match(/^\s*(.)/)?.[1];
       let type = '';
-      if (language.keywords.has(word) || (name === 'sql' && language.keywords.has(word.toLowerCase()))) type = 'keyword';
+      if (language.keywords.has(word) || ((name === 'sql' || name === 'postgres') && language.keywords.has(word.toLowerCase()))) type = 'keyword';
       else if (name === 'shell' && commandPosition && !/^[=]/.test(code[position + word.length] ?? '')) type = 'fn';
       else if (language.builtins?.has(word) && after === '(') type = 'builtin';
       else if (language.types && /^[A-Z]/.test(word) && !/^[A-Z0-9_]+$/.test(word.length > 1 ? word : 'x')) type = 'type';
