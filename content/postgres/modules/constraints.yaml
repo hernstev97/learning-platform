@@ -1,0 +1,878 @@
+id: constraints
+title: Constraints – Regeln, die die Datenbank durchsetzt
+level: 2
+minutes: 150
+summary: NOT NULL, CHECK, UNIQUE, Fremdschlüssel und Exclusion Constraints halten die Regeln der Fachlichkeit fest – auch dann, wenn zwei Anfragen gleichzeitig kommen und die Prüfung in der App längst vorbei ist.
+goals:
+  - Du sicherst Spalten mit `NOT NULL`, `CHECK` und Domains ab und erklärst, warum `NULL` einen `CHECK` besteht.
+  - Du setzt `UNIQUE` und Primärschlüssel richtig ein, auch mit `NULL`-Werten, `NULLS NOT DISTINCT` und Unique-Indexen auf Ausdrücken.
+  - Du wählst für jeden Fremdschlüssel die passende Aktion (`NO ACTION`, `RESTRICT`, `CASCADE`, `SET NULL`) und begründest sie fachlich.
+  - Du verschiebst die Prüfung mit `DEFERRABLE` an das Ende der Anweisung oder der Transaktion, wenn ein Zwischenzustand die Regel verletzen muss.
+  - Du verhinderst Doppelbuchungen mit einem Exclusion Constraint über `tstzrange` und `btree_gist`.
+  - Du begründest, warum eine Prüfung in der App den Constraint nicht ersetzt, und übersetzt SQLSTATE-Fehler in passende HTTP-Antworten.
+resources:
+  - title: PostgreSQL · Constraints
+    url: https://www.postgresql.org/docs/current/ddl-constraints.html
+  - title: PostgreSQL · CREATE TABLE – DEFERRABLE
+    url: https://www.postgresql.org/docs/current/sql-createtable.html#SQL-CREATETABLE-PARMS-DEFERRABLE
+  - title: PostgreSQL · Constraints on Ranges
+    url: https://www.postgresql.org/docs/current/rangetypes.html#RANGETYPES-CONSTRAINT
+  - title: PostgreSQL · btree_gist
+    url: https://www.postgresql.org/docs/current/btree-gist.html
+  - title: PostgreSQL · Error Codes
+    url: https://www.postgresql.org/docs/current/errcodes-appendix.html#ERRCODES-TABLE
+lesson: |
+  Mittwoch, 10 Uhr, Deskwerk Zentrum: Vor dem Loft stehen zwei Teams, beide mit einer Buchungsbestätigung für 10 bis 12 Uhr. Die App prüft vor jeder Buchung, ob der Raum frei ist. Beide Anfragen kamen im Abstand von zwei Millisekunden, beide Prüfungen fanden nichts, beide `INSERT`s gingen durch. Der Code war korrekt – für eine Anfrage nach der anderen.
+
+  Ein **Constraint** ist eine Regel, die PostgreSQL bei jeder Änderung selbst durchsetzt, egal ob sie aus der App, aus einem Admin-Skript oder aus einer Migration kommt. Verletzt eine Zeile die Regel, scheitert die Anweisung mit einem Fehler. Constraints sind damit die letzte Verteidigungslinie für die Integrität deiner Daten. Dieses Modul reicht von `NOT NULL` bis zum Exclusion Constraint, der die Doppelbuchung im Loft verhindert. Die Begriffe Schlüssel und `NULL` kennst du aus [Das relationale Modell](/postgres/relationales-modell).
+
+  ## NOT NULL und CHECK: Regeln für eine Zeile
+
+  `NOT NULL` verbietet fehlende Werte. `CHECK (bedingung)` verlangt, dass eine Bedingung für die neue oder geänderte Zeile gilt. Beide sehen nur die eine Zeile, die gerade geschrieben wird:
+
+  ```postgres run fails
+  CREATE TABLE raeume (
+    id               int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name             text NOT NULL,
+    art              text NOT NULL CHECK (art IN ('schreibtisch', 'meetingraum', 'telefonbox')),
+    plaetze          int NOT NULL CHECK (plaetze > 0),
+    preis_pro_stunde numeric(8,2) CHECK (preis_pro_stunde >= 0)
+  );
+  INSERT INTO raeume (name, art, plaetze, preis_pro_stunde)
+  VALUES ('Loft', 'meetingraum', 8, 24.00), ('Box 1', 'telefonbox', 1, NULL);
+
+  INSERT INTO raeume (name, art, plaetze, preis_pro_stunde)
+  VALUES ('Atelier', 'meetingraum', 6, -5);
+  ```
+
+  Die Fehlermeldung nennt den Constraint: `raeume_preis_pro_stunde_check`. Ohne eigenen Namen bildet PostgreSQL ihn aus Tabelle, Spalte und Art. Die Zeile mit der Telefonbox ging dagegen durch, obwohl ihr Preis fehlt. Das ist keine Lücke, sondern Absicht: Ein `CHECK` ist erfüllt, wenn die Bedingung wahr **oder `NULL`** ist ([PostgreSQL · Check Constraints](https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-CHECK-CONSTRAINTS)). `NULL >= 0` ist unbekannt, und unbekannt reicht. Soll ein Wert immer da sein, braucht die Spalte zusätzlich `NOT NULL`.
+
+  Um mehrere Fälle auf einmal zu zeigen, nutzen Beispiele und Übungen hier `lp.versuch($$…$$)`. Diese Hilfsfunktion der Lernplattform führt eine Anweisung aus, rollt sie immer zurück und liefert `ok` oder den Namen des Fehlers. In deinem eigenen PostgreSQL gibt es sie nicht.
+
+  ```postgres run
+  CREATE TABLE buchungen (
+    id     bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    raum   text NOT NULL,
+    beginn timestamptz NOT NULL,
+    ende   timestamptz NOT NULL,
+    preis  numeric(8,2) CHECK (preis >= 0),
+    CONSTRAINT ende_nach_beginn CHECK (ende > beginn)
+  );
+
+  SELECT lp.versuch($$INSERT INTO buchungen (raum, beginn, ende) VALUES ('Loft', '2026-03-04 12:00', '2026-03-04 10:00')$$) AS rueckwaerts,
+         lp.versuch($$INSERT INTO buchungen (raum, beginn, ende, preis) VALUES ('Loft', '2026-03-04 10:00', '2026-03-04 12:00', NULL)$$) AS ohne_preis,
+         lp.versuch($$INSERT INTO buchungen (beginn, ende) VALUES ('2026-03-04 10:00', '2026-03-04 12:00')$$) AS ohne_raum;
+  ```
+
+  `ende_nach_beginn` ist ein **Tabellen-Constraint**: Er steht nach den Spalten und darf mehrere Spalten vergleichen. Was ein `CHECK` nicht kann, ist andere Zeilen ansehen. „Keine zweite Buchung im selben Zeitraum“ lässt sich damit nicht ausdrücken. Dafür gibt es `UNIQUE` und Exclusion Constraints.
+
+  ### Domains: eine Regel, viele Spalten
+
+  Taucht dieselbe Regel in vielen Tabellen auf, etwa „ein Geldbetrag ist nicht negativ“, fasst eine **Domain** sie zusammen: ein eigener Typ aus einem Basistyp und einem `CHECK` ([PostgreSQL · CREATE DOMAIN](https://www.postgresql.org/docs/current/sql-createdomain.html#SQL-CREATEDOMAIN-NOTES)).
+
+  ```postgres run
+  CREATE DOMAIN geldbetrag AS numeric(10,2) CHECK (VALUE >= 0);
+  CREATE DOMAIN email AS text CHECK (VALUE ~ '^[^@\s]+@[^@\s]+$');
+
+  CREATE TABLE mitglieder (
+    id    int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email email NOT NULL UNIQUE,
+    name  text NOT NULL
+  );
+  CREATE TABLE rechnungen (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    mitglied_id int NOT NULL REFERENCES mitglieder (id),
+    betrag      geldbetrag NOT NULL
+  );
+  INSERT INTO mitglieder (email, name) VALUES ('lena.brandt@example.org', 'Lena Brandt');
+
+  SELECT lp.versuch($$INSERT INTO mitglieder (email, name) VALUES ('lena.brandt', 'Lena Brandt')$$) AS ohne_at,
+         lp.versuch($$INSERT INTO rechnungen (mitglied_id, betrag) VALUES (1, -19.90)$$) AS negativ;
+  ```
+
+  Das `NOT NULL` steht an der Spalte, nicht an der Domain. So empfiehlt es die Dokumentation: Ein Wert vom Domain-Typ kann trotz `NOT NULL` in der Domain `NULL` sein, etwa auf der leeren Seite eines äußeren Joins oder als Ergebnis einer leeren Unterabfrage in einem `INSERT`.
+
+  ## UNIQUE und Primärschlüssel
+
+  `UNIQUE` verlangt, dass keine zwei Zeilen in den genannten Spalten übereinstimmen. PostgreSQL legt dafür einen Unique-Index an und prüft jede neue Zeile dagegen. Ein **Primärschlüssel** ist `UNIQUE` plus `NOT NULL`, und eine Tabelle hat höchstens einen ([PostgreSQL · Unique Constraints](https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-UNIQUE-CONSTRAINTS)).
+
+  Auch hier spielt `NULL` eine Sonderrolle: Zwei `NULL`-Werte gelten als verschieden. Ein Gutscheincode mit `UNIQUE` lässt also beliebig viele Zeilen ohne Code zu. Wenn das nicht gewollt ist, ändert `NULLS NOT DISTINCT` das Verhalten, **seit PostgreSQL 15**. Deskwerk speichert Tarifpreise mit `gueltig_bis`; `NULL` heißt „gilt aktuell“. Je Tarif darf es nur einen aktuellen Preis geben:
+
+  ```postgres run
+  CREATE TABLE tarifpreise (
+    tarif       text NOT NULL,
+    preis       numeric(8,2) NOT NULL,
+    gueltig_bis date,
+    UNIQUE NULLS NOT DISTINCT (tarif, gueltig_bis)
+  );
+  INSERT INTO tarifpreise VALUES ('flex', 179, '2026-03-31'), ('flex', 189, NULL), ('fix', 299, NULL);
+
+  SELECT lp.versuch($$INSERT INTO tarifpreise VALUES ('flex', 199, NULL)$$) AS zweiter_aktueller,
+         lp.versuch($$INSERT INTO tarifpreise VALUES ('team', 499, NULL)$$) AS neuer_tarif;
+  ```
+
+  Eine Alternative ist ein **partieller Unique-Index** (`CREATE UNIQUE INDEX … WHERE gueltig_bis IS NULL`), der nur für die aktuellen Zeilen gilt. Ein Unique-Constraint kann außerdem nur Spalten nennen, keine Ausdrücke. „E-Mail eindeutig ohne Rücksicht auf Groß- und Kleinschreibung“ geht deshalb nur als Unique-Index: `CREATE UNIQUE INDEX ON mitglieder (lower(email))`. Er wirkt wie ein Constraint und meldet denselben Fehler.
+
+  > [!WARNING] UNIQUE ist auch die Grundlage für Upsert
+  > `INSERT … ON CONFLICT (email) DO UPDATE` braucht einen Unique-Index oder -Constraint auf genau diesen Spalten, siehe [Daten ändern](/postgres/daten-aendern). Fehlt er, scheitert die Anweisung mit „there is no unique or exclusion constraint matching the ON CONFLICT specification“.
+
+  ## Fremdschlüssel und was beim Löschen passiert
+
+  Ein **Fremdschlüssel** (`REFERENCES`) verlangt, dass es zum Wert eine Zeile in der Zieltabelle gibt. Das Ziel muss eindeutig sein: ein Primärschlüssel, ein Unique-Constraint oder ein Unique-Index ohne `WHERE`. Was beim Löschen der Zielzeile passiert, legt `ON DELETE` fest ([PostgreSQL · Foreign Keys](https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-FK)):
+
+  - `NO ACTION` (Standard): Das Löschen scheitert, solange noch Zeilen verweisen. Geprüft wird am Ende der Anweisung.
+  - `RESTRICT`: wie `NO ACTION`, aber sofort und nie aufschiebbar. Seit PostgreSQL 18 meldet es einen eigenen Fehler, `restrict_violation`.
+  - `CASCADE`: Die verweisenden Zeilen werden mitgelöscht.
+  - `SET NULL` / `SET DEFAULT`: Der Verweis wird geleert bzw. auf den Standardwert gesetzt; die Zeile bleibt.
+
+  ```postgres run
+  CREATE TABLE mitglieder (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name text NOT NULL);
+  CREATE TABLE gutscheine (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, code text NOT NULL UNIQUE);
+  CREATE TABLE buchungen (
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    mitglied_id  int NOT NULL REFERENCES mitglieder (id),
+    gutschein_id int REFERENCES gutscheine (id) ON DELETE SET NULL,
+    raum         text NOT NULL
+  );
+  CREATE TABLE buchungsnotizen (
+    buchung_id bigint NOT NULL REFERENCES buchungen (id) ON DELETE CASCADE,
+    notiz      text NOT NULL
+  );
+  INSERT INTO mitglieder (name) VALUES ('Lena Brandt'), ('Jonas Albers');
+  INSERT INTO gutscheine (code) VALUES ('WINTER26');
+  INSERT INTO buchungen (mitglied_id, gutschein_id, raum)
+  VALUES (1, 1, 'Loft'), (1, NULL, 'Box 1'), (2, 1, 'Atelier');
+  INSERT INTO buchungsnotizen
+  VALUES (1, 'Beamer bereitstellen'), (1, 'Kaffee für 8'), (3, 'Schlüssel an der Theke');
+
+  SELECT lp.versuch($$DELETE FROM mitglieder WHERE id = 1$$) AS mitglied_loeschen,
+         lp.versuch($$INSERT INTO buchungen (mitglied_id, raum) VALUES (7, 'Loft')$$) AS unbekanntes_mitglied;
+
+  DELETE FROM gutscheine WHERE code = 'WINTER26';
+  DELETE FROM buchungen WHERE id = 1;
+
+  SELECT b.id, b.raum, b.gutschein_id, count(n.notiz) AS notizen
+  FROM buchungen AS b
+  LEFT JOIN buchungsnotizen AS n ON n.buchung_id = b.id
+  GROUP BY b.id
+  ORDER BY b.id;
+  ```
+
+  Lena Brandt lässt sich nicht löschen, solange Buchungen auf sie zeigen. Der gelöschte Gutschein verschwindet aus beiden Buchungen, die Buchungen bleiben. Mit Buchung 1 gehen ihre zwei Notizen. Die Faustregel der Dokumentation: `CASCADE`, wenn die verweisende Zeile ein **Teil** der Zielzeile ist und ohne sie nicht existiert (Notizen einer Buchung, Positionen einer Rechnung). `NO ACTION` oder `RESTRICT`, wenn beide eigenständig sind. `SET NULL` passt für optionale Verweise und braucht eine Spalte ohne `NOT NULL`.
+
+  Ein Verweis mit `NULL` wird gar nicht geprüft. Ist die Beziehung Pflicht, gehört `NOT NULL` an die Spalte. Und: PostgreSQL legt für die verweisende Spalte **keinen Index** an. Jedes `DELETE` in `mitglieder` muss aber `buchungen` nach Verweisen durchsuchen, ohne Index Zeile für Zeile. Warum du Fremdschlüsselspalten fast immer indizierst, zeigt [Indexe](/postgres/indexe).
+
+  ## Wann geprüft wird: DEFERRABLE
+
+  Normalerweise prüft PostgreSQL einen Constraint sofort. Bei `UNIQUE` und Primärschlüsseln heißt das sogar: bei jeder einzelnen Zeile, nicht erst am Ende der Anweisung ([PostgreSQL · CREATE TABLE, Compatibility](https://www.postgresql.org/docs/current/sql-createtable.html#SQL-CREATETABLE-COMPATIBILITY)). Das trifft die App von Deskwerk, wenn jemand in der Raumliste zwei Räume per Drag-and-drop tauscht:
+
+  ```postgres run
+  CREATE TABLE raeume (
+    id          int PRIMARY KEY,
+    standort_id int NOT NULL,
+    name        text NOT NULL,
+    reihenfolge int NOT NULL,
+    CONSTRAINT raeume_reihenfolge_key UNIQUE (standort_id, reihenfolge)
+  );
+  INSERT INTO raeume VALUES (1, 1, 'Loft', 1), (2, 1, 'Atelier', 2), (3, 1, 'Box 1', 3);
+
+  SELECT lp.versuch($$UPDATE raeume SET reihenfolge = 3 - reihenfolge WHERE id IN (1, 2)$$) AS tauschen;
+
+  ALTER TABLE raeume DROP CONSTRAINT raeume_reihenfolge_key;
+  ALTER TABLE raeume ADD CONSTRAINT raeume_reihenfolge_key
+    UNIQUE (standort_id, reihenfolge) DEFERRABLE INITIALLY IMMEDIATE;
+
+  UPDATE raeume SET reihenfolge = 3 - reihenfolge WHERE id IN (1, 2);
+  SELECT name, reihenfolge FROM raeume ORDER BY reihenfolge;
+  ```
+
+  Nach der ersten geänderten Zeile hat das Loft kurz dieselbe Reihenfolge wie das Atelier, und der sofortige Check schlägt an. Mit `DEFERRABLE INITIALLY IMMEDIATE` prüft PostgreSQL am Ende der Anweisung, wie es der SQL-Standard vorsieht. `INITIALLY DEFERRED` schiebt die Prüfung noch weiter, bis zum `COMMIT` ([PostgreSQL · DEFERRABLE](https://www.postgresql.org/docs/current/sql-createtable.html#SQL-CREATETABLE-PARMS-DEFERRABLE)). Das braucht man bei Henne-Ei-Beziehungen: Ein Team hat einen Admin, der selbst Mitglied des Teams ist. Beide Zeilen entstehen in einer Transaktion, und erst danach muss alles stimmen:
+
+  ```postgres run fails
+  CREATE TABLE teams (id int PRIMARY KEY, name text NOT NULL, admin_id int NOT NULL);
+  CREATE TABLE mitglieder (id int PRIMARY KEY, name text NOT NULL, team_id int REFERENCES teams (id));
+  ALTER TABLE teams ADD CONSTRAINT teams_admin_fk
+    FOREIGN KEY (admin_id) REFERENCES mitglieder (id) DEFERRABLE INITIALLY DEFERRED;
+
+  BEGIN;
+  INSERT INTO teams VALUES (10, 'Studio Nordlicht', 1);  -- Mitglied 1 gibt es noch nicht
+  INSERT INTO mitglieder VALUES (1, 'Mara Voss', 10);
+  COMMIT;
+
+  BEGIN;
+  INSERT INTO teams VALUES (11, 'Kanzlei Yilmaz', 2);    -- Mitglied 2 kommt nie
+  COMMIT;
+  ```
+
+  Die erste Transaktion geht durch, die zweite scheitert erst beim `COMMIT` und wird zurückgerollt. `ALTER CONSTRAINT` kann die Prüfzeit nur bei Fremdschlüsseln ändern; bei `UNIQUE` heißt es löschen und neu anlegen wie oben. Mit `SET CONSTRAINTS` lässt sich die Prüfzeit einer Transaktion umstellen ([PostgreSQL · SET CONSTRAINTS](https://www.postgresql.org/docs/current/sql-set-constraints.html)). Zwei Grenzen: `NOT NULL` und `CHECK` sind nie aufschiebbar, und ein aufschiebbarer Unique-Constraint taugt nicht als Ziel von `ON CONFLICT`.
+
+  ## Exclusion Constraint: keine Doppelbuchung
+
+  Zurück ins Loft. Gesucht ist die Regel „keine zwei bestätigten Buchungen desselben Raums, deren Zeiträume sich überschneiden“. `UNIQUE` vergleicht mit `=` und hilft nicht, denn 10–12 und 11–13 sind verschiedene Werte. Ein **Exclusion Constraint** verallgemeinert `UNIQUE`: Für je zwei Zeilen muss mindestens einer der angegebenen Vergleiche falsch (oder `NULL`) sein ([PostgreSQL · Exclusion Constraints](https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-EXCLUSION)). Für Buchungen heißt das: gleicher Raum (`=`) **und** überlappender Zeitraum (`&&`) dürfen nicht zusammen vorkommen.
+
+  ```postgres run
+  CREATE EXTENSION btree_gist;
+
+  CREATE TABLE buchungen (
+    id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    raum_id int NOT NULL,
+    beginn  timestamptz NOT NULL,
+    ende    timestamptz NOT NULL,
+    status  text NOT NULL DEFAULT 'bestaetigt',
+    CHECK (ende > beginn),
+    CONSTRAINT keine_doppelbuchung EXCLUDE USING gist (
+      raum_id WITH =,
+      tstzrange(beginn, ende) WITH &&
+    ) WHERE (status = 'bestaetigt')
+  );
+  INSERT INTO buchungen (raum_id, beginn, ende) VALUES (1, '2026-03-04 10:00', '2026-03-04 12:00');
+
+  SELECT lp.versuch($$INSERT INTO buchungen (raum_id, beginn, ende) VALUES (1, '2026-03-04 11:00', '2026-03-04 13:00')$$) AS ueberlappt,
+         lp.versuch($$INSERT INTO buchungen (raum_id, beginn, ende) VALUES (1, '2026-03-04 12:00', '2026-03-04 14:00')$$) AS direkt_danach,
+         lp.versuch($$INSERT INTO buchungen (raum_id, beginn, ende) VALUES (2, '2026-03-04 11:00', '2026-03-04 13:00')$$) AS anderer_raum,
+         lp.versuch($$INSERT INTO buchungen (raum_id, beginn, ende, status) VALUES (1, '2026-03-04 11:00', '2026-03-04 13:00', 'storniert')$$) AS storniert;
+  ```
+
+  Vier Bausteine machen das möglich:
+
+  - `tstzrange(beginn, ende)` bildet aus zwei Zeitpunkten einen **Range**, einen Zeitraum. Ohne drittes Argument ist er halboffen, `[beginn, ende)`: Der Beginn gehört dazu, das Ende nicht. Deshalb kollidiert die Buchung ab 12 Uhr nicht mit der bis 12 Uhr ([PostgreSQL · Inclusive and Exclusive Bounds](https://www.postgresql.org/docs/current/rangetypes.html#RANGETYPES-INCLUSIVITY)). Range-Typen vertieft [PostgreSQL-Features](/postgres/postgres-features).
+  - `&&` heißt „überlappt“. Ein normaler B-Baum-Index kann das nicht beantworten, ein **GiST-Index** schon. Den legt der Constraint selbst an.
+  - `raum_id WITH =` braucht Gleichheit auf `int` in einem GiST-Index. Die liefert die Erweiterung `btree_gist` ([PostgreSQL · btree_gist](https://www.postgresql.org/docs/current/btree-gist.html)).
+  - `WHERE (status = 'bestaetigt')` beschränkt die Regel auf bestätigte Buchungen. Stornierte Zeilen bleiben als Historie stehen und blockieren nichts.
+
+  Die Fehlermeldung nennt beide Zeilen:
+
+  ```postgres run fails
+  CREATE EXTENSION btree_gist;
+  CREATE TABLE buchungen (
+    raum_id int NOT NULL,
+    beginn  timestamptz NOT NULL,
+    ende    timestamptz NOT NULL,
+    CONSTRAINT keine_doppelbuchung EXCLUDE USING gist (raum_id WITH =, tstzrange(beginn, ende) WITH &&)
+  );
+  INSERT INTO buchungen VALUES (1, '2026-03-04 10:00', '2026-03-04 12:00');
+  INSERT INTO buchungen VALUES (1, '2026-03-04 11:30', '2026-03-04 12:30');
+  ```
+
+  > [!NOTE] PostgreSQL 18: WITHOUT OVERLAPS
+  > Seit PostgreSQL 18 gibt es eine Kurzform für zeitliche Schlüssel: `PRIMARY KEY (raum_id, zeitraum WITHOUT OVERLAPS)` oder `UNIQUE (…)` mit demselben Zusatz ([PostgreSQL · CREATE TABLE](https://www.postgresql.org/docs/current/sql-createtable.html#SQL-CREATETABLE-PARMS-UNIQUE)). Intern ist das ebenfalls ein Exclusion Constraint und braucht `btree_gist`. Die letzte Spalte muss aber selbst ein Range sein, und eine `WHERE`-Bedingung gibt es nicht. Für Deskwerk mit stornierten Buchungen bleibt `EXCLUDE … WHERE` deshalb die passende Form.
+
+  ## Constraints und App: prüfen, einfügen, Fehler übersetzen
+
+  Warum reicht die Prüfung in der App nicht? Weil zwischen Prüfen und Einfügen Zeit vergeht, in der eine zweite Anfrage dasselbe tut. Die Zeitleiste aus dem Loft, zwei Sitzungen im Standard-Isolationslevel Read Committed:
+
+  ```text
+  Zeit          Anfrage A (Lena Brandt)                Anfrage B (Jonas Albers)
+  09:00:00.010  SELECT … überlappende Buchungen → 0
+  09:00:00.012                                         SELECT … überlappende Buchungen → 0
+  09:00:00.015  INSERT Loft 10–12, COMMIT
+  09:00:00.017                                         INSERT Loft 10–12, COMMIT
+                → zwei bestätigte Buchungen für denselben Raum und dieselbe Zeit
+  ```
+
+  Keine der beiden Abfragen sieht die noch nicht committete Buchung der anderen. Diese Lücke heißt **Race Condition**, genauer „check-then-act“. Mit dem Exclusion Constraint scheitert das zweite `INSERT`. Ist A noch nicht committet, wartet B auf das Ende von A: Committet A, scheitert B; rollt A zurück, geht B durch. Welche Alternativen es mit Sperren und Isolationsstufen gibt und was sie kosten, zeigt [Isolation und Sperren](/postgres/isolation-sperren).
+
+  Die App-Validierung liefert weiter schnelle, freundliche Meldungen, die Garantie gibt der Constraint. Die App muss seinen Fehler deshalb erwarten und übersetzen, statt mit einem HTTP 500 zu antworten. Jeder Fehler trägt einen fünfstelligen **SQLSTATE**; die Klasse 23 steht für Integritätsverletzungen ([PostgreSQL · Error Codes](https://www.postgresql.org/docs/current/errcodes-appendix.html#ERRCODES-TABLE)):
+
+  | SQLSTATE | Name | typische Antwort der API |
+  | --- | --- | --- |
+  | `23505` | `unique_violation` | 409 Conflict: „E-Mail ist schon registriert“ |
+  | `23P01` | `exclusion_violation` | 409 Conflict: „Raum ist in diesem Zeitraum belegt“ |
+  | `23503` | `foreign_key_violation` | 422 bei unbekannter `raum_id`, 409 beim Löschen eines noch verwendeten Datensatzes |
+  | `23514`, `23502` | `check_violation`, `not_null_violation` | 422, wenn die Eingabe vom Nutzer kommt; sonst ein Fehler in der eigenen Validierung |
+  | `23001` | `restrict_violation` | wie `23503` beim Löschen; so meldet PostgreSQL seit Version 18 einen Verstoß gegen `ON DELETE RESTRICT`, bis Version 17 kam auch hier `23503` |
+
+  Mit psycopg 3 entspricht jedem SQLSTATE eine eigene Ausnahmeklasse, und `diag.constraint_name` nennt den verletzten Constraint ([psycopg · SQLSTATE exceptions](https://www.psycopg.org/psycopg3/docs/api/errors.html#sqlstate-exceptions)):
+
+  ```python
+  from psycopg import errors
+
+  def buche(conn, raum_id: int, mitglied_id: int, beginn, ende) -> int:
+      try:
+          with conn.transaction():
+              row = conn.execute(
+                  """INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende)
+                     VALUES (%s, %s, %s, %s) RETURNING id""",
+                  (raum_id, mitglied_id, beginn, ende),
+              ).fetchone()
+      except errors.ExclusionViolation:
+          raise Konflikt("Der Raum ist in diesem Zeitraum schon gebucht.")
+      except errors.ForeignKeyViolation as e:
+          raise UngueltigeEingabe(f"Unbekannter Bezug ({e.diag.constraint_name})")
+      return row[0]
+  ```
+
+  SQLAlchemy verpackt den Treiberfehler in `IntegrityError`; das Original steckt in `e.orig`, mit psycopg 3 als Treiber also eine Ausnahme mit `sqlstate` und `diag` ([SQLAlchemy · IntegrityError](https://docs.sqlalchemy.org/en/21/core/exceptions.html#sqlalchemy.exc.IntegrityError)):
+
+  ```python
+  from sqlalchemy.exc import IntegrityError
+
+  try:
+      session.add(Mitglied(email=email, name=name))
+      session.commit()
+  except IntegrityError as e:
+      session.rollback()
+      if e.orig.sqlstate == "23505" and e.orig.diag.constraint_name == "mitglieder_email_key":
+          raise HTTPException(status_code=409, detail="Diese E-Mail ist schon registriert.")
+      raise
+  ```
+
+  > [!PRAXIS] Constraints benennen
+  > In Code-Reviews bei Deskwerk gilt: Jeder Constraint, auf den die App reagiert, bekommt einen festen Namen (`CONSTRAINT keine_doppelbuchung …`), und die Fehlerübersetzung prüft genau diesen Namen. Ein Integrationstest pro Constraint stellt sicher, dass die API bei einer Doppelbuchung 409 liefert ([Integrationstests](/testing/integrationstests)).
+
+  > [!INTERVIEW] „Wie verhinderst du Doppelbuchungen?“
+  > Nicht mit einem `SELECT` vor dem `INSERT` – zwischen beiden kann eine zweite Anfrage dieselbe Lücke finden. Ich lege die Regel in die Datenbank: einen Exclusion Constraint `EXCLUDE USING gist (raum_id WITH =, tstzrange(beginn, ende) WITH &&)` mit `btree_gist`, eingeschränkt auf bestätigte Buchungen. Die App versucht das `INSERT`, fängt SQLSTATE `23P01` ab und antwortet mit 409. Die Vorabprüfung bleibt nur für eine freundliche Meldung.
+
+  ## Häufige Fehler
+
+  - **`CHECK` lässt `NULL` durch.** `CHECK (preis >= 0)` akzeptiert fehlende Preise. Ist der Wert Pflicht, zusätzlich `NOT NULL`.
+  - **`UNIQUE` mit `NULL`-Spalten schützt nicht.** Zwei Zeilen mit `NULL` gelten als verschieden. `NULLS NOT DISTINCT` (seit PostgreSQL 15) oder ein partieller Unique-Index.
+  - **E-Mail-Duplikate in anderer Schreibweise.** `UNIQUE (email)` unterscheidet `Lena.Brandt@…` und `lena.brandt@…`. Unique-Index auf `lower(email)`.
+  - **`ON DELETE CASCADE` überall.** Ein gelöschtes Mitglied nimmt still seine Buchungen und die Grundlage seiner Rechnungen mit. `CASCADE` nur für echte Teile, sonst `NO ACTION` oder `RESTRICT`.
+  - **`SET NULL` auf einer `NOT NULL`-Spalte.** Das Anlegen klappt, das Löschen scheitert später mit `not_null_violation`.
+  - **Fremdschlüssel ohne Index.** Jedes Löschen in der Zieltabelle liest die ganze verweisende Tabelle.
+  - **Exclusion Constraint ohne `btree_gist`** scheitert mit `data type integer has no default operator class for access method "gist"`. Erst `CREATE EXTENSION btree_gist`.
+  - **Constraint nachrüsten scheitert an Altdaten.** `ALTER TABLE … ADD CONSTRAINT` prüft alle bestehenden Zeilen. Vorher mit einer Abfrage die Verstöße finden und bereinigen; wie man das bei großen Tabellen ohne lange Sperre macht, zeigt [Migrationen](/postgres/migrationen).
+
+  ## Zusammenfassung
+
+  - Constraints setzt PostgreSQL bei jeder Änderung durch, egal woher sie kommt. Sie sind die letzte Verteidigungslinie, die App-Validierung ist Komfort.
+  - `NOT NULL` verbietet fehlende Werte, `CHECK` prüft eine Bedingung innerhalb **einer** Zeile und ist auch bei `NULL` erfüllt. Domains bündeln wiederkehrende Regeln.
+  - `UNIQUE` und Primärschlüssel legen einen Unique-Index an. `NULL`-Werte gelten als verschieden, außer mit `NULLS NOT DISTINCT`. Ausdrücke wie `lower(email)` brauchen einen Unique-Index.
+  - Fremdschlüssel prüfen Verweise. `ON DELETE` entscheidet fachlich: `CASCADE` für Teile, `NO ACTION`/`RESTRICT` für eigenständige Objekte, `SET NULL` für optionale Verweise. Die verweisende Spalte bekommt keinen automatischen Index.
+  - `DEFERRABLE INITIALLY IMMEDIATE` prüft am Ende der Anweisung, `INITIALLY DEFERRED` beim `COMMIT`.
+  - Ein Exclusion Constraint mit `btree_gist`, `tstzrange(beginn, ende)` und `&&` verhindert Doppelbuchungen, auch bei gleichzeitigen Anfragen.
+  - Die App fängt SQLSTATE `23505`, `23P01`, `23503` (bei `RESTRICT` seit PostgreSQL 18 `23001`) gezielt ab und antwortet mit 409 oder 422.
+exercises:
+  - id: on-delete-waehlen
+    type: choice
+    title: Was passiert beim Löschen?
+    prompt: |
+      Deskwerk legt die Fremdschlüssel seines Schemas fest. Welche Aussagen stimmen? Mehrere Antworten richtig.
+    lang: postgres
+    code: |
+      CREATE TABLE buchungen (
+        id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        mitglied_id  int NOT NULL REFERENCES mitglieder (id),
+        gutschein_id int REFERENCES gutscheine (id) ON DELETE SET NULL,
+        raum_id      int NOT NULL REFERENCES raeume (id)
+      );
+      CREATE TABLE buchungsnotizen (
+        buchung_id bigint NOT NULL REFERENCES buchungen (id) ON DELETE CASCADE,
+        notiz      text NOT NULL
+      );
+    options:
+      - text: Wird eine Buchung gelöscht, verschwinden ihre Notizen mit. Das passt, weil eine Notiz ohne ihre Buchung keinen Sinn hat.
+        correct: true
+        why: "`ON DELETE CASCADE` löscht verweisende Zeilen mit. Die Dokumentation empfiehlt es genau für Zeilen, die ein Teil der Zielzeile sind."
+      - text: Wird ein Gutschein gelöscht, bleiben die Buchungen erhalten, ihre `gutschein_id` wird `NULL`.
+        correct: true
+        why: "`SET NULL` leert den Verweis. Das geht nur, weil `gutschein_id` kein `NOT NULL` hat."
+      - text: Ein Mitglied mit Buchungen lässt sich löschen; seine Buchungen bleiben mit der alten `mitglied_id` stehen.
+        correct: false
+        why: Ohne `ON DELETE` gilt `NO ACTION`. Das `DELETE` scheitert mit `foreign_key_violation`, solange Buchungen auf das Mitglied zeigen. Verwaiste Verweise lässt ein Fremdschlüssel nie zu.
+      - text: "`mitglied_id` sollte besser `ON DELETE CASCADE` bekommen, damit das Löschen eines Mitglieds nicht scheitert."
+        correct: false
+        why: Mitglied und Buchung sind eigenständige Objekte, auf Buchungen beruhen Rechnungen. Ein `CASCADE` würde beim Löschen eines Kontos still die Buchungshistorie mitnehmen. Wer das will, soll es ausdrücklich mit eigenen `DELETE`s tun.
+      - text: Für `raum_id` legt PostgreSQL automatisch einen Index an, damit das Löschen eines Raums schnell prüfen kann, ob noch Buchungen verweisen.
+        correct: false
+        why: Automatisch indiziert wird nur die Zielspalte (Primärschlüssel von `raeume`). Für die verweisende Spalte `buchungen.raum_id` musst du den Index selbst anlegen.
+    explanation: |
+      `ON DELETE` ist eine fachliche Entscheidung. `CASCADE` passt, wenn die verweisende Zeile ohne die Zielzeile nicht existiert (Notizen, Rechnungspositionen). Bei eigenständigen Objekten wie Mitglied und Buchung bleibt der Standard `NO ACTION`, damit niemand versehentlich Historie löscht. `SET NULL` passt für optionale Verweise und setzt eine Spalte ohne `NOT NULL` voraus. Den Index auf der verweisenden Spalte legt PostgreSQL nie selbst an.
+    resources:
+      - title: PostgreSQL · Foreign Keys
+        url: https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-FK
+      - title: PostgreSQL · CREATE TABLE – ON DELETE
+        url: https://www.postgresql.org/docs/current/sql-createtable.html#SQL-CREATETABLE-PARMS-REFERENCES
+
+  - id: null-und-constraints
+    type: output
+    title: Was NULL alles darf
+    prompt: |
+      Was gibt das Skript aus? Ausgabe wie `psql -At`: Werte durch `|` getrennt, `NULL` leer, `t`/`f`. `lp.versuch(…)` führt eine Anweisung probeweise aus und liefert `ok` oder den Namen des Fehlers.
+    lang: postgres
+    code: |
+      CREATE TABLE gutscheine (
+        code        text UNIQUE,
+        rabatt      int CHECK (rabatt BETWEEN 1 AND 50),
+        mitglied_id int NOT NULL
+      );
+      INSERT INTO gutscheine VALUES ('SOMMER', 10, 1);
+      INSERT INTO gutscheine VALUES (NULL, 20, 2);
+      INSERT INTO gutscheine VALUES (NULL, NULL, 3);
+      INSERT INTO gutscheine (code, mitglied_id) VALUES ('HERBST', 4);
+
+      SELECT count(*), count(code), count(rabatt) FROM gutscheine;
+
+      SELECT lp.versuch($$INSERT INTO gutscheine VALUES (NULL, 20, 5)$$),
+             lp.versuch($$INSERT INTO gutscheine VALUES ('sommer', 60, 6)$$),
+             lp.versuch($$INSERT INTO gutscheine VALUES ('SOMMER', NULL, 7)$$),
+             lp.versuch($$INSERT INTO gutscheine (code, rabatt) VALUES ('WINTER', 5)$$);
+    expected: |
+      4|2|2
+      ok|check_violation|unique_violation|not_null_violation
+    hints:
+      - Wann ist ein `CHECK` erfüllt, wenn die Spalte `NULL` ist?
+      - Wie vergleicht `UNIQUE` zwei `NULL`-Werte – und wie `'sommer'` mit `'SOMMER'`?
+    explanation: |
+      Alle vier ersten `INSERT`s gelingen. Zwei Zeilen ohne Code verletzen `UNIQUE` nicht, weil `NULL`-Werte als verschieden gelten. Fehlende Rabatte bestehen den `CHECK`, weil `NULL BETWEEN 1 AND 50` unbekannt ist und unbekannt reicht. Deshalb `4|2|2`. Bei den Versuchen: ein dritter Gutschein ohne Code geht durch. `'sommer'` ist ein anderer Text als `'SOMMER'` und verletzt `UNIQUE` nicht – der Rabatt von 60 aber den `CHECK`. `'SOMMER'` gibt es schon, und ohne `mitglied_id` greift `NOT NULL`.
+    resources:
+      - title: PostgreSQL · Check Constraints
+        url: https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-CHECK-CONSTRAINTS
+      - title: PostgreSQL · Unique Constraints
+        url: https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-UNIQUE-CONSTRAINTS
+
+  - id: loeschen-mit-folgen
+    type: output
+    title: Eine Rechnung verschwindet
+    prompt: |
+      Was gibt das Skript aus? Ausgabe wie `psql -At`: Werte durch `|` getrennt, `NULL` leer, `t`/`f`. `lp.versuch(…)` führt eine Anweisung probeweise aus und liefert `ok` oder den Namen des Fehlers.
+    lang: postgres
+    code: |
+      CREATE TABLE mitglieder (id int PRIMARY KEY, name text NOT NULL);
+      CREATE TABLE rechnungen (
+        id          int PRIMARY KEY,
+        mitglied_id int NOT NULL REFERENCES mitglieder (id),
+        monat       date NOT NULL
+      );
+      CREATE TABLE rechnungspositionen (
+        rechnung_id int NOT NULL REFERENCES rechnungen (id) ON DELETE CASCADE,
+        betrag      numeric(8,2) NOT NULL
+      );
+      CREATE TABLE buchungen (
+        id          int PRIMARY KEY,
+        mitglied_id int NOT NULL REFERENCES mitglieder (id),
+        rechnung_id int REFERENCES rechnungen (id) ON DELETE SET NULL
+      );
+      INSERT INTO mitglieder VALUES (1, 'Lena Brandt'), (2, 'Jonas Albers'), (3, 'Mara Voss');
+      INSERT INTO rechnungen VALUES (100, 1, '2026-02-01'), (101, 1, '2026-03-01'), (102, 2, '2026-03-01');
+      INSERT INTO rechnungspositionen VALUES (100, 48.00), (101, 24.00), (101, 36.00), (102, 12.00);
+      INSERT INTO buchungen VALUES (1, 1, 100), (2, 1, 101), (3, 1, 101), (4, 2, 102), (5, 3, NULL);
+
+      DELETE FROM rechnungen WHERE id = 101;
+
+      SELECT (SELECT count(*) FROM rechnungen),
+             (SELECT count(*) FROM rechnungspositionen),
+             (SELECT count(*) FROM buchungen),
+             (SELECT count(*) FROM buchungen WHERE rechnung_id IS NULL);
+
+      SELECT lp.versuch($$DELETE FROM mitglieder WHERE id = 3$$),
+             lp.versuch($$DELETE FROM mitglieder WHERE id = 2$$),
+             lp.versuch($$DELETE FROM rechnungen WHERE mitglied_id = 2$$);
+    expected: |
+      2|2|5|3
+      foreign_key_violation|foreign_key_violation|ok
+    hints:
+      - Rechnung 101 hat zwei Positionen und zwei Buchungen. Was machen `CASCADE` und `SET NULL` jeweils damit?
+      - Mara Voss hat keine Rechnung, aber eine Buchung. Welcher Fremdschlüssel zeigt von `buchungen` auf `mitglieder`?
+    explanation: |
+      Das `DELETE` entfernt Rechnung 101. `CASCADE` nimmt ihre zwei Positionen mit, es bleiben 2 von 4. `SET NULL` leert den Verweis in den Buchungen 2 und 3; die Buchungen selbst bleiben (5). Zusammen mit Buchung 5, die nie eine Rechnung hatte, haben drei Buchungen keine `rechnung_id`. Mara Voss lässt sich nicht löschen: Ihre Buchung zeigt per `NO ACTION` auf sie. Jonas Albers ebenso, hier verweisen Buchung und Rechnung. Seine Rechnung 102 lässt sich dagegen löschen – die Position fällt per `CASCADE` weg, Buchung 4 bekommt `NULL`.
+    resources:
+      - title: PostgreSQL · Foreign Keys
+        url: https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-FK
+
+  - id: buchungen-probieren
+    type: output
+    title: Welche Buchung kommt durch?
+    prompt: |
+      Im Raum 1 ist eine Buchung von 10 bis 12 Uhr (Berliner Zeit) bestätigt. Was liefert die Abfrage? Ausgabe wie `psql -At`: Werte durch `|` getrennt. `lp.versuch(…)` führt eine Anweisung probeweise aus und liefert `ok` oder den Namen des Fehlers. Die Sitzung läuft in der Zeitzone `Europe/Berlin`; am 4. März gilt dort UTC+1.
+    lang: postgres
+    code: |
+      CREATE EXTENSION btree_gist;
+      CREATE TABLE buchungen (
+        raum_id int NOT NULL,
+        beginn  timestamptz NOT NULL,
+        ende    timestamptz NOT NULL,
+        status  text NOT NULL DEFAULT 'bestaetigt',
+        CHECK (ende > beginn),
+        EXCLUDE USING gist (raum_id WITH =, tstzrange(beginn, ende) WITH &&)
+          WHERE (status = 'bestaetigt')
+      );
+      INSERT INTO buchungen (raum_id, beginn, ende)
+      VALUES (1, '2026-03-04 10:00', '2026-03-04 12:00');
+
+      SELECT
+        lp.versuch($$INSERT INTO buchungen (raum_id, beginn, ende) VALUES (1, '2026-03-04 08:00', '2026-03-04 10:00')$$),
+        lp.versuch($$INSERT INTO buchungen (raum_id, beginn, ende) VALUES (1, '2026-03-04 11:59', '2026-03-04 13:00')$$),
+        lp.versuch($$INSERT INTO buchungen (raum_id, beginn, ende, status) VALUES (1, '2026-03-04 10:00', '2026-03-04 12:00', 'storniert')$$),
+        lp.versuch($$INSERT INTO buchungen (raum_id, beginn, ende) VALUES (1, '2026-03-04 09:00+00', '2026-03-04 10:00+00')$$),
+        lp.versuch($$INSERT INTO buchungen (raum_id, beginn, ende) VALUES (1, '2026-03-04 11:00+00', '2026-03-04 12:00+00')$$),
+        lp.versuch($$INSERT INTO buchungen (raum_id, beginn, ende) VALUES (2, '2026-03-04 13:00', '2026-03-04 11:00')$$);
+    expected: |
+      ok|exclusion_violation|ok|exclusion_violation|ok|check_violation
+    hints:
+      - "`tstzrange(beginn, ende)` ist halboffen: `[beginn, ende)`. Gehört 10:00 zur Buchung von 8 bis 10?"
+      - "`'2026-03-04 09:00+00'` ist UTC. Wie spät ist es dann in Berlin?"
+      - Welche Zeilen erfasst die `WHERE`-Bedingung des Constraints überhaupt?
+    explanation: |
+      8 bis 10 Uhr endet genau dort, wo die bestehende Buchung beginnt. Weil das Ende nicht zum Range gehört, überlappen sie nicht. 11:59 bis 13 Uhr überlappt um eine Minute. Die stornierte Buchung fällt nicht unter `WHERE (status = 'bestaetigt')` und blockiert nichts. 9 bis 10 Uhr UTC ist 10 bis 11 Uhr in Berlin, also mitten in der bestehenden Buchung. 11 bis 12 Uhr UTC ist 12 bis 13 Uhr Berlin und schließt direkt an. Die letzte Zeile verstößt gegen `CHECK (ende > beginn)`; der Raum ist dabei egal.
+    resources:
+      - title: PostgreSQL · Constraints on Ranges
+        url: https://www.postgresql.org/docs/current/rangetypes.html#RANGETYPES-CONSTRAINT
+      - title: PostgreSQL · Inclusive and Exclusive Bounds
+        url: https://www.postgresql.org/docs/current/rangetypes.html#RANGETYPES-INCLUSIVITY
+
+  - id: rechnungspositionen-anlegen
+    type: gap
+    title: Positionen, die zu ihrer Rechnung gehören
+    prompt: |
+      Ergänze die Tabelle für Rechnungspositionen. Positionen sind Teil ihrer Rechnung und verschwinden mit ihr. Eine Position kann auf eine Buchung verweisen; wird die Buchung gelöscht, bleibt die Position ohne Verweis stehen. Kein Betrag ist `0`. Zum Schluss ein Index für die Spalte, über die das Löschen einer Rechnung ihre Positionen sucht.
+    lang: postgres
+    code: |
+      CREATE TABLE rechnungspositionen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        rechnung_id bigint NOT NULL ⟦REFERENCES⟧ rechnungen (id) ON DELETE ⟦CASCADE⟧,
+        buchung_id  bigint REFERENCES buchungen (id) ON DELETE ⟦SET NULL⟧,
+        text        text NOT NULL,
+        betrag      numeric(10,2) NOT NULL ⟦CHECK⟧ (betrag <> 0)
+      );
+      CREATE INDEX ON rechnungspositionen (⟦rechnung_id⟧);
+    gaps:
+      - label: Fremdschlüssel
+        hint: Das Schlüsselwort, mit dem eine Spalte auf eine andere Tabelle zeigt.
+      - label: Aktion für Teile
+        hint: Die Position gehört zur Rechnung und soll mit ihr gelöscht werden.
+      - label: Aktion für optionale Verweise
+        hint: Die Position bleibt, nur der Verweis wird geleert. Zwei Wörter.
+      - label: Bedingung
+        hint: Ein Constraint, der eine Bedingung innerhalb der Zeile prüft.
+      - label: Indexspalte
+        hint: Welche Spalte durchsucht PostgreSQL bei `DELETE FROM rechnungen WHERE id = …`?
+    explanation: |
+      `REFERENCES rechnungen (id) ON DELETE CASCADE` macht die Positionen zu Teilen der Rechnung. `ON DELETE SET NULL` erhält die Position, wenn die Buchung verschwindet; dazu darf `buchung_id` kein `NOT NULL` haben. `CHECK (betrag <> 0)` erlaubt Gutschriften mit negativem Betrag, aber keine Nullpositionen. Der Index auf `rechnung_id` ist nötig, weil PostgreSQL ihn nicht selbst anlegt: Ohne ihn liest jedes Löschen einer Rechnung die ganze Positionstabelle.
+    resources:
+      - title: PostgreSQL · Foreign Keys
+        url: https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-FK
+
+  - id: tarif-erlaubte-werte
+    type: sql
+    lang: postgres
+    title: Nur drei Tarife
+    prompt: |
+      In `mitglieder.tarif` stehen nur `'flex'`, `'fix'` und `'team'` – bisher, weil die App es so schreibt. Sorge dafür, dass die Datenbank jeden anderen Wert ablehnt, auch eine andere Schreibweise wie `'Flex'`. Der Standardwert `'flex'` und die bestehenden Zeilen bleiben gültig.
+
+      Die Prüfabfrage zeigt, ob vier Einfügungen abgelehnt werden: Tarif `'premium'`, Tarif `'Flex'`, Tarif `'team'` und eine Zeile ohne Angabe des Tarifs.
+    schema: |
+      CREATE TABLE mitglieder (
+        id          int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        email       text NOT NULL UNIQUE,
+        name        text NOT NULL,
+        tarif       text NOT NULL DEFAULT 'flex',
+        erstellt_am timestamptz NOT NULL DEFAULT now()
+      );
+      INSERT INTO mitglieder (email, name, tarif) VALUES
+        ('lena.brandt@example.org',  'Lena Brandt',  'fix'),
+        ('jonas.albers@example.org', 'Jonas Albers', 'flex'),
+        ('mara.voss@example.org',    'Mara Voss',    'team'),
+        ('tom.okafor@example.org',   'Tom Okafor',   'flex');
+    starter: |
+      -- ALTER TABLE mitglieder …
+    solution: |
+      ALTER TABLE mitglieder
+        ADD CONSTRAINT mitglieder_tarif_check CHECK (tarif IN ('flex', 'fix', 'team'));
+    check: |
+      SELECT lp.versuch($$INSERT INTO mitglieder (email, name, tarif) VALUES ('nina.neumann@example.org', 'Nina Neumann', 'premium')$$) <> 'ok' AS premium_abgelehnt,
+             lp.versuch($$INSERT INTO mitglieder (email, name, tarif) VALUES ('nina.neumann@example.org', 'Nina Neumann', 'Flex')$$) <> 'ok' AS gross_abgelehnt,
+             lp.versuch($$INSERT INTO mitglieder (email, name, tarif) VALUES ('nina.neumann@example.org', 'Nina Neumann', 'team')$$) <> 'ok' AS team_abgelehnt,
+             lp.versuch($$INSERT INTO mitglieder (email, name) VALUES ('nina.neumann@example.org', 'Nina Neumann')$$) <> 'ok' AS standard_abgelehnt;
+    hints:
+      - Eine Regel für den Wert einer Spalte in derselben Zeile – welcher Constraint?
+      - "`ALTER TABLE mitglieder ADD CONSTRAINT … CHECK (…)`"
+      - "`CHECK (tarif IN ('flex', 'fix', 'team'))`"
+    explanation: |
+      `CHECK (tarif IN ('flex', 'fix', 'team'))` lehnt jeden anderen Wert ab; der Vergleich unterscheidet Groß- und Kleinschreibung, `'Flex'` scheitert also. `ALTER TABLE … ADD CONSTRAINT` prüft beim Anlegen alle bestehenden Zeilen – hier sind sie sauber. `NULL` muss der Constraint nicht abfangen, das erledigt das vorhandene `NOT NULL`. Eine Lookup-Tabelle `tarife` mit Fremdschlüssel oder ein Enum-Typ lösen die Aufgabe ebenfalls; welche Form wann passt, behandelt [Datenmodellierung](/postgres/datenmodellierung).
+    resources:
+      - title: PostgreSQL · Adding a Constraint
+        url: https://www.postgresql.org/docs/current/ddl-alter.html#DDL-ALTER-ADDING-A-CONSTRAINT
+
+  - id: email-ohne-grossschreibung
+    type: sql
+    lang: postgres
+    title: Lena gibt es nur einmal
+    prompt: |
+      Lena Brandt hat sich als `lena.brandt@example.org` registriert. Gestern legte sie mit `Lena.Brandt@example.org` ein zweites Konto an, weil `UNIQUE (email)` die Schreibweise unterscheidet. Das Duplikat ist schon gelöscht.
+
+      Sorge dafür, dass keine zwei Mitglieder E-Mail-Adressen haben, die sich nur in Groß- und Kleinschreibung unterscheiden. Die Adresse wird weiter so gespeichert, wie das Mitglied sie eingibt – neue Mitglieder mit Großbuchstaben in der Adresse bleiben erlaubt.
+
+      Die Prüfabfrage zeigt, ob vier Einfügungen abgelehnt werden: `LENA.BRANDT@example.org`, `lena.brandt@example.org`, `Mara.Voss@example.org` (neu) und `tom.okafor@example.org` (neu).
+    schema: |
+      CREATE TABLE mitglieder (
+        id    int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        email text NOT NULL UNIQUE,
+        name  text NOT NULL,
+        tarif text NOT NULL DEFAULT 'flex'
+      );
+      INSERT INTO mitglieder (email, name, tarif) VALUES
+        ('lena.brandt@example.org',   'Lena Brandt',   'fix'),
+        ('Jonas.Albers@example.org',  'Jonas Albers',  'flex'),
+        ('elif.yilmaz@example.org',   'Elif Yilmaz',   'team');
+    starter: |
+      -- CREATE …
+    solution: |
+      CREATE UNIQUE INDEX mitglieder_email_lower_key ON mitglieder (lower(email));
+    check: |
+      SELECT lp.versuch($$INSERT INTO mitglieder (email, name) VALUES ('LENA.BRANDT@example.org', 'Lena Brandt')$$) <> 'ok' AS gross_abgelehnt,
+             lp.versuch($$INSERT INTO mitglieder (email, name) VALUES ('lena.brandt@example.org', 'Lena Brandt')$$) <> 'ok' AS gleich_abgelehnt,
+             lp.versuch($$INSERT INTO mitglieder (email, name) VALUES ('Mara.Voss@example.org', 'Mara Voss')$$) <> 'ok' AS neu_gross_abgelehnt,
+             lp.versuch($$INSERT INTO mitglieder (email, name) VALUES ('tom.okafor@example.org', 'Tom Okafor')$$) <> 'ok' AS neu_klein_abgelehnt;
+    hints:
+      - Ein Unique-Constraint kann nur Spalten nennen. Eindeutig sein soll aber ein Ausdruck aus der Spalte.
+      - Ein Unique-Index darf auf einem Ausdruck liegen.
+      - "`CREATE UNIQUE INDEX … ON mitglieder (lower(email));`"
+    explanation: |
+      `CREATE UNIQUE INDEX … ON mitglieder (lower(email))` vergleicht die kleingeschriebene Form, speichert aber die Eingabe unverändert. `LENA.BRANDT@…` kollidiert damit mit `lena.brandt@…`, `Mara.Voss@…` ist neu und darf rein. Ein `CHECK (email = lower(email))` wäre keine Lösung: Er scheitert schon beim Anlegen an `Jonas.Albers@…` und würde Mara Voss ablehnen, obwohl ihre Adresse neu ist. Die Erweiterung `citext` mit einem Text-Typ ohne Groß-/Kleinschreibung ist eine Alternative auf normalen Servern, steht im Browser aber nicht zur Verfügung. Damit der Index genutzt wird, sucht die App beim Login ebenfalls mit `WHERE lower(email) = lower($1)`.
+    resources:
+      - title: PostgreSQL · Indexes on Expressions
+        url: https://www.postgresql.org/docs/current/indexes-expressional.html
+      - title: PostgreSQL · Unique Indexes
+        url: https://www.postgresql.org/docs/current/indexes-unique.html
+
+  - id: ein-aktueller-preis
+    type: sql
+    lang: postgres
+    title: Nur ein aktueller Preis je Tarif
+    prompt: |
+      `tarifpreise` speichert die Preisgeschichte. `gueltig_bis IS NULL` heißt: Dieser Preis gilt aktuell. Je Tarif darf es höchstens **einen** aktuellen Preis geben und zu jedem Enddatum höchstens einen Preis. Der vorhandene Unique-Constraint `tarifpreise_tarif_gueltig_bis_key` verhindert Ersteres nicht. Passe die Constraints an.
+
+      Die Prüfabfrage versucht vier Einfügungen: einen zweiten aktuellen Flex-Preis, einen zweiten Flex-Preis bis `2026-03-31`, einen Flex-Preis bis `2026-06-30` und einen aktuellen Team-Preis.
+    schema: |
+      CREATE TABLE tarifpreise (
+        id          int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        tarif       text NOT NULL,
+        preis       numeric(8,2) NOT NULL CHECK (preis >= 0),
+        gueltig_bis date,
+        CONSTRAINT tarifpreise_tarif_gueltig_bis_key UNIQUE (tarif, gueltig_bis)
+      );
+      INSERT INTO tarifpreise (tarif, preis, gueltig_bis) VALUES
+        ('flex', 169.00, '2025-12-31'),
+        ('flex', 179.00, '2026-03-31'),
+        ('flex', 189.00, NULL),
+        ('fix',  299.00, NULL);
+    starter: |
+      -- ALTER TABLE tarifpreise …
+    solution: |
+      ALTER TABLE tarifpreise DROP CONSTRAINT tarifpreise_tarif_gueltig_bis_key;
+      ALTER TABLE tarifpreise
+        ADD CONSTRAINT tarifpreise_tarif_gueltig_bis_key UNIQUE NULLS NOT DISTINCT (tarif, gueltig_bis);
+    check: |
+      SELECT lp.versuch($$INSERT INTO tarifpreise (tarif, preis) VALUES ('flex', 199)$$) AS zweiter_aktueller,
+             lp.versuch($$INSERT INTO tarifpreise (tarif, preis, gueltig_bis) VALUES ('flex', 175, '2026-03-31')$$) AS gleiches_ende,
+             lp.versuch($$INSERT INTO tarifpreise (tarif, preis, gueltig_bis) VALUES ('flex', 185, '2026-06-30')$$) AS neues_ende,
+             lp.versuch($$INSERT INTO tarifpreise (tarif, preis) VALUES ('team', 499)$$) AS erster_team;
+    hints:
+      - Wie behandelt ein Unique-Constraint zwei Zeilen mit `NULL` in `gueltig_bis`?
+      - Seit PostgreSQL 15 gibt es einen Zusatz, der `NULL`-Werte als gleich behandelt. Alternativ hilft ein partieller Unique-Index nur für die aktuellen Zeilen.
+      - "`UNIQUE NULLS NOT DISTINCT (tarif, gueltig_bis)` – den alten Constraint vorher mit `DROP CONSTRAINT` entfernen."
+    explanation: |
+      Ein normaler Unique-Constraint hält zwei `NULL`-Werte für verschieden, deshalb ließ er beliebig viele aktuelle Preise je Tarif zu. `UNIQUE NULLS NOT DISTINCT` (seit PostgreSQL 15) behandelt sie als gleich: Je Tarif ist nur noch ein `gueltig_bis IS NULL` möglich. Gleichwertig ist, den alten Constraint zu behalten und `CREATE UNIQUE INDEX … ON tarifpreise (tarif) WHERE gueltig_bis IS NULL` hinzuzufügen. Ob sich zwei Gültigkeitszeiträume überschneiden, prüft keine der beiden Lösungen – dafür bräuchte es einen Range und einen Exclusion Constraint.
+    resources:
+      - title: PostgreSQL · Unique Constraints – NULLS NOT DISTINCT
+        url: https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-UNIQUE-CONSTRAINTS
+      - title: PostgreSQL · Partial Indexes
+        url: https://www.postgresql.org/docs/current/indexes-partial.html
+
+  - id: reihenfolge-tauschen
+    type: sql
+    lang: postgres
+    title: Zwei Räume tauschen die Plätze
+    prompt: |
+      In der Raumliste der App lassen sich Räume per Drag-and-drop umsortieren. Zum Tauschen schickt die App eine einzige Anweisung:
+
+      ```postgres
+      UPDATE raeume SET reihenfolge = 3 - reihenfolge WHERE id IN (1, 2);
+      ```
+
+      Sie scheitert mit `unique_violation`, obwohl am Ende keine Reihenfolge doppelt vorkommt. Ändere den Constraint `raeume_reihenfolge_key` so, dass dieser Tausch klappt. Eine Anweisung, die **nach ihrem Ende** zwei gleiche Reihenfolgen im selben Standort hinterlässt, soll weiterhin sofort scheitern – nicht erst beim `COMMIT`.
+
+      Die Prüfabfrage versucht den Tausch und ein `INSERT` mit einer schon vergebenen Reihenfolge.
+    schema: |
+      CREATE TABLE raeume (
+        id          int PRIMARY KEY,
+        standort_id int NOT NULL,
+        name        text NOT NULL,
+        reihenfolge int NOT NULL,
+        CONSTRAINT raeume_reihenfolge_key UNIQUE (standort_id, reihenfolge)
+      );
+      INSERT INTO raeume VALUES
+        (1, 1, 'Loft', 1), (2, 1, 'Atelier', 2), (3, 1, 'Box 1', 3),
+        (4, 2, 'Werkstatt', 1), (5, 2, 'Box 2', 2);
+    starter: |
+      -- ALTER TABLE raeume …
+    solution: |
+      ALTER TABLE raeume DROP CONSTRAINT raeume_reihenfolge_key;
+      ALTER TABLE raeume ADD CONSTRAINT raeume_reihenfolge_key
+        UNIQUE (standort_id, reihenfolge) DEFERRABLE INITIALLY IMMEDIATE;
+    check: |
+      SELECT lp.versuch($$UPDATE raeume SET reihenfolge = 3 - reihenfolge WHERE id IN (1, 2)$$) AS tauschen,
+             lp.versuch($$INSERT INTO raeume VALUES (6, 1, 'Box 3', 3)$$) IN ('unique_violation', 'exclusion_violation') AS doppelt_abgelehnt;
+    hints:
+      - Ein nicht aufschiebbarer Unique-Constraint prüft jede Zeile sofort. Nach der ersten geänderten Zeile gibt es kurz zwei Räume mit Reihenfolge 2.
+      - "`ALTER CONSTRAINT` ändert die Prüfzeit nur bei Fremdschlüsseln. Lösche den Constraint und lege ihn neu an."
+      - "`UNIQUE (standort_id, reihenfolge) DEFERRABLE INITIALLY IMMEDIATE` – nicht `INITIALLY DEFERRED`."
+    explanation: |
+      Ohne `DEFERRABLE` prüft PostgreSQL einen Unique-Constraint bei jeder einzelnen Zeile, also auch den Zwischenzustand mitten im `UPDATE`. `DEFERRABLE INITIALLY IMMEDIATE` prüft am Ende der Anweisung, wie der SQL-Standard es vorsieht: Der Tausch klappt, ein Duplikat scheitert weiterhin sofort. `INITIALLY DEFERRED` würde die Prüfung bis zum `COMMIT` verschieben. Im Test liefe das `INSERT` dann ohne Fehler durch, weil `lp.versuch` vor dem `COMMIT` zurückrollt – in der App käme der Fehler erst bei `commit()`, weit weg von der Ursache. Beachte: Ein aufschiebbarer Unique-Constraint kann nicht mehr Ziel von `ON CONFLICT` sein.
+    resources:
+      - title: PostgreSQL · CREATE TABLE – DEFERRABLE
+        url: https://www.postgresql.org/docs/current/sql-createtable.html#SQL-CREATETABLE-PARMS-DEFERRABLE
+      - title: PostgreSQL · SET CONSTRAINTS
+        url: https://www.postgresql.org/docs/current/sql-set-constraints.html
+
+  - id: geschlossenes-intervall
+    type: bug
+    title: Direkt danach geht nicht
+    prompt: |
+      Seit der Migration gegen Doppelbuchungen beschweren sich Mitglieder: Lena Brandt hat das Loft von 10 bis 12 Uhr gebucht. Jonas Albers will ihn ab 12 Uhr buchen und bekommt `conflicting key value violates exclusion constraint "keine_doppelbuchung"`. Überlappende Buchungen werden korrekt abgelehnt. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: postgres
+    code: |
+      CREATE EXTENSION IF NOT EXISTS btree_gist;
+      ALTER TABLE buchungen
+        ADD CONSTRAINT keine_doppelbuchung EXCLUDE USING gist (
+          raum_id WITH =,
+          tstzrange(beginn, ende, '[]') WITH &&
+        )
+        WHERE (status = 'bestaetigt');
+    lines: [5]
+    fix:
+      - line: 5
+        answers:
+          - "tstzrange(beginn, ende) WITH &&"
+          - "tstzrange(beginn, ende, '[)') WITH &&"
+    hints:
+      - Welcher Zeitpunkt gehört bei `[]` zu beiden Buchungen?
+      - Der Standard von `tstzrange` ist halboffen.
+    explanation: |
+      `'[]'` macht den Range an beiden Enden geschlossen: Die Buchung von 10 bis 12 enthält den Zeitpunkt 12:00, die Buchung ab 12 Uhr ebenfalls. Damit überlappen sie in genau einem Punkt, und `&&` ist wahr. Mit dem Standard `'[)'` gehört das Ende nicht dazu, direkt aufeinanderfolgende Buchungen passen. Halboffene Intervalle sind auch sonst die richtige Wahl für Zeiträume: Sie lassen sich lückenlos aneinanderreihen, und die Dauer ist `ende - beginn`.
+    resources:
+      - title: PostgreSQL · Inclusive and Exclusive Bounds
+        url: https://www.postgresql.org/docs/current/rangetypes.html#RANGETYPES-INCLUSIVITY
+
+  - id: falsche-ausnahme
+    type: bug
+    title: Doppelbuchung gibt HTTP 500
+    prompt: |
+      Der Exclusion Constraint `keine_doppelbuchung` funktioniert: Eine überlappende Buchung landet nicht in der Datenbank. Die API antwortet darauf aber mit HTTP 500 statt mit der erwarteten 409 und der Meldung „Der Raum ist in diesem Zeitraum schon gebucht.“ Im Log steht `psycopg.errors.ExclusionViolation: conflicting key value violates exclusion constraint "keine_doppelbuchung"`. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: python
+    code: |
+      from psycopg import errors
+
+      def buche(conn, raum_id: int, mitglied_id: int, beginn, ende) -> int:
+          try:
+              with conn.transaction():
+                  row = conn.execute(
+                      """INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende)
+                         VALUES (%s, %s, %s, %s) RETURNING id""",
+                      (raum_id, mitglied_id, beginn, ende),
+                  ).fetchone()
+          except errors.UniqueViolation:
+              raise Konflikt("Der Raum ist in diesem Zeitraum schon gebucht.")
+          return row[0]
+    lines: [11]
+    fix:
+      - line: 11
+        answers:
+          - "except errors.ExclusionViolation:"
+          - "except errors.ExclusionViolation as e:"
+          - "except errors.lookup(\"23P01\"):"
+          - "except errors.lookup(\"EXCLUSION_VIOLATION\"):"
+    hints:
+      - Welchen SQLSTATE meldet ein Exclusion Constraint, welchen ein Unique-Constraint?
+      - psycopg hat für jeden SQLSTATE eine eigene Klasse. Der Name steht im Log.
+    explanation: |
+      Ein Exclusion Constraint meldet SQLSTATE `23P01` (`exclusion_violation`), ein Unique-Constraint `23505`. psycopg bildet beide auf verschiedene Klassen ab, und `except errors.UniqueViolation` fängt die Exclusion-Verletzung nicht. Sie fliegt weiter und wird zum HTTP 500. `except errors.IntegrityError` würde zwar fangen, aber auch Fremdschlüsselfehler als „Raum belegt“ melden. Wer mehrere Constraints derselben Art unterscheiden muss, prüft zusätzlich `e.diag.constraint_name`.
+    resources:
+      - title: psycopg · SQLSTATE exceptions
+        url: https://www.psycopg.org/psycopg3/docs/api/errors.html#sqlstate-exceptions
+      - title: PostgreSQL · Error Codes
+        url: https://www.postgresql.org/docs/current/errcodes-appendix.html#ERRCODES-TABLE
+
+  - id: pruefen-dann-einfuegen
+    type: explain
+    title: Die Prüfung, die nicht schützt
+    prompt: |
+      Ein Kollege hat die Buchung so umgesetzt und hält einen Constraint für überflüssig: „Wir prüfen doch vorher.“ Erkläre im Code-Review, warum der Code trotz der Prüfung Doppelbuchungen erzeugen kann, was ein Exclusion Constraint anders macht und wie du die Funktion umbauen würdest.
+    lang: python
+    code: |
+      def buche(session, raum_id, mitglied_id, beginn, ende):
+          belegt = session.scalar(
+              select(func.count()).select_from(Buchung).where(
+                  Buchung.raum_id == raum_id,
+                  Buchung.status == "bestaetigt",
+                  Buchung.beginn < ende,
+                  Buchung.ende > beginn,
+              )
+          )
+          if belegt:
+              raise HTTPException(status_code=409, detail="Raum belegt")
+          session.add(Buchung(raum_id=raum_id, mitglied_id=mitglied_id, beginn=beginn, ende=ende))
+          session.commit()
+    points:
+      - Zwischen `SELECT` und `INSERT` liegt ein Zeitfenster. Zwei gleichzeitige Anfragen sehen beide 0, weil keine die noch nicht committete Buchung der anderen sieht (Read Committed), und beide fügen ein.
+      - Die Prüfung selbst ist richtig (halboffene Überlappung `beginn < ende AND ende > beginn`), das Problem ist allein die Nebenläufigkeit.
+      - Ein Exclusion Constraint prüft beim Schreiben gegen alle bestätigten Buchungen, auch gegen noch offene Transaktionen; die zweite wartet und scheitert nach dem Commit der ersten mit `23P01`.
+      - Umbau – Constraint anlegen, das `INSERT` direkt versuchen, `IntegrityError` mit SQLSTATE `23P01` abfangen, `rollback()` und 409 liefern; die Vorabprüfung höchstens für eine freundliche Meldung behalten.
+    explanation: |
+      Die Abfrage prüft die Überlappung korrekt, aber nur für den Moment, in dem sie läuft. Kommen zwei Anfragen fast gleichzeitig, sehen beide `belegt = 0`: Im Standard-Isolationslevel Read Committed sieht keine die noch nicht committete Buchung der anderen. Beide fügen ein, beide committen – klassisches check-then-act. Ein Exclusion Constraint `EXCLUDE USING gist (raum_id WITH =, tstzrange(beginn, ende) WITH &&) WHERE (status = 'bestaetigt')` prüft dagegen im Moment des Schreibens. Die zweite Transaktion wartet, bis die erste fertig ist, und scheitert nach deren Commit mit SQLSTATE `23P01`. Ich würde das `INSERT` direkt versuchen, `IntegrityError` abfangen, `e.orig.sqlstate == "23P01"` prüfen, die Session zurückrollen und 409 liefern. Die Vorabprüfung kann für eine schnelle Meldung bleiben, Garantie ist sie keine.
+    resources:
+      - title: PostgreSQL · Read Committed Isolation Level
+        url: https://www.postgresql.org/docs/current/transaction-iso.html#XACT-READ-COMMITTED
+      - title: SQLAlchemy · IntegrityError
+        url: https://docs.sqlalchemy.org/en/21/core/exceptions.html#sqlalchemy.exc.IntegrityError
+
+  - id: keine-doppelbuchung
+    type: sql
+    lang: postgres
+    title: Das Loft gehört nur einem
+    prompt: |
+      Sorge dafür, dass ein Raum nie zwei **bestätigte** Buchungen (`status = 'bestaetigt'`) mit überlappendem Zeitraum hat. Buchungen sind halboffen: Eine Buchung bis 12 Uhr und eine ab 12 Uhr im selben Raum sind erlaubt. Stornierte Buchungen (`status = 'storniert'`) bleiben in der Tabelle und blockieren nichts. Lösche keine Zeilen.
+
+      Die Prüfabfrage zeigt die Zahl der Buchungen und versucht fünf Änderungen: eine überlappende Buchung im Loft (Raum 1), eine direkt anschließende im Loft, eine zur gleichen Zeit im Atelier (Raum 2), eine stornierte überlappende Buchung im Loft und die Reaktivierung der stornierten Buchung 4.
+    schema: |
+      CREATE TABLE raeume (
+        id               int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        name             text NOT NULL,
+        preis_pro_stunde numeric(8,2) NOT NULL
+      );
+      CREATE TABLE buchungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        raum_id     int NOT NULL REFERENCES raeume (id),
+        mitglied_id int NOT NULL,
+        beginn      timestamptz NOT NULL,
+        ende        timestamptz NOT NULL,
+        status      text NOT NULL DEFAULT 'bestaetigt',
+        CHECK (ende > beginn)
+      );
+      INSERT INTO raeume (name, preis_pro_stunde) VALUES ('Loft', 24.00), ('Atelier', 18.00), ('Box 1', 6.00);
+      INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, status) VALUES
+        (1, 1, '2026-03-04 10:00', '2026-03-04 12:00', 'bestaetigt'),
+        (1, 2, '2026-03-04 12:00', '2026-03-04 14:00', 'bestaetigt'),
+        (2, 3, '2026-03-04 10:00', '2026-03-04 11:00', 'bestaetigt'),
+        (1, 4, '2026-03-04 11:00', '2026-03-04 13:00', 'storniert'),
+        (3, 1, '2026-03-04 09:00', '2026-03-04 09:30', 'bestaetigt');
+    starter: |
+      -- Doppelbuchungen verhindern
+    solution: |
+      CREATE EXTENSION btree_gist;
+      ALTER TABLE buchungen
+        ADD CONSTRAINT keine_doppelbuchung EXCLUDE USING gist (
+          raum_id WITH =,
+          tstzrange(beginn, ende) WITH &&
+        )
+        WHERE (status = 'bestaetigt');
+    check: |
+      SELECT (SELECT count(*) FROM buchungen) AS buchungen,
+             lp.versuch($$INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende) VALUES (1, 5, '2026-03-04 11:30', '2026-03-04 12:30')$$) AS ueberlappt,
+             lp.versuch($$INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende) VALUES (1, 5, '2026-03-04 14:00', '2026-03-04 15:00')$$) AS anschluss,
+             lp.versuch($$INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende) VALUES (2, 5, '2026-03-04 11:00', '2026-03-04 12:00')$$) AS atelier,
+             lp.versuch($$INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, status) VALUES (1, 5, '2026-03-04 10:30', '2026-03-04 11:30', 'storniert')$$) AS storniert,
+             lp.versuch($$UPDATE buchungen SET status = 'bestaetigt' WHERE id = 4$$) AS reaktiviert;
+    hints:
+      - "`UNIQUE` vergleicht nur mit `=`. Gesucht ist eine Regel aus „gleicher Raum“ und „Zeitraum überlappt“."
+      - "Das Anlegen ohne Einschränkung scheitert an Buchung 4. Ein Exclusion Constraint kann wie ein partieller Index eine `WHERE`-Bedingung haben. Für `raum_id WITH =` im GiST-Index brauchst du eine Erweiterung."
+      - "`CREATE EXTENSION btree_gist;` und `ALTER TABLE buchungen ADD CONSTRAINT … EXCLUDE USING gist (raum_id WITH =, tstzrange(beginn, ende) WITH &&) WHERE (status = 'bestaetigt');`"
+    explanation: |
+      Der Exclusion Constraint verbietet je zwei bestätigte Zeilen, in denen `raum_id` gleich ist **und** sich die Zeiträume überschneiden. `tstzrange(beginn, ende)` ist halboffen, deshalb passen 10–12 und 12–14. `btree_gist` liefert den GiST-Operator für `=` auf `int`. Die Falle steckt in den Daten: Die stornierte Buchung 4 überlappt die Buchungen 1 und 2. Ohne `WHERE (status = 'bestaetigt')` scheitert schon das `ALTER TABLE`, und wer Buchung 4 löscht, um es durchzubekommen, verliert Historie. Mit der Bedingung bleibt sie stehen – und wird abgelehnt, sobald jemand sie wieder auf `bestaetigt` setzt. Der Constraint prüft also auch `UPDATE`s, nicht nur neue Zeilen.
+    resources:
+      - title: PostgreSQL · CREATE TABLE – EXCLUDE
+        url: https://www.postgresql.org/docs/current/sql-createtable.html#SQL-CREATETABLE-EXCLUDE
+      - title: PostgreSQL · btree_gist
+        url: https://www.postgresql.org/docs/current/btree-gist.html

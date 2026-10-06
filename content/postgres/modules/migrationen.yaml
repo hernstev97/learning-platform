@@ -1,0 +1,1073 @@
+id: migrationen
+title: Schema-Migrationen ohne Ausfall
+level: 3
+minutes: 160
+summary: Schemaänderungen als versionierte Migrationen ausliefern, ohne dass die laufende App an Sperren hängen bleibt – mit lock_timeout, Spalten ohne Rewrite, NOT VALID und VALIDATE, CREATE INDEX CONCURRENTLY und Expand and Contract für Umbenennungen und Typwechsel.
+goals:
+  - Du erklärst, wie Alembic, Prisma Migrate und Flyway Migrationen versionieren und anwenden, und liest das SQL, das sie ausführen.
+  - Du bestimmst die Sperre einer DDL-Anweisung, erkennst die Sperrwarteschlange als Ursache eines Ausfalls und begrenzt sie mit `lock_timeout`.
+  - Du sagst vorher, welche `ALTER TABLE`-Anweisungen die Tabelle neu schreiben, und fügst Spalten mit Default ohne Rewrite hinzu.
+  - Du rüstest NOT NULL, CHECK und Fremdschlüssel mit `NOT VALID` und `VALIDATE CONSTRAINT` nach und baust Indexe mit `CREATE INDEX CONCURRENTLY`.
+  - Du planst Umbenennungen und Typwechsel als Expand and Contract mit Backfill in Batches und passender Deployment-Reihenfolge.
+resources:
+  - title: PostgreSQL · Explicit Locking – Table-Level Locks
+    url: https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-TABLES
+  - title: PostgreSQL · ALTER TABLE – Notes
+    url: https://www.postgresql.org/docs/current/sql-altertable.html#SQL-ALTERTABLE-NOTES
+  - title: PostgreSQL · Building Indexes Concurrently
+    url: https://www.postgresql.org/docs/current/sql-createindex.html#SQL-CREATEINDEX-CONCURRENTLY
+  - title: Alembic · Operation Reference
+    url: https://alembic.sqlalchemy.org/en/latest/ops.html
+  - title: Prisma ORM 7 · Customizing migrations
+    url: https://www.prisma.io/docs/orm/v7/prisma-migrate/workflows/customizing-migrations
+lesson: |
+  Freitag, 10:02 Uhr, Deploy der Deskwerk-App. Die erste Migration ist eine Zeile: `ALTER TABLE buchungen ADD COLUMN notiz text`. Lokal dauert sie zwei Millisekunden. In Produktion steht sie vier Minuten, und mit ihr die ganze App: Kein Mitglied kann buchen, nicht einmal „Meine Buchungen“ lädt. Um 10:06 Uhr ist alles wieder da, ohne dass jemand eingegriffen hat. Die Ursache war kein langsames SQL, sondern eine Sperre – und ein Bericht, der seit 9:58 Uhr eine Transaktion offen hielt.
+
+  Ein Datenbankschema ändert sich mit jeder Funktion, und diese Änderungen laufen gegen eine Datenbank, die gleichzeitig benutzt wird. Dieses Modul zeigt, wie Migrationen als Code ausgeliefert werden, welche Sperren DDL-Anweisungen nehmen und mit welchen Mustern Spalten, Constraints und Indexe ohne Ausfall in eine große Tabelle kommen. Die Beispiele laufen in PostgreSQL 18; Ausgaben mit mehreren Sitzungen stammen aus einem echten PostgreSQL 18.
+
+  ## Migrationen als Code: Alembic, Prisma Migrate, Flyway
+
+  Eine **Migration** ist eine versionierte Datei, die das Schema von einem Stand zum nächsten bringt. Die Dateien liegen im Repository, haben eine feste Reihenfolge und werden in jeder Umgebung gleich angewandt: lokal, in CI gegen eine Wegwerf-Datenbank, in Staging und in Produktion. Eine Tabelle in der Datenbank merkt sich, was schon gelaufen ist – bei Alembic `alembic_version`, bei Prisma `_prisma_migrations`, bei Flyway `flyway_schema_history`. Eine Migration, die irgendwo schon lief, wird nie mehr geändert; Korrekturen kommen als neue Migration.
+
+  Das Python-Backend von Deskwerk nutzt [Alembic](https://alembic.sqlalchemy.org/en/latest/ops.html). Eine Migration ist eine Python-Datei mit `upgrade()` und `downgrade()`:
+
+  ```python
+  from alembic import op
+  import sqlalchemy as sa
+
+  revision = "3f2a9c1d7e10"
+  down_revision = None
+
+
+  def upgrade() -> None:
+      op.execute("SET lock_timeout = '3s'")
+      op.add_column(
+          "mitglieder",
+          sa.Column("newsletter", sa.Boolean(), nullable=False, server_default=sa.false()),
+      )
+      with op.get_context().autocommit_block():
+          op.execute("RESET lock_timeout")
+          op.create_index(
+              "buchungen_raum_beginn_idx",
+              "buchungen",
+              ["raum_id", "beginn"],
+              postgresql_concurrently=True,
+          )
+  ```
+
+  Mit `alembic upgrade head --sql` schreibt Alembic das SQL aus, statt es auszuführen ([Alembic · Offline Mode](https://alembic.sqlalchemy.org/en/latest/offline.html)). Das gehört in jedes Review einer Migration:
+
+  ```text
+  BEGIN;
+
+  CREATE TABLE alembic_version (
+      version_num VARCHAR(32) NOT NULL,
+      CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num)
+  );
+
+  -- Running upgrade  -> 3f2a9c1d7e10
+
+  SET lock_timeout = '3s';
+
+  ALTER TABLE mitglieder ADD COLUMN newsletter BOOLEAN DEFAULT false NOT NULL;
+
+  COMMIT;
+
+  RESET lock_timeout;
+
+  CREATE INDEX CONCURRENTLY buchungen_raum_beginn_idx ON buchungen (raum_id, beginn);
+
+  BEGIN;
+
+  INSERT INTO alembic_version (version_num) VALUES ('3f2a9c1d7e10') RETURNING alembic_version.version_num;
+
+  COMMIT;
+  ```
+
+  Mit der `env.py` aus der Vorlage setzt Alembic alle Migrationen eines Laufs in eine gemeinsame Transaktion; mit `transaction_per_migration=True` bekommt jede Datei ihre eigene. `autocommit_block()` committet alles, was bis dahin gelaufen ist, führt den Index ohne Transaktion aus und beginnt danach eine neue. Für Migrationen mit solchen Blöcken empfiehlt die Alembic-Doku `transaction_per_migration` ([Alembic · autocommit_block](https://alembic.sqlalchemy.org/en/latest/api/runtime.html#alembic.runtime.migration.MigrationContext.autocommit_block)). Warum vor dem Index `RESET lock_timeout` steht, zeigt der Abschnitt über `CREATE INDEX CONCURRENTLY`.
+
+  Der TypeScript-Dienst nutzt **Prisma Migrate**. `prisma migrate dev` vergleicht `schema.prisma` mit der Datenbank und erzeugt eine Datei `prisma/migrations/<zeitstempel>_<name>/migration.sql`; mit `--create-only` legt es die Datei nur an, damit du sie vor dem Anwenden bearbeiten kannst ([Prisma · Customizing migrations](https://www.prisma.io/docs/orm/v7/prisma-migrate/workflows/customizing-migrations)). In Staging und Produktion wendet `prisma migrate deploy` die Dateien an. Ein Unterschied zu Alembic, ausprobiert mit Prisma 7.10: Prisma Migrate setzt die Datei nicht in eine umschließende Transaktion. Scheitert die zweite Anweisung, bleibt die erste in der Datenbank, und die Migration steht als fehlgeschlagen in `_prisma_migrations`, bis du sie mit `prisma migrate resolve` auflöst ([Prisma · Failed migration](https://www.prisma.io/docs/orm/v7/prisma-migrate/workflows/patching-and-hotfixing#failed-migration)). [Flyway](https://documentation.red-gate.com/fd/migrations-271585107.html), häufig in Kotlin- und Java-Projekten, nimmt SQL-Dateien wie `V7__newsletter.sql` und setzt jede standardmäßig in eine eigene Transaktion. Enthält eine Datei eine Anweisung, die keine Transaktion verträgt, etwa `CREATE INDEX CONCURRENTLY`, erkennt Flyway das und führt sie ohne Transaktion aus; von Hand schaltest du es mit `executeInTransaction=false` in einer Skriptkonfiguration `V7__newsletter.sql.conf` ab ([Flyway · Transaction handling](https://documentation.red-gate.com/fd/migration-transaction-handling-273973399.html)).
+
+  Dass Alembic und Flyway ganze Migrationen in Transaktionen setzen können, liegt an PostgreSQL: DDL ist dort transaktional, ein `ROLLBACK` nimmt auch `ALTER TABLE` zurück (mehr in [Transaktionen](/postgres/transaktionen)). Das schützt vor halben Migrationen, hat aber einen Preis: Jede Sperre, die eine Anweisung nimmt, bleibt bis zum `COMMIT` bestehen.
+
+  ## Sperren: was ALTER TABLE blockiert
+
+  Jede Anweisung sperrt die Tabellen, die sie anfasst. Die Sperrstufen unterscheiden sich darin, womit sie in Konflikt stehen ([PostgreSQL · Table-Level Locks](https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-TABLES)):
+
+  | Anweisung | Sperre | blockiert |
+  | --- | --- | --- |
+  | `SELECT` | ACCESS SHARE | nur ACCESS EXCLUSIVE |
+  | `INSERT`, `UPDATE`, `DELETE` | ROW EXCLUSIVE | SHARE und stärker, etwa `CREATE INDEX` |
+  | `CREATE INDEX CONCURRENTLY`, `VALIDATE CONSTRAINT` | SHARE UPDATE EXCLUSIVE | andere DDL und `VACUUM`, nicht Lesen und Schreiben |
+  | `CREATE INDEX` | SHARE | alle Schreibzugriffe |
+  | `ADD FOREIGN KEY` (auf beiden Tabellen) | SHARE ROW EXCLUSIVE | alle Schreibzugriffe |
+  | die meisten `ALTER TABLE`, `DROP TABLE`, `TRUNCATE` | ACCESS EXCLUSIVE | alles, auch `SELECT` |
+
+  `ALTER TABLE` nimmt ACCESS EXCLUSIVE, wenn die Dokumentation für eine Unterform nichts anderes sagt. Die eigenen Sperren zeigt die Sicht [`pg_locks`](https://www.postgresql.org/docs/current/view-pg-locks.html):
+
+  ```postgres run
+  CREATE TABLE mitglieder (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, email text NOT NULL);
+  CREATE TABLE buchungen (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    mitglied_id int NOT NULL,
+    preis       numeric(8,2)
+  );
+  CREATE VIEW sperren AS
+    SELECT relation::regclass AS tabelle, mode
+    FROM pg_locks
+    WHERE pid = pg_backend_pid() AND relation IN ('buchungen'::regclass, 'mitglieder'::regclass)
+    ORDER BY relation::regclass::text, mode;
+
+  BEGIN;
+  SELECT count(*) FROM buchungen;
+  SELECT * FROM sperren;
+  ALTER TABLE buchungen ADD COLUMN notiz text;
+  SELECT * FROM sperren;
+  ROLLBACK;
+
+  BEGIN;
+  ALTER TABLE buchungen ADD CONSTRAINT buchungen_mitglied_fk
+    FOREIGN KEY (mitglied_id) REFERENCES mitglieder (id) NOT VALID;
+  SELECT * FROM sperren;
+  ROLLBACK;
+  ```
+
+  Sperren gelten bis zum Ende der Transaktion. Das `ALTER TABLE` selbst ist hier in Mikrosekunden fertig. Gefährlich wird es erst, wenn es **warten** muss. Genau das passierte am Freitag. So sieht es in einem echten PostgreSQL 18 aus, wenn eine Sitzung eine Transaktion offen lässt, die Migration startet und danach eine gewöhnliche Abfrage der App kommt:
+
+  ```text
+   pid |        state        | wartet_auf | blockiert_von |                      query
+  -----+---------------------+------------+---------------+--------------------------------------------------
+   202 | idle in transaction | Client     | {}            | SELECT count(*) FROM buchungen;
+   209 | active              | Lock       | {202}         | ALTER TABLE buchungen ADD COLUMN notiz text
+   216 | active              | Lock       | {209}         | SELECT id, status FROM buchungen WHERE mitglied_
+  ```
+
+  ```text
+   pid |        mode         | granted
+  -----+---------------------+---------
+   202 | AccessShareLock     | t
+   209 | AccessExclusiveLock | f
+   216 | AccessShareLock     | f
+  ```
+
+  Sitzung 202 hält eine ACCESS SHARE-Sperre, weil ihre Transaktion noch offen ist. Die Migration 209 braucht ACCESS EXCLUSIVE und wartet. Die Abfrage 216 bräuchte nur ACCESS SHARE, die mit 202 verträglich wäre – sie wartet trotzdem, und [`pg_blocking_pids`](https://www.postgresql.org/docs/current/functions-info.html#FUNCTIONS-INFO-SESSION-TABLE) nennt als Grund die **wartende** Migration. Neue Sperranfragen stellen sich hinter eine wartende, mit der sie in Konflikt stehen. Jede weitere Anfrage auf `buchungen` landet in dieser **Sperrwarteschlange**, bis 202 endet und die Migration durch ist.
+
+  Die Abhilfe ist [`lock_timeout`](https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-LOCK-TIMEOUT): Wartet eine Anweisung länger auf eine Sperre, bricht sie ab und gibt die Warteschlange frei.
+
+  ```text
+  SET lock_timeout = '2s'
+  SET
+  ALTER TABLE buchungen ADD COLUMN notiz2 text
+  ERROR:  canceling statement due to lock timeout
+  ```
+
+  Eine abgebrochene Migration ist besser als eine wartende: Die App läuft weiter, und das Deployment versucht es nach einer Pause erneut. Zusätzlich hilft `idle_in_transaction_session_timeout` gegen vergessene Transaktionen, die überhaupt erst die Sperre halten.
+
+  > [!MERKE]
+  > Kurze DDL ist nur dann harmlos, wenn sie ihre Sperre sofort bekommt. Jede Migration beginnt mit `SET lock_timeout`, und jede Anweisung mit ACCESS EXCLUSIVE kommt in eine eigene, kurze Transaktion.
+
+  ## Spalten hinzufügen und Typen ändern: mit oder ohne Rewrite
+
+  Neben der Sperre zählt, wie lange eine Anweisung sie hält. Am teuersten ist ein **Rewrite**: PostgreSQL schreibt die ganze Tabelle samt Indexen in eine neue Datei, unter ACCESS EXCLUSIVE. Seit PostgreSQL 11 braucht eine neue Spalte mit Default keinen Rewrite mehr, solange der Default nicht **volatil** ist: PostgreSQL wertet ihn einmal aus und legt das Ergebnis im Katalog ab, bestehende Zeilen liefern ihn beim Lesen ([PostgreSQL · ALTER TABLE – Notes](https://www.postgresql.org/docs/current/sql-altertable.html#SQL-ALTERTABLE-NOTES)). Ein volatiler Default wie `clock_timestamp()`, `random()` oder `gen_random_uuid()` muss dagegen für jede Zeile neu berechnet werden. Ob die Tabelle eine neue Datei bekommen hat, zeigt `pg_relation_filenode`:
+
+  ```postgres run
+  CREATE TABLE buchungen (
+    id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    raum_id int NOT NULL,
+    preis   numeric(8,2)
+  );
+  INSERT INTO buchungen (raum_id, preis) SELECT g % 5 + 1, 35 FROM generate_series(1, 5000) AS g;
+  SELECT pg_relation_filenode('buchungen') AS datei_vorher;
+
+  ALTER TABLE buchungen ADD COLUMN status text NOT NULL DEFAULT 'bestaetigt';
+  ALTER TABLE buchungen ADD COLUMN erfasst_am timestamptz NOT NULL DEFAULT now();
+  SELECT pg_relation_filenode('buchungen') AS datei_nach_default;
+  SELECT attname, atthasmissing, attmissingval
+  FROM pg_attribute
+  WHERE attrelid = 'buchungen'::regclass AND attname IN ('status', 'erfasst_am')
+  ORDER BY attnum;
+
+  ALTER TABLE buchungen ADD COLUMN zufall float8 DEFAULT random();
+  SELECT pg_relation_filenode('buchungen') AS datei_nach_volatile;
+  ```
+
+  `atthasmissing` und `attmissingval` in [`pg_attribute`](https://www.postgresql.org/docs/current/catalog-pg-attribute.html) sind der Default für Zeilen, die vor der Spalte da waren. `now()` ist nicht volatil, sondern liefert innerhalb einer Transaktion immer denselben Zeitpunkt; alle bestehenden Buchungen bekommen den Zeitpunkt der Migration. Erst `random()` erzwingt die neue Datei.
+
+  Typänderungen schreiben die Tabelle in der Regel neu. Ausnahmen sind Typen, die binär gleich gespeichert werden, etwa `varchar(200)` zu `text` oder eine längere `varchar`-Grenze. `int` zu `bigint` ist dagegen ein Rewrite – bei einer großen Tabelle, deren `int`-IDs knapp werden, ein Fall für Expand and Contract weiter unten. Ein neuer `CHECK`- oder `NOT NULL`-Constraint schreibt nichts neu, muss aber alle Zeilen lesen, und das unter ACCESS EXCLUSIVE.
+
+  ## Constraints nachrüsten: NOT VALID und VALIDATE
+
+  Für diesen Scan gibt es die Option `NOT VALID`. Ein Constraint mit `NOT VALID` gilt sofort für jede neue und geänderte Zeile, prüft aber den Bestand nicht. Das geht in Millisekunden. Später prüft `VALIDATE CONSTRAINT` den Bestand unter SHARE UPDATE EXCLUSIVE; Lesen und Schreiben laufen dabei weiter ([PostgreSQL · ADD table_constraint](https://www.postgresql.org/docs/current/sql-altertable.html#SQL-ALTERTABLE-DESC-ADD-TABLE-CONSTRAINT)). `NOT VALID` gibt es für CHECK-Constraints, Fremdschlüssel und seit PostgreSQL 18 auch für NOT NULL.
+
+  Für NOT NULL auf `buchungen.preis` heißt das klassische Muster: CHECK mit `NOT VALID`, Bestand reparieren, validieren, dann `SET NOT NULL`. Findet `SET NOT NULL` einen gültigen CHECK, der `NULL` ausschließt, überspringt es den Scan:
+
+  ```postgres run
+  CREATE TABLE buchungen (
+    id     bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    status text NOT NULL DEFAULT 'bestaetigt',
+    preis  numeric(8,2)
+  );
+  INSERT INTO buchungen (status, preis)
+  SELECT CASE WHEN g % 50 = 0 THEN 'storniert' ELSE 'bestaetigt' END,
+         CASE WHEN g % 50 = 0 THEN NULL ELSE 35 END
+  FROM generate_series(1, 5000) AS g;
+
+  SET lock_timeout = '3s';
+
+  -- 1. Regel für neue Zeilen, ohne Scan (kurz ACCESS EXCLUSIVE)
+  ALTER TABLE buchungen ADD CONSTRAINT buchungen_preis_vorhanden CHECK (preis IS NOT NULL) NOT VALID;
+  SELECT lp.versuch($$INSERT INTO buchungen (status) VALUES ('storniert')$$) AS neue_zeile_ohne_preis;
+
+  -- 2. Bestand reparieren, dann prüfen (SHARE UPDATE EXCLUSIVE)
+  UPDATE buchungen SET preis = 0 WHERE preis IS NULL;
+  ALTER TABLE buchungen VALIDATE CONSTRAINT buchungen_preis_vorhanden;
+
+  -- 3. SET NOT NULL nutzt den gültigen CHECK statt eines Scans
+  SET client_min_messages = debug1;
+  ALTER TABLE buchungen ALTER COLUMN preis SET NOT NULL;
+  RESET client_min_messages;
+  ALTER TABLE buchungen DROP CONSTRAINT buchungen_preis_vorhanden;
+  ```
+
+  Die Meldung `existing constraints on column "buchungen.preis" are sufficient to prove that it does not contain nulls` bestätigt, dass Schritt 3 die Tabelle nicht gelesen hat. In PostgreSQL 18 geht es kürzer: `ALTER TABLE buchungen ADD CONSTRAINT buchungen_preis_not_null NOT NULL preis NOT VALID`, später `VALIDATE CONSTRAINT buchungen_preis_not_null`. Der Haken: Schon vor der Validierung meldet `information_schema.columns` die Spalte als `NOT NULL`. Ob der Bestand geprüft ist, steht nur in `pg_constraint.convalidated`.
+
+  Fremdschlüssel funktionieren genauso und haben einen zweiten Vorteil: Du kannst den Constraint anlegen, bevor die Altlasten bereinigt sind. Ab dann entsteht keine neue Waise mehr.
+
+  ```postgres run
+  CREATE TABLE standorte (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name text NOT NULL UNIQUE);
+  CREATE TABLE checkins (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    mitglied_id int NOT NULL,
+    standort_id int NOT NULL,
+    zeitpunkt   timestamptz NOT NULL
+  );
+  INSERT INTO standorte (name) VALUES ('Plagwitz'), ('Südvorstadt'), ('Zentrum');
+  INSERT INTO checkins (mitglied_id, standort_id, zeitpunkt) VALUES
+    (1, 1, '2026-03-02 08:55+01'), (2, 3, '2026-03-02 09:10+01'), (3, 99, '2026-03-02 09:12+01');
+
+  ALTER TABLE checkins ADD CONSTRAINT checkins_standort_fk
+    FOREIGN KEY (standort_id) REFERENCES standorte (id) NOT VALID;
+  SELECT lp.versuch($$INSERT INTO checkins (mitglied_id, standort_id, zeitpunkt) VALUES (4, 42, now())$$) AS neue_waise;
+
+  DELETE FROM checkins AS c
+  WHERE NOT EXISTS (SELECT 1 FROM standorte AS s WHERE s.id = c.standort_id)
+  RETURNING c.id, c.standort_id;
+  ALTER TABLE checkins VALIDATE CONSTRAINT checkins_standort_fk;
+  SELECT conname, convalidated FROM pg_constraint WHERE conrelid = 'checkins'::regclass AND contype = 'f';
+  ```
+
+  Ohne `NOT VALID` hätte `ADD FOREIGN KEY` beide Tabellen mit SHARE ROW EXCLUSIVE gesperrt, alle Schreibzugriffe blockiert und erst nach dem Scan aller Check-ins freigegeben. Und es wäre am Check-in von Standort 99 gescheitert. `lp.versuch` ist eine Hilfsfunktion dieser Plattform: Sie führt eine Anweisung aus, rollt sie zurück und meldet `ok` oder den Fehler.
+
+  > [!INTERVIEW] „Wie fügst du einer Tabelle mit 50 Millionen Zeilen eine Pflichtspalte hinzu?“
+  > Mit `lock_timeout` und in Schritten. Hat die Spalte einen festen Default, reicht `ADD COLUMN … NOT NULL DEFAULT …` – seit PostgreSQL 11 ist das eine reine Katalogänderung. Braucht jede Zeile einen eigenen Wert, lege ich die Spalte ohne NOT NULL an, lasse die App sie für neue Zeilen füllen, fülle den Bestand in Batches und setze NOT NULL zum Schluss über einen CHECK mit `NOT VALID` und `VALIDATE CONSTRAINT`, in PostgreSQL 18 direkt mit `NOT NULL … NOT VALID`. So hält keine Anweisung lange eine ACCESS EXCLUSIVE-Sperre.
+
+  ## Indexe ohne Schreibsperre: CREATE INDEX CONCURRENTLY
+
+  `CREATE INDEX` sperrt die Tabelle mit SHARE: Lesen geht, Schreiben wartet, bis der Index fertig ist – bei Millionen Zeilen Minuten. `CREATE INDEX CONCURRENTLY` nimmt nur SHARE UPDATE EXCLUSIVE, liest die Tabelle dafür zweimal und wartet auf laufende Transaktionen ([PostgreSQL · Building Indexes Concurrently](https://www.postgresql.org/docs/current/sql-createindex.html#SQL-CREATEINDEX-CONCURRENTLY)). Es läuft nicht in einem Transaktionsblock:
+
+  ```postgres run fails
+  CREATE TABLE buchungen (
+    id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    raum_id int NOT NULL,
+    beginn  timestamptz NOT NULL
+  );
+  CREATE INDEX CONCURRENTLY buchungen_raum_beginn_idx ON buchungen (raum_id, beginn);
+  SELECT indexrelid::regclass AS index, indisvalid FROM pg_index WHERE indrelid = 'buchungen'::regclass;
+
+  BEGIN;
+  CREATE INDEX CONCURRENTLY buchungen_beginn_idx ON buchungen (beginn);
+  ```
+
+  Deshalb braucht das Werkzeug einen Weg aus der Transaktion: in Alembic `autocommit_block()`; in Flyway die automatische Erkennung oder `executeInTransaction=false`, dazu laut Doku `postgresql.transactional.lock=false`, sonst wartet der Index auf Flyways eigene Sperrtransaktion ([Flyway · PostgreSQL Transactional Lock](https://documentation.red-gate.com/fd/flyway-postgresql-transactional-lock-setting-277579114.html)). Prisma Migrate braucht keinen Umweg, weil es die Datei ohne Transaktion ausführt. Es erzeugt aber nur ein gewöhnliches `CREATE INDEX`; `CONCURRENTLY` schreibst du von Hand in die mit `--create-only` angelegte `migration.sql`, am besten als einzige Anweisung der Migration.
+
+  Das Warten auf laufende Transaktionen ist ein Warten auf Sperren, also gilt dafür auch `lock_timeout`. Hat die Migration vorher `SET lock_timeout = '3s'` ausgeführt und läuft irgendwo eine Transaktion länger, bricht der Bau mit `canceling statement due to lock timeout` ab. Weil `CONCURRENTLY` Lesen und Schreiben nicht blockiert, darf es länger warten: Setz die Grenze für den Index mit `RESET lock_timeout` zurück oder deutlich höher.
+
+  Scheitert ein `CONCURRENTLY`-Build, etwa an einem Duplikat bei einem eindeutigen Index oder an `lock_timeout`, bleibt ein **ungültiger Index** zurück. So sah das in einem echten PostgreSQL 18 aus:
+
+  ```text
+  CREATE UNIQUE INDEX CONCURRENTLY mitglieder_email_lower_idx ON mitglieder (lower(email));
+  ERROR:  could not create unique index "mitglieder_email_lower_idx"
+  DETAIL:  Key (lower(email))=(lea.hoffmann@example.org) is duplicated.
+
+  SELECT indexrelid::regclass AS index, indisvalid FROM pg_index WHERE NOT indisvalid;
+             index            | indisvalid
+  ----------------------------+------------
+   mitglieder_email_lower_idx | f
+  (1 row)
+  ```
+
+  Abfragen benutzen ihn nicht, Schreibzugriffe können ihn aber weiter pflegen und kosten dann Zeit. Räume ihn mit `DROP INDEX CONCURRENTLY` ab, behebe die Ursache und baue ihn neu; alternativ baut `REINDEX INDEX CONCURRENTLY` ihn nach der Korrektur an Ort und Stelle neu. Vorsicht mit `CREATE INDEX CONCURRENTLY IF NOT EXISTS` beim zweiten Versuch: Es prüft nur den Namen, meldet `relation "mitglieder_email_lower_idx" already exists, skipping` und lässt den ungültigen Index stehen. Prüfe nach jedem `CONCURRENTLY`-Bau `pg_index.indisvalid`. Welche Indexe sich lohnen, behandelt [Indexe](/postgres/indexe).
+
+  ## Expand and Contract: umbenennen und umbauen ohne Ausfall
+
+  Während eines Deployments laufen alte und neue Version der App gleichzeitig: Instanzen werden nacheinander ersetzt, Hintergrundjobs laufen weiter, der Prisma-Dienst wird an einem anderen Tag ausgeliefert. Jede Migration muss deshalb mit der **alten** App-Version funktionieren. `ALTER TABLE mitglieder RENAME COLUMN name TO anzeigename` ist in Millisekunden durch und trotzdem ein Ausfall: Jede alte Instanz scheitert ab dann mit `column "name" does not exist`.
+
+  **Expand and Contract** zerlegt eine solche Änderung in Schritte, die einzeln mit beiden Versionen verträglich sind:
+
+  1. **Expand:** Neue Spalte anlegen, ohne NOT NULL.
+  2. **Doppelt schreiben:** Die neue App-Version schreibt beide Spalten. Solange irgendeine Version oder ein anderer Dienst nur eine der beiden Spalten schreibt, gleicht ein Trigger sie in beide Richtungen ab.
+  3. **Backfill:** Bestehende Zeilen in Batches nachziehen, jeder Batch eine eigene kurze Transaktion.
+  4. **Umstellen:** NOT NULL für die neue Spalte (über `NOT VALID`), dann eine App-Version, die nur noch die neue Spalte liest und schreibt. Während ihres Rolling Deploys lesen alte Instanzen noch die alte Spalte; der Trigger füllt sie für sie nach.
+  5. **Contract:** Wenn keine laufende Version die alte Spalte mehr kennt, Trigger und alte Spalte entfernen.
+
+  ```postgres run
+  CREATE TABLE mitglieder (
+    id    int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email text NOT NULL,
+    name  text NOT NULL
+  );
+  INSERT INTO mitglieder (email, name)
+  SELECT 'mitglied' || g || '@example.org', 'Mitglied ' || g FROM generate_series(1, 2500) AS g;
+
+  -- 1. Expand
+  ALTER TABLE mitglieder ADD COLUMN anzeigename text;
+
+  -- 2. Schreibt eine Version nur eine der beiden Spalten, ergänzt der Trigger die andere
+  CREATE FUNCTION mitglieder_anzeigename() RETURNS trigger LANGUAGE plpgsql AS $$
+  BEGIN
+    IF TG_OP = 'INSERT' THEN
+      NEW.anzeigename := coalesce(NEW.anzeigename, NEW.name);
+      NEW.name := coalesce(NEW.name, NEW.anzeigename);
+    ELSIF NEW.name IS DISTINCT FROM OLD.name THEN
+      NEW.anzeigename := NEW.name;
+    ELSIF NEW.anzeigename IS DISTINCT FROM OLD.anzeigename THEN
+      NEW.name := NEW.anzeigename;
+    END IF;
+    RETURN NEW;
+  END $$;
+  CREATE TRIGGER mitglieder_anzeigename BEFORE INSERT OR UPDATE ON mitglieder
+    FOR EACH ROW EXECUTE FUNCTION mitglieder_anzeigename();
+
+  -- 3. Backfill in Batches, jeder Batch eine eigene Transaktion
+  DO $$
+  DECLARE
+    anzahl int;
+  BEGIN
+    LOOP
+      UPDATE mitglieder SET anzeigename = name
+      WHERE id IN (SELECT id FROM mitglieder WHERE anzeigename IS NULL ORDER BY id LIMIT 1000);
+      GET DIAGNOSTICS anzahl = ROW_COUNT;
+      RAISE NOTICE 'Batch: % Zeilen', anzahl;
+      EXIT WHEN anzahl = 0;
+      COMMIT;
+    END LOOP;
+  END $$;
+
+  -- Die alte Version schreibt nur name, die neue nur anzeigename
+  INSERT INTO mitglieder (email, name) VALUES ('alte.app@example.org', 'Von der alten App');
+  INSERT INTO mitglieder (email, anzeigename) VALUES ('neue.app@example.org', 'Von der neuen App');
+  SELECT id, name, anzeigename FROM mitglieder WHERE email LIKE '%.app@example.org' ORDER BY id;
+  SELECT count(*) FILTER (WHERE anzeigename IS NULL) AS ohne_anzeigename, count(*) AS gesamt FROM mitglieder;
+  ```
+
+  Der Trigger läuft vor der NOT-NULL-Prüfung. Deshalb gelingt auch das `INSERT` der neuen Version ohne `name`, und eine alte Instanz, die noch `name` liest, sieht trotzdem einen Wert.
+
+  Ein einziges `UPDATE mitglieder SET anzeigename = name` wäre bei Millionen Zeilen eine lange Transaktion mit Zeilensperren auf allem, was es angefasst hat, und viel WAL auf einmal. Der Batch-Loop committet nach jeweils 1 000 Zeilen; das `COMMIT` in einem `DO`-Block ist seit PostgreSQL 11 erlaubt, solange er nicht selbst in einer Transaktion läuft ([PostgreSQL · Transaction Management](https://www.postgresql.org/docs/current/plpgsql-transactions.html)). In der Praxis läuft der Backfill oft als eigenes Skript oder Hintergrundjob mit Pausen, damit Replikation und Autovacuum mithalten. Dasselbe Muster trägt Typwechsel: `betrag numeric` zu `betrag_cent bigint` oder `int`-IDs zu `bigint`.
+
+  Daraus folgt die **Reihenfolge im Deployment**: Expand-Migrationen laufen vor dem Deploy der App, die sie nutzt; Contract-Migrationen frühestens einen Deploy später. Und ein Rollback heißt fast immer **vorwärts reparieren**. Ein `downgrade()`, das eine Spalte löscht, löscht auch die Daten, die seit dem Deploy hineingeschrieben wurden. Weil jeder Schritt mit der vorherigen App-Version läuft, kannst du die App zurückrollen und das Schema stehen lassen.
+
+  > [!PRAXIS] Migrationen im Review
+  > Im Deskwerk-Repository prüft CI jede Migration auf zwei Arten: Sie läuft gegen ein frisches PostgreSQL 18 von der ersten bis zur letzten Version, und das erzeugte SQL (`alembic upgrade head --sql`, die `migration.sql` von Prisma) steht im Pull Request. Im Review sucht das Team gezielt nach ACCESS EXCLUSIVE auf großen Tabellen, `CREATE INDEX` ohne `CONCURRENTLY`, `ADD CONSTRAINT` ohne `NOT VALID`, volatilen Defaults, Typänderungen und `RENAME`. Für Prisma beschreibt die Doku mit [pgfence](https://www.prisma.io/docs/guides/integrations/pgfence) ein Werkzeug eines Drittanbieters, das solche Muster in `migration.sql` findet.
+
+  ## Häufige Fehler
+
+  - **Die App hängt während einer schnellen Migration.** Sperrwarteschlange hinter einer langen Transaktion. `SET lock_timeout` und Wiederholung im Deployment; `pg_stat_activity` auf `idle in transaction` prüfen.
+  - **`ADD COLUMN … DEFAULT clock_timestamp()` oder `gen_random_uuid()`.** Volatiler Default, die Tabelle wird neu geschrieben. Ohne Default anlegen, Default nur für neue Zeilen setzen, Bestand in Batches füllen.
+  - **`SET NOT NULL` oder `ADD CONSTRAINT` auf einer großen Tabelle in einem Schritt.** Scan unter starker Sperre. `NOT VALID`, dann `VALIDATE CONSTRAINT` – in getrennten Transaktionen. UNIQUE und Primärschlüssel kennen kein `NOT VALID`: erst `CREATE UNIQUE INDEX CONCURRENTLY`, dann `ADD CONSTRAINT … UNIQUE USING INDEX`.
+  - **`CREATE INDEX` statt `CREATE INDEX CONCURRENTLY`.** Alle Schreibzugriffe warten bis zum Ende.
+  - **`CREATE INDEX CONCURRENTLY cannot run inside a transaction block`.** Das Werkzeug setzt die Migration in eine Transaktion. `autocommit_block()` oder eigene Migration ohne Transaktion.
+  - **Ungültiger Index nach Abbruch.** `\d` zeigt `INVALID`, oft nach einem Duplikat oder nach `lock_timeout`, das noch aus dem Anfang der Migration gilt. `DROP INDEX CONCURRENTLY`, Ursache beheben, neu bauen.
+  - **`RENAME COLUMN` oder `DROP COLUMN` im selben Deploy wie der Code.** Alte Instanzen scheitern. Expand and Contract über mehrere Deploys.
+  - **Backfill in einer einzigen Anweisung.** Lange Transaktion, viele Zeilensperren. In Batches mit eigenem Commit.
+  - **Eine angewandte Migration nachträglich ändern.** Die Umgebungen laufen auseinander. Neue Migration schreiben.
+
+  ## Zusammenfassung
+
+  - Migrationen sind versionierte Dateien, die in jeder Umgebung gleich laufen; das Werkzeug merkt sich in einer Tabelle, was angewandt ist. Das erzeugte SQL gehört ins Review.
+  - Die meisten `ALTER TABLE` nehmen ACCESS EXCLUSIVE. Wartet die Sperre, stellt sich jede weitere Abfrage dahinter an. `lock_timeout` begrenzt das.
+  - Spalten mit nicht-volatilem Default kommen seit PostgreSQL 11 ohne Rewrite; volatile Defaults und die meisten Typänderungen schreiben die Tabelle neu.
+  - CHECK, Fremdschlüssel und seit PostgreSQL 18 NOT NULL lassen sich mit `NOT VALID` sofort für neue Zeilen einführen und später mit `VALIDATE CONSTRAINT` ohne Schreibsperre prüfen.
+  - `CREATE INDEX CONCURRENTLY` blockiert keine Schreibzugriffe, läuft aber nicht in einer Transaktion und kann einen ungültigen Index hinterlassen.
+  - Umbenennen und Typwechsel gehen mit Expand and Contract: neue Spalte, doppelt schreiben, Backfill in Batches, umstellen, alte Spalte entfernen.
+  - Jede Migration muss mit der laufenden App-Version funktionieren. Rollback heißt vorwärts reparieren.
+exercises:
+  - id: sperrwarteschlange
+    type: choice
+    title: Wer wartet auf wen?
+    prompt: |
+      Drei Sitzungen arbeiten mit `buchungen`. Was gilt für die beiden Anweisungen der App um 09:00:06?
+    lang: text
+    code: |
+      09:00:00  Bericht    BEGIN;
+                           SELECT raum_id, count(*) FROM buchungen GROUP BY raum_id;
+                           -- Transaktion bleibt offen, der Bericht rechnet noch 3 Minuten in Python
+      09:00:05  Migration  ALTER TABLE buchungen ADD COLUMN notiz text;
+      09:00:06  App        SELECT * FROM buchungen WHERE mitglied_id = 7;
+      09:00:06  App        INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende) VALUES (…);
+    options:
+      - text: Beide warten, bis der Bericht seine Transaktion beendet und die Migration durch ist.
+        correct: true
+        why: Die Migration wartet auf ACCESS EXCLUSIVE. Die Anfragen der App stehen mit dieser wartenden Sperre in Konflikt und stellen sich dahinter an.
+      - text: Das SELECT läuft sofort, nur das INSERT wartet.
+        correct: false
+        why: ACCESS SHARE verträgt sich zwar mit der Sperre des Berichts, aber nicht mit der wartenden ACCESS EXCLUSIVE-Anfrage der Migration. Das SELECT reiht sich dahinter ein.
+      - text: Beide laufen sofort, weil `ADD COLUMN` ohne Default nur den Katalog ändert.
+        correct: false
+        why: Die Änderung selbst ist schnell, braucht aber trotzdem ACCESS EXCLUSIVE – und bekommt sie erst, wenn der Bericht fertig ist.
+      - text: Hätte die Migration vorher `SET lock_timeout = '2s'` ausgeführt, liefen beide spätestens um 09:00:07 weiter.
+        correct: true
+        why: Nach zwei Sekunden Warten bricht die Migration mit `canceling statement due to lock timeout` ab. Ihre Anfrage verschwindet aus der Warteschlange, und die App bekommt ihre Sperren.
+      - text: PostgreSQL erkennt einen Deadlock und bricht den Bericht ab.
+        correct: false
+        why: Das ist kein Deadlock – keine Sitzung wartet auf eine, die auf sie wartet. Der Bericht wartet auf nichts in der Datenbank, er hält seine Transaktion nur offen.
+    explanation: |
+      Der Bericht hält bis zu seinem `COMMIT` eine ACCESS SHARE-Sperre. Die Migration braucht ACCESS EXCLUSIVE und muss warten. Alle späteren Anfragen auf `buchungen`, die mit dieser wartenden Sperre in Konflikt stehen – also jede, auch ein SELECT –, warten hinter ihr. So wird aus einer Migration, die in Millisekunden durch wäre, ein Ausfall von drei Minuten. `lock_timeout` lässt die Migration früh aufgeben; das Deployment versucht es später erneut. Gegen die Ursache hilft, Transaktionen in Berichten kurz zu halten und `idle_in_transaction_session_timeout` zu setzen.
+    resources:
+      - title: PostgreSQL · Conflicting Lock Modes
+        url: https://www.postgresql.org/docs/current/explicit-locking.html#TABLE-LOCK-COMPATIBILITY
+      - title: PostgreSQL · lock_timeout
+        url: https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-LOCK-TIMEOUT
+
+  - id: expand-contract-reihenfolge
+    type: order
+    title: Umbenennen in sechs Schritten
+    prompt: |
+      `mitglieder.name` soll `anzeigename` heißen. Python-Backend und Prisma-Dienst werden nacheinander mit Rolling Deploys ausgeliefert, alte und neue Instanzen laufen dabei gleichzeitig. Bring die Schritte in eine Reihenfolge, bei der zu keinem Zeitpunkt eine laufende Version scheitert oder Daten verliert.
+    lang: text
+    lines: |
+      Migration: Spalte anzeigename hinzufügen (ohne NOT NULL) und Trigger, der fehlende Werte zwischen name und anzeigename in beide Richtungen ergänzt
+      Deploy: beide Dienste schreiben name und anzeigename, lesen weiter name
+      Backfill in Batches: anzeigename = name, wo anzeigename IS NULL
+      Migration: anzeigename NOT NULL über NOT VALID und VALIDATE CONSTRAINT
+      Deploy: beide Dienste lesen und schreiben nur noch anzeigename
+      Migration: Trigger und Spalte name entfernen
+    alternatives:
+      - [1, 2, 3, 5, 4, 6]
+      - [1, 3, 2, 4, 5, 6]
+      - [1, 3, 2, 5, 4, 6]
+      - [1, 3, 4, 2, 5, 6]
+    hints:
+      - Was passiert mit Zeilen, die zwischen Backfill und Deploy entstehen, wenn niemand die neue Spalte füllt?
+      - Welche Schritte setzen voraus, dass jede Bestandszeile schon einen `anzeigename` hat?
+    explanation: |
+      Die neue Spalte und der Trigger kommen zuerst: Ab dann bekommt jede neue oder geänderte Zeile beide Werte, egal welche Version schreibt. Erst danach lohnt der Backfill, sonst entstünden Zeilen ohne `anzeigename`. NOT NULL lässt sich erst nach dem Backfill validieren, und die Version, die nur noch `anzeigename` liest, braucht ebenfalls den vollständigen Backfill. Während ihres Rolling Deploys lesen alte Instanzen noch `name`; weil die neue Version `name` nicht mehr schreibt, muss der Trigger auch in diese Richtung ergänzen. Die alte Spalte fällt zuletzt, wenn keine laufende Instanz sie mehr kennt. Weil der Trigger beide Spalten füllt, sind mehrere Reihenfolgen richtig: Der Backfill darf vor oder nach dem ersten Deploy laufen, NOT NULL vor oder nach dem Umstellen.
+    resources:
+      - title: Prisma ORM 7 · Expand and contract
+        url: https://www.prisma.io/docs/orm/v7/prisma-migrate/workflows/customizing-migrations#example-use-the-expand-and-contract-pattern-to-evolve-the-schema-without-downtime
+
+  - id: welche-sperre
+    type: output
+    title: Welche Sperre nimmt das?
+    prompt: |
+      Was gibt das Skript aus? Die Sicht `sperren` zeigt die Sperrmodi der eigenen Sitzung auf `buchungen`, ohne die AccessShareLock vom Lesen. Ausgabe wie `psql -At`: eine Zeile je Ergebniszeile, `NULL` leer, `t`/`f`; die drei Ergebnisse stehen direkt untereinander.
+    lang: postgres
+    code: |
+      CREATE TABLE mitglieder (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, email text NOT NULL);
+      CREATE TABLE buchungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        mitglied_id int NOT NULL,
+        preis       numeric(8,2)
+      );
+      ALTER TABLE buchungen ADD CONSTRAINT buchungen_mitglied_fk
+        FOREIGN KEY (mitglied_id) REFERENCES mitglieder (id) NOT VALID;
+      CREATE VIEW sperren AS
+        SELECT mode FROM pg_locks
+        WHERE pid = pg_backend_pid() AND relation = 'buchungen'::regclass AND mode <> 'AccessShareLock';
+
+      BEGIN;
+      CREATE INDEX ON buchungen (mitglied_id);
+      SELECT * FROM sperren;
+      ROLLBACK;
+
+      BEGIN;
+      ALTER TABLE buchungen VALIDATE CONSTRAINT buchungen_mitglied_fk;
+      SELECT * FROM sperren;
+      ROLLBACK;
+
+      BEGIN;
+      ALTER TABLE buchungen ALTER COLUMN preis SET NOT NULL;
+      SELECT * FROM sperren;
+      ROLLBACK;
+    expected: |
+      ShareLock
+      ShareUpdateExclusiveLock
+      AccessExclusiveLock
+    hints:
+      - "`pg_locks` nennt die Modi in CamelCase: `ShareLock`, `ShareUpdateExclusiveLock`, `AccessExclusiveLock` …"
+      - Welcher dieser Befehle darf Schreibzugriffe weiterlaufen lassen, welcher nicht einmal Lesezugriffe?
+    explanation: |
+      `CREATE INDEX` nimmt SHARE: Lesen geht weiter, Schreiben wartet, damit der Index nichts verpasst. `VALIDATE CONSTRAINT` nimmt nur SHARE UPDATE EXCLUSIVE, weil neue Zeilen den Constraint ohnehin schon erfüllen müssen und nur der Bestand geprüft wird; Lesen und Schreiben laufen weiter. `SET NOT NULL` ist eine gewöhnliche `ALTER TABLE`-Unterform mit ACCESS EXCLUSIVE und muss ohne passenden gültigen CHECK die ganze Tabelle lesen – auf einer großen Tabelle die teuerste der drei Varianten.
+    resources:
+      - title: PostgreSQL · pg_locks
+        url: https://www.postgresql.org/docs/current/view-pg-locks.html
+      - title: PostgreSQL · Table-Level Lock Modes
+        url: https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-TABLES
+
+  - id: neu-geschrieben
+    type: output
+    title: Neue Datei oder nicht?
+    prompt: |
+      Die Funktion `neu_geschrieben()` meldet `t`, wenn die Tabelle `mitglieder` seit dem letzten Aufruf in eine neue Datei geschrieben wurde, sonst `f`. Was gibt das Skript aus? Ausgabe wie `psql -At`: eine Zeile je Ergebniszeile, Wahrheitswerte als `t`/`f`.
+    lang: postgres
+    code: |
+      CREATE TABLE mitglieder (
+        id     int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        email  varchar(200) NOT NULL,
+        punkte int NOT NULL DEFAULT 0
+      );
+      INSERT INTO mitglieder (email) SELECT 'm' || g || '@example.org' FROM generate_series(1, 1000) AS g;
+
+      CREATE TABLE datei AS SELECT pg_relation_filenode('mitglieder') AS nr;
+      CREATE FUNCTION neu_geschrieben() RETURNS boolean LANGUAGE sql AS $$
+        UPDATE datei SET nr = pg_relation_filenode('mitglieder')
+        FROM (SELECT nr AS alt FROM datei) AS vorher
+        RETURNING datei.nr <> vorher.alt;
+      $$;
+
+      ALTER TABLE mitglieder ADD COLUMN tarif text NOT NULL DEFAULT 'flex';
+      SELECT neu_geschrieben();
+      ALTER TABLE mitglieder ADD COLUMN geprueft_am timestamptz DEFAULT clock_timestamp();
+      SELECT neu_geschrieben();
+      ALTER TABLE mitglieder ALTER COLUMN email TYPE text;
+      SELECT neu_geschrieben();
+      ALTER TABLE mitglieder ALTER COLUMN punkte TYPE bigint;
+      SELECT neu_geschrieben();
+      ALTER TABLE mitglieder ADD CONSTRAINT punkte_nicht_negativ CHECK (punkte >= 0);
+      SELECT neu_geschrieben();
+    expected: |
+      f
+      t
+      f
+      t
+      f
+    hints:
+      - Welche dieser Defaults liefern für jede Zeile einen anderen Wert?
+      - "`varchar` und `text` speichern Text gleich. Gilt das auch für `int` und `bigint`?"
+    explanation: |
+      Ein konstanter Default wie `'flex'` landet seit PostgreSQL 11 im Katalog, die Tabelle bleibt, wie sie ist. `clock_timestamp()` ist volatil und liefert für jede Zeile einen anderen Zeitpunkt, also muss PostgreSQL jede Zeile neu schreiben. `varchar(200)` zu `text` ist binär verträglich – kein Rewrite. `int` zu `bigint` ändert die Größe jedes Werts von 4 auf 8 Byte und schreibt die Tabelle neu. Ein CHECK-Constraint liest alle Zeilen, schreibt aber nichts; teuer ist er trotzdem, weil der Scan unter ACCESS EXCLUSIVE läuft, wenn kein `NOT VALID` dabei ist.
+    resources:
+      - title: PostgreSQL · ALTER TABLE – Notes
+        url: https://www.postgresql.org/docs/current/sql-altertable.html#SQL-ALTERTABLE-NOTES
+      - title: PostgreSQL · Function Volatility Categories
+        url: https://www.postgresql.org/docs/current/xfunc-volatility.html
+
+  - id: newsletter-spalte
+    type: sql
+    lang: postgres
+    title: Eine Pflichtspalte ohne Rewrite
+    prompt: |
+      Mitglieder sollen den Newsletter abbestellen können. Füge `mitglieder` die Spalte `newsletter` vom Typ `boolean` hinzu: `NOT NULL`, Default `false`, auch für alle bestehenden Mitglieder. In Produktion hat die Tabelle 2 Millionen Zeilen, deshalb darf die Migration die bestehenden Zeilen **nicht anfassen** – PostgreSQL soll sich den Default im Katalog merken. Begrenze außerdem die Wartezeit auf die Sperre auf drei Sekunden.
+
+      Die Prüfabfrage sieht Typ, `is_nullable`, Default, ob der Default im Katalog steht (`pg_attribute.atthasmissing`), die Werte der bestehenden Zeilen und zwei Test-Inserts. `lock_timeout` sieht sie nicht.
+    schema: |
+      CREATE TABLE mitglieder (
+        id    int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        email text NOT NULL UNIQUE,
+        name  text NOT NULL,
+        tarif text NOT NULL DEFAULT 'flex'
+      );
+      INSERT INTO mitglieder (email, name, tarif) VALUES
+        ('jana.richter@example.org', 'Jana Richter', 'fix'),
+        ('mehmet.yilmaz@example.org', 'Mehmet Yılmaz', 'flex'),
+        ('lea.hoffmann@example.org', 'Lea Hoffmann', 'team'),
+        ('tobias.krueger@example.org', 'Tobias Krüger', 'flex');
+    starter: |
+      ALTER TABLE mitglieder ADD COLUMN newsletter boolean;
+      UPDATE mitglieder SET newsletter = false;
+    solution: |
+      SET lock_timeout = '3s';
+      ALTER TABLE mitglieder ADD COLUMN newsletter boolean NOT NULL DEFAULT false;
+    check: |
+      SELECT c.data_type,
+             c.is_nullable,
+             c.column_default,
+             a.atthasmissing AS default_im_katalog,
+             (SELECT count(*) FROM mitglieder AS m WHERE to_jsonb(m) -> 'newsletter' IS DISTINCT FROM 'false') AS abweichend,
+             lp.versuch($$INSERT INTO mitglieder (email, name) VALUES ('neu@example.org', 'Neu')$$) AS ohne_angabe,
+             lp.versuch($$INSERT INTO mitglieder (email, name, newsletter) VALUES ('neu@example.org', 'Neu', NULL)$$) AS mit_null
+      FROM information_schema.columns AS c
+      JOIN pg_attribute AS a ON a.attrelid = 'mitglieder'::regclass AND a.attname = c.column_name
+      WHERE c.table_name = 'mitglieder' AND c.column_name = 'newsletter';
+    hints:
+      - Der Startcode füllt die Spalte per UPDATE. Das schreibt 2 Millionen neue Zeilenversionen und lässt `atthasmissing` auf `false`.
+      - Seit PostgreSQL 11 reicht eine einzige `ADD COLUMN`-Anweisung mit `NOT NULL` und einem konstanten `DEFAULT`.
+      - "`SET lock_timeout = '3s';` und `ALTER TABLE mitglieder ADD COLUMN newsletter boolean NOT NULL DEFAULT false;`"
+    explanation: |
+      `ADD COLUMN … NOT NULL DEFAULT false` wertet den Default einmal aus und legt ihn als `attmissingval` im Katalog ab; bestehende Zeilen liefern ihn beim Lesen, ohne dass eine Zeile geschrieben wird. Die Anweisung braucht kurz ACCESS EXCLUSIVE und ist in Millisekunden durch – deshalb das `lock_timeout`, damit sie nicht in einer Sperrwarteschlange hängt. Der Weg des Startcodes (Spalte ohne Default, `UPDATE`, dann `SET DEFAULT` und `SET NOT NULL`) endet im selben Schema, aber das `UPDATE` erzeugt eine neue Version jeder Zeile, hält alle Zeilensperren bis zum Commit und hinterlässt Arbeit für Autovacuum. `SET NOT NULL` liest danach noch einmal die ganze Tabelle unter ACCESS EXCLUSIVE.
+    resources:
+      - title: PostgreSQL · Adding a Column
+        url: https://www.postgresql.org/docs/current/ddl-alter.html#DDL-ALTER-ADDING-A-COLUMN
+      - title: PostgreSQL · pg_attribute
+        url: https://www.postgresql.org/docs/current/catalog-pg-attribute.html
+
+  - id: preis-not-null
+    type: sql
+    lang: postgres
+    title: Der Preis wird Pflicht
+    prompt: |
+      `buchungen.preis` soll nie mehr `NULL` sein. Stornierte Buchungen ohne Preis bekommen `0.00`; alle anderen Buchungen haben schon einen Preis. Die Tabelle ist groß, deshalb darf keine Anweisung den Bestand unter ACCESS EXCLUSIVE lesen: Führe die Regel zuerst für neue Zeilen ein, repariere dann den Bestand und validiere zum Schluss. Hilfs-Constraints, die du dafür anlegst, entfernst du am Ende wieder.
+
+      Die Prüfabfrage sieht: ob die Spalte NOT NULL ist, ob alle CHECK- und NOT-NULL-Constraints validiert sind, wie viele CHECK-Constraints es noch gibt, die Zahl der Buchungen mit Preis 0, die Summe der Preise und einen Test-Insert ohne Preis. Ob eine Anweisung den Bestand unter ACCESS EXCLUSIVE gelesen hat, kann sie nicht sehen.
+    schema: |
+      CREATE TABLE buchungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        raum_id     int NOT NULL,
+        mitglied_id int NOT NULL,
+        beginn      timestamptz NOT NULL,
+        ende        timestamptz NOT NULL,
+        status      text NOT NULL DEFAULT 'bestaetigt',
+        preis       numeric(8,2)
+      );
+      INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, status, preis) VALUES
+        (1, 1, '2026-03-02 09:00+01', '2026-03-02 11:00+01', 'bestaetigt', 70),
+        (3, 1, '2026-03-03 14:00+01', '2026-03-03 15:00+01', 'storniert', NULL),
+        (2, 2, '2026-03-02 10:00+01', '2026-03-02 10:30+01', 'bestaetigt', 3),
+        (4, 3, '2026-03-04 09:00+01', '2026-03-04 12:00+01', 'storniert', NULL),
+        (3, 3, '2026-03-05 09:00+01', '2026-03-05 10:00+01', 'storniert', 48),
+        (1, 4, '2026-03-06 13:00+01', '2026-03-06 15:00+01', 'bestaetigt', 70);
+    starter: |
+      SET lock_timeout = '3s';
+      -- 1. Regel für neue Zeilen
+      -- 2. Bestand reparieren
+      -- 3. validieren
+    solution: |
+      SET lock_timeout = '3s';
+      ALTER TABLE buchungen ADD CONSTRAINT buchungen_preis_vorhanden CHECK (preis IS NOT NULL) NOT VALID;
+      UPDATE buchungen SET preis = 0 WHERE preis IS NULL AND status = 'storniert';
+      ALTER TABLE buchungen VALIDATE CONSTRAINT buchungen_preis_vorhanden;
+      ALTER TABLE buchungen ALTER COLUMN preis SET NOT NULL;
+      ALTER TABLE buchungen DROP CONSTRAINT buchungen_preis_vorhanden;
+    check: |
+      SELECT (SELECT attnotnull FROM pg_attribute
+              WHERE attrelid = 'buchungen'::regclass AND attname = 'preis') AS not_null,
+             (SELECT bool_and(convalidated) FROM pg_constraint
+              WHERE conrelid = 'buchungen'::regclass AND contype IN ('c', 'n')) AS alles_validiert,
+             (SELECT count(*) FROM pg_constraint
+              WHERE conrelid = 'buchungen'::regclass AND contype = 'c') AS check_constraints,
+             (SELECT count(*) FROM buchungen WHERE preis = 0) AS preis_null_euro,
+             (SELECT sum(preis) FROM buchungen) AS summe,
+             lp.versuch($$INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, status)
+                         VALUES (1, 1, '2026-03-09 09:00+01', '2026-03-09 10:00+01', 'storniert')$$) AS ohne_preis;
+    hints:
+      - "Schritt 1 ist ein Constraint mit `NOT VALID`: entweder `CHECK (preis IS NOT NULL) NOT VALID` oder in PostgreSQL 18 `NOT NULL preis NOT VALID`."
+      - Nach dem `UPDATE` prüft `VALIDATE CONSTRAINT` den Bestand unter SHARE UPDATE EXCLUSIVE.
+      - "Mit dem CHECK-Weg folgen `ALTER COLUMN preis SET NOT NULL` (ohne Scan, weil der CHECK gültig ist) und `DROP CONSTRAINT`. Mit `NOT NULL … NOT VALID` genügt `VALIDATE CONSTRAINT`."
+    explanation: |
+      Beide Wege enden im selben Zustand. Mit `CHECK (preis IS NOT NULL) NOT VALID` gilt die Regel sofort für neue Zeilen, ohne den Bestand zu lesen. Das `UPDATE` repariert die zwei stornierten Buchungen, `VALIDATE CONSTRAINT` prüft den Bestand unter SHARE UPDATE EXCLUSIVE, während die App weiter bucht. `SET NOT NULL` findet den gültigen CHECK und überspringt den Scan; danach ist der CHECK überflüssig. In PostgreSQL 18 erledigt `ADD CONSTRAINT … NOT NULL preis NOT VALID` mit anschließendem `VALIDATE CONSTRAINT` dasselbe in zwei Anweisungen. Die Prüfung zeigt, warum `alles_validiert` dazugehört: Ein NOT-NULL-Constraint mit `NOT VALID` macht die Spalte für neue Zeilen schon zur Pflicht, ohne dass der Bestand geprüft ist. Jede dieser Anweisungen läuft hier als eigene Transaktion – in einer gemeinsamen würde die erste ACCESS EXCLUSIVE bis zum Ende gehalten.
+    resources:
+      - title: PostgreSQL · ALTER TABLE – SET NOT NULL
+        url: https://www.postgresql.org/docs/current/sql-altertable.html#SQL-ALTERTABLE-DESC-SET-DROP-NOT-NULL
+      - title: PostgreSQL · ALTER TABLE – VALIDATE CONSTRAINT
+        url: https://www.postgresql.org/docs/current/sql-altertable.html#SQL-ALTERTABLE-DESC-VALIDATE-CONSTRAINT
+
+  - id: checkins-fremdschluessel
+    type: sql
+    lang: postgres
+    title: Ein Fremdschlüssel für die Check-ins
+    prompt: |
+      `checkins.standort_id` hat noch keinen Fremdschlüssel auf `standorte (id)`. Lege ihn an, ohne die Schreibzugriffe auf beide Tabellen für einen Scan zu blockieren. Neue Check-ins mit unbekanntem Standort sollen ab der ersten Anweisung abgelehnt werden. Die Check-ins mit `standort_id = 99` stammen aus einem Lasttest und werden gelöscht. Am Ende ist der Fremdschlüssel validiert.
+
+      Die Prüfabfrage sieht die Zahl validierter Fremdschlüssel von `checkins` auf `standorte`, die Zahl der Check-ins, die Zahl der Lasttest-Zeilen und einen Test-Insert mit Standort 99. In welcher Reihenfolge du vorgehst, kann sie nicht sehen.
+    schema: |
+      CREATE TABLE standorte (
+        id    int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        name  text NOT NULL UNIQUE,
+        stadt text NOT NULL DEFAULT 'Leipzig'
+      );
+      CREATE TABLE checkins (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        mitglied_id int NOT NULL,
+        standort_id int NOT NULL,
+        zeitpunkt   timestamptz NOT NULL
+      );
+      INSERT INTO standorte (name) VALUES ('Plagwitz'), ('Südvorstadt'), ('Zentrum');
+      INSERT INTO checkins (mitglied_id, standort_id, zeitpunkt) VALUES
+        (1, 1, '2026-03-02 08:55+01'),
+        (2, 3, '2026-03-02 09:10+01'),
+        (900, 99, '2026-03-02 09:11+01'),
+        (3, 2, '2026-03-02 09:12+01'),
+        (901, 99, '2026-03-02 09:12+01'),
+        (1, 1, '2026-03-03 08:50+01'),
+        (4, 3, '2026-03-03 10:05+01');
+    starter: |
+      SET lock_timeout = '3s';
+      ALTER TABLE checkins ADD CONSTRAINT checkins_standort_fk
+        FOREIGN KEY (standort_id) REFERENCES standorte (id);
+    solution: |
+      SET lock_timeout = '3s';
+      ALTER TABLE checkins ADD CONSTRAINT checkins_standort_fk
+        FOREIGN KEY (standort_id) REFERENCES standorte (id) NOT VALID;
+      DELETE FROM checkins WHERE standort_id = 99;
+      ALTER TABLE checkins VALIDATE CONSTRAINT checkins_standort_fk;
+    check: |
+      SELECT (SELECT count(*) FROM pg_constraint
+              WHERE conrelid = 'checkins'::regclass AND contype = 'f'
+                AND confrelid = 'standorte'::regclass AND convalidated) AS gueltige_fks,
+             (SELECT count(*) FROM checkins) AS checkins,
+             (SELECT count(*) FROM checkins WHERE standort_id = 99) AS lasttest,
+             lp.versuch($$INSERT INTO checkins (mitglied_id, standort_id, zeitpunkt)
+                         VALUES (1, 99, '2026-03-04 09:00+01')$$) AS unbekannter_standort;
+    hints:
+      - Der Startcode scheitert an den Lasttest-Zeilen – und würde auf einer großen Tabelle beide Tabellen für den Scan sperren.
+      - "Reihenfolge: Fremdschlüssel mit `NOT VALID`, Lasttest-Zeilen löschen, `VALIDATE CONSTRAINT`."
+    explanation: |
+      `ADD FOREIGN KEY … NOT VALID` braucht kurz SHARE ROW EXCLUSIVE auf beiden Tabellen und prüft keine bestehende Zeile. Ab diesem Moment lehnt PostgreSQL neue Waisen ab – der Test-Insert mit Standort 99 scheitert schon jetzt. Dann werden die Altlasten bereinigt, ohne dass neue nachkommen. `VALIDATE CONSTRAINT` liest danach alle Check-ins, nimmt dafür aber nur SHARE UPDATE EXCLUSIVE auf `checkins` und ROW SHARE auf `standorte`; Check-ins laufen weiter. Der Startcode hätte auf den Lasttest-Zeilen mit `foreign_key_violation` abgebrochen, und auf einer großen Tabelle hätte er während des Scans alle Schreibzugriffe auf beide Tabellen blockiert. Wo `standort_id` häufig gesucht wird, gehört zum Fremdschlüssel ein Index – siehe [Constraints](/postgres/constraints) und [Indexe](/postgres/indexe).
+    resources:
+      - title: PostgreSQL · ALTER TABLE – ADD table_constraint
+        url: https://www.postgresql.org/docs/current/sql-altertable.html#SQL-ALTERTABLE-DESC-ADD-TABLE-CONSTRAINT
+      - title: PostgreSQL · Foreign Keys
+        url: https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-FK
+
+  - id: email-eindeutig
+    type: sql
+    lang: postgres
+    title: E-Mail ohne Groß und Klein
+    prompt: |
+      Lea Hoffmann hat sich versehentlich ein zweites Mal registriert, mit großem Anfangsbuchstaben in der Adresse. Das zweite Konto (`id = 5`) hat keine Buchungen und wird gelöscht. Danach sollen E-Mail-Adressen ohne Rücksicht auf Groß- und Kleinschreibung eindeutig sein: Lege einen eindeutigen Index auf `lower(email)` an, so dass Schreibzugriffe während des Baus weiterlaufen.
+
+      Die Prüfabfrage sieht die Zahl gültiger eindeutiger Indexe auf `lower(email)`, die Zahl der Mitglieder und Buchungen und zwei Test-Inserts. Ob du `CONCURRENTLY` verwendest, kann sie nicht sehen.
+    schema: |
+      CREATE TABLE mitglieder (
+        id    int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        email text NOT NULL UNIQUE,
+        name  text NOT NULL,
+        tarif text NOT NULL DEFAULT 'flex'
+      );
+      CREATE TABLE buchungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        mitglied_id int NOT NULL REFERENCES mitglieder (id),
+        beginn      timestamptz NOT NULL
+      );
+      INSERT INTO mitglieder (email, name, tarif) VALUES
+        ('jana.richter@example.org', 'Jana Richter', 'fix'),
+        ('mehmet.yilmaz@example.org', 'Mehmet Yılmaz', 'flex'),
+        ('lea.hoffmann@example.org', 'Lea Hoffmann', 'team'),
+        ('tobias.krueger@example.org', 'Tobias Krüger', 'flex'),
+        ('Lea.Hoffmann@example.org', 'Lea Hoffmann', 'flex');
+      INSERT INTO buchungen (mitglied_id, beginn) VALUES
+        (1, '2026-03-02 09:00+01'), (3, '2026-03-04 09:00+01'), (4, '2026-03-05 14:00+01');
+    starter: |
+      CREATE UNIQUE INDEX mitglieder_email_lower_idx ON mitglieder (email);
+    solution: |
+      DELETE FROM mitglieder WHERE id = 5;
+      CREATE UNIQUE INDEX CONCURRENTLY mitglieder_email_lower_idx ON mitglieder (lower(email));
+    check: |
+      SELECT (SELECT count(*) FROM pg_index
+              WHERE indrelid = 'mitglieder'::regclass AND indisunique AND indisvalid
+                AND pg_get_indexdef(indexrelid) LIKE '%lower(email)%') AS eindeutig_ohne_gross_klein,
+             (SELECT count(*) FROM mitglieder) AS mitglieder,
+             (SELECT count(*) FROM buchungen) AS buchungen,
+             lp.versuch($$INSERT INTO mitglieder (email, name) VALUES ('JANA.RICHTER@example.org', 'Jana Doppelt')$$) AS grossbuchstaben,
+             lp.versuch($$INSERT INTO mitglieder (email, name) VALUES ('neu@example.org', 'Neu')$$) AS neue_adresse;
+    hints:
+      - Solange beide Konten von Lea Hoffmann existieren, scheitert jeder eindeutige Index auf `lower(email)`.
+      - "`CREATE UNIQUE INDEX CONCURRENTLY … ON mitglieder (lower(email))` – ein Ausdrucksindex, als eigene Anweisung außerhalb einer Transaktion."
+    explanation: |
+      Ein eindeutiger Index auf den Ausdruck `lower(email)` vergleicht die Adressen kleingeschrieben; `JANA.RICHTER@example.org` kollidiert jetzt mit `jana.richter@example.org`. Vorher muss das Duplikat weg, sonst bricht der Bau ab – mit `CONCURRENTLY` bliebe dann ein ungültiger Index zurück, den du mit `DROP INDEX CONCURRENTLY` entfernen müsstest. `CONCURRENTLY` nimmt nur SHARE UPDATE EXCLUSIVE, Registrierungen laufen während des Baus weiter; ein gewöhnliches `CREATE UNIQUE INDEX` würde alle Schreibzugriffe auf `mitglieder` bis zum Ende blockieren. Die App muss danach auch mit `lower(email)` suchen, sonst nutzt die Anmeldung den Index nicht.
+    resources:
+      - title: PostgreSQL · Building Indexes Concurrently
+        url: https://www.postgresql.org/docs/current/sql-createindex.html#SQL-CREATEINDEX-CONCURRENTLY
+      - title: PostgreSQL · Indexes on Expressions
+        url: https://www.postgresql.org/docs/current/indexes-expressional.html
+
+  - id: not-null-schrittweise
+    type: gap
+    title: NOT NULL in vier Schritten
+    prompt: |
+      Ergänze die Migration, die `buchungen.preis` zur Pflicht macht, ohne die große Tabelle unter ACCESS EXCLUSIVE zu lesen. Die Migration soll höchstens drei Sekunden auf eine Sperre warten. Der Bestand ist schon repariert.
+    lang: postgres
+    code: |
+      SET ⟦lock_timeout⟧ = '3s';
+
+      ALTER TABLE buchungen
+        ADD CONSTRAINT buchungen_preis_vorhanden CHECK (preis IS NOT NULL) ⟦NOT VALID⟧;
+
+      ALTER TABLE buchungen ⟦VALIDATE CONSTRAINT⟧ buchungen_preis_vorhanden;
+
+      ALTER TABLE buchungen ALTER COLUMN preis ⟦SET NOT NULL⟧;
+
+      ALTER TABLE buchungen ⟦DROP CONSTRAINT⟧ buchungen_preis_vorhanden;
+    gaps:
+      - label: Wartezeit begrenzen
+        hint: Die Einstellung, nach der eine Anweisung aufgibt, die auf eine Sperre wartet.
+      - label: Ohne Scan anlegen
+        hint: Zwei Wörter, die den Bestand ungeprüft lassen.
+      - label: Bestand prüfen
+        hint: Die `ALTER TABLE`-Unterform, die einen ungeprüften Constraint nachträglich prüft.
+      - label: Pflichtspalte
+        hint: Die Spaltenunterform, die `NULL` verbietet.
+      - label: Aufräumen
+        hint: Der Hilfs-Constraint wird nicht mehr gebraucht.
+        accept: ["DROP CONSTRAINT IF EXISTS"]
+    explanation: |
+      `lock_timeout` verhindert, dass eine der Anweisungen in einer Sperrwarteschlange hängt und die App mitnimmt. `NOT VALID` legt den CHECK an, ohne den Bestand zu lesen; neue Zeilen müssen ihn ab sofort erfüllen. `VALIDATE CONSTRAINT` prüft den Bestand unter SHARE UPDATE EXCLUSIVE, Lesen und Schreiben laufen weiter. `SET NOT NULL` braucht ACCESS EXCLUSIVE, findet aber den gültigen CHECK und überspringt den Scan, ist also sofort fertig. Danach ist der CHECK doppelt und fällt weg. In PostgreSQL 18 geht es auch mit `ADD CONSTRAINT … NOT NULL preis NOT VALID` und `VALIDATE CONSTRAINT`.
+    resources:
+      - title: PostgreSQL · ALTER TABLE – SET/DROP NOT NULL
+        url: https://www.postgresql.org/docs/current/sql-altertable.html#SQL-ALTERTABLE-DESC-SET-DROP-NOT-NULL
+
+  - id: volatiler-default
+    type: bug
+    title: Elf Minuten für eine Spalte
+    prompt: |
+      Neue Buchungen sollen speichern, wann sie erfasst wurden; für die 40 Millionen bestehenden Buchungen genügt der Zeitpunkt der Migration. Die Migration hat `buchungen` beim Deploy elf Minuten lang gesperrt, die App stand still. `lock_timeout` hat nicht geholfen, denn die Sperre kam sofort. Finde die Zeile, die den Stillstand verursacht, und korrigiere sie.
+    lang: postgres
+    code: |
+      SET lock_timeout = '3s';
+      ALTER TABLE buchungen
+        ADD COLUMN erfasst_am timestamptz NOT NULL DEFAULT clock_timestamp();
+    lines: [3]
+    fix:
+      - line: 3
+        answers:
+          - "ADD COLUMN erfasst_am timestamptz NOT NULL DEFAULT now();"
+          - "ADD COLUMN erfasst_am timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP;"
+          - "ADD COLUMN erfasst_am timestamptz NOT NULL DEFAULT transaction_timestamp();"
+          - "ADD COLUMN erfasst_am timestamptz NOT NULL DEFAULT statement_timestamp();"
+          - "ADD COLUMN erfasst_am timestamptz DEFAULT now() NOT NULL;"
+          - "ADD COLUMN erfasst_am timestamptz DEFAULT CURRENT_TIMESTAMP NOT NULL;"
+    hints:
+      - Wie oft wertet PostgreSQL `clock_timestamp()` aus, wenn 40 Millionen Zeilen einen Wert brauchen?
+      - Es gibt eine Zeitfunktion, die innerhalb einer Transaktion immer denselben Wert liefert.
+    explanation: |
+      `clock_timestamp()` ist volatil: Jeder Aufruf liefert die aktuelle Uhrzeit. Damit jede bestehende Zeile ihren eigenen Wert bekommt, schreibt PostgreSQL die ganze Tabelle samt Indexen neu – unter ACCESS EXCLUSIVE, elf Minuten lang. `now()` (gleichbedeutend mit `CURRENT_TIMESTAMP` und `transaction_timestamp()`) ist nur stabil: Innerhalb einer Transaktion liefert es immer den Startzeitpunkt. `statement_timestamp()` ist ebenfalls stabil und ginge auch. PostgreSQL wertet den Default einmal aus, legt ihn im Katalog ab, und die Spalte kommt ohne Rewrite. Neue Buchungen bekommen über denselben Default den Startzeitpunkt ihrer Transaktion. Wo jede bestehende Zeile einen eigenen Wert braucht, etwa `gen_random_uuid()`, hilft nur: Spalte ohne Default anlegen, `SET DEFAULT` für neue Zeilen, Bestand in Batches füllen.
+    resources:
+      - title: PostgreSQL · Current Date/Time
+        url: https://www.postgresql.org/docs/current/functions-datetime.html#FUNCTIONS-DATETIME-CURRENT
+      - title: PostgreSQL · ALTER TABLE – Notes
+        url: https://www.postgresql.org/docs/current/sql-altertable.html#SQL-ALTERTABLE-NOTES
+
+  - id: fk-ohne-not-valid
+    type: bug
+    title: VALIDATE war schnell, die App trotzdem nicht
+    prompt: |
+      Die Migration soll den Fremdschlüssel von `buchungen.raum_id` auf `raeume` nachrüsten, ohne Schreibzugriffe lange zu blockieren. Die Anweisungen laufen einzeln, jede in ihrer eigenen Transaktion. Trotzdem konnte 90 Sekunden lang niemand buchen und kein Raum geändert werden; die letzte Anweisung war danach in Millisekunden fertig. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: postgres
+    code: |
+      SET lock_timeout = '3s';
+      ALTER TABLE buchungen ADD CONSTRAINT buchungen_raum_fk
+        FOREIGN KEY (raum_id) REFERENCES raeume (id);
+      ALTER TABLE buchungen VALIDATE CONSTRAINT buchungen_raum_fk;
+    lines: [3]
+    fix:
+      - line: 3
+        answers:
+          - "FOREIGN KEY (raum_id) REFERENCES raeume (id) NOT VALID;"
+          - "FOREIGN KEY (raum_id) REFERENCES raeume NOT VALID;"
+    hints:
+      - Welche Anweisung hat den Bestand geprüft, und mit welcher Sperre?
+      - "`VALIDATE CONSTRAINT` hatte nichts mehr zu tun. Warum?"
+    explanation: |
+      Ohne `NOT VALID` prüft `ADD FOREIGN KEY` sofort alle bestehenden Buchungen – unter SHARE ROW EXCLUSIVE auf `buchungen` und `raeume`, also ohne Schreibzugriffe auf beide Tabellen, bis der Scan fertig ist. `VALIDATE CONSTRAINT` fand danach einen gültigen Constraint vor und tat nichts. Mit `NOT VALID` ist der erste Schritt in Millisekunden durch, und der Scan wandert in `VALIDATE CONSTRAINT`, das nur SHARE UPDATE EXCLUSIVE auf `buchungen` und ROW SHARE auf `raeume` braucht. Wichtig ist auch, dass beide Schritte getrennte Transaktionen sind: In einer gemeinsamen Transaktion hielte die erste Anweisung ihre Sperre bis zum Ende.
+    resources:
+      - title: PostgreSQL · ALTER TABLE – VALIDATE CONSTRAINT
+        url: https://www.postgresql.org/docs/current/sql-altertable.html#SQL-ALTERTABLE-DESC-VALIDATE-CONSTRAINT
+
+  - id: alembic-migration-erklaeren
+    type: explain
+    title: Eine Alembic-Migration im Review
+    prompt: |
+      Diese Migration liegt im Pull Request, darunter die Ausgabe von `alembic upgrade head --sql`. Erkläre einer Kollegin, was jede Anweisung sperrt, wie `lock_timeout` auf beide Anweisungen wirkt, warum der Index in `autocommit_block()` steht, was bei einem Abbruch in der Mitte passiert und welcher Teil des Downgrades in Produktion gefährlich ist.
+    lang: python
+    code: |
+      def upgrade() -> None:
+          op.execute("SET lock_timeout = '3s'")
+          op.add_column(
+              "mitglieder",
+              sa.Column("newsletter", sa.Boolean(), nullable=False, server_default=sa.false()),
+          )
+          with op.get_context().autocommit_block():
+              op.create_index(
+                  "buchungen_raum_beginn_idx", "buchungen", ["raum_id", "beginn"],
+                  postgresql_concurrently=True,
+              )
+
+
+      def downgrade() -> None:
+          with op.get_context().autocommit_block():
+              op.drop_index("buchungen_raum_beginn_idx", table_name="buchungen", postgresql_concurrently=True)
+          op.drop_column("mitglieder", "newsletter")
+
+      # alembic upgrade head --sql (gekürzt):
+      # BEGIN;
+      # SET lock_timeout = '3s';
+      # ALTER TABLE mitglieder ADD COLUMN newsletter BOOLEAN DEFAULT false NOT NULL;
+      # COMMIT;
+      # CREATE INDEX CONCURRENTLY buchungen_raum_beginn_idx ON buchungen (raum_id, beginn);
+      # BEGIN;
+      # INSERT INTO alembic_version (version_num) VALUES ('3f2a9c1d7e10') RETURNING alembic_version.version_num;
+      # COMMIT;
+    points:
+      - "`lock_timeout` lässt das `ALTER TABLE` nach drei Sekunden Warten abbrechen, statt die App in eine Sperrwarteschlange zu ziehen; als `SET` gilt es für die ganze Sitzung, auch für den Index, der dann schon an einer länger laufenden Transaktion scheitert."
+      - "`ADD COLUMN … DEFAULT false NOT NULL` braucht kurz ACCESS EXCLUSIVE, schreibt aber keine Zeile neu – der konstante Default steht im Katalog."
+      - "`CREATE INDEX CONCURRENTLY` darf nicht in einer Transaktion laufen; `autocommit_block()` committet vorher und baut den Index ohne Transaktion unter SHARE UPDATE EXCLUSIVE, Schreiben läuft weiter."
+      - Bricht der Index ab, ist die Spalte schon committet, `alembic_version` aber nicht aktualisiert, und ein ungültiger Index kann zurückbleiben. Vor dem erneuten Lauf ungültigen Index entfernen; `add_column` würde sonst an der vorhandenen Spalte scheitern.
+      - "`drop_column` im Downgrade löscht alle Newsletter-Abmeldungen seit dem Deploy; in Produktion repariert man vorwärts."
+    explanation: |
+      Die Migration ist bis auf zwei Lücken so, wie sie sein soll. `SET lock_timeout = '3s'` steht als Erstes und gilt für die ganze Verbindung – auch nach dem `COMMIT` noch für den Index. `CREATE INDEX CONCURRENTLY` wartet auf alle laufenden Transaktionen; dauert eine davon länger als drei Sekunden, bricht der Bau mit `canceling statement due to lock timeout` ab. Ein `RESET lock_timeout` im `autocommit_block()` behebt das, denn der Index blockiert weder Lesen noch Schreiben und darf warten. Die neue Spalte hat einen konstanten Default und ist deshalb eine reine Katalogänderung: kurz ACCESS EXCLUSIVE, kein Rewrite. Alembic setzt die Migration in eine Transaktion; `autocommit_block()` schickt deshalb vor dem Index ein `COMMIT` und danach ein neues `BEGIN`, denn `CREATE INDEX CONCURRENTLY` läuft nur außerhalb einer Transaktion. Der Index braucht dann nur SHARE UPDATE EXCLUSIVE, Buchungen laufen weiter. Die zweite Lücke ist der Abbruch: Scheitert der Index, ist die Spalte schon committet, die Version in `alembic_version` aber nicht. Ein zweiter Lauf scheitert an `add_column`, und ein abgebrochener `CONCURRENTLY`-Bau kann einen ungültigen Index hinterlassen. Sauberer ist es, den Index in eine eigene Migration zu legen. Das Downgrade ist technisch korrekt, aber `drop_column` vernichtet jede Abmeldung seit dem Deploy – in Produktion rollt man die App zurück und lässt die Spalte stehen.
+    resources:
+      - title: Alembic · MigrationContext.autocommit_block
+        url: https://alembic.sqlalchemy.org/en/latest/api/runtime.html#alembic.runtime.migration.MigrationContext.autocommit_block
+      - title: Alembic · Offline Mode
+        url: https://alembic.sqlalchemy.org/en/latest/offline.html
+
+  - id: betrag-in-cent
+    type: sql
+    lang: postgres
+    title: Rechnungsbeträge in Cent
+    prompt: |
+      Der Prisma-Dienst soll Beträge künftig als ganze Cent verarbeiten. `rechnungen` bekommt dafür die Spalte `betrag_cent` vom Typ `bigint` – die **Expand-Phase** eines Typwechsels. Beide Dienste schreiben vorerst weiter nur `betrag`. Setze um:
+
+      1. `betrag_cent` hinzufügen, ohne die Tabelle neu zu schreiben.
+      2. Doppelt schreiben in der Datenbank: Jeder `INSERT` und jede Änderung von `betrag` setzt `betrag_cent = round(betrag * 100)`.
+      3. Den Bestand nachziehen (in Produktion in Batches; hier darfst du es auch in einer Anweisung tun).
+      4. `betrag_cent` wird NOT NULL, mit einem validierten Constraint.
+
+      `betrag_cent` bleibt eine gewöhnliche Spalte, keine generierte: Nach dem Umstellen sollen die Dienste sie selbst schreiben.
+
+      Die Prüfabfrage sieht den Typ der Spalte, ob sie generiert ist, die Zahl falsch befüllter Bestandszeilen, ob der NOT-NULL-Constraint auf `betrag_cent` validiert ist, und den `betrag_cent` einer neu eingefügten Rechnung über 123,45 Euro und einer auf 99,99 Euro geänderten Rechnung.
+    schema: |
+      CREATE TABLE rechnungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        mitglied_id int NOT NULL,
+        monat       date NOT NULL,
+        betrag      numeric(10,2) NOT NULL,
+        bezahlt_am  timestamptz,
+        UNIQUE (mitglied_id, monat)
+      );
+      INSERT INTO rechnungen (mitglied_id, monat, betrag, bezahlt_am) VALUES
+        (1, '2026-01-01', 249.00, '2026-02-03 10:12+01'),
+        (2, '2026-01-01', 86.40, '2026-02-05 08:30+01'),
+        (1, '2026-02-01', 249.00, '2026-03-02 09:45+01'),
+        (2, '2026-02-01', 112.35, NULL),
+        (3, '2026-02-01', 0.00, '2026-03-01 00:05+01'),
+        (1, '2026-03-01', 249.00, NULL),
+        (3, '2026-03-01', 19.99, NULL);
+    starter: |
+      SET lock_timeout = '3s';
+
+      -- 1. Expand
+      -- 2. Trigger für INSERT und UPDATE OF betrag
+      -- 3. Backfill
+      -- 4. NOT NULL, validiert
+    solution: |
+      SET lock_timeout = '3s';
+
+      -- 1. Expand: neue Spalte ohne Default und ohne NOT NULL
+      ALTER TABLE rechnungen ADD COLUMN betrag_cent bigint;
+
+      -- 2. Doppelt schreiben
+      CREATE FUNCTION rechnungen_betrag_cent() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        NEW.betrag_cent := round(NEW.betrag * 100);
+        RETURN NEW;
+      END $$;
+      CREATE TRIGGER rechnungen_betrag_cent
+        BEFORE INSERT OR UPDATE OF betrag ON rechnungen
+        FOR EACH ROW EXECUTE FUNCTION rechnungen_betrag_cent();
+
+      -- 3. Backfill in Batches, jeder Batch eine eigene Transaktion
+      DO $$
+      DECLARE
+        anzahl int;
+      BEGIN
+        LOOP
+          UPDATE rechnungen SET betrag_cent = round(betrag * 100)
+          WHERE id IN (SELECT id FROM rechnungen WHERE betrag_cent IS NULL ORDER BY id LIMIT 3);
+          GET DIAGNOSTICS anzahl = ROW_COUNT;
+          EXIT WHEN anzahl = 0;
+          COMMIT;
+        END LOOP;
+      END $$;
+
+      -- 4. NOT NULL ohne Scan unter ACCESS EXCLUSIVE (PostgreSQL 18)
+      ALTER TABLE rechnungen ADD CONSTRAINT rechnungen_betrag_cent_not_null NOT NULL betrag_cent NOT VALID;
+      ALTER TABLE rechnungen VALIDATE CONSTRAINT rechnungen_betrag_cent_not_null;
+    check: |
+      WITH neu AS (
+        INSERT INTO rechnungen (mitglied_id, monat, betrag) VALUES (4, '2026-03-01', 123.45)
+        RETURNING to_jsonb(rechnungen) ->> 'betrag_cent' AS betrag_cent
+      ), geaendert AS (
+        UPDATE rechnungen SET betrag = 99.99 WHERE mitglied_id = 2 AND monat = '2026-02-01'
+        RETURNING to_jsonb(rechnungen) ->> 'betrag_cent' AS betrag_cent
+      )
+      SELECT (SELECT data_type FROM information_schema.columns
+              WHERE table_name = 'rechnungen' AND column_name = 'betrag_cent') AS typ,
+             (SELECT attgenerated <> '' FROM pg_attribute
+              WHERE attrelid = 'rechnungen'::regclass AND attname = 'betrag_cent') AS generiert,
+             (SELECT count(*) FROM rechnungen AS r
+              WHERE to_jsonb(r) -> 'betrag_cent' IS DISTINCT FROM to_jsonb(round(r.betrag * 100)::bigint)) AS falsch_befuellt,
+             (SELECT c.convalidated FROM pg_constraint AS c
+              JOIN pg_attribute AS a ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
+              WHERE c.conrelid = 'rechnungen'::regclass AND c.contype = 'n' AND a.attname = 'betrag_cent') AS not_null_validiert,
+             (SELECT betrag_cent FROM neu) AS neue_rechnung,
+             (SELECT betrag_cent FROM geaendert) AS geaenderter_betrag;
+    hints:
+      - Eine Spalte ohne Default kommt ohne Rewrite. Den Wert für neue Zeilen liefert ein `BEFORE`-Trigger, der `NEW.betrag_cent` setzt und `NEW` zurückgibt.
+      - "`CREATE TRIGGER … BEFORE INSERT OR UPDATE OF betrag ON rechnungen FOR EACH ROW EXECUTE FUNCTION …` feuert nur, wenn `betrag` im `SET` steht."
+      - "Backfill: `UPDATE rechnungen SET betrag_cent = round(betrag * 100) WHERE betrag_cent IS NULL`. Dann `ADD CONSTRAINT … NOT NULL betrag_cent NOT VALID` und `VALIDATE CONSTRAINT …`."
+    explanation: |
+      Die neue Spalte ohne Default ist eine Katalogänderung. Der `BEFORE`-Trigger übernimmt das doppelte Schreiben für beide Dienste, ohne dass einer von ihnen geändert werden muss: Er setzt `NEW.betrag_cent`, bevor die Zeile gespeichert und NOT NULL geprüft wird. `UPDATE OF betrag` spart den Trigger bei Änderungen, die den Betrag nicht betreffen, etwa beim Setzen von `bezahlt_am`. Der Backfill füllt nur Zeilen mit `betrag_cent IS NULL`; in Batches mit eigenem `COMMIT` hält er keine langen Sperren und lässt sich abbrechen und fortsetzen. Erst danach lässt sich NOT NULL validieren, hier mit dem PostgreSQL-18-Weg über `NOT NULL … NOT VALID`, gleichwertig über einen CHECK und `SET NOT NULL`. Eine generierte Spalte `GENERATED ALWAYS AS (round(betrag * 100))` sähe bequemer aus, taugt aber nicht: Die Dienste könnten sie nie selbst schreiben, `betrag` ließe sich nicht entfernen, und als `STORED` schreibt sie die Tabelle neu. Die Contract-Phase kommt später: Wenn beide Dienste `betrag_cent` lesen und schreiben, fallen Trigger und `betrag` in eigenen Migrationen weg.
+    resources:
+      - title: PostgreSQL · Trigger Functions in PL/pgSQL
+        url: https://www.postgresql.org/docs/current/plpgsql-trigger.html
+      - title: PostgreSQL · Transaction Management in PL/pgSQL
+        url: https://www.postgresql.org/docs/current/plpgsql-transactions.html
+
+  - id: umbenennen-planen
+    type: practice
+    title: Migrationsplan für einen Tarifwechsel
+    prompt: |
+      Deskwerk ersetzt die Textspalte `mitglieder.tarif` (`'flex'`, `'fix'`, `'team'`) durch einen Fremdschlüssel `tarif_id` auf eine neue Tabelle `tarife` mit Preis und Bezeichnung. `mitglieder` hat 2 Millionen Zeilen. Das Python-Backend (Alembic, SQLAlchemy) und der Prisma-Dienst lesen und schreiben `tarif`; beide werden mit Rolling Deploys ausgeliefert, an verschiedenen Tagen.
+
+      Schreibe den Plan: welche Migrationen und Deploys in welcher Reihenfolge, mit dem SQL der Migrationen (gekürzt ist in Ordnung) und je Schritt einem Satz, warum er mit der laufenden App-Version funktioniert. Nenne auch, wie du zurückrollst, wenn nach Schritt 3 ein Fehler auffällt.
+    lang: text
+    solution: |
+      Migration 1 (Expand, vor jedem Deploy)
+        SET lock_timeout = '3s';
+        CREATE TABLE tarife (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                             code text NOT NULL UNIQUE, bezeichnung text NOT NULL,
+                             preis_pro_monat numeric(8,2) NOT NULL);
+        INSERT INTO tarife (code, bezeichnung, preis_pro_monat) VALUES ('flex', …), ('fix', …), ('team', …);
+        ALTER TABLE mitglieder ADD COLUMN tarif_id int;                       -- Katalogänderung
+        ALTER TABLE mitglieder ADD CONSTRAINT mitglieder_tarif_fk
+          FOREIGN KEY (tarif_id) REFERENCES tarife (id) NOT VALID;            -- kein Scan
+        Trigger BEFORE INSERT OR UPDATE OF tarif: wenn NEW.tarif nicht NULL ist,
+          NEW.tarif_id := (SELECT id FROM tarife WHERE code = NEW.tarif)
+        -> Alte Versionen kennen tarif_id nicht und schreiben weiter tarif; der Trigger füllt tarif_id.
+           Die Bedingung schützt später Versionen, die nur noch tarif_id schreiben.
+
+      Backfill (Skript, Batches à 5 000 Zeilen, je ein Commit, mit Pause)
+        UPDATE mitglieder m SET tarif_id = t.id FROM tarife t
+        WHERE t.code = m.tarif AND m.id IN (SELECT id FROM mitglieder WHERE tarif_id IS NULL ORDER BY id LIMIT 5000);
+
+      Migration 2
+        ALTER TABLE mitglieder VALIDATE CONSTRAINT mitglieder_tarif_fk;          -- SHARE UPDATE EXCLUSIVE
+        ALTER TABLE mitglieder ADD CONSTRAINT mitglieder_tarif_id_nn NOT NULL tarif_id NOT VALID;
+        ALTER TABLE mitglieder VALIDATE CONSTRAINT mitglieder_tarif_id_nn;
+        CREATE INDEX CONCURRENTLY mitglieder_tarif_id_idx ON mitglieder (tarif_id);   -- eigene Migration ohne Transaktion
+
+      Deploy A: Python-Backend liest tarif_id (Join auf tarife), schreibt tarif und tarif_id
+      Deploy B: Prisma-Dienst ebenso
+      Migration 3: ALTER TABLE mitglieder ALTER COLUMN tarif DROP NOT NULL; DROP DEFAULT
+        -> nötig, bevor eine Version tarif nicht mehr schreibt; ohne DROP DEFAULT bekäme jede
+           neue Zeile tarif = 'flex', und der Trigger überschriebe tarif_id damit
+      Deploy C und D: beide Dienste schreiben nur noch tarif_id
+      Migration 4 (Contract, frühestens nach C und D): Trigger entfernen, ALTER TABLE mitglieder DROP COLUMN tarif
+
+      Rollback nach Schritt 3: App-Version zurückrollen, Schema stehen lassen. Jede Version davor
+      kommt mit dem erweiterten Schema zurecht; Fehler in den Daten mit einer neuen Migration vorwärts reparieren.
+    checklist:
+      - Jede Migration mit `ALTER TABLE` beginnt mit `SET lock_timeout`, und keine Anweisung liest die 2 Millionen Zeilen unter ACCESS EXCLUSIVE.
+      - Fremdschlüssel und NOT NULL kommen mit `NOT VALID` und werden erst nach dem Backfill mit `VALIDATE CONSTRAINT` geprüft.
+      - Ein Trigger oder beide Dienste füllen `tarif_id` für neue und geänderte Zeilen, bevor der Backfill läuft; ein Trigger überschreibt `tarif_id` nicht, wenn eine neue Version `tarif` leer lässt.
+      - Der Backfill läuft in Batches mit eigenem Commit und lässt sich abbrechen und fortsetzen (`WHERE tarif_id IS NULL`).
+      - "`tarif` wird nullable, bevor eine Version es nicht mehr schreibt, und erst gelöscht, wenn keine laufende Version es liest."
+      - Der Index auf `tarif_id` entsteht mit `CREATE INDEX CONCURRENTLY` in einer Migration ohne Transaktion.
+      - Der Rollback rollt die App zurück und repariert Daten vorwärts, statt Spalten per Downgrade zu löschen.
+    explanation: |
+      Der Plan ist Expand and Contract mit zwei Diensten. Alles, was die alte App-Version sehen kann, kommt zuerst und ist für sie unsichtbar: neue Tabelle, neue Spalte ohne Pflicht, ein Fremdschlüssel mit `NOT VALID` und ein Trigger, der die neue Spalte aus der alten füllt. Der Backfill braucht keine Sperre auf der Tabelle und hält Zeilensperren nur je Batch. Erst wenn alle Zeilen gefüllt sind, werden Fremdschlüssel und NOT NULL validiert, beide unter SHARE UPDATE EXCLUSIVE. Die Dienste stellen nacheinander auf `tarif_id` um, und die alte Spalte verliert ihr NOT NULL, bevor die erste Version aufhört, sie zu schreiben. Die Contract-Migration wartet, bis keine laufende Instanz `tarif` mehr kennt. Weil jedes Schema mit der Version davor funktioniert, heißt Rollback: App zurück, Schema bleibt.
+    resources:
+      - title: Prisma ORM 7 · Expand and contract
+        url: https://www.prisma.io/docs/orm/v7/prisma-migrate/workflows/customizing-migrations#example-use-the-expand-and-contract-pattern-to-evolve-the-schema-without-downtime
+      - title: Prisma ORM 7 · Development and production
+        url: https://www.prisma.io/docs/orm/v7/prisma-migrate/workflows/development-and-production

@@ -1,0 +1,910 @@
+id: normalisierung
+title: Normalisierung – jede Tatsache an genau einer Stelle
+level: 2
+minutes: 130
+summary: Warum eine breite Buchungsliste beim Ändern, Einfügen und Löschen Fehler produziert, wie funktionale Abhängigkeiten und die Normalformen sie beseitigen, wie du eine Legacy-Tabelle sicher zerlegst und wann du bewusst denormalisierst.
+goals:
+  - Du erkennst Einfüge-, Änderungs- und Löschanomalien in einer Tabelle und führst sie auf Redundanz zurück.
+  - Du formulierst funktionale Abhängigkeiten und prüfst mit SQL, ob die Daten sie verletzen.
+  - Du ordnest Verstöße der ersten, zweiten, dritten und Boyce-Codd-Normalform zu und begründest Arrays und JSONB als bewusste Ausnahme.
+  - Du zerlegst eine Legacy-Tabelle mit `INSERT … SELECT DISTINCT` in Tabellen mit Schlüsseln und Fremdschlüsseln und weist nach, dass nichts verloren ging.
+  - Du unterscheidest bewusste Denormalisierung – Snapshot-Preise, Zählerspalten, materialisierte Sichten – von Redundanz aus Versehen.
+resources:
+  - title: PostgreSQL · Foreign Keys
+    url: https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-FK
+  - title: PostgreSQL · INSERT
+    url: https://www.postgresql.org/docs/current/sql-insert.html
+  - title: PostgreSQL · Searching in Arrays
+    url: https://www.postgresql.org/docs/current/arrays.html#ARRAYS-SEARCHING
+  - title: PostgreSQL · Designing JSON Documents
+    url: https://www.postgresql.org/docs/current/datatype-json.html#JSON-DOC-DESIGN
+  - title: PostgreSQL · Materialized Views
+    url: https://www.postgresql.org/docs/current/rules-materializedviews.html
+lesson: |
+  Deskwerk hat 2024 mit einer Tabellenkalkulation angefangen: eine Zeile je Buchung, daneben Standort, Adresse, Raum, Stundenpreis, E-Mail, Name und Tarif des Mitglieds. Für ein paar hundert Buchungen ging das. Dann heiratete Lena Brandt. Ihr neuer Name landete nur in einer ihrer Zeilen, und seitdem gingen Rechnungen mal an „Lena Brandt“, mal an „Lena Okafor“. Der Standort Südvorstadt verschwand aus der Auswertung, als jemand die einzige Buchung des Monats löschte. Und den neuen Raum „Werkstatt“ konnte niemand eintragen, solange ihn keiner gebucht hatte.
+
+  Diese Fehler haben eine gemeinsame Ursache: Dieselbe Tatsache steht an mehreren Stellen. **Normalisierung** ist das Verfahren, ein Schema so zu zerlegen, dass jede Tatsache genau einmal gespeichert ist. Dieses Modul zeigt die Theorie, soweit du sie für Entwurf und Code-Review brauchst, und dann die Praxis: eine Legacy-Tabelle zerlegen, ohne Daten zu verlieren. Was eine Zeile bedeutet und wozu Schlüssel da sind, kennst du aus [Saubere Tabellen und Datenmodelle](/data/tabellenmodelle).
+
+  ## Anomalien: was eine breite Tabelle falsch macht
+
+  Die importierte Liste hat den Primärschlüssel `zeile` und wiederholt in jeder Zeile Standort- und Mitgliedsdaten:
+
+  ```postgres run
+  CREATE TABLE buchungsliste (
+    zeile            int PRIMARY KEY,
+    beginn           timestamptz NOT NULL,
+    ende             timestamptz NOT NULL,
+    standort         text NOT NULL,
+    standort_adresse text NOT NULL,
+    raum             text NOT NULL,
+    preis_pro_stunde numeric(8,2) NOT NULL,
+    mitglied_email   text NOT NULL,
+    mitglied_name    text NOT NULL,
+    tarif            text NOT NULL
+  );
+  INSERT INTO buchungsliste VALUES
+    (1, '2026-03-02 09:00', '2026-03-02 11:00', 'Zentrum',     'Markt 10',                  'Loft',    24.00, 'lena.brandt@example.org',  'Lena Brandt',  'fix'),
+    (2, '2026-03-02 14:00', '2026-03-02 15:00', 'Zentrum',     'Markt 10',                  'Box 1',    6.00, 'jonas.albers@example.org', 'Jonas Albers', 'flex'),
+    (3, '2026-03-03 10:00', '2026-03-03 12:00', 'Plagwitz',    'Karl-Heine-Straße 93',      'Atelier', 18.00, 'lena.brandt@example.org',  'Lena Brandt',  'fix'),
+    (4, '2026-03-04 10:00', '2026-03-04 12:00', 'Zentrum',     'Markt 10',                  'Loft',    24.00, 'mara.voss@example.org',    'Mara Voss',    'team'),
+    (5, '2026-03-05 08:00', '2026-03-05 09:00', 'Südvorstadt', 'Karl-Liebknecht-Straße 50', 'Box 2',    6.00, 'jonas.albers@example.org', 'Jonas Albers', 'flex'),
+    (6, '2026-04-07 10:00', '2026-04-07 12:00', 'Zentrum',     'Markt 10',                  'Loft',    26.00, 'lena.brandt@example.org',  'Lena Brandt',  'fix');
+
+  -- Änderungsanomalie: Lena heißt jetzt Okafor, geändert wird nur eine Zeile
+  UPDATE buchungsliste SET mitglied_name = 'Lena Okafor' WHERE zeile = 6;
+  SELECT mitglied_email, string_agg(DISTINCT mitglied_name, ' / ') AS namen
+  FROM buchungsliste
+  GROUP BY mitglied_email
+  HAVING count(DISTINCT mitglied_name) > 1;
+
+  -- Einfügeanomalie: ein Raum ohne Buchung
+  SELECT lp.versuch($$INSERT INTO buchungsliste (zeile, standort, standort_adresse, raum, preis_pro_stunde)
+                      VALUES (7, 'Plagwitz', 'Karl-Heine-Straße 93', 'Werkstatt', 15.00)$$) AS neuer_raum;
+
+  -- Löschanomalie: die einzige Buchung in der Südvorstadt wird gelöscht
+  DELETE FROM buchungsliste WHERE zeile = 5;
+  SELECT count(*) AS zeilen_suedvorstadt FROM buchungsliste WHERE standort = 'Südvorstadt';
+  ```
+
+  (`lp.versuch($$…$$)` ist eine Hilfsfunktion der Lernplattform: Sie probiert eine Anweisung, rollt sie zurück und liefert `ok` oder den Fehlernamen.)
+
+  Drei Fehlerarten:
+
+  - **Änderungsanomalie:** Eine Tatsache steht in vielen Zeilen. Wer nicht alle ändert, erzeugt Widersprüche – jetzt hat dieselbe E-Mail zwei Namen.
+  - **Einfügeanomalie:** Eine Tatsache lässt sich nicht speichern, ohne eine andere zu erfinden. Ein Raum braucht hier eine Buchung.
+  - **Löschanomalie:** Wer eine Tatsache löscht, verliert eine andere. Mit der Buchung ist die Adresse der Südvorstadt weg.
+
+  ## Funktionale Abhängigkeiten
+
+  Das Werkzeug, um Redundanz präzise zu beschreiben, ist die **funktionale Abhängigkeit**: `X → Y` heißt „Zeilen mit gleichem X haben auch gleiches Y“, X bestimmt Y. In der Buchungsliste gelten fachlich:
+
+  ```text
+  standort             → standort_adresse
+  mitglied_email       → mitglied_name, tarif
+  standort, raum       → preis_pro_stunde      (gilt das?)
+  zeile                → alle Spalten
+  ```
+
+  Ein **Schlüssel** ist eine minimale Spaltenmenge, die alle anderen Spalten bestimmt. Hier ist das `zeile`, fachlich auch `(standort, raum, beginn)`. Redundanz entsteht, wenn eine Abhängigkeit **nicht** vom Schlüssel ausgeht: `mitglied_email → mitglied_name` sorgt dafür, dass derselbe Name in jeder Buchung eines Mitglieds wiederkehrt.
+
+  Abhängigkeiten kommen aus der Fachlichkeit. Die Daten können eine vermutete Abhängigkeit nur widerlegen, nie beweisen. Das Prüfmuster: nach X gruppieren und verschiedene Y zählen.
+
+  ```postgres run
+  CREATE TABLE buchungsliste (
+    zeile int PRIMARY KEY, beginn timestamptz NOT NULL, standort text NOT NULL, raum text NOT NULL,
+    preis_pro_stunde numeric(8,2) NOT NULL, mitglied_email text NOT NULL, mitglied_name text NOT NULL, tarif text NOT NULL
+  );
+  INSERT INTO buchungsliste VALUES
+    (1, '2026-03-02 09:00', 'Zentrum',     'Loft',    24.00, 'lena.brandt@example.org',  'Lena Brandt',  'fix'),
+    (2, '2026-03-02 14:00', 'Zentrum',     'Box 1',    6.00, 'jonas.albers@example.org', 'Jonas Albers', 'flex'),
+    (3, '2026-03-03 10:00', 'Plagwitz',    'Atelier', 18.00, 'lena.brandt@example.org',  'Lena Brandt',  'fix'),
+    (4, '2026-03-04 10:00', 'Zentrum',     'Loft',    24.00, 'mara.voss@example.org',    'Mara Voss',    'team'),
+    (5, '2026-03-05 08:00', 'Südvorstadt', 'Box 2',    6.00, 'jonas.albers@example.org', 'Jonas Albers', 'flex'),
+    (6, '2026-04-07 10:00', 'Zentrum',     'Loft',    26.00, 'lena.brandt@example.org',  'Lena Brandt',  'fix');
+
+  -- Gilt (standort, raum) → preis_pro_stunde?
+  SELECT standort, raum, string_agg(DISTINCT preis_pro_stunde::text, ', ') AS preise
+  FROM buchungsliste
+  GROUP BY standort, raum
+  HAVING count(DISTINCT preis_pro_stunde) > 1;
+
+  -- Gilt mitglied_email → mitglied_name, tarif?
+  SELECT mitglied_email
+  FROM buchungsliste
+  GROUP BY mitglied_email
+  HAVING count(DISTINCT mitglied_name) > 1 OR count(DISTINCT tarif) > 1;
+  ```
+
+  Die Mitgliedsdaten sind konsistent. Der Loft hat aber zwei Preise, weil er zum 1. April teurer wurde. `(standort, raum) → preis_pro_stunde` gilt also nur zu einem Zeitpunkt. Die Spalte in der Liste ist in Wahrheit der **Preis zum Buchungszeitpunkt** und hängt an der Buchung, nicht am Raum.
+
+  ## Erste Normalform: ein Wert je Zelle
+
+  Die **erste Normalform** (1NF) verlangt atomare Werte: In jeder Zelle steht ein Wert, keine Liste, und es gibt keine Wiederholungsgruppen wie `telefon1`, `telefon2`, `telefon3`. Der Klassiker in gewachsenen Tabellen ist eine Spalte mit kommagetrennten Einträgen:
+
+  ```postgres run
+  CREATE TABLE raeume_alt (id int PRIMARY KEY, name text NOT NULL, ausstattung text);
+  INSERT INTO raeume_alt VALUES
+    (1, 'Loft',      'Beamer, Whiteboard, Flipchart'),
+    (2, 'Atelier',   'Whiteboard'),
+    (3, 'Box 1',     NULL),
+    (4, 'Werkstatt', 'Beamer-Halterung, Whiteboard');
+
+  -- Welche Räume haben einen Beamer?
+  SELECT name FROM raeume_alt WHERE ausstattung LIKE '%Beamer%';
+
+  -- Erste Normalform: eine Zeile je Raum und Ausstattung
+  CREATE TABLE raum_ausstattung (
+    raum_id     int NOT NULL REFERENCES raeume_alt (id),
+    ausstattung text NOT NULL,
+    PRIMARY KEY (raum_id, ausstattung)
+  );
+  INSERT INTO raum_ausstattung (raum_id, ausstattung)
+  SELECT r.id, trim(teil)
+  FROM raeume_alt AS r, string_to_table(r.ausstattung, ',') AS teil;
+
+  SELECT r.name
+  FROM raeume_alt AS r
+  JOIN raum_ausstattung AS ra ON ra.raum_id = r.id
+  WHERE ra.ausstattung = 'Beamer';
+  ```
+
+  Die `LIKE`-Suche findet auch die Werkstatt mit ihrer Halterung. In der zerlegten Tabelle ist „Raum hat Beamer“ eine Zeile, die du per Gleichheit findest, geschützt durch Primär- und Fremdschlüssel. `string_to_table` (seit PostgreSQL 14) zerlegt den Text in Zeilen, `trim` entfernt die Leerzeichen ([PostgreSQL · String Functions](https://www.postgresql.org/docs/current/functions-string.html#FUNCTIONS-STRING-OTHER)).
+
+  Arrays und JSONB sind damit nicht verboten, sondern eine bewusste Ausnahme. Die Dokumentation formuliert die Grenze selbst: Arrays sind keine Mengen, und wer nach einzelnen Elementen sucht, hat oft eine eigene Tabelle übersehen ([PostgreSQL · Searching in Arrays](https://www.postgresql.org/docs/current/arrays.html#ARRAYS-SEARCHING)). Ein JSON-Dokument soll eine Tatsache sein, die sich nicht sinnvoll in unabhängig änderbare Teile zerlegen lässt ([PostgreSQL · Designing JSON Documents](https://www.postgresql.org/docs/current/datatype-json.html#JSON-DOC-DESIGN)).
+
+  > [!TIP] Array oder eigene Tabelle?
+  > Ein Array oder JSONB passt, wenn der Wert fast immer als Ganzes gelesen und geschrieben wird und kein Element einen Fremdschlüssel braucht – etwa die Benachrichtigungseinstellungen eines Mitglieds. Eine eigene Tabelle ist richtig, sobald du nach Elementen filterst, zählst oder sie mit anderen Tabellen verknüpfst. Die Ausstattung eines Raums gehört deshalb in eine Tabelle: Die Buchungssuche filtert danach.
+
+  ## Zweite, dritte und Boyce-Codd-Normalform
+
+  Die weiteren Normalformen betreffen Abhängigkeiten, die nicht vom ganzen Schlüssel ausgehen. Die **zweite Normalform** (2NF) verbietet bei zusammengesetzten Schlüsseln, dass eine Spalte nur von einem Teil des Schlüssels abhängt:
+
+  ```postgres
+  -- verletzt 2NF: raum_name hängt nur von raum_id ab, nicht von (raum_id, ausstattung)
+  CREATE TABLE raum_ausstattung (
+    raum_id     int  NOT NULL,
+    ausstattung text NOT NULL,
+    raum_name   text NOT NULL,
+    PRIMARY KEY (raum_id, ausstattung)
+  );
+  ```
+
+  Bei einem Raum mit fünf Ausstattungsteilen steht sein Name fünfmal da. `raum_name` gehört in `raeume`. Bei einem einspaltigen künstlichen Schlüssel (Surrogatschlüssel) wie `id` prüfst du die 2NF am fachlichen Schlüssel, etwa `(standort_id, name)` bei Räumen.
+
+  Die **dritte Normalform** (3NF) verbietet transitive Abhängigkeiten: Eine Spalte hängt von einer anderen Nicht-Schlüsselspalte ab statt direkt vom Schlüssel.
+
+  ```postgres
+  -- verletzt 3NF: id → tarif → tarif_monatspreis
+  CREATE TABLE mitglieder (
+    id                int PRIMARY KEY,
+    email             text NOT NULL UNIQUE,
+    tarif             text NOT NULL,
+    tarif_monatspreis numeric(8,2) NOT NULL
+  );
+  -- normalisiert: der Preis steht einmal je Tarif
+  CREATE TABLE tarife (name text PRIMARY KEY, monatspreis numeric(8,2) NOT NULL);
+  CREATE TABLE mitglieder (
+    id    int PRIMARY KEY,
+    email text NOT NULL UNIQUE,
+    tarif text NOT NULL REFERENCES tarife (name)
+  );
+  ```
+
+  Wird der Flex-Tarif teurer, ändert sich jetzt eine Zeile statt 300. Der Fremdschlüssel verhindert außerdem Tippfehler wie `'flexx'`.
+
+  > [!MERKE]
+  > Jede Nicht-Schlüsselspalte hängt vom Schlüssel ab (1NF), vom ganzen Schlüssel (2NF) und von nichts als dem Schlüssel (3NF).
+
+  Die **Boyce-Codd-Normalform** (BCNF) verschärft die 3NF: Jede Spaltenmenge, die eine andere Spalte bestimmt, muss einen Schlüssel enthalten. Der Unterschied zeigt sich selten:
+
+  ```postgres
+  -- Jedes Mitglied hat je Standort genau eine Ansprechperson,
+  -- jede Ansprechperson arbeitet an genau einem Standort.
+  CREATE TABLE betreuung (
+    mitglied_id    int  NOT NULL,
+    standort       text NOT NULL,
+    ansprechperson text NOT NULL,
+    PRIMARY KEY (mitglied_id, standort)
+  );
+  -- (mitglied_id, standort) → ansprechperson   und   ansprechperson → standort
+  ```
+
+  `ansprechperson → standort` geht nicht von einem Schlüssel aus, also nicht BCNF; weil `standort` Teil des Schlüssels ist, ist die 3NF trotzdem erfüllt. Die BCNF-Zerlegung in `ansprechpersonen (name, standort)` und `betreuung (mitglied_id, ansprechperson)` kostet etwas: Die Regel „eine Ansprechperson je Mitglied und Standort“ ist dann kein einfacher Unique-Constraint mehr. In der Praxis genügt meist die 3NF.
+
+  ## Eine Legacy-Tabelle zerlegen
+
+  Die Zerlegung der Buchungsliste folgt einem festen Muster: Zieltabellen mit Schlüsseln anlegen, dann von den unabhängigen Tabellen zu den abhängigen füllen, jeweils mit `INSERT … SELECT` ([PostgreSQL · INSERT](https://www.postgresql.org/docs/current/sql-insert.html)). `SELECT DISTINCT` liefert jede Kombination einmal; dabei gelten `NULL`-Werte als gleich ([PostgreSQL · DISTINCT](https://www.postgresql.org/docs/current/queries-select-lists.html#QUERIES-DISTINCT)). Zum Schluss beweist eine Probe, dass die Zerlegung **verlustfrei** ist: Der Join aller Teile liefert die alte Liste zurück.
+
+  ```postgres run
+  CREATE TABLE buchungsliste (
+    zeile int PRIMARY KEY, beginn timestamptz NOT NULL, ende timestamptz NOT NULL,
+    standort text NOT NULL, standort_adresse text NOT NULL, raum text NOT NULL, preis_pro_stunde numeric(8,2) NOT NULL,
+    mitglied_email text NOT NULL, mitglied_name text NOT NULL, tarif text NOT NULL
+  );
+  INSERT INTO buchungsliste VALUES
+    (1, '2026-03-02 09:00', '2026-03-02 11:00', 'Zentrum',     'Markt 10',                  'Loft',    24.00, 'lena.brandt@example.org',  'Lena Brandt',  'fix'),
+    (2, '2026-03-02 14:00', '2026-03-02 15:00', 'Zentrum',     'Markt 10',                  'Box 1',    6.00, 'jonas.albers@example.org', 'Jonas Albers', 'flex'),
+    (3, '2026-03-03 10:00', '2026-03-03 12:00', 'Plagwitz',    'Karl-Heine-Straße 93',      'Atelier', 18.00, 'lena.brandt@example.org',  'Lena Brandt',  'fix'),
+    (4, '2026-03-04 10:00', '2026-03-04 12:00', 'Zentrum',     'Markt 10',                  'Loft',    24.00, 'mara.voss@example.org',    'Mara Voss',    'team'),
+    (5, '2026-03-05 08:00', '2026-03-05 09:00', 'Südvorstadt', 'Karl-Liebknecht-Straße 50', 'Box 2',    6.00, 'jonas.albers@example.org', 'Jonas Albers', 'flex'),
+    (6, '2026-04-07 10:00', '2026-04-07 12:00', 'Zentrum',     'Markt 10',                  'Loft',    26.00, 'lena.brandt@example.org',  'Lena Brandt',  'fix');
+
+  CREATE TABLE standorte (
+    id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name text NOT NULL UNIQUE, adresse text NOT NULL
+  );
+  CREATE TABLE raeume (
+    id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, standort_id int NOT NULL REFERENCES standorte (id),
+    name text NOT NULL, preis_pro_stunde numeric(8,2) NOT NULL, UNIQUE (standort_id, name)
+  );
+  CREATE TABLE mitglieder (
+    id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, email text NOT NULL UNIQUE, name text NOT NULL, tarif text NOT NULL
+  );
+  CREATE TABLE buchungen (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    raum_id int NOT NULL REFERENCES raeume (id), mitglied_id int NOT NULL REFERENCES mitglieder (id),
+    beginn timestamptz NOT NULL, ende timestamptz NOT NULL,
+    preis_pro_stunde numeric(8,2) NOT NULL   -- Preis zum Buchungszeitpunkt
+  );
+
+  INSERT INTO standorte (name, adresse)
+  SELECT DISTINCT standort, standort_adresse FROM buchungsliste;
+
+  INSERT INTO raeume (standort_id, name, preis_pro_stunde)   -- aktueller Preis = Preis der jüngsten Buchung
+  SELECT DISTINCT ON (s.id, l.raum) s.id, l.raum, l.preis_pro_stunde
+  FROM buchungsliste AS l
+  JOIN standorte AS s ON s.name = l.standort
+  ORDER BY s.id, l.raum, l.beginn DESC;
+
+  INSERT INTO mitglieder (email, name, tarif)
+  SELECT DISTINCT mitglied_email, mitglied_name, tarif FROM buchungsliste;
+
+  INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, preis_pro_stunde)
+  SELECT r.id, m.id, l.beginn, l.ende, l.preis_pro_stunde
+  FROM buchungsliste AS l
+  JOIN standorte  AS s ON s.name = l.standort
+  JOIN raeume     AS r ON r.standort_id = s.id AND r.name = l.raum
+  JOIN mitglieder AS m ON m.email = l.mitglied_email;
+
+  -- Probe: Der Join über alle Tabellen muss die Liste exakt wiederherstellen
+  SELECT count(*) AS abweichungen
+  FROM (
+    SELECT beginn, ende, standort, standort_adresse, raum, preis_pro_stunde, mitglied_email, mitglied_name, tarif
+    FROM buchungsliste
+    EXCEPT
+    SELECT b.beginn, b.ende, s.name, s.adresse, r.name, b.preis_pro_stunde, m.email, m.name, m.tarif
+    FROM buchungen AS b
+    JOIN raeume     AS r ON r.id = b.raum_id
+    JOIN standorte  AS s ON s.id = r.standort_id
+    JOIN mitglieder AS m ON m.id = b.mitglied_id
+  ) AS rest;
+  SELECT count(*) AS buchungen FROM buchungen;
+  ```
+
+  Drei Stellen sind wichtig. Erstens die Reihenfolge: Standorte vor Räumen, Räume und Mitglieder vor Buchungen, sonst fehlen die Ziele der Fremdschlüssel. Zweitens der Raumpreis: Weil der Loft zwei Preise hat, würde `SELECT DISTINCT` zwei Loft-Zeilen liefern und an `UNIQUE (standort_id, name)` scheitern. `DISTINCT ON` (siehe [Abfragen](/postgres/abfragen)) nimmt je Raum die jüngste Buchung. Drittens die Constraints der Zieltabellen: Hätte Lena in einer Zeile einen anderen Namen, liefe `INSERT INTO mitglieder … SELECT DISTINCT` auf `unique_violation` bei `email`. Der Fehler ist erwünscht, er findet schmutzige Daten. Prüfe die Abhängigkeiten deshalb vorher und entscheide fachlich, welcher Wert gilt.
+
+  > [!PRAXIS] Zerlegen in einer Migration
+  > Deskwerk hat die Zerlegung als eine Migration in einer Transaktion ausgeführt: anlegen, füllen, Probe. Nur bei 0 Abweichungen wurde die alte Tabelle umbenannt, nicht gelöscht; als `buchungsliste_alt` blieb sie liegen, bis die Buchhaltung zwei Monatsabschlüsse abgestimmt hatte. Wie man so etwas bei großen Tabellen ohne Ausfall macht, zeigt [Migrationen](/postgres/migrationen).
+
+  ## Bewusst denormalisieren
+
+  Nicht jede Wiederholung ist ein Fehler. Drei Formen von Redundanz sind in Anwendungen üblich und richtig, wenn man sie bewusst wählt.
+
+  **Snapshot statt Verweis.** Der Preis einer Buchung ist der Preis, der beim Buchen galt – mit Rabatten, Aktionen und dem Stundenpreis von damals. Er hängt an der Buchung und gehört in `buchungen`, auch wenn `raeume` einen aktuellen Preis hat. Das ist kein Verstoß gegen die 3NF, sondern eine andere Tatsache:
+
+  ```postgres run
+  CREATE TABLE raeume (id int PRIMARY KEY, name text NOT NULL, preis_pro_stunde numeric(8,2) NOT NULL);
+  CREATE TABLE buchungen (
+    id      int PRIMARY KEY,
+    raum_id int NOT NULL REFERENCES raeume (id),
+    beginn  timestamptz NOT NULL,
+    ende    timestamptz NOT NULL,
+    preis   numeric(8,2) NOT NULL   -- Snapshot: Preis zum Buchungszeitpunkt
+  );
+  INSERT INTO raeume VALUES (1, 'Loft', 24.00), (2, 'Box 1', 6.00);
+  INSERT INTO buchungen VALUES
+    (1, 1, '2026-03-02 09:00', '2026-03-02 11:00', 48.00),
+    (2, 2, '2026-03-02 14:00', '2026-03-02 15:00',  6.00),
+    (3, 1, '2026-03-04 10:00', '2026-03-04 12:00', 48.00);
+
+  -- Zum 1. April wird der Loft teurer
+  UPDATE raeume SET preis_pro_stunde = 26.00 WHERE id = 1;
+
+  SELECT sum(b.preis) AS maerz_laut_buchung,
+         round(sum(r.preis_pro_stunde * extract(epoch FROM b.ende - b.beginn) / 3600), 2) AS maerz_mit_heutigem_preis
+  FROM buchungen AS b
+  JOIN raeume AS r ON r.id = b.raum_id
+  WHERE b.beginn >= '2026-03-01' AND b.beginn < '2026-04-01';
+  ```
+
+  Ohne Snapshot stiege der Märzumsatz rückwirkend von 102 auf 110 Euro, und die Rechnungen passten nicht mehr zur Auswertung. Dasselbe gilt für Rechnungsadressen.
+
+  **Zählerspalten.** Eine Spalte `mitglieder.anzahl_buchungen` spart einen `count(*)` in jeder Profilansicht. Sie ist echte Redundanz: Jede Buchung muss sie in derselben Transaktion mitpflegen, atomar mit `SET anzahl_buchungen = anzahl_buchungen + 1` (siehe [Isolation und Sperren](/postgres/isolation-sperren)), sonst driftet sie. Das lohnt erst, wenn `count(*)` nachweislich teuer ist.
+
+  **Materialisierte Sichten.** Für Berichte rechnet eine **Materialized View** eine Abfrage einmal aus und speichert das Ergebnis ([PostgreSQL · Materialized Views](https://www.postgresql.org/docs/current/rules-materializedviews.html)). Die Daten sind dann so alt wie der letzte `REFRESH`. `REFRESH … CONCURRENTLY` lässt Leser währenddessen weiterlesen und verlangt einen Unique-Index auf Spalten der Sicht ([PostgreSQL · REFRESH MATERIALIZED VIEW](https://www.postgresql.org/docs/current/sql-refreshmaterializedview.html)):
+
+  ```postgres run
+  CREATE TABLE buchungen (
+    id int PRIMARY KEY, raum_id int NOT NULL, beginn timestamptz NOT NULL,
+    preis numeric(8,2) NOT NULL, status text NOT NULL DEFAULT 'bestaetigt'
+  );
+  INSERT INTO buchungen VALUES
+    (1, 1, '2026-03-02 09:00', 48.00, 'bestaetigt'), (2, 2, '2026-03-02 14:00', 6.00, 'bestaetigt'),
+    (3, 1, '2026-03-04 10:00', 48.00, 'storniert'),  (4, 1, '2026-04-07 10:00', 52.00, 'bestaetigt');
+
+  CREATE MATERIALIZED VIEW umsatz_je_raum_und_monat AS
+  SELECT raum_id, date_trunc('month', beginn)::date AS monat, count(*) AS buchungen, sum(preis) AS umsatz
+  FROM buchungen
+  WHERE status = 'bestaetigt'
+  GROUP BY raum_id, date_trunc('month', beginn)::date;
+  CREATE UNIQUE INDEX ON umsatz_je_raum_und_monat (raum_id, monat);
+
+  INSERT INTO buchungen VALUES (5, 1, '2026-03-20 10:00', 48.00, 'bestaetigt');
+  SELECT * FROM umsatz_je_raum_und_monat ORDER BY raum_id, monat;   -- noch ohne Buchung 5
+
+  REFRESH MATERIALIZED VIEW CONCURRENTLY umsatz_je_raum_und_monat;
+  SELECT * FROM umsatz_je_raum_und_monat ORDER BY raum_id, monat;
+  ```
+
+  Das Schema der App ist ein **OLTP**-Schema (Online Transaction Processing): viele kleine Schreibvorgänge, jede Tatsache einmal, Integrität durch Constraints. Für Auswertungen baut man dagegen oft ein **Sternschema** aus Fakten- und Dimensionstabellen, in dem Dimensionen absichtlich denormalisiert sind, damit Berichte mit wenigen Joins auskommen ([Saubere Tabellen und Datenmodelle](/data/tabellenmodelle)). Das ist **OLAP** (Online Analytical Processing), meist in einem eigenen Data Warehouse, das aus dem normalisierten Schema befüllt wird. Ein Sternschema als App-Schema brächte die Anomalien vom Anfang zurück.
+
+  > [!INTERVIEW] „Normalisieren oder denormalisieren?“
+  > Im Schema der Anwendung normalisiere ich bis zur dritten Normalform: Jede Tatsache steht an einer Stelle, Constraints schützen sie. Denormalisiert wird bewusst und begründet: Snapshot-Werte wie der Preis zum Buchungszeitpunkt, weil sie eine eigene Tatsache sind; Zählerspalten oder materialisierte Sichten erst, wenn eine Messung zeigt, dass die normalisierte Abfrage zu teuer ist – und dann mit klarer Regel, wer die Kopie aktualisiert. Für Analysen nutze ich ein Sternschema in einem eigenen Modell.
+
+  ## Häufige Fehler
+
+  - **Kommagetrennte Listen in einer Spalte.** `LIKE '%Beamer%'` findet auch die Halterung, Fremdschlüssel sind unmöglich. Eigene Tabelle mit einer Zeile je Element.
+  - **Zerlegen ohne Probe.** Ein `INNER JOIN` auf eine falsche Spalte verliert Buchungen ohne Fehlermeldung. Den Join aller Teile mit `EXCEPT` gegen das Original prüfen und Zeilen zählen.
+  - **`SELECT DISTINCT` über unsaubere Werte.** `'Zentrum'`, `'Zentrum '` und `'zentrum'` werden drei Standorte. Vorher mit `trim` und `lower` vereinheitlichen und Duplikate fachlich klären.
+  - **Snapshot für Redundanz halten.** Wer `buchungen.preis` „normalisiert“ entfernt, ändert rückwirkend Umsätze und Rechnungen.
+
+  ## Zusammenfassung
+
+  - Redundanz verursacht Änderungs-, Einfüge- und Löschanomalien. Normalisierung speichert jede Tatsache an genau einer Stelle.
+  - Eine funktionale Abhängigkeit `X → Y` heißt: gleiches X, gleiches Y. Prüfen mit `GROUP BY x HAVING count(DISTINCT y) > 1`.
+  - 1NF: atomare Werte, keine Listen in Zellen. Arrays und JSONB sind eine bewusste Ausnahme für Werte, die als Ganzes gelesen und geschrieben werden.
+  - 2NF: nichts hängt von einem Teil des Schlüssels ab. 3NF: nichts hängt von einer Nicht-Schlüsselspalte ab. BCNF: jede bestimmende Spaltenmenge enthält einen Schlüssel.
+  - Zerlegen: Zieltabellen mit Constraints anlegen, von unabhängig nach abhängig mit `INSERT … SELECT DISTINCT` füllen, mit Join und `EXCEPT` die Verlustfreiheit beweisen.
+  - Snapshot-Werte wie der Preis zum Buchungszeitpunkt sind eigene Tatsachen, keine Redundanz.
+  - Zählerspalten und materialisierte Sichten sind bewusste Redundanz mit klarer Pflegeregel. Für Analysen gibt es das Sternschema in einem eigenen Modell.
+exercises:
+  - id: anomalien-erkennen
+    type: choice
+    title: Was an der Liste schiefgeht
+    prompt: |
+      Deskwerk speichert Buchungen noch in einer Tabelle `buchungsliste (zeile, beginn, ende, standort, standort_adresse, raum, preis_pro_stunde, mitglied_email, mitglied_name, tarif)` mit Primärschlüssel `zeile`. Welche Aussagen stimmen? Mehrere Antworten richtig.
+    options:
+      - text: Ändert Jonas Albers seinen Tarif, muss jede seiner Zeilen geändert werden. Vergisst ein Skript eine, hat er zwei Tarife gleichzeitig – eine Änderungsanomalie.
+        correct: true
+        why: Der Tarif hängt an der E-Mail, nicht an der Buchung, und steht deshalb so oft da, wie Jonas gebucht hat.
+      - text: Einen neuen Raum kann man erst eintragen, wenn ihn jemand bucht – eine Einfügeanomalie.
+        correct: true
+        why: Raumdaten existieren nur als Teil einer Buchungszeile. Ohne Buchung fehlen die Pflichtwerte `beginn`, `ende` und die Mitgliedsspalten.
+      - text: Wird die einzige Buchung eines Standorts gelöscht, ist auch seine Adresse weg – eine Löschanomalie.
+        correct: true
+        why: Die Adresse hat keine eigene Zeile. Mit der letzten Buchung verschwindet die letzte Kopie.
+      - text: Die Anomalien verschwinden, weil `zeile` als Primärschlüssel jede Zeile eindeutig macht.
+        correct: false
+        why: Ein Schlüssel verhindert doppelte Zeilen, keine doppelten Tatsachen. Die Adresse steht weiter in jeder Buchung des Standorts.
+      - text: Die Liste verletzt die erste Normalform, weil Name und E-Mail in getrennten Spalten stehen.
+        correct: false
+        why: Getrennte Spalten mit je einem Wert sind gerade das, was die 1NF verlangt. Die Probleme der Liste sind Abhängigkeiten, die nicht vom Schlüssel ausgehen.
+    explanation: |
+      Alle drei Anomalien haben dieselbe Ursache: Die Tabelle speichert Tatsachen über Standorte, Räume und Mitglieder in jeder Buchungszeile. Ändern heißt dann viele Zeilen ändern, Einfügen braucht eine erfundene Buchung, Löschen nimmt fremde Tatsachen mit. Ein Primärschlüssel allein ändert daran nichts; erst die Zerlegung in `standorte`, `raeume`, `mitglieder` und `buchungen` gibt jeder Tatsache genau eine Zeile.
+    resources:
+      - title: PostgreSQL · Foreign Keys
+        url: https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-FK
+
+  - id: welche-normalform
+    type: choice
+    title: Welche Regel ist verletzt?
+    prompt: |
+      Welche Normalform verletzt diese Tabelle zuerst? Fachlich gilt: Jeder Tarif hat genau einen Monatspreis.
+    lang: postgres
+    code: |
+      CREATE TABLE mitglieder (
+        id                int PRIMARY KEY,
+        email             text NOT NULL UNIQUE,
+        name              text NOT NULL,
+        tarif             text NOT NULL,
+        tarif_monatspreis numeric(8,2) NOT NULL
+      );
+    options:
+      - text: Die erste Normalform, weil `tarif` und `tarif_monatspreis` zusammengehören.
+        correct: false
+        why: Jede Zelle enthält genau einen Wert. Zusammengehörende Spalten verletzen die 1NF nicht.
+      - text: Die zweite Normalform, weil der Monatspreis nur von einem Teil des Schlüssels abhängt.
+        correct: false
+        why: Der Primärschlüssel `id` hat nur eine Spalte. Eine Abhängigkeit von einem Teil davon gibt es nicht; auch `email` als zweiter Schlüssel ist einspaltig.
+      - text: Die dritte Normalform, weil `tarif_monatspreis` über `tarif` vom Schlüssel abhängt.
+        correct: true
+        why: "`id → tarif → tarif_monatspreis` ist eine transitive Abhängigkeit. Der Preis gehört in eine Tabelle `tarife`."
+      - text: Keine – jede Spalte hängt vom Schlüssel `id` ab.
+        correct: false
+        why: Sie hängt ab, aber nicht nur von ihm. Bei 300 Flex-Mitgliedern steht der Flex-Preis 300-mal da, und eine Preisänderung muss alle Zeilen treffen.
+    explanation: |
+      Die Tabelle ist in 1NF (atomare Werte) und in 2NF (kein zusammengesetzter Schlüssel). Sie verletzt die 3NF: Der Monatspreis wird nicht vom Mitglied bestimmt, sondern von seinem Tarif, einer Nicht-Schlüsselspalte. Die Folge ist dieselbe Redundanz wie in der Buchungsliste. Zerlegt wird in `tarife (name, monatspreis)` und `mitglieder (…, tarif REFERENCES tarife (name))`.
+
+  - id: zerlegung-ordnen
+    type: order
+    title: In welcher Reihenfolge zerlegen?
+    prompt: |
+      Diese Anweisungen zerlegen `buchungsliste` in Standorte, Räume und Buchungen und entfernen danach die alte Tabelle. Bring sie in eine Reihenfolge, die ohne Fehler durchläuft und alle Zeilen der Liste in `buchungen` übernimmt.
+    lang: postgres
+    lines: |
+      CREATE TABLE standorte (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name text NOT NULL UNIQUE);
+      INSERT INTO standorte (name) SELECT DISTINCT standort FROM buchungsliste;
+      CREATE TABLE raeume (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, standort_id int NOT NULL REFERENCES standorte (id), name text NOT NULL);
+      INSERT INTO raeume (standort_id, name) SELECT DISTINCT s.id, l.raum FROM buchungsliste AS l JOIN standorte AS s ON s.name = l.standort;
+      CREATE TABLE buchungen (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, raum_id int NOT NULL REFERENCES raeume (id), beginn timestamptz NOT NULL);
+      INSERT INTO buchungen (raum_id, beginn) SELECT r.id, l.beginn FROM buchungsliste AS l JOIN standorte AS s ON s.name = l.standort JOIN raeume AS r ON r.standort_id = s.id AND r.name = l.raum;
+      DROP TABLE buchungsliste;
+    alternatives:
+      - [1, 2, 3, 5, 4, 6, 7]
+      - [1, 3, 2, 4, 5, 6, 7]
+      - [1, 3, 2, 5, 4, 6, 7]
+      - [1, 3, 5, 2, 4, 6, 7]
+    hints:
+      - Eine Tabelle mit Fremdschlüssel lässt sich erst anlegen, wenn die Zieltabelle existiert.
+      - "`INSERT INTO raeume` liest `standorte` und findet nur Standorte, die schon eingefügt sind."
+    explanation: |
+      Die Abhängigkeiten bestimmen die Reihenfolge: `raeume` verweist auf `standorte`, `buchungen` auf `raeume`. Jede Tabelle muss vor der Tabelle angelegt sein, die auf sie verweist, und gefüllt sein, bevor eine abhängige Tabelle ihre IDs per Join nachschlägt. Wann eine Tabelle angelegt wird, ist sonst frei, deshalb gibt es mehrere gültige Reihenfolgen. `DROP TABLE` kommt zuletzt – in der Praxis erst nach einer Probe, dass der Join aller Teile die Liste wiederherstellt.
+    resources:
+      - title: PostgreSQL · INSERT
+        url: https://www.postgresql.org/docs/current/sql-insert.html
+
+  - id: abhaengigkeit-pruefen
+    type: output
+    title: Gilt E-Mail → Name?
+    prompt: |
+      Was gibt das Skript aus? Ausgabe wie `psql -At`: Werte durch `|` getrennt, `NULL` leer, `t`/`f`.
+    lang: postgres
+    code: |
+      CREATE TABLE liste (email text NOT NULL, name text, tarif text);
+      INSERT INTO liste VALUES
+        ('lena.brandt@example.org',  'Lena Brandt',  'fix'),
+        ('lena.brandt@example.org',  'Lena Brandt ', 'fix'),
+        ('jonas.albers@example.org', 'Jonas Albers', 'flex'),
+        ('jonas.albers@example.org', NULL,           'flex'),
+        ('jonas.albers@example.org', 'Jonas Albers', 'fix'),
+        ('mara.voss@example.org',    'Mara Voss',    'team');
+
+      SELECT email, count(*), count(DISTINCT name), count(DISTINCT tarif)
+      FROM liste
+      GROUP BY email
+      ORDER BY email;
+
+      SELECT count(*)
+      FROM (
+        SELECT email FROM liste GROUP BY email HAVING count(DISTINCT name) > 1
+      ) AS verstoesse;
+    expected: |
+      jonas.albers@example.org|3|1|2
+      lena.brandt@example.org|2|2|1
+      mara.voss@example.org|1|1|1
+      1
+    hints:
+      - Was zählt `count(DISTINCT name)`, wenn ein Name `NULL` ist?
+      - Sind `'Lena Brandt'` und `'Lena Brandt '` gleich?
+    explanation: |
+      `count(DISTINCT …)` zählt verschiedene Werte und lässt `NULL` weg. Für Jonas zählt nur „Jonas Albers“, also 1 Name; seine Tarife `flex` und `fix` ergeben 2 – `email → tarif` ist verletzt. Für Lena sind `'Lena Brandt'` und `'Lena Brandt '` mit Leerzeichen zwei verschiedene Texte, also 2 Namen. Die zweite Abfrage meldet deshalb genau einen Verstoß gegen `email → name`: Lenas Leerzeichen. Jonas' fehlender Name fällt dabei nicht auf. Vor einer Zerlegung bereinigst du solche Werte mit `trim` und entscheidest über `NULL`.
+    resources:
+      - title: PostgreSQL · Aggregate Functions
+        url: https://www.postgresql.org/docs/current/functions-aggregate.html#FUNCTIONS-AGGREGATE-TABLE
+
+  - id: distinct-mit-tuecken
+    type: output
+    title: Wie viele Standorte?
+    prompt: |
+      Ein Import soll später die Tabelle `standorte` füllen. Was gibt das Skript aus? Ausgabe wie `psql -At`: Werte durch `|` getrennt, `NULL` leer.
+    lang: postgres
+    code: |
+      CREATE TABLE import (standort text, adresse text, raum text);
+      INSERT INTO import VALUES
+        ('Zentrum',     'Markt 10',             'Loft'),
+        ('Zentrum',     'Markt 10',             'Loft'),
+        ('Zentrum',     'Markt 10 ',            'Box 1'),
+        ('Plagwitz',    'Karl-Heine-Straße 93', 'Atelier'),
+        ('plagwitz',    'Karl-Heine-Straße 93', 'Werkstatt'),
+        ('Südvorstadt', NULL,                   'Box 2'),
+        ('Südvorstadt', NULL,                   'Box 3');
+
+      SELECT count(*) FROM (SELECT DISTINCT standort, adresse FROM import) AS s;
+      SELECT count(DISTINCT standort), count(DISTINCT adresse) FROM import;
+      SELECT count(DISTINCT lower(trim(standort))) FROM import;
+    expected: |
+      5
+      4|3
+      3
+    hints:
+      - "`SELECT DISTINCT` und `count(DISTINCT …)` behandeln `NULL` verschieden."
+      - Groß- und Kleinschreibung sowie Leerzeichen am Ende zählen beim Vergleich mit.
+    explanation: |
+      `SELECT DISTINCT standort, adresse` liefert fünf Kombinationen: Zentrum mit `'Markt 10'` und mit `'Markt 10 '`, `Plagwitz` und `plagwitz`, und Südvorstadt mit `NULL` – einmal, denn `DISTINCT` hält zwei `NULL`-Werte für gleich. `count(DISTINCT adresse)` lässt `NULL` dagegen weg und zählt drei Adressen; `count(DISTINCT standort)` zählt vier Schreibweisen. Erst `lower(trim(standort))` bringt die drei echten Standorte zusammen. Ein `INSERT … SELECT DISTINCT` aus diesem Import würde also fünf Standorte anlegen – oder an einem Unique-Constraint auf `name` scheitern.
+    resources:
+      - title: PostgreSQL · DISTINCT
+        url: https://www.postgresql.org/docs/current/queries-select-lists.html#QUERIES-DISTINCT
+
+  - id: snapshot-oder-join
+    type: output
+    title: Was hat der Loft eingebracht?
+    prompt: |
+      Was gibt das Skript aus? Ausgabe wie `psql -At`: Werte durch `|` getrennt, `numeric(8,2)` mit zwei Nachkommastellen.
+    lang: postgres
+    code: |
+      CREATE TABLE raeume (id int PRIMARY KEY, name text NOT NULL, preis_pro_stunde numeric(8,2) NOT NULL);
+      CREATE TABLE buchungen (
+        id      int PRIMARY KEY,
+        raum_id int NOT NULL REFERENCES raeume (id),
+        stunden int NOT NULL,
+        preis   numeric(8,2) NOT NULL
+      );
+      INSERT INTO raeume VALUES (1, 'Loft', 24.00), (2, 'Atelier', 18.00);
+      INSERT INTO buchungen VALUES (1, 1, 2, 48.00), (2, 2, 3, 54.00), (3, 1, 1, 20.00);
+
+      UPDATE raeume SET preis_pro_stunde = 30.00 WHERE name = 'Loft';
+      INSERT INTO buchungen VALUES (4, 1, 1, 30.00);
+
+      SELECT sum(b.preis), sum(b.stunden * r.preis_pro_stunde)
+      FROM buchungen AS b
+      JOIN raeume AS r ON r.id = b.raum_id;
+
+      SELECT r.name, count(*), sum(b.preis)
+      FROM buchungen AS b
+      JOIN raeume AS r ON r.id = b.raum_id
+      GROUP BY r.name
+      ORDER BY r.name;
+    expected: |
+      152.00|174.00
+      Atelier|1|54.00
+      Loft|3|98.00
+    hints:
+      - "`buchungen.preis` ändert sich durch das `UPDATE` auf `raeume` nicht."
+      - Buchung 3 kostete weniger als den Listenpreis. Was rechnet die zweite Spalte für sie?
+    explanation: |
+      Die Snapshot-Summe addiert die gespeicherten Preise: 48 + 54 + 20 + 30 = 152. Die zweite Spalte rechnet jede Buchung mit dem **heutigen** Stundenpreis nach: 2 × 30 + 3 × 18 + 1 × 30 + 1 × 30 = 174. Sie verliert den Rabatt von Buchung 3 und schreibt die alten Loft-Buchungen zum neuen Preis um. Je Raum: Der Loft hat drei Buchungen mit 48 + 20 + 30 = 98. Genau deshalb gehört der Preis zum Buchungszeitpunkt in die Buchung.
+
+  - id: namen-je-email
+    type: sql
+    lang: postgres
+    title: Wer hat mehrere Namen?
+    prompt: |
+      Vor der Zerlegung der Buchungsliste willst du wissen, wo `mitglied_email → mitglied_name` verletzt ist. Liste jede E-Mail-Adresse, zu der es **mehr als einen verschiedenen Namen** gibt. Fehlende Namen (`NULL`) zählen nicht als eigener Name.
+
+      Spalten: `mitglied_email`, `namen` (die verschiedenen Namen, alphabetisch sortiert, getrennt durch ` / `, also Leerzeichen, Schrägstrich, Leerzeichen) und `zeilen` (Zahl aller Zeilen dieser E-Mail). Sortierung: `mitglied_email` aufsteigend.
+    schema: |
+      CREATE TABLE buchungsliste (
+        zeile          int PRIMARY KEY,
+        beginn         timestamptz NOT NULL,
+        raum           text NOT NULL,
+        mitglied_email text NOT NULL,
+        mitglied_name  text,
+        tarif          text NOT NULL
+      );
+      INSERT INTO buchungsliste VALUES
+        (1,  '2026-03-02 09:00', 'Loft',    'lena.brandt@example.org',  'Lena Brandt',   'fix'),
+        (2,  '2026-03-02 14:00', 'Box 1',   'jonas.albers@example.org', 'Jonas Albers',  'flex'),
+        (3,  '2026-03-03 10:00', 'Atelier', 'lena.brandt@example.org',  'Lena Brandt',   'fix'),
+        (4,  '2026-03-04 10:00', 'Loft',    'tom.okafor@example.org',   'Tom Okafor',    'team'),
+        (5,  '2026-03-05 08:00', 'Box 2',   'jonas.albers@example.org', NULL,            'flex'),
+        (6,  '2026-03-09 13:00', 'Atelier', 'tom.okafor@example.org',   'Thomas Okafor', 'team'),
+        (7,  '2026-03-11 09:00', 'Loft',    'lena.brandt@example.org',  'Lena Okafor',   'fix'),
+        (8,  '2026-03-12 15:00', 'Box 1',   'mara.voss@example.org',    'Mara Voss',     'flex'),
+        (9,  '2026-03-16 10:00', 'Loft',    'tom.okafor@example.org',   'Tom Okafor',    'team'),
+        (10, '2026-03-18 11:00', 'Box 2',   'mara.voss@example.org',    'Mara Voß',      'flex'),
+        (11, '2026-03-20 09:00', 'Box 1',   'tom.okafor@example.org',   NULL,            'team');
+    starter: |
+      SELECT mitglied_email, mitglied_name
+      FROM buchungsliste
+      ORDER BY mitglied_email;
+    solution: |
+      SELECT mitglied_email,
+             string_agg(DISTINCT mitglied_name, ' / ' ORDER BY mitglied_name) AS namen,
+             count(*) AS zeilen
+      FROM buchungsliste
+      GROUP BY mitglied_email
+      HAVING count(DISTINCT mitglied_name) > 1
+      ORDER BY mitglied_email;
+    ordered: true
+    hints:
+      - Gruppiere nach `mitglied_email` und zähle verschiedene Namen. Welche Klausel filtert Gruppen?
+      - "`count(DISTINCT mitglied_name)` lässt `NULL` weg. `count(*)` zählt alle Zeilen."
+      - "`string_agg(DISTINCT mitglied_name, ' / ' ORDER BY mitglied_name)` – bei `DISTINCT` muss das `ORDER BY` im Aggregat denselben Ausdruck sortieren."
+    explanation: |
+      Das Prüfmuster für eine Abhängigkeit `X → Y` ist `GROUP BY x HAVING count(DISTINCT y) > 1`. Jonas Albers erscheint nicht: Seine zweite Zeile hat keinen Namen, und `count(DISTINCT …)` ignoriert `NULL`. Übrig bleiben drei Verstöße mit verschiedenen Ursachen – eine Namensänderung (Lena), eine Kurzform (Tom/Thomas) und eine Schreibweise mit ß (Mara). Welcher Name gilt, entscheidet die Fachabteilung, nicht SQL. Ergebnis: Lena 3 Zeilen, Mara 2, Tom 4 – Toms Zeile ohne Namen zählt `count(*)` mit, `count(mitglied_name)` nicht.
+    resources:
+      - title: PostgreSQL · Aggregate Functions
+        url: https://www.postgresql.org/docs/current/functions-aggregate.html#FUNCTIONS-AGGREGATE-TABLE
+
+  - id: ausstattung-aufteilen
+    type: sql
+    lang: postgres
+    title: Eine Zeile je Ausstattung
+    prompt: |
+      `raeume_alt.ausstattung` enthält kommagetrennte Listen. Für die neue Tabelle `raum_ausstattung` brauchst du je Raum und Ausstattungsteil eine Zeile. Entferne Leerzeichen am Anfang und Ende jedes Teils. Leere Teile (etwa nach einem Komma am Ende) und Räume ohne Ausstattung erscheinen nicht.
+
+      Spalten: `raum_id` und `ausstattung`. Sortierung: `raum_id`, dann `ausstattung` aufsteigend.
+    schema: |
+      CREATE TABLE raeume_alt (
+        id          int PRIMARY KEY,
+        name        text NOT NULL,
+        ausstattung text
+      );
+      INSERT INTO raeume_alt VALUES
+        (1, 'Loft',      'Beamer, Whiteboard, Flipchart'),
+        (2, 'Atelier',   'Whiteboard,Flipchart'),
+        (3, 'Box 1',     NULL),
+        (4, 'Werkstatt', 'Beamer,  Werkbank,'),
+        (5, 'Box 2',     ''),
+        (6, 'Lounge',    'Sofa');
+    starter: |
+      SELECT id AS raum_id, ausstattung
+      FROM raeume_alt
+      ORDER BY raum_id;
+    solution: |
+      SELECT r.id AS raum_id, trim(teil) AS ausstattung
+      FROM raeume_alt AS r
+      CROSS JOIN LATERAL string_to_table(r.ausstattung, ',') AS teil
+      WHERE trim(teil) <> ''
+      ORDER BY raum_id, ausstattung;
+    ordered: true
+    hints:
+      - Eine Funktion, die einen Text an einem Trennzeichen in mehrere Zeilen zerlegt, steht im `FROM` neben der Tabelle.
+      - "`FROM raeume_alt AS r, string_to_table(r.ausstattung, ',') AS teil` – oder `unnest(string_to_array(…))`."
+      - "`trim(teil)` gegen die Leerzeichen, `WHERE trim(teil) <> ''` gegen leere Teile."
+    explanation: |
+      `string_to_table(text, ',')` liefert für jeden Teil eine Zeile; im `FROM` neben der Tabelle läuft es je Raum (implizit `LATERAL`). Für `NULL` und den leeren Text liefert es keine Zeile, deshalb fallen Box 1 und Box 2 weg. Das Komma am Ende der Werkstatt erzeugt einen leeren Teil, den das `WHERE` entfernt; `trim` macht aus `'  Werkbank'` den sauberen Wert. Die Abfrage ist zugleich der Kern der Migration: `INSERT INTO raum_ausstattung (raum_id, ausstattung) SELECT …`.
+    resources:
+      - title: PostgreSQL · string_to_table und andere String-Funktionen
+        url: https://www.postgresql.org/docs/current/functions-string.html#FUNCTIONS-STRING-OTHER
+      - title: PostgreSQL · Searching in Arrays
+        url: https://www.postgresql.org/docs/current/arrays.html#ARRAYS-SEARCHING
+
+  - id: standort-auslagern
+    type: gap
+    title: Standorte in eine eigene Tabelle
+    prompt: |
+      `raeume` enthält bisher `standort` und `standort_adresse` als Text. Ergänze die Migration, die die Standorte in eine eigene Tabelle auslagert, jeden Raum per Fremdschlüssel verknüpft und die alten Spalten entfernt.
+    lang: postgres
+    code: |
+      CREATE TABLE standorte (
+        id      int GENERATED ALWAYS AS IDENTITY ⟦PRIMARY KEY⟧,
+        name    text NOT NULL UNIQUE,
+        adresse text NOT NULL
+      );
+      INSERT INTO standorte (name, adresse)
+      SELECT ⟦DISTINCT⟧ standort, standort_adresse
+      FROM raeume;
+
+      ALTER TABLE raeume ADD COLUMN standort_id int REFERENCES standorte (id);
+      UPDATE raeume AS r
+      SET standort_id = s.id
+      ⟦FROM standorte AS s⟧
+      WHERE s.name = r.standort;
+
+      ALTER TABLE raeume ALTER COLUMN standort_id ⟦SET NOT NULL⟧;
+      ALTER TABLE raeume DROP COLUMN standort, DROP COLUMN standort_adresse;
+    gaps:
+      - label: Schlüssel
+        hint: Auf diese Spalte zeigt später der Fremdschlüssel.
+      - label: Jede Kombination einmal
+        hint: Mehrere Räume liegen am selben Standort.
+      - label: Zweite Tabelle im UPDATE
+        hint: PostgreSQL nennt im `UPDATE` weitere Tabellen in einer eigenen Klausel, mit Alias.
+        accept: ["FROM standorte s"]
+      - label: Pflicht machen
+        hint: Jetzt hat jeder Raum einen Standort, und das soll so bleiben.
+    explanation: |
+      Der Primärschlüssel macht `standorte.id` zum Ziel des Fremdschlüssels. `SELECT DISTINCT` liefert jeden Standort einmal; hätte ein Standort zwei Schreibweisen der Adresse, entstünden zwei Zeilen, und der Unique-Constraint auf `name` würde die Migration anhalten. `UPDATE … FROM` verbindet `raeume` mit `standorte` und trägt die neue ID ein. Erst danach lässt sich `standort_id` auf `NOT NULL` setzen – vorher wären alle Werte leer. Zum Schluss verschwinden die redundanten Textspalten.
+    resources:
+      - title: PostgreSQL · UPDATE mit FROM
+        url: https://www.postgresql.org/docs/current/sql-update.html
+      - title: PostgreSQL · ALTER TABLE
+        url: https://www.postgresql.org/docs/current/ddl-alter.html#DDL-ALTER-ADDING-A-CONSTRAINT
+
+  - id: tarife-auslagern
+    type: sql
+    lang: postgres
+    title: Der Monatspreis gehört zum Tarif
+    prompt: |
+      `mitglieder.tarif_monatspreis` hängt am Tarif, nicht am Mitglied (3NF-Verstoß). Lege eine Tabelle `tarife` mit den Spalten `name` (Primärschlüssel) und `monatspreis` (`numeric(8,2) NOT NULL`) an und fülle sie mit jedem vorkommenden Tarif. Für `flex` stehen zwei Preise in der Tabelle; gültig ist der höhere, 189,00. Mache `mitglieder.tarif` zu einem Fremdschlüssel auf `tarife (name)` und entferne `tarif_monatspreis`. Einen Tarif, den noch Mitglieder haben, darf man nicht löschen können.
+
+      Die Prüfabfrage zeigt den Inhalt von `tarife`, ob die alte Spalte noch existiert, die Zahl der Mitglieder und das Ergebnis dreier Versuche: ein neues Mitglied mit Tarif `'premium'`, eines mit `'team'` und das Löschen des Tarifs `'fix'` (`loeschen_verhindert` ist `t`, wenn der Fremdschlüssel das Löschen ablehnt).
+    schema: |
+      CREATE TABLE mitglieder (
+        id                int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        email             text NOT NULL UNIQUE,
+        name              text NOT NULL,
+        tarif             text NOT NULL,
+        tarif_monatspreis numeric(8,2) NOT NULL
+      );
+      INSERT INTO mitglieder (email, name, tarif, tarif_monatspreis) VALUES
+        ('lena.brandt@example.org',  'Lena Brandt',  'fix',  299.00),
+        ('jonas.albers@example.org', 'Jonas Albers', 'flex', 189.00),
+        ('mara.voss@example.org',    'Mara Voss',    'team', 499.00),
+        ('tom.okafor@example.org',   'Tom Okafor',   'flex', 179.00),
+        ('elif.yilmaz@example.org',  'Elif Yilmaz',  'flex', 189.00),
+        ('paul.richter@example.org', 'Paul Richter', 'fix',  299.00);
+    starter: |
+      CREATE TABLE tarife (
+        name        text PRIMARY KEY,
+        monatspreis numeric(8,2) NOT NULL
+      );
+      -- INSERT INTO tarife …
+    solution: |
+      CREATE TABLE tarife (
+        name        text PRIMARY KEY,
+        monatspreis numeric(8,2) NOT NULL
+      );
+      INSERT INTO tarife (name, monatspreis)
+      SELECT tarif, max(tarif_monatspreis)
+      FROM mitglieder
+      GROUP BY tarif;
+      ALTER TABLE mitglieder ADD FOREIGN KEY (tarif) REFERENCES tarife (name);
+      ALTER TABLE mitglieder DROP COLUMN tarif_monatspreis;
+    check: |
+      SELECT (SELECT string_agg(name || ' ' || monatspreis, ', ' ORDER BY name) FROM tarife) AS tarife,
+             (SELECT count(*) FROM information_schema.columns
+              WHERE table_name = 'mitglieder' AND column_name = 'tarif_monatspreis') AS alte_spalte,
+             (SELECT count(*) FROM mitglieder) AS mitglieder,
+             lp.versuch($$INSERT INTO mitglieder (email, name, tarif) VALUES ('nina.neumann@example.org', 'Nina Neumann', 'premium')$$) AS unbekannter_tarif,
+             lp.versuch($$INSERT INTO mitglieder (email, name, tarif) VALUES ('nina.neumann@example.org', 'Nina Neumann', 'team')$$) AS bekannter_tarif,
+             lp.versuch($$DELETE FROM tarife WHERE name = 'fix'$$)
+               IN ('foreign_key_violation', 'restrict_violation') AS loeschen_verhindert;
+    hints:
+      - "`INSERT INTO tarife SELECT DISTINCT tarif, tarif_monatspreis …` scheitert. Warum?"
+      - "Ein Wert je Tarif: `GROUP BY tarif` mit `max(tarif_monatspreis)`."
+      - "`ALTER TABLE mitglieder ADD FOREIGN KEY (tarif) REFERENCES tarife (name);` und `ALTER TABLE mitglieder DROP COLUMN tarif_monatspreis;`"
+    explanation: |
+      Die Daten zeigen die Änderungsanomalie: Tom Okafor hat noch den alten Flex-Preis. `SELECT DISTINCT tarif, tarif_monatspreis` liefert deshalb zwei Flex-Zeilen und scheitert am Primärschlüssel – der Constraint findet den Widerspruch. `GROUP BY tarif` mit `max` entscheidet ihn so, wie die Aufgabe es verlangt. Der Fremdschlüssel lehnt danach unbekannte Tarife ab und verhindert, dass ein Tarif gelöscht wird, solange Mitglieder ihn haben. Das leistet schon das Standardverhalten `NO ACTION` (Fehler `foreign_key_violation`); `ON DELETE RESTRICT` (Fehler `restrict_violation`) wirkt hier genauso. Anders als bei `NO ACTION` lässt sich seine Prüfung nicht bis zum Ende der Transaktion aufschieben. `ON DELETE CASCADE` wäre falsch: Es löschte alle Fix-Mitglieder mit. Erst zuletzt fällt `tarif_monatspreis` weg; den Preis eines Mitglieds liefert jetzt `JOIN tarife ON tarife.name = mitglieder.tarif`.
+    resources:
+      - title: PostgreSQL · Foreign Keys
+        url: https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-FK
+      - title: PostgreSQL · ALTER TABLE – Constraint hinzufügen
+        url: https://www.postgresql.org/docs/current/ddl-alter.html#DDL-ALTER-ADDING-A-CONSTRAINT
+
+  - id: bericht-mit-aktuellem-preis
+    type: bug
+    title: Der März wird rückwirkend teurer
+    prompt: |
+      Der Raumbericht für März 2026 zeigte am 31. März für den Loft 1 248,00 € Umsatz. Seit der Preiserhöhung zum 1. April liefert derselbe Bericht für März 1 352,00 € – an den Märzbuchungen hat sich nichts geändert. `buchungen.preis` enthält den Preis, der beim Buchen galt. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: postgres
+    code: |
+      SELECT r.name AS raum,
+             count(*) AS buchungen,
+             sum(r.preis_pro_stunde * extract(epoch FROM b.ende - b.beginn) / 3600) AS umsatz
+      FROM buchungen AS b
+      JOIN raeume AS r ON r.id = b.raum_id
+      WHERE b.status = 'bestaetigt'
+        AND b.beginn >= '2026-03-01' AND b.beginn < '2026-04-01'
+      GROUP BY r.name
+      ORDER BY r.name;
+    lines: [3]
+    fix:
+      - line: 3
+        answers:
+          - "sum(b.preis) AS umsatz"
+          - "sum(b.preis) umsatz"
+          - "sum(preis) AS umsatz"
+          - "sum(preis) umsatz"
+    hints:
+      - Welche der beiden Tabellen ändert sich bei einer Preiserhöhung?
+      - Der Wert, der den März festhält, steht schon in jeder Buchung.
+    explanation: |
+      Die Abfrage rechnet jede Märzbuchung mit `raeume.preis_pro_stunde` nach, also mit dem Preis von heute. Nach der Preiserhöhung wächst der März deshalb rückwirkend, und Rabatte gehen verloren. `buchungen.preis` ist der Snapshot zum Buchungszeitpunkt – eine eigene Tatsache, die sich nicht mehr ändert. `sum(b.preis)` liefert dieselben Zahlen wie die Rechnungen, egal wann der Bericht läuft.
+
+  - id: snapshot-kein-verstoss
+    type: explain
+    title: Ist der Preis in der Buchung redundant?
+    prompt: |
+      Ein Kollege schlägt diese Migration vor: „`buchungen.preis` ist redundant zu `raeume.preis_pro_stunde` mal Dauer und verletzt die dritte Normalform.“ Erkläre im Review, warum die Spalte bleiben muss, und nenne ein Beispiel für eine Spalte, die in `buchungen` tatsächlich redundant wäre.
+    lang: postgres
+    code: |
+      -- Migration 0042: Redundanz entfernen
+      ALTER TABLE buchungen DROP COLUMN preis;
+      -- Preis künftig berechnen:
+      -- r.preis_pro_stunde * extract(epoch FROM b.ende - b.beginn) / 3600
+    points:
+      - "`buchungen.preis` ist der Preis zum Buchungszeitpunkt (Snapshot). Er hängt an der Buchung, nicht am Raum – also kein 3NF-Verstoß."
+      - Die Abhängigkeit `raum → preis_pro_stunde` gilt nur zu einem Zeitpunkt; nach einer Preisänderung ergäbe die Berechnung für alte Buchungen andere Beträge.
+      - Rabatte, Aktionen und individuelle Preise lassen sich aus dem Raumpreis gar nicht berechnen; Rechnungen und Berichte würden rückwirkend falsch.
+      - Redundant wäre dagegen etwa eine Spalte `raum_name` oder `standort_adresse` in `buchungen`, weil sie vollständig aus `raum_id` folgt und sich mit dem Raum ändern soll.
+    explanation: |
+      Die Spalte sieht redundant aus, speichert aber eine andere Tatsache: den Preis, der beim Buchen vereinbart wurde. Er hängt von der Buchung ab, nicht vom Raum, und ist deshalb mit der 3NF vereinbar. `raum → preis_pro_stunde` gilt nur für den Moment; erhöht Deskwerk den Loft-Preis, würde die vorgeschlagene Berechnung alle alten Buchungen umschreiben, und die Summen passten nicht mehr zu den versandten Rechnungen. Rabatte oder Sonderpreise lassen sich ohnehin nicht aus dem Listenpreis ableiten. Redundant wäre dagegen eine Spalte `raum_name` in `buchungen`: Sie folgt vollständig aus `raum_id`, und wird der Raum umbenannt, soll sich der Name überall ändern – die klassische Änderungsanomalie.
+
+  - id: buchungsliste-zerlegen
+    type: sql
+    lang: postgres
+    title: Die Buchungsliste wird ein Schema
+    prompt: |
+      Die Tabelle `raeume` existiert schon. Zerlege `buchungsliste` in zwei neue Tabellen und übernimm alle Zeilen. `buchungsliste` bleibt bestehen.
+
+      - `mitglieder`: `id` (Identity-Primärschlüssel), `email` (eindeutig), `name`, `tarif` – alle `NOT NULL`. Je E-Mail genau eine Zeile. Jonas Albers und Tom Okafor haben den Tarif gewechselt; es gilt jeweils der Tarif aus der Buchung mit dem **spätesten `beginn`** eines Mitglieds.
+      - `buchungen`: `id` (Identity-Primärschlüssel), `raum_id` (Fremdschlüssel auf `raeume`), `mitglied_id` (Fremdschlüssel auf `mitglieder`), `beginn`, `ende`, `preis` – alle `NOT NULL`, Typen wie in der Liste.
+
+      Die Prüfabfrage zeigt E-Mail und Tarif aller Mitglieder, die Zahl der Buchungen, wie viele Zeilen der Liste sich über die neuen Tabellen nicht wiederfinden, und drei Versuche: eine Buchung mit unbekanntem Raum, eine mit unbekanntem Mitglied und ein zweites Mitglied mit Lenas E-Mail.
+    schema: |
+      CREATE TABLE raeume (
+        id   int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        name text NOT NULL UNIQUE
+      );
+      INSERT INTO raeume (name) VALUES ('Loft'), ('Atelier'), ('Box 1'), ('Box 2');
+      CREATE TABLE buchungsliste (
+        zeile          int PRIMARY KEY,
+        beginn         timestamptz NOT NULL,
+        ende           timestamptz NOT NULL,
+        raum           text NOT NULL,
+        mitglied_email text NOT NULL,
+        mitglied_name  text NOT NULL,
+        tarif          text NOT NULL,
+        preis          numeric(8,2) NOT NULL
+      );
+      INSERT INTO buchungsliste VALUES
+        (1, '2026-03-02 09:00', '2026-03-02 11:00', 'Loft',    'lena.brandt@example.org',  'Lena Brandt',  'fix',  48.00),
+        (2, '2026-03-02 14:00', '2026-03-02 15:00', 'Box 1',   'jonas.albers@example.org', 'Jonas Albers', 'flex',  6.00),
+        (3, '2026-03-03 10:00', '2026-03-03 12:00', 'Atelier', 'lena.brandt@example.org',  'Lena Brandt',  'fix',  36.00),
+        (4, '2026-03-04 10:00', '2026-03-04 12:00', 'Loft',    'mara.voss@example.org',    'Mara Voss',    'team', 48.00),
+        (5, '2026-03-30 08:00', '2026-03-30 09:00', 'Box 2',   'jonas.albers@example.org', 'Jonas Albers', 'flex',  6.00),
+        (6, '2026-04-07 10:00', '2026-04-07 12:00', 'Loft',    'jonas.albers@example.org', 'Jonas Albers', 'fix',  52.00),
+        (7, '2026-04-08 10:00', '2026-04-08 11:00', 'Box 1',   'tom.okafor@example.org',   'Tom Okafor',   'team',  6.00),
+        (8, '2026-04-09 09:00', '2026-04-09 11:00', 'Loft',    'lena.brandt@example.org',  'Lena Brandt',  'fix',  52.00),
+        (9, '2026-03-16 13:00', '2026-03-16 14:00', 'Box 2',   'tom.okafor@example.org',   'Tom Okafor',   'fix',   6.00);
+    starter: |
+      CREATE TABLE mitglieder (
+        id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY
+        -- email, name, tarif
+      );
+      -- CREATE TABLE buchungen …
+      -- INSERT INTO mitglieder …
+      -- INSERT INTO buchungen …
+    solution: |
+      CREATE TABLE mitglieder (
+        id    int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        email text NOT NULL UNIQUE,
+        name  text NOT NULL,
+        tarif text NOT NULL
+      );
+      CREATE TABLE buchungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        raum_id     int NOT NULL REFERENCES raeume (id),
+        mitglied_id int NOT NULL REFERENCES mitglieder (id),
+        beginn      timestamptz NOT NULL,
+        ende        timestamptz NOT NULL,
+        preis       numeric(8,2) NOT NULL
+      );
+      INSERT INTO mitglieder (email, name, tarif)
+      SELECT DISTINCT ON (mitglied_email) mitglied_email, mitglied_name, tarif
+      FROM buchungsliste
+      ORDER BY mitglied_email, beginn DESC;
+      INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, preis)
+      SELECT r.id, m.id, l.beginn, l.ende, l.preis
+      FROM buchungsliste AS l
+      JOIN raeume AS r ON r.name = l.raum
+      JOIN mitglieder AS m ON m.email = l.mitglied_email;
+    check: |
+      SELECT (SELECT string_agg(email || ' ' || tarif, ', ' ORDER BY email) FROM mitglieder) AS mitglieder,
+             (SELECT count(*) FROM buchungen) AS buchungen,
+             (SELECT count(*)
+              FROM buchungsliste AS l
+              WHERE NOT EXISTS (
+                SELECT 1
+                FROM buchungen AS b
+                JOIN mitglieder AS m ON m.id = b.mitglied_id
+                JOIN raeume AS r ON r.id = b.raum_id
+                WHERE m.email = l.mitglied_email AND m.name = l.mitglied_name AND r.name = l.raum
+                  AND b.beginn = l.beginn AND b.ende = l.ende AND b.preis = l.preis
+              )) AS fehlende_zeilen,
+             lp.versuch($$INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, preis) VALUES (99, 1, '2026-05-04 10:00', '2026-05-04 11:00', 6)$$) AS unbekannter_raum,
+             lp.versuch($$INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, preis) VALUES (1, 99, '2026-05-04 10:00', '2026-05-04 11:00', 6)$$) AS unbekanntes_mitglied,
+             lp.versuch($$INSERT INTO mitglieder (email, name, tarif) VALUES ('lena.brandt@example.org', 'Lena Brandt', 'fix')$$) AS doppelte_email;
+    hints:
+      - Lege zuerst die Tabellen mit allen Constraints an, dann `mitglieder` füllen, dann `buchungen`.
+      - "`SELECT DISTINCT mitglied_email, mitglied_name, tarif` liefert Jonas und Tom je zweimal. `min(tarif)` oder `max(tarif)` wählen alphabetisch, nicht nach der Zeit."
+      - "Je E-Mail die Zeile mit dem spätesten `beginn`: `DISTINCT ON (mitglied_email) … ORDER BY mitglied_email, beginn DESC`."
+      - "Die Buchungen holen `raum_id` und `mitglied_id` per Join: `JOIN raeume AS r ON r.name = l.raum JOIN mitglieder AS m ON m.email = l.mitglied_email`."
+    explanation: |
+      Die Zerlegung folgt den Abhängigkeiten: `email → name, tarif` gehört in `mitglieder`, alles, was an der einzelnen Buchung hängt, in `buchungen`. Die Falle sind die Tarifwechsel – `email → tarif` gilt in der Liste nicht, `SELECT DISTINCT` liefert Jonas und Tom zweimal, und `UNIQUE (email)` hält die Migration an. `DISTINCT ON (mitglied_email)` mit `ORDER BY mitglied_email, beginn DESC` nimmt je Mitglied die Zeile mit dem spätesten Beginn; eine Unterabfrage mit `max(beginn)` wäre gleichwertig. `min(tarif)` oder `max(tarif)` sehen nur auf das Alphabet und treffen je einen der beiden Wechsel falsch. Nach `zeile` zu sortieren ginge ebenfalls schief: Toms Märzbuchung wurde als letzte Zeile importiert. Die Buchungen bekommen ihre Fremdschlüssel per Join über die natürlichen Schlüssel `raeume.name` und `mitglieder.email`. Die Probe `fehlende_zeilen = 0` und die Zahl 9 zeigen, dass der Join nichts verloren und nichts verdoppelt hat. Wer sich später fragt, welchen Tarif Jonas im März hatte, braucht eine Historie mit Gültigkeitszeiträumen – das ist Thema in [Datenmodellierung](/postgres/datenmodellierung).
+    resources:
+      - title: PostgreSQL · SELECT DISTINCT ON
+        url: https://www.postgresql.org/docs/current/sql-select.html#SQL-DISTINCT
+      - title: PostgreSQL · INSERT
+        url: https://www.postgresql.org/docs/current/sql-insert.html

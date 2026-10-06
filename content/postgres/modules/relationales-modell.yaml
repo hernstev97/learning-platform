@@ -1,0 +1,1019 @@
+id: relationales-modell
+title: Das relationale Modell
+level: 1
+minutes: 120
+summary: Was eine Tabelle in PostgreSQL ist – eine Menge von Zeilen mit Schlüsseln, Typen und Regeln – und was dein ORM-Modell davon abbildet, am Schema von Deskwerk, das dich durch den ganzen Kurs begleitet.
+goals:
+  - Du erklärst Relation, Tupel und Attribut und begründest, warum eine Abfrage ohne `ORDER BY` keine Reihenfolge garantiert.
+  - Du unterscheidest Primär-, Kandidaten- und Fremdschlüssel und wählst begründet zwischen natürlichem und künstlichem Schlüssel (`identity` oder `uuid`).
+  - Du sagst das Ergebnis von Vergleichen mit `NULL` nach der dreiwertigen Logik vorher und prüfst mit `IS NULL` und `IS DISTINCT FROM`.
+  - Du wählst PostgreSQL-Typen für Text, Ganzzahlen, Geld, Zeitpunkte und Datumswerte und erkennst die Fallen von Gleitkommazahlen und `timestamp` ohne Zeitzone.
+  - Du liest ein Schema mit `\d` und `information_schema` und erkennst, welche Tabelle ein SQLAlchemy- oder Prisma-Modell erzeugt.
+resources:
+  - title: PostgreSQL · Constraints (Primär-, Fremd- und Unique-Schlüssel)
+    url: https://www.postgresql.org/docs/current/ddl-constraints.html
+  - title: PostgreSQL · Data Types
+    url: https://www.postgresql.org/docs/current/datatype.html
+  - title: PostgreSQL · Identity Columns
+    url: https://www.postgresql.org/docs/current/ddl-identity-columns.html
+  - title: PostgreSQL Wiki · Don't Do This
+    url: https://wiki.postgresql.org/wiki/Don%27t_Do_This
+  - title: SQLAlchemy 2.1 · Table Configuration with Declarative
+    url: https://docs.sqlalchemy.org/en/21/orm/declarative_tables.html
+lesson: |
+  Deskwerk betreibt drei Coworking-Standorte in Leipzig: Plagwitz, Südvorstadt und Zentrum. Mitglieder buchen in der App Schreibtische, Meetingräume und Telefonboxen, checken morgens am Empfang ein und bekommen am Monatsende eine Rechnung. Das Backend ist in Python mit SQLAlchemy 2 geschrieben, der Abrechnungsdienst in TypeScript mit Prisma. Im Code sieht eine Buchung aus wie ein Objekt: `buchung.raum.name`, `buchung.preis`. In PostgreSQL ist sie eine Zeile in einer Tabelle, und für diese Zeile gelten Regeln, die das ORM dir nicht zeigt: Es gibt keine garantierte Reihenfolge, `NULL` verhält sich anders als `None`, Geld braucht einen exakten Typ, und ein Zeitpunkt ohne Zeitzone ist mehrdeutig.
+
+  Dieses Modul legt das Fundament für den Kurs. Es führt das Schema von Deskwerk ein, auf das sich alle weiteren Module beziehen, und das Denkmodell dahinter: das relationale Modell. Wer es kennt, liest Fehlermeldungen schneller, schreibt Abfragen, die morgen noch dasselbe liefern, und erkennt im Code-Review, wenn ein ORM-Modell eine andere Tabelle erzeugt als gedacht.
+
+  ## Das Schema von Deskwerk
+
+  Sechs Tabellen bilden den Kern. Das Zeichen `<` steht für „viele“: Ein Standort hat viele Räume, ein Raum viele Buchungen, ein Mitglied viele Buchungen, Check-ins und Rechnungen.
+
+  ```text
+  standorte 1 ──< raeume 1 ──< buchungen >── 1 mitglieder
+  standorte 1 ──< checkins >──────────────── 1 mitglieder
+                  rechnungen >────────────── 1 mitglieder
+  ```
+
+  Führe den Block aus. Er legt das Schema an, füllt es mit ein paar Zeilen und fragt die Buchungen mit Mitglied, Raum und Standort ab. Jeder Block in diesem Kurs startet mit einer frischen, leeren Datenbank.
+
+  ```postgres run
+  CREATE TABLE standorte (
+    id    int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name  text NOT NULL UNIQUE,
+    stadt text NOT NULL DEFAULT 'Leipzig'
+  );
+  CREATE TABLE raeume (
+    id               int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    standort_id      int NOT NULL REFERENCES standorte (id),
+    name             text NOT NULL,
+    art              text NOT NULL CHECK (art IN ('schreibtisch', 'meetingraum', 'telefonbox')),
+    plaetze          int NOT NULL CHECK (plaetze > 0),
+    preis_pro_stunde numeric(8,2) NOT NULL CHECK (preis_pro_stunde >= 0),
+    UNIQUE (standort_id, name)
+  );
+  CREATE TABLE mitglieder (
+    id          int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email       text NOT NULL UNIQUE,
+    name        text NOT NULL,
+    tarif       text NOT NULL DEFAULT 'flex',
+    erstellt_am timestamptz NOT NULL DEFAULT now()
+  );
+  CREATE TABLE buchungen (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    raum_id     int NOT NULL REFERENCES raeume (id),
+    mitglied_id int NOT NULL REFERENCES mitglieder (id),
+    beginn      timestamptz NOT NULL,
+    ende        timestamptz NOT NULL,
+    status      text NOT NULL DEFAULT 'bestaetigt',
+    preis       numeric(8,2),
+    CHECK (ende > beginn)
+  );
+  CREATE TABLE rechnungen (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    mitglied_id int NOT NULL REFERENCES mitglieder (id),
+    monat       date NOT NULL,
+    betrag      numeric(10,2) NOT NULL,
+    bezahlt_am  timestamptz,
+    UNIQUE (mitglied_id, monat)
+  );
+  CREATE TABLE checkins (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    mitglied_id int NOT NULL REFERENCES mitglieder (id),
+    standort_id int NOT NULL REFERENCES standorte (id),
+    zeitpunkt   timestamptz NOT NULL
+  );
+
+  INSERT INTO standorte (name) VALUES ('Plagwitz'), ('Südvorstadt'), ('Zentrum');
+  INSERT INTO raeume (standort_id, name, art, plaetze, preis_pro_stunde) VALUES
+    (1, 'Atelier', 'meetingraum', 8, 25.00),
+    (1, 'Box 1', 'telefonbox', 1, 4.00),
+    (2, 'Loft', 'meetingraum', 12, 35.00),
+    (3, 'Fensterplatz 3', 'schreibtisch', 1, 6.50);
+  INSERT INTO mitglieder (email, name, tarif) VALUES
+    ('jana.krueger@example.org', 'Jana Krüger', 'fix'),
+    ('mehmet.oezdemir@example.org', 'Mehmet Özdemir', 'flex'),
+    ('lea.hoffmann@example.org', 'Lea Hoffmann', 'team');
+  INSERT INTO buchungen (raum_id, mitglied_id, beginn, ende, preis) VALUES
+    (1, 1, '2026-03-02 09:00', '2026-03-02 11:00', 50.00),
+    (2, 2, '2026-03-02 10:00', '2026-03-02 10:30', 2.00),
+    (3, 1, '2026-03-30 14:00', '2026-03-30 16:00', 70.00);
+
+  SELECT b.id, m.name AS mitglied, r.name AS raum, s.name AS standort, b.beginn, b.preis
+  FROM buchungen AS b
+  JOIN mitglieder AS m ON m.id = b.mitglied_id
+  JOIN raeume     AS r ON r.id = b.raum_id
+  JOIN standorte  AS s ON s.id = r.standort_id
+  ORDER BY b.id;
+  ```
+
+  In jeder Zeile des `CREATE TABLE` steckt eine Entscheidung. `GENERATED ALWAYS AS IDENTITY` lässt PostgreSQL die `id` vergeben. `REFERENCES` macht eine Spalte zum Fremdschlüssel. `CHECK` und `UNIQUE` halten Regeln fest, etwa „ein Raumname kommt je Standort nur einmal vor“. `DEFAULT` füllt Spalten, die beim `INSERT` fehlen: `stadt` wird `'Leipzig'`, `erstellt_am` der aktuelle Zeitpunkt. Beachte auch die Ausgabe von `beginn`: Die Buchung am 2. März zeigt `+01`, die am 30. März `+02`. Dazwischen liegt die Umstellung auf Sommerzeit am 29. März 2026.
+
+  ## Relationen: Tabellen sind Mengen, keine Listen
+
+  Das relationale Modell beschreibt Daten als **Relationen**. Eine Relation ist eine Menge von **Tupeln**, die alle dieselben **Attribute** haben. Im Alltag sagst du Tabelle, Zeile und Spalte, im ORM Klasse, Objekt und Feld:
+
+  | Relationales Modell | SQL | ORM |
+  | --- | --- | --- |
+  | Relation | Tabelle | Modellklasse (`Mitglied`) |
+  | Tupel | Zeile | Objekt (`Mitglied(id=1, …)`) |
+  | Attribut | Spalte | Feld (`mitglied.email`) |
+  | Domäne | Datentyp | Typannotation (`Mapped[str]`) |
+
+  Das Wort „Menge“ hat Folgen. Eine Menge hat **keine Reihenfolge**. PostgreSQL liefert Zeilen ohne `ORDER BY` in der Reihenfolge, in der es sie gerade findet, und die ändert sich. Die Dokumentation sagt es knapp: „If sorting is not chosen, the rows will be returned in an unspecified order“ ([Sorting Rows](https://www.postgresql.org/docs/current/queries-order.html)).
+
+  ```postgres run
+  CREATE TABLE mitglieder (
+    id    int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email text NOT NULL UNIQUE,
+    name  text NOT NULL,
+    tarif text NOT NULL DEFAULT 'flex'
+  );
+  INSERT INTO mitglieder (email, name) VALUES
+    ('jana.krueger@example.org', 'Jana Krüger'),
+    ('mehmet.oezdemir@example.org', 'Mehmet Özdemir'),
+    ('lea.hoffmann@example.org', 'Lea Hoffmann');
+
+  SELECT id, name, tarif FROM mitglieder;
+
+  UPDATE mitglieder SET tarif = 'fix' WHERE id = 1;
+  SELECT ctid, id, name, tarif FROM mitglieder;
+
+  SELECT tarif FROM mitglieder;
+  SELECT DISTINCT tarif FROM mitglieder;
+  ```
+
+  Nach dem `UPDATE` steht Jana Krüger am Ende. PostgreSQL ändert eine Zeile nicht an Ort und Stelle, es schreibt eine neue Version und markiert die alte als veraltet. Die Systemspalte `ctid` zeigt, wo eine Version physisch liegt: Seite 0, Eintrag 4. Ein Sequential Scan liest die Tabelle von vorn nach hinten und findet die neue Version zuletzt. Wie das Versionieren genau funktioniert, zeigt [Isolation und Sperren](/postgres/isolation-sperren). Für dich zählt hier: Eine Listenansicht, die heute nach `id` sortiert aussieht, ist es morgen nach einem Update oder einem anderen Query-Plan nicht mehr. Schreib `ORDER BY`, sobald die Reihenfolge eine Rolle spielt.
+
+  In einem zweiten Punkt weicht SQL vom Modell ab: Ergebnisse dürfen **Duplikate** enthalten. `SELECT tarif` liefert `flex` zweimal, erst `DISTINCT` macht eine Menge daraus. Auch eine Tabelle ohne Primärschlüssel nimmt zwei identische Zeilen an, und dann kann keine Abfrage mehr die eine von der anderen unterscheiden. Erst ein Schlüssel macht eine Tabelle zu einer echten Menge.
+
+  ## Schlüssel: woran PostgreSQL eine Zeile erkennt
+
+  Ein **Kandidatenschlüssel** ist eine minimale Menge von Spalten, deren Werte jede Zeile eindeutig bestimmen. `mitglieder` hat zwei: `id` und `email`. `raeume` hat ebenfalls zwei: `id` und das Paar `(standort_id, name)`, denn „Atelier“ darf es in Plagwitz und im Zentrum geben, aber nicht zweimal in Plagwitz. Minimal heißt: Lässt du eine Spalte weg, ist es nicht mehr eindeutig. `(id, name)` ist zwar eindeutig, aber kein Kandidatenschlüssel, weil `id` allein schon reicht.
+
+  Einen Kandidaten wählst du als **Primärschlüssel**. PostgreSQL erzwingt dafür `NOT NULL` und Eindeutigkeit und legt einen Index an ([Primary Keys](https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-PRIMARY-KEYS)). Die anderen Kandidaten sicherst du mit `UNIQUE` ab. Ohne `UNIQUE (standort_id, name)` könnte die App zwei Räume namens „Box 1“ im selben Standort anlegen, und die `id` würde das nicht verhindern. Ein **Fremdschlüssel** ist eine Spalte, deren Werte auf einen Schlüssel einer anderen Tabelle zeigen müssen. PostgreSQL lehnt jede Zeile ab, die ins Leere zeigt ([Foreign Keys](https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-FK)):
+
+  ```postgres run fails
+  CREATE TABLE standorte (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name text NOT NULL UNIQUE);
+  CREATE TABLE raeume (
+    id          int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    standort_id int NOT NULL REFERENCES standorte (id),
+    name        text NOT NULL
+  );
+  INSERT INTO standorte (name) VALUES ('Plagwitz'), ('Südvorstadt'), ('Zentrum');
+  INSERT INTO raeume (standort_id, name) VALUES (4, 'Atelier');
+  ```
+
+  ### Natürlicher oder künstlicher Schlüssel
+
+  Ein **natürlicher Schlüssel** stammt aus der Fachlichkeit, etwa die E-Mail-Adresse. Ein **künstlicher Schlüssel** (Surrogatschlüssel) hat keine Bedeutung außerhalb der Datenbank, etwa eine fortlaufende `id`. E-Mail-Adressen ändern sich: Jemand heiratet, wechselt den Arbeitgeber, vertippt sich bei der Anmeldung. Wäre `email` der Primärschlüssel, müsste jede Buchung, Rechnung und jeder Check-in mitgeändert werden, und jede URL wie `/mitglieder/jana.krueger@example.org` wäre danach kaputt. Deshalb nimmt Deskwerk eine künstliche `id` als Primärschlüssel und hält den natürlichen Schlüssel mit `UNIQUE` fest. Beides zusammen ist der Normalfall in Anwendungen.
+
+  Für künstliche Schlüssel gibt es zwei Familien:
+
+  - **Identity-Spalten** (`int` oder `bigint GENERATED ALWAYS AS IDENTITY`) zählen hoch, sind klein und schnell. `ALWAYS` lehnt eigene Werte der App ab, außer sie schreibt ausdrücklich `OVERRIDING SYSTEM VALUE`; `BY DEFAULT` nimmt sie an ([Identity Columns](https://www.postgresql.org/docs/current/ddl-identity-columns.html)). `serial` ist die ältere Schreibweise desselben Prinzips. Nachteil: IDs sind erratbar. Wer `/rechnungen/1042` sieht, probiert `/rechnungen/1041`. Eine fortlaufende `id` ersetzt also nie die Prüfung, ob jemand eine Zeile sehen darf.
+  - **UUIDs** (`uuid`) lassen sich schon in der App oder auf dem Handy erzeugen, bevor die Zeile die Datenbank erreicht, und kollidieren nicht, wenn Daten aus mehreren Systemen zusammenkommen. Sie sind 16 statt 4 oder 8 Bytes groß. Zufällige UUIDs (`gen_random_uuid()`, Version 4) verteilen neue Einträge über den ganzen Index. Seit PostgreSQL 18 erzeugt `uuidv7()` zeitlich geordnete UUIDs, die wie eine Identity am Ende des Index landen ([UUID Functions](https://www.postgresql.org/docs/current/functions-uuid.html)).
+
+  Deskwerk nimmt `bigint` für Tabellen, die schnell wachsen (`buchungen`, `checkins`). `int` endet bei 2 147 483 647, und ein Typwechsel einer Primärschlüsselspalte im laufenden Betrieb ist eine aufwendige [Migration](/postgres/migrationen).
+
+  > [!INTERVIEW] „Natürlicher oder künstlicher Primärschlüssel?“
+  > Ich nehme fast immer einen künstlichen Schlüssel als Primärschlüssel, weil er sich nie ändert und Fremdschlüssel klein und stabil bleiben. Den natürlichen Schlüssel, etwa die E-Mail-Adresse, sichere ich trotzdem mit `UNIQUE` ab, sonst entstehen Dubletten. Zwischen `bigint`-Identity und UUID entscheide ich nach Bedarf: Identity ist kompakt und schnell, UUIDs lassen sich ohne Datenbank erzeugen und sind nicht erratbar. Seit PostgreSQL 18 gibt es mit `uuidv7()` zeitlich geordnete UUIDs, die den Index schonen.
+
+  ## NULL: unbekannt, nicht leer
+
+  `NULL` bedeutet „Wert unbekannt oder nicht vorhanden“. Die Grundregeln kennst du vielleicht aus [SQL-Abfragen für Analysen](/data/sql-abfragen): Jeder Vergleich mit `NULL` ist selbst `NULL`, Aggregatfunktionen überspringen `NULL`, `count(*)` zählt Zeilen. Hier geht es um die Folgen für Anwendungen. SQL rechnet mit drei Wahrheitswerten: wahr, falsch und unbekannt ([Logical Operators](https://www.postgresql.org/docs/current/functions-logical.html)). `WHERE` behält nur Zeilen, deren Bedingung **wahr** ist, unbekannt fliegt raus wie falsch.
+
+  ```postgres run
+  SELECT NULL = NULL      AS gleich,
+         NULL IS NULL     AS ist_null,
+         NULL AND false   AS und_falsch,
+         NULL OR true     AS oder_wahr,
+         1 IS DISTINCT FROM NULL    AS verschieden,
+         NULL IS DISTINCT FROM NULL AS beide_null;
+
+  CREATE TABLE rechnungen (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    mitglied_id int NOT NULL,
+    monat       date NOT NULL,
+    betrag      numeric(10,2) NOT NULL,
+    bezahlt_am  timestamptz
+  );
+  INSERT INTO rechnungen (mitglied_id, monat, betrag, bezahlt_am) VALUES
+    (1, '2026-03-01', 189.00, '2026-04-03 10:15'),
+    (2, '2026-03-01',  42.50, NULL),
+    (3, '2026-03-01',  96.00, NULL);
+
+  SELECT count(*) AS mit_gleich FROM rechnungen WHERE bezahlt_am = NULL;
+  SELECT count(*) AS mit_is_null FROM rechnungen WHERE bezahlt_am IS NULL;
+  SELECT count(*) AS alle, count(bezahlt_am) AS bezahlt FROM rechnungen;
+  ```
+
+  `NULL AND false` ist falsch, weil das Ergebnis für jeden möglichen Wert falsch wäre. `NULL OR true` ist aus demselben Grund wahr. `IS DISTINCT FROM` behandelt `NULL` wie einen gewöhnlichen Wert und liefert immer wahr oder falsch ([Comparison Functions and Operators](https://www.postgresql.org/docs/current/functions-comparison.html)). Das brauchst du, wenn die App prüft, ob sich ein Feld geändert hat: `alt <> neu` ist für „vorher leer, jetzt gesetzt“ unbekannt, `alt IS DISTINCT FROM neu` ist wahr.
+
+  In Python ist `None == None` wahr, in SQL ist `NULL = NULL` unbekannt. ORMs übersetzen deshalb: SQLAlchemy macht aus `Rechnung.bezahlt_am == None` ein `bezahlt_am IS NULL`, Prisma aus `where: { bezahltAm: null }` ebenso. Schreibst du SQL von Hand und reichst `None` als Parameter in `bezahlt_am = %s` hinein, entsteht `bezahlt_am = NULL`, und die Abfrage findet nie etwas.
+
+  Entscheide pro Spalte, ob `NULL` eine fachliche Bedeutung hat. In `rechnungen.bezahlt_am` heißt `NULL` „noch nicht bezahlt“, in `buchungen.preis` „noch nicht berechnet“. Alle anderen Spalten von Deskwerk sind `NOT NULL`. Eine Spalte, die `NULL` erlaubt, obwohl es fachlich keinen fehlenden Wert gibt, lädt Fehler ein: Jede Abfrage und jeder Code, der sie liest, muss den Fall behandeln.
+
+  ## Datentypen, die Fehler verhindern
+
+  Der Typ einer Spalte ist die erste Regel, die PostgreSQL bei jedem Schreiben prüft. Die wichtigsten für Anwendungen:
+
+  | Zweck | Nimm | Statt | Warum |
+  | --- | --- | --- | --- |
+  | Text | `text` | `varchar(255)` aus Gewohnheit | gleich schnell; eine Längengrenze nur, wenn die Fachlichkeit sie verlangt |
+  | Ganzzahl | `int`, `bigint` für schnell wachsende IDs | `smallint` aus Sparsamkeit | `int` endet bei 2 147 483 647 |
+  | Geld | `numeric(10,2)` | `real`, `double precision`, `money` | exakte Dezimalrechnung |
+  | Zeitpunkt | `timestamptz` | `timestamp` | eindeutiger Moment, unabhängig von der Zeitzone des Servers |
+  | Kalendertag | `date` | `timestamptz` um Mitternacht | ein Abrechnungsmonat ist kein Moment |
+  | Ja/Nein | `boolean` | `int` mit 0/1 | nur `true`, `false`, `NULL` |
+
+  Bei `text` und `varchar` gibt es in PostgreSQL keinen Geschwindigkeitsunterschied ([Character Types](https://www.postgresql.org/docs/current/datatype-character.html)). `varchar(n)` lehnt längere Werte mit `value too long for type character varying(n)` ab. Das ist nur sinnvoll, wenn die Grenze fachlich begründet ist, sonst wird sie zum Fehler, sobald jemand einen langen Firmennamen eingibt.
+
+  Für Geld zählt jeder Cent. `real` und `double precision` sind binäre Gleitkommazahlen und können 0,1 nicht exakt darstellen, `numeric` rechnet dezimal und exakt ([Arbitrary Precision Numbers](https://www.postgresql.org/docs/current/datatype-numeric.html#DATATYPE-NUMERIC-DECIMAL)):
+
+  ```postgres run
+  SELECT 0.1::double precision + 0.2::double precision AS gleitkomma,
+         0.1 + 0.2 AS numeric_summe,
+         0.1 + 0.2 = 0.3 AS exakt;
+
+  CREATE TABLE posten (gleitkomma real, exakt numeric(10,2));
+  INSERT INTO posten SELECT 189.90, 189.90 FROM generate_series(1, 30);
+  INSERT INTO posten VALUES (42.15, 42.15), (0.10, 0.10);
+  SELECT sum(gleitkomma) AS summe_real, sum(exakt) AS summe_numeric FROM posten;
+
+  SELECT 19.995::numeric(8,2) AS gerundet, 7 / 2 AS ganzzahlig, 7 / 2.0 AS dezimal;
+  ```
+
+  Dreißig Monatsbeiträge zu 189,90 € plus zwei Posten ergeben 5739,25 €. `real` liefert 5739.2485, und der Fehler wächst mit jeder Zeile. `numeric(10,2)` speichert zehn Stellen, davon zwei nach dem Komma, und rundet beim Speichern auf Cent. Werte über 99 999 999,99 lehnt die Spalte mit `numeric field overflow` ab, statt sie still zu verfälschen. Ganzzahlige Division schneidet ab: `7 / 2` ist `3`.
+
+  Für Zeitpunkte nimmst du `timestamptz` (ausgeschrieben `timestamp with time zone`). Der Name täuscht: PostgreSQL speichert keine Zeitzone, sondern einen eindeutigen Moment in UTC. Beim Einlesen ohne Zeitzonenangabe und bei der Ausgabe nutzt es die Einstellung `TimeZone` der Sitzung ([Time Zones](https://www.postgresql.org/docs/current/datatype-datetime.html#DATATYPE-TIMEZONES)). `timestamp` ohne Zeitzone speichert dagegen nur Datum und Uhrzeit, wie eine Wanduhr ohne Ortsangabe:
+
+  ```postgres run
+  CREATE TABLE zeiten (art text, mit_zone timestamptz, ohne_zone timestamp);
+  INSERT INTO zeiten VALUES
+    ('Winter', '2026-03-02 09:00', '2026-03-02 09:00'),
+    ('Sommer', '2026-03-30 09:00', '2026-03-30 09:00');
+
+  SELECT art, mit_zone, ohne_zone FROM zeiten;
+
+  SET TIME ZONE 'UTC';
+  SELECT art, mit_zone, ohne_zone FROM zeiten;
+  ```
+
+  Der Abrechnungsdienst läuft auf einem Server mit UTC. Für ihn zeigt `mit_zone` denselben Moment in UTC: 08:00 im Winter, 07:00 im Sommer. `ohne_zone` zeigt in beiden Sitzungen 09:00. Ob damit 9 Uhr in Leipzig oder 9 Uhr UTC gemeint war, weiß nur, wer die Zeile geschrieben hat. Genau diese Mehrdeutigkeit kostet Teams Stunden, wenn Buchungen um die Sommerzeitumstellung um eine Stunde verrutschen.
+
+  > [!WARNING] ORMs legen oft `timestamp` ohne Zeitzone an
+  > SQLAlchemy macht aus `Mapped[datetime]` ohne weitere Angabe `TIMESTAMP WITHOUT TIME ZONE`, Prisma aus `DateTime` ein `timestamp(3)` ohne Zeitzone. Schreib in SQLAlchemy `mapped_column(DateTime(timezone=True))` und in Prisma `@db.Timestamptz(3)`. Prüfe das in jeder neuen Migration, bevor sie in Produktion geht.
+
+  ## Schema als Vertrag: Katalog, psql und ORM-Modell
+
+  Das Schema ist ein Vertrag zwischen allen, die die Datenbank nutzen: Backend, Abrechnungsdienst, Datenexport, ein Kollege mit psql. Jede Regel im Schema gilt für alle, eine Regel im Python-Code nur für das Python-Backend. Den Vertrag liest du im Terminal mit `\d` in psql, hier gegen ein PostgreSQL 18 mit der Datenbank `deskwerk` ([psql · \d](https://www.postgresql.org/docs/current/app-psql.html#APP-PSQL-META-COMMAND-D)):
+
+  ```console
+  $ psql deskwerk -c '\d buchungen'
+                                     Table "public.buchungen"
+     Column    |           Type           | Collation | Nullable |           Default
+  -------------+--------------------------+-----------+----------+------------------------------
+   id          | bigint                   |           | not null | generated always as identity
+   raum_id     | integer                  |           | not null |
+   mitglied_id | integer                  |           | not null |
+   beginn      | timestamp with time zone |           | not null |
+   ende        | timestamp with time zone |           | not null |
+   status      | text                     |           | not null | 'bestaetigt'::text
+   preis       | numeric(8,2)             |           |          |
+  Indexes:
+      "buchungen_pkey" PRIMARY KEY, btree (id)
+  Check constraints:
+      "buchungen_check" CHECK (ende > beginn)
+  Foreign-key constraints:
+      "buchungen_mitglied_id_fkey" FOREIGN KEY (mitglied_id) REFERENCES mitglieder(id)
+      "buchungen_raum_id_fkey" FOREIGN KEY (raum_id) REFERENCES raeume(id)
+  ```
+
+  `\d` ist ein Befehl von psql, kein SQL. Dahinter stehen Abfragen auf den **Systemkatalog**, die Tabellen, in denen PostgreSQL sein eigenes Schema beschreibt. Den standardisierten Teil davon erreichst du mit SQL über `information_schema`, auch aus Tests oder Skripten ([information_schema.columns](https://www.postgresql.org/docs/current/infoschema-columns.html)). PostgreSQL legt seine Namen klein ab, und `table_schema = 'public'` blendet Systemtabellen aus:
+
+  ```postgres run
+  CREATE TABLE buchungen (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    raum_id     int NOT NULL,
+    mitglied_id int NOT NULL,
+    beginn      timestamptz NOT NULL,
+    ende        timestamptz NOT NULL,
+    status      text NOT NULL DEFAULT 'bestaetigt',
+    preis       numeric(8,2),
+    CHECK (ende > beginn)
+  );
+
+  SELECT column_name, data_type, is_nullable, column_default, is_identity
+  FROM information_schema.columns
+  WHERE table_schema = 'public' AND table_name = 'buchungen'
+  ORDER BY ordinal_position;
+  ```
+
+  ### Was ein ORM-Modell auf eine Tabelle abbildet
+
+  Ein ORM-Modell beschreibt dieselbe Tabelle aus Sicht des Codes. In SQLAlchemy 2 leitet `mapped_column()` Typ und Nullbarkeit aus der Annotation ab: `Mapped[str]` wird `NOT NULL`, `Mapped[Optional[str]]` erlaubt `NULL` ([SQLAlchemy · mapped_column derives the datatype and nullability](https://docs.sqlalchemy.org/en/21/orm/declarative_tables.html#mapped-column-derives-the-datatype-and-nullability-from-the-mapped-annotation)).
+
+  ```python
+  class Buchung(Base):
+      __tablename__ = "buchungen"
+
+      id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+      raum_id: Mapped[int] = mapped_column(ForeignKey("raeume.id"))
+      mitglied_id: Mapped[int] = mapped_column(ForeignKey("mitglieder.id"))
+      beginn: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+      ende: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+      status: Mapped[str] = mapped_column(Text, server_default="bestaetigt")
+      preis: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 2))
+  ```
+
+  Ohne die ausdrücklichen Typen sähe die Tabelle anders aus. Die Standardabbildung von SQLAlchemy 2 (2.0 und 2.1 erzeugen dasselbe) und Prisma 7 auf PostgreSQL, erzeugt mit `CreateTable(...)` bzw. `prisma migrate diff`:
+
+  | Im Code | SQLAlchemy erzeugt | Prisma erzeugt | Besser |
+  | --- | --- | --- | --- |
+  | Text | `Mapped[str]` → `VARCHAR` | `String` → `TEXT` | `text` |
+  | Ganzzahl-ID | `Mapped[int]` als Primärschlüssel → `SERIAL` | `Int @default(autoincrement())` → `SERIAL` | `bigint` mit Identity, wo die Tabelle wächst |
+  | Zeitpunkt | `Mapped[datetime]` → `TIMESTAMP WITHOUT TIME ZONE` | `DateTime` → `TIMESTAMP(3)` | `timestamptz` |
+  | Geld | `Mapped[Decimal]` → `NUMERIC` ohne Stellen | `Decimal` → `DECIMAL(65,30)` | `numeric(10,2)` |
+
+  Ein zweiter Unterschied: `server_default` landet als `DEFAULT` im Schema und gilt für jeden, der die Tabelle beschreibt. `default=` setzt den Wert nur, wenn SQLAlchemy selbst einfügt. Fehlt es im Schema, bekommt ein Import per psql keinen Wert.
+
+  > [!PRAXIS] Im Review liest du das SQL, nicht nur das Modell
+  > Bei Deskwerk hängt an jedem Pull Request mit Modelländerung das SQL der Migration: `alembic upgrade head --sql` gibt es aus, ohne eine Datenbank zu verändern, Prisma schreibt es mit `prisma migrate dev --create-only` in eine Datei. Im Review prüft das Team Typen (`timestamptz`, `numeric` mit Stellen, `bigint` für wachsende Tabellen), `NOT NULL`, `UNIQUE` für natürliche Schlüssel und Fremdschlüssel. Ein falscher Typ ist nach dem ersten Deploy teuer zu ändern, im Review kostet er eine Zeile.
+
+  ## Häufige Fehler
+
+  - **Liste springt nach einem Update.** Die Abfrage hat kein `ORDER BY` und verlässt sich auf die Einfügereihenfolge. Immer sortieren, wenn die Reihenfolge sichtbar ist.
+  - **`WHERE spalte = NULL` findet nichts.** Der Vergleich ist unbekannt. `IS NULL` schreiben; bei Parametern, die `None` sein können, `IS NOT DISTINCT FROM`.
+  - **Cent-Abweichungen in Summen.** Beträge stehen in `real` oder `double precision`. `numeric(10,2)` nehmen.
+  - **Zeiten um eine oder zwei Stunden verschoben.** Die Spalte ist `timestamp` ohne Zeitzone, und zwei Dienste lesen sie mit unterschiedlicher `TimeZone`. `timestamptz` nehmen.
+  - **Dubletten trotz Primärschlüssel.** Der natürliche Schlüssel (E-Mail, Raumname je Standort) hat kein `UNIQUE`. Die `id` verhindert keine fachlichen Dubletten.
+  - **`insert or update on table "raeume" violates foreign key constraint`.** Die Zeile zeigt auf einen Schlüssel, den es nicht gibt. Erst den Standort anlegen, oder die `id` per Unterabfrage aus dem Namen holen.
+  - **`cannot insert a non-DEFAULT value into column "id"`.** Die Spalte ist `GENERATED ALWAYS AS IDENTITY`, die App setzt die `id` selbst. Die Spalte im `INSERT` weglassen.
+  - **`integer out of range` nach Jahren im Betrieb.** Eine schnell wachsende Tabelle hat einen `int`-Schlüssel. Für solche Tabellen von Anfang an `bigint`.
+
+  ## Zusammenfassung
+
+  - Eine Tabelle ist eine Menge von Zeilen. Ohne `ORDER BY` gibt es keine garantierte Reihenfolge, und erst ein Schlüssel verhindert identische Zeilen.
+  - Kandidatenschlüssel sind minimal und eindeutig. Einer wird Primärschlüssel, die übrigen sicherst du mit `UNIQUE`. Fremdschlüssel verhindern Verweise ins Leere.
+  - Künstlicher Primärschlüssel plus `UNIQUE` auf dem natürlichen Schlüssel ist der Normalfall. `bigint`-Identity ist kompakt, UUIDs (seit PostgreSQL 18 auch `uuidv7()`) entstehen ohne Datenbank.
+  - SQL hat drei Wahrheitswerte. `WHERE` behält nur wahre Zeilen, `= NULL` ist nie wahr, `IS NULL` und `IS DISTINCT FROM` sind es.
+  - `text` für Text, `numeric` für Geld, `timestamptz` für Zeitpunkte, `date` für Kalendertage, `bigint` für wachsende IDs.
+  - Das Schema ist ein Vertrag für alle Clients. Du liest es mit `\d` oder `information_schema` und prüfst das SQL, das dein ORM daraus macht.
+exercises:
+  - id: schluessel-von-raeume
+    type: choice
+    title: Welche Schlüssel hat raeume?
+    prompt: |
+      So ist `raeume` bei Deskwerk definiert. Welche Aussagen stimmen? Mehrere Antworten sind richtig.
+    lang: postgres
+    code: |
+      CREATE TABLE raeume (
+        id               int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        standort_id      int NOT NULL REFERENCES standorte (id),
+        name             text NOT NULL,
+        art              text NOT NULL,
+        plaetze          int NOT NULL,
+        preis_pro_stunde numeric(8,2) NOT NULL,
+        UNIQUE (standort_id, name)
+      );
+    options:
+      - text: "`id` und `(standort_id, name)` sind beide Kandidatenschlüssel."
+        correct: true
+        why: Beide bestimmen jede Zeile eindeutig, und keiner bleibt eindeutig, wenn du eine seiner Spalten weglässt. `id` ist der gewählte Primärschlüssel, `(standort_id, name)` ist mit `UNIQUE` abgesichert.
+      - text: "`name` allein ist ein Kandidatenschlüssel."
+        correct: false
+        why: Ein „Atelier“ darf es in Plagwitz und im Zentrum geben. Nur zusammen mit `standort_id` ist der Name eindeutig.
+      - text: "`(id, name)` ist ein Kandidatenschlüssel."
+        correct: false
+        why: Das Paar ist eindeutig, aber nicht minimal – `id` allein reicht schon. Solche Spaltenmengen heißen Superschlüssel.
+      - text: "`standort_id` ist ein Fremdschlüssel; für sich allein muss sie nicht eindeutig sein."
+        correct: true
+        why: Ein Standort hat viele Räume, also kommt jede `standort_id` mehrfach vor. `REFERENCES` verlangt nur, dass es den Standort gibt.
+      - text: Weil `id` der Primärschlüssel ist, ist `UNIQUE (standort_id, name)` überflüssig.
+        correct: false
+        why: Die `id` ist für jeden neuen Raum neu. Zwei Zeilen „Box 1“ im selben Standort hätten verschiedene `id`s und wären erlaubt. Die fachliche Regel braucht ihr eigenes `UNIQUE`.
+    explanation: |
+      Ein Kandidatenschlüssel ist eine minimale Spaltenmenge, die jede Zeile eindeutig bestimmt. `raeume` hat zwei: die künstliche `id` und den natürlichen Schlüssel `(standort_id, name)`. Einer davon wird Primärschlüssel, der andere bekommt `UNIQUE` – sonst verhindert nichts fachliche Dubletten. Ein Fremdschlüssel ist eine andere Rolle: Er verweist auf einen Schlüssel einer anderen Tabelle und darf sich wiederholen.
+    resources:
+      - title: PostgreSQL · Unique Constraints
+        url: https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-UNIQUE-CONSTRAINTS
+      - title: PostgreSQL · Primary Keys
+        url: https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-PRIMARY-KEYS
+
+  - id: aufbau-und-abbau
+    type: order
+    title: Aufbauen, füllen, abräumen
+    prompt: |
+      Ein Test legt zwei Tabellen an, füllt sie und räumt am Ende wieder ab. Bring die Anweisungen in eine Reihenfolge, in der keine davon scheitert.
+    lang: postgres
+    lines: |
+      CREATE TABLE standorte (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name text NOT NULL UNIQUE);
+      CREATE TABLE raeume (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, standort_id int NOT NULL REFERENCES standorte (id), name text NOT NULL);
+      INSERT INTO standorte (name) VALUES ('Plagwitz');
+      INSERT INTO raeume (standort_id, name) VALUES (1, 'Atelier');
+      DROP TABLE raeume;
+      DROP TABLE standorte;
+    alternatives:
+      - [1, 3, 2, 4, 5, 6]
+    hints:
+      - "`REFERENCES standorte (id)` setzt voraus, dass `standorte` schon existiert. Ein Raum mit `standort_id = 1` setzt voraus, dass der Standort 1 existiert."
+      - Solange `raeume` auf `standorte` verweist, lehnt PostgreSQL `DROP TABLE standorte` ab.
+    explanation: |
+      Fremdschlüssel legen eine Reihenfolge fest. Beim Anlegen kommt die referenzierte Tabelle zuerst, beim Befüllen der referenzierte Datensatz. Beim Abbauen ist es umgekehrt: `DROP TABLE standorte` scheitert mit `cannot drop table standorte because other objects depend on it`, solange `raeume` darauf verweist. Ob du `standorte` vor oder nach dem Anlegen von `raeume` befüllst, ist egal. Dieselbe Reihenfolge erzeugen Migrationswerkzeuge wie Alembic oder Prisma Migrate aus den Abhängigkeiten der Modelle.
+    resources:
+      - title: PostgreSQL · Foreign Keys
+        url: https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-FK
+
+  - id: null-in-rechnungen
+    type: output
+    title: Wie viele Rechnungen sind offen?
+    prompt: |
+      Was gibt das Skript aus? Ausgabe wie `psql -At`: eine Zeile je Ergebniszeile, Werte durch `|` getrennt, `NULL` als leerer Wert, Wahrheitswerte als `t`/`f`. Befehlsmeldungen wie `INSERT 0 3` erscheinen nicht.
+    lang: postgres
+    code: |
+      SELECT NULL = NULL, NULL IS NULL, NULL <> 'flex', 'fix' IS DISTINCT FROM NULL;
+
+      CREATE TABLE rechnungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        mitglied_id int NOT NULL,
+        monat       date NOT NULL,
+        betrag      numeric(10,2) NOT NULL,
+        bezahlt_am  timestamptz
+      );
+      INSERT INTO rechnungen (mitglied_id, monat, betrag, bezahlt_am) VALUES
+        (1, '2026-03-01', 189.00, '2026-04-02 10:15'),
+        (2, '2026-03-01',  42.50, NULL),
+        (3, '2026-03-01',  96.00, NULL);
+
+      SELECT count(*), count(bezahlt_am) FROM rechnungen;
+      SELECT count(*) FROM rechnungen WHERE bezahlt_am = NULL;
+      SELECT count(*) FROM rechnungen WHERE NOT (bezahlt_am < '2026-04-05');
+      SELECT sum(betrag) FROM rechnungen WHERE bezahlt_am IS NULL;
+    expected: |
+      |t||t
+      3|1
+      0
+      0
+      138.50
+    hints:
+      - Ein Vergleich mit `NULL` ist unbekannt, und `psql -At` zeigt unbekannt als leeren Wert.
+      - "`NOT` von unbekannt ist wieder unbekannt. Welche Zeilen behält `WHERE`?"
+    explanation: |
+      `NULL = NULL` und `NULL <> 'flex'` sind unbekannt, also leer. `IS NULL` und `IS DISTINCT FROM` liefern immer wahr oder falsch. `count(*)` zählt alle drei Zeilen, `count(bezahlt_am)` nur die eine mit Wert. `bezahlt_am = NULL` ist für jede Zeile unbekannt, deshalb 0. Die vorletzte Abfrage ist die Falle: Die bezahlte Rechnung erfüllt `bezahlt_am < '2026-04-05'`, `NOT` macht daraus falsch. Für die beiden offenen ist der Vergleich unbekannt, und `NOT unbekannt` bleibt unbekannt – auch sie fallen heraus. Wer „nicht vor dem 5. April bezahlt“ meint, muss `OR bezahlt_am IS NULL` ausdrücklich schreiben.
+    resources:
+      - title: PostgreSQL · Logical Operators (Wahrheitstabelle)
+        url: https://www.postgresql.org/docs/current/functions-logical.html
+      - title: PostgreSQL · IS DISTINCT FROM
+        url: https://www.postgresql.org/docs/current/functions-comparison.html
+
+  - id: geld-genau
+    type: output
+    title: Cent für Cent
+    prompt: |
+      Was gibt das Skript aus? Ausgabe wie `psql -At`: eine Zeile je Ergebniszeile, Werte durch `|` getrennt, `NULL` als leerer Wert, Wahrheitswerte als `t`/`f`. Zahlen schreibst du so, wie PostgreSQL sie ausgibt.
+    lang: postgres
+    code: |
+      CREATE TABLE posten (betrag numeric(8,2) NOT NULL);
+      INSERT INTO posten VALUES (19.99), (0.10), (0.20);
+
+      SELECT sum(betrag), count(*) FROM posten;
+      SELECT 0.1::float8 + 0.2::float8 = 0.3::float8, 0.10 + 0.20 = 0.30;
+      SELECT 199 / 2, 199 / 2.0, (199 / 2.0)::numeric(8,2);
+      SELECT 12.345::numeric(8,2), 12.344::numeric(8,2);
+    expected: |
+      20.29|3
+      f|t
+      99|99.5000000000000000|99.50
+      12.35|12.34
+    hints:
+      - "`float8` ist `double precision`, eine binäre Gleitkommazahl. Ein Literal wie `0.10` ohne Cast ist `numeric`."
+      - Zwei ganze Zahlen ergeben eine ganze Zahl. `numeric(8,2)` rundet beim Umwandeln auf zwei Nachkommastellen.
+    explanation: |
+      Die Summe einer `numeric(8,2)`-Spalte behält die zwei Nachkommastellen: `20.29`. Mit Gleitkomma ist `0.1 + 0.2` nicht gleich `0.3`, weil keiner der Werte binär exakt darstellbar ist; mit `numeric` ist er es. `199 / 2` ist ganzzahlige Division und schneidet ab. `199 / 2.0` rechnet in `numeric` und gibt viele Nachkommastellen aus, erst der Cast auf `numeric(8,2)` macht daraus `99.50`. Beim Umwandeln rundet PostgreSQL kaufmännisch: `12.345` wird `12.35`, `12.344` wird `12.34`. Für Geld heißt das: Spalten als `numeric(10,2)` anlegen und Zwischenergebnisse bewusst runden.
+    resources:
+      - title: PostgreSQL · Arbitrary Precision Numbers
+        url: https://www.postgresql.org/docs/current/datatype-numeric.html#DATATYPE-NUMERIC-DECIMAL
+      - title: PostgreSQL · Floating-Point Types
+        url: https://www.postgresql.org/docs/current/datatype-numeric.html#DATATYPE-FLOAT
+
+  - id: zeitzone-der-sitzung
+    type: output
+    title: Ein Termin, zwei Server
+    prompt: |
+      Der Buchungsdienst läuft mit `TimeZone = 'Europe/Berlin'`, der Abrechnungsdienst mit UTC. Was gibt das Skript aus? Ausgabe wie `psql -At`: Werte durch `|` getrennt, Wahrheitswerte als `t`/`f`. Zeitpunkte so, wie PostgreSQL sie ausgibt, etwa `2026-03-02 09:00:00+01`.
+    lang: postgres
+    code: |
+      CREATE TABLE zeiten (mit_zone timestamptz, ohne_zone timestamp);
+      INSERT INTO zeiten VALUES ('2026-03-30 09:00', '2026-03-30 09:00');
+
+      SELECT mit_zone, ohne_zone FROM zeiten;
+
+      SET TIME ZONE 'UTC';
+      SELECT mit_zone, ohne_zone FROM zeiten;
+      SELECT mit_zone = ohne_zone FROM zeiten;
+    expected: |
+      2026-03-30 09:00:00+02|2026-03-30 09:00:00
+      2026-03-30 07:00:00+00|2026-03-30 09:00:00
+      f
+    hints:
+      - Der 30. März 2026 liegt nach der Umstellung auf Sommerzeit. Welchen Abstand hat Berlin dann zu UTC?
+      - "`timestamp` ohne Zeitzone kennt keinen Abstand zu UTC. Für den Vergleich mit `timestamptz` liest PostgreSQL ihn in der Zeitzone der Sitzung."
+    explanation: |
+      Beim `INSERT` gilt Berlin, Sommerzeit: `mit_zone` speichert den Moment 07:00 UTC und zeigt ihn in Berlin als `09:00:00+02`. `ohne_zone` speichert nur „30. März, 9 Uhr“. Nach `SET TIME ZONE 'UTC'` zeigt `mit_zone` denselben Moment als `07:00:00+00`, `ohne_zone` bleibt bei 9 Uhr. Für den Vergleich wandelt PostgreSQL `ohne_zone` in einen Zeitpunkt um und nimmt dafür die Zeitzone der Sitzung: 09:00 UTC. Das ist ein anderer Moment als 07:00 UTC, also `f`. In der Berliner Sitzung wäre derselbe Vergleich `t` gewesen – dieselben Daten, ein anderes Ergebnis je nach Server.
+    resources:
+      - title: PostgreSQL · Time Zones
+        url: https://www.postgresql.org/docs/current/datatype-datetime.html#DATATYPE-TIMEZONES
+      - title: PostgreSQL Wiki · Don't use timestamp (without time zone)
+        url: https://wiki.postgresql.org/wiki/Don%27t_Do_This#Don.27t_use_timestamp_.28without_time_zone.29
+
+  - id: mitglieder-tabelle
+    type: gap
+    title: Die Tabelle mitglieder
+    prompt: |
+      Ergänze die Definition von `mitglieder`. Die `id` vergibt ausschließlich die Datenbank, die App darf keine eigene setzen. Jede E-Mail-Adresse darf es nur einmal geben. `erstellt_am` ist ein eindeutiger Zeitpunkt und wird beim Einfügen automatisch gesetzt.
+    lang: postgres
+    code: |
+      CREATE TABLE mitglieder (
+        id          int ⟦GENERATED ALWAYS AS IDENTITY⟧ PRIMARY KEY,
+        email       text NOT NULL ⟦UNIQUE⟧,
+        name        text NOT NULL,
+        tarif       text NOT NULL DEFAULT 'flex',
+        erstellt_am ⟦timestamptz⟧ NOT NULL ⟦DEFAULT now()⟧
+      );
+    gaps:
+      - label: Automatische ID
+        hint: Eine Identity-Spalte, bei der die App keinen eigenen Wert einfügen darf.
+      - label: E-Mail eindeutig
+        hint: Ein Constraint, der den natürlichen Schlüssel absichert.
+      - label: Typ für Zeitpunkte
+        hint: Der Typ, der einen Moment unabhängig von der Zeitzone des Servers speichert.
+        accept: ["timestamp with time zone"]
+      - label: Automatischer Wert
+        hint: Ein Standardwert mit der Funktion für den aktuellen Zeitpunkt.
+        accept: ["DEFAULT CURRENT_TIMESTAMP", "DEFAULT transaction_timestamp()", "DEFAULT statement_timestamp()", "DEFAULT clock_timestamp()"]
+    explanation: |
+      `GENERATED ALWAYS AS IDENTITY` lässt PostgreSQL die `id` vergeben und lehnt eigene Werte ab; `BY DEFAULT` würde sie erlauben und später Kollisionen mit der Sequenz riskieren. `UNIQUE` sichert den natürlichen Schlüssel neben dem künstlichen Primärschlüssel ab. `timestamptz` speichert einen eindeutigen Moment. `DEFAULT now()` setzt den Startzeitpunkt der Transaktion ein, wenn die Spalte im `INSERT` fehlt – für jeden Client, nicht nur für das ORM.
+    resources:
+      - title: PostgreSQL · Identity Columns
+        url: https://www.postgresql.org/docs/current/ddl-identity-columns.html
+      - title: PostgreSQL · Default Values
+        url: https://www.postgresql.org/docs/current/ddl-default.html
+
+  - id: checkins-anlegen
+    type: sql
+    lang: postgres
+    title: Check-ins speichern
+    prompt: |
+      Am Empfang jedes Standorts checken Mitglieder morgens ein. Lege die Tabelle `checkins` an:
+
+      - `id`: `bigint`, vergeben ausschließlich von der Datenbank (eigene Werte werden abgelehnt), Primärschlüssel.
+      - `mitglied_id`: Pflicht, muss auf ein vorhandenes Mitglied zeigen.
+      - `standort_id`: Pflicht, muss auf einen vorhandenen Standort zeigen.
+      - `zeitpunkt`: Pflicht, ein eindeutiger Zeitpunkt (mit Zeitzone).
+
+      Die Prüfabfrage versucht gültige und ungültige Check-ins und liest die Typen von `id` und `zeitpunkt` aus `information_schema`.
+    schema: |
+      CREATE TABLE standorte (
+        id    int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        name  text NOT NULL UNIQUE,
+        stadt text NOT NULL DEFAULT 'Leipzig'
+      );
+      CREATE TABLE mitglieder (
+        id          int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        email       text NOT NULL UNIQUE,
+        name        text NOT NULL,
+        tarif       text NOT NULL DEFAULT 'flex',
+        erstellt_am timestamptz NOT NULL DEFAULT now()
+      );
+      INSERT INTO standorte (name) VALUES ('Plagwitz'), ('Südvorstadt'), ('Zentrum');
+      INSERT INTO mitglieder (email, name, tarif) VALUES
+        ('jana.krueger@example.org', 'Jana Krüger', 'fix'),
+        ('mehmet.oezdemir@example.org', 'Mehmet Özdemir', 'flex');
+    starter: |
+      CREATE TABLE checkins (
+        -- deine Spalten
+      );
+    solution: |
+      CREATE TABLE checkins (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        mitglied_id int NOT NULL REFERENCES mitglieder (id),
+        standort_id int NOT NULL REFERENCES standorte (id),
+        zeitpunkt   timestamptz NOT NULL
+      );
+    check: |
+      SELECT lp.versuch($$INSERT INTO checkins (mitglied_id, standort_id, zeitpunkt) VALUES (1, 3, '2026-03-02 08:55')$$) AS gueltig,
+             lp.versuch($$INSERT INTO checkins (mitglied_id, standort_id, zeitpunkt) VALUES (9, 3, '2026-03-02 08:55')$$) AS unbekanntes_mitglied,
+             lp.versuch($$INSERT INTO checkins (mitglied_id, standort_id, zeitpunkt) VALUES (1, 7, '2026-03-02 08:55')$$) AS unbekannter_standort,
+             lp.versuch($$INSERT INTO checkins (mitglied_id, standort_id) VALUES (1, 3)$$) AS ohne_zeitpunkt,
+             lp.versuch($$INSERT INTO checkins (mitglied_id, zeitpunkt) VALUES (1, '2026-03-02 08:55')$$) AS ohne_standort,
+             lp.versuch($$INSERT INTO checkins (id, mitglied_id, standort_id, zeitpunkt) VALUES (5, 1, 3, '2026-03-02 08:55')$$) AS eigene_id,
+             (SELECT data_type FROM information_schema.columns
+               WHERE table_schema = 'public' AND table_name = 'checkins' AND column_name = 'id') AS typ_id,
+             (SELECT data_type FROM information_schema.columns
+               WHERE table_schema = 'public' AND table_name = 'checkins' AND column_name = 'zeitpunkt') AS typ_zeitpunkt;
+    hints:
+      - Orientiere dich an `buchungen` aus der Lektion. Jede Spalte braucht einen Typ, die Pflichtspalten `NOT NULL`.
+      - "Ein Fremdschlüssel in der Spaltendefinition: `mitglied_id int NOT NULL REFERENCES mitglieder (id)`."
+      - "`id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY` und `zeitpunkt timestamptz NOT NULL`."
+    explanation: |
+      Jede Regel aus der Aufgabe steht als Constraint im Schema und gilt damit für jeden Client. `REFERENCES` lehnt Check-ins für unbekannte Mitglieder oder Standorte mit `foreign_key_violation` ab, `NOT NULL` fehlende Werte mit `not_null_violation`. `GENERATED ALWAYS` lehnt eine eigene `id` mit SQLSTATE `428C9` ab. `bigint` ist bei Deskwerk die Regel für Ereignistabellen wie `checkins` und `buchungen`: Sie wachsen ohne Obergrenze, die vier zusätzlichen Bytes je Zeile fallen kaum ins Gewicht, und ein späterer Wechsel des Schlüsseltyps wäre eine teure Migration. Der Typ `timestamptz` erscheint in `information_schema` als `timestamp with time zone`.
+    resources:
+      - title: PostgreSQL · CREATE TABLE
+        url: https://www.postgresql.org/docs/current/sql-createtable.html
+      - title: PostgreSQL · Foreign Keys
+        url: https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-FK
+
+  - id: raum-und-mitglied-einfuegen
+    type: sql
+    lang: postgres
+    title: Neue Box, neues Mitglied
+    prompt: |
+      Zwei Änderungen für den Start im April:
+
+      1. Im Standort **Zentrum** eröffnet die Telefonbox `Box 4`: Art `telefonbox`, 1 Platz, 4,00 € pro Stunde. Hole die `standort_id` über den Namen des Standorts, statt eine Zahl abzuschreiben.
+      2. `Ole Becker` meldet sich mit `ole.becker@example.org` an. Er bekommt den Standardtarif, und `id` und `erstellt_am` setzt die Datenbank.
+
+      Die Prüfabfrage zeigt den neuen Raum mit seinem Standort und das neue Mitglied mit Tarif und der Angabe, ob `erstellt_am` gesetzt ist.
+    schema: |
+      CREATE TABLE standorte (
+        id    int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        name  text NOT NULL UNIQUE,
+        stadt text NOT NULL DEFAULT 'Leipzig'
+      );
+      CREATE TABLE raeume (
+        id               int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        standort_id      int NOT NULL REFERENCES standorte (id),
+        name             text NOT NULL,
+        art              text NOT NULL CHECK (art IN ('schreibtisch', 'meetingraum', 'telefonbox')),
+        plaetze          int NOT NULL CHECK (plaetze > 0),
+        preis_pro_stunde numeric(8,2) NOT NULL CHECK (preis_pro_stunde >= 0),
+        UNIQUE (standort_id, name)
+      );
+      CREATE TABLE mitglieder (
+        id          int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        email       text NOT NULL UNIQUE,
+        name        text NOT NULL,
+        tarif       text NOT NULL DEFAULT 'flex',
+        erstellt_am timestamptz NOT NULL DEFAULT now()
+      );
+      INSERT INTO standorte (name) VALUES ('Südvorstadt'), ('Zentrum'), ('Plagwitz');
+      INSERT INTO raeume (standort_id, name, art, plaetze, preis_pro_stunde) VALUES
+        (3, 'Atelier', 'meetingraum', 8, 25.00),
+        (3, 'Box 1', 'telefonbox', 1, 4.00),
+        (1, 'Loft', 'meetingraum', 12, 35.00),
+        (2, 'Box 3', 'telefonbox', 1, 4.00);
+      INSERT INTO mitglieder (email, name, tarif) VALUES
+        ('jana.krueger@example.org', 'Jana Krüger', 'fix'),
+        ('lea.hoffmann@example.org', 'Lea Hoffmann', 'team');
+    starter: |
+      -- INSERT INTO raeume (…) SELECT … FROM standorte WHERE …;
+      -- INSERT INTO mitglieder (…) VALUES (…);
+    solution: |
+      INSERT INTO raeume (standort_id, name, art, plaetze, preis_pro_stunde)
+      SELECT id, 'Box 4', 'telefonbox', 1, 4.00
+      FROM standorte
+      WHERE name = 'Zentrum';
+
+      INSERT INTO mitglieder (email, name)
+      VALUES ('ole.becker@example.org', 'Ole Becker');
+    check: |
+      SELECT s.name AS standort, r.name AS raum, r.art, r.plaetze, r.preis_pro_stunde,
+             m.name AS mitglied, m.tarif, m.erstellt_am IS NOT NULL AS erstellt_gesetzt
+      FROM raeume AS r
+      JOIN standorte AS s ON s.id = r.standort_id
+      CROSS JOIN mitglieder AS m
+      WHERE r.name = 'Box 4' AND m.email = 'ole.becker@example.org';
+    hints:
+      - "`INSERT … SELECT` fügt die Zeilen ein, die eine Abfrage liefert. Die Abfrage darf neben Spalten auch feste Werte auswählen."
+      - Spalten, die im `INSERT` fehlen, bekommen ihren `DEFAULT` – auch `tarif` und `erstellt_am`. Die `id` lässt du ganz weg.
+      - "`INSERT INTO raeume (standort_id, name, art, plaetze, preis_pro_stunde) SELECT id, 'Box 4', 'telefonbox', 1, 4.00 FROM standorte WHERE name = 'Zentrum';`"
+    explanation: |
+      Die `id` eines Standorts ist ein künstlicher Schlüssel und kann in jeder Umgebung anders sein – hier hat das Zentrum die 2, nicht die 3. `INSERT … SELECT` holt sie über den natürlichen Schlüssel `name`, so funktioniert dieselbe Anweisung in Test, Staging und Produktion. Gibt es den Standort nicht, fügt sie keine Zeile ein, statt auf einen falschen Standort zu zeigen. Beim Mitglied lässt du `id`, `tarif` und `erstellt_am` weg: Die Datenbank setzt die Identity, den Standardtarif `flex` und `now()`. Ein ausdrückliches `DEFAULT` als Wert wäre ebenfalls richtig.
+    resources:
+      - title: PostgreSQL · INSERT
+        url: https://www.postgresql.org/docs/current/sql-insert.html
+      - title: PostgreSQL · Default Values
+        url: https://www.postgresql.org/docs/current/ddl-default.html
+
+  - id: mahnliste
+    type: sql
+    lang: postgres
+    title: Die Mahnliste
+    prompt: |
+      Die Buchhaltung will alle **offenen** Rechnungen (`bezahlt_am` ist leer) aus Monaten **vor März 2026** sehen, mit Name und E-Mail des Mitglieds.
+
+      Spalten: `name`, `email`, `monat`, `betrag`. Sortierung: `monat` aufsteigend, bei gleichem Monat `name` aufsteigend.
+    schema: |
+      CREATE TABLE mitglieder (
+        id    int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        email text NOT NULL UNIQUE,
+        name  text NOT NULL,
+        tarif text NOT NULL DEFAULT 'flex'
+      );
+      CREATE TABLE rechnungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        mitglied_id int NOT NULL REFERENCES mitglieder (id),
+        monat       date NOT NULL,
+        betrag      numeric(10,2) NOT NULL,
+        bezahlt_am  timestamptz,
+        UNIQUE (mitglied_id, monat)
+      );
+      INSERT INTO mitglieder (email, name, tarif) VALUES
+        ('jana.krueger@example.org', 'Jana Krüger', 'fix'),
+        ('mehmet.oezdemir@example.org', 'Mehmet Özdemir', 'flex'),
+        ('lea.hoffmann@example.org', 'Lea Hoffmann', 'team'),
+        ('tobias.schulz@example.org', 'Tobias Schulz', 'flex');
+      INSERT INTO rechnungen (mitglied_id, monat, betrag, bezahlt_am) VALUES
+        (1, '2026-01-01', 189.00, '2026-02-03 09:12'),
+        (2, '2026-01-01',  36.00, NULL),
+        (3, '2026-01-01', 420.00, '2026-02-10 14:30'),
+        (1, '2026-02-01', 189.00, '2026-03-04 08:40'),
+        (2, '2026-02-01',  52.00, NULL),
+        (3, '2026-02-01', 420.00, NULL),
+        (4, '2026-02-01',  12.00, NULL),
+        (1, '2026-03-01', 189.00, NULL),
+        (2, '2026-03-01',  18.00, NULL);
+    starter: |
+      SELECT m.name, m.email, r.monat, r.betrag, r.bezahlt_am
+      FROM rechnungen AS r
+      JOIN mitglieder AS m ON m.id = r.mitglied_id;
+    solution: |
+      SELECT m.name, m.email, r.monat, r.betrag
+      FROM rechnungen AS r
+      JOIN mitglieder AS m ON m.id = r.mitglied_id
+      WHERE r.bezahlt_am IS NULL
+        AND r.monat < '2026-03-01'
+      ORDER BY r.monat, m.name;
+    ordered: true
+    hints:
+      - Offen heißt `bezahlt_am` ist `NULL`. Welcher Vergleich ist für `NULL` wahr?
+      - "`monat` ist ein `date` mit dem ersten Tag des Monats. „Vor März“ heißt kleiner als der 1. März."
+      - "`WHERE r.bezahlt_am IS NULL AND r.monat < '2026-03-01' ORDER BY r.monat, m.name`."
+    explanation: |
+      `bezahlt_am IS NULL` findet die offenen Rechnungen; `bezahlt_am = NULL` fände keine einzige. `monat` ist ein `date`, deshalb vergleicht `< '2026-03-01'` Kalendertage, ohne Uhrzeit und ohne Zeitzone. Das Ergebnis hat vier Zeilen: Mehmet Özdemir für Januar, dann für Februar Lea Hoffmann, Mehmet Özdemir und Tobias Schulz. Die beiden offenen März-Rechnungen sind noch nicht fällig. Ohne den zweiten Sortierschlüssel `name` wäre die Reihenfolge innerhalb des Februars zufällig – mehr dazu in [Abfragen für Anwendungen](/postgres/abfragen).
+    resources:
+      - title: PostgreSQL · Comparison Predicates (IS NULL)
+        url: https://www.postgresql.org/docs/current/functions-comparison.html#FUNCTIONS-COMPARISON-PRED-TABLE
+
+  - id: typen-audit
+    type: sql
+    lang: postgres
+    title: Typen-Audit im Katalog
+    prompt: |
+      Vor der Übernahme der Abrechnung prüfst du das Schema eines älteren Deskwerk-Dienstes. Finde mit `information_schema.columns` alle Spalten im Schema `public`, die einen **Zeitpunkt ohne Zeitzone** (`timestamp without time zone`) oder eine **Gleitkommazahl** (`real` oder `double precision`) speichern.
+
+      Spalten: `table_name`, `column_name`, `data_type`. Sortierung: `table_name`, dann `column_name`, beide aufsteigend.
+    schema: |
+      CREATE TABLE mitglieder (
+        id          int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        email       text NOT NULL UNIQUE,
+        name        text NOT NULL,
+        erstellt_am timestamp NOT NULL DEFAULT now()
+      );
+      CREATE TABLE buchungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        mitglied_id int NOT NULL REFERENCES mitglieder (id),
+        beginn      timestamptz NOT NULL,
+        ende        timestamptz NOT NULL,
+        preis       real
+      );
+      CREATE TABLE rechnungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        mitglied_id int NOT NULL REFERENCES mitglieder (id),
+        monat       date NOT NULL,
+        betrag      double precision NOT NULL,
+        rabatt      numeric(5,2) NOT NULL DEFAULT 0,
+        bezahlt_am  timestamp(3)
+      );
+    starter: |
+      SELECT table_name, column_name, data_type
+      FROM information_schema.columns
+      WHERE table_schema = 'public';
+    solution: |
+      SELECT table_name, column_name, data_type
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND data_type IN ('timestamp without time zone', 'real', 'double precision')
+      ORDER BY table_name, column_name;
+    ordered: true
+    hints:
+      - "`information_schema.columns` hat eine Zeile je Spalte jeder Tabelle. Der Typ steht ausgeschrieben in `data_type`, etwa `timestamp with time zone`."
+      - "Du suchst drei Typnamen. `IN (…)` ist kürzer als drei `OR`."
+      - "`AND data_type IN ('timestamp without time zone', 'real', 'double precision') ORDER BY table_name, column_name`."
+    explanation: |
+      Der Katalog ist selbst eine Menge von Tabellen, die du mit SQL abfragst. `information_schema.columns` nennt den Typ in der Schreibweise des SQL-Standards: `timestamp` heißt dort `timestamp without time zone`, auch mit Genauigkeit wie bei `timestamp(3)`, und `timestamptz` heißt `timestamp with time zone`. Gefunden werden `buchungen.preis` (`real`), `mitglieder.erstellt_am` und `rechnungen.bezahlt_am` (ohne Zeitzone) sowie `rechnungen.betrag` (`double precision`). `rechnungen.monat` ist ein `date` und richtig so. Eine solche Abfrage lässt sich als Test in die CI hängen, damit kein neuer Gleitkomma-Betrag mehr durchrutscht.
+    resources:
+      - title: PostgreSQL · information_schema.columns
+        url: https://www.postgresql.org/docs/current/infoschema-columns.html
+
+  - id: rechnungstabelle-typen
+    type: bug
+    title: Cent-Fehler und verschobene Zahlungen
+    prompt: |
+      Zwei Tickets zur Tabelle `rechnungen`:
+
+      - Die Buchhaltung meldet, dass `sum(betrag)` für März `5739.2485` liefert. Die Einzelbeträge haben zwei Nachkommastellen, die Summe müsste `5739.25` sein.
+      - Der Abrechnungsdienst läuft mit UTC und zeigt jeden Zahlungseingang eine bzw. zwei Stunden später als die Buchungs-App, die mit `Europe/Berlin` läuft und die Zahlungen speichert.
+
+      Finde die beiden fehlerhaften Zeilen und korrigiere sie.
+    lang: postgres
+    code: |
+      CREATE TABLE rechnungen (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        mitglied_id int NOT NULL REFERENCES mitglieder (id),
+        monat       date NOT NULL,
+        betrag      real NOT NULL,
+        bezahlt_am  timestamp,
+        UNIQUE (mitglied_id, monat)
+      );
+    lines: [5, 6]
+    fix:
+      - line: 5
+        answers:
+          - "betrag numeric(10,2) NOT NULL,"
+          - "betrag decimal(10,2) NOT NULL,"
+          - "betrag numeric(12,2) NOT NULL,"
+          - "betrag numeric(8,2) NOT NULL,"
+          - "betrag numeric NOT NULL,"
+      - line: 6
+        answers:
+          - "bezahlt_am timestamptz,"
+          - "bezahlt_am timestamp with time zone,"
+          - "bezahlt_am timestamptz(3),"
+    hints:
+      - Welcher Typ kann 0,10 € nicht exakt speichern?
+      - Die App schreibt `09:00` in Berlin. Was steht danach in einer Spalte, die keine Zeitzone kennt, und wie liest ein Dienst mit UTC sie?
+    explanation: |
+      `real` ist eine binäre Gleitkommazahl mit etwa sechs Stellen Genauigkeit. Schon `189.90` ist darin nur angenähert, und beim Summieren wachsen die Fehler: `5739.2485` statt `5739.25`. `numeric(10,2)` rechnet dezimal und exakt. `timestamp` ohne Zeitzone speichert die Berliner Wanduhrzeit, etwa `09:00`, ohne Ortsangabe. Der Abrechnungsdienst liest sie als 09:00 UTC, das ist in Berlin 10:00 im Winter und 11:00 im Sommer. Mit `timestamptz` speichert die Spalte den Moment, und jeder Dienst zeigt ihn richtig in seiner Zeitzone an. `monat` bleibt ein `date`: Ein Abrechnungsmonat ist ein Kalenderdatum, kein Moment.
+    resources:
+      - title: PostgreSQL Wiki · Don't use timestamp (without time zone)
+        url: https://wiki.postgresql.org/wiki/Don%27t_Do_This#Don.27t_use_timestamp_.28without_time_zone.29
+      - title: PostgreSQL · Floating-Point Types
+        url: https://www.postgresql.org/docs/current/datatype-numeric.html#DATATYPE-FLOAT
+
+  - id: none-als-parameter
+    type: bug
+    title: Offene Rechnungen gibt es nie
+    prompt: |
+      Der Abrechnungsdienst lädt Rechnungen eines Mitglieds mit psycopg. `rechnungen(con, 7, datetime(2026, 4, 3, 10, 15, tzinfo=BERLIN))` liefert die Rechnungen, die zu diesem Zeitpunkt bezahlt wurden. `rechnungen(con, 7, None)` soll die **offenen** Rechnungen liefern, gibt aber immer eine leere Liste zurück, obwohl Mitglied 7 zwei offene Rechnungen hat. Finde die fehlerhafte Zeile und korrigiere sie so, dass beide Aufrufe stimmen.
+    lang: python
+    code: |
+      def rechnungen(con, mitglied_id: int, bezahlt_am: datetime | None):
+          return con.execute(
+              "SELECT monat, betrag FROM rechnungen"
+              " WHERE mitglied_id = %s AND bezahlt_am = %s"
+              " ORDER BY monat",
+              (mitglied_id, bezahlt_am),
+          ).fetchall()
+    lines: [4]
+    fix:
+      - line: 4
+        answers:
+          - "\" WHERE mitglied_id = %s AND bezahlt_am IS NOT DISTINCT FROM %s\""
+          - "\" WHERE mitglied_id = %s AND bezahlt_am is not distinct from %s\""
+          - "\" WHERE mitglied_id = %s AND bezahlt_am IS NOT DISTINCT FROM %s \""
+    hints:
+      - psycopg schickt `None` als `NULL`. Welche Bedingung entsteht daraus, und was ist ihr Wahrheitswert?
+      - Gesucht ist ein Vergleich, der `NULL` wie einen gewöhnlichen Wert behandelt und für zwei `NULL` wahr ist.
+    explanation: |
+      psycopg übergibt `None` als `NULL`, die Bedingung lautet dann `bezahlt_am = NULL`. Das ist für jede Zeile unbekannt, auch für Zeilen mit `bezahlt_am IS NULL`, und `WHERE` verwirft unbekannte Zeilen. `IS NOT DISTINCT FROM` behandelt `NULL` als vergleichbaren Wert: Mit `None` findet es die offenen Rechnungen, mit einem Zeitpunkt die dazu bezahlten. Der Preis: Für `IS NOT DISTINCT FROM` nutzt PostgreSQL keinen B-Baum-Index auf `bezahlt_am`. Bei großen Tabellen wählst du deshalb in Python zwischen zwei Abfragen (`IS NULL` oder `= %s`). SQLAlchemy nimmt dir diese Übersetzung ab, wenn du `Rechnung.bezahlt_am == None` oder `.is_(None)` schreibst, bei rohem SQL bist du selbst zuständig.
+    resources:
+      - title: PostgreSQL · IS DISTINCT FROM
+        url: https://www.postgresql.org/docs/current/functions-comparison.html#FUNCTIONS-COMPARISON-PRED-TABLE
+      - title: psycopg 3 · Passing parameters to SQL queries
+        url: https://www.psycopg.org/psycopg3/docs/basic/params.html
+
+  - id: orm-modell-lesen
+    type: explain
+    title: Welche Tabelle erzeugt dieses Modell?
+    prompt: |
+      Ein Kollege hat für ein neues Feature dieses SQLAlchemy-Modell geschrieben und die Migration automatisch erzeugen lassen. Erkläre im Review, welche Tabelle PostgreSQL daraus bekommt (Typen, `NULL` oder `NOT NULL`, Standardwerte, Schlüssel), und was du vor dem Merge ändern würdest.
+    lang: python
+    code: |
+      class Mitglied(Base):
+          __tablename__ = "mitglieder"
+
+          id: Mapped[int] = mapped_column(primary_key=True)
+          email: Mapped[str] = mapped_column(unique=True)
+          name: Mapped[str]
+          tarif: Mapped[str] = mapped_column(default="flex")
+          erstellt_am: Mapped[datetime] = mapped_column(server_default=func.now())
+          gekuendigt_am: Mapped[Optional[datetime]]
+    points:
+      - "Die Nullbarkeit kommt aus der Annotation: alle Spalten außer `gekuendigt_am` werden `NOT NULL`, `Optional[...]` erlaubt `NULL`."
+      - "`Mapped[datetime]` ohne `DateTime(timezone=True)` wird `timestamp without time zone` – beide Zeitspalten sollten `timestamptz` sein."
+      - "`id` wird ein `SERIAL`-Primärschlüssel (`integer`), `email` ein `VARCHAR` mit `UNIQUE`; `text` oder eine fachliche Längenregel wären klarer."
+      - "`default=\"flex\"` gilt nur für Inserts über SQLAlchemy; im Schema steht kein `DEFAULT`. `server_default` würde die Regel für alle Clients festhalten, wie bei `erstellt_am`."
+    explanation: |
+      SQLAlchemy 2 leitet Typ und Nullbarkeit aus den Annotationen ab. `Mapped[int]` mit `primary_key=True` wird auf PostgreSQL ein `SERIAL`, also ein `integer` mit Sequenz; für eine Mitgliedertabelle reicht `int`, als Stil im Projekt wäre `Identity(always=True)` moderner. `Mapped[str]` ergibt `VARCHAR NOT NULL` ohne Länge – in PostgreSQL funktional wie `text`. `email` bekommt `UNIQUE`, gut so. Kritisch sind die Zeiten: `Mapped[datetime]` wird `TIMESTAMP WITHOUT TIME ZONE`, und damit hängen `erstellt_am` und `gekuendigt_am` von der Zeitzone der Sitzung ab. Ich würde `mapped_column(DateTime(timezone=True), …)` verlangen. `gekuendigt_am` ist `Optional` und damit nullable, fachlich richtig: `NULL` heißt „nicht gekündigt“. `tarif` hat nur einen Python-Default; ein Import per psql oder der Prisma-Dienst bekämen keinen Wert und scheitern an `NOT NULL`. Mit `server_default="flex"` steht der Standardwert im Schema, wie bei `erstellt_am`.
+    resources:
+      - title: SQLAlchemy · mapped_column derives the datatype and nullability
+        url: https://docs.sqlalchemy.org/en/21/orm/declarative_tables.html#mapped-column-derives-the-datatype-and-nullability-from-the-mapped-annotation
+      - title: SQLAlchemy · DateTime
+        url: https://docs.sqlalchemy.org/en/21/core/type_basics.html#sqlalchemy.types.DateTime
+
+  - id: gutscheine-modellieren
+    type: sql
+    lang: postgres
+    title: Gutscheine für Deskwerk
+    prompt: |
+      Deskwerk verkauft Gutscheine. Lege die Tabelle `gutscheine` an und füge zwei Gutscheine ein.
+
+      Anforderungen an die Tabelle:
+
+      - `id`: `bigint`, vergeben ausschließlich von der Datenbank, Primärschlüssel.
+      - `code`: Text, Pflicht, jeder Code nur einmal (er steht auf dem Gutschein und wird an der Kasse eingetippt).
+      - `wert`: Geldbetrag mit genau zwei Nachkommastellen, Pflicht, exakt gerechnet.
+      - `mitglied_id`: optional (`NULL` = noch keinem Mitglied zugeordnet), muss sonst auf ein vorhandenes Mitglied zeigen.
+      - `gueltig_bis`: Kalendertag, Pflicht.
+      - `eingeloest_am`: optionaler Zeitpunkt mit Zeitzone.
+
+      Gutscheine:
+
+      - `DESK-2026-A` über 25,00 €, gültig bis 30. Juni 2026, keinem Mitglied zugeordnet.
+      - `DESK-2026-B` über 50,00 €, gültig bis 31. Dezember 2026, für das Mitglied mit der E-Mail `lea.hoffmann@example.org`.
+
+      Die Prüfabfrage zeigt je Prüfung eine Zeile: Versuche mit gültigen und ungültigen Gutscheinen, die Typen von `id`, `wert`, `gueltig_bis` und `eingeloest_am` (mit Nachkommastellen von `wert`) und die beiden eingefügten Gutscheine.
+    schema: |
+      CREATE TABLE mitglieder (
+        id          int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        email       text NOT NULL UNIQUE,
+        name        text NOT NULL,
+        tarif       text NOT NULL DEFAULT 'flex',
+        erstellt_am timestamptz NOT NULL DEFAULT now()
+      );
+      INSERT INTO mitglieder (email, name, tarif) VALUES
+        ('jana.krueger@example.org', 'Jana Krüger', 'fix'),
+        ('mehmet.oezdemir@example.org', 'Mehmet Özdemir', 'flex'),
+        ('lea.hoffmann@example.org', 'Lea Hoffmann', 'team');
+    starter: |
+      CREATE TABLE gutscheine (
+        -- deine Spalten
+      );
+
+      -- INSERT INTO gutscheine …
+    solution: |
+      CREATE TABLE gutscheine (
+        id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        code          text NOT NULL UNIQUE,
+        wert          numeric(8,2) NOT NULL,
+        mitglied_id   int REFERENCES mitglieder (id),
+        gueltig_bis   date NOT NULL,
+        eingeloest_am timestamptz
+      );
+
+      INSERT INTO gutscheine (code, wert, gueltig_bis)
+      VALUES ('DESK-2026-A', 25.00, '2026-06-30');
+
+      INSERT INTO gutscheine (code, wert, mitglied_id, gueltig_bis)
+      SELECT 'DESK-2026-B', 50.00, id, '2026-12-31'
+      FROM mitglieder
+      WHERE email = 'lea.hoffmann@example.org';
+    check: |
+      SELECT 'gültiger Gutschein' AS pruefung,
+             lp.versuch($$INSERT INTO gutscheine (code, wert, gueltig_bis) VALUES ('DESK-TEST', 10, '2026-12-31')$$) AS ergebnis
+      UNION ALL
+      SELECT 'doppelter Code',
+             lp.versuch($$INSERT INTO gutscheine (code, wert, gueltig_bis) VALUES ('DESK-2026-A', 10, '2026-12-31')$$)
+      UNION ALL
+      SELECT 'ohne Code',
+             lp.versuch($$INSERT INTO gutscheine (wert, gueltig_bis) VALUES (10, '2026-12-31')$$)
+      UNION ALL
+      SELECT 'ohne Wert',
+             lp.versuch($$INSERT INTO gutscheine (code, gueltig_bis) VALUES ('DESK-TEST', '2026-12-31')$$)
+      UNION ALL
+      SELECT 'ohne Ablaufdatum',
+             lp.versuch($$INSERT INTO gutscheine (code, wert) VALUES ('DESK-TEST', 10)$$)
+      UNION ALL
+      SELECT 'unbekanntes Mitglied',
+             lp.versuch($$INSERT INTO gutscheine (code, wert, mitglied_id, gueltig_bis) VALUES ('DESK-TEST', 10, 99, '2026-12-31')$$)
+      UNION ALL
+      SELECT 'eigene id',
+             lp.versuch($$INSERT INTO gutscheine (id, code, wert, gueltig_bis) VALUES (100, 'DESK-TEST', 10, '2026-12-31')$$)
+      UNION ALL
+      SELECT 'Typ ' || column_name,
+             data_type || CASE WHEN data_type = 'numeric'
+                               THEN ' mit ' || coalesce(numeric_scale::text, 'beliebig vielen') || ' Nachkommastellen'
+                               ELSE '' END
+      FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'gutscheine'
+        AND column_name IN ('id', 'wert', 'gueltig_bis', 'eingeloest_am')
+      UNION ALL
+      SELECT 'Gutschein ' || g.code,
+             g.wert || ' € bis ' || g.gueltig_bis || ', ' || coalesce(m.email, 'ohne Mitglied')
+                    || ', eingelöst: ' || coalesce(g.eingeloest_am::text, 'nein')
+      FROM gutscheine AS g
+      LEFT JOIN mitglieder AS m ON m.id = g.mitglied_id;
+    hints:
+      - Gehe die Anforderungen Spalte für Spalte durch. Für jede brauchst du einen Typ und die Entscheidung `NULL` oder `NOT NULL`; dazu kommen `UNIQUE`, `REFERENCES` und die Identity.
+      - Geld ist `numeric` mit zwei Nachkommastellen, ein Kalendertag `date`, ein Zeitpunkt `timestamptz`. Eine optionale Fremdschlüsselspalte hat `REFERENCES`, aber kein `NOT NULL`.
+      - "Den zweiten Gutschein fügst du mit `INSERT INTO gutscheine (code, wert, mitglied_id, gueltig_bis) SELECT 'DESK-2026-B', 50.00, id, '2026-12-31' FROM mitglieder WHERE email = …` ein."
+    explanation: |
+      Die Tabelle hat einen künstlichen Primärschlüssel und den natürlichen Schlüssel `code` mit `UNIQUE`, denn an der Kasse wird der Code eingetippt, nicht die `id`. `numeric(8,2)` (oder mehr Vorkommastellen) rechnet exakt in Cent. `mitglied_id` ist ein optionaler Fremdschlüssel: `NULL` hat hier eine fachliche Bedeutung („nicht zugeordnet“), und `REFERENCES` prüft nur Werte, die gesetzt sind. `gueltig_bis` ist ein Kalendertag, kein Zeitpunkt – „gültig bis 30. Juni“ gilt in jeder Zeitzone für den ganzen Tag. `eingeloest_am` ist dagegen ein Moment und deshalb `timestamptz`. Den zweiten Gutschein ordnest du über die E-Mail zu, nicht über eine abgeschriebene `id`.
+    resources:
+      - title: PostgreSQL · CREATE TABLE
+        url: https://www.postgresql.org/docs/current/sql-createtable.html
+      - title: PostgreSQL · Date/Time Types
+        url: https://www.postgresql.org/docs/current/datatype-datetime.html
+      - title: PostgreSQL · Arbitrary Precision Numbers
+        url: https://www.postgresql.org/docs/current/datatype-numeric.html#DATATYPE-NUMERIC-DECIMAL
