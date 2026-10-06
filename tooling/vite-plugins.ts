@@ -133,7 +133,8 @@ export function vmVersion(): string {
 const files = (dir: string): string[] => existsSync(dir) ? readdirSync(dir, { recursive: true, encoding: 'utf8' }).filter((name) => statSync(join(dir, name)).isFile()) : [];
 /**
  * Emits /sw.js from src/service-worker.ts in production builds. It precaches every built file (app shell and all
- * content chunks) plus fonts, icons and the manifest from public/; Pyodide and the Linux VM are only cached once used.
+ * content chunks except PostgreSQL's large runtime files) plus fonts, icons and the manifest from public/; Pyodide,
+ * PostgreSQL and the Linux VM are only cached once used.
  * The cache version changes with any of these files, so each deployment installs a fresh, consistent set.
  */
 export function serviceWorker(): Plugin {
@@ -145,7 +146,9 @@ export function serviceWorker(): Plugin {
     configResolved(config) { publicDir = config.publicDir; },
     async generateBundle(_, bundle) {
       const hash = createHash('sha256');
-      const built = Object.keys(bundle).sort();
+      // PostgreSQL's WebAssembly, file system bundle and extension archives (about 16 MB): cached on first use only.
+      const lazy = Object.keys(bundle).filter((name) => /\.(?:wasm|data|gz)$/.test(name)).sort();
+      const built = Object.keys(bundle).filter((name) => !lazy.includes(name)).sort();
       for (const name of built) {
         const item = bundle[name];
         hash.update(name).update(item.type === 'chunk' ? item.code : item.source);
@@ -158,6 +161,8 @@ export function serviceWorker(): Plugin {
         version: hash.digest('hex').slice(0, 12),
         files: [...built, ...extra].map((name) => `/${name}`),
         pyodide: runtime.digest('hex').slice(0, 12),
+        // Hashed names: a new PGlite version means new names and thus a new cache.
+        pglite: { version: createHash('sha256').update(lazy.join('\n')).digest('hex').slice(0, 12), files: lazy.map((name) => `/${name}`) },
         vm: vmVersion(),
       };
       const source = join(ROOT, 'src/service-worker.ts');

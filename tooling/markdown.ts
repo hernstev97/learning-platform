@@ -13,7 +13,7 @@ export const slug = (value: string) => value.toLowerCase()
 
 const LABELS: Record<string, string> = {
   kotlin: 'Kotlin', rust: 'Rust', python: 'Python', shell: 'Shell', console: 'Terminal', yaml: 'YAML', toml: 'TOML', json: 'JSON',
-  sql: 'SQL', xml: 'XML', dockerfile: 'Dockerfile', ini: 'Konfiguration', diff: 'Diff', text: 'Text',
+  sql: 'SQL', postgres: 'PostgreSQL', xml: 'XML', dockerfile: 'Dockerfile', ini: 'Konfiguration', diff: 'Diff', text: 'Text',
   excel: 'Excel-Formel', powerquery: 'Power Query (M)', csv: 'CSV', typescript: 'TypeScript', javascript: 'JavaScript',
 };
 
@@ -22,9 +22,9 @@ export function codeBlock(text: string, info = ''): string {
   const [lang = '', ...flags] = info.trim().split(/\s+/);
   const name = languageOf(lang);
   // Python runs as a script (or, marked `pytest`, as a test file under pytest); SQL runs statement by statement
-  // against a fresh in-memory SQLite database.
+  // against a fresh in-memory SQLite database, `postgres` against a fresh PostgreSQL database (PGlite).
   const pytest = flags.includes('pytest') && name === 'python';
-  const runnable = pytest || (flags.includes('run') && (name === 'python' || name === 'sql'));
+  const runnable = pytest || (flags.includes('run') && (name === 'python' || name === 'sql' || name === 'postgres'));
   // Shell commands that run unchanged in the Linux VM get a button that types them into the lesson's terminal.
   const vm = flags.includes('vm') && (name === 'shell' || name === 'console');
   const playground = name === 'rust' && /\bfn main\s*\(/.test(text) && !flags.includes('norun') && !flags.includes('nocheck');
@@ -32,7 +32,7 @@ export function codeBlock(text: string, info = ''): string {
   const label = title ?? (pytest ? 'Python · pytest' : LABELS[name]) ?? (lang || 'Text');
   const attrs = [`data-lang="${escape(name)}"`, runnable ? `data-run="${pytest ? 'pytest' : name}"` : '', vm ? 'data-vm' : '', playground ? 'data-playground="rust"' : ''].filter(Boolean).join(' ');
   const body = runnable
-    ? `<textarea class="code-editor" wrap="off" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="${name === 'sql' ? 'SQL' : 'Python'}-Code, editierbar">${escape(text)}</textarea>`
+    ? `<textarea class="code-editor" wrap="off" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="${name === 'python' ? 'Python' : 'SQL'}-Code, editierbar">${escape(text)}</textarea>`
     : `<pre tabindex="0"><code>${highlight(text, name)}</code></pre>`;
   return `<div class="codeblock" ${attrs}><div class="codeblock-bar"><span>${escape(label)}</span></div>${body}</div>`;
 }

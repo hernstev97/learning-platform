@@ -18,7 +18,7 @@ const family = (lang: Lang) => {
   if (['python', 'py', 'python3', 'pycon'].includes(l)) return 'python';
   if (['bash', 'sh', 'shell', 'zsh', 'fish', 'console', 'terminal'].includes(l)) return 'shell';
   if (['excel', 'xlsx', 'formula'].includes(l)) return 'excel';
-  if (['sql', 'sqlite', 'postgresql', 'postgres'].includes(l)) return 'sql';
+  if (['sql', 'sqlite', 'postgresql', 'postgres', 'pgsql', 'plpgsql'].includes(l)) return 'sql';
   if (['typescript', 'ts', 'tsx', 'mts', 'cts', 'javascript', 'js', 'jsx', 'mjs', 'cjs'].includes(l)) return 'script';
   return 'generic';
 };
