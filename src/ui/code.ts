@@ -117,7 +117,7 @@ export function enhanceCode(root: ParentNode, terminal?: (commands: string) => v
         output.textContent = 'Läuft …';
         try {
           if (language === 'postgres') {
-            const result = await runPgScript(editor.value);
+            const result = await runPgScript(editor.value, block.dataset.continue !== undefined);
             output.classList.toggle('error', !!result.error);
             output.innerHTML = pgResultsMarkup(result.results, result.error);
           } else if (language === 'sql') {

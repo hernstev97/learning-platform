@@ -95,7 +95,7 @@ function run<T>(job: NewJob): Promise<T> {
   return result;
 }
 
-export const runPgScript = (code: string) => run<PgScriptResult>({ kind: 'script', code });
+export const runPgScript = (code: string, keepGoing = false) => run<PgScriptResult>({ kind: 'script', code, keepGoing });
 export const runPgExercise = (schema: string, query: string, solution: string, check: string | null) =>
   run<PgExerciseResult>({ kind: 'exercise', schema, query, solution, check });
 

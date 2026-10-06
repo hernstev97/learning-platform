@@ -30,7 +30,9 @@ export function codeBlock(text: string, info = ''): string {
   const playground = name === 'rust' && /\bfn main\s*\(/.test(text) && !flags.includes('norun') && !flags.includes('nocheck');
   const title = flags.find((flag) => flag.startsWith('title='))?.slice(6).replace(/_/g, ' ');
   const label = title ?? (pytest ? 'Python · pytest' : LABELS[name]) ?? (lang || 'Text');
-  const attrs = [`data-lang="${escape(name)}"`, runnable ? `data-run="${pytest ? 'pytest' : name}"` : '', vm ? 'data-vm' : '', playground ? 'data-playground="rust"' : ''].filter(Boolean).join(' ');
+  // `postgres run continue`: like psql without ON_ERROR_STOP, a failing statement does not end the block.
+  const keepGoing = runnable && name === 'postgres' && flags.includes('continue');
+  const attrs = [`data-lang="${escape(name)}"`, runnable ? `data-run="${pytest ? 'pytest' : name}"` : '', keepGoing ? 'data-continue' : '', vm ? 'data-vm' : '', playground ? 'data-playground="rust"' : ''].filter(Boolean).join(' ');
   const body = runnable
     ? `<textarea class="code-editor" wrap="off" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="${name === 'python' ? 'Python' : 'SQL'}-Code, editierbar">${escape(text)}</textarea>`
     : `<pre tabindex="0"><code>${highlight(text, name)}</code></pre>`;

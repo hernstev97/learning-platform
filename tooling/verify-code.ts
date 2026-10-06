@@ -307,6 +307,11 @@ for (const areaId of Object.keys(loaded.areas)) {
         } });
       } else if ((lang === 'sql' || languageOf(lang) === 'postgres') && flags.includes('run')) {
         jobs.push({ label, run: async () => {
+          if (flags.includes('continue') && lang !== 'sql') {
+            // Errors are part of the demonstration; the block only must show at least one and run to its end.
+            const result = await (await postgres()).script(code, true);
+            return result.results.some((r) => r.error) ? null : 'als "continue" markiert, aber keine Anweisung scheitert – dann genügt "run"';
+          }
           const result = lang === 'sql' ? await sqlScript(code) : await (await postgres()).script(code);
           if (flags.includes('fails')) return result.error ? null : 'als "fails" markiert, läuft aber fehlerfrei';
           return result.error ? `Codeblock wirft einen Fehler:\n${result.error}` : null;

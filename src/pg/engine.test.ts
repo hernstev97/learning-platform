@@ -62,6 +62,18 @@ describe('PgEngine (PostgreSQL in PGlite)', () => {
     expect(result.error).toBe('ERROR:  division by zero');
   });
 
+  it('keeps going after an error on request, so an aborted transaction can be shown', async () => {
+    const result = await engine.script('BEGIN; SELECT 1/0; SELECT 1; COMMIT; SELECT 2 AS danach;', true);
+    expect(result.error).toBeNull();
+    expect(result.results.map((r) => r.error ?? r.tag)).toEqual([
+      'BEGIN',
+      'ERROR:  division by zero',
+      'ERROR:  current transaction is aborted, commands ignored until end of transaction block',
+      'ROLLBACK',
+      'SELECT 1',
+    ]);
+  });
+
   it('starts every run on a fresh database', async () => {
     await engine.script('CREATE TABLE bleibt_nicht (id int);');
     const result = await engine.script('SELECT count(*) FROM bleibt_nicht;');

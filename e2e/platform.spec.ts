@@ -321,7 +321,12 @@ test('PostgreSQL runs in the browser: previews, results, checks after DDL and ru
   await expect(page.locator('#feedback')).toContainText('Richtig.');
 
   await page.goto(base);
-  const block = page.locator('.codeblock[data-run="postgres"]');
+  const keepGoing = page.locator('.codeblock[data-run="postgres"][data-continue]');
+  await keepGoing.getByRole('button', { name: 'Ausführen' }).click();
+  await expect(keepGoing.locator('.run-output .sql-error').nth(1)).toContainText('current transaction is aborted', { timeout: 90_000 });
+  await expect(keepGoing.locator('.run-output')).toContainText('ROLLBACK');
+  await expect(keepGoing.locator('.run-output')).not.toHaveClass(/error/);
+  const block = page.locator('.codeblock[data-run="postgres"]').first();
   await expect(block.locator('.codeblock-bar')).toContainText('PostgreSQL');
   await block.getByRole('button', { name: 'Ausführen' }).click();
   await expect(block.locator('.run-output table')).toContainText('75.00', { timeout: 90_000 });

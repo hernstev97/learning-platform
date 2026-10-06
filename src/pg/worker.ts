@@ -4,7 +4,7 @@
 import { createBase, PgEngine } from './engine.ts';
 
 export type PgJob =
-  | { id: number; kind: 'script'; code: string }
+  | { id: number; kind: 'script'; code: string; keepGoing: boolean }
   | { id: number; kind: 'exercise'; schema: string; query: string; solution: string; check: string | null };
 
 let ready: Promise<PgEngine> | null = null;
@@ -22,7 +22,7 @@ self.onmessage = async (event: MessageEvent<PgJob | { id: number; kind: 'boot' }
     const engine = await boot();
     if (job.kind === 'boot') { self.postMessage({ id: job.id, result: { ready: true } }); return; }
     const result = job.kind === 'script'
-      ? await engine.script(job.code)
+      ? await engine.script(job.code, job.keepGoing)
       : await engine.exercise(job.schema, job.query, job.solution, job.check);
     self.postMessage({ id: job.id, result });
   } catch (error) {

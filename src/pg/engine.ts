@@ -16,8 +16,8 @@ export type PgResultSet = {
   cells: string[][];
   truncated: boolean;
 };
-/** One statement of a script: its rows (if it returns any), its command tag and its notices. */
-export type PgStatementResult = PgResultSet & { tag: string; returnsRows: boolean; notices: string[] };
+/** One statement of a script: its rows (if it returns any), its command tag and its notices; `error` when it failed. */
+export type PgStatementResult = PgResultSet & { tag: string; returnsRows: boolean; notices: string[]; error?: string };
 export type PgScriptResult = { results: PgStatementResult[]; text: string; error: string | null };
 export type PgQueryResult = PgResultSet & { error: string | null };
 export type PgExerciseResult = { actual: PgQueryResult; expected: PgQueryResult; script: PgStatementResult[] | null };
@@ -218,9 +218,13 @@ export class PgEngine {
     try { return await use(db); } finally { await db.close(); }
   }
 
-  /** Lesson blocks and `output` exercises: every statement in order, stopping at the first error. */
-  async script(code: string): Promise<PgScriptResult> {
-    return this.fresh((db) => runScript(db, code));
+  /**
+   * Lesson blocks and `output` exercises: every statement in order, stopping at the first error. With `keepGoing`
+   * (lesson blocks marked `continue`), a failed statement becomes an entry with its error and the script goes on, like
+   * psql without ON_ERROR_STOP – which shows what an aborted transaction does with the statements that follow.
+   */
+  async script(code: string, keepGoing = false): Promise<PgScriptResult> {
+    return this.fresh((db) => runScript(db, code, keepGoing));
   }
 
   /**
@@ -282,11 +286,14 @@ export class PgEngine {
   }
 }
 
-async function runScript(db: PGlite, code: string): Promise<PgScriptResult> {
+async function runScript(db: PGlite, code: string, keepGoing = false): Promise<PgScriptResult> {
   const results: PgStatementResult[] = [];
   let error: string | null = null;
   for (const statement of splitStatements(code)) {
-    try { results.push(...await statementResult(db, statement)); } catch (e) { error = formatError(e, statement); break; }
+    try { results.push(...await statementResult(db, statement)); } catch (e) {
+      if (!keepGoing) { error = formatError(e, statement); break; }
+      results.push({ columns: [], rows: [], cells: [], truncated: false, tag: '', returnsRows: false, notices: [], error: formatError(e, statement) });
+    }
   }
   return { results, text: scriptText(results), error };
 }

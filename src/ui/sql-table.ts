@@ -29,6 +29,7 @@ export function pgResultsMarkup(results: PgStatementResult[], error: string | nu
   let n = 0;
   const parts = results.map((result) => {
     const notices = result.notices.map((notice) => `<span class="sql-notice">${escape(notice)}</span>`).join('\n');
+    if (result.error) return `${notices}${notices ? '\n' : ''}<span class="sql-error">${escape(result.error)}</span>`;
     if (!result.returnsRows) return `${notices}${notices ? '\n' : ''}<span class="sql-tag">${escape(result.tag)}</span>`;
     n++;
     const label = `<span class="run-label">${tables > 1 ? `Ergebnis ${n} · ` : 'Ergebnis · '}${rowCount(result.rows.length)}${result.truncated ? ' (gekürzt)' : ''}</span>`;
