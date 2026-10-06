@@ -30,6 +30,7 @@ pnpm dev            # http://127.0.0.1:5180
 | `pnpm build` | TypeScript prüfen und statisch nach `dist/` bauen |
 | `pnpm bear:build`, `pnpm bear:check` | Bear-Track aus dem gepinnten Snapshot erzeugen bzw. prüfen |
 | `pnpm pg:run datei.sql` | SQL in einem frischen PostgreSQL wie im Browser ausführen (`-e 'SELECT …'`, `--tuples` für erwartete Ausgaben) |
+| `pnpm pg:try bereich/modul/übung datei.sql` | Eine Antwort gegen eine PostgreSQL-Übung prüfen, mit demselben Urteil wie im Browser |
 | `pnpm screenshots /pfad@390 …` | Screenshots gegen den laufenden Dev-Server |
 
 `CONTENT_LENIENT=1 pnpm dev` überspringt ungültige oder fehlende Module statt abzubrechen – praktisch, während man an Inhalten schreibt. Der Produktionsbuild ist immer strikt.

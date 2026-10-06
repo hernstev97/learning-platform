@@ -538,6 +538,8 @@ Für alles, was kein Ergebnis liefert – Constraints anlegen, Daten migrieren, 
 - Der Prompt nennt alles, was geprüft wird. Die Prüfabfrage ist für den Lernenden sichtbar und verrät die Lösung nicht.
 - `pnpm verify` verlangt: Nach der Lösung liefert die Prüfabfrage Zeilen und keinen Fehler, nach dem `starter` (oder, ohne Starter, auf dem nackten Schema) ein anderes Ergebnis.
 - `ordered: true` bezieht sich bei `check` auf die Prüfabfrage; sie braucht dann `ORDER BY`.
+- Ist die Musterlösung eine Änderung mit `RETURNING` (`INSERT`, `UPDATE`, `DELETE`, `MERGE`), zählt nur eine Änderung als Lösung, kein `SELECT`, das dieselben Zeilen berechnet.
+- **Andere Lösungen ausprobieren:** `pnpm pg:try bereich/modul/übung -e '…'` prüft eine Antwort genau wie der Browser. Probiere mindestens eine andere richtige Formulierung und einen typischen Fehler aus.
 
 ### `scenario` – Linux-Szenario (echte VM im Browser)
 
@@ -757,6 +759,7 @@ pnpm verify [bereich]          # führt Python aus, kompiliert Rust, vergleicht 
 pnpm vm:verify [bereich]       # Linux-Szenarien und vm-Blöcke in der echten VM (siehe scenario)
 pnpm vm:run skript.sh          # ein Skript in einer frischen VM ausführen (zum Ausprobieren)
 pnpm pg:run datei.sql          # SQL in einem frischen PostgreSQL ausführen (wie im Browser)
+pnpm pg:try bereich/modul/übung datei.sql   # eine Antwort gegen eine PostgreSQL-sql-Übung prüfen (Urteil wie im Browser)
 pnpm test                      # Unit-Tests inkl. Bear-Rekonstruktion und Prüflogik
 pnpm test:e2e                  # Browser-Tests (Playwright)
 pnpm build                     # TypeScript + Produktionsbuild
