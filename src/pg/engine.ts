@@ -48,6 +48,7 @@ BEGIN
   EXCEPTION WHEN OTHERS THEN
     RETURN CASE SQLSTATE
       WHEN 'LPROK' THEN 'ok'
+      WHEN '23001' THEN 'restrict_violation'
       WHEN '23502' THEN 'not_null_violation'
       WHEN '23503' THEN 'foreign_key_violation'
       WHEN '23505' THEN 'unique_violation'
