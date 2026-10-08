@@ -260,7 +260,9 @@ for (const { area, module, file, exercise: authored, normalized } of loaded.raw)
   } else if (normalized.type === 'practice' && ['bash', 'sh', 'shell'].includes(lang) && authored.verify === true) {
     jobs.push({ label, run: async () => {
       const result = await bash(normalized.solution, { strict: true });
-      return result.code === 0 ? null : `Musterlösung endet mit Exit-Code ${result.code}:\n${(result.stdout + result.stderr).trim().split('\n').slice(-15).join('\n')}`;
+      // 141 is SIGPIPE: under pipefail, `producer | grep -q …` or `| head` fails whenever the producer writes after the reader has quit.
+      const hint = result.code === 141 ? '\n(141 = SIGPIPE: eine Pipeline mit grep -q oder head hat den Leser früh beendet, der Schreiber schrieb weiter. Statt grep -q: grep … > /dev/null.)' : '';
+      return result.code === 0 ? null : `Musterlösung endet mit Exit-Code ${result.code}:\n${(result.stdout + result.stderr).trim().split('\n').slice(-15).join('\n')}${hint}`;
     } });
   } else if (normalized.type === 'bug' && lang === 'python' && (normalized as BugExercise).fixes.length) {
     const code = fixedCode(normalized as BugExercise);
