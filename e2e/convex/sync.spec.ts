@@ -187,7 +187,8 @@ test('lesson notes autosave while typing, reach another device and survive a res
   await expect(other.locator('#note')).toHaveValue('Merke');
   await page.reload(); await expect(page.locator('#note')).toHaveValue('Merke');
   await other.goto('/kotlin'); await expect(other.locator('.module-row[href="/kotlin/bear-01"] .note-mark')).toHaveText('Notiz');
-  await other.goto(base); await expect(other.locator('#note')).toBeEditable();
+  // Opening the lesson also writes the learning position. Offline, an unconfirmed position would count as a second change.
+  await other.goto(base); await expect(other.locator('#note')).toBeEditable(); await synced(other);
   await phone.setOffline(true);
   await other.locator('#note').fill('Frage vom Handy');
   await expect(other.locator('#storage-status')).toContainText('1 Änderung');
