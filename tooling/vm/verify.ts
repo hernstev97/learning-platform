@@ -107,7 +107,11 @@ async function scenario(exercise: ScenarioExercise): Promise<{ problems: string[
   await prepareScenario(agent, exercise.setup);
   const solution = await agent.run(asLearner(exercise.solution), 300_000);
   const after = await runChecks(agent, exercise.checks);
-  if (!after.every((r) => r.ok)) problems.push(`Nach der Lösung scheitern Prüfungen:\n      ${summary(after)}\n    Ausgabe der Lösung:\n${indent(solution.output)}`);
+  if (!after.every((r) => r.ok)) {
+    // The VM's clock and journal show whether a failure is the content's or a timing problem of the run.
+    const state = await agent.run('date +%T.%N; journalctl -n 25 --no-pager -o short-precise', 30_000).then((r) => r.output, () => '(VM antwortet nicht)');
+    problems.push(`Nach der Lösung scheitern Prüfungen:\n      ${summary(after)}\n    Ausgabe der Lösung:\n${indent(solution.output)}\n    Zustand der VM danach:\n${indent(state.trim())}`);
+  }
   return { problems, ok: `vorher ${before.filter((r) => !r.ok).length} von ${before.length} Prüfungen offen, nachher alle bestanden` };
 }
 
