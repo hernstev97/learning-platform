@@ -1,0 +1,733 @@
+id: testszene-ausweichen
+title: "Testszene: Ausweichen und Trainingsgegner"
+level: 2
+minutes: 180
+summary: Die Figur bekommt ein Ausweichen mit i-Frames, der Dummy einen angekündigten Angriff, und ein großer Trainingsgegner mit zwei Trefferzonen kommt dazu. Unterwegs findest du einen Fehler, der nur mit i-Frames auftritt, und liest an Logs ab, wer nach einer Aktion zuerst wieder handeln kann.
+goals:
+  - Du baust ein Ausweichen mit einstellbaren i-Frames und sagst vorher, in welchem Frame ein Treffer ankommt oder ausbleibt.
+  - Du erklärst, warum die Testszene die Hurtbox während der i-Frames abschaltet, statt Treffer nur abzulehnen.
+  - Du richtest einen Trainingsgegner mit Telegraph und einem Muster aus mehreren Angriffen im Inspektor ein.
+  - Du liest aus einem Log ab, wie viele Frames ein Punish-Fenster nach dem Ausweichen offen ist.
+  - Du baust einen großen Trainingsgegner mit mehreren Hurtbox-Zonen und schaltest seine Unterbrechbarkeit um.
+resources:
+  - title: Godot Docs · Area2D (monitorable, area_entered)
+    url: https://docs.godotengine.org/en/stable/classes/class_area2d.html
+  - title: Godot Docs · Using Area2D
+    url: https://docs.godotengine.org/en/stable/tutorials/physics/using_area_2d.html
+  - title: Godot Docs · GDScript exported properties
+    url: https://docs.godotengine.org/en/stable/tutorials/scripting/gdscript/gdscript_exports.html
+  - title: GDC 2021 · Melee AI in The Last of Us Part II (Folien)
+    url: https://media.gdcvault.com/GDC+2021/Melee+AI+in+The+Last+of+Us+Part+II.pdf
+lesson: |
+  > [!NOTE] Am PC
+  > Für diese Lektion brauchst du Godot 4 am Rechner. Lesen kannst du sie auch unterwegs, die Übungen setzen die Testszene voraus.
+
+  Bisher hält der Dummy still. Jetzt schlägt er zurück, und die Figur bekommt ein Ausweichen. Damit kommen die Fragen, um die es in [Ausweichen, Risiko und Belohnung](/combat/ausweichen) geht, in deine Szene: Ab welchem Frame schützt das Ausweichen? Wann bin ich wieder verwundbar? Und wie lange bleibt mir danach, um zurückzuschlagen?
+
+  Das Modul baut auf [Testszene: Angriff mit Frame-Daten](/combat/testszene-angriff) auf. `enemy.gd`, `hurtbox.gd`, `attack_data.gd` und `hit_log.gd` bleiben, wie sie sind; `player.gd` ersetzt du am Ende durch die neue Fassung. Alle Zahlen sind wieder Platzhalter.
+
+  ## Ausweichen als eigener Zustand
+
+  Das Ausweichen bekommt zwei Zustände: `DODGE`, in dem die Figur sich schnell bewegt, und `DODGE_RECOVERY`, in dem sie danach kurz stillsteht. Die Werte stehen in einer eigenen Gruppe im Inspektor ([@export_group](https://docs.godotengine.org/en/stable/tutorials/scripting/gdscript/gdscript_exports.html#grouping-exports)):
+
+  ```gdscript
+  @export_group("Ausweichen")
+  @export_range(1, 60) var dodge_frames := 18
+  @export_range(1, 60) var invulnerable_from := 2   ## erster unverwundbarer Frame des Ausweichens
+  @export_range(1, 60) var invulnerable_to := 12    ## letzter unverwundbarer Frame
+  @export var dodge_speed := 220.0
+  @export_range(0, 60) var dodge_recovery := 8
+  ```
+
+  Die Richtung liest die Figur aus dem Stick, wenn das Ausweichen startet; mit Puffer kann das bis zu `input_buffer` Frames nach dem Druck sein. Ohne Richtung weicht die Figur in Blickrichtung aus. So geht das Ausweichen in alle 360°:
+
+  ```gdscript
+  func _enter(new_state: State) -> void:
+  	HitLog.add("Spieler %s -> %s" % [State.keys()[state], State.keys()[new_state]])
+  	state = new_state
+  	frame = 1
+  	# Hitbox nur in der aktiven Phase. set_deferred, weil _enter auch aus Treffer-Signalen
+  	# kommt und Godot Formen während der Physik-Abfrage nicht umschalten lässt.
+  	hitbox_shape.set_deferred(&"disabled", new_state != State.ACTIVE)
+  	match new_state:
+  		State.WINDUP:
+  			velocity = Vector2.ZERO
+  		State.ACTIVE:
+  			already_hit.clear()
+  		State.DODGE:
+  			var direction := Input.get_vector(&"move_left", &"move_right", &"move_up", &"move_down")
+  			dodge_direction = direction.normalized() if direction != Vector2.ZERO else facing
+  ```
+
+  Mit den Platzhaltern dauert das Ausweichen 18 Frames, die Frames 2 bis 12 sind unverwundbar, danach folgen 8 Frames Erholung. Bei 220 Pixeln pro Sekunde legt die Figur `220 × 18 / 60 = 66` Pixel zurück; in Godot 4.7.2 gemessen: 65,99998 Pixel, der Rest ist Rundung von Gleitkommazahlen. Ein echter Lauf ohne Gegner:
+
+  ```text
+      12  Druck dodge
+      12  Spieler MOVE -> DODGE
+      13  Spieler i-Frames an (Frame 2 des Ausweichens)
+      24  Spieler i-Frames aus (Frame 13 des Ausweichens)
+      30  Spieler DODGE -> DODGE_RECOVERY
+      38  Spieler DODGE_RECOVERY -> MOVE
+  ```
+
+  Ob dein Ausweichen eine verwundbare Anlaufphase hat, wie weit es trägt und ob es eine Erholung braucht, entscheidest du. Hades 2 zeigt, dass die Werte zusammenhängen: Ein Upgrade machte den Dash sofort und schneller, und die Patchnotes warnen, dass die Figur dadurch „very slightly less time“ unverwundbar ist ([Hades 2 Patch 1](https://www.shacknews.com/article/139921/hades-2-early-access-patch-notes-1)).
+
+  ## i-Frames: Die Hurtbox schaltet ab
+
+  Die erste Idee für i-Frames liegt nahe: `take_hit()` gibt während der i-Frames `false` zurück, und der Treffer zählt nicht. Das funktioniert, solange kein Angriff noch aktiv ist, wenn die i-Frames enden. Im folgenden Lauf hat der Dummy einen Angriff mit 20 aktiven Frames, und die Figur weicht auf der Stelle aus (`dodge_speed = 0`, nur für den Test):
+
+  ```text
+      28  Druck dodge
+      28  Spieler MOVE -> DODGE
+      30  Dummy TELEGRAPH -> ACTIVE
+      31  Spieler weicht aus (Frame 3 des Ausweichens)
+      46  Spieler DODGE -> DODGE_RECOVERY
+      50  Dummy ACTIVE -> RECOVERY
+  ```
+
+  Die i-Frames enden in Frame 40. Bis Frame 49 steht die Figur verwundbar in der aktiven Hitbox, und nichts passiert. Der Grund: `area_entered` meldet nur das **Hineinkommen**. Die Figur war schon in Frame 31 drin, also gibt es keine zweite Meldung ([Area2D](https://docs.godotengine.org/en/stable/classes/class_area2d.html#class-area2d-signal-area-entered)).
+
+  Die Testszene schaltet deshalb die Hurtbox selbst ab. `monitorable = false` nimmt sie aus der Physik, gegnerische Hitboxen finden sie nicht mehr. Geht sie nach den i-Frames wieder an, erkennt die Physik die Überlappung neu und meldet sie:
+
+  ```gdscript
+  func is_invulnerable() -> bool:
+  	return state == State.DODGE and frame >= invulnerable_from and frame <= invulnerable_to
+
+
+  ## i-Frames schalten die Hurtbox ab. Wird sie wieder eingeschaltet, während eine
+  ## gegnerische Hitbox noch aktiv ist, meldet die Physik die Überlappung neu.
+  func _update_hurtbox() -> void:
+  	var off := is_invulnerable()
+  	if off == hurtbox_off:
+  		return
+  	hurtbox_off = off
+  	hurtbox.set_deferred(&"monitorable", not off)
+  	HitLog.add("Spieler i-Frames %s (Frame %d des Ausweichens)" % ["an" if off else "aus", frame])
+  ```
+
+  Derselbe Lauf mit dieser Fassung:
+
+  ```text
+      28  Druck dodge
+      28  Spieler MOVE -> DODGE
+      29  Spieler i-Frames an (Frame 2 des Ausweichens)
+      30  Dummy TELEGRAPH -> ACTIVE
+      40  Spieler i-Frames aus (Frame 13 des Ausweichens)
+      41  Spieler getroffen in DODGE, Frame 13
+  ```
+
+  Wer zu früh ausweicht und stehen bleibt, wird jetzt getroffen, wenn die i-Frames enden. Geprüft wird `is_invulnerable()` in `take_hit()` trotzdem noch; doppelt hält hier besser.
+
+  > [!WARNING] monitorable, nicht monitoring
+  > `monitoring` schaltet ab, ob eine Fläche **selbst** etwas erkennt. Die Hurtbox erkennt ohnehin nichts. Wer hier `monitoring` umschaltet, ändert nichts, und der lange Angriff trifft wieder nie. Gemessen mit Godot 4.7.2.
+
+  ### Zu spät oder gerade noch: ein Frame im Log
+
+  Der Dummy hat für diese Läufe einen Angriff mit 20 Frames Telegraph, 4 aktiv und 30 Erholung. Die Figur steht in Reichweite. Einen Frame zu spät gedrückt:
+
+  ```text
+      10  Dummy WAIT -> TELEGRAPH
+      30  Druck dodge
+      30  Spieler MOVE -> DODGE
+      30  Dummy TELEGRAPH -> ACTIVE
+      31  Spieler getroffen in DODGE, Frame 1
+  ```
+
+  Die Hitbox geht in Frame 30 an, der Treffer kommt in Frame 31 an. Zu diesem Zeitpunkt ist die Figur im ersten Frame des Ausweichens, und der ist nicht unverwundbar. Einen Frame früher, im letzten möglichen Frame:
+
+  ```text
+      29  Druck dodge
+      29  Spieler MOVE -> DODGE
+      30  Spieler i-Frames an (Frame 2 des Ausweichens)
+      30  Dummy TELEGRAPH -> ACTIVE
+      34  Dummy ACTIVE -> RECOVERY
+      41  Spieler i-Frames aus (Frame 13 des Ausweichens)
+  ```
+
+  Kein Treffer: In Frame 30 gehen die Hitbox an und die Hurtbox aus, der Physik-Schritt findet nichts. Und weil kein Treffer zählte, gibt es auch keinen Hitstop: Die aktive Phase des Dummys endet nach genau 4 Frames. Der Unterschied ist ein Frame, knapp 17 Millisekunden. Genau hier entscheidet sich, ob sich ein Ausweichen fair anfühlt, und deshalb brauchst du das Log: Aus dem Spielgefühl allein weißt du nicht, ob du zu spät warst oder ob der Code einen Frame verschluckt hat (siehe [Schwer, unfair oder kaputt?](/combat/frust-diagnose)).
+
+  ## Der Trainingsgegner: Telegraph, Angriff, Erholung
+
+  Der Dummy war schon ein Gegner ohne Angriffe. Gib ihm im Inspektor unter `attacks` eine oder mehrere `AttackData`, und er arbeitet sie der Reihe nach ab. Der Wind-up einer gegnerischen `AttackData` ist sein **Telegraph**: Solange er läuft, zeigt `Telegraph` eine gelbe Fläche am Boden.
+
+  ```gdscript
+  func _physics_process(_delta: float) -> void:
+  	if hitstop_left > 0:
+  		hitstop_left -= 1
+  		return
+  	frame += 1
+  	if frame > _duration():
+  		_enter(_next_state())
+  	if state == State.HITSTUN:
+  		velocity = velocity.move_toward(Vector2.ZERO, 10.0)
+  		move_and_slide()
+
+
+  func current_attack() -> AttackData:
+  	return attacks[pattern_index]
+
+
+  func _duration() -> int:
+  	match state:
+  		State.WAIT: return wait_frames
+  		State.TELEGRAPH: return current_attack().windup
+  		State.ACTIVE: return current_attack().active
+  		State.RECOVERY: return current_attack().recovery
+  		State.HITSTUN: return hitstun_frames
+  	return 0
+
+
+  func _next_state() -> State:
+  	match state:
+  		State.WAIT: return State.TELEGRAPH if not attacks.is_empty() else State.WAIT
+  		State.TELEGRAPH: return State.ACTIVE
+  		State.ACTIVE: return State.RECOVERY
+  	return State.WAIT
+
+
+  func _enter(new_state: State) -> void:
+  	if new_state != state:
+  		HitLog.add("%s %s -> %s" % [name, State.keys()[state], State.keys()[new_state]])
+  	if state == State.RECOVERY:
+  		pattern_index = (pattern_index + 1) % attacks.size()
+  	state = new_state
+  	frame = 1
+  	telegraph.visible = new_state == State.TELEGRAPH
+  	hitbox_shape.set_deferred(&"disabled", new_state != State.ACTIVE)
+
+  ```
+
+  Ein voller Zyklus mit `wait_frames = 10` und dem Platzhalterangriff:
+
+  ```text
+      10  Dummy WAIT -> TELEGRAPH
+      30  Dummy TELEGRAPH -> ACTIVE
+      34  Dummy ACTIVE -> RECOVERY
+      64  Dummy RECOVERY -> WAIT
+      74  Dummy WAIT -> TELEGRAPH
+  ```
+
+  Zeichne den `Telegraph` so groß wie die Hitbox des Angriffs, dann zeigt die Fläche genau, wo es trifft. Naughty Dog beschreibt für The Last of Us Part II denselben Schritt: Früher galt „Enemy starts swinging = certain hit“, für das neue Ausweichen wurden die Ankündigungen länger und deutlicher ([Melee AI in The Last of Us Part II](https://media.gdcvault.com/GDC+2021/Melee+AI+in+The+Last+of+Us+Part+II.pdf)). Wie lang deine Telegraphs sind, ob sie die Fläche genau zeigen oder nur andeuten, entscheidest du. Das Muster aus mehreren Angriffen behandelt [Gegnermuster und Telegraphing](/combat/gegnermuster).
+
+  ## Punish-Fenster: Wer ist zuerst wieder frei?
+
+  Ein Log zeigt nicht nur, ob getroffen wurde, sondern auch, wer danach zuerst handeln kann. Ein Lauf mit Druck in Frame 28 geht so weiter:
+
+  ```text
+      34  Dummy ACTIVE -> RECOVERY
+      46  Spieler DODGE -> DODGE_RECOVERY
+      54  Spieler DODGE_RECOVERY -> MOVE
+      64  Dummy RECOVERY -> WAIT
+  ```
+
+  Die Figur ist ab Frame 54 frei, der Dummy erholt sich bis Frame 63. Das sind 10 Frames, in denen ein Angriff von dir ihn in der Erholung trifft: ein **Punish-Fenster**. Mit 8 Frames Wind-up und Start in Frame 54 geht deine Hitbox in Frame 62 an, und der Treffer kommt in Frame 63, im letzten Erholungsframe. Auch ein Start in Frame 55 trifft noch: Die Meldung aus Frame 64 kommt am Anfang des Frames, bevor der Dummy seine Erholung verlässt, und das Log schreibt „in RECOVERY Frame 30“. Das alles gilt nur, wenn du in Reichweite stehst. In diesem Lauf stehst du 66 Pixel weiter, denn das Ausweichen hat dich an ihm vorbeigetragen.
+
+  Diese Rechnung hängt an vier Werten: Erholung des Gegners, Länge deines Ausweichens samt Erholung, dein Wind-up und die Strecke. Ändere einen, und das Fenster ändert sich. Das ist der Kern von Risiko und Belohnung, und deshalb stimmst du diese Werte später als Experiment ab, nicht einzeln nach Gefühl.
+
+  ## Der große Trainingsgegner: Zonen und Unterbrechbarkeit
+
+  Für große Kreaturen bekommt derselbe `enemy.gd` einen größeren Körper, eine große Hitbox und mehrere Hurtboxen, alle als direkte Kinder:
+
+  ```text
+  BigEnemy (CharacterBody2D)  enemy.gd, interruptible aus
+  ├── Body (Polygon2D)        48 × 48
+  ├── Telegraph (Polygon2D)   64 × 40 unter dem Körper
+  ├── Kopf (Area2D)           hurtbox.gd, zone kopf, damage_multiplier 2
+  │   └── CollisionShape2D    24 × 16
+  ├── Bein (Area2D)           hurtbox.gd, zone bein, damage_multiplier 1
+  │   └── CollisionShape2D    16 × 20
+  └── Hitbox (Area2D)         Maske 2
+      └── CollisionShape2D    64 × 40, disabled
+  ```
+
+  Ein echter Lauf mit einem langsamen Platzhalterangriff (40 Frames Telegraph, 6 aktiv, 50 Erholung). Die Figur trifft zweimal das Bein, einmal im Warten und einmal in der Erholung:
+
+  ```text
+      12  Druck attack
+      12  Spieler MOVE -> WINDUP
+      20  Spieler WINDUP -> ACTIVE
+      21  BigEnemy getroffen: Zone bein, Schaden 1.0, in WAIT Frame 21
+      34  BigEnemy WAIT -> TELEGRAPH
+      74  BigEnemy TELEGRAPH -> ACTIVE
+      80  BigEnemy ACTIVE -> RECOVERY
+      81  BigEnemy getroffen: Zone bein, Schaden 1.0, in RECOVERY Frame 1
+  ```
+
+  Zwei Dinge sieht man hier. Erstens: Mit `interruptible = false` wechselt der Gegner nach dem Treffer nicht in `HITSTUN`, er setzt sein Muster fort. Das ist eine Designentscheidung. Den Hitstop bekommt er trotzdem, deshalb beginnt sein Telegraph erst in Frame 34 statt 30. Zweitens: Der Stampfer trifft die Figur nicht. Sie steht neben der großen Fläche, und das Log zeigt das: Es gibt keine Zeile „Spieler getroffen“. Ob der Kopf von der Seite erreichbar ist, welche Zone mehr Schaden nimmt und wann, sind Fragen für deinen eigenen großen Gegner (siehe [Große Kreaturen als Bosse](/combat/grosse-gegner)).
+
+  > [!PRAXIS]
+  > Stimm Gegner gegen feste Spielerwerte ab. Ändere nie Spielerwerte und Gegnerwerte im selben Testlauf. Sonst weißt du nicht, welche Änderung das Punish-Fenster verschoben hat.
+
+  > [!INTERVIEW]
+  > „Wie stellst du sicher, dass ein Ausweichen gegen alle Angriffe fair ist?“ Gute Antwort: Ich lege für jeden Angriff den Telegraph, die aktive Phase und die Fläche fest und prüfe im Log, aus welchen Druck-Frames das Ausweichen gelingt. Lange aktive Phasen teste ich ausdrücklich mit „zu früh ausweichen und stehen bleiben“, weil dort Fehler in der Treffererkennung sichtbar werden. Die Grenzen dieser Frames sind dann eine bewusste Entscheidung.
+
+  ## Das neue Skript der Spielfigur zum Kopieren
+
+  Ersetze `player.gd` durch diese Fassung. Neu sind die Ausweich-Werte, die Zustände `DODGE`, `DODGE_RECOVERY` und `HITSTUN`, `_update_hurtbox()` und `take_hit()`. Die Figur braucht dafür einen Hurtbox-Node namens `Hurtbox` (Ebene 2), den sie seit dem letzten Modul schon hat, und die Aktion `dodge` in der Input Map.
+
+  ```gdscript title=player.gd
+  extends CharacterBody2D
+
+  ## Spielfigur der Testszene: Bewegung, ein Angriff mit Frame-Daten, Ausweichen.
+  ## Ein Frame ist ein Physik-Tick. Alle Startwerte sind Platzhalter zum Abstimmen.
+
+  enum State { MOVE, WINDUP, ACTIVE, RECOVERY, DODGE, DODGE_RECOVERY, HITSTUN }
+
+  @export var move_speed := 90.0                 ## Pixel pro Sekunde
+  @export var attack: AttackData
+  @export_range(0, 20) var input_buffer := 6     ## so viele Frames bleibt ein Tastendruck gültig
+
+  @export_group("Ausweichen")
+  @export_range(1, 60) var dodge_frames := 18
+  @export_range(1, 60) var invulnerable_from := 2   ## erster unverwundbarer Frame des Ausweichens
+  @export_range(1, 60) var invulnerable_to := 12    ## letzter unverwundbarer Frame
+  @export var dodge_speed := 220.0
+  @export_range(0, 60) var dodge_recovery := 8
+
+  var state := State.MOVE
+  var frame := 1                  # Frame im aktuellen Zustand, ab 1
+  var facing := Vector2.RIGHT
+  var dodge_direction := Vector2.RIGHT
+  var buffered_action := &""
+  var buffer_age := -1            # Frames seit dem gepufferten Druck, -1 = leer
+  var hitstop_left := 0
+  var hitstun_frames := 0
+  var already_hit: Array[Node] = []
+  var hurtbox_off := false        # true während der i-Frames
+
+  @onready var hitbox_pivot: Node2D = $HitboxPivot
+  @onready var hitbox: Area2D = $HitboxPivot/Hitbox
+  @onready var hitbox_shape: CollisionShape2D = $HitboxPivot/Hitbox/CollisionShape2D
+  @onready var hurtbox: Hurtbox = $Hurtbox
+
+
+  func _ready() -> void:
+  	hitbox_shape.disabled = true
+  	hitbox.area_entered.connect(_on_hitbox_area_entered)
+
+
+  func _physics_process(_delta: float) -> void:
+  	_read_buttons()
+  	if hitstop_left > 0:
+  		hitstop_left -= 1
+  		return
+  	# 1. Übergänge: Ist der Zustand abgelaufen, oder startet eine Aktion?
+  	frame += 1
+  	if state != State.MOVE and frame > _duration(state):
+  		_enter(_next_state(state))
+  	if state == State.MOVE:
+  		if _consume(&"attack"):
+  			_enter(State.WINDUP)
+  		elif _consume(&"dodge"):
+  			_enter(State.DODGE)
+  	elif state == State.RECOVERY and attack.cancel_from > 0 and frame >= attack.cancel_from:
+  		if _consume(&"attack"):
+  			_enter(State.WINDUP)
+  	_update_hurtbox()
+  	# 2. Verhalten im (neuen) Zustand
+  	match state:
+  		State.MOVE:
+  			_move()
+  		State.DODGE:
+  			velocity = dodge_direction * dodge_speed
+  			move_and_slide()
+  		State.HITSTUN:
+  			velocity = velocity.move_toward(Vector2.ZERO, 10.0)
+  			move_and_slide()
+  	if buffer_age >= 0:
+  		buffer_age += 1
+
+
+  func _read_buttons() -> void:
+  	for action: StringName in [&"attack", &"dodge"]:
+  		if Input.is_action_just_pressed(action):
+  			HitLog.add("Druck %s" % action)
+  			buffered_action = action
+  			buffer_age = 0
+
+
+  func _consume(action: StringName) -> bool:
+  	if buffered_action == action and buffer_age >= 0 and buffer_age <= input_buffer:
+  		buffer_age = -1
+  		return true
+  	return false
+
+
+  func _move() -> void:
+  	var direction := Input.get_vector(&"move_left", &"move_right", &"move_up", &"move_down")
+  	if direction != Vector2.ZERO:
+  		facing = direction.normalized()
+  		hitbox_pivot.rotation = facing.angle()
+  	velocity = direction * move_speed
+  	move_and_slide()
+
+
+  func _duration(s: State) -> int:
+  	match s:
+  		State.WINDUP: return attack.windup
+  		State.ACTIVE: return attack.active
+  		State.RECOVERY: return attack.recovery
+  		State.DODGE: return dodge_frames
+  		State.DODGE_RECOVERY: return dodge_recovery
+  		State.HITSTUN: return hitstun_frames
+  	return 0
+
+
+  func _next_state(s: State) -> State:
+  	match s:
+  		State.WINDUP: return State.ACTIVE
+  		State.ACTIVE: return State.RECOVERY
+  		State.DODGE: return State.DODGE_RECOVERY
+  	return State.MOVE
+
+
+  func _enter(new_state: State) -> void:
+  	HitLog.add("Spieler %s -> %s" % [State.keys()[state], State.keys()[new_state]])
+  	state = new_state
+  	frame = 1
+  	# Hitbox nur in der aktiven Phase. set_deferred, weil _enter auch aus Treffer-Signalen
+  	# kommt und Godot Formen während der Physik-Abfrage nicht umschalten lässt.
+  	hitbox_shape.set_deferred(&"disabled", new_state != State.ACTIVE)
+  	match new_state:
+  		State.WINDUP:
+  			velocity = Vector2.ZERO
+  		State.ACTIVE:
+  			already_hit.clear()
+  		State.DODGE:
+  			var direction := Input.get_vector(&"move_left", &"move_right", &"move_up", &"move_down")
+  			dodge_direction = direction.normalized() if direction != Vector2.ZERO else facing
+
+
+  func state_name() -> String:
+  	return State.keys()[state]
+
+
+  func is_invulnerable() -> bool:
+  	return state == State.DODGE and frame >= invulnerable_from and frame <= invulnerable_to
+
+
+  ## i-Frames schalten die Hurtbox ab. Wird sie wieder eingeschaltet, während eine
+  ## gegnerische Hitbox noch aktiv ist, meldet die Physik die Überlappung neu.
+  func _update_hurtbox() -> void:
+  	var off := is_invulnerable()
+  	if off == hurtbox_off:
+  		return
+  	hurtbox_off = off
+  	hurtbox.set_deferred(&"monitorable", not off)
+  	HitLog.add("Spieler i-Frames %s (Frame %d des Ausweichens)" % ["an" if off else "aus", frame])
+
+
+  func _on_hitbox_area_entered(area: Area2D) -> void:
+  	if not area is Hurtbox or area.get_parent() in already_hit:
+  		return
+  	if (area as Hurtbox).receive(attack, self):
+  		already_hit.append(area.get_parent())
+  		hitstop_left = attack.hitstop
+
+
+  func take_hit(enemy_attack: AttackData, source: Node2D, _hurtbox: Hurtbox) -> bool:
+  	if is_invulnerable():
+  		return false
+  	HitLog.add("Spieler getroffen in %s, Frame %d" % [State.keys()[state], frame])
+  	hitstop_left = enemy_attack.hitstop
+  	hitstun_frames = enemy_attack.hitstun
+  	velocity = (global_position - source.global_position).normalized() * enemy_attack.knockback
+  	_enter(State.HITSTUN)
+  	return true
+  ```
+
+  ## Häufige Fehler
+
+  - **Lange Angriffe treffen nach den i-Frames nie.** Treffer nur in `take_hit()` abgelehnt, statt die Hurtbox abzuschalten; `area_entered` meldet nur das Hineinkommen.
+  - **`monitoring` statt `monitorable` umgeschaltet.** Ändert an einer Hurtbox nichts.
+  - **Hitstop auch beim Ausweichen.** Der Angreifer setzt `hitstop_left`, bevor er weiß, ob der Treffer zählt. Seine aktive Phase verlängert sich dann bei jedem Ausweichen.
+  - **Telegraph und Hitbox versehentlich unterschiedlich groß.** Der Spieler weicht der gelben Fläche aus und wird trotzdem getroffen, oder umgekehrt. Soll die Fläche bewusst nur andeuten, ist das eine Designentscheidung; dann gehört sie so ins Protokoll.
+  - **Ausweichrichtung ungewollt nur aus der Blickrichtung.** Liest der Code den Stick nicht, muss der Spieler erst laufen, um in eine neue Richtung auszuweichen.
+  - **Spieler- und Gegnerwerte im selben Lauf geändert.** Dann lässt sich keine Änderung einem Ergebnis zuordnen.
+
+  ## Zusammenfassung
+
+  - Ausweichen sind zwei Zustände: `DODGE` mit Bewegung und i-Frames, `DODGE_RECOVERY` danach. Richtung aus dem Stick, sonst Blickrichtung.
+  - i-Frames schalten die Hurtbox mit `monitorable` ab. Geht sie wieder an, meldet die Physik eine noch bestehende Überlappung neu.
+  - Die Figur entscheidet in `take_hit()`, ob ein Treffer zählt; Hitstop gibt es nur für gezählte Treffer.
+  - Der Wind-up eines gegnerischen Angriffs ist sein Telegraph. Eine Liste von `AttackData` ist das Muster.
+  - Das Punish-Fenster liest du aus dem Log: Frames, in denen du frei bist und der Gegner noch in der Erholung.
+  - Große Gegner sind derselbe Code mit größeren Flächen, mehreren Hurtbox-Zonen und `interruptible` aus.
+exercises:
+  - id: iframes-umsetzen
+    type: choice
+    title: Ablehnen oder abschalten?
+    prompt: |
+      Ein Gegnerangriff ist 20 Frames aktiv, die i-Frames dauern 11 Frames. Welche Aussagen über die beiden Umsetzungen stimmen?
+    options:
+      - text: Lehnt nur `take_hit()` in den i-Frames ab, trifft der Angriff nicht mehr, wenn die Figur nach den i-Frames in der Hitbox stehen bleibt.
+        correct: true
+        why: "`area_entered` kam schon während der i-Frames. Eine zweite Meldung gibt es nur beim erneuten Hineinkommen."
+      - text: Schaltet die Figur ihre Hurtbox mit `monitorable` ab und danach wieder an, meldet die Physik die Überlappung neu.
+        correct: true
+        why: Eine wieder eingeschaltete Fläche ist für die Physik eine neue Überlappung. Gemessen mit Godot 4.7.2.
+      - text: Beide Umsetzungen verhalten sich gleich, solange die Hitbox kürzer aktiv ist als die i-Frames.
+        correct: false
+        why: Entscheidend ist, ob die i-Frames enden, während die Hitbox noch an ist. Ein Angriff mit 4 aktiven Frames ab Frame 30 trifft eine Figur, die in Frame 20 auf der Stelle ausweicht, mit `monitorable` in Frame 33; die Fassung, die nur ablehnt, trifft nie. Gemessen mit Godot 4.7.2.
+      - text: Die Hurtbox mit `monitoring = false` abzuschalten reicht.
+        correct: false
+        why: "`monitoring` steuert, ob die Hurtbox selbst etwas erkennt. Sie erkennt ohnehin nichts; gefunden wird sie über `monitorable`."
+    explanation: |
+      Der Unterschied liegt im Signal: `area_entered` meldet nur Übergänge von draußen nach drinnen. Wer einen Treffer während der i-Frames nur ablehnt, verliert ihn endgültig, sobald die Figur in der Fläche bleibt. Wird die Hurtbox abgeschaltet und wieder eingeschaltet, entsteht ein neuer Übergang. Gleich verhalten sich beide Fassungen nur, wenn die aktive Phase endet, bevor die i-Frames enden. Deshalb gehört „zu früh ausweichen und stehen bleiben“ gegen einen langen Angriff in jeden Test.
+    resources:
+      - title: Godot Docs · Area2D.monitorable
+        url: https://docs.godotengine.org/en/stable/classes/class_area2d.html#class-area2d-property-monitorable
+
+  - id: ausweichen-zeitleiste
+    type: order
+    title: Ein Ausweichen von Anfang bis Ende
+    prompt: |
+      Bring die Ereignisse eines Ausweichens mit den Platzhaltern (18 Frames, i-Frames 2 bis 12, Erholung 8) in die richtige Reihenfolge.
+    lang: text
+    lines: |
+      Druck dodge, die Figur wechselt nach DODGE (Frame 1, verwundbar)
+      i-Frames an, die Hurtbox ist aus (Frame 2)
+      i-Frames aus, die Hurtbox ist wieder an (Frame 13)
+      Ende der Bewegung, Wechsel nach DODGE_RECOVERY
+      Erholung vorbei, Wechsel nach MOVE
+    explanation: |
+      Frame 1 ist mit den Platzhaltern verwundbar: Ein Treffer, der in diesem Frame ankommt, zählt. Dann folgen elf Frames i-Frames, danach bewegt sich die Figur noch sechs Frames verwundbar weiter, bevor sie acht Frames steht. Diese Reihenfolge ist eine Designentscheidung im Gerüst. Ein Ausweichen ohne verwundbaren Anfang oder ohne Erholung ist genauso baubar.
+
+  - id: treffer-nach-iframes
+    type: output
+    title: Wann trifft der lange Angriff?
+    prompt: |
+      Die Figur weicht auf der Stelle aus (`dodge_speed = 0`), i-Frames 2 bis 12. Ein Gegnerangriff ist von Frame 302 bis 321 aktiv, die Figur steht die ganze Zeit in seiner Fläche. In welchem Frame steht `Spieler getroffen`?
+    lang: text
+    code: |
+      300  Druck dodge
+      300  Spieler MOVE -> DODGE
+      301  Spieler i-Frames an (Frame 2 des Ausweichens)
+      302  Gegner TELEGRAPH -> ACTIVE
+      ???  Spieler getroffen in DODGE, Frame 13
+    expected: |
+      313
+    hints:
+      - Frame 12 des Ausweichens ist Frame 311.
+      - Die Hurtbox geht in Frame 312 wieder an. Wann meldet die Physik eine neue Überlappung?
+    explanation: |
+      Frame 1 des Ausweichens ist 300, also ist Frame 12 der Frame 311. In Frame 312 schaltet `_update_hurtbox()` die Hurtbox wieder an, der Physik-Schritt am Ende dieses Frames erkennt die Überlappung, und das Signal kommt in Frame 313. Im Log steht dabei „Frame 13“, weil die Figur in Frame 312 zuletzt gerechnet hat. Dasselbe Muster ist mit Godot 4.7.2 gemessen: Ausweichen ab Frame 28, Treffer in Frame 41.
+    resources:
+      - title: Godot Docs · Using Area2D
+        url: https://docs.godotengine.org/en/stable/tutorials/physics/using_area_2d.html
+
+  - id: ausweich-strecke
+    type: output
+    title: Wie weit trägt das Ausweichen?
+    prompt: |
+      `dodge_speed` ist 240 Pixel pro Sekunde, `dodge_frames` 15. Die Figur bewegt sich in jedem Frame von `DODGE`. Wie viele Pixel legt sie zurück? Antworte mit der Zahl.
+    lang: text
+    code: |
+      dodge_speed  = 240   # Pixel pro Sekunde
+      dodge_frames = 15
+    expected: |
+      60
+    accept:
+      - 60 px
+      - 60 Pixel
+    explanation: |
+      Pro Frame bewegt sich die Figur `240 / 60 = 4` Pixel, in 15 Frames also 60. Mit den Platzhaltern der Testszene (220 Pixel pro Sekunde, 18 Frames) sind es 66; Godot 4.7.2 misst 65,99998. Die Strecke ist für die Draufsicht wichtiger als die Geschwindigkeit allein: Sie entscheidet, ob ein Ausweichen aus einer großen Angriffsfläche herausführt oder die i-Frames das allein schaffen müssen.
+
+  - id: hurtbox-abschalten
+    type: gap
+    title: Die Hurtbox für die i-Frames
+    prompt: |
+      Ergänze `_update_hurtbox()`, sodass die Hurtbox während der i-Frames für gegnerische Hitboxen unsichtbar ist und das auch aus einem Treffer-Signal heraus funktioniert.
+    lang: gdscript
+    code: |
+      func _update_hurtbox() -> void:
+      	var off := is_invulnerable()
+      	if off == hurtbox_off:
+      		return
+      	hurtbox_off = off
+      	hurtbox.⟦set_deferred⟧(&"⟦monitorable⟧", ⟦not off⟧)
+    gaps:
+      - label: Verzögert setzen
+        hint: Dieselbe Methode wie für `disabled` der Hitbox.
+      - label: Welche Eigenschaft?
+        hint: Nicht „erkennt selbst“, sondern „kann gefunden werden“.
+      - label: Neuer Wert
+        hint: Während der i-Frames soll die Hurtbox nicht gefunden werden.
+        accept: ["!off", "off == false"]
+    explanation: |
+      `monitorable` entscheidet, ob andere Flächen die Hurtbox finden. Während der i-Frames ist `off` wahr, also soll `monitorable` falsch sein: `not off`. `set_deferred()` ist Vorsorge: `_update_hurtbox()` läuft heute nur in `_physics_process`, wo eine direkte Zuweisung ginge, aber wer es später aus einem Treffer-Signal aufruft, bekommt sonst die Fehlermeldung aus dem Godot-Start. `hurtbox_off` merkt sich den letzten Stand, damit die Zeile nur beim Wechsel läuft und das Log nicht jeden Frame eine Zeile schreibt.
+    resources:
+      - title: Godot Docs · Area2D.monitorable
+        url: https://docs.godotengine.org/en/stable/classes/class_area2d.html#class-area2d-property-monitorable
+
+  - id: ausweichrichtung
+    type: gap
+    title: Ausweichen in alle Richtungen
+    prompt: |
+      Ergänze die Zeile: Zeigt der Stick eine Richtung, weicht die Figur dorthin aus, sonst in Blickrichtung.
+    lang: gdscript
+    code: |
+      var direction := Input.get_vector(&"move_left", &"move_right", &"move_up", &"move_down")
+      dodge_direction = ⟦direction.normalized()⟧ if ⟦direction != Vector2.ZERO⟧ else ⟦facing⟧
+    gaps:
+      - label: Richtung des Sticks, Länge 1
+        hint: Ein halb gedrückter Stick soll nicht halb so weit ausweichen.
+      - label: Bedingung
+        hint: Wann zeigt der Stick überhaupt eine Richtung?
+        accept: ["not direction.is_zero_approx()", "direction.length() > 0", "direction.length() > 0.0", "Vector2.ZERO != direction", "direction != Vector2()", "direction.length_squared() > 0"]
+      - label: Sonst
+        hint: Die gemerkte Blickrichtung der Figur.
+    explanation: |
+      `normalized()` macht aus jedem Stick-Ausschlag einen Vektor der Länge 1. Ohne das wiche die Figur bei leicht gedrücktem Stick nur ein Stück weit aus, weil `get_vector()` kleine Ausschläge kürzer liefert. Ob ein halber Ausschlag ein kürzeres Ausweichen geben soll, ist eine Designfrage; das Gerüst entscheidet sich für immer gleich weit. Ohne Richtung nimmt die Figur `facing`, die Richtung, in die sie zuletzt gelaufen ist.
+    resources:
+      - title: Godot Docs · Vector2.normalized
+        url: https://docs.godotengine.org/en/stable/classes/class_vector2.html#class-vector2-method-normalized
+
+  - id: hitstop-beim-ausweichen
+    type: bug
+    title: Der Gegner friert beim Ausweichen ein
+    prompt: |
+      In einer Fassung, in der die Figur Treffer während der i-Frames nur in `take_hit()` ablehnt: Weicht die Figur aus, steht der Gegner trotzdem 4 Frames still, und seine aktive Phase endet im Log 4 Frames später als eingestellt. Finde die Zeile und korrigiere sie.
+    lang: gdscript
+    code: |
+      func _on_hitbox_area_entered(area: Area2D) -> void:
+      	if not area is Hurtbox:
+      		return
+      	var accepted := (area as Hurtbox).receive(current_attack(), self)
+      	hitstop_left = current_attack().hitstop
+    lines: [5]
+    fix:
+      - line: 5
+        answers:
+          - "if accepted: hitstop_left = current_attack().hitstop"
+          - "hitstop_left = current_attack().hitstop if accepted else 0"
+          - "hitstop_left = current_attack().hitstop if accepted else hitstop_left"
+    explanation: |
+      `receive()` gibt zurück, ob der Treffer gezählt hat. Zeile 5 setzt den Hitstop aber in jedem Fall, auch wenn die Figur gerade unverwundbar war. Dann verlängert jedes Ausweichen die aktive Phase des Gegners um den Hitstop, und das Punish-Fenster verschiebt sich, ohne dass jemand es so wollte. Genau dieser Fehler steckte in einer frühen Fassung des Gerüsts und fiel erst im Log auf: `ACTIVE -> RECOVERY` stand 4 Frames zu spät da.
+
+  - id: monitoring-verwechselt
+    type: bug
+    title: Der lange Angriff trifft wieder nie
+    prompt: |
+      Nach einem Umbau trifft der 20 Frames lange Angriff nicht mehr, wenn die Figur am Anfang ausweicht und stehen bleibt. Das Log zeigt `i-Frames an` und `i-Frames aus`, aber keinen Treffer. Finde die Zeile und korrigiere sie.
+    lang: gdscript
+    code: |
+      func _update_hurtbox() -> void:
+      	var off := is_invulnerable()
+      	if off == hurtbox_off:
+      		return
+      	hurtbox_off = off
+      	hurtbox.set_deferred(&"monitoring", not off)
+    lines: [6]
+    fix:
+      - line: 6
+        answers:
+          - hurtbox.set_deferred(&"monitorable", not off)
+          - hurtbox.set_deferred("monitorable", not off)
+          - hurtbox.set_deferred(&"monitorable", !off)
+          - hurtbox.set_deferred("monitorable", !off)
+          - hurtbox.set_deferred(&"monitorable", off == false)
+          - hurtbox.set_deferred("monitorable", off == false)
+          - hurtbox.monitorable = not off
+          - hurtbox.monitorable = !off
+    explanation: |
+      `monitoring` legt fest, ob eine Fläche selbst Überlappungen meldet. Die Hurtbox hat `monitoring` ohnehin aus, also ändert die Zeile nichts. Gefunden wird sie über `monitorable`, und nur dessen Wechsel erzeugt nach den i-Frames eine neue Überlappung. Mit Godot 4.7.2 nachgestellt: Mit `monitoring` trifft der lange Angriff nie, mit `monitorable` einen Frame nach dem Ende der i-Frames.
+    resources:
+      - title: Godot Docs · Area2D.monitoring
+        url: https://docs.godotengine.org/en/stable/classes/class_area2d.html#class-area2d-property-monitoring
+
+  - id: punish-fenster-lesen
+    type: explain
+    title: Zehn Frames für die Antwort
+    prompt: |
+      Erkläre an diesem Log, wie lange das Punish-Fenster ist und wovon es abhängt. Warum trifft die Figur in diesem Lauf trotzdem nicht?
+    lang: text
+    code: |
+      34  Dummy ACTIVE -> RECOVERY
+      46  Spieler DODGE -> DODGE_RECOVERY
+      54  Spieler DODGE_RECOVERY -> MOVE
+      64  Dummy RECOVERY -> WAIT
+    points:
+      - Die Figur ist ab Frame 54 frei, der Dummy erholt sich bis Frame 63; das Fenster ist 10 Frames lang.
+      - Mit 8 Frames Wind-up trifft ein Angriff mit Start in Frame 54 oder 55 noch in der Erholung; die Meldung aus Frame 64 kommt, bevor der Dummy sie verlässt.
+      - Das Fenster hängt an der Erholung des Gegners, an Dauer und Erholung des Ausweichens und am Wind-up des eigenen Angriffs.
+      - Die Figur trifft nicht, weil das Ausweichen sie 66 Pixel weit getragen hat und sie außer Reichweite steht.
+    explanation: |
+      Ein Punish-Fenster ist die Zeit, in der du frei bist und der Gegner noch nicht. Hier beginnt es mit Frame 54 und endet mit Frame 63, zehn Frames. Ein Angriff mit 8 Frames Wind-up kann in Frame 54 oder 55 starten und trifft dann in Frame 63 oder 64; die Meldung aus Frame 64 kommt am Anfang des Frames, bevor der Dummy seine Erholung verlässt. Ob das reicht, hängt aber auch am Weg: Ein Ausweichen, das weit trägt, bringt dich aus der Gefahr und zugleich aus der Reichweite. Diese Spannung ist eine der Stellen, an denen du für dein Spiel entscheiden musst, was es belohnen soll.
+    resources:
+      - title: Hades 2 Early Access Patch 1 (Shacknews)
+        url: https://www.shacknews.com/article/139921/hades-2-early-access-patch-notes-1
+
+  - id: interruptible-erklaeren
+    type: explain
+    title: Warum der große Gegner weitermacht
+    prompt: |
+      Erkläre, was `interruptible = false` am großen Trainingsgegner im Log bewirkt und was es nicht abschaltet.
+    lang: gdscript
+    code: |
+      func take_hit(attack: AttackData, source: Node2D, hurtbox: Hurtbox) -> bool:
+      	hits_taken += 1
+      	HitLog.add("%s getroffen: Zone %s, Schaden %.1f, in %s Frame %d" % [name, hurtbox.zone, attack.damage * hurtbox.damage_multiplier, State.keys()[state], frame])
+      	hitstop_left = attack.hitstop
+      	var flash := create_tween()
+      	body.modulate = Color(3, 3, 3)
+      	flash.tween_property(body, ^"modulate", Color.WHITE, 0.15)
+      	if interruptible:
+      		hitstun_frames = attack.hitstun
+      		velocity = (global_position - source.global_position).normalized() * attack.knockback
+      		_enter(State.HITSTUN)
+      	return true
+    points:
+      - Mit `interruptible = false` wechselt der Gegner nach einem Treffer nicht in `HITSTUN` und setzt sein Muster fort.
+      - Treffer zählen trotzdem; das Log schreibt Zone und Schaden, und `hits_taken` steigt.
+      - Den Hitstop bekommt er weiterhin, deshalb verschiebt sich sein Muster um die Hitstop-Frames.
+      - Ob und wann ein großer Gegner unterbrechbar ist, ist eine Designentscheidung; die Eigenschaft macht sie nur einstellbar.
+    explanation: |
+      `take_hit()` schreibt den Treffer ins Log, setzt den Hitstop und lässt den Gegner blinken. Erst die Zeile `if interruptible:` entscheidet, ob er zurückgestoßen wird und in `HITSTUN` wechselt. Ohne Unterbrechung bleibt er in seinem Muster, das sich nur um die Hitstop-Frames verschiebt: Im Log beginnt der Telegraph in Frame 34 statt 30. Ob deine großen Gegner unterbrechbar sind, immer oder nur in bestimmten Phasen, legst du fest.
+
+  - id: ausweichen-einbauen
+    type: practice
+    title: Ausweichen und Trainingsgegner einbauen
+    prompt: |
+      Ersetze `player.gd`, leg die Aktion `dodge` an und gib dem Dummy einen Angriff (Platzhalter: Wind-up 20, aktiv 4, Erholung 30, `wait_frames` 10). Stelle mit dem Drehbuch aus [Testszene: Angriff mit Frame-Daten](/combat/testszene-angriff) die drei Fälle aus der Lektion frame-genau nach: zu spät ausgewichen (`29: dodge`), gerade noch (`28: dodge`) und, mit `active = 20` und `dodge_speed = 0`, zu früh gegen den langen Angriff (`27: dodge`).
+    lang: text
+    solution: |
+      Die Hitbox des Dummys geht in Frame A an.
+      Zu spät, Druck in A:       Treffer in A + 1, „Frame 1“
+      Gerade noch, Druck in A-1: i-Frames an in A, kein Treffer
+      Zu früh mit dodge_speed 0 gegen den langen Angriff,
+      Druck in D:                i-Frames aus in D + 12,
+                                 Treffer in D + 13
+    checklist:
+      - Der Dummy zeigt den Telegraph als gelbe Fläche, so groß wie seine Hitbox.
+      - Alle drei Fälle stehen so im Log wie in der Lektion, mit denselben Abständen.
+      - Weicht die Figur aus, endet die aktive Phase des Dummys nach genau so vielen Frames wie eingestellt (kein Hitstop ohne Treffer).
+      - Du hast `dodge_speed` danach wieder auf deinen Testwert gestellt.
+    explanation: |
+      Die drei Fälle decken die Stellen ab, an denen Ausweich-Code am häufigsten falsch ist: der erste, verwundbare Frame, die i-Frames selbst und das Ende der i-Frames in einer noch aktiven Fläche. Stimmen sie mit der Lektion überein, kannst du dich bei allen weiteren Tests auf das Log verlassen. Weicht ein Fall ab, vergleiche zuerst `_update_hurtbox()` und die Ebenen der Hurtbox.
+
+  - id: grosser-gegner-bauen
+    type: practice
+    title: Den großen Trainingsgegner aufstellen
+    prompt: |
+      Bau den großen Trainingsgegner mit den Zonen `kopf` und `bein` und `interruptible` aus. Prüfe im Log, welche Zone du von welcher Seite triffst. Notiere danach drei Fragen, die du für einen eigenen großen Gegner beantworten müsstest. Antworten brauchst du nicht.
+    lang: text
+    solution: |
+      Beispiel für die Form, nicht für deinen Gegner:
+
+      Log: Von links unten trifft der Schlag nur „bein“.
+           Von oben trifft er „kopf“, Schaden 2.0.
+      Fragen:
+      1. Soll eine Zone nur in bestimmten Phasen erreichbar sein?
+      2. Wie zeigt der Gegner, dass er gerade nicht unterbrechbar ist?
+      3. Wohin soll der Spieler während des Stampfers ausweichen?
+    checklist:
+      - Jede Hurtbox ist ein direktes Kind des großen Gegners und hat eine eigene `zone`.
+      - Das Log zeigt für beide Zonen mindestens einen Treffer mit dem passenden Schaden.
+      - Mit `interruptible` aus wechselt der Gegner nach einem Treffer nicht in `HITSTUN`.
+      - Deine drei Fragen betreffen Entscheidungen, nicht Werte; sie sind von dir und bleiben vorerst offen.
+    explanation: |
+      Ein großer Gegner ist in der Testszene derselbe Code mit anderen Flächen. Was ihn als Gegner ausmacht, steckt in den Entscheidungen hinter diesen Flächen: welche Zone wann erreichbar ist, wie er seine Unverwundbarkeit zeigt, wohin der Spieler soll. Die Fragen hältst du fest, damit du sie später gezielt testest. Antworten gibt dir der Kurs nicht; sie gehören zu deinem Spiel.
+    resources:
+      - title: Godot Docs · GDScript exported properties
+        url: https://docs.godotengine.org/en/stable/tutorials/scripting/gdscript/gdscript_exports.html

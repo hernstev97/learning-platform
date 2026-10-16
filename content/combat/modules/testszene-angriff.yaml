@@ -1,0 +1,887 @@
+id: testszene-angriff
+title: "Testszene: Angriff mit Frame-Daten"
+level: 2
+minutes: 180
+summary: Ein Angriff, dessen Wind-up, aktive Phase und Erholung als Zahlen im Inspektor stehen, ein Zustandsautomat, der Physik-Frames zählt, ein Eingabepuffer, ein Trainingsdummy mit Hurtbox, Hitstop und eine Anzeige, die jeden Treffer mit Frame-Nummer protokolliert.
+goals:
+  - Du legst Frame-Daten als `Resource` an und änderst sie im Inspektor, ohne Code anzufassen.
+  - Du liest einen Zustandsautomaten, der Physik-Frames zählt, und sagst vorher, in welchem Frame ein Zustandswechsel im Log steht.
+  - Du erklärst Eingabepuffer und Abbruchfenster am Code und an echten Log-Zeilen.
+  - Du richtest Hitbox, Hurtbox und Kollisionsebenen so ein, dass nur gewollte Treffer zählen.
+  - Du unterscheidest lokalen Hitstop von `Engine.time_scale` und begründest, warum die Testszene den lokalen nimmt.
+resources:
+  - title: Godot Docs · Resources
+    url: https://docs.godotengine.org/en/stable/tutorials/scripting/resources.html
+  - title: Godot Docs · Physics introduction · Collision layers and masks
+    url: https://docs.godotengine.org/en/stable/tutorials/physics/physics_introduction.html#collision-layers-and-masks
+  - title: Godot Docs · Singletons (Autoload)
+    url: https://docs.godotengine.org/en/stable/tutorials/scripting/singletons_autoload.html
+  - title: Godot Docs · Engine.time_scale
+    url: https://docs.godotengine.org/en/stable/classes/class_engine.html#class-engine-property-time-scale
+lesson: |
+  > [!NOTE] Am PC
+  > Für diese Lektion brauchst du Godot 4 am Rechner. Lesen kannst du sie auch unterwegs, die Übungen setzen die Testszene voraus.
+
+  Im [Godot-Start](/combat/godot-start) steckte das Timing des Angriffs in Keys einer Animation. Wer acht Frames Wind-up auf zehn ändern will, verschiebt dort zwei Keys und hofft, dass er keinen dritten vergessen hat. Zum Abstimmen willst du etwas anderes: Zahlen im Inspektor, einen Dummy zum Draufhauen und ein Log, das sagt, in welchem Frame was passiert ist.
+
+  Dieses Modul baut genau das. Die Skripte darf dir eine KI schreiben, und hier stehen sie fertig. Lesen solltest du sie trotzdem: Wenn sich ein Treffer falsch anfühlt, musst du unterscheiden können, ob dein Wert nicht passt oder der Code etwas anderes tut, als du denkst. Alle Zahlen in den Skripten sind Platzhalter. Sie sind so gewählt, dass die Szene läuft, nicht so, dass sie sich gut anfühlt. Das Abstimmen ist deine Arbeit in [Tuning als Experiment](/combat/tuning).
+
+  ## Frame-Daten als Resource
+
+  Eine **Resource** ist in Godot ein Datenobjekt, das du im Inspektor bearbeitest und als `.tres`-Datei speichern kannst ([Resources](https://docs.godotengine.org/en/stable/tutorials/scripting/resources.html)). Für einen Angriff ist das ideal: Die Figur bekommt ein Feld `attack`, und du ziehst verschiedene Angriffsdateien hinein, etwa `angriff_a.tres` und `angriff_b.tres` für einen Vergleich.
+
+  ```gdscript title=attack_data.gd
+  class_name AttackData
+  extends Resource
+
+  ## Frame-Daten eines Angriffs. Ein Frame ist ein Physik-Tick (60 pro Sekunde).
+  ## Die Startwerte sind willkürlich, damit die Szene läuft. Sie sind kein Vorschlag.
+
+  @export_range(1, 60) var windup := 8      ## Frames vor der aktiven Phase
+  @export_range(1, 30) var active := 3      ## Frames, in denen die Hitbox trifft
+  @export_range(0, 60) var recovery := 14   ## Frames danach, bis die Figur wieder frei ist
+  @export_range(0, 60) var cancel_from := 0 ## Ab diesem Erholungs-Frame darf ein Anschluss starten (0 = nie)
+  @export var damage := 1
+  @export_range(0, 20) var hitstop := 4     ## Frames, die Angreifer und Ziel beim Treffer anhalten
+  @export_range(0, 60) var hitstun := 12    ## Frames, die das Ziel danach handlungsunfähig ist
+  @export var knockback := 120.0            ## Pixel pro Sekunde, die das Ziel zurückgestoßen wird
+
+
+  func total() -> int:
+  	return windup + active + recovery
+  ```
+
+  `class_name AttackData` macht den Typ im ganzen Projekt bekannt. `@export_range` begrenzt den Schieberegler im Inspektor; die Grenzen sind keine Empfehlung, sie verhindern nur Tippfehler wie 600 statt 6 ([@export_range](https://docs.godotengine.org/en/stable/classes/class_@gdscript.html#class-gdscript-annotation-export-range)). Alles ist in Frames angegeben, nur der Knockback in Pixeln pro Sekunde.
+
+  > [!PRAXIS] Wo liegt die Wahrheit über das Timing?
+  > Entscheide pro Projekt, wer das Timing besitzt: die Animation oder der Code. Im Godot-Start war es die Animation. Hier zählt der Code die Frames, und eine Animation dürfte nur noch Bilder zeigen. Steuern beide die Hitbox, laufen sie beim ersten Tuning auseinander, und keiner weiß, welcher Wert gilt. Bleibt das Timing in der Animation, gehört `advance(0)` hinter jedes `play()`, sonst beginnt sie einen Frame zu spät.
+
+  ## Ein Zustandsautomat, der Frames zählt
+
+  Die Figur ist immer in genau einem Zustand: `MOVE`, `WINDUP`, `ACTIVE` oder `RECOVERY`. `frame` zählt, im wievielten Frame dieses Zustands sie gerade ist, beginnend bei 1. Jeder Aufruf von `_physics_process` ist ein Frame:
+
+  ```gdscript
+  func _physics_process(_delta: float) -> void:
+  	_read_buttons()
+  	if hitstop_left > 0:
+  		hitstop_left -= 1
+  		return
+  	# 1. Übergänge: Ist der Zustand abgelaufen, oder startet eine Aktion?
+  	frame += 1
+  	if state != State.MOVE and frame > _duration(state):
+  		_enter(_next_state(state))
+  	if state == State.MOVE and _consume(&"attack"):
+  		_enter(State.WINDUP)
+  	elif state == State.RECOVERY and attack.cancel_from > 0 and frame >= attack.cancel_from:
+  		if _consume(&"attack"):
+  			_enter(State.WINDUP)
+  	# 2. Verhalten im (neuen) Zustand
+  	if state == State.MOVE:
+  		_move()
+  	if buffer_age >= 0:
+  		buffer_age += 1
+  ```
+
+  Der Ablauf hat zwei Phasen. Zuerst die **Übergänge**: `frame` rückt vor, und ist der Zustand abgelaufen, wechselt die Figur in den nächsten. Danach startet ein neuer Angriff, wenn die Figur frei ist. Dann das **Verhalten**: Nur in `MOVE` läuft die Figur. Wie lange ein Zustand dauert und was danach kommt, steht in zwei kleinen Funktionen:
+
+  ```gdscript
+  func _duration(s: State) -> int:
+  	match s:
+  		State.WINDUP: return attack.windup
+  		State.ACTIVE: return attack.active
+  		State.RECOVERY: return attack.recovery
+  	return 0
+
+
+  func _next_state(s: State) -> State:
+  	match s:
+  		State.WINDUP: return State.ACTIVE
+  		State.ACTIVE: return State.RECOVERY
+  	return State.MOVE
+
+
+  func _enter(new_state: State) -> void:
+  	HitLog.add("Spieler %s -> %s" % [State.keys()[state], State.keys()[new_state]])
+  	state = new_state
+  	frame = 1
+  	# Hitbox nur in der aktiven Phase. set_deferred, weil Godot Formen
+  	# während der Physik-Abfrage nicht umschalten lässt.
+  	hitbox_shape.set_deferred(&"disabled", new_state != State.ACTIVE)
+  	if new_state == State.ACTIVE:
+  		already_hit.clear()
+  ```
+
+  Mit den Platzhaltern Wind-up 8, aktiv 3, Erholung 14 belegt der Angriff 25 Frames: Frame 1 bis 8 Wind-up, 9 bis 11 aktiv, 12 bis 25 Erholung. So steht es auch im Log, wenn kein Ziel in Reichweite ist. Die erste Spalte ist der Physik-Frame seit Spielstart:
+
+  ```text
+      12  Druck attack
+      12  Spieler MOVE -> WINDUP
+      20  Spieler WINDUP -> ACTIVE
+      23  Spieler ACTIVE -> RECOVERY
+      37  Spieler RECOVERY -> MOVE
+  ```
+
+  Offizielle Frame-Daten wie die von Street Fighter 6 nennen den ersten aktiven Frame mit: Wind-up 8 heißt dort Startup 9 (siehe [Angriffsphasen](/combat/angriffsphasen)). Prüf bei jeder Tabelle, welche Zählung sie nutzt.
+
+  ## Eingabepuffer und Abbruchfenster
+
+  `is_action_just_pressed()` ist nur in dem einen Frame wahr, in dem die Taste runtergeht. Drückst du drei Frames vor dem Ende der Erholung, geht der Druck ohne Puffer verloren. Der Puffer merkt sich deshalb die Aktion und wie viele Frames der Druck alt ist:
+
+  ```gdscript
+  func _read_buttons() -> void:
+  	if Input.is_action_just_pressed(&"attack"):
+  		HitLog.add("Druck attack")
+  		buffered_action = &"attack"
+  		buffer_age = 0
+
+
+  func _consume(action: StringName) -> bool:
+  	if buffered_action == action and buffer_age >= 0 and buffer_age <= input_buffer:
+  		buffer_age = -1
+  		return true
+  	return false
+  ```
+
+  `buffer_age` altert am Ende jedes Frames um eins, aber nicht im Hitstop, weil `_physics_process` dort vorher zurückkehrt. Ein Druck während des Hitstops bleibt also gültig. `input_buffer = 6` heißt: Ein Druck zählt, wenn die Figur höchstens 6 Frames später frei ist. Die Zeile `Druck attack` schreibt die Figur in dem Frame, in dem sie den Druck sieht. Zwei echte Läufe mit Treffer zeigen beide Fälle; die Erholung endet hier in Frame 41:
+
+  ```text
+      27  Spieler ACTIVE -> RECOVERY
+      32  Druck attack
+      41  Spieler RECOVERY -> MOVE
+  ```
+
+  ```text
+      27  Spieler ACTIVE -> RECOVERY
+      37  Druck attack
+      41  Spieler RECOVERY -> MOVE
+      41  Spieler MOVE -> WINDUP
+  ```
+
+  Der Druck aus Frame 32 ist in Frame 41 neun Frames alt und verfällt. Der aus Frame 37 ist vier Frames alt, und der zweite Angriff startet im ersten freien Frame. Warum Puffer überhaupt nötig sind und wie groß sie in veröffentlichten Spielen sind, steht in [Eingabe, Reaktionszeit und Puffer](/combat/eingabe).
+
+  ### Abbruchfenster: Anschluss aus der Erholung
+
+  `cancel_from` erlaubt einen neuen Angriff, bevor die Erholung vorbei ist. Mit `cancel_from = 6` darf ab dem sechsten Frame der Erholung ein gepufferter Angriff starten. Im echten Lauf beginnt die Erholung in Frame 27, der Druck kommt in Frame 31, und in Frame 32, dem sechsten Erholungsframe, startet der Anschluss:
+
+  ```text
+      27  Spieler ACTIVE -> RECOVERY
+      31  Druck attack
+      32  Spieler RECOVERY -> WINDUP
+  ```
+
+  Ob dein Spiel Anschlussangriffe hat, ab wann und ob nur nach einem Treffer, entscheidest du. Der Platzhalter `0` schaltet das Fenster ab.
+
+  ## Treffer: Hitbox, Hurtbox und der Trainingsdummy
+
+  Die **Hitbox** ist die Fläche, mit der ein Angriff trifft; die **Hurtbox** die Fläche, an der eine Figur verwundbar ist. Beide sind `Area2D`. Die Hurtbox bekommt ein kleines Skript. Es gibt jeden Treffer an seine Figur weiter, und die Figur entscheidet in `take_hit()`, ob er zählt:
+
+  ```gdscript title=hurtbox.gd
+  class_name Hurtbox
+  extends Area2D
+
+  ## Fläche, an der eine Figur getroffen werden kann.
+  ## Ob ein Treffer zählt, entscheidet die Figur (der Elternknoten) in take_hit().
+
+  @export var zone := &"body"
+  @export var damage_multiplier := 1.0
+
+
+  func receive(attack: AttackData, source: Node2D) -> bool:
+  	return get_parent().take_hit(attack, source, self)
+  ```
+
+  Damit nur gewollte Paare sich finden, benennst du unter *Projekteinstellungen → Ebenennamen → 2D-Physik* drei Ebenen und setzt Ebene (`collision_layer`) und Maske (`collision_mask`) so ([Collision layers and masks](https://docs.godotengine.org/en/stable/tutorials/physics/physics_introduction.html#collision-layers-and-masks)):
+
+  | Node | Ebene | Maske | Einstellung |
+  | --- | --- | --- | --- |
+  | Hurtbox Spieler | 2 | – | `monitoring` aus |
+  | Hitbox Spieler | – | 3 | `monitorable` aus |
+  | Hurtbox Gegner | 3 | – | `monitoring` aus |
+  | Hitbox Gegner | – | 2 | `monitorable` aus |
+
+  Ebene 1 heißt „Welt“ und bleibt für Wände. Die Regel aus der Doku: Ein Objekt A erkennt B nur, wenn B in einer Ebene liegt, die A scannt. Die Hitbox scannt also die Hurtboxen der Gegenseite und sonst nichts. Eine Hurtbox scannt selbst nichts (`monitoring` aus), muss aber gefunden werden können (`monitorable` an).
+
+  Berührt die Hitbox eine Hurtbox, fragt sie über `receive()` nach. Nur wenn die getroffene Figur `true` zurückgibt, zählt der Treffer, und erst dann beginnt der Hitstop:
+
+  ```gdscript
+  func _on_hitbox_area_entered(area: Area2D) -> void:
+  	if not area is Hurtbox or area.get_parent() in already_hit:
+  		return
+  	if (area as Hurtbox).receive(attack, self):
+  		already_hit.append(area.get_parent())
+  		hitstop_left = attack.hitstop
+  ```
+
+  `already_hit` sorgt dafür, dass ein Angriff jedes Ziel höchstens einmal trifft, auch wenn er zwei Hurtboxen desselben Gegners berührt. Ob ein Angriff mehrfach treffen soll, ist eine Designfrage. Die Regel hier ist nur der Startpunkt. Dafür muss jede Hurtbox ein direktes Kind ihrer Figur sein. Dass die Figur einen Treffer ablehnen kann, brauchst du im nächsten Modul: Während der i-Frames zählt kein Treffer.
+
+  Eine Hitbox, die im Frame X angeht, meldet den Treffer im Frame X + 1. Im Log siehst du das als Abstand zwischen `WINDUP -> ACTIVE` und `getroffen`.
+
+  ### Der Trainingsdummy
+
+  Der Dummy nutzt dasselbe Skript wie die Trainingsgegner im nächsten Modul, nur ohne Angriffe. Er zählt Treffer, blinkt, wird zurückgestoßen und schreibt alles ins Log; das steht in `take_hit()` am Ende. Die Angriffslogik im oberen Teil liest du erst in [Testszene: Ausweichen und Gegner](/combat/testszene-ausweichen):
+
+  ```gdscript title=enemy.gd
+  extends CharacterBody2D
+
+  ## Trainingsgegner: wartet, kündigt den Angriff an (Telegraph), greift an, erholt sich.
+  ## Ohne Angriffe in „attacks“ ist er ein Dummy, der nur Treffer zählt.
+
+  enum State { WAIT, TELEGRAPH, ACTIVE, RECOVERY, HITSTUN }
+
+  @export var attacks: Array[AttackData] = []     ## Muster, wird der Reihe nach wiederholt
+  @export_range(1, 600) var wait_frames := 60     ## Pause vor jedem Angriff
+  @export var interruptible := true               ## false: Treffer unterbrechen den Angriff nicht
+
+  var state := State.WAIT
+  var frame := 1
+  var pattern_index := 0
+  var hitstop_left := 0
+  var hitstun_frames := 0
+  var hits_taken := 0
+
+  @onready var body: CanvasItem = $Body
+  @onready var telegraph: CanvasItem = $Telegraph
+  @onready var hitbox: Area2D = $Hitbox
+  @onready var hitbox_shape: CollisionShape2D = $Hitbox/CollisionShape2D
+
+
+  func _ready() -> void:
+  	telegraph.visible = false
+  	hitbox_shape.disabled = true
+  	hitbox.area_entered.connect(_on_hitbox_area_entered)
+
+
+  func _physics_process(_delta: float) -> void:
+  	if hitstop_left > 0:
+  		hitstop_left -= 1
+  		return
+  	frame += 1
+  	if frame > _duration():
+  		_enter(_next_state())
+  	if state == State.HITSTUN:
+  		velocity = velocity.move_toward(Vector2.ZERO, 10.0)
+  		move_and_slide()
+
+
+  func current_attack() -> AttackData:
+  	return attacks[pattern_index]
+
+
+  func _duration() -> int:
+  	match state:
+  		State.WAIT: return wait_frames
+  		State.TELEGRAPH: return current_attack().windup
+  		State.ACTIVE: return current_attack().active
+  		State.RECOVERY: return current_attack().recovery
+  		State.HITSTUN: return hitstun_frames
+  	return 0
+
+
+  func _next_state() -> State:
+  	match state:
+  		State.WAIT: return State.TELEGRAPH if not attacks.is_empty() else State.WAIT
+  		State.TELEGRAPH: return State.ACTIVE
+  		State.ACTIVE: return State.RECOVERY
+  	return State.WAIT
+
+
+  func _enter(new_state: State) -> void:
+  	if new_state != state:
+  		HitLog.add("%s %s -> %s" % [name, State.keys()[state], State.keys()[new_state]])
+  	if state == State.RECOVERY:
+  		pattern_index = (pattern_index + 1) % attacks.size()
+  	state = new_state
+  	frame = 1
+  	telegraph.visible = new_state == State.TELEGRAPH
+  	hitbox_shape.set_deferred(&"disabled", new_state != State.ACTIVE)
+
+
+  func _on_hitbox_area_entered(area: Area2D) -> void:
+  	if area is Hurtbox and (area as Hurtbox).receive(current_attack(), self):
+  		hitstop_left = current_attack().hitstop
+
+
+  func take_hit(attack: AttackData, source: Node2D, hurtbox: Hurtbox) -> bool:
+  	hits_taken += 1
+  	HitLog.add("%s getroffen: Zone %s, Schaden %.1f, in %s Frame %d" % [name, hurtbox.zone, attack.damage * hurtbox.damage_multiplier, State.keys()[state], frame])
+  	hitstop_left = attack.hitstop
+  	var flash := create_tween()
+  	body.modulate = Color(3, 3, 3)
+  	flash.tween_property(body, ^"modulate", Color.WHITE, 0.15)
+  	if interruptible:
+  		hitstun_frames = attack.hitstun
+  		velocity = (global_position - source.global_position).normalized() * attack.knockback
+  		_enter(State.HITSTUN)
+  	return true
+  ```
+
+  Sein Baum:
+
+  ```text
+  Dummy (CharacterBody2D)   enemy.gd, motion_mode Floating
+  ├── Body (Polygon2D)      12 × 16
+  ├── Telegraph (Polygon2D) gelbe Bodenfläche, erst im nächsten Modul
+  ├── Hurtbox (Area2D)      hurtbox.gd, Ebene 3
+  │   └── CollisionShape2D
+  └── Hitbox (Area2D)       Maske 2
+      └── CollisionShape2D  disabled
+  ```
+
+  ## Hitstop: Angreifer und Ziel halten an
+
+  Beim Treffer frieren Angreifer und Ziel für `hitstop` Frames ein. Beide setzen dafür ihren eigenen Zähler `hitstop_left`; solange er läuft, kehrt `_physics_process` sofort zurück. Der echte Lauf mit Treffer:
+
+  ```text
+      12  Druck attack
+      12  Spieler MOVE -> WINDUP
+      20  Spieler WINDUP -> ACTIVE
+      21  Dummy getroffen: Zone body, Schaden 1.0, in WAIT Frame 21
+      21  Dummy WAIT -> HITSTUN
+      27  Spieler ACTIVE -> RECOVERY
+      36  Dummy HITSTUN -> WAIT
+      41  Spieler RECOVERY -> MOVE
+  ```
+
+  Ohne Treffer endete die aktive Phase in Frame 23, jetzt in Frame 27: Die Frames 21 bis 24 standen still. Der Angriff dauert für den Spieler vier Frames länger, und für diese vier Frames kann er nichts anderes tun. Diese Kosten gehören zum Hitstop dazu (mehr in [Trefferfeedback](/combat/trefferfeedback)).
+
+  Naheliegend wäre `Engine.time_scale = 0` für den Stillstand. Das hält aber nur an, was mit `delta` rechnet. `_physics_process` läuft weiter, nur mit `delta = 0`; mit Godot 4.7.2 gemessen: sechs Aufrufe in 0,1 Sekunden ([Engine.time_scale](https://docs.godotengine.org/en/stable/classes/class_engine.html#class-engine-property-time-scale)). Ein Zustandsautomat, der Frames zählt, zählt also weiter, und der Angriff läuft im „Stillstand“ ab. Außerdem stünde alles still, auch Menüs und die Debug-Anzeige.
+
+  ## Messen: Treffer-Log, Anzeige und Drehbuch
+
+  Das Log ist ein **Autoload**: ein Node, den Godot beim Start einmal anlegt und der unter seinem Namen überall erreichbar ist ([Singletons (Autoload)](https://docs.godotengine.org/en/stable/tutorials/scripting/singletons_autoload.html)). Trag `hit_log.gd` unter *Projekteinstellungen → Globals → Autoload* mit dem Namen `HitLog` ein.
+
+  ```gdscript title=hit_log.gd
+  extends Node
+
+  ## Autoload „HitLog“: schreibt jedes Ereignis mit Physik-Frame in die Ausgabe
+  ## und hält die letzten Zeilen für die Debug-Anzeige bereit.
+
+  const MAX_LINES := 8
+  var lines: PackedStringArray = []
+
+
+  func add(text: String) -> void:
+  	var line := "%6d  %s" % [Engine.get_physics_frames(), text]
+  	print(line)
+  	lines.append(line)
+  	if lines.size() > MAX_LINES:
+  		lines.remove_at(0)
+  ```
+
+  Die Anzeige im Bild ist ein `Label` in einem `CanvasLayer`, damit sie nicht mit der Kamera wandert. Im Inspektor ziehst du die Figur in das Feld `player` und stellst unter *Theme Overrides → Font Sizes* die Schriftgröße auf 8. Mit der Standardgröße 16 und acht Log-Zeilen wäre das Label über 500 Pixel breit, das Bild ist nur 320 breit; mit Größe 8, Statuszeile und drei Log-Zeilen misst es 257 × 57 Pixel (gemessen in Godot 4.7.2). Das vollständige Log steht weiter in der Ausgabe.
+
+  ```gdscript title=debug_label.gd
+  extends Label
+
+  ## Zeigt Zustand, Frame und Puffer der Spielfigur und die letzten drei Einträge aus HitLog.
+  ## Im Inspektor unter Theme Overrides → Font Sizes die Größe auf 8 stellen,
+  ## sonst ist die Anzeige breiter als das 320 × 180 Pixel große Bild.
+
+  @export var player: CharacterBody2D
+
+
+  func _process(_delta: float) -> void:
+  	var buffer := "leer" if player.buffer_age < 0 else "%s seit %d" % [player.buffered_action, player.buffer_age]
+  	text = "%s  Frame %d  Puffer: %s\n%s" % [player.state_name(), player.frame, buffer, "\n".join(HitLog.lines.slice(-3))]
+  ```
+
+  Zusammen mit *Debug → Kollisionsformen sichtbar* und dem Einzelbild-Schritt (F10) siehst du jetzt bei jedem Treffer, welcher Zustand, welcher Frame und welcher Puffer im Spiel war.
+
+  ### Eingaben nach Drehbuch
+
+  Von Hand triffst du keinen Frame genau; bei 60 Frames pro Sekunde ist einer knapp 17 Millisekunden lang. Willst du einen Lauf wie in dieser Lektion wiederholen, drückt ein kleines Skript die Tasten für dich. Es ist Testgerüst, kein Teil des Spiels:
+
+  ```gdscript title=drehbuch.gd
+  extends Node
+
+  ## Drehbuch für Testläufe: drückt Aktionen in festen Physik-Frames, damit ein Lauf
+  ## frame-genau wiederholbar ist. Technisches Gerüst, kein Teil des Spiels.
+  ## Die Figur sieht einen Druck aus Frame N im Frame N + 1.
+
+  @export var presses: Dictionary[int, StringName] = {}   ## Physik-Frame -> Aktion
+
+
+  func _physics_process(_delta: float) -> void:
+  	for action: StringName in [&"attack", &"dodge"]:
+  		if Input.is_action_pressed(action):
+  			Input.action_release(action)
+  	var now := Engine.get_physics_frames()
+  	if presses.has(now):
+  		Input.action_press(presses[now])
+  ```
+
+  Häng einen `Node` mit diesem Skript unter `Main` und stell im Inspektor *Process → Physics Priority* auf `-1`, damit er vor der Figur rechnet. Unter `presses` trägst du ein, in welchem Physik-Frame welche Aktion gedrückt wird. Die Figur sieht den Druck einen Frame später: Mit `11: attack` und `36: attack` steht im Log `12  Druck attack` und `37  Druck attack`, genau die Läufe von oben (geprüft mit Godot 4.7.2). Für wiederholbare Läufe startest du die Szene aus dem Terminal mit fester Bildrate, etwa `godot --path . --fixed-fps 60`.
+
+  > [!INTERVIEW]
+  > „Ein Tester sagt, der Angriff komme manchmal nicht raus. Wie gehst du vor?“ Gute Antwort: Erst messen, dann ändern. Ein Log mit Frame-Nummer für jeden Tastendruck und jeden Zustandswechsel zeigt, ob der Druck in der Erholung kam und verfiel, ob er im Hitstop lag oder gar nicht ankam. Erst dann entscheidest du, ob der Puffer zu kurz ist oder die Erholung zu lang – und das ist eine Designentscheidung, keine Fehlerbehebung.
+
+  ## Die Szene und das Skript der Spielfigur zum Kopieren
+
+  So sieht die Hauptszene dieses Moduls aus. Positionen und Größen sind die, mit denen die Logs der Lektion entstanden sind:
+
+  ```text
+  Main (Node2D)
+  ├── Player (CharacterBody2D)    player.gd, Position (80, 90), Floating
+  │   ├── Body (Polygon2D)        12 × 12
+  │   ├── CollisionShape2D        10 × 10, Ebene 1
+  │   ├── Hurtbox (Area2D)        hurtbox.gd, Ebene 2, monitoring aus
+  │   │   └── CollisionShape2D    10 × 10
+  │   └── HitboxPivot (Node2D)
+  │       └── Hitbox (Area2D)     Maske 3, monitorable aus
+  │           └── CollisionShape2D  14 × 10 bei (12, 0), disabled
+  ├── Dummy (CharacterBody2D)     enemy.gd, Position (100, 90), Floating
+  │   ├── Body (Polygon2D)        12 × 16
+  │   ├── Telegraph (Polygon2D)   14 × 10 bei (−16, 0), wie die Hitbox
+  │   ├── Hurtbox (Area2D)        hurtbox.gd, Ebene 3, monitoring aus
+  │   │   └── CollisionShape2D    12 × 16
+  │   └── Hitbox (Area2D)         Maske 2, monitorable aus
+  │       └── CollisionShape2D    14 × 10 bei (−16, 0), disabled
+  ├── DebugLayer (CanvasLayer)
+  │   └── DebugLabel (Label)      debug_label.gd, Schrift 8, player = Player
+  └── Drehbuch (Node)             drehbuch.gd, nur für Testläufe
+  ```
+
+  Die Spielfigur hat also gegenüber dem Godot-Start eine `Hurtbox` mit eigenem Skript und eigener Form und keinen `AnimationPlayer` mehr. Ins Feld `attack` legst du im Inspektor *Neues AttackData* an und speicherst es als `angriff_a.tres`.
+
+  ```gdscript title=player.gd
+  extends CharacterBody2D
+
+  ## Spielfigur der Testszene: Bewegung und ein Angriff mit Frame-Daten.
+  ## Ein Frame ist ein Physik-Tick. Alle Startwerte sind Platzhalter zum Abstimmen.
+
+  enum State { MOVE, WINDUP, ACTIVE, RECOVERY }
+
+  @export var move_speed := 90.0                 ## Pixel pro Sekunde
+  @export var attack: AttackData
+  @export_range(0, 20) var input_buffer := 6     ## so viele Frames bleibt ein Tastendruck gültig
+
+  var state := State.MOVE
+  var frame := 1                  # Frame im aktuellen Zustand, ab 1
+  var facing := Vector2.RIGHT
+  var buffered_action := &""
+  var buffer_age := -1            # Frames seit dem gepufferten Druck, -1 = leer
+  var hitstop_left := 0
+  var already_hit: Array[Node] = []
+
+  @onready var hitbox_pivot: Node2D = $HitboxPivot
+  @onready var hitbox: Area2D = $HitboxPivot/Hitbox
+  @onready var hitbox_shape: CollisionShape2D = $HitboxPivot/Hitbox/CollisionShape2D
+
+
+  func _ready() -> void:
+  	hitbox_shape.disabled = true
+  	hitbox.area_entered.connect(_on_hitbox_area_entered)
+
+
+  func _physics_process(_delta: float) -> void:
+  	_read_buttons()
+  	if hitstop_left > 0:
+  		hitstop_left -= 1
+  		return
+  	# 1. Übergänge: Ist der Zustand abgelaufen, oder startet eine Aktion?
+  	frame += 1
+  	if state != State.MOVE and frame > _duration(state):
+  		_enter(_next_state(state))
+  	if state == State.MOVE and _consume(&"attack"):
+  		_enter(State.WINDUP)
+  	elif state == State.RECOVERY and attack.cancel_from > 0 and frame >= attack.cancel_from:
+  		if _consume(&"attack"):
+  			_enter(State.WINDUP)
+  	# 2. Verhalten im (neuen) Zustand
+  	if state == State.MOVE:
+  		_move()
+  	if buffer_age >= 0:
+  		buffer_age += 1
+
+
+  func _read_buttons() -> void:
+  	if Input.is_action_just_pressed(&"attack"):
+  		HitLog.add("Druck attack")
+  		buffered_action = &"attack"
+  		buffer_age = 0
+
+
+  func _consume(action: StringName) -> bool:
+  	if buffered_action == action and buffer_age >= 0 and buffer_age <= input_buffer:
+  		buffer_age = -1
+  		return true
+  	return false
+
+
+  func _move() -> void:
+  	var direction := Input.get_vector(&"move_left", &"move_right", &"move_up", &"move_down")
+  	if direction != Vector2.ZERO:
+  		facing = direction.normalized()
+  		hitbox_pivot.rotation = facing.angle()
+  	velocity = direction * move_speed
+  	move_and_slide()
+
+
+  func _duration(s: State) -> int:
+  	match s:
+  		State.WINDUP: return attack.windup
+  		State.ACTIVE: return attack.active
+  		State.RECOVERY: return attack.recovery
+  	return 0
+
+
+  func _next_state(s: State) -> State:
+  	match s:
+  		State.WINDUP: return State.ACTIVE
+  		State.ACTIVE: return State.RECOVERY
+  	return State.MOVE
+
+
+  func _enter(new_state: State) -> void:
+  	HitLog.add("Spieler %s -> %s" % [State.keys()[state], State.keys()[new_state]])
+  	state = new_state
+  	frame = 1
+  	# Hitbox nur in der aktiven Phase. set_deferred, weil Godot Formen
+  	# während der Physik-Abfrage nicht umschalten lässt.
+  	hitbox_shape.set_deferred(&"disabled", new_state != State.ACTIVE)
+  	if new_state == State.ACTIVE:
+  		already_hit.clear()
+
+
+  func state_name() -> String:
+  	return State.keys()[state]
+
+
+  func _on_hitbox_area_entered(area: Area2D) -> void:
+  	if not area is Hurtbox or area.get_parent() in already_hit:
+  		return
+  	if (area as Hurtbox).receive(attack, self):
+  		already_hit.append(area.get_parent())
+  		hitstop_left = attack.hitstop
+  ```
+
+  ## Häufige Fehler
+
+  - **Wind-up einen Frame zu kurz.** `frame >= _duration(state)` statt `>`: Der Zustand endet schon im letzten Frame. Das Log zeigt sieben statt acht Frames zwischen `MOVE -> WINDUP` und `WINDUP -> ACTIVE`.
+  - **Frames in `_process` gezählt.** Dann hängt die Länge eines Angriffs an der Bildrate.
+  - **Hitbox im Treffer-Signal direkt umgeschaltet.** Godot lehnt das ab; `set_deferred()` nehmen.
+  - **Treffer kommen nie an.** Hurtbox mit `monitorable` aus, falsche Ebene, oder die Hurtbox ist kein direktes Kind der Figur (dann findet `receive()` kein `take_hit()`).
+  - **Hitstop mit `Engine.time_scale = 0`.** Frame-Zähler laufen weiter, und das ganze Spiel steht, auch Anzeigen.
+  - **Puffer altert im Hitstop.** Steht `buffer_age += 1` vor der Hitstop-Prüfung, verfällt ein Druck, während das Bild stillsteht.
+  - **Animation und Code schalten beide die Hitbox.** Eine Quelle für das Timing festlegen.
+
+  ## Zusammenfassung
+
+  - Frame-Daten liegen in einer `AttackData`-Resource. Du änderst sie im Inspektor und speicherst Varianten als `.tres`.
+  - Der Zustandsautomat zählt Physik-Frames ab 1: erst Übergänge, dann Verhalten. Wind-up 8, aktiv 3, Erholung 14 ergibt 25 Frames.
+  - Der Puffer merkt Aktion und Alter des Drucks. Er altert nicht im Hitstop.
+  - `cancel_from` öffnet ein Abbruchfenster in der Erholung; `0` heißt nie.
+  - Hitbox scannt die Hurtbox-Ebene der Gegenseite. Treffer kommen einen Frame nach dem Einschalten.
+  - Lokaler Hitstop hält genau Angreifer und Ziel an und verlängert ihre Zustände. `Engine.time_scale` hält keine Frame-Zähler an.
+  - `HitLog` und die Debug-Anzeige machen jeden Treffer mit Frame-Nummer nachvollziehbar.
+exercises:
+  - id: quelle-des-timings
+    type: choice
+    title: Animation oder Code?
+    prompt: |
+      Du willst Wind-up und aktive Phase oft ändern und Varianten vergleichen. Welche Aussagen stimmen?
+    options:
+      - text: Zählt der Code die Frames, änderst du einen Wert im Inspektor, und alles Weitere folgt daraus.
+        correct: true
+        why: Die Dauer jedes Zustands kommt aus `AttackData`. Keine Keys müssen mitwandern.
+      - text: Varianten als `.tres`-Dateien lassen sich im Inspektor austauschen, ohne den Code zu ändern.
+        correct: true
+        why: Eine Resource ist eine Datei. Das Feld `attack` nimmt jede `AttackData` an.
+      - text: Am sichersten ist es, wenn die Animation und der Code beide die Hitbox schalten, dann fällt ein Fehler sofort auf.
+        correct: false
+        why: Zwei Quellen laufen beim ersten Tuning auseinander. Dann gilt mal die eine, mal die andere, je nachdem, wer zuletzt schreibt.
+      - text: Mit Frame-Zählung im Code braucht der Angriff keine Animation mehr.
+        correct: false
+        why: Sehen soll der Spieler den Angriff trotzdem. Die Animation zeigt Bilder, nur das Timing der Hitbox kommt aus dem Code.
+    explanation: |
+      Für das Abstimmen zählt, dass ein Wert an genau einer Stelle steht. Liegt das Timing im Code, steht es in der Resource; die Animation folgt dem Zustand und zeigt nur Bilder. Liegt es in der Animation, gilt die Zeitleiste. Beides funktioniert. Gefährlich ist nur, beides gleichzeitig zu tun.
+    resources:
+      - title: Godot Docs · Resources
+        url: https://docs.godotengine.org/en/stable/tutorials/scripting/resources.html
+
+  - id: frame-ablauf
+    type: order
+    title: Was in einem Frame passiert
+    prompt: |
+      Bring die Schritte von `_physics_process` der Spielfigur in die Reihenfolge, in der sie in einem Frame ablaufen.
+    lang: text
+    lines: |
+      Tastendrücke lesen und neuen Druck merken
+      Im Hitstop: Zähler verringern und den Frame beenden
+      frame um eins erhöhen
+      Ist der Zustand abgelaufen, in den nächsten wechseln
+      Ist die Figur frei und ein Angriff gepuffert, den Angriff starten
+      In MOVE die Figur bewegen
+      Den gepufferten Druck einen Frame älter machen
+    explanation: |
+      Tasten liest die Figur zuerst, auch im Hitstop, damit kein Druck verloren geht. Der Hitstop beendet den Frame früh, deshalb rückt in dieser Zeit weder `frame` noch `buffer_age` vor. Danach kommen erst die Übergänge (Zustand abgelaufen, neue Aktion) und dann das Verhalten im neuen Zustand. Am Ende altert der Puffer. Würde die Figur erst laufen und dann den Angriff starten, machte sie im ersten Frame des Angriffs noch einen Schritt.
+    resources:
+      - title: Godot Docs · Idle and Physics Processing
+        url: https://docs.godotengine.org/en/stable/tutorials/scripting/idle_and_physics_processing.html
+
+  - id: aktiv-ab-frame
+    type: output
+    title: Wann geht die Hitbox an?
+    prompt: |
+      Ein Angriff hat Wind-up 10, aktiv 4, Erholung 16. Das Log zeigt `200  Spieler MOVE -> WINDUP`. In welchem Physik-Frame steht `Spieler WINDUP -> ACTIVE`? Antworte mit der Zahl.
+    lang: text
+    code: |
+      200  Spieler MOVE -> WINDUP
+      ???  Spieler WINDUP -> ACTIVE
+    expected: |
+      210
+    explanation: |
+      Frame 200 ist der erste Wind-up-Frame. Wind-up 10 belegt die Frames 200 bis 209, in Frame 210 beginnt die aktive Phase. Allgemein: Wechsel nach `ACTIVE` bei Startframe plus Wind-up. Mit Godot 4.7.2 nachgemessen.
+    resources:
+      - title: Street Fighter 6 · Frame-Daten (Begriffe Startup, Active, Recovery)
+        url: https://www.streetfighter.com/6/character/ryu/frame
+
+  - id: erholung-mit-hitstop
+    type: output
+    title: Der Treffer verlängert den Angriff
+    prompt: |
+      Derselbe Angriff (Wind-up 10, aktiv 4, Erholung 16) mit Hitstop 5 trifft den Dummy im ersten aktiven Frame. In welchem Frame steht `Spieler ACTIVE -> RECOVERY`?
+    lang: text
+    code: |
+      200  Spieler MOVE -> WINDUP
+      210  Spieler WINDUP -> ACTIVE
+      211  Dummy getroffen: Zone body, Schaden 1.0, in WAIT …
+      ???  Spieler ACTIVE -> RECOVERY
+    expected: |
+      219
+    hints:
+      - Ohne Treffer wäre es Frame 214.
+      - Der Treffer kommt in Frame 211 an. Ab da stehen fünf Frames still.
+    explanation: |
+      Die Hitbox ist ab Frame 210 an, der Treffer kommt einen Frame später, in 211, und setzt den Hitstop auf 5. Die Frames 211 bis 215 stehen still. Danach zählt die aktive Phase weiter: 216, 217 und 218 sind ihre Frames 2 bis 4, in 219 beginnt die Erholung. Ohne Treffer wäre es 214. Mit Godot 4.7.2 nachgemessen.
+    resources:
+      - title: Godot Docs · Idle and Physics Processing
+        url: https://docs.godotengine.org/en/stable/tutorials/scripting/idle_and_physics_processing.html
+
+  - id: puffer-reicht
+    type: output
+    title: Kommt der zweite Angriff?
+    prompt: |
+      Die Figur ist ab Frame 230 wieder frei (`RECOVERY -> MOVE`). `input_buffer` ist 6. Du drückst `attack`, und `_read_buttons()` sieht den Druck in Frame 225. In welchem Frame steht `Spieler MOVE -> WINDUP`?
+    lang: text
+    code: |
+      225  Druck attack
+      230  Spieler RECOVERY -> MOVE
+      ???  Spieler MOVE -> WINDUP
+    expected: |
+      230
+    explanation: |
+      In Frame 225 ist der Druck 0 Frames alt, in Frame 230 fünf. Das ist höchstens `input_buffer`, also startet der Angriff im ersten freien Frame, 230. Hätte die Figur den Druck in Frame 222 gesehen, wäre er in 230 acht Frames alt und verfallen.
+    resources:
+      - title: Godot Docs · Input.is_action_just_pressed
+        url: https://docs.godotengine.org/en/stable/classes/class_input.html#class-input-method-is-action-just-pressed
+
+  - id: puffer-bedingung
+    type: gap
+    title: Wann zählt ein gepufferter Druck?
+    prompt: |
+      Ergänze die Bedingung: Ein Druck zählt, wenn er zur Aktion passt, überhaupt vorhanden ist und höchstens `input_buffer` Frames alt ist.
+    lang: gdscript
+    code: |
+      func _consume(action: StringName) -> bool:
+      	if buffered_action == action and ⟦buffer_age >= 0⟧ and ⟦buffer_age <= input_buffer⟧:
+      		buffer_age = -1
+      		return true
+      	return false
+    gaps:
+      - label: Ein Druck ist gemerkt
+        hint: Ohne Druck ist `buffer_age` −1.
+        accept: ["buffer_age > -1", "buffer_age != -1", "0 <= buffer_age"]
+      - label: Nicht zu alt
+        hint: Alter in Frames gegen den Puffer.
+        accept: ["input_buffer >= buffer_age"]
+    explanation: |
+      `buffer_age` ist −1, solange nichts gemerkt ist, sonst das Alter in Frames. Die Obergrenze ist inklusiv: Bei `input_buffer = 0` zählt ein Druck nur im selben Frame, bei 6 bis zu sechs Frame alt. Danach setzt `_consume` das Alter auf −1, damit ein Druck nicht zwei Aktionen auslöst.
+    resources:
+      - title: Godot Docs · Input.is_action_just_pressed
+        url: https://docs.godotengine.org/en/stable/classes/class_input.html#class-input-method-is-action-just-pressed
+
+  - id: hitbox-nur-aktiv
+    type: gap
+    title: Die Hitbox folgt dem Zustand
+    prompt: |
+      Ergänze die Zeile in `_enter()`, die die Hitbox genau in der aktiven Phase einschaltet. Sie muss auch funktionieren, wenn `_enter()` aus einem Treffer-Signal aufgerufen wird.
+    lang: gdscript
+    code: |
+      func _enter(new_state: State) -> void:
+      	state = new_state
+      	frame = 1
+      	hitbox_shape.⟦set_deferred⟧(&"disabled", ⟦new_state != State.ACTIVE⟧)
+    gaps:
+      - label: Umschalten, ohne die Physik-Abfrage zu stören
+        hint: Die Methode von `Object`, die eine Eigenschaft am Ende der laufenden Abfrage setzt.
+      - label: Wann ist die Hitbox aus?
+        hint: "`disabled` ist wahr in jedem Zustand außer einem."
+        accept: ["not new_state == State.ACTIVE", "State.ACTIVE != new_state"]
+    explanation: |
+      `disabled` ist das Gegenteil von „aktiv“, deshalb `new_state != State.ACTIVE`. Weil jeder Zustandswechsel durch diese Zeile läuft, kann die Hitbox nicht versehentlich anbleiben. `set_deferred()` braucht es, weil `_enter()` im nächsten Modul auch aus Treffer-Signalen kommt, und dort lehnt Godot direkte Änderungen an Formen ab.
+    resources:
+      - title: Godot Docs · CollisionShape2D.disabled
+        url: https://docs.godotengine.org/en/stable/classes/class_collisionshape2d.html#class-collisionshape2d-property-disabled
+
+  - id: wind-up-zu-kurz
+    type: bug
+    title: Acht eingestellt, sieben gemessen
+    prompt: |
+      `windup` steht auf 8. Im Log liegen zwischen `MOVE -> WINDUP` (Frame 12) und `WINDUP -> ACTIVE` (Frame 19) aber nur sieben Frames. Finde die Zeile und korrigiere sie.
+    lang: gdscript
+    code: |
+      func _physics_process(_delta: float) -> void:
+      	_read_buttons()
+      	if hitstop_left > 0:
+      		hitstop_left -= 1
+      		return
+      	frame += 1
+      	if state != State.MOVE and frame >= _duration(state):
+      		_enter(_next_state(state))
+    lines: [7]
+    fix:
+      - line: 7
+        answers:
+          - "if state != State.MOVE and frame > _duration(state):"
+          - "if frame > _duration(state) and state != State.MOVE:"
+          - "if state != State.MOVE and _duration(state) < frame:"
+          - "if state != State.MOVE and frame >= _duration(state) + 1:"
+    explanation: |
+      `frame` beginnt bei 1. Im achten Wind-up-Frame ist `frame` 8, und mit `>=` endet der Zustand schon dort; der Wechsel steht dann im Log einen Frame zu früh. Mit `>` endet er erst, wenn `frame` 9 erreicht, also nach genau acht Frames. Off-by-one-Fehler wie dieser verschieben alle Frame-Daten um eins, und niemand merkt es, bis jemand das Log nachzählt.
+    resources:
+      - title: Godot Docs · Idle and Physics Processing
+        url: https://docs.godotengine.org/en/stable/tutorials/scripting/idle_and_physics_processing.html
+
+  - id: hitstop-time-scale
+    type: bug
+    title: Stillstand, der keiner ist
+    prompt: |
+      Du baust den Hitstop um. Beim Treffer steht das Bild jetzt still, aber im Log endet die aktive Phase so früh, als gäbe es keinen Hitstop. Finde die Zeile, die das verursacht, und ersetze sie so, dass der lokale Hitstop der Testszene greift.
+    lang: gdscript
+    code: |
+      func _start_hitstop(frames: int) -> void:
+      	Engine.time_scale = 0.0
+      	await get_tree().create_timer(frames / 60.0, true, false, true).timeout
+      	Engine.time_scale = 1.0
+    lines: [2]
+    fix:
+      - line: 2
+        answers:
+          - hitstop_left = frames
+          - self.hitstop_left = frames
+    explanation: |
+      `Engine.time_scale = 0` skaliert `delta` auf 0, aber `_physics_process` wird weiter aufgerufen. Mit Godot 4.7.2 gemessen: sechs Aufrufe in 0,1 Sekunden. Was mit `delta` rechnet, steht still; der Frame-Zähler des Zustandsautomaten läuft weiter. Mit `hitstop_left = frames` kehrt `_physics_process` während des Hitstops sofort zurück. Die Zeilen 3 und 4 sind danach überflüssig und können weg.
+    resources:
+      - title: Godot Docs · Engine.time_scale
+        url: https://docs.godotengine.org/en/stable/classes/class_engine.html#class-engine-property-time-scale
+
+  - id: zwei-phasen-erklaeren
+    type: explain
+    title: Erst Übergänge, dann Verhalten
+    prompt: |
+      Erkläre, warum `_physics_process` erst den Zustand weiterschaltet und einen neuen Angriff startet und erst danach die Figur bewegt. Was ginge schief, wenn `_move()` ganz am Anfang stünde?
+    lang: gdscript
+    code: |
+      	# 1. Übergänge: Ist der Zustand abgelaufen, oder startet eine Aktion?
+      	frame += 1
+      	if state != State.MOVE and frame > _duration(state):
+      		_enter(_next_state(state))
+      	if state == State.MOVE and _consume(&"attack"):
+      		_enter(State.WINDUP)
+      	elif state == State.RECOVERY and attack.cancel_from > 0 and frame >= attack.cancel_from:
+      		if _consume(&"attack"):
+      			_enter(State.WINDUP)
+      	# 2. Verhalten im (neuen) Zustand
+      	if state == State.MOVE:
+      		_move()
+    points:
+      - Der Zustand für diesen Frame steht erst nach den Übergängen fest; das Verhalten soll zum aktuellen Zustand passen.
+      - Startet ein Angriff, bewegt sich die Figur in diesem Frame schon nicht mehr; der erste Wind-up-Frame ist ein Frame ohne Schritt.
+      - Endet die Erholung, kann die Figur im selben Frame schon laufen oder einen gepufferten Angriff starten, ohne einen Frame zu verlieren.
+      - Stünde `_move()` vorn, liefe die Figur im ersten Angriffsframe noch einen Schritt und stünde im ersten freien Frame still.
+    explanation: |
+      Die Reihenfolge legt fest, in welchem Zustand die Figur einen Frame verbringt. Erst wird entschieden: Ist der Zustand abgelaufen, startet eine Aktion? Dann handelt die Figur so, wie es zum neuen Zustand passt. So belegt ein Angriff genau Wind-up plus aktiv plus Erholung Frames, und der erste freie Frame ist wirklich frei. Mit `_move()` am Anfang wäre jede Aktion um einen Frame verschoben. Das wäre klein, aber messbar, und es würde jede Frame-Tabelle verfälschen.
+
+  - id: ein-treffer-pro-ziel
+    type: explain
+    title: Warum already_hit?
+    prompt: |
+      Erkläre, was `already_hit` verhindert und warum die Hurtbox dafür ein direktes Kind ihrer Figur sein muss.
+    lang: gdscript
+    code: |
+      func _on_hitbox_area_entered(area: Area2D) -> void:
+      	if not area is Hurtbox or area.get_parent() in already_hit:
+      		return
+      	if (area as Hurtbox).receive(attack, self):
+      		already_hit.append(area.get_parent())
+      		hitstop_left = attack.hitstop
+    points:
+      - Berührt ein Angriff mehrere Hurtboxen desselben Ziels, zählt nur der erste angenommene Treffer; ohne die Liste träfe er zweimal.
+      - Die Liste wird beim Eintritt in `ACTIVE` geleert, jeder neue Angriff darf also wieder treffen.
+      - Gemerkt wird die Figur über `get_parent()`; liegt die Hurtbox tiefer im Baum, wäre der Elternknoten nicht die Figur, und zwei Zonen zählten als zwei Ziele.
+      - Ob ein Angriff mehrfach treffen soll, ist eine Designentscheidung; die Liste ist nur die Startregel der Testszene.
+    explanation: |
+      Ein großer Gegner hat später mehrere Hurtboxen, etwa Kopf und Bein. Ohne `already_hit` würde ein breiter Schlag, der beide berührt, doppelt zählen. Die Liste merkt sich deshalb die Figur, nicht die Hurtbox, und sie findet die Figur über den Elternknoten. Geleert wird sie in `_enter()` beim Eintritt in die aktive Phase. Wenn du Mehrfachtreffer willst, etwa bei einem Wirbelangriff, änderst du genau diese Regel.
+    resources:
+      - title: Godot Docs · Area2D.area_entered
+        url: https://docs.godotengine.org/en/stable/classes/class_area2d.html#class-area2d-signal-area-entered
+
+  - id: testszene-bauen
+    type: practice
+    title: Die Testszene mit Dummy bauen
+    prompt: |
+      Bau die Szene dieses Moduls: Spielfigur mit `player.gd`, Hurtbox und Hitbox, ein Dummy mit `enemy.gd`, `HitLog` als Autoload, Debug-Anzeige. Starte die Szene, triff den Dummy einmal und vergleiche dein Log mit dem in der Lektion.
+    lang: text
+    solution: |
+      Log mit den Platzhalterwerten (Godot 4.7.2):
+
+          12  Druck attack
+          12  Spieler MOVE -> WINDUP
+          20  Spieler WINDUP -> ACTIVE
+          21  Dummy getroffen: Zone body, Schaden 1.0, in WAIT Frame 21
+          21  Dummy WAIT -> HITSTUN
+          27  Spieler ACTIVE -> RECOVERY
+          36  Dummy HITSTUN -> WAIT
+          41  Spieler RECOVERY -> MOVE
+
+      Die absoluten Frame-Nummern hängen davon ab, wann du drückst.
+      Die Abstände müssen gleich sein: 8 Frames bis ACTIVE, Treffer
+      1 Frame danach, RECOVERY 7 Frames nach ACTIVE, MOVE 14 danach.
+    checklist:
+      - Die Ebenen 1 bis 3 heißen „Welt“, „Hurtbox Spieler“, „Hurtbox Gegner“, und Ebenen und Masken stehen wie in der Tabelle.
+      - "`HitLog` ist als Autoload eingetragen, und die Ausgabe zeigt jede Zeile mit Frame-Nummer."
+      - Mit den Platzhalterwerten stimmen die Abstände im Log mit der Lektion überein (8 Frames Wind-up, Treffer einen Frame später, aktive Phase 7 Frames inklusive Hitstop, 14 Frames Erholung).
+      - Die Debug-Anzeige zeigt Zustand, Frame und Puffer, und du hast mit F10 einen Angriff Frame für Frame angesehen.
+      - "Mit dem Drehbuch (`11: attack`, `36: attack`) startet der zweite Angriff in Frame 41; mit `31: attack` statt `36` verfällt der zweite Druck."
+    explanation: |
+      Stimmen die Abstände, verhält sich deine Szene wie die geprüfte. Weichen sie ab, liegt es fast immer an einer von drei Stellen: `>=` statt `>` beim Zustandsende, einer Hurtbox, die nicht direkt unter ihrer Figur hängt, oder einer falschen Maske. Das Log ist ab jetzt dein wichtigstes Werkzeug. Jede Frage, warum etwas getroffen hat oder nicht, beantwortest du zuerst dort.
+    resources:
+      - title: Godot Docs · Singletons (Autoload)
+        url: https://docs.godotengine.org/en/stable/tutorials/scripting/singletons_autoload.html
+
+  - id: erste-vorhersage
+    type: practice
+    title: Erst vorhersagen, dann messen
+    prompt: |
+      Leg im Dateisystem-Dock eine Kopie `angriff_b.tres` von `angriff_a.tres` an und wähle dort selbst einen neuen Wert für `windup` oder `recovery`. Schreib **vor** dem Start auf, in welchen Frames die Zustandswechsel im Log stehen werden. Dann starte und vergleiche. Notiere zum Schluss in einem Satz, wie sich der Angriff mit dem neuen Wert anfühlt.
+    lang: text
+    solution: |
+      Beispiel für die Form, nicht für den Wert:
+
+      Änderung: recovery 14 -> 20 (Platzhalter gegen Platzhalter)
+      Vorhersage ohne Treffer, Start in Frame S:
+        WINDUP -> ACTIVE     S + 8
+        ACTIVE -> RECOVERY   S + 11
+        RECOVERY -> MOVE     S + 31
+      Gemessen (S = 140): 148, 151, 171 – stimmt.
+      (Diese Zahlen sind in Godot 4.7.2 nachgemessen.)
+      Eindruck: Nach dem Schlag stehe ich spürbar länger, ich will
+      danach öfter laufen, als ich darf.
+    checklist:
+      - Die Vorhersage stand fest, bevor du die Szene gestartet hast.
+      - Du hast die Abweichung zwischen Vorhersage und Log erklärt oder festgestellt, dass es keine gibt.
+      - Der Satz zum Eindruck beschreibt, was du beim Spielen bemerkt hast, nicht, ob der Wert „richtig“ ist.
+      - Der neue Wert steht als eigene Datei (`angriff_b.tres`), die alte ist unverändert.
+    explanation: |
+      Die Übung trennt zwei Fragen, die beim Abstimmen gern verschwimmen: Tut die Szene, was du denkst? Das beantwortet das Log. Und wie fühlt es sich an? Das beantwortest nur du. Wer die erste Frage nicht vorher klärt, beurteilt bei der zweiten womöglich einen Fehler statt eines Werts. Welchen Wert du wählst, ist egal; es geht um die Gewohnheit, vorherzusagen und zu messen. Die zweite Datei brauchst du für Vergleichstests in [Tuning als Experiment](/combat/tuning).
