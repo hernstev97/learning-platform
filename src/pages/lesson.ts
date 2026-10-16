@@ -3,7 +3,7 @@ import { NOTE_LIMIT } from '../../convex/model.ts';
 import { isDone } from '../engine/storage.ts';
 import { moduleNumber } from '../ui/area-nav.ts';
 import { enhanceCode } from '../ui/code.ts';
-import { $, LEVELS, TYPE_LABELS, html, icons, minutes, pad, raw } from '../ui/dom.ts';
+import { $, LEVELS, PLACES, html, icons, minutes, pad, placeMark, raw, typeLabel } from '../ui/dom.ts';
 import type { Page } from '../router.ts';
 
 const lesson: Page<{ name: 'lesson'; area: string; module: string }> = async (main, route) => {
@@ -26,6 +26,7 @@ const lesson: Page<{ name: 'lesson'; area: string; module: string }> = async (ma
         <p class="module-kicker label">Modul ${moduleNumber(summary, module.id)} · ${LEVELS[module.level]} · ${minutes(module.minutes)} · ${module.exercises.length} Übungen</p>
         <h1 class="page-title module-title-big" tabindex="-1">${module.title}</h1>
         <p class="module-lead">${module.summary}</p>
+        ${module.place ? html`<p class="module-place">${placeMark(module.place)}<span>${PLACES[module.place].text}</span></p>` : ''}
         <div class="module-actions">
           <a class="btn primary" href="/${summary.id}/${module.id}/${firstOpen + 1}">${done ? `Übungen fortsetzen (${done}/${module.exercises.length})` : 'Direkt zu den Übungen'} ${raw(icons.arrow)}</a>
           ${module.vm || module.lab ? html`<button type="button" class="btn" id="open-terminal">${raw(icons.play)} Linux-Terminal öffnen</button>` : ''}
@@ -59,7 +60,7 @@ const lesson: Page<{ name: 'lesson'; area: string; module: string }> = async (ma
           </div>
           <ol class="exercise-list">
             ${module.exercises.map((exercise, i) => html`<li><a href="/${summary.id}/${module.id}/${i + 1}" class="${isDone(progress, exercise) ? 'done' : ''}">
-              <span class="label">${pad(i + 1)}</span><span>${exercise.title}</span><span class="tag">${TYPE_LABELS[exercise.type]}</span><span class="exercise-state" aria-label="${isDone(progress, exercise) ? 'gelöst' : 'offen'}">${raw(isDone(progress, exercise) ? icons.check : '')}</span>
+              <span class="label">${pad(i + 1)}</span><span>${exercise.title}</span><span class="tag">${typeLabel(exercise)}</span><span class="exercise-state" aria-label="${isDone(progress, exercise) ? 'gelöst' : 'offen'}">${raw(isDone(progress, exercise) ? icons.check : '')}</span>
             </a></li>`)}
           </ol>
           <a class="btn primary big" href="/${summary.id}/${module.id}/${firstOpen + 1}">${done ? 'Weiterüben' : 'Übungen starten'} ${raw(icons.arrow)}</a>

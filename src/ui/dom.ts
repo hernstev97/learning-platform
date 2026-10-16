@@ -1,5 +1,6 @@
 export { escape } from '../engine/highlight.ts';
 import { escape } from '../engine/highlight.ts';
+import type { Place } from '../content/types.ts';
 
 export const $ = <T extends Element = HTMLElement>(selector: string, root: ParentNode = document) => root.querySelector<T>(selector)!;
 export const $$ = <T extends Element = HTMLElement>(selector: string, root: ParentNode = document) => [...root.querySelectorAll<T>(selector)];
@@ -28,6 +29,8 @@ export const TYPE_VERBS: Record<string, string> = {
   gap: 'Schreiben', choice: 'Verstehen', order: 'Verstehen', output: 'Vorhersagen', command: 'Schreiben',
   code: 'Schreiben', practice: 'Anwenden', bug: 'Fehler finden', explain: 'Erklären', sql: 'Schreiben', scenario: 'Diagnostizieren',
 };
+/** Gap exercises in running text are a cloze, not code. */
+export const typeLabel = (exercise: { type: string; lang?: string }) => exercise.type === 'gap' && exercise.lang === 'prose' ? 'Lückentext' : TYPE_LABELS[exercise.type];
 export const minutes = (value: number) => value >= 90 ? `${Math.round(value / 60 * 2) / 2} h`.replace('.', ',') : `${value} min`;
 export const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
 
@@ -43,5 +46,14 @@ export const icons = {
   moon: '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4 8.5 8.5 0 1 0 20 14.5z" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linejoin="miter"/></svg>',
   search: '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10" cy="10" r="6.5" fill="none" stroke="currentColor" stroke-width="2.6"/><path d="m15 15 6 6" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="square"/></svg>',
   repeat: '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 11V8h14m-4-4 4 4-4 4M20 13v3H6m4 4-4-4 4-4" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="square"/></svg>',
+  phone: '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="6.5" y="2.5" width="11" height="19" fill="none" stroke="currentColor" stroke-width="2.4"/><path d="M10.5 18h3" stroke="currentColor" stroke-width="2.4"/></svg>',
+  monitor: '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="2.5" y="4" width="19" height="12.5" fill="none" stroke="currentColor" stroke-width="2.4"/><path d="M8 21h8m-4-4.5V21" fill="none" stroke="currentColor" stroke-width="2.4"/></svg>',
   external: '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 5h10v10M19 5 6 18" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="square"/></svg>',
 };
+
+/** Where a module can be worked through (`place` in the module file). */
+export const PLACES: Record<Place, { label: string; text: string; icon: string }> = {
+  unterwegs: { label: 'Unterwegs', text: 'Geht auf dem Handy: lesen, analysieren, kurz schreiben.', icon: icons.phone },
+  pc: { label: 'Am PC', text: 'Braucht einen Rechner: längeres Schreiben oder ein Werkzeug.', icon: icons.monitor },
+};
+export const placeMark = (place: Place | null) => place ? html`<span class="place-mark place-${place}" title="${PLACES[place].text}">${raw(PLACES[place].icon)}${PLACES[place].label}</span>` : '';

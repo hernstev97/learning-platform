@@ -66,6 +66,32 @@ describe('content', () => {
       expect(loadContent(undefined, root).errors.map((issue) => issue.message)).toContain('"checklist[1]" ist kein Text – YAML hat ": " als Schlüssel gelesen; setze den Eintrag in Anführungszeichen');
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
+  it('reads where a module can be done and lets prose practice go without a model answer', () => {
+    const loaded = loadContent(undefined, join(import.meta.dirname, 'fixtures'));
+    const { modules } = loaded.areas.beispiel;
+    expect([modules['alle-typen'].place, modules.texte.place]).toEqual(['pc', 'unterwegs']);
+    expect(loaded.catalog.areas[0].modules.map((m) => [m.id, m.place])).toEqual([['alle-typen', 'pc'], ['texte', 'unterwegs']]);
+    // Summaries carry `lang` only for running text, so labels and resume links know a cloze from code.
+    expect(loaded.catalog.areas[0].modules[1].exercises.find((e) => e.type === 'gap')!.lang).toBe('prose');
+    expect(loaded.catalog.areas[0].modules[0].exercises.some((e) => 'lang' in e)).toBe(false);
+    const practice = modules.texte.exercises.find((e) => e.type === 'practice')!;
+    expect(practice.type === 'practice' && [practice.lang, practice.solution]).toEqual(['prose', '']);
+    const root = mkdtempSync(join(tmpdir(), 'learning-place-'));
+    try {
+      cpSync(join(import.meta.dirname, 'fixtures/beispiel'), join(root, 'beispiel'), { recursive: true });
+      const texte = join(root, 'beispiel/modules/texte.yaml');
+      writeFileSync(texte, readFileSync(texte, 'utf8').replace('place: unterwegs', 'place: bus').replace('    lang: prose\n    checklist:', '    lang: prose\n    solution: Ein Mustertext.\n    checklist:'));
+      const alle = join(root, 'beispiel/modules/alle-typen.yaml');
+      writeFileSync(alle, readFileSync(alle, 'utf8').replace(/    solution: \|\n      fn main\(\) \{\n          for n[\s\S]*?\n    checklist:/, '    checklist:'));
+      const changed = loadContent(undefined, root);
+      const messages = changed.errors.map((issue) => `${issue.where}: ${issue.message}`);
+      expect(messages).toContain('Modul texte: "place" muss unterwegs oder pc sein');
+      expect(messages).toContain('Modul alle-typen › Übung 8 (praxis): "solution" fehlt');
+      expect(messages).toContain('Modul texte › Übung 6 (eigener-text): "solution" gibt es bei lang: prose nicht – eigene Texte haben keine Musterlösung; Hilfen gehören in "hints" oder "wiki"');
+      expect(messages).toHaveLength(3);
+      expect(changed.areas.beispiel.modules.texte.place).toBeNull();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
   it('makes Python and SQL blocks runnable, other languages not', () => {
     expect(codeBlock('SELECT 1;', 'sql run')).toContain('data-run="sql"');
     expect(codeBlock('print(1)', 'python run')).toContain('data-run="python"');

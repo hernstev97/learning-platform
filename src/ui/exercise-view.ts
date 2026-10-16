@@ -7,7 +7,7 @@ import { choice, command, gap, output } from '../exercises/basic.ts';
 import { scenario } from '../exercises/scenario.ts';
 import { sql } from '../exercises/sql.ts';
 import type { ExerciseRenderer, Feedback } from '../exercises/types.ts';
-import { $, TYPE_LABELS, TYPE_VERBS, escape, html, icons, raw, type Raw } from './dom.ts';
+import { $, TYPE_VERBS, escape, html, icons, raw, typeLabel, type Raw } from './dom.ts';
 
 const RENDERERS: Record<Exercise['type'], ExerciseRenderer<any, any>> = { gap, choice, order, output, command, code, practice, bug, explain, sql, scenario };
 
@@ -72,12 +72,13 @@ export function exerciseView(exercise: Exercise, hooks: ExerciseHooks, layout: E
     },
   };
   const view = RENDERERS[exercise.type](exercise as never, context);
+  const solution = view.solution();
   const hints = exercise.hints;
   const source = exercise.source;
   const heading = raw(layout.heading);
   const markup = html`
     <article class="exercise" aria-labelledby="exercise-title">
-      <p class="exercise-kicker"><span class="tag ink">${TYPE_VERBS[exercise.type]}</span>${TYPE_LABELS[exercise.type] !== TYPE_VERBS[exercise.type] ? html`<span class="tag">${TYPE_LABELS[exercise.type]}</span>` : ''}<span class="label muted">${layout.counter}</span></p>
+      <p class="exercise-kicker"><span class="tag ink">${TYPE_VERBS[exercise.type]}</span>${typeLabel(exercise) !== TYPE_VERBS[exercise.type] ? html`<span class="tag">${typeLabel(exercise)}</span>` : ''}<span class="label muted">${layout.counter}</span></p>
       <${heading} id="exercise-title" class="exercise-title" tabindex="-1">${exercise.title}</${heading}>
       <div class="prose prompt">${raw(exercise.prompt)}</div>
       ${source ? html`<p class="source-ref"><button type="button" class="link-button" id="open-source">${source.file.replace(/^android\/app\/src\/(main|test)\/java\/app\/kiumu\/bear\//, '')}:${source.start}${source.end !== source.start ? `–${source.end}` : ''}</button> <span class="muted small">Originaldatei aus Bear (enthält die Lösung)</span></p>` : ''}
@@ -90,9 +91,9 @@ export function exerciseView(exercise: Exercise, hooks: ExerciseHooks, layout: E
       </section>
       <div class="help-row">
         ${hints.length ? html`<div class="hints"><button type="button" class="btn small" id="hint">Hinweis 1 / ${hints.length}</button><ol id="hint-list" class="hint-list"></ol></div>` : ''}
-        ${exercise.type !== 'explain' ? html`<button type="button" class="btn small ghost" id="reveal">Lösung zeigen</button>` : ''}
+        ${exercise.type !== 'explain' && solution ? html`<button type="button" class="btn small ghost" id="reveal">Lösung zeigen</button>` : ''}
       </div>
-      <section id="solution" class="solution" hidden aria-label="Lösung"><p class="label">Lösung</p><div class="prose compact">${raw(view.solution())}</div><p class="muted small">Tipp: Schließ die Lösung wieder und schreib sie aus dem Kopf – erst dann zählt die Übung als gelöst.</p></section>
+      <section id="solution" class="solution" hidden aria-label="Lösung"><p class="label">Lösung</p><div class="prose compact">${raw(solution)}</div><p class="muted small">Tipp: Schließ die Lösung wieder und schreib sie aus dem Kopf – erst dann zählt die Übung als gelöst.</p></section>
       ${layout.footer ?? ''}
       <details class="wiki" id="wiki">
         <summary><span class="label">Zum Nachlesen</span><span>${exercise.wiki?.title ?? 'Die Lektion zu diesem Modul'}</span></summary>

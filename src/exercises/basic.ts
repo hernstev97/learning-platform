@@ -7,7 +7,7 @@ import { failOnce, type ExerciseRenderer } from './types.ts';
 
 export const codeCard = (code: string, lang: string, label: string, gaps = false) =>
   `<div class="codeblock exercise-code" data-lang="${escape(lang)}"><div class="codeblock-bar"><span>${escape(label)}</span></div><pre tabindex="0"><code>${gaps ? highlightWithGaps(code, lang) : highlight(code, lang)}</code></pre></div>`;
-export const LANG_NAMES: Record<string, string> = { kotlin: 'Kotlin', rust: 'Rust', python: 'Python', bash: 'Bash', sh: 'Shell', shell: 'Shell', console: 'Terminal', yaml: 'YAML', toml: 'TOML', json: 'JSON', sql: 'SQL', postgres: 'PostgreSQL', dockerfile: 'Dockerfile', ini: 'Konfiguration', xml: 'XML', gradle: 'Gradle', kts: 'Gradle Kotlin DSL', excel: 'Excel-Formel', powerquery: 'Power Query (M)', m: 'Power Query (M)', csv: 'CSV' };
+export const LANG_NAMES: Record<string, string> = { kotlin: 'Kotlin', rust: 'Rust', python: 'Python', bash: 'Bash', sh: 'Shell', shell: 'Shell', console: 'Terminal', yaml: 'YAML', toml: 'TOML', json: 'JSON', sql: 'SQL', postgres: 'PostgreSQL', dockerfile: 'Dockerfile', ini: 'Konfiguration', xml: 'XML', gradle: 'Gradle', kts: 'Gradle Kotlin DSL', excel: 'Excel-Formel', powerquery: 'Power Query (M)', m: 'Power Query (M)', csv: 'CSV', prose: 'Text', harlowe: 'Harlowe (Twine)', ablauf: 'Ablauf' };
 export const langName = (lang: string) => LANG_NAMES[lang] ?? (lang ? lang.toUpperCase() : 'Code');
 
 export const gap: ExerciseRenderer<GapExercise, Answers> = (exercise, ctx) => {
@@ -18,11 +18,11 @@ export const gap: ExerciseRenderer<GapExercise, Answers> = (exercise, ctx) => {
       <div class="gap-fields">
         ${exercise.gaps.map((g, i) => html`<div class="gap-field" data-gap="${g.id}">
           <div class="gap-label"><label for="answer-${g.id}"><span class="gap-number">${i + 1}</span>${g.label}</label><span class="gap-state label" id="state-${g.id}">Offen</span></div>
-          <textarea id="answer-${g.id}" class="answer-input${g.multiline ? ' multiline' : ''}" data-answer="${g.id}" rows="${g.multiline ? 4 : 1}" spellcheck="false" autocapitalize="off" autocomplete="off" maxlength="12000" placeholder="${g.multiline ? 'Code eingeben …' : 'Fehlenden Code eingeben …'}" aria-describedby="state-${g.id}">${answers[g.id] ?? ''}</textarea>
+          <textarea id="answer-${g.id}" class="answer-input${g.multiline ? ' multiline' : ''}" data-answer="${g.id}" rows="${g.multiline ? 4 : 1}" spellcheck="false" autocapitalize="off" autocomplete="off" maxlength="12000" placeholder="${exercise.lang === 'prose' ? 'Fehlendes Wort eingeben …' : g.multiline ? 'Code eingeben …' : 'Fehlenden Code eingeben …'}" aria-describedby="state-${g.id}">${answers[g.id] ?? ''}</textarea>
           ${g.hint ? html`<details class="gap-hint"><summary>Hinweis zu ${i + 1}</summary><p>${raw(g.hint)}</p></details>` : ''}
         </div>`)}
       </div>
-      <p class="check-note">Jede Lücke wird beim Tippen geprüft – tokenweise, Leerzeichen zwischen Symbolen sind egal. Es wird kein Compiler ausgeführt.</p>`.value,
+      <p class="check-note">${exercise.lang === 'prose' ? 'Jede Lücke wird beim Tippen geprüft. Groß- und Kleinschreibung und Satzzeichen sind egal.' : 'Jede Lücke wird beim Tippen geprüft – tokenweise, Leerzeichen zwischen Symbolen sind egal. Es wird kein Compiler ausgeführt.'}</p>`.value,
     solution: () => html`<ol class="solution-list">${exercise.gaps.map((g) => html`<li><code>${g.answers[0]}</code>${g.answers.length > 1 ? html` <span class="muted">(auch: ${g.answers.slice(1).map((a, i) => html`${i ? ', ' : ''}<code>${a}</code>`)})</span>` : ''}</li>`)}</ol>`.value,
     bind(root) {
       const update = () => {
@@ -30,7 +30,7 @@ export const gap: ExerciseRenderer<GapExercise, Answers> = (exercise, ctx) => {
         for (const g of exercise.gaps) {
           const value = answers[g.id] ?? '';
           const right = isGapCorrect(g, value, exercise.lang);
-          const partial = !right && isPartial(g, value);
+          const partial = !right && isPartial(g, value, exercise.lang);
           const wrong = !!value.trim() && !right && !partial;
           if (right) solved++;
           if (value.trim()) attempted = true;
@@ -55,7 +55,7 @@ export const gap: ExerciseRenderer<GapExercise, Answers> = (exercise, ctx) => {
         // Answers are checked while typing; only a wrong answer left behind in a field counts as a wrong attempt.
         input.addEventListener('change', () => {
           const g = exercise.gaps.find((x) => x.id === input.dataset.answer)!;
-          if (input.value.trim() && !isGapCorrect(g, input.value, exercise.lang) && !isPartial(g, input.value)) ctx.fail();
+          if (input.value.trim() && !isGapCorrect(g, input.value, exercise.lang) && !isPartial(g, input.value, exercise.lang)) ctx.fail();
         });
       });
       $$<HTMLDetailsElement>('.gap-hint', root).forEach((details) => details.addEventListener('toggle', () => { if (details.open) ctx.hint(); }, { once: true }));
@@ -118,11 +118,13 @@ export const choice: ExerciseRenderer<ChoiceExercise, number[]> = (exercise, ctx
   };
 };
 
+/** Twine passages and flow notation are played, not run: the prediction is what the player sees. */
+const PLAYED = ['harlowe', 'ablauf'];
 export const output: ExerciseRenderer<OutputExercise, string> = (exercise, ctx) => ({
   markup: html`
-    ${raw(codeCard(exercise.code, exercise.lang, `${langName(exercise.lang)} · Programm`))}
-    <label class="field-label label" for="prediction">Deine Vorhersage der Ausgabe</label>
-    <textarea id="prediction" class="answer-input multiline" rows="${Math.max(2, exercise.expected[0].split('\n').length + 1)}" spellcheck="false" autocapitalize="off" autocomplete="off" placeholder="So, wie es im Terminal stünde …">${ctx.draft ?? ''}</textarea>
+    ${raw(codeCard(exercise.code, exercise.lang, PLAYED.includes(exercise.lang) ? langName(exercise.lang) : `${langName(exercise.lang)} · Programm`))}
+    <label class="field-label label" for="prediction">${PLAYED.includes(exercise.lang) ? 'Deine Vorhersage: was der Spieler sieht' : 'Deine Vorhersage der Ausgabe'}</label>
+    <textarea id="prediction" class="answer-input multiline" rows="${Math.max(2, exercise.expected[0].split('\n').length + 1)}" spellcheck="false" autocapitalize="off" autocomplete="off" placeholder="${PLAYED.includes(exercise.lang) ? 'So, wie es auf dem Bildschirm stünde …' : 'So, wie es im Terminal stünde …'}">${ctx.draft ?? ''}</textarea>
     <div class="exercise-actions"><button type="button" class="btn primary" id="check">Vorhersage prüfen</button><span class="muted small kbd-hint">Strg + Enter</span></div>
     <div id="diff" class="diff" hidden></div>`.value,
   solution: () => `<pre class="code plain">${escape(exercise.expected[0])}</pre>`,

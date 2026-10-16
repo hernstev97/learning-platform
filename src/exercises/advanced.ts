@@ -21,7 +21,7 @@ export const order: ExerciseRenderer<OrderExercise, number[]> = (exercise, ctx) 
   return {
     markup: html`
       <p class="label">${langName(exercise.lang)} · ${exercise.lines.length} Zeilen · mit den Pfeilen oder per Ziehen sortieren</p>
-      <ol class="order-list codeblock" id="order-list"></ol>
+      <ol class="order-list codeblock" id="order-list" data-lang="${exercise.lang}"></ol>
       <div class="exercise-actions"><button type="button" class="btn primary" id="check">Reihenfolge prüfen</button></div>`.value,
     solution: () => codeCard(exercise.lines.join('\n'), exercise.lang, 'Richtige Reihenfolge'),
     bind(root) {
@@ -161,21 +161,27 @@ export const code: ExerciseRenderer<CodeExercise, string> = (exercise, ctx) => (
 type PracticeDraft = { code: string; checked: number[] };
 export const practice: ExerciseRenderer<PracticeExercise, PracticeDraft> = (exercise, ctx) => {
   const draft: PracticeDraft = { code: ctx.draft?.code ?? exercise.starter, checked: [...(ctx.draft?.checked ?? [])] };
+  // Own texts: a wrapping text field with spell checking and no model answer.
+  const prose = exercise.lang === 'prose';
+  const note = prose ? 'Dein Entwurf wird gespeichert. Für eigene Texte gibt es keine Musterlösung: Prüf ihn mit der Checkliste.'
+    : exercise.lang === 'rust' ? 'Dein Entwurf wird gespeichert. Kompilieren und ausführen kannst du ihn im offiziellen Rust Playground.'
+      : 'Dein Entwurf wird gespeichert. Schreib ihn hier oder in deiner IDE und vergleiche danach mit der Musterlösung.';
   return {
     markup: html`
       <div class="codeblock editor-block" data-lang="${exercise.lang}">
         <div class="codeblock-bar"><span>${langName(exercise.lang)} · dein Entwurf</span>${exercise.lang === 'rust' ? html`<a id="playground" href="#" target="_blank" rel="noopener noreferrer">Im Playground ausführen ${raw(icons.external)}</a>` : ''}</div>
-        <textarea id="editor" class="code-editor" wrap="off" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Dein Entwurf" placeholder="Schreib hier deinen Entwurf …">${draft.code}</textarea>
+        ${prose ? html`<textarea id="editor" class="code-editor prose-editor" spellcheck="true" autocapitalize="sentences" aria-label="Dein Text" placeholder="Schreib hier deinen Text …">${draft.code}</textarea>`
+    : html`<textarea id="editor" class="code-editor" wrap="off" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Dein Entwurf" placeholder="Schreib hier deinen Entwurf …">${draft.code}</textarea>`}
       </div>
-      <p class="check-note">${exercise.lang === 'rust' ? 'Dein Entwurf wird gespeichert. Kompilieren und ausführen kannst du ihn im offiziellen Rust Playground.' : 'Dein Entwurf wird gespeichert. Schreib ihn hier oder in deiner IDE und vergleiche danach mit der Musterlösung.'}</p>
-      <fieldset class="checklist"><legend class="label">Selbstkontrolle – hake ab, was deine Lösung erfüllt</legend>
+      <p class="check-note">${note}</p>
+      <fieldset class="checklist"><legend class="label">Selbstkontrolle – hake ab, was ${prose ? 'dein Text' : 'deine Lösung'} erfüllt</legend>
         ${exercise.checklist.map((item, i) => html`<label class="check-item"><input type="checkbox" data-check="${i}" ${draft.checked.includes(i) ? 'checked' : ''}><span>${raw(item)}</span></label>`)}
       </fieldset>`.value,
-    solution: () => codeCard(exercise.solution, exercise.lang, 'Musterlösung'),
+    solution: () => prose ? '' : codeCard(exercise.solution, exercise.lang, 'Musterlösung'),
     bind(root) {
       const editor = $<HTMLTextAreaElement>('#editor', root);
       autosize(editor, 8);
-      editorKeys(editor);
+      if (!prose) editorKeys(editor);
       editor.addEventListener('input', () => { draft.code = editor.value; ctx.save(draft); });
       const playground = root.querySelector<HTMLAnchorElement>('#playground');
       if (playground) { playground.href = playgroundUrl(editor.value); playground.addEventListener('pointerdown', () => { playground.href = playgroundUrl(editor.value); }); playground.addEventListener('focus', () => { playground.href = playgroundUrl(editor.value); }); }
@@ -200,11 +206,13 @@ export const bug: ExerciseRenderer<BugExercise, BugDraft> = (exercise, ctx) => {
   const draft: BugDraft = { selected: [...(ctx.draft?.selected ?? [])], found: !!ctx.draft?.found, fixes: { ...(ctx.draft?.fixes ?? {}) } };
   const lines = exercise.code.split('\n');
   const many = exercise.lines.length > 1;
+  // In running text the task names what to look for; a line is "meant", not broken code.
+  const prose = exercise.lang === 'prose';
   return {
     markup: html`
       <div class="codeblock bug-code" data-lang="${exercise.lang}">
-        <div class="codeblock-bar"><span>${langName(exercise.lang)} · ${many ? `${exercise.lines.length} fehlerhafte Zeilen` : 'eine fehlerhafte Zeile'} – klicke ${many ? 'sie' : 'sie'} an</span></div>
-        <ol class="bug-lines" role="group" aria-label="Codezeilen, auswählbar">
+        <div class="codeblock-bar"><span>${langName(exercise.lang)} · ${prose ? many ? `${exercise.lines.length} Zeilen sind gemeint` : 'eine Zeile ist gemeint' : many ? `${exercise.lines.length} fehlerhafte Zeilen` : 'eine fehlerhafte Zeile'} – ${prose ? 'tippe' : 'klicke'} sie an</span></div>
+        <ol class="bug-lines" role="group" aria-label="${prose ? 'Textzeilen' : 'Codezeilen'}, auswählbar">
           ${lines.map((line, i) => html`<li><button type="button" class="bug-line" data-line="${i + 1}" aria-pressed="${draft.selected.includes(i + 1)}"><span class="line-number">${i + 1}</span><code>${raw(highlight(line, exercise.lang) || ' ')}</code></button></li>`)}
         </ol>
       </div>
@@ -214,7 +222,7 @@ export const bug: ExerciseRenderer<BugExercise, BugDraft> = (exercise, ctx) => {
         ${exercise.fixes.map((fix) => html`<div class="gap-field"><div class="gap-label"><label for="fix-${fix.line}"><span class="gap-number">${fix.line}</span>Zeile ${fix.line} korrigiert</label><span class="gap-state label" id="fix-state-${fix.line}">Offen</span></div>
           <textarea id="fix-${fix.line}" class="answer-input" rows="1" data-fix="${fix.line}" spellcheck="false" autocapitalize="off" autocomplete="off">${draft.fixes[fix.line] ?? lines[fix.line - 1].trim()}</textarea></div>`)}
       </div>`.value,
-    solution: () => html`<p>Fehlerhaft: Zeile ${exercise.lines.join(', ')}.</p>${exercise.fixes.length ? raw(codeCard(fixedCode(exercise), exercise.lang, 'Korrigierter Code')) : ''}`.value,
+    solution: () => html`<p>${prose ? 'Gemeint' : 'Fehlerhaft'}: Zeile ${exercise.lines.join(', ')}.</p>${exercise.fixes.length ? raw(codeCard(fixedCode(exercise), exercise.lang, prose ? 'Korrigierter Text' : 'Korrigierter Code')) : ''}`.value,
     bind(root) {
       const buttons = $$<HTMLButtonElement>('.bug-line', root);
       const paint = (checked = false) => buttons.forEach((b) => {
@@ -246,7 +254,7 @@ export const bug: ExerciseRenderer<BugExercise, BugDraft> = (exercise, ctx) => {
       }));
       $('#check', root).addEventListener('click', () => {
         if (draft.found) return;
-        if (!draft.selected.length) { ctx.feedback('bad', 'Klicke zuerst die Zeile an, in der du den Fehler vermutest.'); return; }
+        if (!draft.selected.length) { ctx.feedback('bad', prose ? 'Tippe zuerst die Zeile an, die du meinst.' : 'Klicke zuerst die Zeile an, in der du den Fehler vermutest.'); return; }
         if (isBugSelectionCorrect(exercise, draft.selected)) {
           draft.found = true;
           ctx.save(draft);
@@ -257,7 +265,7 @@ export const bug: ExerciseRenderer<BugExercise, BugDraft> = (exercise, ctx) => {
           fail([...draft.selected].sort());
           paint(true);
           const hits = draft.selected.filter((line) => exercise.lines.includes(line)).length;
-          ctx.feedback('bad', hits ? `${hits} Treffer, aber nicht alles stimmt. Vergleiche das beschriebene Symptom mit jeder Zeile.` : 'Diese Zeile ist nicht die Ursache. Spiel den Code mit einem konkreten Beispiel durch.');
+          ctx.feedback('bad', hits ? `${hits} Treffer, aber nicht alles stimmt. ${prose ? 'Prüf jede Zeile gegen die Frage aus der Aufgabe.' : 'Vergleiche das beschriebene Symptom mit jeder Zeile.'}` : prose ? 'Diese Zeile ist es nicht. Lies den Ausschnitt noch einmal mit der Frage aus der Aufgabe.' : 'Diese Zeile ist nicht die Ursache. Spiel den Code mit einem konkreten Beispiel durch.');
         }
       });
       $$<HTMLTextAreaElement>('[data-fix]', root).forEach((input) => {
@@ -283,20 +291,22 @@ type ExplainDraft = { text: string; revealed: boolean; checked: number[] };
 export const explain: ExerciseRenderer<ExplainExercise, ExplainDraft> = (exercise, ctx) => {
   const draft: ExplainDraft = { text: ctx.draft?.text ?? '', revealed: !!ctx.draft?.revealed, checked: [...(ctx.draft?.checked ?? [])] };
   const MIN = 80;
+  // A text to analyse instead of code to explain.
+  const prose = exercise.lang === 'prose';
   return {
     ownsExplanation: true,
     markup: html`
-      ${raw(codeCard(exercise.code, exercise.lang, `${langName(exercise.lang)} · zu erklären`))}
-      <label class="field-label label" for="explanation-input">Deine Erklärung – so, wie du sie im Code-Review oder Interview sagen würdest</label>
-      <textarea id="explanation-input" class="answer-input prose-input" rows="6" placeholder="Was passiert hier, warum ist es so gebaut, worauf muss man achten?">${draft.text}</textarea>
-      <div class="exercise-actions"><button type="button" class="btn primary" id="compare">Mit Musterantwort vergleichen</button><span class="muted small" id="count"></span></div>
+      ${raw(codeCard(exercise.code, exercise.lang, `${langName(exercise.lang)} · ${prose ? 'zu untersuchen' : 'zu erklären'}`))}
+      <label class="field-label label" for="explanation-input">${prose ? 'Deine Analyse – in eigenen Worten, ein paar Sätze genügen' : 'Deine Erklärung – so, wie du sie im Code-Review oder Interview sagen würdest'}</label>
+      <textarea id="explanation-input" class="answer-input prose-input" rows="6" ${prose ? html`spellcheck="true" autocapitalize="sentences"` : ''} placeholder="${prose ? 'Was bewirkt der Text, womit erreicht er das, woran siehst du es?' : 'Was passiert hier, warum ist es so gebaut, worauf muss man achten?'}">${draft.text}</textarea>
+      <div class="exercise-actions"><button type="button" class="btn primary" id="compare">Mit ${prose ? 'Beispielanalyse' : 'Musterantwort'} vergleichen</button><span class="muted small" id="count"></span></div>
       <section id="model" class="model-answer" ${draft.revealed ? '' : 'hidden'}>
-        <p class="label">Musterantwort</p>
+        <p class="label">${prose ? 'Eine mögliche Analyse' : 'Musterantwort'}</p>
         <div class="prose compact">${raw(exercise.explanation)}</div>
-        <fieldset class="checklist"><legend class="label">Welche Kernpunkte hat deine Erklärung getroffen?</legend>
+        <fieldset class="checklist"><legend class="label">Welche Kernpunkte hat deine ${prose ? 'Analyse' : 'Erklärung'} getroffen?</legend>
           ${exercise.points.map((point, i) => html`<label class="check-item"><input type="checkbox" data-point="${i}" ${draft.checked.includes(i) ? 'checked' : ''}><span>${raw(point)}</span></label>`)}
         </fieldset>
-        <p class="muted small">Fehlt ein Punkt? Ergänze deine Erklärung oben in eigenen Worten und hake ihn dann ab.</p>
+        <p class="muted small">Fehlt ein Punkt? Ergänze deine ${prose ? 'Analyse' : 'Erklärung'} oben in eigenen Worten und hake ihn dann ab.</p>
       </section>`.value,
     solution: () => '',
     bind(root) {
