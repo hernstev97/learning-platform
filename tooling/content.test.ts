@@ -119,6 +119,17 @@ describe('content', () => {
       expect(messages.some((m) => /als "vm" markiert, enthält aber keinen Befehl/.test(m))).toBe(true);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
+  it('highlights GDScript without making it runnable', () => {
+    const html = codeBlock('@export var windup := 12  # Frames\nfunc _ready() -> void:\n\t$Hitbox.monitoring = false\n\tplay(&"attack")', 'gdscript run');
+    expect(html).toContain('<span>GDScript</span>');
+    expect(html).not.toContain('data-run');
+    expect(html).toContain('<span class="syntax-annotation">@export</span>');
+    expect(html).toContain('<span class="syntax-keyword">func</span>');
+    expect(html).toContain('<span class="syntax-variable">$Hitbox</span>');
+    expect(html).toContain('<span class="syntax-string">&amp;&quot;attack&quot;</span>');
+    expect(html).toContain('<span class="syntax-comment"># Frames</span>');
+    expect(codeBlock('pass', 'gd')).toContain('<span>GDScript</span>');
+  });
   it('does not offer deliberately invalid Rust snippets as executable playground examples', () => {
     expect(codeBlock('fn main() { invalid }', 'rust nocheck')).not.toContain('data-playground');
     expect(codeBlock('fn main() {}', 'rust')).toContain('data-playground="rust"');

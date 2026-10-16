@@ -188,7 +188,7 @@ Richtwert: 3–6 Callouts pro Lektion, davon mindestens ein `INTERVIEW` und ein 
 
 ### Codeblöcke
 
-Codeblöcke immer mit Sprache angeben. Unterstützt werden `kotlin`, `rust`, `python`, `bash`/`sh`, `console`, `yaml`, `toml`, `json`, `sql`, `postgres` (auch `postgresql`, `pgsql`), `xml`, `dockerfile`, `ini` (auch für systemd-Units), `diff`, `excel` (Formeln), `powerquery` (Power Query M, auch `m`), `csv`, `typescript` (auch `ts`, `tsx`), `javascript` (auch `js`, `jsx`) und `text`.
+Codeblöcke immer mit Sprache angeben. Unterstützt werden `kotlin`, `rust`, `python`, `bash`/`sh`, `console`, `yaml`, `toml`, `json`, `sql`, `postgres` (auch `postgresql`, `pgsql`), `xml`, `dockerfile`, `ini` (auch für systemd-Units), `diff`, `excel` (Formeln), `powerquery` (Power Query M, auch `m`), `csv`, `typescript` (auch `ts`, `tsx`), `javascript` (auch `js`, `jsx`), `gdscript` (auch `gd`) und `text`. GDScript wird nur hervorgehoben und läuft nirgends, wie Kotlin; in Lücken und Korrekturen wird es wie Python verglichen (`'a'` = `"a"`).
 
 | Info-String | Wirkung |
 | --- | --- |

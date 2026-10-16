@@ -14,7 +14,7 @@ export const slug = (value: string) => value.toLowerCase()
 const LABELS: Record<string, string> = {
   kotlin: 'Kotlin', rust: 'Rust', python: 'Python', shell: 'Shell', console: 'Terminal', yaml: 'YAML', toml: 'TOML', json: 'JSON',
   sql: 'SQL', postgres: 'PostgreSQL', xml: 'XML', dockerfile: 'Dockerfile', ini: 'Konfiguration', diff: 'Diff', text: 'Text',
-  excel: 'Excel-Formel', powerquery: 'Power Query (M)', csv: 'CSV', typescript: 'TypeScript', javascript: 'JavaScript',
+  excel: 'Excel-Formel', powerquery: 'Power Query (M)', csv: 'CSV', typescript: 'TypeScript', javascript: 'JavaScript', gdscript: 'GDScript',
 };
 
 /** Render a fenced code block; shared by lessons and exercise code. */

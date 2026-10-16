@@ -15,7 +15,8 @@ const family = (lang: Lang) => {
   const l = lang.toLowerCase();
   if (['kotlin', 'kt', 'kts', 'gradle', 'java', 'groovy'].includes(l)) return 'kotlin';
   if (['rust', 'rs'].includes(l)) return 'rust';
-  if (['python', 'py', 'python3', 'pycon'].includes(l)) return 'python';
+  // GDScript tokenises like Python: # comments, 'a' = "a", := and ->.
+  if (['python', 'py', 'python3', 'pycon', 'gdscript', 'gd'].includes(l)) return 'python';
   if (['bash', 'sh', 'shell', 'zsh', 'fish', 'console', 'terminal'].includes(l)) return 'shell';
   if (['excel', 'xlsx', 'formula'].includes(l)) return 'excel';
   if (['sql', 'sqlite', 'postgresql', 'postgres', 'pgsql', 'plpgsql'].includes(l)) return 'sql';
