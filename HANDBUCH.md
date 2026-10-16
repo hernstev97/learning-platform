@@ -71,7 +71,7 @@ Eine vollständige, minimale Vorlage mit jeder Übungsart liegt in [`tooling/fix
 
 1. **Lehrplan entwerfen.** Schreibe zuerst die Liste der Module auf: 10–16 Module in 2–4 Tracks, vom Einstieg bis zum Profi-Niveau. Frage dich bei jedem Modul: *Was kann ich danach, was ich vorher nicht konnte?* Und: *Würde ein Arbeitgeber das erwarten?*
 2. **Ordner anlegen:** `content/<bereich>/` mit `area.yaml` (Abschnitt 4). Die Ordner-ID ist kurz, klein und kebab-case, zum Beispiel `go`, `typescript`, `devops`.
-3. **Farbe wählen.** Eine kräftige Farbe, auf der schwarzer Text gut lesbar ist (Kontrast ≥ 4,5 : 1 zu `#0B0B0B`). Vorhandene Farben nicht wiederholen: `#A98BFF` Kotlin, `#FF6A3D` Rust, `#FFD400` Linux, `#4D8BFF` Python, `#2BD97C` Automation, `#FF5CA8` Git, `#22D3EE` Data Analysis, `#C6F432` Testing, `#FF9F1C` PostgreSQL. Guter freier Kandidat: `#F4A3FF` (Orchidee).
+3. **Farbe wählen.** Eine kräftige Farbe, auf der schwarzer Text gut lesbar ist (Kontrast ≥ 4,5 : 1 zu `#0B0B0B`). Vorhandene Farben nicht wiederholen: `#A98BFF` Kotlin, `#FF6A3D` Rust, `#FFD400` Linux, `#4D8BFF` Python, `#2BD97C` Automation, `#FF5CA8` Git, `#22D3EE` Data Analysis, `#C6F432` Testing, `#FF9F1C` PostgreSQL, `#F4A3FF` Erzählhandwerk. Gute freie Kandidaten: `#FFC6A8` (Apricot), `#B5E3FF` (Eisblau).
 4. **Module schreiben** (Abschnitte 5–7). Ein Modul pro Datei, Dateiname = Modul-ID.
 5. **Karten, Projekte, Glossar, Spickzettel, Berufsseite** ergänzen (Abschnitt 8).
 6. **Prüfen:** `pnpm content:check <bereich>`, dann `pnpm verify <bereich>`, dann `pnpm test` und `pnpm build`.
@@ -118,6 +118,7 @@ goals:                        # 3–6 überprüfbare Lernziele, beginnen mit „
 resources:                    # 2–5 offizielle Quellen, nur https
   - title: The Rust Book · Kapitel 4
     url: https://doc.rust-lang.org/book/ch04-00-understanding-ownership.html
+place: pc                     # optional: unterwegs (Handy reicht) oder pc
 lab: |                        # optional, nur Linux: bereitet das Terminal der Lektion vor (Abschnitt 6, Codeblöcke)
   …
 lesson: |
@@ -126,6 +127,8 @@ lesson: |
 exercises:
   - …
 ```
+
+**`place`: unterwegs oder am PC.** Optional. `unterwegs` heißt: Lektion und alle Übungen gehen auf einem 360 px breiten Handy, Schreibaufgaben bleiben bei wenigen Sätzen. `pc` heißt: Das Modul braucht einen Rechner, etwa für längeres Schreiben, eine IDE oder ein Werkzeug. Die Plattform zeigt das als Marke „Unterwegs“ oder „Am PC“ in der Modulliste, im Kopf der Lektion und auf der Übungsseite. Ein Modul ist entweder das eine oder das andere: Wer im Handy-Modul eine längere Aufgabe braucht, legt sie in ein eigenes PC-Modul. Ohne `place` erscheint keine Marke.
 
 **Richtwerte pro Modul**
 
@@ -140,6 +143,15 @@ exercises:
 | davon Multiple Choice | – | höchstens ein Drittel |
 
 `pnpm content:check` warnt unterhalb der Minima.
+
+### Kurse ohne Code
+
+Manche Bereiche lehren Handwerk ohne Programmcode, zum Beispiel Erzählhandwerk. Dort gelten die Richtwerte sinngemäß:
+
+- **Belege** sind Primärquellen statt API-Dokumentation: gemeinfreie Texte (etwa auf [Wikisource](https://de.wikisource.org/)), Vorträge der Entwickler (GDC Vault), Fachbücher und Fachlexika. Urheberrechtlich geschützte Werke werden beschrieben, verlinkt oder nur kurz zitiert; gemeinfreie Texte wortgetreu mit Quelle.
+- **Übungen** nutzen `lang: prose` (Abschnitt 7). `output` passt nur, wo man wirklich etwas vorhersagt, etwa den Zustand einer Verzweigung; die Warnung „keine Vorhersage-Übung“ ist dort bewusst akzeptiert. `bug` heißt „die gemeinte Zeile finden“, meist ohne `fix`.
+- **Kreative Aufgaben** lassen die Lösung offen. Es gibt keine Mustertexte: `practice` mit `lang: prose` hat keine `solution`, die Checkliste enthält überprüfbare Kriterien, keine Geschmacksurteile. Analysen veröffentlichter Texte dürfen eine Musterantwort haben.
+- **Callouts** `INTERVIEW` und `PRAXIS` nur, wenn sie wirklich passen; `PRAXIS` zeigt dann, wie Studios oder Autoren arbeiten.
 
 ## 6. Lektionen schreiben
 
@@ -242,6 +254,10 @@ Gemeinsame Felder aller Übungen:
 | `hints` | nein | Liste abgestufter Hinweise (Markdown inline), vom sanften Schubs bis fast zur Lösung. Bei `gap` stattdessen `gaps[].hint`. |
 | `wiki` | nein | Hintergrundwissen, das die Lösung **nicht** verrät. Text oder `{ title, body }`. Wird im aufklappbaren „Zum Nachlesen“ gezeigt. |
 | `resources` | empfohlen | `[{ title, url }]` – gezielte Links in die offizielle Doku (Anker verwenden). Mindestens die Hälfte der Übungen eines Moduls hat einen. |
+
+`lang: prose` steht für Fließtext statt Code (Gedichtzeilen, Dialoge, Szenen). Es gilt für `choice` (mit `code`), `order`, `gap`, `bug`, `explain` und `practice`: Zeilen brechen um, statt seitlich zu scrollen, die Schrift ist proportional, und die Beschriftungen sprechen von Text statt Code („Lückentext“, „Deine Analyse“, „Eine mögliche Analyse“). Lücken vergleichen nur die Wörter, ohne Groß-/Kleinschreibung und Satzzeichen. `practice` mit `lang: prose` hat ein Textfeld mit Rechtschreibprüfung, das mit dem Text wächst, und keine Musterlösung: `solution` ist dort verboten, und es gibt keinen Button „Lösung zeigen“. Hilfen gehören in `hints` oder `wiki`. Ein `bug` mit Prosa kommt meist ohne `fix` aus; mit `fix` werden auch die korrigierten Zeilen nur nach Wörtern verglichen. Ein Beispiel jeder Art steht in `tooling/fixtures/beispiel/modules/texte.yaml`.
+
+Für Abläufe, die man durchspielt statt ausführt, gibt es zwei weitere Werte: `lang: harlowe` für Twine-Code (Story-Format Harlowe) und `lang: ablauf` für eine eigene, im Prompt erklärte Ablaufnotation. In `output`-Übungen fragt die Plattform dann nach dem, was der Spieler sieht, statt nach einer Terminalausgabe. Beides prüft `pnpm verify` nicht; probiere Harlowe-Code in Twine aus.
 
 Nach jeder Übung kann man „Lösung zeigen“. Gelöst ist eine Übung aber erst, wenn die eigene Eingabe stimmt oder, bei `practice`, alle Punkte abgehakt sind.
 
@@ -658,7 +674,7 @@ Ablauf: Der Lernende schreibt seine Erklärung (mindestens ein paar Sätze), ver
     fn main() {
         // Dein Code
     }
-  solution: |                  # Pflicht; Rust wird von pnpm verify kompiliert (#[test]s laufen)
+  solution: |                  # Pflicht, bei lang: prose verboten; Rust wird von pnpm verify kompiliert (#[test]s laufen)
     fn main() { … }
   checklist:                   # Selbstkontrolle; alle Punkte abhaken = gelöst
     - Du nutzt `match` auf einem Tupel.
@@ -667,7 +683,7 @@ Ablauf: Der Lernende schreibt seine Erklärung (mindestens ein paar Sätze), ver
   explanation: …
 ```
 
-Für alles, was sich im Browser nicht prüfen lässt: Kotlin-Programme, Rust-Programme, Konfigurationen, Dockerfiles, systemd-Units, Bash-Skripte. Rust-Aufgaben bekommen automatisch einen Button „Im Rust Playground öffnen“ mit dem eigenen Entwurf. Die Checkliste enthält überprüfbare Kriterien, keine Floskeln.
+Für alles, was sich im Browser nicht prüfen lässt: Kotlin-Programme, Rust-Programme, Konfigurationen, Dockerfiles, systemd-Units, Bash-Skripte, eigene Texte (`lang: prose`, ohne Musterlösung). Rust-Aufgaben bekommen automatisch einen Button „Im Rust Playground öffnen“ mit dem eigenen Entwurf. Die Checkliste enthält überprüfbare Kriterien, keine Floskeln.
 
 **Kaputt-Labore** (Bash mit `verify: true`): `starter` ist ein Skript, das in einem leeren Verzeichnis einen kaputten Zustand erzeugt, etwa ein Git-Repository nach einem missglückten `reset --hard`. `solution` wiederholt dieses Skript zeichengleich, ergänzt die Reparatur und endet mit einer `# Kontrolle` aus `test`, `grep -q` oder `git diff --quiet`, die ohne Reparatur scheitert. `pnpm verify` führt die Lösung unter `set -euo pipefail` in einem Wegwerf-Verzeichnis aus und verlangt Exit-Code 0. Absichtlich scheiternde Befehle (Merge mit Konflikt, abgelehnter Push) brauchen `|| true`. Der Git-Bereich nutzt dieses Muster in jedem Modul.
 
@@ -778,6 +794,7 @@ Checkliste vor dem Commit:
 - [ ] Jede Übung ist eindeutig lösbar; alternative richtige Antworten sind in `accept`/`answers`/`alternatives`
 - [ ] Jede Erklärung liefert das *Warum*
 - [ ] Links zeigen auf offizielle Dokumentation und funktionieren
+- [ ] Module mit `place: unterwegs` auf 360 px Breite durchgeklickt, Schreibaufgaben dort kurz
 - [ ] Im Browser durchgeklickt, auch mobil
 
 ## 11. IDs, Fortschritt und Änderungen

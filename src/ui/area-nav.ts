@@ -2,7 +2,7 @@ import type { AreaSummary } from '../content/types.ts';
 import type { Resume } from '../engine/persistence.ts';
 import { areaStats, isDone, type AreaProgress } from '../engine/storage.ts';
 import { analyzeArea, dueTopics } from '../engine/weakness.ts';
-import { TYPE_LABELS, html, pad, raw } from './dom.ts';
+import { html, pad, raw, typeLabel } from './dom.ts';
 
 export type Tab = 'pfad' | 'wiederholen' | 'karten' | 'projekte' | 'spickzettel' | 'glossar' | 'beruf';
 
@@ -45,7 +45,7 @@ export const moduleNumber = (area: AreaSummary, id: string) => pad(area.modules.
 export function resumeStep(resume: Resume): string {
   switch (resume.step.page) {
     case 'lesson': return 'Lektion';
-    case 'exercise': return `Übung ${resume.step.index} von ${resume.step.total} · ${TYPE_LABELS[resume.step.type]}`;
+    case 'exercise': return `Übung ${resume.step.index} von ${resume.step.total} · ${typeLabel(resume.step)}`;
     case 'project': return 'Projekt';
     case 'finished': return 'Alle Übungen gelöst';
   }

@@ -11,7 +11,7 @@ import { escape, languageOf } from '../src/engine/highlight.ts';
 import { vmCommands } from '../src/vm/commands.ts';
 import { shuffledOrder, tokens } from '../src/engine/answers.ts';
 import type {
-  Area, AreaSummary, Card, Catalog, Exercise, GlossaryEntry, Level, Module, ModuleSummary, Project, Resource, SqlExercise, SqlTable, SqlValue, TopicSummary, TrackSummary,
+  Area, AreaSummary, Card, Catalog, Exercise, GlossaryEntry, Level, Module, ModuleSummary, Place, Project, Resource, SqlExercise, SqlTable, SqlValue, TopicSummary, TrackSummary,
 } from '../src/content/types.ts';
 
 export const ROOT = join(import.meta.dirname, '..');
@@ -20,6 +20,7 @@ export const RESERVED = ['karten', 'projekte', 'spickzettel', 'glossar', 'beruf'
 /** Top-level pages that an area folder must not shadow. */
 export const RESERVED_AREAS = ['daten', 'wiederholen'];
 const TYPES = ['gap', 'choice', 'order', 'output', 'command', 'code', 'practice', 'bug', 'explain', 'sql', 'scenario'] as const;
+const PLACES: Place[] = ['unterwegs', 'pc'];
 const ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const validId = (id: unknown): id is string => typeof id === 'string' && id.length <= 120 && ID.test(id) && !['constructor', 'prototype'].includes(id);
 
@@ -306,8 +307,11 @@ function exercise(raw: Obj, moduleId: string, where: string, report: Reporter): 
     case 'practice': {
       const checklist = f.texts('checklist', true).map((item) => inline(item));
       if (!checklist.length) report.error(where, '"checklist" braucht mindestens einen Punkt');
-      const solution = trimCode(f.str('solution'));
-      return { ...base, type, lang: lang(), starter: trimCode(f.str('starter', false)), solution, checklist, fingerprint: fingerprint([type, base.title, checklist]) };
+      const language = lang();
+      // Own texts have no model answer. Help belongs in hints and background reading, not behind "Lösung zeigen".
+      if (language === 'prose' && raw.solution !== undefined) report.error(where, '"solution" gibt es bei lang: prose nicht – eigene Texte haben keine Musterlösung; Hilfen gehören in "hints" oder "wiki"');
+      const solution = language === 'prose' ? '' : trimCode(f.str('solution'));
+      return { ...base, type, lang: language, starter: trimCode(f.str('starter', false)), solution, checklist, fingerprint: fingerprint([type, base.title, checklist]) };
     }
     case 'bug': {
       const language = lang();
@@ -376,7 +380,7 @@ function loadModule(areaId: string, moduleId: string, report: Reporter, raw: Raw
   const data = readYaml(report.file, report);
   if (!data) return null;
   const where = `Modul ${moduleId}`;
-  const f = fields(data, where, report, ['id', 'title', 'level', 'minutes', 'summary', 'goals', 'resources', 'lesson', 'lab', 'exercises']);
+  const f = fields(data, where, report, ['id', 'title', 'level', 'minutes', 'summary', 'goals', 'resources', 'place', 'lesson', 'lab', 'exercises']);
   if (data.id !== moduleId) report.error(where, `id "${data.id}" muss dem Dateinamen "${moduleId}" entsprechen`);
   const lessonSource = f.str('lesson');
   const { html: lesson, toc } = md.document(lessonSource);
@@ -385,6 +389,8 @@ function loadModule(areaId: string, moduleId: string, report: Reporter, raw: Raw
   const links = (lessonSource.match(/\]\(https:\/\//g) ?? []).length;
   if (links < 4) report.warn(where, `Lektion verlinkt nur ${links}× auf externe Dokumentation (Richtwert: 6+)`);
   const lab = data.lab === undefined ? null : trimCode(f.str('lab'));
+  const place = data.place == null || PLACES.includes(data.place) ? (data.place ?? null) as Place | null : null;
+  if (data.place != null && !place) report.error(where, `"place" muss ${PLACES.join(' oder ')} sein`);
   const vm = lessonBlocks(lessonSource).some((block) => block.vm);
   for (const block of lessonBlocks(lessonSource)) if (block.flags.includes('vm') && !block.vm) report.error(where, `Codeblock ${block.n} ist als "vm" markiert, aber kein bash- oder console-Block`);
   for (const block of lessonBlocks(lessonSource)) if (block.vm && !vmCommands(block.code, languageOf(block.lang)).trim()) report.error(where, `Codeblock ${block.n} ist als "vm" markiert, enthält aber keinen Befehl (console: Zeilen mit "$ ")`);
@@ -411,7 +417,7 @@ function loadModule(areaId: string, moduleId: string, report: Reporter, raw: Raw
   if (noResources > exercises.length / 2) report.warn(where, `${noResources} Übungen ohne Doku-Link (resources)`);
   return {
     id: moduleId, title: f.str('title'), summary: f.str('summary'), level: level(data.level, where, report), minutes: f.num('minutes', 60, 5, 600),
-    goals: f.texts('goals').map((goal) => inline(goal)), lesson, toc, resources: resources(data.resources, where, report), exercises, lab, vm, bear: false,
+    goals: f.texts('goals').map((goal) => inline(goal)), lesson, toc, resources: resources(data.resources, where, report), exercises, lab, vm, bear: false, place,
   };
 }
 
@@ -451,7 +457,7 @@ function loadBear(areaDir: string, path: string, report: Reporter): { modules: M
       + topics.map((topic: Obj) => `<h2 id="${topic.id}"><a class="anchor" href="#${topic.id}" aria-hidden="true" tabindex="-1">#</a>${escape(topic.title)}</h2>${paragraphs(topic.body)}`).join('');
     return {
       id, title: chapter.title, summary: chapter.description, level: index < 4 ? 1 : index < 8 ? 2 : 3, minutes: 60,
-      goals: [], lesson, toc: topics.map((topic: Obj) => ({ id: topic.id, title: topic.title })), resources: [], lab: null, vm: false, bear: true,
+      goals: [], lesson, toc: topics.map((topic: Obj) => ({ id: topic.id, title: topic.title })), resources: [], lab: null, vm: false, bear: true, place: null,
       exercises: tasks.map((task: Obj): Exercise => ({
         id: `${id}/${task.id}`, module: id, type: 'gap', lang: 'kotlin', title: task.title, prompt: paragraphs(task.prompt),
         explanation: paragraphs(task.explanation), wiki: { title: task.wiki.title, body: paragraphs(task.wiki.body) }, hints: [],
@@ -608,7 +614,7 @@ function loadArea(dir: string, raw: RawExercise[], sink: { errors: Issue[]; warn
 
   const moduleSummaries: ModuleSummary[] = tracks.flatMap((track) => track.modules).map((mid) => {
     const m = modules[mid];
-    return { id: m.id, title: m.title, summary: m.summary, level: m.level, minutes: m.minutes, bear: m.bear, exercises: m.exercises.map((e) => ({ id: e.id, type: e.type, fingerprint: e.fingerprint })) };
+    return { id: m.id, title: m.title, summary: m.summary, level: m.level, minutes: m.minutes, bear: m.bear, place: m.place, exercises: m.exercises.map((e) => ({ id: e.id, type: e.type, fingerprint: e.fingerprint, ...('lang' in e && e.lang === 'prose' ? { lang: 'prose' as const } : {}) })) };
   });
   // Cards without a module are grouped by their first tag, so weak spots still come in topics.
   const loose = new Map<string, string[]>();

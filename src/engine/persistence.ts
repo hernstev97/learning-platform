@@ -80,7 +80,7 @@ export type Resume = {
   module?: { id: string; title: string; number: number; done: number; total: number };
   step:
     | { page: 'lesson' }
-    | { page: 'exercise'; index: number; total: number; type: ExerciseType }
+    | { page: 'exercise'; index: number; total: number; type: ExerciseType; lang?: 'prose' }
     | { page: 'project'; title: string }
     | { page: 'finished' };
   /** Why the stored position was not used as-is. */
@@ -101,7 +101,7 @@ export function resolveResume(area: AreaSummary, progress: AreaProgress): Resume
     id: m.id, title: m.title, number: modules.indexOf(m) + 1, done: m.exercises.filter((e) => isDone(progress, e)).length, total: m.exercises.length,
   });
   const exercise = (m: AreaSummary['modules'][number], index: number, moved: Resume['moved']): Resume => ({
-    href: `/${area.id}/${m.id}/${index + 1}`, module: moduleInfo(m), step: { page: 'exercise', index: index + 1, total: m.exercises.length, type: m.exercises[index].type }, moved, started,
+    href: `/${area.id}/${m.id}/${index + 1}`, module: moduleInfo(m), step: { page: 'exercise', index: index + 1, total: m.exercises.length, type: m.exercises[index].type, ...(m.exercises[index].lang ? { lang: m.exercises[index].lang } : {}) }, moved, started,
   });
   const lesson = (m: AreaSummary['modules'][number], moved: Resume['moved']): Resume => ({ href: `/${area.id}/${m.id}`, module: moduleInfo(m), step: { page: 'lesson' }, moved, started });
   // A module that was already begun continues at its first open exercise, a new one at its lesson.

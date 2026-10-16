@@ -4,7 +4,7 @@ import { isDone } from '../engine/storage.ts';
 import { navigate } from '../router.ts';
 import type { Page } from '../router.ts';
 import { moduleNumber } from '../ui/area-nav.ts';
-import { $, $$, html, icons, pad, raw } from '../ui/dom.ts';
+import { $, $$, html, icons, pad, placeMark, raw } from '../ui/dom.ts';
 import { exerciseView } from '../ui/exercise-view.ts';
 
 const exercisePage: Page<{ name: 'exercise'; area: string; module: string; index: number }> = async (main, route) => {
@@ -78,7 +78,7 @@ const exercisePage: Page<{ name: 'exercise'; area: string; module: string; index
   main.innerHTML = html`
     <div class="player" style="--area:${summary.color}">
       <header class="player-head">
-        <nav class="crumbs" aria-label="Brotkrumen"><a href="/${summary.id}">${summary.title}</a><span aria-hidden="true">/</span><a href="${base}">${moduleNumber(summary, module.id)} ${module.title}</a></nav>
+        <nav class="crumbs" aria-label="Brotkrumen"><a href="/${summary.id}">${summary.title}</a><span aria-hidden="true">/</span><a href="${base}">${moduleNumber(summary, module.id)} ${module.title}</a>${placeMark(module.place)}</nav>
         <nav class="steps" aria-label="Übungen dieses Moduls – Pfeiltasten wechseln">
           ${module.exercises.map((e, i) => html`<a class="step${isDone(progress, e) ? ' done' : ''}${i === index ? ' active' : ''}" href="${base}/${i + 1}" ${i === index ? html`aria-current="step"` : ''} aria-label="Übung ${i + 1}: ${e.title} (${isDone(progress, e) ? 'gelöst' : 'offen'})" title="${i + 1}. ${e.title}"><span>${i + 1}</span></a>`)}
         </nav>

@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { join } from 'node:path';
 import { loadContent } from '../../tooling/content.ts';
 import type { GapExercise } from '../content/types.ts';
-import { assemble, gapSolution, isChoiceCorrect, isCommandCorrect, isGapCorrect, isGapExerciseCorrect, isOrderCorrect, isOutputCorrect, shellTokens, shuffledOrder, tokens } from './answers.ts';
+import { assemble, gapSolution, isChoiceCorrect, isCommandCorrect, isGapCorrect, isGapExerciseCorrect, isOrderCorrect, isOutputCorrect, isPartial, shellTokens, shuffledOrder, tokens } from './answers.ts';
 
 const kotlin = loadContent(['kotlin'], undefined, { allowMissing: true }).areas.kotlin;
 const bear = Object.values(kotlin.modules).filter((m) => m.bear).flatMap((m) => m.exercises) as GapExercise[];
@@ -97,6 +97,16 @@ describe('Answer checking per language', () => {
     expect(tokens('select count(*) from kunden where region != \'Nord\';', 'sql')).toEqual(tokens('SELECT COUNT(*) FROM Kunden WHERE region <> \'Nord\'', 'sql'));
     expect(tokens("WHERE region = 'nord'", 'sql')).not.toEqual(tokens("WHERE region = 'Nord'", 'sql'));
     expect(tokens('a >= 1', 'sql')).not.toEqual(tokens('a > = 1', 'sql'));
+  });
+  it('compares running text by its words only', () => {
+    expect(tokens('„Subtext“, nicht Text.', 'prose')).toEqual(['subtext', 'nicht', 'text']);
+    const cloze = fixtures.areas.beispiel.modules.texte.exercises.find((e) => e.type === 'gap') as GapExercise;
+    expect(isGapCorrect(cloze.gaps[0], 'perspektive.', cloze.lang)).toBe(true);
+    expect(isGapCorrect(cloze.gaps[0], 'Sicht', cloze.lang)).toBe(false);
+    // While typing, lower case and a missing capital still count as on the way, not as wrong.
+    expect(isPartial(cloze.gaps[0], 'persp', cloze.lang)).toBe(true);
+    expect(isPartial(cloze.gaps[0], 'Sicht', cloze.lang)).toBe(false);
+    expect(tokens('Erza\u0308hler', 'prose')).toEqual(['erzähler']);
   });
   it('checks every fixture exercise type', () => {
     expect(isGapExerciseCorrect(byId('lueckentext'), { g1: 'def', g2: '2*x' })).toBe(true);

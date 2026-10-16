@@ -253,7 +253,7 @@ test('practice, bug and explain exercises', async ({ page }) => {
   for (const box of await page.locator('[data-point]').all()) await box.check();
   await expect(page.locator('#feedback')).toContainText('Richtig.');
   await page.goto('/beispiel');
-  await expect(page.locator('.module-row .label').last()).toHaveText('3/18');
+  await expect(page.locator('.module-row', { hasText: 'Alle Übungsarten' }).locator('.module-progress .label')).toHaveText('3/18');
 });
 
 test('SQL runs in the browser: table preview, result table, feedback and runnable lesson blocks', async ({ page }) => {
@@ -484,6 +484,44 @@ test('cards, projects, reference pages and data export', async ({ page }) => {
   expect((await download).suggestedFilename()).toMatch(/^learn-kiumu-.*\.json$/);
 });
 
+test('modules say whether they work on a phone, and prose exercises wrap and need no model answer', async ({ page }) => {
+  const errors = errorsOf(page);
+  await page.goto('/beispiel');
+  await expect(page.locator('.module-row', { hasText: 'Alle Übungsarten' }).locator('.place-mark')).toHaveText('Am PC');
+  await expect(page.locator('.module-row', { hasText: 'Übungen mit Fließtext' }).locator('.place-mark')).toHaveText('Unterwegs');
+  await page.setViewportSize({ width: 360, height: 800 });
+  // The list hides level and minutes on a phone; the place stays.
+  await expect(page.locator('.module-row', { hasText: 'Übungen mit Fließtext' }).locator('.place-mark')).toBeVisible();
+  await page.goto('/beispiel/texte');
+  await expect(page.locator('.module-place')).toContainText('Unterwegs');
+  await expect(page.locator('.module-place')).toContainText('Geht auf dem Handy');
+
+  await page.goto('/beispiel/texte/2');
+  await expect(page.locator('.player-head .place-mark')).toHaveText('Unterwegs');
+  await expect(page.locator('.exercise-kicker')).toContainText('Lückentext');
+  await page.locator('#answer-g1').fill('perspektive.');
+  await expect(page.locator('#feedback')).toContainText('Richtig.');
+
+  await page.goto('/beispiel/texte/4');
+  const text = page.locator('.bug-code');
+  expect(await text.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
+  await page.locator('[data-line="1"]').click();
+  await page.locator('#check').click();
+  await expect(page.locator('#feedback')).toContainText('Diese Zeile ist es nicht');
+  await page.locator('[data-line="3"]').click();
+  await page.locator('#check').click();
+  await expect(page.locator('#feedback')).toContainText('Richtig.');
+
+  await page.goto('/beispiel/texte/6');
+  await expect(page.locator('#reveal')).toHaveCount(0);
+  await expect(page.locator('#editor')).toHaveAttribute('spellcheck', 'true');
+  await page.locator('#editor').fill('Der Flur riecht nach Bohnerwachs. Hinter der Tür läuft ein Radio. Auf der Treppe liegt ein einzelner Handschuh.');
+  for (const box of await page.locator('[data-check]').all()) await box.check();
+  await expect(page.locator('#feedback')).toContainText('Richtig.');
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  expect(errors).toEqual([]);
+});
+
 test('lesson python blocks run, pages stay within the viewport on mobile', async ({ page }) => {
   test.setTimeout(120_000);
   await page.goto(base);
@@ -586,7 +624,7 @@ test('unsaved work can be exported and merged when browser storage is blocked', 
   backup.areas.beispiel.read = { 'alle-typen': '2026-09-28' };
   await page.locator('#import-file').setInputFiles({ name: 'backup.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(backup)) });
   await expect(page.locator('#data-message')).toContainText('übernommen');
-  await expect(page.locator('.data-table tr', { hasText: 'Beispielbereich' })).toContainText('1 / 18');
+  await expect(page.locator('.data-table tr', { hasText: 'Beispielbereich' })).toContainText('1 / 24');
 });
 
 test('malformed addresses render the not-found page without an unhandled exception', async ({ page }) => {

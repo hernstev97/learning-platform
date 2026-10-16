@@ -20,6 +20,7 @@ const family = (lang: Lang) => {
   if (['excel', 'xlsx', 'formula'].includes(l)) return 'excel';
   if (['sql', 'sqlite', 'postgresql', 'postgres', 'pgsql', 'plpgsql'].includes(l)) return 'sql';
   if (['typescript', 'ts', 'tsx', 'mts', 'cts', 'javascript', 'js', 'jsx', 'mjs', 'cjs'].includes(l)) return 'script';
+  if (l === 'prose') return 'prose';
   return 'generic';
 };
 
@@ -41,6 +42,8 @@ export function tokens(value: string, lang: Lang = 'kotlin'): string[] {
     case 'excel': return excelTokens(value);
     case 'sql': return sqlTokens(value);
     case 'script': return scriptTokens(value);
+    // Running text: words only, without case and punctuation, so „Subtext.“ = „subtext“.
+    case 'prose': return value.normalize('NFC').toLocaleLowerCase('de').match(/[\p{L}\p{N}]+/gu) ?? [];
     default: return value.match(KOTLIN) ?? [];
   }
 }
@@ -102,9 +105,15 @@ export function isGapCorrect(gap: Gap, value: string, lang: Lang = 'kotlin'): bo
 export function isGapExerciseCorrect(exercise: Pick<GapExercise, 'gaps' | 'lang'>, answers: Answers): boolean {
   return exercise.gaps.every((gap) => isGapCorrect(gap, answers[gap.id] ?? '', exercise.lang));
 }
-export function isPartial(gap: Gap, value: string): boolean {
+export function isPartial(gap: Gap, value: string, lang: Lang = 'kotlin'): boolean {
   const actual = value.trim();
-  return !!actual && gap.answers.some((answer) => answer.startsWith(actual));
+  if (!actual) return false;
+  // Running text ignores case and punctuation while typing, too: „persp“ is on its way to „Perspektive“.
+  if (family(lang) === 'prose') {
+    const typed = tokens(actual, lang).join(' ');
+    return !!typed && gap.answers.some((answer) => tokens(answer, lang).join(' ').startsWith(typed));
+  }
+  return gap.answers.some((answer) => answer.startsWith(actual));
 }
 export function gapSolution(exercise: Pick<GapExercise, 'gaps'>): Answers {
   return Object.fromEntries(exercise.gaps.map((gap) => [gap.id, gap.answers[0]]));

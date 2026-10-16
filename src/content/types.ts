@@ -32,6 +32,7 @@ export type OutputExercise = ExerciseBase & { type: 'output'; lang: string; code
 export type CommandExercise = ExerciseBase & { type: 'command'; context: string | null; answers: string[]; output: string | null; symbol: string };
 export type CodeTest = { name: string; code: string };
 export type CodeExercise = ExerciseBase & { type: 'code'; lang: 'python'; starter: string; solution: string; setup: string; tests: CodeTest[] };
+/** Larger task, judged by the learner against `checklist`. `solution` is the model answer; empty with `lang: prose` (own texts). */
 export type PracticeExercise = ExerciseBase & { type: 'practice'; lang: string; starter: string; solution: string; checklist: string[] };
 /** Find the faulty line(s), then optionally type the corrected line. Lines are 1-based. */
 export type BugFix = { line: number; answers: string[] };
@@ -65,6 +66,8 @@ export type Exercise = GapExercise | ChoiceExercise | OrderExercise | OutputExer
 export type ExerciseType = Exercise['type'];
 
 export type TocEntry = { id: string; title: string };
+/** Where a module can be worked through: `unterwegs` on a phone (reading, analysis, short writing), `pc` needs a computer. */
+export type Place = 'unterwegs' | 'pc';
 export type Module = {
   id: string;
   title: string;
@@ -85,6 +88,8 @@ export type Module = {
   vm: boolean;
   /** Set for modules generated from the Bear snapshot. */
   bear: boolean;
+  /** Null when the module does not say. */
+  place: Place | null;
 };
 
 /** `module` is the module whose topic the card tests; weak spots are bundled by it. */
@@ -121,7 +126,9 @@ export type ModuleSummary = {
   level: Level;
   minutes: number;
   bear: boolean;
-  exercises: { id: string; type: ExerciseType; fingerprint: string }[];
+  place: Place | null;
+  /** `lang` only for running text (`prose`), so labels like „Lückentext“ work without loading the area. */
+  exercises: { id: string; type: ExerciseType; fingerprint: string; lang?: 'prose' }[];
 };
 export type AreaSummary = {
   id: string;
