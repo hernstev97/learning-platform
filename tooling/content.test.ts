@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { formatIssues, lessonBlocks, loadContent } from './content.ts';
-import { codeBlock } from './markdown.ts';
+import { codeBlock, createMarkdown } from './markdown.ts';
 
 describe('content', () => {
   it('fixture area loads without errors and covers every exercise type', () => {
@@ -118,6 +118,14 @@ describe('content', () => {
       expect(messages.some((m) => /als "vm" markiert, aber kein bash- oder console-Block/.test(m))).toBe(true);
       expect(messages.some((m) => /als "vm" markiert, enthält aber keinen Befehl/.test(m))).toBe(true);
     } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it('keeps headings of later blocks out of a lesson\'s table of contents', () => {
+    const md = createMarkdown();
+    const { toc } = md.document('## Erster Abschnitt\n\nText\n\n## Zweiter Abschnitt\n');
+    md.block('## Auftrag\n\nBrief eines Projekts');
+    expect(toc.map((entry) => entry.title)).toEqual(['Erster Abschnitt', 'Zweiter Abschnitt']);
+    const module = loadContent(undefined, join(import.meta.dirname, 'fixtures')).areas.beispiel.modules['alle-typen'];
+    expect(module.toc.every((entry) => module.lesson.includes(`id="${entry.id}"`))).toBe(true);
   });
   it('highlights GDScript without making it runnable', () => {
     const html = codeBlock('@export var windup := 12  # Frames\nfunc _ready() -> void:\n\t$Hitbox.monitoring = false\n\tplay(&"attack")', 'gdscript run');

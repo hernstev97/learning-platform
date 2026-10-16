@@ -93,7 +93,10 @@ export function createMarkdown() {
       toc = [];
       used.clear();
       const html = marked.parse(callouts(source), { async: false }) as string;
-      return { html, toc };
+      const result = { html, toc };
+      // Later block() calls (exercise prompts, project briefs) must not add their headings to this lesson's table of contents.
+      toc = [];
+      return result;
     },
     block(source: string): string {
       return marked.parse(callouts(source), { async: false }) as string;
