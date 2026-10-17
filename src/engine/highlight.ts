@@ -28,6 +28,13 @@ const LANGUAGES: Record<string, Language> = {
     builtins: words(`print len range enumerate zip map filter sorted reversed sum min max abs any all open isinstance issubclass type int float str bool list dict set tuple frozenset bytes object super iter next repr hash id input round divmod getattr setattr hasattr vars dir format callable`),
     types: true, calls: true,
   },
+  // GDScript (Godot 4): @annotations, $Node and %Unique paths, &"StringName", ^"NodePath" and r"raw" strings.
+  gdscript: {
+    rules: [hashComment, [/[&^r]?(?:"""[\s\S]*?(?:"""|$)|'''[\s\S]*?(?:'''|$)|"(?:\\.|[^"\\\n])*"?|'(?:\\.|[^'\\\n])*'?)/y, 'string'], [/@[A-Za-z_]\w*/y, 'annotation'], [/[$%][A-Za-z_][\w/]*/y, 'variable'], number],
+    keywords: words(`if elif else for while match when break continue pass return class class_name extends is in as self signal func static const enum var await preload super true false null not and or void PI TAU INF NAN breakpoint`),
+    builtins: words(`print push_warning push_error len range str int float bool abs absf absi clamp clampf clampi lerp lerpf min max minf maxf sign signf move_toward snapped randf randi randf_range randi_range is_instance_valid load typeof deg_to_rad rad_to_deg`),
+    types: true, calls: true,
+  },
   shell: {
     rules: [hashComment, [/'[^']*'?/y, 'string'], [/"(?:\\.|[^"\\])*"?/y, 'string'], [/\$\{[^}\n]*\}?|\$[A-Za-z_]\w*|\$[0-9@#?$!*-]/y, 'variable'], [/(?<=\s)--?[A-Za-z][\w-]*/y, 'option']],
     keywords: words(`if then else elif fi for while until do done case esac in function return local export readonly declare set unset shift exit trap source select break continue`),
@@ -100,7 +107,7 @@ const LANGUAGES: Record<string, Language> = {
 };
 LANGUAGES.javascript = LANGUAGES.typescript;
 const ALIASES: Record<string, string> = {
-  kt: 'kotlin', kts: 'kotlin', gradle: 'kotlin', java: 'kotlin', groovy: 'kotlin', rs: 'rust', py: 'python', python3: 'python',
+  kt: 'kotlin', kts: 'kotlin', gradle: 'kotlin', java: 'kotlin', groovy: 'kotlin', rs: 'rust', py: 'python', python3: 'python', gd: 'gdscript',
   bash: 'shell', sh: 'shell', zsh: 'shell', fish: 'shell', terminal: 'shell', yml: 'yaml', jsonc: 'json', docker: 'dockerfile',
   containerfile: 'dockerfile', systemd: 'ini', service: 'ini', conf: 'ini', cfg: 'ini', html: 'xml', svg: 'xml', pycon: 'python',
   postgresql: 'postgres', pgsql: 'postgres', plpgsql: 'postgres',

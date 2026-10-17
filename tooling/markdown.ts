@@ -14,7 +14,7 @@ export const slug = (value: string) => value.toLowerCase()
 const LABELS: Record<string, string> = {
   kotlin: 'Kotlin', rust: 'Rust', python: 'Python', shell: 'Shell', console: 'Terminal', yaml: 'YAML', toml: 'TOML', json: 'JSON',
   sql: 'SQL', postgres: 'PostgreSQL', xml: 'XML', dockerfile: 'Dockerfile', ini: 'Konfiguration', diff: 'Diff', text: 'Text',
-  excel: 'Excel-Formel', powerquery: 'Power Query (M)', csv: 'CSV', typescript: 'TypeScript', javascript: 'JavaScript',
+  excel: 'Excel-Formel', powerquery: 'Power Query (M)', csv: 'CSV', typescript: 'TypeScript', javascript: 'JavaScript', gdscript: 'GDScript',
 };
 
 /** Render a fenced code block; shared by lessons and exercise code. */
@@ -93,7 +93,10 @@ export function createMarkdown() {
       toc = [];
       used.clear();
       const html = marked.parse(callouts(source), { async: false }) as string;
-      return { html, toc };
+      const result = { html, toc };
+      // Later block() calls (exercise prompts, project briefs) must not add their headings to this lesson's table of contents.
+      toc = [];
+      return result;
     },
     block(source: string): string {
       return marked.parse(callouts(source), { async: false }) as string;
