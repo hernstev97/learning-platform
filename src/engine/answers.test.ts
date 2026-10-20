@@ -54,6 +54,11 @@ describe('Answer checking per language', () => {
     expect(tokens(`print('a')`, 'python')).not.toEqual(tokens(`print('b')`, 'python'));
     expect(tokens(`f'{x}'`, 'python')).toEqual(tokens(`f"{x}"`, 'python'));
   });
+  it('compares GDScript like Python: quote styles equal, := kept as one operator', () => {
+    expect(tokens(`animation_player.play(&'attack')`, 'gdscript')).toEqual(tokens(`animation_player.play(&"attack")`, 'gd'));
+    expect(tokens(`var speed := 90.0`, 'gdscript')).toEqual(['var', 'speed', ':=', '90.0']);
+    expect(tokens(`hitbox.set_deferred("monitoring", true)`, 'gdscript')).not.toEqual(tokens(`hitbox.set_deferred("monitoring", false)`, 'gdscript'));
+  });
   it('treats TypeScript quote styles and line-final semicolons as equal', () => {
     const answer = `await user.click(screen.getByRole('button', { name: 'Buchen' }));`;
     expect(tokens(answer, 'typescript')).toEqual(tokens(`await user.click(screen.getByRole("button", { name: \`Buchen\` }))`, 'typescript'));
