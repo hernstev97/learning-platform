@@ -1,4 +1,4 @@
-import { loadArea, onProgressChange, progressOf, recordDrill, saveAnswer, setEntry, summaryOf } from '../app.ts';
+import { loadArea, offlineDraftFor, onProgressChange, progressOf, recordDrill, saveAnswer, settleOfflineDraft, setEntry, summaryOf } from '../app.ts';
 import type { DrillEvent } from '../../convex/model.ts';
 import { isDone } from '../engine/storage.ts';
 import { navigate } from '../router.ts';
@@ -99,12 +99,31 @@ const exercisePage: Page<{ name: 'exercise'; area: string; module: string; index
     navigate(`${base}/${target + 1}`);
     requestAnimationFrame(() => document.querySelector<HTMLElement>('.step.active')?.focus());
   });
+  // A text typed offline that differs from the saved draft: the saved one stays until the offline one is loaded.
+  const reload = () => navigate(location.pathname, { replace: true, keepScroll: true });
+  const offerOfflineDraft = () => {
+    const offer = main.querySelector('#offline-draft');
+    if (offlineDraftFor(summary.id, exercise) === undefined) { offer?.remove(); return; }
+    if (offer) return;
+    const box = document.createElement('div');
+    box.id = 'offline-draft'; box.className = 'draft-offer';
+    box.innerHTML = '<button class="btn small" type="button">Offline geschriebener Entwurf verfügbar · Laden</button><button class="btn small ghost" type="button">Verwerfen</button>';
+    const [load, drop] = box.querySelectorAll('button');
+    load.addEventListener('click', () => { settleOfflineDraft(summary.id, exercise, true); reload(); });
+    drop.addEventListener('click', () => {
+      if (!confirm('Den offline geschriebenen Entwurf von diesem Gerät löschen? Der gespeicherte Entwurf bleibt.')) return;
+      settleOfflineDraft(summary.id, exercise, false); box.remove();
+    });
+    $('#feedback', main).after(box);
+  };
+  offerOfflineDraft();
   cleanups.push(onProgressChange((draft) => {
+    offerOfflineDraft();
     if (draft && !main.querySelector('#refresh-draft')) {
       const button = document.createElement('button');
       button.id = 'refresh-draft'; button.className = 'btn small';
       button.textContent = 'Geänderter Entwurf verfügbar · Laden';
-      button.addEventListener('click', () => navigate(location.pathname, { replace: true, keepScroll: true }));
+      button.addEventListener('click', reload);
       $('#feedback', main).after(button);
     }
     const nextSolved = isDone(progress, exercise);

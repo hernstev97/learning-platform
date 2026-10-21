@@ -36,7 +36,7 @@ test('a browser that was signed in before reads lessons offline with its last sy
   await context.setOffline(true);
   await page.goto(`/python/${first.id}`);
   await expect(page.locator('#sync-notice')).toContainText('Offline-Modus');
-  await expect(page.locator('#sync-notice')).toContainText('Änderungen werden hier nicht gespeichert');
+  await expect(page.locator('#sync-notice')).toContainText('Häkchen, gelöste Übungen und Karten werden hier nicht gespeichert');
   await expect(page.locator('#storage-status')).toContainText('Offline · Lernstand vom');
   await expect(page.locator('#sign-out')).toBeHidden();
   await expect(page.locator('h1')).toContainText(first.title);
@@ -57,6 +57,30 @@ test('a browser that was signed in before reads lessons offline with its last sy
   await expect(page.locator('#data-message')).toContainText('Sicherung konnte nicht geladen werden');
   await expect(page.locator('#reconnect')).toBeVisible();
   expect(errors).toEqual([]);
+});
+
+test('texts typed in offline reading mode survive a reload and wait on the device for the next sign-in', async ({ page, context }) => {
+  const module = loadContent(['narrative']).areas.narrative.modules['figuren-motivation'];
+  const index = module.exercises.findIndex((e) => e.type === 'practice' && e.lang === 'prose');
+  const exercise = module.exercises[index];
+  const text = 'Mara will bis Freitag den Mietvertrag unterschreiben.';
+  const stored = () => page.evaluate(() => Object.keys(localStorage).filter((key) => key.startsWith('learn-offline:draft:')));
+  await installed(page);
+  await page.evaluate((value) => localStorage.setItem('learn-offline:snapshot:v1', JSON.stringify(value)), copy);
+  await context.setOffline(true);
+  await page.goto(`/narrative/${module.id}/${index + 1}`);
+  await expect(page.locator('#sync-notice')).toContainText('Deine Eingaben in Übungen bleiben auf diesem Gerät');
+  await page.locator('#editor').fill(text);
+  await page.reload();
+  await expect(page.locator('#sync-notice')).toContainText('Offline-Modus');
+  await expect(page.locator('#editor')).toHaveValue(text);
+  // Back online. The placeholder sign-in fails like an unreachable Clerk; the text must stay for the next authorized start.
+  await context.setOffline(false);
+  await page.locator('#reconnect').click();
+  await expect(page.getByRole('button', { name: 'Offline weiterlesen' })).toBeVisible();
+  expect(await stored()).toEqual([`learn-offline:draft:v1:narrative:${exercise.id}:${exercise.fingerprint}`]);
+  await page.getByRole('button', { name: 'Offline weiterlesen' }).click();
+  await expect(page.locator('#editor')).toHaveValue(text);
 });
 
 test('offline without an earlier sign-in stays closed', async ({ page, context }) => {
