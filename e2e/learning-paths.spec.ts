@@ -209,7 +209,7 @@ for (const area of loaded.catalog.areas) {
   });
 }
 
-test('real content fits phone, tablet and desktop viewports', async ({ context }) => {
+test('real content fits phone, tablet and desktop viewports', async ({ page }) => {
   test.setTimeout(180_000);
   // Weak spots in every area, so the review pages show topic cards, the topic map and a running round.
   const day = (offset: number) => new Date(Date.now() + offset * 86_400_000).toISOString().slice(0, 10);
@@ -220,14 +220,9 @@ test('real content fits phone, tablet and desktop viewports', async ({ context }
     const card = area.topics.find((t) => t.cards.length)!.cards[0];
     return [area.id, { version: 1, done, drafts: {}, revealed: {}, read: {}, cards: { [card]: { box: 1, due: day(0), seen: 2, grade: 'again', lapses: 2 } }, projects: {}, drills, topics: {}, last: null }];
   }));
-  const seed = await context.newPage();
-  await seed.goto('/');
-  await seed.evaluate((areas) => { for (const [id, value] of Object.entries(areas)) localStorage.setItem(`learn:${id}:v1`, JSON.stringify(value)); }, seeded);
-  await seed.close();
+  await page.goto('/');
+  await page.evaluate((areas) => { for (const [id, value] of Object.entries(areas)) localStorage.setItem(`learn:${id}:v1`, JSON.stringify(value)); }, seeded);
   for (const width of [360, 768, 1440]) {
-    // Some 300 dev-server navigations in one tab exhaust a busy CI runner (net::ERR_INSUFFICIENT_RESOURCES, then a page
-    // module fails to load): a fresh tab per width, and a second try for a page that did not load. Layout is what counts.
-    const page = await context.newPage();
     await page.setViewportSize({ width, height: 900 });
     const paths = ['/', '/daten', '/wiederholen'];
     for (const area of loaded.catalog.areas) {
@@ -241,13 +236,10 @@ test('real content fits phone, tablet and desktop viewports', async ({ context }
       }
     }
     for (const path of paths) {
-      await expect(async () => {
-        await page.goto(path);
-        await expect(page.locator('h1')).toBeVisible();
-      }).toPass({ timeout: 30_000 });
+      await page.goto(path);
+      await expect(page.locator('h1')).toBeVisible();
       await page.evaluate(() => document.fonts.ready);
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), `${width}px ${path}`).toBe(true);
     }
-    await page.close();
   }
 });
