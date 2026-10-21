@@ -95,6 +95,8 @@ export function getContinueArea(): string | null {
 export const onProgressChange = (_fn: (draft: boolean) => void) => () => {};
 export const closeDraft = () => {};
 export const prepareDraft = async (_area: string, _exercise: Exercise) => {};
+export const offlineDraftFor = (_area: string, _exercise: Exercise): unknown => undefined;
+export const settleOfflineDraft = (_area: string, _exercise: Exercise, _use: boolean) => {};
 export function saveAnswer(area: string, exercise: Exercise, draft: unknown) { progressOf(area).drafts[exercise.id] = structuredClone(draft); save(area); }
 export function setEntry(area: string, entry: Entry) {
   const p = progressOf(area);

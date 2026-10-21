@@ -4,13 +4,13 @@ import loaders from 'virtual:area-loaders';
 import type { ConvexClient } from 'convex/browser';
 import type { FunctionReturnType } from 'convex/server';
 import { api } from '../convex/_generated/api.js';
-import { applyEntries, generationOf, validateDraft, validateEntry, validateNote, type DrillEvent, type DraftInput, type Entry, type Grade, type NoteInput, type Position, type Snapshot } from '../convex/model.ts';
+import { applyEntries, assertId, generationOf, validateDraft, validateEntry, validateNote, type DrillEvent, type DraftInput, type Entry, type Grade, type NoteInput, type Position, type Snapshot } from '../convex/model.ts';
 import type { Area, AreaSummary, Exercise } from './content/types.ts';
 import { freshProgress, localDay, type AreaProgress, type Backup } from './engine/storage.ts';
 import { schedule } from './engine/review.ts';
 import { drill, drillBase } from './engine/drill.ts';
 import { latestArea, projectSnapshot, safeDraft, sameEntry, toEntries } from './engine/persistence.ts';
-import { browserStorage, readOfflineCopy, writeOfflineCopy } from './engine/offline.ts';
+import { browserStorage, readOfflineCopy, readOfflineDrafts, removeOfflineDraft, writeOfflineCopy, writeOfflineDraft, type OfflineDraft } from './engine/offline.ts';
 
 export { catalog };
 const areas = new Map<string, Area>();
@@ -24,7 +24,7 @@ let connected = false;
 let unreachable = false;
 let downSince: number | null = null;
 let copyTimer: ReturnType<typeof setTimeout> | undefined;
-/** Offline reading mode: time of the shown snapshot copy; nothing is written. */
+/** Offline reading mode: time of the shown snapshot copy; only drafts are kept, on this device (see saveAnswer). */
 let offlineSince: number | null = null;
 let active = false;
 let pending = 0;
@@ -36,6 +36,11 @@ let cancelDraftLoad: (() => void) | undefined;
 // Until the open exercise's saved draft has arrived, a typed draft is held instead of blindly replacing it.
 let draftKnown = true;
 let heldDraft: { json: string; send: () => void } | undefined;
+// Drafts typed in offline reading mode that differ from the saved one, by area, exercise and fingerprint. Their exercise
+// offers them until they are loaded or discarded; the copy on this device stays until then.
+const offered = new Map<string, OfflineDraft>();
+const offerKey = (areaId: string, exerciseId: string, fingerprint: string) => `${areaId}:${exerciseId}:${fingerprint}`;
+const validOfflineDraft = (draft: OfflineDraft) => { assertId(draft.areaId); validateDraft(draft); };
 // Lessons with notes by area. Typed note text is sent after a short pause; confirmed text reaches the open lesson
 // only once none of its own writes is outstanding, so server echoes never replace newer typing.
 let noted = new Map<string, Set<string>>();
@@ -67,7 +72,7 @@ export const getSyncStatus = () => offlineSince !== null ? `Offline · Lernstand
   : waiting() ? `${changes(waiting())} ${waiting() === 1 ? 'wird' : 'werden'} gespeichert …` : !connected ? 'Verbindung wird wiederhergestellt …' : 'Lernstand synchronisiert';
 /** Explains a lasting connection problem above the page; null while everything is (or is about to be) synchronized. */
 export function getSyncNotice(): string | null {
-  if (offlineSince !== null) return `Offline-Modus: Lerninhalte und dein Lernstand vom ${stamp(offlineSince)}. Änderungen werden hier nicht gespeichert.`;
+  if (offlineSince !== null) return `Offline-Modus, Lernstand vom ${stamp(offlineSince)}. Eingaben in Übungen bleiben auf diesem Gerät, bis du mit Netz startest. Häkchen, gelöste Übungen und Karten gelten nur bis zum Neuladen.`;
   if (!unreachable) return null;
   const n = waiting();
   return n ? `Keine Verbindung. ${changes(n)} ${n === 1 ? 'ist' : 'sind'} noch nicht synchronisiert und ${n === 1 ? 'wird' : 'werden'} automatisch gespeichert, sobald die Verbindung zurück ist. Lass diese Seite bis dahin geöffnet.`
@@ -152,11 +157,53 @@ export async function connectProgress(convex: ConvexClient, denied: () => void):
     noted = next;
     if (!same) progressListeners.forEach((fn) => fn(false));
   }, () => {});
+  // A page opened right away should already see adopted drafts; a slow server does not hold up the start for long.
+  await Promise.race([adoptOfflineDrafts(), new Promise((resolve) => setTimeout(resolve, 3000))]);
   return () => {
     active = false; ++draftToken; stopSnapshot(); stopNotes(); stopConnection(); stopDraft?.();
     clearTimeout(copyTimer); clearTimeout(queuedNote?.timer); queuedNote = undefined; openNote = undefined;
-    progress.clear(); snapshot = { entries: [], resets: [] }; noted = new Map();
+    progress.clear(); snapshot = { entries: [], resets: [] }; noted = new Map(); offered.clear();
   };
+}
+
+/**
+ * Hands drafts typed in offline reading mode to Convex after an authorized start. The server stores one only where no
+ * draft is saved; an identical one just clears the copy here, a different one stays saved and the offline one is offered.
+ */
+async function adoptOfflineDrafts(): Promise<void> {
+  const store = browserStorage();
+  await Promise.allSettled(readOfflineDrafts(store, validOfflineDraft).map(async (local) => {
+    const { areaId, exerciseId, fingerprint, json } = local;
+    // Saved for changed content, no exercise would show it; it stays on this device instead (see docs/CONVEX.md).
+    if (summaryOf(areaId)?.modules.flatMap((m) => m.exercises).find((e) => e.id === exerciseId)?.fingerprint !== fingerprint) return;
+    // The area was reset after the offline copy, which deleted its drafts on purpose: offer, never save on its own.
+    const generation = generationOf(snapshot, areaId);
+    const result = local.generation === generation ? await track(client.mutation(api.progress.adoptDraft, { areaId, generation, draft: { exerciseId, fingerprint, json } })) : 'different';
+    if (!active) return;
+    if (result === 'different') offered.set(offerKey(areaId, exerciseId, fingerprint), local);
+    else removeOfflineDraft(store, local);
+  }));
+  if (active) progressListeners.forEach((fn) => fn(false));
+}
+/** The offline draft offered for this exercise, if any (see adoptOfflineDrafts). */
+export function offlineDraftFor(areaId: string, exercise: Exercise): unknown {
+  const local = offered.get(offerKey(areaId, exercise.id, exercise.fingerprint));
+  return local && safeDraft(exercise, JSON.parse(local.json));
+}
+/** Saves the offered offline draft as this exercise's draft (or drops it) and then forgets the copy on this device. */
+export function settleOfflineDraft(areaId: string, exercise: Exercise, use: boolean): void {
+  const key = offerKey(areaId, exercise.id, exercise.fingerprint);
+  const local = offered.get(key);
+  if (!local) return;
+  const value = offlineDraftFor(areaId, exercise);
+  offered.delete(key);
+  const store = browserStorage();
+  if (!use || value === undefined) { removeOfflineDraft(store, local); return; }
+  // Loading is an explicit choice: text typed before the saved draft arrived must not replace it on leaving.
+  heldDraft = undefined; statusChanged();
+  progressOf(areaId).drafts[exercise.id] = value;
+  // The copy here goes only once the server has the text; otherwise the next start offers it again.
+  void sendDraft(areaId, generationOf(snapshot, areaId), { exerciseId: local.exerciseId, fingerprint: local.fingerprint, json: local.json }).then(() => removeOfflineDraft(store, local), () => {});
 }
 
 function track<T>(work: Promise<T>): Promise<T> {
@@ -221,6 +268,12 @@ export function closeDraft(): void {
 }
 export async function prepareDraft(areaId: string, exercise: Exercise): Promise<void> {
   closeDraft();
+  if (offlineSince !== null) {
+    // Reading mode: a text typed here before the last reload waits on this device.
+    const local = readOfflineDrafts(browserStorage(), validOfflineDraft).find((d) => d.areaId === areaId && d.exerciseId === exercise.id && d.fingerprint === exercise.fingerprint);
+    const value = local && safeDraft(exercise, JSON.parse(local.json));
+    if (value !== undefined) progressOf(areaId).drafts[exercise.id] = value;
+  }
   if (!active) return;
   const token = draftToken;
   draftArea = areaId;
@@ -252,17 +305,22 @@ export function saveAnswer(areaId: string, exercise: Exercise, value: unknown): 
   try { validateDraft(draft); }
   catch { warning = 'Dieser Entwurf ist zu groß oder ungültig. Maximal 60 KB pro Übung; bitte kopiere deinen Text, bevor du die Seite verlässt.'; statusChanged(); return; }
   progressOf(areaId).drafts[exercise.id] = structuredClone(value);
+  if (offlineSince !== null && !writeOfflineDraft(browserStorage(), { areaId, ...draft, generation: generationOf(snapshot, areaId), savedAt: Date.now() })) {
+    warning = 'Dieser Entwurf konnte auf diesem Gerät nicht gespeichert werden. Bitte kopiere deinen Text, bevor du die Seite verlässt.'; statusChanged();
+  }
   if (!active) return;
   const generation = generationOf(snapshot, areaId);
-  const send = () => void track(client.mutation(api.progress.saveDraft, { areaId, generation, draft }, {
-    optimisticUpdate(store) {
-      const current = store.getQuery(api.progress.snapshot, {});
-      if (current && generationOf(current, areaId) === generation) store.setQuery(api.progress.draft, { areaId, exerciseId: exercise.id }, { json: draft.json, fingerprint: draft.fingerprint });
-    },
-  })).catch(() => {});
+  const send = () => void sendDraft(areaId, generation, draft).catch(() => {});
   if (draftKnown) send();
   else { heldDraft = { json: draft.json, send }; statusChanged(); }
 }
+
+const sendDraft = (areaId: string, generation: number, draft: DraftInput) => track(client.mutation(api.progress.saveDraft, { areaId, generation, draft }, {
+  optimisticUpdate(store) {
+    const current = store.getQuery(api.progress.snapshot, {});
+    if (current && generationOf(current, areaId) === generation) store.setQuery(api.progress.draft, { areaId, exerciseId: draft.exerciseId }, { json: draft.json, fingerprint: draft.fingerprint });
+  },
+}));
 
 /** Shows the saved note of one lesson, first on arrival and later for changes made elsewhere. */
 export function watchNote(areaId: string, moduleId: string, show: (text: string) => void): () => void {
