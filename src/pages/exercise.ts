@@ -109,7 +109,10 @@ const exercisePage: Page<{ name: 'exercise'; area: string; module: string; index
     box.id = 'offline-draft'; box.className = 'draft-offer';
     box.innerHTML = '<button class="btn small" type="button">Offline geschriebener Entwurf verfügbar · Laden</button><button class="btn small ghost" type="button">Verwerfen</button>';
     const [load, drop] = box.querySelectorAll('button');
-    load.addEventListener('click', () => { settleOfflineDraft(summary.id, exercise, true); reload(); });
+    load.addEventListener('click', () => {
+      if (!confirm('Den offline geschriebenen Entwurf laden? Er ersetzt den gespeicherten Entwurf dieser Übung.')) return;
+      settleOfflineDraft(summary.id, exercise, true); reload();
+    });
     drop.addEventListener('click', () => {
       if (!confirm('Den offline geschriebenen Entwurf von diesem Gerät löschen? Der gespeicherte Entwurf bleibt.')) return;
       settleOfflineDraft(summary.id, exercise, false); box.remove();
