@@ -41,7 +41,8 @@ export function clearOfflineCopy(store: Storage | null): void {
 // Drafts typed in offline reading mode, one key per area, exercise and fingerprint. They wait on this device until the
 // next authorized start adopts them (see adoptOfflineDrafts in src/app.ts); signing out forgets them.
 export const OFFLINE_DRAFT_PREFIX = 'learn-offline:draft:v1:';
-export type OfflineDraft = { areaId: string; exerciseId: string; fingerprint: string; json: string; savedAt: number };
+/** `generation` is the area's reset generation in the offline copy the draft was typed on. */
+export type OfflineDraft = { areaId: string; exerciseId: string; fingerprint: string; json: string; generation: number; savedAt: number };
 const draftKey = (d: Pick<OfflineDraft, 'areaId' | 'exerciseId' | 'fingerprint'>) => `${OFFLINE_DRAFT_PREFIX}${d.areaId}:${d.exerciseId}:${d.fingerprint}`;
 
 export function writeOfflineDraft(store: Storage | null, draft: OfflineDraft): boolean {
@@ -58,17 +59,21 @@ export function readOfflineDrafts(store: Storage | null, validate: (draft: Offli
       if (!key?.startsWith(OFFLINE_DRAFT_PREFIX)) continue;
       try {
         const value = JSON.parse(store.getItem(key) ?? '') as OfflineDraft;
-        if (typeof value?.areaId !== 'string' || typeof value.exerciseId !== 'string' || typeof value.fingerprint !== 'string' || typeof value.json !== 'string' || !Number.isFinite(value.savedAt) || draftKey(value) !== key) continue;
+        if (typeof value?.areaId !== 'string' || typeof value.exerciseId !== 'string' || typeof value.fingerprint !== 'string' || typeof value.json !== 'string' || !Number.isSafeInteger(value.generation) || !Number.isFinite(value.savedAt) || draftKey(value) !== key) continue;
         validate(value);
-        drafts.push({ areaId: value.areaId, exerciseId: value.exerciseId, fingerprint: value.fingerprint, json: value.json, savedAt: value.savedAt });
+        drafts.push({ areaId: value.areaId, exerciseId: value.exerciseId, fingerprint: value.fingerprint, json: value.json, generation: value.generation, savedAt: value.savedAt });
       } catch { /* skip this one */ }
     }
   } catch { /* blocked storage holds nothing */ }
   return drafts;
 }
 
-export function removeOfflineDraft(store: Storage | null, draft: Pick<OfflineDraft, 'areaId' | 'exerciseId' | 'fingerprint'>): void {
-  try { store?.removeItem(draftKey(draft)); } catch { /* nothing to forget */ }
+/** Forgets this draft unless the key holds newer text meanwhile, for example from an offline tab still open. */
+export function removeOfflineDraft(store: Storage | null, draft: OfflineDraft): void {
+  try {
+    const current = JSON.parse(store?.getItem(draftKey(draft)) ?? 'null') as OfflineDraft | null;
+    if (current?.savedAt === draft.savedAt && current.json === draft.json) store?.removeItem(draftKey(draft));
+  } catch { /* nothing to forget */ }
 }
 
 export function clearOfflineDrafts(store: Storage | null): void {

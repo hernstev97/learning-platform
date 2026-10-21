@@ -48,7 +48,7 @@ describe('offline copy', () => {
 
 describe('offline drafts', () => {
   const validate = (d: OfflineDraft) => { assertId(d.areaId); validateDraft(d); };
-  const text: OfflineDraft = { areaId: 'narrative', exerciseId: 'figuren-motivation/eigene-figur', fingerprint: 'abc123', json: '{"code":"Im Bus geschrieben","checked":[]}', savedAt: 5 };
+  const text: OfflineDraft = { areaId: 'narrative', exerciseId: 'figuren-motivation/eigene-figur', fingerprint: 'abc123', json: '{"code":"Im Bus geschrieben","checked":[]}', generation: 0, savedAt: 5 };
   it('keeps one draft per area, exercise and fingerprint next to the offline copy and outside the legacy pattern', () => {
     const store = memoryStorage();
     writeOfflineCopy(store, { entries: [], resets: [] });
@@ -57,7 +57,10 @@ describe('offline drafts', () => {
     expect(writeOfflineDraft(store, { ...text, fingerprint: 'def456' })).toBe(true);
     expect(readOfflineDrafts(store, validate)).toEqual([{ ...text, json: '{"code":"weiter","checked":[]}', savedAt: 6 }, { ...text, fingerprint: 'def456' }]);
     expect([...store.data.keys()].filter((key) => /^learn:[a-z0-9-]+:v1$/.test(key))).toEqual([]);
+    // Only the text that was handed over is forgotten, never newer text typed meanwhile.
     removeOfflineDraft(store, text);
+    expect(readOfflineDrafts(store, validate)).toHaveLength(2);
+    removeOfflineDraft(store, { ...text, json: '{"code":"weiter","checked":[]}', savedAt: 6 });
     expect(readOfflineDrafts(store, validate).map((d) => d.fingerprint)).toEqual(['def456']);
     clearOfflineDrafts(store);
     expect(readOfflineDrafts(store, validate)).toEqual([]);
@@ -68,6 +71,7 @@ describe('offline drafts', () => {
     store.setItem(`${OFFLINE_DRAFT_PREFIX}bad`, '{bad');
     writeOfflineDraft(store, { ...text, json: '"' + 'x'.repeat(60_000) + '"' });
     writeOfflineDraft(store, { ...text, areaId: 'Bad Area' });
+    writeOfflineDraft(store, { ...text, exerciseId: 'figuren-motivation/ohne-generation', generation: 1.5 });
     store.setItem(`${OFFLINE_DRAFT_PREFIX}narrative:other/id:abc123`, JSON.stringify(text));
     expect(readOfflineDrafts(store, validate)).toEqual([]);
     const blocked = { get length(): number { throw new Error('blocked'); }, key: () => null, getItem: () => { throw new Error('blocked'); }, setItem: () => { throw new Error('quota'); }, removeItem: () => { throw new Error('blocked'); } } as unknown as Storage;

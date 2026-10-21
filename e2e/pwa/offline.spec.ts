@@ -36,7 +36,7 @@ test('a browser that was signed in before reads lessons offline with its last sy
   await context.setOffline(true);
   await page.goto(`/python/${first.id}`);
   await expect(page.locator('#sync-notice')).toContainText('Offline-Modus');
-  await expect(page.locator('#sync-notice')).toContainText('Häkchen, gelöste Übungen und Karten werden hier nicht gespeichert');
+  await expect(page.locator('#sync-notice')).toContainText('Häkchen, gelöste Übungen und Karten gelten nur bis zum Neuladen');
   await expect(page.locator('#storage-status')).toContainText('Offline · Lernstand vom');
   await expect(page.locator('#sign-out')).toBeHidden();
   await expect(page.locator('h1')).toContainText(first.title);
@@ -69,7 +69,7 @@ test('texts typed in offline reading mode survive a reload and wait on the devic
   await page.evaluate((value) => localStorage.setItem('learn-offline:snapshot:v1', JSON.stringify(value)), copy);
   await context.setOffline(true);
   await page.goto(`/narrative/${module.id}/${index + 1}`);
-  await expect(page.locator('#sync-notice')).toContainText('Deine Eingaben in Übungen bleiben auf diesem Gerät');
+  await expect(page.locator('#sync-notice')).toContainText('Eingaben in Übungen bleiben auf diesem Gerät, bis du mit Netz startest');
   await page.locator('#editor').fill(text);
   await page.reload();
   await expect(page.locator('#sync-notice')).toContainText('Offline-Modus');
