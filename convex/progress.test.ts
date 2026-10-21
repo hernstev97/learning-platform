@@ -24,6 +24,7 @@ const endpoints = [
   ['exportDrafts', (t: Client) => t.query(api.progress.exportDrafts, { paginationOpts: { numItems: 10, cursor: null } })],
   ['set', (t: Client) => t.mutation(api.progress.set, { areaId, generation: 0, changes: [lesson] })],
   ['saveDraft', (t: Client) => t.mutation(api.progress.saveDraft, { areaId, generation: 0, draft })],
+  ['adoptDraft', (t: Client) => t.mutation(api.progress.adoptDraft, { areaId, generation: 0, draft })],
   ['reviewCard', (t: Client) => t.mutation(api.progress.reviewCard, { areaId, generation: 0, cardId: 'first', grade: 'good', today: '2026-09-28' })],
   ['recordDrill', (t: Client) => t.mutation(api.progress.recordDrill, { areaId, generation: 0, exerciseId: 'intro/first', event: 'fail', review: false, today: '2026-09-28' })],
   ['importLegacy', (t: Client) => t.mutation(api.progress.importLegacy, imported)],
@@ -84,6 +85,18 @@ describe('personal state', () => {
     expect(await t.query(api.progress.draft, { areaId, exerciseId: draft.exerciseId })).toEqual({ json: '"b"', fingerprint: draft.fingerprint });
     expect((await t.query(api.progress.snapshot, {})).entries[0].value).toEqual(completion);
     expect((await t.query(api.progress.exportDrafts, { paginationOpts: { cursor: null, numItems: 16 } })).page).toHaveLength(1);
+  });
+  it('adopts an offline draft only where none is saved and never replaces a different one', async () => {
+    const t = create().withIdentity(identity);
+    expect(await t.mutation(api.progress.adoptDraft, { areaId, generation: 0, draft })).toBe('saved');
+    expect(await t.mutation(api.progress.adoptDraft, { areaId, generation: 0, draft })).toBe('same');
+    expect(await t.mutation(api.progress.adoptDraft, { areaId, generation: 0, draft: { ...draft, json: '"offline"' } })).toBe('different');
+    expect(await t.mutation(api.progress.adoptDraft, { areaId, generation: 0, draft: { ...draft, fingerprint: 'def456' } })).toBe('different');
+    expect(await t.query(api.progress.draft, { areaId, exerciseId: draft.exerciseId })).toEqual({ json: draft.json, fingerprint: draft.fingerprint });
+    expect((await t.query(api.progress.exportDrafts, { paginationOpts: { cursor: null, numItems: 16 } })).page).toHaveLength(1);
+    await expect(t.mutation(api.progress.adoptDraft, { areaId, generation: 0, draft: { ...draft, json: '{bad' } })).rejects.toThrow();
+    await t.mutation(api.progress.resetArea, { areaId, generation: 0 });
+    await expect(t.mutation(api.progress.adoptDraft, { areaId, generation: 0, draft })).rejects.toThrow('PROGRESS_WAS_RESET');
   });
   it('grades reviews from the latest stored state, rather than a stale client counter', async () => {
     const t = create();

@@ -177,6 +177,31 @@ test('a draft typed offline does not silently replace a different draft saved on
   await phone.close();
 });
 
+test('drafts kept in offline reading mode are adopted on the next start without replacing a different saved draft', async ({ page }) => {
+  const [first, other] = loadContent(['kotlin']).areas.kotlin.modules['bear-01'].exercises;
+  const gap = (text: string) => JSON.stringify({ g1: text });
+  const generation = (await http.query(api.progress.snapshot, {})).resets.find((r) => r.areaId === 'kotlin')?.generation ?? 0;
+  await http.mutation(api.progress.saveDraft, { areaId: 'kotlin', generation, draft: { exerciseId: other.id, fingerprint: other.fingerprint, json: gap('"Bo') } });
+  const key = (e: typeof first) => `learn-offline:draft:v1:kotlin:${e.id}:${e.fingerprint}`;
+  const local = (e: typeof first, text: string) => [key(e), JSON.stringify({ areaId: 'kotlin', exerciseId: e.id, fingerprint: e.fingerprint, json: gap(text), savedAt: 1 })];
+  const stored = () => page.evaluate(() => Object.keys(localStorage).filter((k) => k.startsWith('learn-offline:draft:')).sort());
+  await page.goto('/'); await synced(page);
+  await page.evaluate((items) => items.forEach(([k, v]) => localStorage.setItem(k, v)), [local(first, 'val'), local(other, '"Be')]);
+  // The next authorized start hands both to Convex: the missing one is saved, the different one is only offered.
+  await page.goto(`${base}/1`); await synced(page);
+  expect(await http.query(api.progress.draft, { areaId: 'kotlin', exerciseId: first.id })).toMatchObject({ json: gap('val') });
+  expect(await stored()).toEqual([key(other)]);
+  await page.reload(); await expect(page.locator('#answer-g1')).toHaveValue('val');
+  await expect(page.locator('#offline-draft')).toHaveCount(0);
+  await page.goto(`${base}/2`); await expect(page.locator('#answer-g1')).toHaveValue('"Bo');
+  expect(await http.query(api.progress.draft, { areaId: 'kotlin', exerciseId: other.id })).toMatchObject({ json: gap('"Bo') });
+  await page.getByRole('button', { name: 'Offline geschriebener Entwurf verfügbar · Laden' }).click();
+  await expect(page.locator('#answer-g1')).toHaveValue('"Be'); await synced(page);
+  await expect(page.locator('#offline-draft')).toHaveCount(0);
+  expect(await http.query(api.progress.draft, { areaId: 'kotlin', exerciseId: other.id })).toMatchObject({ json: gap('"Be') });
+  expect(await stored()).toEqual([]);
+});
+
 test('lesson notes autosave while typing, reach another device and survive a reset', async ({ page, browser }) => {
   const phone = await browser.newContext({ viewport: { width: 390, height: 844 } }); await fixture(phone); const other = await phone.newPage();
   await page.goto(base); await other.goto(base);

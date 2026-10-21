@@ -3,7 +3,7 @@ import './styles/layout.css';
 import './styles/content.css';
 import './styles/exercise.css';
 import './styles/pages.css';
-import { browserStorage, clearOfflineCopy, hasOfflineCopy, waitForToken } from './engine/offline.ts';
+import { browserStorage, clearOfflineCopy, clearOfflineDrafts, hasOfflineCopy, readOfflineDrafts, waitForToken } from './engine/offline.ts';
 import { html } from './ui/dom.ts';
 
 // Caches the public app shell and learning content for offline use; personal progress never passes through it.
@@ -113,7 +113,11 @@ async function connect(url: string, key: string): Promise<void> {
       alert('Änderungen werden noch gespeichert. Bitte warte vor dem Abmelden auf „Lernstand synchronisiert“.');
       return;
     }
+    // Offline drafts still here differ from the saved ones (offered on their exercise) or could not be handed over.
+    const left = readOfflineDrafts(browserStorage(), () => {}).length;
+    if (left && !confirm(`${left === 1 ? 'Ein offline geschriebener Entwurf ist' : `${left} offline geschriebene Entwürfe sind`} noch nicht übernommen. Abmelden löscht ${left === 1 ? 'ihn' : 'sie'} von diesem Gerät. Trotzdem abmelden?`)) return;
     clearOfflineCopy(browserStorage());
+    clearOfflineDrafts(browserStorage());
     await clerk.signOut({ redirectUrl: location.origin });
   });
 }
