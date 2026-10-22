@@ -1,0 +1,721 @@
+id: performance-messen
+title: "Performance messen: Inspector, Profiler, Benchmarks, Baseline Profiles"
+level: 3
+minutes: 210
+place: pc
+summary: Mit Layout Inspector, Profiler, System-Trace, Macrobenchmark und Baseline Profiles messen statt vermuten – und Debugger, Logcat, StrictMode und LeakCanary so einrichten, dass sie Fehler früh zeigen.
+goals:
+  - Du misst an einem profilierbaren Release-Build auf einem echten Gerät und begründest, warum Debug-Builds falsche Zahlen liefern.
+  - Du zählst mit dem Layout Inspector Recompositions und Skips und nimmst beim Scrollen einen System-Trace auf.
+  - Du schreibst Macrobenchmarks für Kaltstart und Scrollen und liest Median und Perzentile im Ergebnis.
+  - Du erzeugst ein Baseline Profile mit dem Gradle-Plugin und belegst seine Wirkung mit `CompilationMode.None()` gegen `Partial(BaselineProfileMode.Require)`.
+  - Du setzt bedingte Breakpoints, filterst Logcat mit Abfragen und richtest StrictMode und LeakCanary nur für Debug-Builds ein.
+resources:
+  - title: Profile your app performance
+    url: https://developer.android.com/studio/profile
+  - title: Write a Macrobenchmark
+    url: https://developer.android.com/topic/performance/benchmarking/macrobenchmark-overview
+  - title: Create Baseline Profiles
+    url: https://developer.android.com/topic/performance/baselineprofiles/create-baselineprofile
+  - title: Benchmark Baseline Profiles with Macrobenchmark
+    url: https://developer.android.com/topic/performance/baselineprofiles/measure-baselineprofile
+  - title: Debug your app
+    url: https://developer.android.com/studio/debug
+lesson: |
+  Im Modul „Spuren lesen“ hast du Traces, Reports und Stacktraces gelesen, die schon da waren. Hier nimmst du sie selbst auf, am PC, mit Android Studio und einem Gerät per USB. Das Ziel ist eine Gewohnheit: Vor jeder Optimierung steht eine Messung, nach jeder Optimierung die zweite. Alles dazwischen ist Raten.
+
+  Du brauchst ein Android-Gerät mit API 33 oder neuer, auf dem die Entwickleroptionen aktiv sind. Ein Emulator reicht für den Layout Inspector und den Debugger. Für Zeiten verzerrt er zu stark, weil er auf deinem PC mit dessen CPU und Grafik läuft.
+
+  ## Messen wie die Nutzer: Release-Build und echtes Gerät
+
+  Ein Debug-Build ist für Zeitmessungen ungeeignet. R8 ist aus, der Code ist nicht optimiert, und die Laufzeit hält Informationen für den Debugger bereit, die Zeit kosten. Ein Ruckeln im Debug-Build kann im Release verschwinden, und ein echtes Problem im Release kann im Debug-Build in anderem Rauschen untergehen.
+
+  Android Studio bietet deshalb zwei Arten, ein Profil aufzunehmen ([Profileable vs debuggable](https://developer.android.com/studio/profile#profileable-v-debuggable)). **Profileable** ist ein Release-Build, der dem Profiler Zugriff erlaubt, fast ohne Mehrkosten. Damit misst du CPU, Startzeit und Frames. **Debuggable** ist der Debug-Build; ihn brauchst du für Heap Dumps, die Aufzeichnung von Java/Kotlin-Allokationen und den Layout Inspector. Für einen profilierbaren Release-Build steht im Manifest:
+
+  ```xml
+  <application>
+      <profileable android:shell="true" />
+  </application>
+  ```
+
+  Messe auf einem Gerät, das deine Nutzer haben könnten, nicht nur auf dem neuesten Pixel. Schließe andere Apps, lade das Gerät nicht gleichzeitig, und miss mehrmals. Eine einzelne Zahl ist eine Anekdote, zehn Läufe mit Median sind eine Messung.
+
+  ## Layout Inspector: Wie oft komponiert jede Composable?
+
+  Der [Layout Inspector](https://developer.android.com/develop/ui/compose/tooling/debug#recomposition-counts) zeigt den Baum der laufenden App. Unter **View Options → Show Recomposition Counts** bekommt der Komponentenbaum zwei Spalten: wie oft eine Composable komponiert wurde und wie oft Compose sie übersprungen hat. Das funktioniert ab API 29 mit einem Debug-Build.
+
+  Das Vorgehen ist immer gleich: Zähler mit **Reset** auf null setzen, genau eine Interaktion ausführen, etwa einmal durch die Liste scrollen, dann die Zahlen lesen. Vergleiche mit deiner Erwartung. Scrollst du über zwölf neue Zeilen, sind zwölf Compositions für Zeilen normal. Komponiert dabei aber ein Kopfbereich, der sich nicht ändert, vierzigmal, liest er einen Scrollwert in der Composition.
+
+  Hier sind Zahlen wichtiger als Zeiten. Deshalb darfst du den Layout Inspector mit dem Debug-Build benutzen, obwohl dieser langsamer ist: Er komponiert gleich oft.
+
+  ## Profiler und System-Trace
+
+  Der [Profiler](https://developer.android.com/studio/profile) arbeitet in Aufgaben. Die wichtigsten:
+
+  | Aufgabe | Wofür |
+  | --- | --- |
+  | System-Trace | Frames, Threads und Slices beim Ruckeln |
+  | Find CPU Hotspots (Callstack Sample) | Welche Methoden stehen am häufigsten auf dem Stack? |
+  | Track Memory Consumption (Java/Kotlin Allocations) | Wer erzeugt beim Scrollen Objekte? |
+  | Analyze Memory Usage (Heap Dump) | Was liegt gerade im Speicher, und wer hält es fest? |
+
+  Für Ruckeln nimmst du einen System-Trace auf: Aufgabe starten, die Interaktion ausführen, stoppen. Android Studio zeigt unter **Display** die Spur „Janky frames“ ([Jank detection](https://developer.android.com/studio/profile/jank-detection)). Ein Klick auf einen roten Frame zeigt die Slices von Main-Thread und RenderThread in diesem Zeitraum. Wer mehr Abfragen braucht, öffnet dieselbe Datei in der Weboberfläche von [Perfetto](https://ui.perfetto.dev/).
+
+  Ohne Zusatz siehst du unter `Compose:recompose` nur graue Blöcke. Mit Composition Tracing bekommt jede Composable einen eigenen Slice mit Namen und Zeile ([Composition tracing](https://developer.android.com/develop/ui/compose/tooling/tracing)):
+
+  ```kotlin
+  dependencies {
+      implementation(platform(libs.androidx.compose.bom))
+      implementation("androidx.compose.runtime:runtime-tracing")
+  }
+  ```
+
+  Für deinen eigenen Code legst du Abschnitte mit `trace("Name") { … }` aus `androidx.tracing` an, wie im vorigen Modul gezeigt. Beides kostet im Release fast nichts, solange niemand einen Trace aufnimmt.
+
+  ## Macrobenchmark: Startzeit und Frames reproduzierbar messen
+
+  Ein Trace beantwortet „warum war dieser Frame langsam?“. Ein [Macrobenchmark](https://developer.android.com/topic/performance/benchmarking/macrobenchmark-overview) beantwortet „wie schnell ist der Kaltstart im Median, und wird er mit meiner Änderung besser?“. Er startet die echte App in einem eigenen Prozess, steuert sie über UiAutomator, wiederholt das zehnmal und wertet die Traces aus.
+
+  Benchmarks liegen in einem eigenen Modul mit dem Plugin `com.android.test`. Android Studio legt es über **New Module → Baseline Profile Generator** an; das Modul enthält dann Benchmarks und den Generator für Baseline Profiles.
+
+  ```kotlin
+  @RunWith(AndroidJUnit4::class)
+  class StartupBenchmark {
+      @get:Rule
+      val rule = MacrobenchmarkRule()
+
+      @Test
+      fun startupWithoutProfile() = startup(CompilationMode.None())
+
+      @Test
+      fun startupWithProfile() = startup(
+          CompilationMode.Partial(BaselineProfileMode.Require),
+      )
+
+      private fun startup(mode: CompilationMode) = rule.measureRepeated(
+          packageName = "app.bear",
+          metrics = listOf(StartupTimingMetric()),
+          compilationMode = mode,
+          iterations = 10,
+          startupMode = StartupMode.COLD,
+          setupBlock = { pressHome() },
+      ) {
+          startActivityAndWait()
+      }
+  }
+  ```
+
+  `setupBlock` läuft vor jeder Iteration, wird aber nicht gemessen. Der Block am Ende ist die Messung. `StartupMode.COLD` beendet vor jedem Lauf den Prozess, `WARM` erzeugt nur die Activity neu, `HOT` holt sie nach vorn. `CompilationMode` bestimmt, wie viel ART vorab kompiliert hat: `None()` wie bei einer frischen Installation ohne Profil, `Partial(BaselineProfileMode.Require)` mit deinem Baseline Profile, `Full()` alles. Neuere Beispiele der Doku starten die App mit `uiAutomator { startApp(packageName) }` aus UiAutomator 2.4; `startActivityAndWait()` funktioniert weiter.
+
+  Für Frames misst `FrameTimingMetric` beim Scrollen. Compose-Knoten findet UiAutomator nur, wenn die App ihre Test-Tags als Resource-IDs veröffentlicht:
+
+  ```kotlin
+  LazyColumn(
+      Modifier
+          .semantics { testTagsAsResourceId = true }
+          .testTag("thoughts"),
+  ) { /* … */ }
+  ```
+
+  ```kotlin
+  @Test
+  fun scrollThoughts() = rule.measureRepeated(
+      packageName = "app.bear",
+      metrics = listOf(FrameTimingMetric()),
+      iterations = 5,
+      startupMode = StartupMode.WARM,
+      setupBlock = { pressHome() },
+  ) {
+      startActivityAndWait()
+      val list = device.findObject(By.res("thoughts"))
+      list.setGestureMargin(device.displayWidth / 5)
+      list.fling(Direction.DOWN)
+      device.waitForIdle()
+  }
+  ```
+
+  Gestartet wird mit `./gradlew :baselineprofile:connectedBenchmarkReleaseAndroidTest` oder über den grünen Pfeil neben dem Test. Das Plugin baut dafür eine eigene Variante `benchmarkRelease`, die wie der Release optimiert, aber mit Debug-Schlüssel signiert ist. Das Ergebnis steht im Testbericht und als JSON unter `build/outputs/`:
+
+  ```text
+  StartupBenchmark_startupWithoutProfile
+  timeToInitialDisplayMs   min 588.1,   median 612.4,   max 671.0
+  StartupBenchmark_startupWithProfile
+  timeToInitialDisplayMs   min 419.7,   median 431.0,   max 468.2
+  ```
+
+  Vergleiche Mediane, nicht einzelne Läufe. Bei Frames meldet `FrameTimingMetric` `frameDurationCpuMs` und `frameOverrunMs` als P50, P90, P95 und P99 ([Metriken](https://developer.android.com/topic/performance/benchmarking/macrobenchmark-metrics#frame-timing)). `frameOverrunMs` ist die Zeit, um die ein Frame seine Frist verpasst hat; negative Werte heißen „rechtzeitig“. Ruckeln spürt man in P95 und P99, nicht im Median. Jeder Lauf legt außerdem einen Trace ab, den du in Android Studio öffnen kannst.
+
+  > [!WARNING] Nicht im Emulator messen
+  > Ein Emulator teilt sich CPU und Grafik mit Android Studio, dem Browser und Gradle. Seine Zeiten schwanken stärker als jede Änderung, die du messen willst. Für Benchmarks gehört ein echtes Gerät an den USB-Port.
+
+  ## Baseline Profiles erzeugen und ihre Wirkung belegen
+
+  Nach der Installation führt Android Code zunächst interpretiert oder per JIT aus. Ein [Baseline Profile](https://developer.android.com/topic/performance/baselineprofiles/overview) nennt die Klassen und Methoden, die beim Start und in wichtigen Abläufen laufen; das System kompiliert sie bei der Installation vorab. Die Doku nennt rund 30 % schnellere Ausführung ab dem ersten Start. Ein **Startup Profile** ist die Teilmenge für den Start; R8 legt diesen Code damit in die erste DEX-Datei ([DEX layout optimizations](https://developer.android.com/topic/performance/startupprofiles/dex-layout-optimizations)).
+
+  Das Profil erzeugt ein Test, der die wichtigen Abläufe durchspielt, während das System mitschreibt, welcher Code läuft:
+
+  ```kotlin
+  @RunWith(AndroidJUnit4::class)
+  class BaselineProfileGenerator {
+      @get:Rule
+      val rule = BaselineProfileRule()
+
+      @Test
+      fun generate() = rule.collect(
+          packageName = "app.bear",
+          includeInStartupProfile = true,
+      ) {
+          pressHome()
+          startActivityAndWait()
+          val list = device.findObject(By.res("thoughts"))
+          list.fling(Direction.DOWN)
+          device.waitForIdle()
+      }
+  }
+  ```
+
+  Das Gradle-Plugin `androidx.baselineprofile` verbindet App und Generator:
+
+  ```kotlin title=app/build.gradle.kts
+  plugins {
+      alias(libs.plugins.android.application)
+      alias(libs.plugins.baselineprofile)
+  }
+
+  dependencies {
+      implementation(libs.androidx.profileinstaller)
+      baselineProfile(project(":baselineprofile"))
+  }
+  ```
+
+  ```console
+  $ ./gradlew :app:generateBaselineProfile
+  ```
+
+  Der Task baut die App, führt den Generator auf dem Gerät aus und kopiert das Ergebnis nach `app/src/release/generated/baselineProfiles/` ([Generate the profile](https://developer.android.com/topic/performance/baselineprofiles/create-baselineprofile#generate-profile)). Das Gerät muss API 33 oder neuer haben oder gerootet sein; alternativ läuft der Generator auf einem Gradle Managed Device. Die Dateien `baseline-prof.txt` und `startup-prof.txt` checkst du ein. Ihre Zeilen sehen so aus:
+
+  ```text
+  HSPLbear/ui/ThoughtsScreenKt;->ThoughtsScreen(Lbear/ui/ThoughtsState;Landroidx/compose/runtime/Composer;I)V
+  Lbear/ui/ThoughtsState$Loaded;
+  ```
+
+  `H`, `S` und `P` markieren eine Methode als heiß, beim Start und nach dem Start genutzt; eine Zeile, die nur mit `L` beginnt, ist eine Klasse ([Rule syntax](https://developer.android.com/topic/performance/baselineprofiles/manually-create-measure)). `profileinstaller` sorgt dafür, dass das Profil auch bei Installationen außerhalb von Google Play und auf älteren Versionen ankommt.
+
+  Ob das Profil wirkt, zeigt der Benchmark von oben: `startupWithoutProfile` gegen `startupWithProfile`. Im Beispiel sinkt der Median von 612 auf 431 ms. Diese beiden Zahlen gehören in den Pull Request, nicht „fühlt sich schneller an“.
+
+  ## Debugger und Logcat in Android Studio
+
+  Der [Debugger](https://developer.android.com/studio/debug) hält die App an einer Zeile an und zeigt Variablen, Aufrufstapel und Threads. Drei Funktionen sparen die meiste Zeit:
+
+  - **Bedingte Breakpoints:** Rechtsklick auf den Breakpoint, Bedingung `thought.id == "7"`. Die App hält nur beim interessanten Fall an, nicht bei jedem der 200 Einträge.
+  - **Logpoints:** Im selben Dialog „Suspend“ abschalten und „Evaluate and log“ setzen. Der Debugger schreibt einen Ausdruck ins Log, ohne anzuhalten und ohne dass du Code änderst.
+  - **Ausnahme-Breakpoints:** Unter **Run → View Breakpoints** eine Klasse wie `DateTimeParseException` eintragen. Der Debugger hält dort, wo sie geworfen wird, statt erst beim Absturz.
+
+  Mit **Attach Debugger to Android Process** hängst du dich an eine laufende App, ohne sie neu zu starten. So bleibt ein Zustand erhalten, den du mühsam herbeigeführt hast. „Evaluate Expression“ (Alt+F8) rechnet im angehaltenen Zustand beliebige Ausdrücke aus.
+
+  [Logcat](https://developer.android.com/studio/debug/logcat#key-value-search) filterst du mit Abfragen aus Schlüssel und Wert:
+
+  | Abfrage | Bedeutung |
+  | --- | --- |
+  | `package:mine` | nur Prozesse deiner App |
+  | `level:warn` | Warnungen und schwerer |
+  | `tag:OkHttp` | Tag enthält „OkHttp“ |
+  | `-tag:chatty` | ohne Tag „chatty“ |
+  | `message~:"retry \d/3"` | Nachricht passt zum regulären Ausdruck |
+  | `is:crash` | nur Abstürze |
+  | `age:5m` | nur die letzten fünf Minuten |
+
+  Bedingungen mit verschiedenen Schlüsseln verbindet Logcat mit „und“: `package:mine level:error -tag:OkHttp`. Mehrere Bedingungen mit demselben Schlüssel ohne Minus, etwa `tag:Sync tag:OkHttp`, verbindet es mit „oder“ ([Implicit operators](https://developer.android.com/studio/debug/logcat#logical-operators)). Ohne Android Studio geht es über `adb`:
+
+  ```console
+  $ adb logcat -s StrictMode
+  $ adb shell am start -W -S app.bear/.MainActivity
+  Starting: Intent { cmp=app.bear/.MainActivity }
+  Status: ok
+  LaunchState: COLD
+  Activity: app.bear/.MainActivity
+  TotalTime: 612
+  WaitTime: 618
+  Complete
+  ```
+
+  `-S` beendet die App vor dem Start, also ein Kaltstart; `-W` wartet, bis der erste Frame da ist, und gibt `TotalTime` in Millisekunden aus. Für einen schnellen Vergleich reicht das, für belastbare Zahlen nimm den Macrobenchmark.
+
+  ## StrictMode und LeakCanary nur im Debug-Build
+
+  [StrictMode](https://developer.android.com/reference/android/os/StrictMode) richtest du in `Application.onCreate` ein, und nur, wenn die App debugbar ist:
+
+  ```kotlin
+  class BearApp : Application() {
+      override fun onCreate() {
+          super.onCreate()
+          val debuggable =
+              applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
+          if (debuggable) {
+              StrictMode.setThreadPolicy(
+                  StrictMode.ThreadPolicy.Builder()
+                      .detectDiskReads()
+                      .detectDiskWrites()
+                      .detectNetwork()
+                      .penaltyLog()
+                      .build(),
+              )
+              StrictMode.setVmPolicy(
+                  StrictMode.VmPolicy.Builder()
+                      .detectLeakedClosableObjects()
+                      .detectActivityLeaks()
+                      .penaltyLog()
+                      .build(),
+              )
+          }
+      }
+  }
+  ```
+
+  `penaltyLog()` schreibt die Meldungen ins Log, die du im vorigen Modul gelesen hast. `penaltyDeath()` beendet die App beim ersten Verstoß; manche Teams schalten das im Debug-Build ein, damit niemand die Meldung übersieht. `BuildConfig.DEBUG` ginge auch, aber seit AGP 8 entsteht `BuildConfig` nur noch mit `buildFeatures { buildConfig = true }`.
+
+  [LeakCanary](https://square.github.io/leakcanary/getting_started/) braucht nur eine Zeile, und zwar als `debugImplementation`:
+
+  ```kotlin
+  dependencies {
+      debugImplementation(libs.leakcanary)
+  }
+  ```
+
+  Es beobachtet zerstörte Activities, Fragments, Views und ViewModels. Hält nach dem Zerstören noch jemand eine Referenz, erstellt es einen Heap Dump, analysiert ihn auf dem Gerät und zeigt eine Benachrichtigung mit der Spur. Im Release darf es nie landen: Ein Heap Dump friert die App für Sekunden ein und schreibt den Speicherinhalt auf die Platte.
+
+  > [!PRAXIS]
+  > Ein Performance-Pull-Request in einem guten Team enthält drei Dinge: den Benchmark oder Trace vorher, dieselbe Messung nachher, beide auf demselben Gerät, und die Änderung dazwischen. „Liste ruckelt nicht mehr“ ohne Zahlen bekommt im Review die Frage „gemessen wie?“.
+
+  > [!INTERVIEW]
+  > „Wie würdest du die Startzeit einer App verbessern?“ – Erst messen: ein Macrobenchmark mit `StartupTimingMetric` im Kaltstart, auf einem echten Gerät. Dann im Trace eines Laufs nachsehen, was vor dem ersten Frame passiert, etwa Initialisierung in `Application.onCreate`. Danach ein Baseline Profile mit Startup Profile erzeugen und mit `CompilationMode.None()` gegen `Partial(BaselineProfileMode.Require)` belegen, was es bringt. Im Release prüfe ich die Startzeiten in Android vitals.
+
+  ## Häufige Fehler
+
+  - **Debug-Build oder Emulator messen:** Die Zahlen sagen nichts über den Release.
+  - **Einen einzelnen Lauf vergleichen:** Rauschen ist größer als viele Verbesserungen. Median aus zehn Läufen.
+  - **Falscher `StartupMode`:** Ein `HOT`-Start misst nicht, was Nutzer beim ersten Öffnen erleben.
+  - **Baseline Profile erzeugt, aber nie gemessen:** Ohne Vergleich weißt du nicht, ob es greift.
+  - **Test-Tags nicht als Resource-IDs:** UiAutomator findet die Liste nicht, der Benchmark scheitert.
+  - **LeakCanary oder StrictMode im Release:** Heap Dumps und Logs bei Nutzern. Nur `debugImplementation` und nur bei debugbarer App.
+
+  ## Zusammenfassung
+
+  - Zeiten misst du an einem profilierbaren Release-Build auf einem echten Gerät, Zählungen und Heap Dumps am Debug-Build.
+  - Der Layout Inspector zählt Recompositions und Skips. Reset, eine Interaktion, lesen.
+  - Der System-Trace zeigt Janky frames; Composition Tracing und `trace()` geben den Slices Namen.
+  - Macrobenchmarks wiederholen Kaltstart und Scrollen und melden Median und Perzentile.
+  - `BaselineProfileRule` erzeugt das Profil, `:app:generateBaselineProfile` legt es ins Projekt, der Benchmark mit `None()` gegen `Partial(Require)` belegt die Wirkung.
+  - Bedingte Breakpoints, Logpoints und Logcat-Abfragen sparen Zeit beim Debuggen.
+  - StrictMode und LeakCanary laufen nur in debugbaren Builds.
+exercises:
+  - id: release-messen
+    type: choice
+    title: Welcher Build für welche Messung?
+    prompt: |
+      Du willst wissen, ob dein Umbau den Kaltstart verkürzt. Welche Aufnahme liefert eine belastbare Zahl?
+    options:
+      - text: Macrobenchmark mit `StartupMode.COLD` gegen die Variante `benchmarkRelease` auf einem echten Gerät, zehn Iterationen
+        correct: true
+        why: Der Build ist wie der Release optimiert, das Gerät ist real, und der Median aus zehn Läufen glättet Rauschen.
+      - text: Debug-Build im Emulator, Zeit aus dem Logcat-Eintrag „Displayed …“
+        correct: false
+        why: Debug-Code ist nicht optimiert, und der Emulator teilt sich die CPU mit deinem PC. Die Zahl sagt wenig über Nutzer.
+      - text: Release-Build auf dem Gerät, einmal gestartet und mit der Stoppuhr gemessen
+        correct: false
+        why: Ein einzelner Lauf schwankt stärker als viele Verbesserungen, und die Stoppuhr misst deine Reaktionszeit mit.
+      - text: Heap Dump im Debug-Build vor und nach dem Umbau
+        correct: false
+        why: Ein Heap Dump zeigt Speicher, keine Zeit.
+    explanation: |
+      Belastbar ist eine Messung, die den Release-Code auf einem echten Gerät mehrmals ausführt und einen Median liefert. Genau das macht ein Macrobenchmark. Die Variante `benchmarkRelease` legt das Baseline-Profile-Plugin an: optimiert wie der Release, aber mit Debug-Schlüssel signiert, damit der Test sie installieren kann.
+    resources:
+      - title: Profileable vs debuggable
+        url: https://developer.android.com/studio/profile#profileable-v-debuggable
+
+  - id: profil-ablauf
+    type: order
+    title: Vom fehlenden zum belegten Baseline Profile
+    prompt: |
+      Bring die Schritte in die Reihenfolge, in der du ein Baseline Profile einführst.
+    lang: text
+    lines: |
+      Benchmark-Modul mit Plugin androidx.baselineprofile anlegen
+      Generator mit BaselineProfileRule für Start und Scrollen schreiben
+      ./gradlew :app:generateBaselineProfile auf einem Gerät mit API 33+ ausführen
+      baseline-prof.txt und startup-prof.txt einchecken
+      Benchmark mit None() gegen Partial(Require) laufen lassen
+      Mediane in den Pull Request schreiben
+    explanation: |
+      Ohne Modul und Plugin gibt es keinen Task, ohne Generator nichts zu erzeugen. Die erzeugten Dateien gehören ins Repository, denn der Release-Build packt sie aus `src/release/generated/baselineProfiles/` in die App. Erst der Vergleich der beiden `CompilationMode`s zeigt, ob das Profil den Start wirklich verkürzt.
+    resources:
+      - title: Create Baseline Profiles
+        url: https://developer.android.com/topic/performance/baselineprofiles/create-baselineprofile
+
+  - id: logcat-abfrage
+    type: output
+    title: Was zeigt die Abfrage?
+    prompt: |
+      Deine App hat das Paket `app.bear`. In Logcat steht die Abfrage `package:mine level:warn -tag:OkHttp`. Welche Zeilen bleiben stehen? Gib je Zeile nur ihr Tag an, in derselben Reihenfolge.
+    lang: text
+    code: |
+      D app.bear     ThoughtsVm   load 12 thoughts
+      W app.bear     OkHttp       retry 1/3 after timeout
+      W app.bear     SyncWorker   sync deferred: no network
+      E com.android  Telecom      dial failed
+      E app.bear     Dates        parse failed: 2026-10-22
+      I app.bear     ThoughtsVm   loaded in 84 ms
+    expected: |
+      SyncWorker
+      Dates
+    explanation: |
+      `package:mine` lässt nur Zeilen deiner App übrig, damit fällt `com.android` weg. `level:warn` zeigt Warnungen und alles Schwerere, also `W` und `E`, nicht `D` und `I`. `-tag:OkHttp` schließt die Zeile mit diesem Tag aus. Die drei Bedingungen gelten zusammen.
+    resources:
+      - title: Logcat · Key-value search
+        url: https://developer.android.com/studio/debug/logcat#key-value-search
+
+  - id: median-vergleich
+    type: output
+    title: Wie viel bringt das Profil?
+    prompt: |
+      Um wie viel Prozent verkürzt das Baseline Profile den Kaltstart im Median? Runde auf ganze Prozent und gib nur die Zahl mit Prozentzeichen an.
+    lang: text
+    code: |
+      StartupBenchmark_startupWithoutProfile
+      timeToInitialDisplayMs   min 588.1,   median 612.4,   max 671.0
+      StartupBenchmark_startupWithProfile
+      timeToInitialDisplayMs   min 419.7,   median 431.0,   max 468.2
+    expected: |
+      30 %
+    accept:
+      - 30%
+      - "30"
+    explanation: |
+      Verglichen werden die Mediane: (612,4 − 431,0) / 612,4 ≈ 0,296, also rund 30 %. Minimum und Maximum zeigen nur die Streuung; ein einzelner schneller Lauf ohne Profil hätte dir eine falsche Hoffnung gemacht. 30 % liegen im Bereich, den die Doku für Baseline Profiles nennt.
+    resources:
+      - title: Benchmark Baseline Profiles
+        url: https://developer.android.com/topic/performance/baselineprofiles/measure-baselineprofile
+
+  - id: kaltstart-benchmark
+    type: gap
+    title: Ein Benchmark für den Kaltstart
+    prompt: |
+      Ergänze Metrik, Startart und den Aufruf, der die Standard-Activity startet und auf den ersten Frame wartet.
+    lang: kotlin
+    code: |
+      @Test
+      fun coldStartup() = rule.measureRepeated(
+          packageName = "app.bear",
+          metrics = listOf(⟦StartupTimingMetric()⟧),
+          iterations = 10,
+          startupMode = ⟦StartupMode.COLD⟧,
+          setupBlock = { pressHome() },
+      ) {
+          ⟦startActivityAndWait()⟧
+      }
+    gaps:
+      - label: Metrik
+        hint: Sie misst TTID und, wenn die App sie meldet, TTFD.
+      - label: Startart
+        hint: Vor jedem Lauf soll der Prozess beendet sein.
+      - label: Start
+        hint: Eine Funktion des `MacrobenchmarkScope`.
+        accept: ['uiAutomator { startApp("app.bear") }']
+    explanation: |
+      `StartupTimingMetric` liest `timeToInitialDisplayMs` und, falls die App `reportFullyDrawn()` aufruft, `timeToFullDisplayMs` aus dem Trace. `StartupMode.COLD` beendet den Prozess vor jeder Iteration. `startActivityAndWait()` startet die Launcher-Activity und wartet auf den ersten Frame; die neuere Schreibweise ist `uiAutomator { startApp(packageName) }`.
+    resources:
+      - title: StartupTimingMetric
+        url: https://developer.android.com/topic/performance/benchmarking/macrobenchmark-metrics#startup-timing
+
+  - id: generator-schreiben
+    type: gap
+    title: Ein Generator für das Profil
+    prompt: |
+      Ergänze Rule, Methode und den Schalter, der denselben Ablauf auch ins Startup Profile übernimmt.
+    lang: kotlin
+    code: |
+      @get:Rule
+      val rule = ⟦BaselineProfileRule()⟧
+
+      @Test
+      fun generate() = rule.⟦collect⟧(
+          packageName = "app.bear",
+          ⟦includeInStartupProfile⟧ = true,
+      ) {
+          pressHome()
+          startActivityAndWait()
+      }
+    gaps:
+      - label: Rule
+        hint: Das Gegenstück zur `MacrobenchmarkRule` für Profile.
+      - label: Methode
+        hint: Sie sammelt, welcher Code im Block läuft.
+      - label: Schalter
+        hint: Er beginnt mit `include`.
+    explanation: |
+      `BaselineProfileRule.collect` startet die App mehrmals, führt den Block aus und schreibt mit, welche Klassen und Methoden laufen. Mit `includeInStartupProfile = true` landet derselbe Ablauf zusätzlich im Startup Profile, das R8 für die Anordnung der DEX-Dateien nutzt. Nimm das nur für den Start, nicht für jeden Ablauf.
+    resources:
+      - title: Create Baseline Profiles
+        url: https://developer.android.com/topic/performance/baselineprofiles/create-baselineprofile
+
+  - id: plugin-verdrahten
+    type: gap
+    title: App und Generator verbinden
+    prompt: |
+      Ergänze das Plugin, die Bibliothek, die Profile auch außerhalb von Google Play installiert, und die Abhängigkeit auf das Generator-Modul `:baselineprofile`.
+    lang: kotlin
+    code: |
+      plugins {
+          alias(libs.plugins.android.application)
+          alias(libs.plugins.⟦baselineprofile⟧)
+      }
+
+      dependencies {
+          implementation(libs.androidx.⟦profileinstaller⟧)
+          ⟦baselineProfile⟧(project(":baselineprofile"))
+      }
+    gaps:
+      - label: Plugin
+        hint: Der Alias für `androidx.baselineprofile` im Katalog.
+      - label: Bibliothek
+        hint: Sie installiert das Profil beim ersten Start.
+      - label: Konfiguration
+        hint: Das Plugin legt eine eigene Abhängigkeitskonfiguration an.
+    explanation: |
+      Das Plugin in der App legt die Tasks `generateBaselineProfile` an und weiß über `baselineProfile(project(…))`, aus welchem Modul das Profil kommt. `profileinstaller` sorgt dafür, dass das Profil auch bei Installationen über Android Studio oder `adb` und auf älteren Android-Versionen angewendet wird.
+    resources:
+      - title: Baseline Profile Gradle plugin
+        url: https://developer.android.com/topic/performance/baselineprofiles/configure-baselineprofiles
+
+  - id: profil-erzeugen
+    type: command
+    title: Das Profil erzeugen
+    prompt: |
+      Erzeuge das Baseline Profile für das Modul `:app` mit dem Gradle Wrapper.
+    context: Du bist im Wurzelverzeichnis des Projekts, ein Gerät mit API 34 ist angeschlossen.
+    answers:
+      - ./gradlew :app:generateBaselineProfile
+      - ./gradlew :app:generateReleaseBaselineProfile
+      - ./gradlew app:generateBaselineProfile
+    output: |
+      > Task :baselineprofile:connectedNonMinifiedReleaseAndroidTest
+      > Task :app:copyReleaseBaselineProfileIntoSrc
+      BUILD SUCCESSFUL in 2m 41s
+    explanation: |
+      Der Task baut App und Generator, führt den Generator auf dem Gerät aus und kopiert das Ergebnis nach `app/src/release/generated/baselineProfiles/`. `generateReleaseBaselineProfile` macht dasselbe nur für die Variante `release`, was bei Apps mit Flavors Zeit spart.
+    resources:
+      - title: Generate the Baseline Profile
+        url: https://developer.android.com/topic/performance/baselineprofiles/create-baselineprofile#generate-profile
+
+  - id: benchmarks-starten
+    type: command
+    title: Alle Benchmarks laufen lassen
+    prompt: |
+      Starte alle Tests im Modul `:baselineprofile` für die Variante `benchmarkRelease` auf dem angeschlossenen Gerät.
+    answers:
+      - ./gradlew :baselineprofile:connectedBenchmarkReleaseAndroidTest
+      - ./gradlew baselineprofile:connectedBenchmarkReleaseAndroidTest
+    explanation: |
+      Instrumentierte Tests laufen mit `connected<Variante>AndroidTest`. Das Baseline-Profile-Plugin legt im Testmodul die Variante `benchmarkRelease` an: optimiert wie der Release, aber debug-signiert. Die Ergebnisse stehen danach im Testbericht und als JSON unter `build/outputs/`.
+    resources:
+      - title: Run a Macrobenchmark
+        url: https://developer.android.com/topic/performance/benchmarking/macrobenchmark-overview
+
+  - id: kaltstart-adb
+    type: command
+    title: Ein schneller Kaltstart ohne Benchmark
+    prompt: |
+      Starte `app.bear/.MainActivity` per `adb` als Kaltstart und lass dir die Startzeit ausgeben.
+    answers:
+      - adb shell am start -W -S app.bear/.MainActivity
+      - adb shell am start -S -W app.bear/.MainActivity
+      - adb shell am start -W -S -n app.bear/.MainActivity
+      - adb shell am start -S -W -n app.bear/.MainActivity
+    output: |
+      Status: ok
+      LaunchState: COLD
+      Activity: app.bear/.MainActivity
+      TotalTime: 612
+      WaitTime: 618
+      Complete
+    explanation: |
+      `-S` beendet die App vor dem Start, deshalb ist es ein Kaltstart. `-W` wartet auf den ersten Frame und gibt `TotalTime` in Millisekunden aus. Für eine schnelle Probe reicht das; für Vergleiche brauchst du den Median aus vielen Läufen, also einen Macrobenchmark.
+    resources:
+      - title: Activity Manager (am)
+        url: https://developer.android.com/tools/adb#am
+
+  - id: falscher-startmodus
+    type: bug
+    title: Im Benchmark startet die App in 80 ms
+    prompt: |
+      Der Benchmark meldet für den Start einen Median von 80 ms. Android vitals zeigt für dieselbe Version Kaltstarts um 1,9 s. Finde die Zeile, die die Messung verfälscht, und korrigiere sie.
+    lang: kotlin
+    code: |
+      @Test
+      fun startup() = rule.measureRepeated(
+          packageName = "app.bear",
+          metrics = listOf(StartupTimingMetric()),
+          compilationMode = CompilationMode.None(),
+          iterations = 10,
+          startupMode = StartupMode.HOT,
+          setupBlock = { pressHome() },
+      ) {
+          startActivityAndWait()
+      }
+    lines: [7]
+    fix:
+      - line: 7
+        answers:
+          - startupMode = StartupMode.COLD,
+    explanation: |
+      Ein Heißstart holt nur eine vorhandene Activity nach vorn; Prozess und Activity leben noch. Das misst nicht, was Android vitals als Kaltstart zählt. Mit `StartupMode.COLD` beendet Macrobenchmark den Prozess vor jeder Iteration, und die Zahl ist mit den Werten der Nutzer vergleichbar.
+    resources:
+      - title: StartupMode
+        url: https://developer.android.com/reference/kotlin/androidx/benchmark/macro/StartupMode
+
+  - id: leakcanary-im-release
+    type: bug
+    title: Nutzer sehen „Dumping heap“
+    prompt: |
+      Nach dem Update melden Nutzer eine Benachrichtigung „Dumping heap“ und ein neues App-Symbol „Leaks“. Finde die Zeile und korrigiere sie.
+    lang: kotlin
+    code: |
+      dependencies {
+          implementation(platform(libs.androidx.compose.bom))
+          implementation(libs.androidx.compose.material3)
+          implementation(libs.leakcanary)
+          testImplementation(libs.junit)
+      }
+    lines: [4]
+    fix:
+      - line: 4
+        answers:
+          - debugImplementation(libs.leakcanary)
+    explanation: |
+      Mit `implementation` landet LeakCanary in jedem Build, auch im Release. Dort macht es Heap Dumps bei Nutzern, friert die App dafür ein und legt ein eigenes Symbol an. `debugImplementation` beschränkt die Bibliothek auf Debug-Builds; ohne Code-Änderung ist sie im Release dann einfach nicht da.
+    resources:
+      - title: LeakCanary · Getting started
+        url: https://square.github.io/leakcanary/getting_started/
+
+  - id: zaehler-erklaeren
+    type: explain
+    title: Was sagen die Zähler?
+    prompt: |
+      Du hast im Layout Inspector die Zähler zurückgesetzt und einmal durch die Liste gescrollt. Dabei kamen zwölf neue Zeilen ins Bild. Erkläre, welche Zahlen normal sind, welche auffallen und was du als Nächstes prüfst.
+    lang: text
+    code: |
+      Composable            Compositions   Skips
+      ThoughtsScreen                   0       0
+        TopBar                        41       0
+        LazyColumn                    41       0
+          ThoughtRow (12 neu)         12       0
+          ThoughtRow (sichtbar)        0      29
+        SyncBadge                      0      41
+    points:
+      - Zwölf Compositions für zwölf neue Zeilen sind normal; die schon sichtbaren Zeilen werden übersprungen.
+      - "`TopBar` komponiert bei jedem Scrollschritt neu, obwohl sie sich nicht ändert – sie liest vermutlich den Scrollzustand in der Composition."
+      - "`SyncBadge` wird bei jedem Schritt übersprungen, das ist erwünscht."
+      - Als Nächstes prüfst du, wo `TopBar` den Scrollwert liest, und verlegst den Read in einen Lambda-Modifier oder hinter `derivedStateOf`.
+    explanation: |
+      Die Zähler zeigen Häufigkeit, nicht Dauer. `LazyColumn` muss beim Scrollen neu komponieren, und neue Zeilen kommen einmal dazu; die übrigen Zeilen haben unveränderte Parameter und werden übersprungen. Auffällig ist `TopBar`: 41 Compositions bei 41 Scrollschritten, keine einzige übersprungen. Typisch ist ein Read wie `if (listState.firstVisibleItemIndex > 0)` im Körper. Mit `derivedStateOf` komponiert sie nur noch, wenn sich das Ergebnis ändert, also einmal.
+    resources:
+      - title: Recomposition counts
+        url: https://developer.android.com/develop/ui/compose/tooling/debug#recomposition-counts
+
+  - id: profil-fuer-eigene-app
+    type: practice
+    title: Ein belegtes Baseline Profile für deine App
+    prompt: |
+      Nimm eine eigene Compose-App, etwa die aus dem Modul „Architektur“. Lege mit Android Studio ein Modul `:baselineprofile` an, schreibe einen Generator für Start und einmal Scrollen, erzeuge das Profil und belege die Wirkung mit einem Startup-Benchmark in beiden `CompilationMode`s. Schreib Code, Testnamen und das Ergebnis selbst; der Wert der Übung liegt im Messen und Deuten.
+    lang: kotlin
+    solution: |
+      // baselineprofile/src/main/java/…/BaselineProfileGenerator.kt
+      @RunWith(AndroidJUnit4::class)
+      class BaselineProfileGenerator {
+          @get:Rule
+          val rule = BaselineProfileRule()
+
+          @Test
+          fun generate() = rule.collect(
+              packageName = "app.bear",
+              includeInStartupProfile = true,
+          ) {
+              pressHome()
+              startActivityAndWait()
+              device.findObject(By.res("thoughts")).fling(Direction.DOWN)
+              device.waitForIdle()
+          }
+      }
+
+      // baselineprofile/src/main/java/…/StartupBenchmark.kt
+      @RunWith(AndroidJUnit4::class)
+      class StartupBenchmark {
+          @get:Rule
+          val rule = MacrobenchmarkRule()
+
+          @Test
+          fun none() = startup(CompilationMode.None())
+
+          @Test
+          fun profile() = startup(CompilationMode.Partial(BaselineProfileMode.Require))
+
+          private fun startup(mode: CompilationMode) = rule.measureRepeated(
+              packageName = "app.bear",
+              metrics = listOf(StartupTimingMetric()),
+              compilationMode = mode,
+              iterations = 10,
+              startupMode = StartupMode.COLD,
+              setupBlock = { pressHome() },
+          ) {
+              startActivityAndWait()
+          }
+      }
+
+      // Ablauf:
+      // ./gradlew :app:generateBaselineProfile
+      // git add app/src/release/generated/baselineProfiles/
+      // ./gradlew :baselineprofile:connectedBenchmarkReleaseAndroidTest
+    checklist:
+      - Die Liste hat `testTagsAsResourceId = true` und ein Test-Tag, das der Generator findet.
+      - "`baseline-prof.txt` und `startup-prof.txt` liegen unter `app/src/release/generated/baselineProfiles/` im Repository."
+      - Der Benchmark lief auf einem echten Gerät mit mindestens zehn Iterationen je Modus.
+      - Du hast beide Mediane notiert und die Differenz in Prozent ausgerechnet.
+      - Du kannst erklären, warum ein Lauf mit `CompilationMode.Full()` nicht zeigt, was Nutzer erleben.
+    explanation: |
+      Die Musterlösung ist absichtlich nah am Lektionscode. Was sie nicht liefern kann, sind deine Zahlen: Wie viel ein Profil bringt, hängt von App, Gerät und Abläufen ab. Bleibt der Unterschied unter dem Rauschen, prüfe, ob der Generator die wichtigen Abläufe wirklich durchspielt und ob das Profil im Release-Build ankommt (`assets/dexopt/baseline.prof` im APK). `Full()` kompiliert alles vorab und entspricht keiner echten Installation.
+    resources:
+      - title: Benchmark Baseline Profiles with Macrobenchmark
+        url: https://developer.android.com/topic/performance/baselineprofiles/measure-baselineprofile
+
+  - id: ruckeln-finden
+    type: practice
+    title: Ein Ruckeln finden, beheben und belegen
+    prompt: |
+      Bau in eine eigene Liste absichtlich einen Fehler ein: Jede Zeile formatiert ein Datum mit einem neu erzeugten `DateTimeFormatter`, und der Kopfbereich liest `listState.firstVisibleItemIndex` im Körper. Finde beides mit Layout Inspector und System-Trace, behebe es und belege die Wirkung mit einem `FrameTimingMetric`-Benchmark.
+    lang: text
+    solution: |
+      Notiz nach der Übung (Beispiel):
+
+      Layout Inspector, einmal scrollen:
+        Header 38 Compositions, 0 Skips  → liest Scrollzustand
+        Nach derivedStateOf: 1 Composition
+
+      System-Trace, Frame 912: 24 ms
+        Compose:recompose 19 ms
+        ThoughtRow.format 15 ms         → Formatter je Zeile
+        Nach Formatieren im ViewModel: Frame 9 ms
+
+      FrameTimingMetric, 5 Iterationen, Pixel 6a:
+        frameOverrunMs P95 vorher  +7,8
+        frameOverrunMs P95 nachher −3,1
+    checklist:
+      - Du hast Zähler und Trace vor der Änderung festgehalten.
+      - Der eigene Slice mit `trace("…")` taucht im Trace auf.
+      - Beide Ursachen sind getrennt behoben und getrennt gemessen.
+      - Der Benchmark lief vor und nach der Änderung auf demselben Gerät.
+      - Deine Notiz nennt P95 von `frameOverrunMs`, nicht nur den Median.
+    explanation: |
+      Absichtlich eingebaute Fehler sind die beste Übung für echte: Du weißt, was du suchst, und lernst, wie es in den Werkzeugen aussieht. Wichtig ist die Trennung. Der Header-Fehler zeigt sich in den Zählern, der Formatter im Trace; nur wer beide getrennt behebt und misst, weiß, welche Änderung was gebracht hat. Ruckeln spürt man in den hohen Perzentilen, deshalb P95.
+    resources:
+      - title: FrameTimingMetric
+        url: https://developer.android.com/topic/performance/benchmarking/macrobenchmark-metrics#frame-timing
