@@ -42,9 +42,9 @@ Plane pro Woche mehrere kurze aktive Einheiten und einen längeren Praxisblock. 
 | 5 | [Android-Grundlagen: App, Lebenszyklus, Prozess](/kotlin/android-grundlagen), [Jetpack Compose: Denkmodell, Layouts, Material 3](/kotlin/compose-grundlagen) | Bedienbaren Screen mit großer Schrift und Preview bauen |
 | 6 | [Compose State & Side Effects](/kotlin/compose-state), [Navigation mit Compose](/kotlin/navigation) | Editorprojekt mit Wiederherstellung und geprüftem Rückweg |
 | 7 | [Compose fortgeschritten](/kotlin/compose-fortgeschritten) | Eigenes Layout, eine Animation und ein Zweispaltenlayout ab 600 dp erklären |
-| 8 | [App-Architektur: MVVM, UDF und Dependency Injection](/kotlin/architektur) | Route, Screen, ViewModel und Repository begründet trennen; Modulgraph mit `api` und `implementation` zeichnen |
-| 9 | [Daten & Netzwerk: Room, DataStore, Retrofit, WorkManager](/kotlin/daten-netzwerk) | Lokale Leseliste, Token-Refresh mit Grenze und seitenweise Suche |
-| 10 | [Testing: ViewModels, Coroutines, Room und Compose](/kotlin/testing) | Tests für einen Erfolgspfad und zwei Fehlerfälle, ein MockWebServer-Test |
+| 8 | [App-Architektur: MVVM, UDF, Dependency Injection und Module](/kotlin/architektur) | Route, Screen, ViewModel und Repository begründet trennen; Modulgraph mit `api` und `implementation` zeichnen |
+| 9 | [Daten & Netzwerk: Room, Paging, Retrofit, OkHttp, WorkManager](/kotlin/daten-netzwerk) | Lokale Leseliste, Token-Refresh mit Grenze und seitenweise Suche |
+| 10 | [Testing: ViewModels, Coroutines, Netzwerk, Worker und Compose](/kotlin/testing) | Tests für einen Erfolgspfad und zwei Fehlerfälle, ein MockWebServer-Test |
 | 11 | [Performance & Debugging: Spuren lesen](/kotlin/performance-diagnose), [Performance messen](/kotlin/performance-messen) | Ein Ruckeln mit Trace belegen und beheben; Startzeit mit und ohne Baseline Profile messen |
 | 12 | [Gradle, Signieren und Release](/kotlin/gradle-release) | CI mit Qualitätstor, Convention Plugins und signiertes Test-Release ohne Geheimnisse im Repo |
 | 13 | [Praxis: Kotlin mit Bear](/kotlin/bear-01) und Abschlussprojekt | Einen realen Bear-Ablauf erklären; Offline-Abnahme des eigenen Projekts |
