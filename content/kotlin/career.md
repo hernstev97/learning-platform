@@ -29,7 +29,7 @@ Rechne je nach Unternehmen mit Screening, technischem Gespräch, Live-Coding ode
 
 Nutze die [Interviewkarten](/kotlin/karten) mit eigenen Beispielen. Eine Antwort ist belastbar, wenn du sie an Code zeigen und eine Gegenfrage beantworten kannst. Auswendig gelernte Definitionen sind nur der Einstieg.
 
-## Zwölf Wochen mit überprüfbarem Ergebnis
+## Vierzehn Wochen mit überprüfbarem Ergebnis
 
 Plane pro Woche mehrere kurze aktive Einheiten und einen längeren Praxisblock. Die Tabelle ist ein Vorschlag, keine Garantie für eine bestimmte Lerngeschwindigkeit oder Anstellung. Wiederhole eine Woche, wenn du ihren Nachweis noch nicht selbstständig erbringen kannst.
 
@@ -41,12 +41,14 @@ Plane pro Woche mehrere kurze aktive Einheiten und einen längeren Praxisblock. 
 | 4 | [Coroutines](/kotlin/coroutines), [Flow, StateFlow und SharedFlow](/kotlin/flow) | Abbruch und konkurrierende Zustandsänderung kontrolliert prüfen |
 | 5 | [Android-Grundlagen: App, Lebenszyklus, Prozess](/kotlin/android-grundlagen), [Jetpack Compose: Denkmodell, Layouts, Material 3](/kotlin/compose-grundlagen) | Bedienbaren Screen mit großer Schrift und Preview bauen |
 | 6 | [Compose State & Side Effects](/kotlin/compose-state), [Navigation mit Compose](/kotlin/navigation) | Editorprojekt mit Wiederherstellung und geprüftem Rückweg |
-| 7 | [App-Architektur: MVVM, UDF und Dependency Injection](/kotlin/architektur) | Route, Screen, ViewModel und Repository begründet trennen |
-| 8 | [Daten & Netzwerk: Room, DataStore, Retrofit, WorkManager](/kotlin/daten-netzwerk) | Lokale Leseliste und Fake-basierte API-Fehlerbehandlung |
-| 9 | [Testing: ViewModels, Coroutines, Room und Compose](/kotlin/testing) | Tests für einen vollständigen Erfolgspfad und zwei Fehlerfälle |
-| 10 | [Gradle, Signieren und Release](/kotlin/gradle-release) | CI und installierbares signiertes Test-Release ohne Geheimnisse im Repo |
-| 11 | [Praxis: Kotlin mit Bear](/kotlin/bear-01) und Abschlussprojekt | Einen realen Bear-Ablauf erklären; Offline-Abnahme des eigenen Projekts |
-| 12 | [Interviewtraining](/kotlin/karten), [Abschlussprojekt](/kotlin/projekte/abschluss-leseliste) | Demo, README, Architekturdiagramm und technisches Probeinterview |
+| 7 | [Compose fortgeschritten](/kotlin/compose-fortgeschritten) | Eigenes Layout, eine Animation und ein Zweispaltenlayout ab 600 dp erklären |
+| 8 | [App-Architektur: MVVM, UDF und Dependency Injection](/kotlin/architektur) | Route, Screen, ViewModel und Repository begründet trennen; Modulgraph mit `api` und `implementation` zeichnen |
+| 9 | [Daten & Netzwerk: Room, DataStore, Retrofit, WorkManager](/kotlin/daten-netzwerk) | Lokale Leseliste, Token-Refresh mit Grenze und seitenweise Suche |
+| 10 | [Testing: ViewModels, Coroutines, Room und Compose](/kotlin/testing) | Tests für einen Erfolgspfad und zwei Fehlerfälle, ein MockWebServer-Test |
+| 11 | [Performance & Debugging: Spuren lesen](/kotlin/performance-diagnose), [Performance messen](/kotlin/performance-messen) | Ein Ruckeln mit Trace belegen und beheben; Startzeit mit und ohne Baseline Profile messen |
+| 12 | [Gradle, Signieren und Release](/kotlin/gradle-release) | CI mit Qualitätstor, Convention Plugins und signiertes Test-Release ohne Geheimnisse im Repo |
+| 13 | [Praxis: Kotlin mit Bear](/kotlin/bear-01) und Abschlussprojekt | Einen realen Bear-Ablauf erklären; Offline-Abnahme des eigenen Projekts |
+| 14 | [Interviewtraining](/kotlin/karten), [Abschlussprojekt](/kotlin/projekte/abschluss-leseliste) | Demo, README, Architekturdiagramm, gemessene Startzeit und technisches Probeinterview |
 
 ## Offizielle Ressourcen
 
@@ -57,3 +59,4 @@ Plane pro Woche mehrere kurze aktive Einheiten und einen längeren Praxisblock. 
 - [Now in Android](https://github.com/android/nowinandroid): vollständiges offizielles Beispiel zum Lesen und Vergleichen.
 - [Android Testing](https://developer.android.com/training/testing): Prüfarten und Werkzeuge.
 - [App Signing](https://developer.android.com/studio/publish/app-signing): Signierung und Veröffentlichungsgrundlagen.
+- [App performance](https://developer.android.com/topic/performance/overview): Startzeit, Rendering, Baseline Profiles und Messwerkzeuge.
