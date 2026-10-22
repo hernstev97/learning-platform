@@ -1,21 +1,23 @@
 id: daten-netzwerk
-title: "Daten & Netzwerk: Room, DataStore, Retrofit, WorkManager"
+title: "Daten & Netzwerk: Room, Paging, Retrofit, OkHttp, WorkManager"
 level: 3
-minutes: 180
+minutes: 270
+place: pc
 summary: Wie eine App Daten lokal speichert, mit einem Server spricht, Fehler sauber unterscheidet und Änderungen auch ohne Netz zuverlässig ausliefert – offline-first mit Room als Single Source of Truth.
 goals:
   - Du modellierst Tabellen mit Room (Entity, DAO, Database), liest sie als `Flow` und schreibst mit `suspend`-Funktionen und Transaktionen.
-  - Du änderst ein bestehendes Datenbankschema mit einer automatischen oder manuellen Migration, ohne Nutzerdaten zu verlieren.
+  - Du verknüpfst Tabellen mit Fremdschlüssel, Index und `@Relation` und änderst ein Schema mit einer Migration, ohne Nutzerdaten zu verlieren.
   - Du speicherst Einstellungen mit DataStore und begründest, warum nicht mit `SharedPreferences`.
-  - Du sprichst eine REST-API mit Retrofit und kotlinx.serialization an und bildest Netzwerk-, HTTP- und Parsing-Fehler auf fachliche Ergebnisse ab.
+  - Du sprichst eine REST-API mit Retrofit und OkHttp an, hängst Tokens per Interceptor an, erneuerst sie mit einem `Authenticator` und bildest Fehler auf fachliche Ergebnisse ab.
+  - Du lädst lange Listen mit Paging 3, aus dem Netz und mit `RemoteMediator` über Room, und löst Konflikte beim Sync mit einer bewusst gewählten Regel.
   - Du planst garantierte Hintergrundarbeit mit WorkManager – mit Constraints, Backoff, Unique Work und idempotenten Workern.
 resources:
   - title: Save data in a local database using Room
     url: https://developer.android.com/training/data-storage/room
-  - title: DataStore
-    url: https://developer.android.com/topic/libraries/architecture/datastore
   - title: Build an offline-first app
     url: https://developer.android.com/topic/architecture/data-layer/offline-first
+  - title: Paging library overview
+    url: https://developer.android.com/topic/libraries/architecture/paging/v3-overview
   - title: Retrofit
     url: https://lysine.dev/retrofit/
   - title: WorkManager – Define work requests
@@ -138,6 +140,55 @@ lesson: |
   > [!WARNING] `fallbackToDestructiveMigration()` löscht Nutzerdaten
   > Mit dieser Option löscht Room die Datenbank und legt sie neu an, wenn eine Migration fehlt. Während der Entwicklung ist das bequem. In einer veröffentlichten App bedeutet es: Jeder noch nicht gesendete Gedanke ist nach dem Update weg. Für Daten, die nur ein Cache des Servers sind, kann es vertretbar sein – für eine Outbox nie.
 
+  ## Relationen und Indizes
+
+  Ein Thema hat viele Gedanken. In Room steht das als Fremdschlüssel in der Kind-Tabelle: Jeder Gedanke trägt die `topicId` seines Themas. Die Spalten stehen als Arrays da, weil ein Schlüssel aus mehreren Spalten bestehen kann:
+
+  ```kotlin
+  @Entity(
+      tableName = "thoughts",
+      foreignKeys = [
+          ForeignKey(
+              entity = TopicEntity::class,
+              parentColumns = ["id"],
+              childColumns = ["topicId"],
+              onDelete = ForeignKey.CASCADE,
+          ),
+      ],
+      indices = [Index("topicId")],
+  )
+  data class ThoughtEntity(
+      @PrimaryKey val id: String,
+      val topicId: String,
+      val text: String,
+      val createdAt: Long,
+  )
+  ```
+
+  Der [Fremdschlüssel](https://developer.android.com/reference/kotlin/androidx/room3/ForeignKey) lässt SQLite prüfen, dass es das Thema gibt; `CASCADE` löscht die Gedanken mit, wenn das Thema gelöscht wird. Der **Index** auf `topicId` ist kein Detail. Ohne ihn muss SQLite bei jedem Löschen oder Ändern eines Themas die ganze Gedanken-Tabelle nach Kindern durchsuchen, und jede Abfrage „Gedanken zu Thema X“ liest jede Zeile ([SQLite · Foreign key indexes](https://www.sqlite.org/foreignkeys.html#fk_indexes)). Room warnt beim Build: „topicId column references a foreign key but it is not part of an index“. Nimm die Warnung ernst, statt sie zu unterdrücken. Ein Index kostet Platz und macht jedes Schreiben etwas teurer. Lege ihn deshalb für Spalten an, nach denen du filterst, sortierst oder verknüpfst, nicht für jede. `Index(value = ["issueId"], unique = true)` erzwingt zusätzlich Eindeutigkeit.
+
+  Um ein Thema samt Gedanken zu lesen, beschreibst du das Ergebnis als Klasse. [`@Embedded`](https://developer.android.com/training/data-storage/room/relationships/one-to-many) übernimmt die Spalten des Themas, `@Relation` holt die passenden Gedanken:
+
+  ```kotlin
+  data class TopicWithThoughts(
+      @Embedded val topic: TopicEntity,
+      @Relation(
+          parentColumns = ["id"],
+          entityColumns = ["topicId"],
+      )
+      val thoughts: List<ThoughtEntity>,
+  )
+
+  @Dao
+  interface TopicDao {
+      @Transaction
+      @Query("SELECT * FROM topics WHERE id = :id")
+      fun observeWithThoughts(id: String): Flow<TopicWithThoughts?>
+  }
+  ```
+
+  Room führt dafür zwei Abfragen aus: eine für das Thema, eine für die Gedanken. `@Transaction` sorgt dafür, dass beide denselben Stand sehen; ohne sie könnte ein Schreibvorgang dazwischen ein Thema mit Gedanken eines anderen Stands liefern. Für viele-zu-viele, etwa Gedanken mit mehreren Schlagworten, kommt eine Verknüpfungstabelle dazu, die `@Relation` über `associateBy = Junction(…)` kennt ([Many-to-many](https://developer.android.com/training/data-storage/room/relationships/many-to-many)). Bei `@Relation` hat sich mit Room 3 die Schreibweise geändert: Room 3 nimmt `parentColumns` und `entityColumns` als Arrays, Room 2 hatte `parentColumn` und `entityColumn` mit je einem String.
+
   ## DataStore statt SharedPreferences
 
   Für kleine Einstellungen – Name des Bären, Zeitfenster, ob ein Hinweis schon gesehen wurde – ist eine Datenbank zu schwer. Der Klassiker dafür war `SharedPreferences`. Seine Probleme: Die API ist synchron und sieht auf dem Main-Thread harmlos aus, obwohl sie Dateien liest; `apply()` meldet keine Fehler; es gibt keine Transaktionen über mehrere Werte. [DataStore](https://developer.android.com/topic/libraries/architecture/datastore) löst das mit Coroutines: Lesen ist ein `Flow`, Schreiben eine atomare `suspend`-Funktion.
@@ -199,6 +250,62 @@ lesson: |
 
   Die Alternative ist der [Ktor-Client](https://ktor.io/docs/client-create-new-application.html) von JetBrains. Er läuft auch in Kotlin Multiplatform, konfiguriert sich über Plugins (`install(ContentNegotiation) { json() }`) und wirft bei HTTP-Fehlern standardmäßig **keine** Exception, solange du nicht `expectSuccess = true` setzt. Bear nutzt keines von beiden direkt, sondern OkHttp mit kotlinx.serialization, weil die Linear-API GraphQL spricht und nur einen Endpunkt hat.
 
+  ## OkHttp: Interceptor und Authenticator
+
+  Unter Retrofit arbeitet OkHttp. Dort hängst du Dinge ein, die für **jeden** Aufruf gelten: ein Token, ein Header mit der App-Version, Logging. Ein [Interceptor](https://github.com/square/okhttp/blob/master/docs/features/interceptors.md) bekommt die Anfrage, darf sie ändern und reicht sie mit `chain.proceed` weiter:
+
+  ```kotlin
+  class AuthInterceptor(
+      private val tokens: TokenStore,
+  ) : Interceptor {
+      override fun intercept(chain: Interceptor.Chain): Response {
+          val token = tokens.accessToken()
+              ?: return chain.proceed(chain.request())
+          val request = chain.request().newBuilder()
+              .header("Authorization", "Bearer $token")
+              .build()
+          return chain.proceed(request)
+      }
+  }
+  ```
+
+  OkHttp kennt zwei Arten. Ein **Application Interceptor** (`addInterceptor`) sieht jeden Aufruf genau einmal, auch wenn OkHttp intern umleitet oder wiederholt. Ein **Network Interceptor** (`addNetworkInterceptor`) sieht jede einzelne Anfrage ans Netz, also auch jede Umleitung, und muss `proceed` genau einmal aufrufen. Für Tokens und App-Header nimmst du den ersten. Logging gehört nur in Debug-Builds, und der `Authorization`-Header wird dabei geschwärzt (`HttpLoggingInterceptor.redactHeader`), sonst steht das Token im Logcat.
+
+  Läuft das Token ab, antwortet der Server mit 401. Dafür hat OkHttp einen eigenen Haken, den `Authenticator`. Er wird nur bei 401 aufgerufen, darf ein neues Token besorgen und gibt die Anfrage mit neuem Header zurück. Gibt er `null` zurück, gibt OkHttp auf, und der Aufrufer bekommt die 401:
+
+  ```kotlin
+  class TokenAuthenticator(
+      private val tokens: TokenStore,
+  ) : Authenticator {
+      override fun authenticate(route: Route?, response: Response): Request? {
+          if (response.responseCount >= 2) return null
+          val sent = response.request.header("Authorization")
+              ?.removePrefix("Bearer ")
+          val fresh = synchronized(this) {
+              val current = tokens.accessToken()
+              if (current != null && current != sent) {
+                  current
+              } else {
+                  tokens.refreshBlocking() ?: return null
+              }
+          }
+          return response.request.newBuilder()
+              .header("Authorization", "Bearer $fresh")
+              .build()
+      }
+
+      private val Response.responseCount: Int
+          get() = generateSequence(this) { it.priorResponse }.count()
+  }
+
+  val client = OkHttpClient.Builder()
+      .addInterceptor(AuthInterceptor(tokens))
+      .authenticator(TokenAuthenticator(tokens))
+      .build()
+  ```
+
+  Drei Stellen tragen das Muster. `responseCount` zählt über `priorResponse`, wie oft diese Anfrage schon abgelehnt wurde, wie im [Rezept der OkHttp-Doku](https://github.com/square/okhttp/blob/master/docs/recipes.md#handling-authentication-kt-java); nach dem zweiten Versuch ist Schluss. Ohne diese Grenze würde eine abgelaufene Anmeldung zur Schleife, bis OkHttp nach 20 Folgeanfragen mit „Too many follow-up requests“ abbricht. `synchronized` mit dem Vergleich gegen `sent` verhindert, dass fünf gleichzeitig abgelehnte Aufrufe fünfmal das Token erneuern: Der erste erneuert, die anderen sehen danach ein neues Token und nehmen es. Und `refreshBlocking()` läuft über einen eigenen Client ohne diesen Authenticator, sonst löst eine 401 beim Erneuern wieder den Authenticator aus. Der Authenticator läuft auf einem Thread von OkHttp, deshalb darf er blockieren.
+
   ## Fehler unterscheiden und abbilden
 
   Ein Netzwerkaufruf kann auf drei grundverschiedene Arten scheitern, und jede verlangt eine andere Reaktion:
@@ -244,6 +351,149 @@ lesson: |
 
   > [!PRAXIS] Idempotenz: Die verlorene Antwort
   > Das tückischste Szenario im Mobilnetz: Der Server legt das Issue an, aber die Antwort kommt nie zurück. Für die App sieht das aus wie ein Timeout, also wiederholt sie – und es gibt zwei Issues. Bear verhindert das, indem es das Issue mit einer **selbst erzeugten UUID** anlegt. Scheitert der Aufruf, fragt der Worker zuerst nach, ob es ein Issue mit dieser ID schon gibt. So ist das Senden idempotent: Beliebig oft wiederholt, bleibt das Ergebnis dasselbe. In Vorstellungsgesprächen für Mobile-Stellen ist genau diese Frage beliebt – „Was passiert, wenn die Antwort verloren geht?“
+
+  ## Konflikte beim Sync auflösen
+
+  Die Outbox klärt, was **dieses** Gerät noch senden muss. Sie klärt nicht, was passiert, wenn auf dem Server inzwischen jemand anderes denselben Datensatz geändert hat: ein zweites Gerät, ein Kollege, das Web-Frontend. Dann gibt es einen **Konflikt**, und eine Regel muss entscheiden, welcher Stand gilt ([Conflict resolution](https://developer.android.com/topic/architecture/data-layer/offline-first#conflict-resolution)).
+
+  Dafür braucht jeder Datensatz eine Version, die der Server bei jeder Änderung erhöht. Der Client merkt sich, auf welcher Version seine Änderung beruht, und schickt sie mit. Weicht sie ab, lehnt der Server ab, über HTTP etwa mit `412 Precondition Failed` auf ein `If-Match` mit ETag oder mit `409 Conflict`. Dann gibt es drei übliche Regeln:
+
+  | Regel | Wie | Passt für |
+  | --- | --- | --- |
+  | Server gewinnt | lokale Änderung verwerfen, Server-Stand übernehmen | Caches, Daten anderer |
+  | Last write wins | neuerer Zeitstempel gewinnt, ganzer Datensatz | einfache Einstellungen |
+  | Feldweise zusammenführen | nur lokal geänderte Felder überschreiben den Server | Formulare, Notizen |
+
+  [Last write wins](https://developer.android.com/topic/architecture/data-layer/offline-first#last-write) ist am einfachsten, verliert aber still Änderungen: Hat das Handy den Titel geändert und das Web die Notiz, gewinnt einer, und die andere Änderung ist weg. Feldweise zusammenführen braucht drei Stände – den gemeinsamen Ursprung (`base`), den lokalen und den vom Server:
+
+  ```kotlin
+  fun merge(base: Topic, local: Topic, server: Topic): Topic =
+      server.copy(
+          title = if (local.title != base.title) local.title else server.title,
+          note = if (local.note != base.note) local.note else server.note,
+      )
+  ```
+
+  Was lokal geändert wurde, setzt sich durch; alles andere kommt vom Server, auch dessen Version. Haben beide dasselbe Feld geändert, gewinnt hier die lokale Seite. Das ist eine Produktentscheidung, keine technische, und sie gehört ins README. Für Texte, die zwei Menschen gleichzeitig bearbeiten, reicht keine dieser Regeln; dann zeigst du beide Stände und lässt den Nutzer wählen.
+
+  ## Paging 3: lange Listen seitenweise
+
+  Der öffentliche Katalog hat Millionen Bücher. Niemand lädt sie alle. [Paging 3](https://developer.android.com/topic/libraries/architecture/paging/v3-overview) lädt Seiten nach, während der Nutzer scrollt, hält sie im Speicher, verwirft alte und meldet Lade- und Fehlerzustände. Die kleinste Form ist eine `PagingSource`, die eine Seite zu einem Schlüssel lädt:
+
+  ```kotlin
+  const val PAGE_SIZE = 20
+
+  class SearchPagingSource(
+      private val api: CatalogApi,
+      private val query: String,
+  ) : PagingSource<Int, BookDto>() {
+
+      override suspend fun load(params: LoadParams<Int>): LoadResult<Int, BookDto> {
+          val page = params.key ?: 1
+          return try {
+              val books = api.search(query, page = page, limit = PAGE_SIZE)
+              LoadResult.Page(
+                  data = books,
+                  prevKey = if (page == 1) null else page - 1,
+                  nextKey = if (books.size < PAGE_SIZE) null else page + 1,
+              )
+          } catch (e: IOException) {
+              LoadResult.Error(e)
+          } catch (e: HttpException) {
+              LoadResult.Error(e)
+          }
+      }
+
+      override fun getRefreshKey(state: PagingState<Int, BookDto>): Int? =
+          state.anchorPosition?.let { anchor ->
+              val page = state.closestPageToPosition(anchor)
+              page?.prevKey?.plus(1) ?: page?.nextKey?.minus(1)
+          }
+  }
+  ```
+
+  `nextKey = null` heißt „Ende erreicht“. `getRefreshKey` bestimmt nach einem Neuladen, etwa nach Prozessverlust, bei welcher Seite Paging wieder anfängt, damit der Nutzer nicht nach oben springt. Achte auf die Seitengröße: Paging lädt beim ersten Mal standardmäßig die dreifache `pageSize` und meldet das in `params.loadSize`. Schickst du bei Seitennummern `params.loadSize` als `limit`, liefert Seite 2 Einträge, die Seite 1 schon hatte ([Paging · load](https://developer.android.com/topic/libraries/architecture/paging/v3-paged-data#pagingsource)).
+
+  Das ViewModel baut daraus einen `Flow<PagingData>`, die UI sammelt ihn mit `collectAsLazyPagingItems()`:
+
+  ```kotlin
+  val books: Flow<PagingData<BookDto>> =
+      Pager(PagingConfig(pageSize = PAGE_SIZE)) {
+          SearchPagingSource(api, query)
+      }.flow.cachedIn(viewModelScope)
+  ```
+
+  ```kotlin
+  val books = viewModel.books.collectAsLazyPagingItems()
+  LazyColumn {
+      items(
+          count = books.itemCount,
+          key = books.itemKey { it.key },
+      ) { index ->
+          val book = books[index]
+          if (book != null) BookRow(book) else BookPlaceholder()
+      }
+      if (books.loadState.append is LoadState.Loading) {
+          item { CircularProgressIndicator() }
+      }
+  }
+  ```
+
+  `cachedIn(viewModelScope)` hält die geladenen Seiten über eine Drehung hinweg. `loadState` sagt für Neuladen, Anhängen und Voranstellen getrennt, ob gerade geladen wird, ein Fehler vorliegt oder alles da ist; `books.retry()` versucht eine gescheiterte Seite erneut.
+
+  Offline-first wird es mit Room. Dann liest die Liste nur aus der Datenbank, und ein [`RemoteMediator`](https://developer.android.com/topic/libraries/architecture/paging/v3-network-db#implement-remotemediator) lädt Seiten vom Server in die Datenbank, wenn Paging das Ende der lokalen Daten erreicht. In Room 3 braucht ein DAO, das `PagingSource` liefert, das Artefakt `room3-paging` und einen Konverter:
+
+  ```kotlin
+  @Dao
+  @DaoReturnTypeConverters(PagingSourceDaoReturnTypeConverter::class)
+  abstract class ThoughtPageDao {
+      @Query("SELECT * FROM thoughts ORDER BY createdAt DESC")
+      abstract fun pagingSource(): PagingSource<Int, ThoughtEntity>
+
+      @Transaction
+      open suspend fun savePage(refresh: Boolean, thoughts: List<ThoughtEntity>, nextCursor: String?) {
+          if (refresh) clearThoughts()
+          upsertAll(thoughts)
+          upsertKey(RemoteKey("thoughts", nextCursor))
+      }
+      // clearThoughts, upsertAll, upsertKey, remoteKey: einfache @Query/@Upsert
+  }
+
+  @OptIn(ExperimentalPagingApi::class)
+  class ThoughtsRemoteMediator(
+      private val api: ThoughtApi,
+      private val dao: ThoughtPageDao,
+  ) : RemoteMediator<Int, ThoughtEntity>() {
+
+      override suspend fun load(
+          loadType: LoadType,
+          state: PagingState<Int, ThoughtEntity>,
+      ): MediatorResult {
+          val cursor = when (loadType) {
+              LoadType.REFRESH -> null
+              LoadType.PREPEND ->
+                  return MediatorResult.Success(endOfPaginationReached = true)
+              LoadType.APPEND -> dao.remoteKey("thoughts")?.nextCursor
+                  ?: return MediatorResult.Success(endOfPaginationReached = true)
+          }
+          return try {
+              val page = api.thoughts(cursor, limit = state.config.pageSize)
+              dao.savePage(
+                  refresh = loadType == LoadType.REFRESH,
+                  thoughts = page.items.map { it.toEntity() },
+                  nextCursor = page.nextCursor,
+              )
+              MediatorResult.Success(endOfPaginationReached = page.nextCursor == null)
+          } catch (e: IOException) {
+              MediatorResult.Error(e)
+          } catch (e: HttpException) {
+              MediatorResult.Error(e)
+          }
+      }
+  }
+  ```
+
+  Der Mediator schreibt nur in die Datenbank, er gibt nichts an die UI. Room merkt die Änderung und erneuert die `PagingSource`, die Liste zeigt die neuen Zeilen. Den Cursor für die nächste Seite speichert er in einer eigenen Tabelle, weil die Liste nach Prozessverlust weiterladen können muss. `REFRESH` leert die alten Zeilen in derselben Transaction, in der die neuen kommen, sonst sieht die Liste kurz gar nichts. `RemoteMediator` ist in Paging 3.5 noch als `@ExperimentalPagingApi` markiert, deshalb das `@OptIn`. Im `Pager` stehen beide zusammen: `Pager(config, remoteMediator = …, pagingSourceFactory = { dao.pagingSource() })`.
 
   ## WorkManager: Arbeit, die garantiert passiert
 
@@ -295,6 +545,12 @@ lesson: |
   - **`runCatching` um Suspend-Aufrufe** verschluckt Abbrüche.
   - **Nicht-idempotente Worker.** Jede Wiederholung legt einen neuen Datensatz auf dem Server an. Lösung: Client-generierte IDs, vor dem Wiederholen nachsehen.
   - **`enqueue` statt `enqueueUniqueWork`.** Jeder Tipp auf „Senden“ erzeugt einen weiteren Auftrag.
+  - **Fremdschlüssel ohne Index.** Jedes Löschen eines Themas durchsucht die ganze Kind-Tabelle.
+  - **Relation ohne `@Transaction`.** Thema und Gedanken können aus verschiedenen Ständen stammen.
+  - **Authenticator ohne Grenze.** Eine abgelaufene Anmeldung wird zur Schleife aus 401-Antworten.
+  - **Token im Log.** `HttpLoggingInterceptor` ohne `redactHeader("Authorization")` schreibt es ins Logcat.
+  - **`params.loadSize` als Seitengröße bei Seitennummern.** Die zweite Seite wiederholt Einträge der ersten.
+  - **Last write wins ohne Absprache.** Änderungen anderer Geräte verschwinden ohne Meldung.
 
   ## Zusammenfassung
 
@@ -303,7 +559,10 @@ lesson: |
   - DataStore ersetzt `SharedPreferences`: asynchron, transaktional, als `Flow` lesbar; eine Instanz pro Datei.
   - Retrofit beschreibt die API als Interface, kotlinx.serialization wandelt JSON in DTOs; `ignoreUnknownKeys` und Standardwerte machen die App robust gegen Serveränderungen.
   - `IOException`, `HttpException` und `SerializationException` sind drei verschiedene Fehler mit drei verschiedenen Reaktionen; das Repository bildet sie auf fachliche Ergebnisse ab. Abbrüche nie verschlucken.
-  - Offline-first: lesen aus Room, schreiben lokal und über eine Outbox synchronisieren.
+  - Relationen beschreibst du mit Fremdschlüssel, Index und `@Embedded`/`@Relation`; Abfragen darüber laufen in einer `@Transaction`.
+  - Interceptor ergänzen jede Anfrage, der Authenticator erneuert bei 401 das Token – mit Grenze und nur einmal für alle wartenden Aufrufe.
+  - Offline-first: lesen aus Room, schreiben lokal und über eine Outbox synchronisieren. Konflikte mit dem Server brauchen Versionen und eine bewusst gewählte Regel.
+  - Paging 3 lädt Seiten nach; mit `RemoteMediator` schreibt es sie in Room, und die Liste liest nur von dort.
   - WorkManager garantiert Ausführung über Prozesstod und Neustart hinweg; Constraints, Backoff, Unique Work und idempotente Worker gehören zusammen.
 exercises:
   - id: wohin-speichern
@@ -440,6 +699,34 @@ exercises:
         url: https://github.com/Kotlin/kotlinx.serialization/blob/master/docs/json.md
       - title: Serialization (Kotlin-Doku)
         url: https://kotlinlang.org/docs/serialization.html
+  - id: merge-vorhersagen
+    type: output
+    title: Welcher Stand gewinnt?
+    prompt: |
+      Das Handy hat den Titel geändert, das Web-Frontend gleichzeitig die Notiz. Was gibt `main` aus?
+    lang: kotlin
+    code: |
+      data class Topic(val title: String, val note: String, val version: Int)
+
+      fun merge(base: Topic, local: Topic, server: Topic): Topic =
+          server.copy(
+              title = if (local.title != base.title) local.title else server.title,
+              note = if (local.note != base.note) local.note else server.note,
+          )
+
+      fun main() {
+          val base = Topic("Backup", "", 4)
+          val local = Topic("Backup prüfen", "", 4)
+          val server = Topic("Backup", "NAS zuerst", 5)
+          println(merge(base, local, server))
+      }
+    expected: |
+      Topic(title=Backup prüfen, note=NAS zuerst, version=5)
+    explanation: |
+      Feldweises Zusammenführen vergleicht jedes Feld mit dem gemeinsamen Ursprung. Lokal geändert ist nur der Titel, also kommt er vom Handy. Die Notiz hat lokal niemand angefasst, sie kommt vom Server, ebenso dessen Version 5. Last write wins hätte eine der beiden Änderungen verworfen.
+    resources:
+      - title: Offline-first · Conflict resolution
+        url: https://developer.android.com/topic/architecture/data-layer/offline-first#conflict-resolution
   - id: room-schema
     type: gap
     title: Eine Tabelle für Themen
@@ -499,6 +786,54 @@ exercises:
         url: https://developer.android.com/training/data-storage/room#components
       - title: Automated migrations
         url: https://developer.android.com/training/data-storage/room/migrating-db-versions#automated
+  - id: relation-lesen
+    type: gap
+    title: Ein Thema mit seinen Gedanken
+    prompt: |
+      Ergänze Index, Relation und die Annotation an der Abfrage, damit Thema und Gedanken aus demselben Stand kommen. Das Projekt nutzt Room 3.
+    lang: kotlin
+    code: |
+      @Entity(
+          tableName = "thoughts",
+          foreignKeys = [
+              ForeignKey(
+                  entity = TopicEntity::class,
+                  parentColumns = ["id"],
+                  childColumns = ["topicId"],
+                  onDelete = ForeignKey.CASCADE,
+              ),
+          ],
+          indices = [⟦Index("topicId")⟧],
+      )
+      data class ThoughtEntity(@PrimaryKey val id: String, val topicId: String, val text: String)
+
+      data class TopicWithThoughts(
+          ⟦@Embedded⟧ val topic: TopicEntity,
+          @Relation(parentColumns = ["id"], entityColumns = [⟦"topicId"⟧])
+          val thoughts: List<ThoughtEntity>,
+      )
+
+      @Dao
+      interface TopicDao {
+          ⟦@Transaction⟧
+          @Query("SELECT * FROM topics WHERE id = :id")
+          fun observeWithThoughts(id: String): Flow<TopicWithThoughts?>
+      }
+    gaps:
+      - label: Index
+        hint: Auf der Spalte des Fremdschlüssels.
+        accept: ['Index(value = ["topicId"])']
+      - label: Elternobjekt
+        hint: Übernimmt die Spalten des Themas in die Ergebnisklasse.
+      - label: Kindspalte
+        hint: Die Spalte in `thoughts`, die auf das Thema zeigt.
+      - label: Abfrage
+        hint: Room führt zwei Abfragen aus; beide sollen denselben Stand sehen.
+    explanation: |
+      Der Index auf `topicId` hält Löschen, Ändern und „Gedanken zu Thema X“ schnell. `@Embedded` übernimmt die Spalten von `TopicEntity`, `@Relation` holt alle Gedanken, deren `topicId` zur `id` des Themas passt. Weil das zwei Abfragen sind, gehört `@Transaction` an die DAO-Funktion. In Room 3 sind Spalten Arrays, in Room 2 hießen die Parameter `parentColumn` und `entityColumn`.
+    resources:
+      - title: Define one-to-many relationships
+        url: https://developer.android.com/training/data-storage/room/relationships/one-to-many
   - id: datastore-einstellungen
     type: gap
     title: Der Name des Bären
@@ -589,6 +924,41 @@ exercises:
         url: https://lysine.dev/retrofit/
       - title: Retrofit kotlinx.serialization converter
         url: https://github.com/lysine-dev/retrofit/tree/trunk/retrofit-converters/kotlinx-serialization
+  - id: token-interceptor
+    type: gap
+    title: Das Token an jede Anfrage hängen
+    prompt: |
+      Ergänze den Interceptor so, dass jede Anfrage den Header `Authorization: Bearer <token>` bekommt, und registriere ihn als Application Interceptor.
+    lang: kotlin
+    code: |
+      class AuthInterceptor(private val tokens: TokenStore) : Interceptor {
+          override fun intercept(chain: Interceptor.Chain): Response {
+              val token = tokens.accessToken()
+                  ?: return chain.proceed(chain.request())
+              val request = chain.request().⟦newBuilder()⟧
+                  .⟦header⟧("Authorization", "Bearer $token")
+                  .build()
+              return chain.⟦proceed(request)⟧
+          }
+      }
+
+      val client = OkHttpClient.Builder()
+          .⟦addInterceptor⟧(AuthInterceptor(tokens))
+          .build()
+    gaps:
+      - label: Kopie
+        hint: Requests sind unveränderlich; du baust eine geänderte Kopie.
+      - label: Header setzen
+        hint: Ersetzt einen vorhandenen Header gleichen Namens, statt einen zweiten anzuhängen.
+      - label: Weiterreichen
+        hint: Die geänderte Anfrage geht an das nächste Glied der Kette.
+      - label: Registrieren
+        hint: Application, nicht Network.
+    explanation: |
+      `Request` ist unveränderlich, `newBuilder()` liefert eine Kopie zum Ändern. `header` ersetzt einen vorhandenen Wert, `addHeader` hängte einen zweiten an. `chain.proceed(request)` schickt die geänderte Anfrage weiter; wer versehentlich `chain.request()` weiterreicht, schickt die alte ohne Token. `addInterceptor` sieht jeden Aufruf einmal, auch bei Umleitungen.
+    resources:
+      - title: OkHttp · Interceptors
+        url: https://github.com/square/okhttp/blob/master/docs/features/interceptors.md
   - id: workmanager-auftrag
     type: gap
     title: Senden, sobald Netz da ist
@@ -721,6 +1091,70 @@ exercises:
     resources:
       - title: Retry and backoff policy
         url: https://developer.android.com/develop/background-work/background-tasks/persistent/getting-started/define-work#retries_backoff
+  - id: authenticator-schleife
+    type: bug
+    title: Too many follow-up requests
+    prompt: |
+      Ein Admin hat Bear den Zugriff entzogen. Das Erneuern des Tokens klappt weiter, aber der Server lehnt auch jedes neue Token mit 401 ab. Die App hängt ein paar Sekunden und meldet dann `java.net.ProtocolException: Too many follow-up requests: 21`. Finde die Zeile und korrigiere sie.
+    lang: kotlin
+    code: |
+      class TokenAuthenticator(private val tokens: TokenStore) : Authenticator {
+          override fun authenticate(route: Route?, response: Response): Request? {
+              if (response.responseCount >= 2) null
+              val fresh = tokens.refreshBlocking() ?: return null
+              return response.request.newBuilder()
+                  .header("Authorization", "Bearer $fresh")
+                  .build()
+          }
+
+          private val Response.responseCount: Int
+              get() = generateSequence(this) { it.priorResponse }.count()
+      }
+    lines: [3]
+    fix:
+      - line: 3
+        answers:
+          - if (response.responseCount >= 2) return null
+          - if (response.responseCount > 1) return null
+          - if (response.responseCount >= 3) return null
+    hints:
+      - Die Grenze ist da. Was passiert mit ihrem Ergebnis?
+      - "Der Compiler warnt bei dieser Zeile: „Expression is unused.“"
+    explanation: |
+      Zeile 3 rechnet die Grenze richtig aus, aber `null` ohne `return` ist nur ein Ausdruck, dessen Wert verworfen wird; Kotlin warnt mit „Expression is unused.“ Der Authenticator erneuert deshalb bei jeder 401 und schickt die Anfrage wieder, bis OkHttp nach 20 Folgeanfragen abbricht. Mit `return null` gibt er nach der zweiten Ablehnung auf, und die App kann den Nutzer neu anmelden lassen.
+    resources:
+      - title: OkHttp · Handling authentication
+        url: https://github.com/square/okhttp/blob/master/docs/recipes.md#handling-authentication-kt-java
+  - id: paging-doppelt
+    type: bug
+    title: Bücher tauchen doppelt auf
+    prompt: |
+      Die Katalogsuche zeigt die ersten 60 Treffer. Beim Weiterscrollen erscheinen die Treffer 21 bis 40 noch einmal. Die API nimmt `page` (ab 1) und `limit`. `PagingConfig(pageSize = 20)` ist gesetzt. Finde die Zeile und korrigiere sie.
+    lang: kotlin
+    code: |
+      override suspend fun load(params: LoadParams<Int>): LoadResult<Int, BookDto> {
+          val page = params.key ?: 1
+          return try {
+              val books = api.search(query, page = page, limit = params.loadSize)
+              LoadResult.Page(
+                  data = books,
+                  prevKey = if (page == 1) null else page - 1,
+                  nextKey = if (books.size < PAGE_SIZE) null else page + 1,
+              )
+          } catch (e: IOException) {
+              LoadResult.Error(e)
+          }
+      }
+    lines: [4]
+    fix:
+      - line: 4
+        answers:
+          - val books = api.search(query, page = page, limit = PAGE_SIZE)
+    explanation: |
+      Paging lädt beim ersten Mal standardmäßig die dreifache `pageSize` und meldet das in `params.loadSize`: Seite 1 mit 60 Einträgen. Für die API heißt Seite 2 mit `limit = 20` aber „Einträge 21 bis 40“. Bei Seitennummern muss jede Seite gleich groß sein, also eine feste Größe. Alternativ setzt du `initialLoadSize = PAGE_SIZE` im `PagingConfig`; mit Cursor- oder Offset-Schlüsseln tritt das Problem gar nicht auf.
+    resources:
+      - title: Load and display paged data
+        url: https://developer.android.com/topic/libraries/architecture/paging/v3-paged-data#pagingsource
   - id: send-thought-worker-erklaeren
     type: explain
     title: Bears SendThoughtWorker

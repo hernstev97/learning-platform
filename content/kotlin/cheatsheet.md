@@ -120,6 +120,10 @@ try {
 | `rememberCoroutineScope` | UI-Coroutine aus Event-Handler starten |
 | `DisposableEffect(key)` | Registrieren und in `onDispose` aufräumen |
 | `SideEffect` | Zustand nach erfolgreicher Composition veröffentlichen |
+| `remember(key) { … }` | Neu rechnen, wenn sich der Key ändert |
+| `rememberSaveable(saver = …)` | Eigene Klasse mit `listSaver`/`mapSaver` wiederherstellen |
+| `produceState(initial, key)` | Fremde `suspend`-Quelle als State |
+| `snapshotFlow { … }` | Compose-State als Flow |
 
 ```kotlin
 @Composable
@@ -140,11 +144,58 @@ Draft(value = draft, onChange = { draft = it })
 | Route lesen | `entry.toRoute<Detail>()` |
 | Zurück | `nav.popBackStack()`; leeren Verlauf vermeiden |
 | Doppeltes oberstes Ziel vermeiden | `launchSingleTop = true` |
+| Ablauf bündeln | `navigation<Onboarding>(startDestination = Welcome) { … }` |
+| Ablauf verlassen | `navigate(Done) { popUpTo<Onboarding> { inclusive = true } }` |
+| ViewModel für den Ablauf | `viewModel(nav.getBackStackEntry<Onboarding>())` |
+| Ergebnis zurück | `nav.previousBackStackEntry?.savedStateHandle?.set(KEY, wert)` |
+| Bereich wechseln | `popUpTo(graph.findStartDestination().id) { saveState = true }`, `launchSingleTop`, `restoreState` |
+| Zurück abfangen | `BackHandler(enabled = hatEntwurf) { … }` |
 | Datenquelle | Room → Repository → ViewModel → Screen |
 | Änderung | UI-Callback → Owner → Repository → neue Daten |
 | Dauerhafter Bestand | Room |
 | Kleine Einstellungen | DataStore |
 | Verschiebbare Hintergrundarbeit | WorkManager; keine exakte Uhrzeitgarantie |
+| Relation lesen | `@Embedded` + `@Relation(parentColumns = […], entityColumns = […])`, DAO mit `@Transaction` |
+| Fremdschlüssel | `ForeignKey(…)` plus `Index("spalte")` |
+| Token anhängen | OkHttp-`Interceptor` mit `newBuilder().header(…)` |
+| Token erneuern | `Authenticator`: bei 401, Grenze über `priorResponse`, sonst `null` |
+| Lange Listen | `Pager(PagingConfig(pageSize))` → `collectAsLazyPagingItems()`; Netz + Room: `RemoteMediator` |
+| Konflikt beim Sync | Version mitschicken; Server gewinnt, Last write wins oder feldweise zusammenführen |
+
+## Compose fortgeschritten
+
+| Aufgabe | API |
+| --- | --- |
+| Wert animieren | `animateFloatAsState(target, label = …)` |
+| Erscheinen/Verschwinden | `AnimatedVisibility(visible) { … }` |
+| Inhalt wechseln | `AnimatedContent(state) { shown -> … }` – `shown` benutzen |
+| Eigenes Layout | `Layout(content) { ms, cs -> … layout(w, h) { p.placeRelative(x, y) } }` |
+| Zeichnen | `Canvas`, `Modifier.drawBehind`, `drawWithCache { onDrawBehind { … } }` |
+| Geste | `Modifier.pointerInput(key) { detectTapGestures(…) }` |
+| Wert im Teilbaum | `staticCompositionLocalOf { … }`, `CompositionLocalProvider(X provides y)` |
+| Fensterbreite | `currentWindowAdaptiveInfo().windowSizeClass.isWidthAtLeastBreakpoint(WIDTH_DP_MEDIUM_LOWER_BOUND)` |
+| View einbetten | `AndroidView(factory = { … }, update = { … }, onRelease = { … })` |
+
+## Performance und Debugging
+
+| Frage | Werkzeug |
+| --- | --- |
+| Warum komponiert das neu? | Compiler-Report (`reportsDestination`), Layout Inspector mit Recomposition-Zählern |
+| Instabile Klasse? | `val` statt `var`, UI-Modell, `@Immutable`, `stabilityConfigurationFiles` |
+| Wert ändert sich jeden Frame | Lambda-Modifier: `offset { }`, `graphicsLayer { }`, `drawBehind { }` |
+| Welcher Frame ruckelt? | System-Trace, Spur „Janky frames“, Perfetto |
+| Startzeit | Macrobenchmark mit `StartupTimingMetric`, `ReportDrawnWhen` für TTFD |
+| Baseline Profile | `BaselineProfileRule`, `./gradlew :app:generateBaselineProfile`, `None()` gegen `Partial(Require)` |
+| Arbeit auf dem Main-Thread | StrictMode im Debug-Build |
+| Speicherleck | LeakCanary als `debugImplementation` |
+| Absturz im Release | Android vitals, letzte `Caused by`-Zeile, `mapping.txt` |
+
+| Logcat-Abfrage | Bedeutung |
+| --- | --- |
+| `package:mine` | nur deine App |
+| `level:warn` | Warnung und schwerer |
+| `-tag:OkHttp` | Tag ausschließen |
+| `is:crash` | nur Abstürze |
 
 ## Gradle und adb
 
@@ -155,9 +206,13 @@ Draft(value = draft, onChange = { draft = it })
 ./gradlew lintDebug
 ./gradlew assembleDebug
 ./gradlew assembleRelease
+./gradlew :app:generateBaselineProfile
+./gradlew :baselineprofile:connectedBenchmarkReleaseAndroidTest
 adb devices
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 adb logcat
+adb logcat -s StrictMode
+adb shell am start -W -S app.bear/.MainActivity
 ```
 
 | Grenze | Beachten |
@@ -166,7 +221,9 @@ adb logcat
 | `assembleRelease` | Signing-Konfiguration und Artefakt prüfen |
 | Build-Varianten | Task-Namen hängen vom konkreten Projekt ab |
 | Logs / Repository | Keine Tokens, Nutzerdaten oder Signing-Geheimnisse veröffentlichen |
+| Mehrere Module | Build-Logik in Convention Plugins (`build-logic`), Wurzel deklariert Fremd-Plugins mit `apply false` |
+| `api` oder `implementation` | `implementation` als Standard, `api` nur für Typen der öffentlichen Schnittstelle |
 
 ## Offizielle Referenzen
 
-[Kotlin](https://kotlinlang.org/docs/home.html) · [Coroutines](https://kotlinlang.org/docs/coroutines-guide.html) · [Flow](https://kotlinlang.org/docs/flow.html) · [Compose State](https://developer.android.com/develop/ui/compose/state) · [Effekte](https://developer.android.com/develop/ui/compose/side-effects) · [Navigation](https://developer.android.com/guide/navigation/design/type-safety) · [adb](https://developer.android.com/tools/adb)
+[Kotlin](https://kotlinlang.org/docs/home.html) · [Coroutines](https://kotlinlang.org/docs/coroutines-guide.html) · [Flow](https://kotlinlang.org/docs/flow.html) · [Compose State](https://developer.android.com/develop/ui/compose/state) · [Effekte](https://developer.android.com/develop/ui/compose/side-effects) · [Navigation](https://developer.android.com/guide/navigation/design/type-safety) · [Paging](https://developer.android.com/topic/libraries/architecture/paging/v3-overview) · [Compose-Performance](https://developer.android.com/develop/ui/compose/performance) · [Baseline Profiles](https://developer.android.com/topic/performance/baselineprofiles/overview) · [Modularisierung](https://developer.android.com/topic/modularization) · [adb](https://developer.android.com/tools/adb)
