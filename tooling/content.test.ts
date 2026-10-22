@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { join } from 'node:path';
-import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { formatIssues, lessonBlocks, loadContent } from './content.ts';
 import { codeBlock, createMarkdown } from './markdown.ts';
@@ -126,6 +126,32 @@ describe('content', () => {
     expect(toc.map((entry) => entry.title)).toEqual(['Erster Abschnitt', 'Zweiter Abschnitt']);
     const module = loadContent(undefined, join(import.meta.dirname, 'fixtures')).areas.beispiel.modules['alle-typen'];
     expect(module.toc.every((entry) => module.lesson.includes(`id="${entry.id}"`))).toBe(true);
+  });
+  it('renders images from public/media as sized figures and reports missing files and alt texts', () => {
+    const root = mkdtempSync(join(tmpdir(), 'learning-media-'));
+    try {
+      // Smallest valid PNG header: signature, IHDR length and type, then width 640 and height 360.
+      const png = Buffer.alloc(33);
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52]).copy(png);
+      png.writeUInt32BE(640, 16);
+      png.writeUInt32BE(360, 20);
+      const media = join(root, 'public');
+      mkdirSync(join(media, 'media', 'kurs'), { recursive: true });
+      writeFileSync(join(media, 'media', 'kurs', 'szene.png'), png);
+      writeFileSync(join(media, 'media', 'kurs', 'pixel@2x.png'), png);
+      const md = createMarkdown({ media });
+      const figure = md.block('![Szenen-Dock mit drei Nodes](/media/kurs/szene.png "Der Baum der Testszene")');
+      expect(figure).toBe('<figure class="figure"><a class="figure-link" href="/media/kurs/szene.png" target="_blank" rel="noopener"><img src="/media/kurs/szene.png" alt="Szenen-Dock mit drei Nodes" width="640" height="360" loading="lazy" decoding="async"><span class="sr-only"> (in voller Größe, neuer Tab)</span></a><figcaption>Der Baum der Testszene</figcaption></figure>\n');
+      expect(md.block('![Spielbild, doppelt aufgelöst](/media/kurs/pixel@2x.png)')).toContain('width="320" height="180"');
+      expect(md.takeImageProblems()).toEqual([]);
+      md.block('Text mit ![](/media/kurs/szene.png) und ![Fehlt](/media/kurs/fehlt.png) und ![Außen](https://example.com/a.png)');
+      expect(md.takeImageProblems()).toEqual([
+        'Bild /media/kurs/szene.png braucht einen Alt-Text, der beschreibt, was zu sehen ist',
+        'Bild /media/kurs/fehlt.png fehlt: erlaubt sind PNG-Dateien unter public/media/',
+        'Bild https://example.com/a.png fehlt: erlaubt sind PNG-Dateien unter public/media/',
+      ]);
+      expect(md.takeImageProblems()).toEqual([]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
   it('highlights GDScript without making it runnable', () => {
     const html = codeBlock('@export var windup := 12  # Frames\nfunc _ready() -> void:\n\t$Hitbox.monitoring = false\n\tplay(&"attack")', 'gdscript run');
