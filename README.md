@@ -1,6 +1,6 @@
 # learn.kiumu.app
 
-Private Lernplattform für Kotlin & Android, Rust, Linux, Python, Automation mit Python, Git, Data Analysis mit Excel, SQL und Python, Testing & Softwarequalität, SQL & PostgreSQL für Anwendungsentwickler, Combat Design & Game Feel mit Godot 4 sowie Godot 4 für Gestaltung & 2D-Prototypen. Live: [learn.kiumu.app](https://learn.kiumu.app) · Öffentliches Repository: [hernstev97/learning-platform](https://github.com/hernstev97/learning-platform)
+Private Lernplattform für Kotlin & Android, Rust, Linux, Python, Automation mit Python, Git, Data Analysis mit Excel, SQL und Python, Testing & Softwarequalität, SQL & PostgreSQL für Anwendungsentwickler, Erzählhandwerk & interaktive Entscheidungen, Combat Design & Game Feel mit Godot 4, Godot 4 für Gestaltung & 2D-Prototypen sowie Zeichnen, Character Design & Pixelart. Live: [learn.kiumu.app](https://learn.kiumu.app) · Öffentliches Repository: [hernstev97/learning-platform](https://github.com/hernstev97/learning-platform)
 
 Die Plattform ist kein Nachschlagewerk. Jedes Modul besteht aus einer Lektion, die ein Denkmodell aufbaut und auf die offizielle Dokumentation verweist, und aus 10–14 Übungen in fester Reihenfolge: verstehen → vorhersagen → schreiben → Fehler finden → erklären → anwenden. Jeder Bereich hat Interview-Karteikarten mit Wiederholung, Projekte und ein Abschlussprojekt, das wie eine Take-Home-Aufgabe im Bewerbungsprozess geschnitten ist.
 
