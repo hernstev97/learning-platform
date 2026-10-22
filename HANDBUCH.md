@@ -240,6 +240,20 @@ lesson: |
 
 Tabellen (GFM) sind erlaubt und im Spickzettel ausdrücklich erwünscht.
 
+### Bilder
+
+Screenshots und Abbildungen gehören dorthin, wo Text nicht reicht: ein Editor-Dock, das man wiedererkennen soll, ein Spielbild mit einem Darstellungsfehler, den man diagnostiziert. Sie gehen in Lektionen und in allen Markdown-Feldern der Übungen.
+
+```markdown
+![Inspektor eines Sprite2D mit Filter Linear: die Figur ist verwaschen](/media/godot/pixelraster/filter-linear@2x.png "Godot 4.7.2, Filter Linear, vierfach skaliert")
+```
+
+- **Ablage:** nur PNG unter `public/media/<bereich>/<modul>/`. Der Service Worker legt alle PNG-Dateien aus `public/` beim Installieren ab, Bilder gehen also offline. Halte sie klein (Pixelart und Editor-Ausschnitte als PNG mit wenigen Farben, meist unter 100 KB).
+- **Alt-Text ist Pflicht** und beschreibt, was zu sehen ist, auch das, worauf es ankommt. Der Titel in Anführungszeichen wird zur Bildunterschrift; nenne dort Quelle und Version.
+- **Größe:** Der Build liest Breite und Höhe aus der Datei, damit die Seite beim Laden nicht springt. Eine Datei `…@2x.png` hat doppelt so viele Pixel, wie sie anzeigt, und bleibt auf hochauflösenden Displays scharf. Ein Bild ist nie breiter als die Textspalte; ein Tipp öffnet es in voller Größe zum Zoomen. Gestalte Bilder für Unterwegs-Module deshalb so, dass sie bei 330 px Breite lesbar bleiben: lieber einen Ausschnitt als den ganzen Bildschirm.
+- **Prüfung:** `content:check` meldet fehlende Dateien und fehlende Alt-Texte als Fehler. Bilder von außerhalb (`https://…`) sind nicht erlaubt: Sie gingen offline nicht und könnten verschwinden.
+- Ein Bild allein in einem Absatz wird eine Abbildung mit Unterschrift; mitten im Text erscheint es als Block ohne Unterschrift.
+
 ## 7. Übungen
 
 Gemeinsame Felder aller Übungen:

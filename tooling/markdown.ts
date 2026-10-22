@@ -1,8 +1,25 @@
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { Marked, type Tokens } from 'marked';
 import { escape, highlight, languageOf } from '../src/engine/highlight.ts';
 import type { TocEntry } from '../src/content/types.ts';
 
 // Build-time Markdown. Content is authored in this repository and therefore trusted.
+
+const PUBLIC = join(import.meta.dirname, '..', 'public');
+
+/**
+ * Width and height of a PNG under public/media/, in CSS pixels: a name ending in `@2x.png` holds twice as many
+ * pixels as it shows. Null if the file is missing or no PNG.
+ */
+function pngSize(root: string, src: string): { width: number; height: number } | null {
+  const file = join(root, src);
+  if (!/^\/media\/[\w\-/.@]+\.png$/.test(src) || src.includes('..') || !existsSync(file)) return null;
+  const head = readFileSync(file).subarray(0, 24);
+  if (head.toString('latin1', 1, 4) !== 'PNG') return null;
+  const density = Number(src.match(/@(\d)x\.png$/)?.[1] ?? 1);
+  return { width: Math.round(head.readUInt32BE(16) / density), height: Math.round(head.readUInt32BE(20) / density) };
+}
 
 const CALLOUTS: Record<string, string> = {
   NOTE: 'Hinweis', TIP: 'Tipp', WARNING: 'Achtung', INTERVIEW: 'Im Interview', PRAXIS: 'Aus der Praxis', MERKE: 'Merksatz', DEEP: 'Tiefer graben',
@@ -39,13 +56,28 @@ export function codeBlock(text: string, info = ''): string {
   return `<div class="codeblock" ${attrs}><div class="codeblock-bar"><span>${escape(label)}</span></div>${body}</div>`;
 }
 
-export function createMarkdown() {
+export function createMarkdown({ media = PUBLIC }: { media?: string } = {}) {
   let toc: TocEntry[] = [];
   const used = new Set<string>();
+  let imageProblems: string[] = [];
+  /** `![Alt](/media/…png "Caption")`: the size comes from the file, so the page does not jump while it loads. A tap opens the full image. */
+  function image({ href, title, text }: Tokens.Image): string {
+    const size = pngSize(media, href);
+    if (!size) imageProblems.push(`Bild ${href} fehlt: erlaubt sind PNG-Dateien unter public/media/`);
+    if (!text.trim()) imageProblems.push(`Bild ${href} braucht einen Alt-Text, der beschreibt, was zu sehen ist`);
+    const img = `<img src="${escape(href)}" alt="${escape(text)}"${size ? ` width="${size.width}" height="${size.height}"` : ''} loading="lazy" decoding="async">`;
+    return `<a class="figure-link" href="${escape(href)}" target="_blank" rel="noopener">${img}<span class="sr-only"> (in voller Größe, neuer Tab)</span></a>${title ? `<figcaption>${escape(title)}</figcaption>` : ''}`;
+  }
   const marked = new Marked({
     gfm: true,
     renderer: {
       code({ text, lang }: Tokens.Code) { return codeBlock(text, lang ?? ''); },
+      image,
+      // An image on its own line is a figure; its title becomes the caption.
+      paragraph(this: any, { tokens }: Tokens.Paragraph) {
+        if (tokens.length === 1 && tokens[0].type === 'image') return `<figure class="figure">${image(tokens[0] as Tokens.Image)}</figure>\n`;
+        return `<p>${this.parser.parseInline(tokens)}</p>\n`;
+      },
       heading(this: any, { tokens, depth }: Tokens.Heading) {
         const html = this.parser.parseInline(tokens);
         const level = Math.min(depth + 0, 6);
@@ -103,6 +135,12 @@ export function createMarkdown() {
     },
     inline(source: string): string {
       return marked.parseInline(source, { async: false }) as string;
+    },
+    /** Missing files and alt texts of the images rendered since the last call. */
+    takeImageProblems(): string[] {
+      const problems = imageProblems;
+      imageProblems = [];
+      return problems;
     },
   };
 }
