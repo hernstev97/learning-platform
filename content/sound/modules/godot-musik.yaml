@@ -1,0 +1,813 @@
+id: godot-musik
+title: "Musik in Godot: AudioStreamInteractive und Synchronized"
+level: 3
+minutes: 160
+summary: Wie du in Godot 4.7 eigene Musik über eine Übergangstabelle zwischen Zuständen wechselst, Schichten ein- und ausblendest und mit Prüfloops misst, wann ein Wechsel zu hören ist, statt es zu vermuten.
+place: pc
+goals:
+  - Du baust eine Übergangstabelle aus Clips, Zeitpunkt, Ziel-Position, Fade-Modus und Übergangsstück und sagst vorher, wann ein Wechsel hörbar wird.
+  - Du schaltest über das Playback um, nicht über den Stream, und verhinderst mit einem Nachlauf, dass die Musik flattert oder neu beginnt.
+  - Du kennst die gemessenen Abweichungen von der Doku in 4.7.2, etwa die Einblendung nach dem Übergangsstück und `FADE_IN` bei Loops.
+  - Du blendest Schichten eines `AudioStreamSynchronized` per Tween ein und aus und weißt, wie sich eine Kurve in dB von einer linearen unterscheidet.
+  - Du prüfst Übergänge in der Combat-Testszene mit Log und Mitschnitt und liest die Wechselzeit aus der WAV-Datei ab.
+resources:
+  - title: Godot Docs · AudioStreamInteractive · add_transition
+    url: https://docs.godotengine.org/en/stable/classes/class_audiostreaminteractive.html#class-audiostreaminteractive-method-add-transition
+  - title: Godot Docs · AudioStreamPlaybackInteractive
+    url: https://docs.godotengine.org/en/stable/classes/class_audiostreamplaybackinteractive.html#class-audiostreamplaybackinteractive-method-switch-to-clip-by-name
+  - title: Godot Docs · AudioStreamSynchronized
+    url: https://docs.godotengine.org/en/stable/classes/class_audiostreamsynchronized.html#class-audiostreamsynchronized-method-set-sync-stream-volume
+  - title: Godot Docs · Creating movies (Movie Maker)
+    url: https://docs.godotengine.org/en/stable/tutorials/animation/creating_movies.html#command-line-usage
+  - title: Winifred Phillips · Horizontal Resequencing and Dynamic Transitions (GDC 2021)
+    url: https://www.gamedeveloper.com/audio/horizontal-resequencing-and-dynamic-transitions-for-game-music-composers-from-spyder-to-sackboy-gdc-2021-
+lesson: |
+  In der Combat-Testszene beginnt der Dummy in Frame 200 seinen Telegraph. Dein Skript fragt im selben Frame den Musik-Zustand „gefahr“ an. Zu hören ist er erst bei 4,0 Sekunden, also rund Frame 240. Lässt du den Zustand enden, sobald der Angriff vorbei ist, passiert in einem echten Lauf etwas anderes: Bei den ersten beiden Telegraphs wechselt die Musik gar nicht. Beides ist kein Fehler in Godot. Die Übergangstabelle tut genau, was in ihr steht, und dein Code fragt im falschen Rhythmus an.
+
+  Dieses Modul baut die Tabelle mit `AudioStreamInteractive`, misst mit Prüfloops, wann ein Wechsel hörbar wird, und schreibt den Code, der richtig anfragt. Es baut auf [Audio zuordnen](/godot/audio) auf (Player, Busse, Dezibel), auf [Eigenes Stück aufbereiten](/sound/loops-stems) (Import-Felder `bpm`, `beat_count`, `bar_beats`) und auf deinem Zustandsdiagramm aus [Musik für Zustände](/sound/musik-zustaende). Die Zustände „ruhe“ und „gefahr“, das Tempo und alle Längen sind Platzhalter der Testszene. Welche Zustände dein Spiel hat und wie deine Musik sie trägt, entscheidest du.
+
+  ## Der Prüfaufbau: Prüfloops, Offline-Messung, Mitschnitt
+
+  Gemessen wird mit **Prüfloops**, technischen Signalen statt Musik: 120 BPM, 4/4, vier Takte, auf der Eins ein hoher Klick, sonst ein tiefer. Damit du beide Zustände im Kopfhörer und in der Auswertung auseinanderhältst, spielt Zustand A nur links und Zustand B nur rechts. Das Übergangsstück klickt auf beiden Seiten. Wie du so einen Loop mit REAPERs Click Source renderst, steht in [Eigenes Stück aufbereiten](/sound/loops-stems). Für die Messungen in diesem Modul hat dieses Skript dieselben Muster erzeugt:
+
+  ```python
+  import math, struct, wave
+
+  RATE, BPM, TAKTE = 44100, 120, 4            # Platzhalter
+  SCHLAG = round(RATE * 60 / BPM)             # 22050 Samples
+
+
+  def klick(freq):                            # 30 ms, schnell abklingend
+      return [0.5 * min(1, i / 44) * math.exp(-i / 353) * math.sin(2 * math.pi * freq * i / RATE)
+              for i in range(int(RATE * 0.03))]
+
+
+  def pruefloop(datei, hoch, tief, links=True, rechts=True, takte=TAKTE):
+      werte = [0.0] * (SCHLAG * 4 * takte)
+      for s in range(4 * takte):
+          for i, v in enumerate(klick(hoch if s % 4 == 0 else tief)):
+              werte[s * SCHLAG + i] += v
+      with wave.open(datei, "wb") as w:
+          w.setnchannels(2), w.setsampwidth(2), w.setframerate(RATE)
+          w.writeframes(b"".join(struct.pack("<hh", int(v * 32767) * links, int(v * 32767) * rechts) for v in werte))
+
+
+  pruefloop("zustand_a.wav", 1760, 880, rechts=False)
+  pruefloop("zustand_b.wav", 2640, 1320, links=False)
+  pruefloop("uebergang.wav", 3520, 3520, takte=1)
+  ```
+
+  Die WAV-Dateien werden zu Ogg, etwa mit `ffmpeg -i zustand_a.wav -c:a libvorbis -q:a 6 zustand_a.ogg`. Im Import-Dock bekommen die beiden Loops `loop` an, `bpm` 120 und `beat_count` 16, das Übergangsstück `loop` aus, `bpm` 120 und `beat_count` 4. Ohne `bpm` gibt es keinen Takt-Wechsel, dazu unten mehr.
+
+  Gemessen wird auf drei Wegen. Der genaueste braucht keinen Audiotreiber: [`mix_audio()`](https://docs.godotengine.org/en/stable/classes/class_audiostreamplayback.html#class-audiostreamplayback-method-mix-audio) mischt einen Stream Sample für Sample, und du fragst an einer exakt bekannten Stelle um. Die Tabellen in diesem Modul stammen aus solchen Läufen, gemischt mit 44,1 kHz:
+
+  ```gdscript title=messlauf.gd
+  extends SceneTree
+
+  ## Messlauf ohne Audiotreiber: mischt die Musik Sample für Sample und schreibt eine WAV-Datei.
+  ## Aufruf: godot --headless --path . -s messlauf.gd
+
+  const RATE := 44100
+
+
+  func _init() -> void:
+  	var musik: AudioStreamInteractive = load("res://musik.tres")
+  	var pb := musik.instantiate_playback() as AudioStreamPlaybackInteractive
+  	pb.start(0.0)
+  	var frames := pb.mix_audio(1.0, int(5.30 * RATE))   # bis zur Anfrage
+  	pb.switch_to_clip_by_name(&"gefahr")
+  	frames.append_array(pb.mix_audio(1.0, int(6.70 * RATE)))
+  	var data := PackedByteArray()
+  	data.resize(frames.size() * 4)
+  	for i in frames.size():
+  		data.encode_s16(i * 4, int(frames[i].x * 32767))
+  		data.encode_s16(i * 4 + 2, int(frames[i].y * 32767))
+  	var wav := AudioStreamWAV.new()
+  	wav.format = AudioStreamWAV.FORMAT_16_BITS
+  	wav.stereo = true
+  	wav.mix_rate = RATE
+  	wav.data = data
+  	wav.save_to_wav("res://out/messung.wav")
+  	quit()
+  ```
+
+  Im laufenden Spiel schneidest du den Master-Bus mit einem `AudioEffectCapture` oder `AudioEffectRecord` mit ([AudioEffectRecord](https://docs.godotengine.org/en/stable/classes/class_audioeffectrecord.html#class-audioeffectrecord-method-get-recording)). Frame-genau wird es mit dem Movie Maker: `godot --path . --write-movie film.png --fixed-fps 60` schreibt Bilder und daneben eine WAV-Datei ([Creating movies](https://docs.godotengine.org/en/stable/tutorials/animation/creating_movies.html#png)). Sie hat 48 kHz (`editor/movie_writer/mix_rate`), also 800 Samples pro Bild. Der Movie Maker braucht ein Fenster: Mit `--headless` bricht Godot 4.7.2 mit Signal 11 ab.
+
+  Ausgewertet wird mit einem kurzen Skript. Es sucht in jedem Kanal den Beginn jedes Klicks und zählt Nulldurchgänge, um hoch und tief zu unterscheiden:
+
+  ```python
+  import struct, sys, wave
+
+  with wave.open(sys.argv[1]) as w:                 # 16 Bit, Stereo
+      rate, n = w.getframerate(), w.getnframes()
+      werte = struct.unpack(f"<{2 * n}h", w.readframes(n))
+
+  klicks = []
+  for kanal, name in ((0, "A"), (1, "B")):          # A links, B rechts
+      x = werte[kanal::2]
+      i = 0
+      while i < n:
+          if abs(x[i]) > 100:                       # Klick beginnt (etwa -50 dBFS)
+              stueck = x[i:i + rate // 100]         # 10 ms
+              wechsel = sum((a < 0) != (b < 0) for a, b in zip(stueck, stueck[1:]))
+              klicks.append((i / rate, name, "hoch" if wechsel * 50 > 1500 else "tief"))
+              i += rate // 10                       # 100 ms weiter
+          else:
+              i += 1
+
+  for zeit, name, hoehe in sorted(klicks):
+      print(f"{zeit:7.3f} s  {name} {hoehe}")
+  ```
+
+  Für den Messlauf oben mit „nächster Takt“ gibt es aus (Ausschnitt):
+
+  ```text
+    4.500 s  A tief
+    5.000 s  A tief
+    5.499 s  A tief
+    5.997 s  B hoch
+    6.495 s  B tief
+  ```
+
+  Angefragt bei 5,30 s, gewechselt auf der Eins bei 6,0 s. Die 3 ms davor sind gemessen: In den Messläufen wechselte Godot bis zu 124 Samples vor dem Raster, musikalisch bedeutungslos. Das Übergangsstück erscheint in dieser Ausgabe als „A hoch“ und „B hoch“ zur selben Zeit.
+
+  ## Die Übergangstabelle: Clips, Regeln und was ohne Regel passiert
+
+  Ein `AudioStreamInteractive` ist eine Resource. Im Inspektor legst du Clips an, jeder mit Namen und Stream, und wählst den Startclip. Der Knopf *Übergänge bearbeiten* (Edit Transitions) öffnet eine Tabelle „von/nach“, in der du je Paar den Übergang einschaltest (Use Transition) und *Übergang von* (Transition From), *Übergang nach* (Transition To), *Fade-Modus* (Fade Mode), *Fade-Beats* (Fade Beats), *Filler-Clip* (Filler Clip) und *Voriges halten* (Hold Previous) setzt. In Code heißt dasselbe [`add_transition()`](https://docs.godotengine.org/en/stable/classes/class_audiostreaminteractive.html#class-audiostreaminteractive-method-add-transition). So speichert Godot die Resource der Testszene, zwei Regeln, gekürzt:
+
+  ```ini title=musik.tres
+  [resource]
+  clip_count = 3
+  clip_0/name = &"ruhe"
+  clip_0/stream = ExtResource("1_h5apq")
+  clip_1/name = &"gefahr"
+  clip_1/stream = ExtResource("2_vybc6")
+  clip_2/name = &"bruecke"
+  clip_2/stream = ExtResource("3_c7rmj")
+  _transitions = {
+  Vector2i(0, 1): {
+  "fade_beats": 1.0,
+  "fade_mode": 0,
+  "from_time": 2,
+  "to_time": 1
+  },
+  Vector2i(1, 0): {
+  "fade_beats": 2.0,
+  "fade_mode": 2,
+  "from_time": 2,
+  "to_time": 1
+  }
+  }
+  ```
+
+  `Vector2i(0, 1)` ist „von Clip 0 nach Clip 1“, `from_time` 2 heißt „nächster Takt“, `to_time` 1 „Clip-Anfang“, `fade_mode` 2 „Fade-Out“. Clip 2, das Übergangsstück, steht schon in der Liste, aber keine der beiden Regeln benutzt ihn; in der Übung am Ende bekommt die Regel zurück nach „ruhe“ das Übergangsstück. Statt eines Clips darfst du *Beliebiger Clip* (Any Clip) setzen, in Code `CLIP_ANY`. Godot sucht in dieser Reihenfolge: genaues Paar, von diesem Clip zu beliebig, von beliebig zu diesem Clip, beliebig zu beliebig ([Quelltext 4.7.2](https://github.com/godotengine/godot/blob/4.7.2-stable/modules/interactive_music/audio_stream_interactive.cpp)). Findet es nichts, nimmt es eine leere Regel: nächster Schlag, Clip-Anfang, Fade-Modus automatisch, ein Schlag. Gemessen: Ohne jede Regel wechselte die Musik bei 5,5 s, und A klang über einen Schlag aus.
+
+  ## Wann der Wechsel greift: sofort, Schlag, Takt, Ende
+
+  Dieselbe Anfrage bei 5,30 s, vier Regeln, je ein Messlauf, ohne Blende:
+
+  | Übergang ab | Wechsel hörbar |
+  | --- | --- |
+  | `IMMEDIATE` | 5,30 s |
+  | `NEXT_BEAT` | 5,50 s |
+  | `NEXT_BAR` | 6,00 s |
+  | `END` | 8,00 s |
+
+  Godot rechnet nicht mit einer Uhr des Spiels, sondern mit der Position im laufenden Clip. Es nimmt sie modulo Schlag oder Takt und wartet den Rest ab; „Ende“ ist `beat_count` Schläge oder, ohne `beat_count`, die Dateilänge. Das Modell dazu stimmt mit allen Messungen dieses Moduls überein, solange der laufende Clip bei 0 s begonnen hat:
+
+  ```python run
+  def wechsel(anfrage, bpm, bar_beats, art, beat_count=16):
+      schlag = 60 / bpm
+      loop = beat_count * schlag
+      pos = anfrage % loop                       # Position im Clip, er schleift
+      if art == "sofort":
+          warte = 0
+      elif art == "schlag":
+          warte = schlag - pos % schlag
+      elif art == "takt":
+          warte = schlag * bar_beats - pos % (schlag * bar_beats)
+      else:                                      # "ende"
+          warte = loop - pos
+      return round(anfrage + warte, 2)
+
+
+  for art in ["sofort", "schlag", "takt", "ende"]:
+      print(art, wechsel(5.30, 120, 4, art))
+  print("genau auf dem Schlag:", wechsel(5.50, 120, 4, "schlag"))
+  ```
+
+  Drei Folgen davon sind wichtig.
+
+  - **Auf dem Schlag ist schon vorbei.** Eine Anfrage genau bei 5,50 s wartet auf den folgenden Schlag, gemessen 6,00 s.
+  - **Das Raster gehört dem Clip.** Startet B mit „sofort“ und „Clip-Anfang“ bei 5,30 s, liegen seine Takte bei 7,30, 9,30 und so weiter. Eine Anfrage zurück nach A „nächster Takt“ bei 7,0 s wechselte gemessen bei 7,30 s. Mit „gleiche Position“ (`TRANSITION_TO_TIME_SAME_POSITION`) springt B an die Stelle von A, und das Raster bleibt, wo es war.
+  - **Ohne `bpm` gibt es keinen Takt.** Steht `bpm` auf 0, wechselt „nächster Schlag“ und „nächster Takt“ sofort, ohne Fehlermeldung. Zusätzlich zählt `fade_beats` dann in Sekunden: 2 „Schläge“ Crossfade dauerten gemessen 2 Sekunden statt einer.
+
+  Im laufenden Spiel kommt eine kleine Verzögerung dazu: Godot nimmt die Anfrage erst beim nächsten Mischblock an. Für „nächster Schlag“ und „nächster Takt“ spielt das meist keine Rolle; kommt die Anfrage wenige Millisekunden vor der Grenze, kann sie auf die nächste rutschen. Für „sofort“ sind es einige Millisekunden plus die Latenz des Treibers ([`get_output_latency()`](https://docs.godotengine.org/en/stable/classes/class_audioserver.html#class-audioserver-method-get-output-latency)).
+
+  ## Blenden und Übergangsstücke: was die Fade-Modi tun
+
+  Für Blenden taugen Klicks wenig. Die Messung lief mit Dauertönen, A links, B rechts, „sofort“ bei 5,30 s und `fade_beats` 2, also eine Sekunde bei 120 BPM:
+
+  | Fade-Modus | alter Clip A | neuer Clip B |
+  | --- | --- | --- |
+  | `FADE_DISABLED` | sofort aus | sofort voll |
+  | `FADE_IN` | sofort aus | 1 s Einblendung |
+  | `FADE_OUT` | 1 s Ausblendung | sofort voll |
+  | `FADE_CROSS` | 1 s Ausblendung | 1 s Einblendung |
+  | `FADE_AUTOMATIC` | mit Clip-Anfang wie `FADE_OUT`, mit gleicher Position wie `FADE_CROSS` | |
+
+  Die Blende ist linear in der Amplitude. Alle 100 ms gemessen fällt A um −0,4, −1,3, −2,4, −3,7, −5,1, −6,9, −9,1, −12,0, −16,4 und −26,0 dB. In der Mitte steht er also schon bei −6 dB, am Ende stürzt er ab. Aus der Musikproduktion kennst du das als lineare Fade-Kurve; eine andere Form bietet `AudioStreamInteractive` nicht. Brauchst du eine, render sie in die Datei.
+
+  > [!WARNING] Doku und Messung weichen ab
+  > Die Doku beschreibt `FADE_IN` mit „let the current clip finish“ ([FadeMode](https://docs.godotengine.org/en/stable/classes/class_audiostreaminteractive.html#enum-audiostreaminteractive-fademode)). Mit einem Loop als altem Clip stimmt das nicht: Er bricht am Wechselpunkt ab, mit einer Blende von einer Millisekunde. Ausspielen darf er nur, wenn er keinen Loop hat und die Regel „Clip-Ende“ heißt. Und die Import-Seite der Doku nennt `bpm`, `beat_count` und `bar_beats` noch „currently unused“. Gemessen sind sie die Grundlage jedes Takt-Wechsels. Vertrau bei Musik-Übergängen der Messung.
+
+  Ein **Übergangsstück** (Filler) trägst du in der Übergangsregel als *Filler-Clip* ein. So lief „nächster Takt“ mit Übergangsstück von einem Takt und `FADE_DISABLED`, gemessen:
+
+  ```text
+  5,30 s  Anfrage B
+  6,00 s  A hört auf, Übergangsstück beginnt voll
+  8,00 s  Übergangsstück endet nach beat_count 4, B beginnt
+  8,00 s  B blendet ein: −25 dB, −16 dB, −12 dB …
+  9,00 s  B voll
+  ```
+
+  Die Einblendung hast du nicht bestellt. Nach einem Übergangsstück blendet Godot 4.7.2 den Zielclip mit `FADE_DISABLED`, `FADE_OUT` und, bei „Clip-Anfang“, `FADE_AUTOMATIC` immer über eine Sekunde ein, gemessen bei 120 und bei 90 BPM, unabhängig von `fade_beats`. Mit `FADE_IN` und `FADE_CROSS` dauert sie `fade_beats` Schläge; `FADE_AUTOMATIC` mit „gleicher Position“ wird laut Quelltext zu `FADE_CROSS`. Im Quelltext steht an dieser Stelle der Kommentar „start at full volume, as filler is meant as a transition“. Gewollt ist die Einblendung also vermutlich nicht; miss sie nach jedem Godot-Update neu. Soll B nach dem Übergangsstück hart einsetzen, nimm `FADE_IN` mit sehr kleinem `fade_beats`: Mit 0,05 Schlägen, 25 ms bei 120 BPM, war B nach 25 ms voll da. `FADE_IN` schneidet A aber am Takt ab, das Ende von A gehört dann ins Übergangsstück. Das Übergangsstück selbst blendet Godot nie, auch das renderst du in die Datei.
+
+  ### Stinger: einmal hin und zurück
+
+  Ein **Stinger** ist ein kurzes Musikstück, das ein Ereignis markiert. Meist liegt er über der laufenden Musik, dann ist er ein eigener `AudioStreamPlayer`. Er kann die Musik auch kurz ersetzen, danach kehrt sie zurück. Dafür gibt es in `AudioStreamInteractive` zwei Wege. *Voriges halten* (Hold Previous, `hold_previous`) mit dem Auto-Advance-Modus `AUTO_ADVANCE_RETURN_TO_HOLD` kehrte im Messlauf nur zurück, wenn die Regel mit *Voriges halten* schon vor dem Stinger gegriffen hatte, etwa bei A nach B, und der Stinger danach kam. Zurück ging es dann zu A, an die Stelle, an der A verlassen wurde, nicht zu B, das der Stinger ersetzt hatte. Stand *Voriges halten* auf der Regel A nach Stinger selbst, blieb es nach dem Stinger still. Laut [Quelltext](https://github.com/godotengine/godot/blob/4.7.2-stable/modules/interactive_music/audio_stream_interactive.cpp) merkt sich Godot den gehaltenen Clip erst nach der Prüfung auf `AUTO_ADVANCE_RETURN_TO_HOLD`. Miss diesen Weg nach jedem Godot-Update neu. Zuverlässig lief der zweite Weg: Der Stinger bekommt `AUTO_ADVANCE_ENABLED` mit A als nächstem Clip, und die Regel Stinger nach A heißt „Clip-Ende“ und „vorige Position“. Gemessen ging A an der Stelle weiter, an der der Stinger es abgelöst hatte.
+
+  ## Umschalten aus dem Code: Playback, Nachlauf, keine Doppelanfrage
+
+  Umgeschaltet wird nicht am Stream, sondern an seinem Playback, das der Player erst nach `play()` hat ([`get_stream_playback()`](https://docs.godotengine.org/en/stable/classes/class_audiostreamplayer.html#class-audiostreamplayer-method-get-stream-playback)). Die drei typischen Fehler und was Godot 4.7.2 dazu ausgibt:
+
+  ```text
+  get_stream_playback() vor play():
+    ERROR: Player is inactive. Call play() before requesting get_stream_playback().
+  switch_to_clip_by_name() auf dem Stream:
+    SCRIPT ERROR: Invalid call. Nonexistent function 'switch_to_clip_by_name' in base 'AudioStreamInteractive'.
+  unbekannter Clip-Name:
+    ERROR: Clip not found: Kampf
+  ```
+
+  Den Stream-Fehler meldet Godot erst zur Laufzeit, auch wenn die Variable als `AudioStreamInteractive` typisiert ist. Statt der Methode geht auch die Eigenschaft des Players: `player.set(&"parameters/switch_to_clip", &"ruhe")` wechselte gemessen genauso. `get_current_clip_index()` springt erst, wenn der neue Clip gemischt wird, nicht bei der Anfrage. Damit schreibt das Log beides: wann du gefragt hast und wann gewechselt wurde.
+
+  Bevor ein Spielereignis umschaltet, prüf die Tabelle per Taste. Dieses Testgerüst hängt am Musik-Player; die Aktion `musik_wechsel` legst du in der Eingabeliste an, der Name ist ein Platzhalter:
+
+  ```gdscript title=musik_taste.gd
+  extends AudioStreamPlayer
+
+  ## Testgerüst: schaltet mit der Aktion „musik_wechsel“ zwischen zwei Clips um.
+
+  var _target := &"ruhe"
+
+
+  func _ready() -> void:
+  	play()
+
+
+  func _unhandled_input(event: InputEvent) -> void:
+  	if event.is_action_pressed(&"musik_wechsel"):   # Platzhalter-Aktion
+  		_target = &"ruhe" if _target == &"gefahr" else &"gefahr"
+  		get_stream_playback().switch_to_clip_by_name(_target)
+  		HitLog.add("Musik: Anfrage %s" % _target)
+  ```
+
+  Gedrückt in Frame 30 und 150; die Zeilen `spielt` schreibt ein zweites Gerüst, das `get_current_clip_index()` abfragt:
+
+  ```text
+       1  Musik: spielt ruhe
+      30  Musik: Anfrage gefahr
+     121  Musik: spielt gefahr
+     150  Musik: Anfrage ruhe
+     244  Musik: spielt ruhe
+  ```
+
+  Der erste Wechsel kommt an der Eins bei 2,0 s. Der zweite kommt erst bei 4,0 s, obwohl die Taste bei 2,5 s gedrückt wurde: „gefahr“ hat bei 2,0 s begonnen, und sein Takt zählt.
+
+  > [!MERKE]
+  > Frag nie den Clip an, der schon läuft. Godot fasst das als neue Anfrage auf: Der laufende Clip verstummt bis zum Wechselpunkt und beginnt dort von vorn. Gemessen fehlte nach einer Anfrage bei 5,30 s der Klick bei 5,5 s, und bei 6,0 s kam die Eins von Takt 1 statt Takt 4. Wer jeden Frame anfragt, bekommt Stille.
+
+  Dasselbe passiert mit einer zurückgenommenen Anfrage. Fragst du B an und vor dem nächsten Takt wieder A, verwirft Godot das wartende B und startet A am Takt neu (gemessen: B bei 5,30 s, A bei 5,60 s, ab 6,0 s A von vorn). Deshalb braucht die Musikregie zwei Regeln: nur anfragen, wenn sich das Ziel ändert, und einen Zustand erst verlassen, wenn sein Signal eine Zeit lang ununterbrochen fehlt. Diese Wartezeit heißt **Nachlauf**. So sieht die Musikregie für die Testszene aus:
+
+  ```gdscript title=music_director.gd
+  extends Node
+
+  ## Musikregie der Testszene: zwei Platzhalter-Zustände, „ruhe“ und „gefahr“.
+  ## Gefahr, solange ein Gegner im Telegraph oder aktiv ist. Zurück erst nach hold_frames ruhigen Frames.
+
+  @export var music: AudioStreamPlayer
+  @export var enemies: Array[Node] = []
+  @export_range(0, 600) var hold_frames := 120   ## Nachlauf in Physik-Frames ohne Gefahr
+
+  var _target := &"ruhe"
+  var _calm := 0
+  var _clip := -1
+
+
+  func _ready() -> void:
+  	music.play()
+
+
+  func _physics_process(_delta: float) -> void:
+  	var danger := enemies.any(_is_dangerous)
+  	_calm = 0 if danger else _calm + 1
+  	if danger:
+  		_request(&"gefahr")
+  	elif _calm >= hold_frames:
+  		_request(&"ruhe")
+  	_log_switch()
+
+
+  func _is_dangerous(enemy: Node) -> bool:
+  	return enemy.state == enemy.State.TELEGRAPH or enemy.state == enemy.State.ACTIVE
+
+
+  func _request(clip: StringName) -> void:
+  	if clip == _target:
+  		return   # nie den Clip anfragen, der schon gilt
+  	_target = clip
+  	_playback().switch_to_clip_by_name(clip)
+  	HitLog.add("Musik: Anfrage %s" % clip)
+
+
+  func _log_switch() -> void:
+  	var now := _playback().get_current_clip_index()
+  	if now != _clip:
+  		_clip = now
+  		HitLog.add("Musik: spielt %s" % music.stream.get_clip_name(now))
+
+
+  func _playback() -> AudioStreamPlaybackInteractive:
+  	return music.get_stream_playback()
+  ```
+
+  In der Szene hängt ein `AudioStreamPlayer` „Musik“ mit `musik.tres` auf dem Bus `Musik`, daneben ein `Node` „Musikregie“ mit diesem Skript; `music` und `enemies` setzt du im Inspektor. Der Dummy hat einen Angriff (Telegraph 20, aktiv 4, Erholung 30) und `wait_frames` 200. Ein echter Lauf in Echtzeit mit `hold_frames` 120, Log von `HitLog`:
+
+  ```text
+     200  Dummy WAIT -> TELEGRAPH
+     200  Musik: Anfrage gefahr
+     220  Dummy TELEGRAPH -> ACTIVE
+     224  Dummy ACTIVE -> RECOVERY
+     244  Musik: spielt gefahr
+     254  Dummy RECOVERY -> WAIT
+     343  Musik: Anfrage ruhe
+     361  Musik: spielt ruhe
+  ```
+
+  Im Mitschnitt kommt B bei 4,00 s und A bei 6,00 s, jeweils auf der Eins. Die Zeile `spielt` steht einige Frames nach dem Takt, weil Godot den Index beim Mischen umstellt und das Spiel ihn im nächsten Physik-Frame liest. Für das Hören zählt der Mitschnitt. Derselbe Lauf mit `hold_frames` 0, nur die Musik-Zeilen:
+
+  ```text
+     200  Musik: Anfrage gefahr
+     224  Musik: Anfrage ruhe
+     454  Musik: Anfrage gefahr
+     478  Musik: Anfrage ruhe
+     708  Musik: Anfrage gefahr
+     725  Musik: spielt gefahr
+     732  Musik: Anfrage ruhe
+  ```
+
+  Die Gefahr dauert 24 Frames, der Weg zum nächsten Takt bis zu 120. Ob die Musik wechselt, hängt dann davon ab, wo im Takt der Telegraph beginnt. Und zweimal startete „ruhe“ von vorn: Mit einem Prüfloop, der die Taktnummer in der Tonhöhe der Eins trägt, begann „ruhe“ bei 4,0 s und bei 8,0 s jeweils mit Takt 1. Welchen Nachlauf dein Spiel braucht, entscheidest du am Diagramm aus [Musik für Zustände](/sound/musik-zustaende); 120 Frames sind ein Platzhalter.
+
+  > [!INTERVIEW]
+  > „Unsere Kampfmusik setzt manchmal Sekunden zu spät ein und manchmal gar nicht. Woran liegt es?“ Gute Antwort, etwa als Technical Sound Designer: Ich lasse ein Log mit Frame der Anfrage und Frame des tatsächlichen Wechsels laufen und schneide den Ton mit. Wartet ein Takt-Wechsel bis zur Eins, ist „zu spät“ das Raster, kein Fehler, und die dringende Information gehört in ein Geräusch. Kommt der Wechsel gar nicht, prüfe ich, ob der Zustand kürzer ist als der Weg zum Takt und ob der Code die Anfrage zurücknimmt oder den laufenden Clip erneut anfragt. Dann setze ich einen Nachlauf und frage nur bei Änderungen an.
+
+  ## Vertikal: Schichten mit AudioStreamSynchronized
+
+  `AudioStreamSynchronized` spielt bis zu 32 Streams gleichzeitig ab derselben Position, jeden mit eigener Lautstärke in dB ([`set_sync_stream_volume()`](https://docs.godotengine.org/en/stable/classes/class_audiostreamsynchronized.html#class-audiostreamsynchronized-method-set-sync-stream-volume)). Das ist die vertikale Schichtung. Winifred Phillips grenzt sie von Stems für einen Mix ab: Die Schichten sind Dateien, „that are not always meant to play simultaneously“ ([Pure Vertical Layering](https://www.gamedeveloper.com/game-platforms/pure-vertical-layering-for-game-music-composers-from-spyder-to-sackboy-gdc-2021-)). Gleich lang müssen sie trotzdem sein, sonst wandern sie auseinander (siehe [Eigenes Stück aufbereiten](/sound/loops-stems)).
+
+  Die Lautstärke liest Godot bei jedem Mischblock neu. Gemessen liefen beide Wege, ohne dass die Wiedergabe neu startete:
+
+  ```gdscript
+  var tw := create_tween()
+  tw.tween_method(func(db: float): layers.set_sync_stream_volume(1, db), -60.0, 0.0, 1.0)
+  # oder über den Pfad der Eigenschaft:
+  create_tween().tween_property(layers, ^"stream_1/volume", 0.0, 1.0)
+  ```
+
+  Der Inspektor lässt −60 bis +12 dB zu. −60 dB ist nicht stumm, gemessen −60,6 dB unter dem vollen Pegel; im leisen Abschnitt eines Kopfhörermixes kann das zu hören sein. Und die Kurve entscheidet, wie die Blende klingt. Dieselbe Sekunde, einmal in dB linear, einmal in der Amplitude linear (`linear_to_db()` auf 0 bis 1), gemessen:
+
+  | nach | dB linear | Amplitude linear |
+  | --- | --- | --- |
+  | 0,1 s | −51,5 dB | −16,9 dB |
+  | 0,5 s | −27,3 dB | −5,2 dB |
+  | 0,9 s | −3,3 dB | −0,4 dB |
+
+  In dB linear bleibt die Schicht fast die ganze Sekunde leise und kommt am Ende; linear in der Amplitude ist sie nach einer Zehntelsekunde da. Welche Kurve zu deiner Musik passt, hörst du. Die Lautstärke ist eine Eigenschaft der Resource, nicht des Players; laut [Quelltext](https://github.com/godotengine/godot/blob/4.7.2-stable/modules/interactive_music/audio_stream_synchronized.cpp) liest jede Wiedergabe sie dort. Spielen zwei Player dieselbe `.tres`, ändert ein Tween also beide.
+
+  Ein `AudioStreamSynchronized` kann selbst ein Clip in einem `AudioStreamInteractive` sein. Es übernimmt Tempo und Taktart seiner Streams; ein Wechsel „nächster Takt“ aus so einem Clip kam gemessen auf der Eins. So kombinierst du beide Achsen.
+
+  > [!PRAXIS] Viele Segmente, ein Raster
+  > Phillips beschreibt die horizontale Neuordnung als Segmente mit Markern, die „may be positioned on each individual beat, at the beginning of each measure“ ([GDC 2021, Teil 2](https://www.gamedeveloper.com/audio/horizontal-resequencing-and-dynamic-transitions-for-game-music-composers-from-spyder-to-sackboy-gdc-2021-)). In Godot sind das „nächster Schlag“ und „nächster Takt“. Für Spyder hatte jedes Level über dreißig Segmente in zufälliger Reihenfolge. Die Boss-Musik von Sackboy dagegen besteht aus drei Segmenten, deren Übergänge man nicht hören soll. Beides sind Entscheidungen der Komposition, die Technik folgt ihnen. Für zufällige Folgen gibt es in Godot `AudioStreamPlaylist`: `shuffle`, `loop` (Standard an) und `fade_time` (Standard 0,3 s). Mit `bpm` und `beat_count` ging sie gemessen nach dieser Zahl Schläge zum nächsten Stream, sonst nach der Dateilänge ([AudioStreamPlaylist](https://docs.godotengine.org/en/stable/classes/class_audiostreamplaylist.html#class-audiostreamplaylist-property-fade-time)).
+
+  ## Häufige Fehler
+
+  - **Umschalten am Stream.** `switch_to_clip_by_name()` gehört dem Playback; am Stream gibt es nur einen Laufzeitfehler.
+  - **`bpm` 0.** Takt- und Schlagwechsel kommen sofort, `fade_beats` zählt in Sekunden.
+  - **Jeden Frame anfragen.** Die Musik verstummt. Nur bei Änderung anfragen.
+  - **Anfrage zurücknehmen.** Der laufende Clip beginnt am Wechselpunkt von vorn. Nachlauf setzen.
+  - **„sofort“ mit Clip-Anfang, danach Takt-Regeln.** Das Raster verschiebt sich um die Anfragezeit. Gleiche Position nehmen oder auf den Takt wechseln.
+  - **Einblendung nach dem Übergangsstück übersehen.** Mit `FADE_DISABLED` blendet B eine Sekunde ein.
+  - **`FADE_IN` für einen Loop, der ausklingen soll.** Er bricht ab.
+  - **Schicht auf −60 dB für „aus“.** Das ist leise, nicht stumm.
+
+  ## Zusammenfassung
+
+  - `AudioStreamInteractive` wechselt nach einer Tabelle; ohne passende Regel: nächster Schlag, Ausblendung über einen Schlag.
+  - Schlag und Takt rechnet Godot aus der Position im laufenden Clip. Auf dem Schlag heißt: nächster Schlag. „sofort“ mit Clip-Anfang verschiebt das Raster.
+  - `bpm`, `beat_count` und `bar_beats` aus dem Import sind Pflicht für Takt-Wechsel, trotz anderslautender Import-Doku.
+  - Blenden sind linear in der Amplitude. `FADE_IN` schneidet einen Loop ab; nach einem Übergangsstück blendet das Ziel ohne `FADE_IN`/`FADE_CROSS` eine Sekunde ein (gemessen mit „Clip-Anfang“).
+  - Umschalten über `get_stream_playback()`, nur bei Änderung und mit Nachlauf. Der laufende Clip, erneut angefragt, beginnt von vorn.
+  - `AudioStreamSynchronized` blendet Schichten live; Kurve in dB und linear klingen verschieden, −60 dB ist nicht stumm.
+  - Gemessen wird mit Prüfloops: offline mit `mix_audio()`, im Spiel mit Mitschnitt, frame-genau mit dem Movie Maker.
+exercises:
+  - id: fade-modi
+    type: choice
+    title: Wer hört wann auf?
+    prompt: |
+      Alter Clip A ist ein Loop, die Regel heißt „sofort“, `fade_beats` 2 bei 120 BPM. Welche Aussagen entsprechen den Messungen mit Godot 4.7.2? Mehrere Antworten richtig.
+    options:
+      - text: Mit `FADE_OUT` klingt A eine Sekunde lang aus, B setzt sofort voll ein.
+        correct: true
+        why: So gemessen. Die Ausblendung dauert `fade_beats` Schläge, hier zwei zu je 0,5 s.
+      - text: Mit `FADE_IN` spielt A zu Ende, während B einblendet.
+        correct: false
+        why: Das steht so in der Doku, gemessen bricht ein Loop aber am Wechselpunkt ab. Nur ein Clip ohne Loop mit der Regel „Clip-Ende“ darf ausspielen.
+      - text: "`FADE_AUTOMATIC` mit „gleicher Position“ verhält sich wie ein Crossfade."
+        correct: true
+        why: Mit „Clip-Anfang“ wird daraus `FADE_OUT`, mit „gleicher Position“ `FADE_CROSS`. Gemessen und im Quelltext so festgelegt.
+      - text: Nach der halben Blende steht der ausblendende Clip bei −3 dB.
+        correct: false
+        why: Die Blende ist linear in der Amplitude, nach der halben Zeit misst er etwa −6 dB, nicht −3 dB wie bei einer Kurve gleicher Leistung.
+      - text: Mit `FADE_DISABLED` endet A sofort und B setzt sofort voll ein.
+        correct: true
+        why: Ein harter Schnitt, mit einer Mini-Blende von einer Millisekunde gegen Klicks.
+    explanation: |
+      Die Fade-Modi beschreiben zwei Dinge auf einmal: was mit dem alten Clip passiert und was mit dem neuen. Gemessen ist das eindeutig, die Doku-Zeile zu `FADE_IN` aber nicht. Für Loops ist sie falsch. Weil alle Blenden linear in der Amplitude laufen, klingt ein Crossfade in der Mitte dünner als ein Crossfade gleicher Leistung aus REAPER. Ob dich das stört, hörst du mit deiner Musik.
+    resources:
+      - title: Godot Docs · AudioStreamInteractive · FadeMode
+        url: https://docs.godotengine.org/en/stable/classes/class_audiostreaminteractive.html#enum-audiostreaminteractive-fademode
+
+  - id: schicht-kurve
+    type: choice
+    title: Eine Schicht in einer Sekunde einblenden
+    prompt: |
+      Schicht 1 eines `AudioStreamSynchronized` soll von −60 dB auf 0 dB kommen. Welche Aussagen stimmen nach den Messungen? Mehrere Antworten richtig.
+    options:
+      - text: Ein Tween auf `set_sync_stream_volume()` ändert die Lautstärke, während die Musik weiterläuft.
+        correct: true
+        why: Godot liest die Lautstärke bei jedem Mischblock neu. Gemessen startete nichts neu.
+      - text: Linear in dB getweent ist die Schicht nach der halben Zeit fast so laut wie am Ende.
+        correct: false
+        why: Gemessen lag sie nach 0,5 s noch bei −27 dB. Erst kurz vor Schluss wird sie laut.
+      - text: Linear in der Amplitude ist sie nach 0,1 s schon bei rund −17 dB.
+        correct: true
+        why: Ein Zehntel der Amplitude sind −20 dB; gemessen −16,9 dB im Fenster ab 0,1 s.
+      - text: Bei −60 dB ist die Schicht stumm.
+        correct: false
+        why: −60 dB ist ein Tausendstel der Amplitude. In einem leisen Abschnitt kann man das hören. Für „aus“ schaltest du die Schicht ab oder gehst im Code tiefer.
+    explanation: |
+      Die Lautstärke einer Schicht ist eine Zahl in dB, die Godot bei jedem Block liest. Wie sich eine Blende anfühlt, hängt an der Kurve, mit der du diese Zahl bewegst. Linear in dB klingt eher wie ein später Einsatz, linear in der Amplitude wie ein schneller. Keine ist richtig; du wählst nach dem Hören. Prüf außerdem, ob −60 dB in deinem leisesten Abschnitt verschwindet.
+    resources:
+      - title: Godot Docs · AudioStreamSynchronized · set_sync_stream_volume
+        url: https://docs.godotengine.org/en/stable/classes/class_audiostreamsynchronized.html#class-audiostreamsynchronized-method-set-sync-stream-volume
+      - title: Godot Docs · Tween.tween_method
+        url: https://docs.godotengine.org/en/stable/classes/class_tween.html#class-tween-method-tween-method
+
+  - id: filler-ablauf
+    type: order
+    title: Ein Wechsel über ein Übergangsstück
+    prompt: |
+      Regel A nach B: „nächster Takt“, „Clip-Anfang“, `FADE_DISABLED`, Übergangsstück F mit `beat_count` 4, 120 BPM. Bring die Ereignisse in die gemessene Reihenfolge.
+    lang: prose
+    lines: |
+      Der Code fragt B an, A spielt weiter
+      Auf der nächsten Eins hört A auf und F beginnt voll
+      get_current_clip_index meldet den Filler-Clip
+      Nach vier Schlägen endet F und B beginnt
+      B blendet über eine Sekunde ein
+      B spielt mit voller Lautstärke
+    explanation: |
+      Die Anfrage wartet bis zum Takt. Dort übernimmt das Übergangsstück, ungeblendet und in voller Lautstärke, und der Index springt auf F, denn das Playback meldet immer, was gerade gemischt wird. F läuft `beat_count` Schläge, danach beginnt B. Dass B einblendet, obwohl die Regel keine Blende hat, ist das gemessene Verhalten von 4.7.2: Mit `FADE_DISABLED`, `FADE_OUT` und, bei „Clip-Anfang“, `FADE_AUTOMATIC` dauert die Einblendung nach einem Übergangsstück immer eine Sekunde.
+    resources:
+      - title: Godot Docs · AudioStreamInteractive · add_transition
+        url: https://docs.godotengine.org/en/stable/classes/class_audiostreaminteractive.html#class-audiostreaminteractive-method-add-transition
+
+  - id: wechselzeit-90
+    type: output
+    title: Wann wechselt es bei 90 BPM?
+    prompt: |
+      Das Modell aus der Lektion, Prüfloop A mit 90 BPM, 4/4, `beat_count` 16. Die ersten drei Anfragen kommen bei 7,10 s, die letzte bei 12,00 s, nachdem A einmal geschleift hat. Was gibt das Programm aus? Alle Werte sind gegen Messläufe in Godot 4.7.2 geprüft.
+    lang: python
+    code: |
+      def wechsel(anfrage, bpm, bar_beats, art, beat_count=16):
+          schlag = 60 / bpm
+          loop = beat_count * schlag
+          pos = anfrage % loop
+          if art == "schlag":
+              warte = schlag - pos % schlag
+          elif art == "takt":
+              warte = schlag * bar_beats - pos % (schlag * bar_beats)
+          else:
+              warte = loop - pos
+          return round(anfrage + warte, 2)
+
+
+      print(wechsel(7.10, 90, 4, "schlag"))
+      print(wechsel(7.10, 90, 4, "takt"))
+      print(wechsel(7.10, 90, 4, "ende"))
+      print(wechsel(12.00, 90, 4, "takt"))
+    expected: |
+      7.33
+      8.0
+      10.67
+      13.33
+    hints:
+      - Ein Schlag dauert bei 90 BPM 0,667 s, ein Takt 2,667 s, der Loop 10,667 s.
+      - Bei 12,00 s ist A schon wieder bei Position 1,333 s.
+    explanation: |
+      Bei 7,10 s liegt A im elften Schlag, der nächste beginnt bei 7,33 s. Takte beginnen bei 0, 2,67, 5,33 und 8,0 s, also 8,0. „Ende“ wartet auf 16 Schläge, 10,67 s. Bei 12,00 s ist A bei Position 1,33 s im zweiten Durchlauf; der nächste Takt im Clip liegt bei 2,67 s, also 13,33 s. Die Messläufe ergaben 7,331, 7,998, 10,664 und 13,332 s, jeweils wenige Millisekunden vor dem Raster.
+    resources:
+      - title: Godot Docs · AudioStreamInteractive · TransitionFromTime
+        url: https://docs.godotengine.org/en/stable/classes/class_audiostreaminteractive.html#enum-audiostreaminteractive-transitionfromtime
+
+  - id: raster-verschoben
+    type: output
+    title: Wo liegt jetzt der Takt?
+    prompt: |
+      120 BPM, 4/4. A läuft seit 0 s. Bei 5,30 s fragt der Code B an, Regel „sofort“ und „Clip-Anfang“. Bei 7,00 s fragt er A an, Regel B nach A „nächster Takt“. Bei welcher Zeit in Sekunden wird A hörbar? Antworte mit der Zahl, zwei Nachkommastellen.
+    lang: text
+    code: |
+      5.30  Anfrage B   sofort, Clip-Anfang
+      7.00  Anfrage A   nächster Takt
+      ????  A hörbar
+    expected: |
+      7.30
+    accept:
+      - "7,30"
+      - "7.3"
+      - "7,3"
+    hints:
+      - Die Takte von B zählen ab dem Moment, in dem B begonnen hat.
+    explanation: |
+      B startet bei 5,30 s an seinem Anfang. Seine Takte liegen also bei 5,30, 7,30, 9,30 s. Bei 7,00 s ist B bei Position 1,70 s, der nächste Takt im Clip kommt 0,30 s später. Gemessen wechselte A bei 7,30 s. Mit der globalen Rechnung „nächste Eins bei 8,00 s“ lägst du daneben. Wer das Raster behalten will, nimmt für den ersten Wechsel „gleiche Position“ oder wechselt auf den Takt.
+    resources:
+      - title: Godot Docs · AudioStreamInteractive · TransitionToTime
+        url: https://docs.godotengine.org/en/stable/classes/class_audiostreaminteractive.html#enum-audiostreaminteractive-transitiontotime
+
+  - id: filler-voll
+    type: output
+    title: Ab wann ist B voll da?
+    prompt: |
+      120 BPM, 4/4. Regel A nach B: „nächster Takt“, `FADE_DISABLED`, `fade_beats` 1, Übergangsstück F mit `beat_count` 4. Die Anfrage kommt bei 5,30 s. Ab welcher Zeit spielt B mit voller Lautstärke? Antworte in Sekunden mit einer Nachkommastelle.
+    lang: text
+    code: |
+      5.3  Anfrage B
+      ???  B voll
+    expected: |
+      9.0
+    accept:
+      - "9,0"
+      - "9"
+    hints:
+      - Erst die nächste Eins, dann vier Schläge Übergangsstück.
+      - Die Einblendung nach dem Übergangsstück hängt hier nicht an `fade_beats`.
+    explanation: |
+      Die nächste Eins ist 6,0 s, dort beginnt F. Vier Schläge später, bei 8,0 s, beginnt B und blendet ein. Mit `FADE_DISABLED` dauert diese Einblendung in 4.7.2 immer eine Sekunde, gemessen bei 120 und 90 BPM. B ist also ab 9,0 s voll da. Mit `FADE_IN` und `fade_beats` 1 wäre es 8,5 s, mit 0,05 Schlägen 25 ms nach 8,0 s.
+    resources:
+      - title: Godot Docs · AudioStreamInteractive · add_transition
+        url: https://docs.godotengine.org/en/stable/classes/class_audiostreaminteractive.html#class-audiostreaminteractive-method-add-transition
+
+  - id: tabelle-im-code
+    type: gap
+    title: Zwei Regeln und ein Wechsel
+    prompt: |
+      Ergänze: Von „ruhe“ (Clip 0) nach „gefahr“ (Clip 1) auf den nächsten Takt, ohne Blende. Von jedem Clip zurück nach „ruhe“ auf den nächsten Takt mit Ausblendung über zwei Schläge. Umgeschaltet wird am Playback des Players `music`.
+    lang: gdscript
+    code: |
+      var m := AudioStreamInteractive.new()
+      m.clip_count = 2
+      m.set_clip_name(0, &"ruhe")
+      m.set_clip_name(1, &"gefahr")
+      m.add_transition(0, 1, AudioStreamInteractive.⟦TRANSITION_FROM_TIME_NEXT_BAR⟧, AudioStreamInteractive.TRANSITION_TO_TIME_START, AudioStreamInteractive.FADE_DISABLED, 1.0)
+      m.add_transition(AudioStreamInteractive.⟦CLIP_ANY⟧, 0, AudioStreamInteractive.TRANSITION_FROM_TIME_NEXT_BAR, AudioStreamInteractive.TRANSITION_TO_TIME_START, AudioStreamInteractive.⟦FADE_OUT⟧, ⟦2.0⟧)
+      music.stream = m
+      music.play()
+      music.⟦get_stream_playback()⟧.switch_to_clip_by_name(&"gefahr")
+    gaps:
+      - label: Zeitpunkt
+        hint: Die Konstante für „nächster Takt“.
+      - label: Von jedem Clip
+        hint: Eine Konstante mit dem Wert −1.
+      - label: Blende
+        hint: Nur der alte Clip blendet aus.
+        accept: ["FADE_AUTOMATIC"]
+      - label: Länge
+        hint: In Schlägen, als Kommazahl.
+        accept: ["2"]
+      - label: Playback
+        hint: Die Methode des Players, die nach `play()` die laufende Wiedergabe liefert.
+    explanation: |
+      `CLIP_ANY` als Quelle heißt „von jedem Clip“; Godot nimmt diese Regel, wenn es kein genaues Paar gibt. `FADE_OUT` lässt den alten Clip ausklingen, der neue beginnt voll. `FADE_AUTOMATIC` ist hier gleichwertig, weil das Ziel „Clip-Anfang“ ist. Umgeschaltet wird am Playback, das `get_stream_playback()` nach `play()` liefert. Im echten Code bekommen die Clips noch ihre Streams mit `set_clip_stream()`.
+    resources:
+      - title: Godot Docs · AudioStreamInteractive · add_transition
+        url: https://docs.godotengine.org/en/stable/classes/class_audiostreaminteractive.html#class-audiostreaminteractive-method-add-transition
+
+  - id: regie-luecken
+    type: gap
+    title: Nur bei Änderung, erst nach dem Nachlauf
+    prompt: |
+      Ergänze die Musikregie: Ruhige Frames zählen hoch und bei Gefahr auf 0 zurück, „ruhe“ erst nach `hold_frames`, und der Clip, der schon gilt, wird nicht noch einmal angefragt.
+    lang: gdscript
+    code: |
+      func _physics_process(_delta: float) -> void:
+      	var danger := enemies.any(_is_dangerous)
+      	_calm = 0 if danger else ⟦_calm + 1⟧
+      	if danger:
+      		_request(&"gefahr")
+      	elif _calm ⟦>=⟧ hold_frames:
+      		_request(&"ruhe")
+
+
+      func _request(clip: StringName) -> void:
+      	if ⟦clip == _target⟧:
+      		return
+      	_target = clip
+      	_playback().switch_to_clip_by_name(clip)
+    gaps:
+      - label: Zähler
+        hint: Einen Frame mehr.
+        accept: ["1 + _calm"]
+      - label: Vergleich
+        hint: Ab genau `hold_frames` ruhigen Frames.
+        accept: [">"]
+      - label: Schutz
+        hint: Vergleiche mit dem zuletzt angefragten Ziel.
+        accept: ["_target == clip"]
+    explanation: |
+      Der Zähler macht aus „gerade keine Gefahr“ einen Nachlauf: „ruhe“ kommt erst, wenn `hold_frames` Frames lang ununterbrochen keine Gefahr war. `>` statt `>=` verschiebt ihn nur um einen Frame, beides ist eine Wahl. Der Schutz in `_request` ist kein Stil, sondern Pflicht: Ein zweites `switch_to_clip_by_name()` für den Clip, der schon gilt, lässt ihn verstummen und am Wechselpunkt neu beginnen. Die Lösung vergleicht mit `_target`, also mit dem zuletzt angefragten Clip, nicht mit dem, der gerade hörbar ist.
+    resources:
+      - title: Godot Docs · AudioStreamPlaybackInteractive · switch_to_clip_by_name
+        url: https://docs.godotengine.org/en/stable/classes/class_audiostreamplaybackinteractive.html#class-audiostreamplaybackinteractive-method-switch-to-clip-by-name
+
+  - id: wechsel-am-stream
+    type: bug
+    title: Der Telegraph kommt, die Musik nicht
+    prompt: |
+      Beim Telegraph soll die Musik wechseln. Stattdessen steht im Ausgabefenster `Invalid call. Nonexistent function 'switch_to_clip_by_name' in base 'AudioStreamInteractive'.`, und die Musik spielt weiter „ruhe“. Finde die Zeile und korrigiere sie.
+    lang: gdscript
+    code: |
+      @onready var music: AudioStreamPlayer = $Musik
+
+
+      func _ready() -> void:
+      	music.play()
+
+
+      func _on_dummy_telegraph() -> void:
+      	var stream: AudioStreamInteractive = music.stream
+      	stream.switch_to_clip_by_name(&"gefahr")
+    lines: [10]
+    fix:
+      - line: 10
+        answers:
+          - music.get_stream_playback().switch_to_clip_by_name(&"gefahr")
+          - music.get_stream_playback().switch_to_clip_by_name("gefahr")
+          - (music.get_stream_playback() as AudioStreamPlaybackInteractive).switch_to_clip_by_name(&"gefahr")
+          - (music.get_stream_playback() as AudioStreamPlaybackInteractive).switch_to_clip_by_name("gefahr")
+          - music.set(&"parameters/switch_to_clip", &"gefahr")
+          - music.set(&"parameters/switch_to_clip", "gefahr")
+          - music.set("parameters/switch_to_clip", &"gefahr")
+          - music.set("parameters/switch_to_clip", "gefahr")
+          - music["parameters/switch_to_clip"] = &"gefahr"
+          - music["parameters/switch_to_clip"] = "gefahr"
+    explanation: |
+      Der Stream ist die Beschreibung, das Playback die laufende Wiedergabe. Nur das Playback kennt `switch_to_clip_by_name()`. Die typisierte Variable hilft hier nicht: Godot 4.7.2 meldet den Fehler erst zur Laufzeit. Die Eigenschaft `parameters/switch_to_clip` des Players führt zum selben Ziel, mit `set()` oder in eckigen Klammern; alle diese Schreibweisen wechselten in Godot 4.7.2 gemessen den Clip. Zeile 9 ist danach überflüssig.
+    resources:
+      - title: Godot Docs · AudioStreamPlayer · get_stream_playback
+        url: https://docs.godotengine.org/en/stable/classes/class_audiostreamplayer.html#class-audiostreamplayer-method-get-stream-playback
+
+  - id: bpm-null
+    type: bug
+    title: Der Takt-Wechsel kommt sofort
+    prompt: |
+      Die Regel heißt „nächster Takt“, mit Übergangsstück. Im Mitschnitt wechselt der Zustand aber sofort bei der Anfrage, mitten im Takt, und eine Ausblendung über zwei Schläge dauert zwei Sekunden statt einer. Die Datei ist ein Loop mit vier Takten bei 120 BPM. Finde die Zeile in ihrer Import-Datei und korrigiere sie.
+    lang: ini
+    code: |
+      [params]
+
+      loop=true
+      loop_offset=0
+      bpm=0
+      beat_count=16
+      bar_beats=4
+    lines: [5]
+    fix:
+      - line: 5
+        answers:
+          - bpm=120
+          - bpm=120.0
+    explanation: |
+      Ohne `bpm` kennt Godot keinen Schlag. „nächster Schlag“ und „nächster Takt“ werden dann zu „sofort“, ohne Fehlermeldung, und `fade_beats` zählt in Sekunden. Beides ist gemessen. Nach einem Import steht `bpm` auf 0, auch wenn die Datei ein BPM-Tag trägt. Trag den Wert im Import-Dock ein; die Zeile in der `.import`-Datei ist dann das Ergebnis.
+    resources:
+      - title: Godot Docs · AudioStreamOggVorbis.bpm
+        url: https://docs.godotengine.org/en/stable/classes/class_audiostreamoggvorbis.html#class-audiostreamoggvorbis-property-bpm
+
+  - id: log-ohne-mindestdauer
+    type: explain
+    title: Warum die Musik zweimal nicht wechselt
+    prompt: |
+      Ein echter Lauf der Testszene mit `hold_frames` 0, 120 BPM, Regeln „nächster Takt“. Der Dummy ist jeweils 24 Frames lang im Telegraph oder aktiv. Erkläre, warum „gefahr“ erst beim dritten Mal zu hören ist und was ein Nachlauf daran ändert.
+    lang: text
+    code: |
+         200  Musik: Anfrage gefahr
+         224  Musik: Anfrage ruhe
+         454  Musik: Anfrage gefahr
+         478  Musik: Anfrage ruhe
+         708  Musik: Anfrage gefahr
+         725  Musik: spielt gefahr
+         732  Musik: Anfrage ruhe
+    points:
+      - Ein Takt dauert 2 s, also 120 Frames; eine Anfrage wartet bis zu 120 Frames auf die Eins.
+      - Bei Frame 200 und 454 kommt „ruhe“ nach 24 Frames, bevor die nächste Eins erreicht ist; Godot verwirft das wartende „gefahr“.
+      - Die zurückgenommene Anfrage startet „ruhe“ an der Eins von vorn.
+      - Bei Frame 708 liegt die Eins nur 12 Frames entfernt, deshalb wechselt es dort.
+      - Dauern Gefahr und Nachlauf zusammen mindestens einen Takt, bleibt „gefahr“ angefragt, bis es erklungen ist; der Wechsel hängt nicht mehr von der Lage im Takt ab.
+    explanation: |
+      Die Anfragen kommen im Rhythmus des Gegners, die Wechsel im Rhythmus der Musik. Frame 200 ist 3,33 s, die nächste Eins 4,0 s, also Frame 240. Schon bei Frame 224 kommt „ruhe“, und Godot verwirft das wartende „gefahr“. Weil „ruhe“ der laufende Clip ist, beginnt er an der Eins von vorn. Bei Frame 454 ist es dasselbe. Frame 708 ist 11,8 s, die Eins bei 12,0 s kommt nach 12 Frames, also vor der Rücknahme in Frame 732. Ob die Musik wechselt, entscheidet damit der Zufall der Lage im Takt. Ein Nachlauf, im Log mit `hold_frames` 120 gemessen, hält die Anfrage lange genug, damit jeder Telegraph die Musik erreicht: 24 Frames Gefahr plus 120 Frames Nachlauf sind mehr als ein Takt von 120 Frames. Wie lang er sein soll, ist eine Designfrage.
+    resources:
+      - title: Godot Docs · AudioStreamPlaybackInteractive · get_current_clip_index
+        url: https://docs.godotengine.org/en/stable/classes/class_audiostreamplaybackinteractive.html#class-audiostreamplaybackinteractive-method-get-current-clip-index
+
+  - id: testszene-musik
+    type: practice
+    title: Prüfloops und Musikregie in der Testszene
+    prompt: |
+      Bau die Musik in deine Kopie der [Combat-Testszene](/combat/testszene-angriff) ein, mit Prüfloops, nicht mit Musik:
+
+      1. Erzeuge drei Prüfloops (A nur links, B nur rechts, Übergangsstück beidseitig) und importiere sie als Ogg mit `loop`, `bpm`, `beat_count` und `bar_beats`.
+      2. Leg einen Bus `Musik` an, eine Resource `musik.tres` mit drei Clips und zwei Regeln, einen `AudioStreamPlayer` „Musik“ und die Musikregie. Eine der beiden Regeln bekommt das Übergangsstück als *Filler-Clip* (Filler Clip).
+      3. Prüf beide Regeln zuerst per Taste mit `musik_taste.gd`.
+      4. Gib dem Dummy einen Angriff und eine Wartezeit, sodass er alle paar Sekunden telegraphiert und keine Anfrage in das Übergangsstück fällt, und schalte mit der Musikregie um.
+      5. Starte die Szene und lies im Log, wann angefragt und wann gewechselt wurde.
+
+      Die Musikregie ist Code und darf aus der Lektion stammen; die Werte sind Platzhalter.
+    lang: gdscript
+    solution: |
+      # music_director.gd wie in der Lektion. Im Inspektor:
+      #   Musik (AudioStreamPlayer): stream = musik.tres, bus = Musik
+      #   Musikregie (Node): music = ../Musik, enemies = [../Dummy], hold_frames = 120
+      #   Dummy: attacks = [AttackData mit windup 20, active 4, recovery 30], wait_frames = 400
+      #
+      # musik.tres:
+      #   Clip 0 ruhe    = zustand_a.ogg  (loop, bpm 120, beat_count 16, bar_beats 4)
+      #   Clip 1 gefahr  = zustand_b.ogg  (loop, bpm 120, beat_count 16, bar_beats 4)
+      #   Clip 2 bruecke = uebergang.ogg  (ohne loop, bpm 120, beat_count 4)
+      #   ruhe -> gefahr: Next Bar, Clip Start, Fade Mode Disabled
+      #   gefahr -> ruhe: Next Bar, Clip Start, Fade Mode Fade-Out, Fade Beats 2,
+      #                   Filler Clip bruecke
+      #
+      # Erwartetes Log (Echtzeitlauf, Godot 4.7.2):
+      #    400  Dummy WAIT -> TELEGRAPH
+      #    400  Musik: Anfrage gefahr
+      #    485  Musik: spielt gefahr
+      #    543  Musik: Anfrage ruhe
+      #    602  Musik: spielt bruecke
+      #    725  Musik: spielt ruhe
+      # Im Mitschnitt: B ab 8,0 s, Übergangsstück von 10,0 bis 12,0 s,
+      # dann A ab 12,0 s mit einer Einblendung bis 13,0 s.
+      #
+      # wait_frames 400 ist ein Platzhalter. Mit 200 fiel die nächste Anfrage
+      # „gefahr“ (Frame 454) in das Übergangsstück. Gemessen ging es danach
+      # bei 8,0 s direkt zu „gefahr“, „ruhe“ erklang nicht.
+    checklist:
+      - Die Prüfloops liegen als Ogg vor; in ihren `.import`-Dateien stehen `bpm`, `beat_count` und `bar_beats` passend zur Datei.
+      - Im Kopfhörer kommt A von links, B von rechts und das Übergangsstück von beiden Seiten.
+      - Jede Regel hast du einmal per Taste ausgelöst, bevor die Musikregie sie benutzt.
+      - Das Log zeigt zu jeder Anfrage eine spätere Zeile `spielt` mit dem Frame des Wechsels.
+      - Die Musikregie fragt keinen Clip an, der schon gilt; im Log steht keine Anfrage zweimal hintereinander.
+      - Mit `hold_frames` 0 und 120 hast du je einen Lauf gemacht und die Logs verglichen.
+    explanation: |
+      Die Prüfloops machen Fehler hörbar, die in echter Musik als „klingt komisch“ durchgehen: ein Wechsel neben der Eins, ein Neustart, eine Einblendung. Das Log trennt Anfrage und Wechsel. So erkennst du, ob der Code zu spät fragt oder die Tabelle wartet. Erst wenn beides mit Prüfloops stimmt, setzt du deine Musik ein; dann suchst du nur noch musikalische Fragen.
+    resources:
+      - title: Godot Docs · AudioStreamInteractive
+        url: https://docs.godotengine.org/en/stable/classes/class_audiostreaminteractive.html#class-audiostreaminteractive-method-add-transition
+
+  - id: uebergangs-protokoll
+    type: practice
+    title: Prüfprotokoll für deine Übergänge
+    prompt: |
+      Prüf mit deinem eigenen Stück oder mit Prüfloops mindestens drei Übergänge deiner Tabelle. Halte für jeden fest: Regel (von, nach, Zeitpunkt, Ziel, Fade-Modus, Übergangsstück), Anfrage (Frame oder Sekunde), deine Vorhersage mit dem Modell aus der Lektion, gemessener Wechsel aus dem Mitschnitt oder Movie Maker und die Abweichung. Schreib dazu, was du hörst, ohne es zu bewerten, und welche Frage für dich offen bleibt.
+    lang: prose
+    checklist:
+      - Zu jedem Übergang steht die vollständige Regel mit allen sechs Angaben.
+      - Zu jedem Übergang steht eine Vorhersage, aufgeschrieben vor dem Lauf.
+      - Die gemessene Wechselzeit stammt aus einer WAV-Datei, nicht aus dem Log allein.
+      - Bei jeder Abweichung über 50 ms hast du notiert, ob sie aus Raster, Übergangsstück, Einblendung oder Code kommt.
+      - Mindestens ein Übergang ist mit Übergangsstück oder Stinger geprüft.
+      - Zu mindestens einem Übergang steht eine offene Frage, die du mit einem weiteren Lauf klären kannst.
+    explanation: |
+      Ein Übergang ist eine Behauptung: „Bei dieser Anfrage wechselt die Musik dann und so.“ Das Protokoll prüft sie. Die Vorhersage vor dem Lauf zwingt dich, die Regel zu verstehen; die Messung zeigt, ob Godot sie so umsetzt. Abweichungen sind die interessanten Zeilen. In 4.7.2 kommen sie meist aus der Einblendung nach dem Übergangsstück, aus einem verschobenen Raster oder aus dem Code. Was musikalisch richtig ist, entscheidest du danach.
+    resources:
+      - title: Godot Docs · Creating movies (Movie Maker)
+        url: https://docs.godotengine.org/en/stable/tutorials/animation/creating_movies.html#command-line-usage
