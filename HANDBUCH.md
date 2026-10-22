@@ -71,7 +71,7 @@ Eine vollständige, minimale Vorlage mit jeder Übungsart liegt in [`tooling/fix
 
 1. **Lehrplan entwerfen.** Schreibe zuerst die Liste der Module auf: 10–16 Module in 2–4 Tracks, vom Einstieg bis zum Profi-Niveau. Frage dich bei jedem Modul: *Was kann ich danach, was ich vorher nicht konnte?* Und: *Würde ein Arbeitgeber das erwarten?*
 2. **Ordner anlegen:** `content/<bereich>/` mit `area.yaml` (Abschnitt 4). Die Ordner-ID ist kurz, klein und kebab-case, zum Beispiel `go`, `typescript`, `devops`.
-3. **Farbe wählen.** Eine kräftige Farbe, auf der schwarzer Text gut lesbar ist (Kontrast ≥ 4,5 : 1 zu `#0B0B0B`). Vorhandene Farben nicht wiederholen: `#A98BFF` Kotlin, `#FF6A3D` Rust, `#FFD400` Linux, `#4D8BFF` Python, `#2BD97C` Automation, `#FF5CA8` Git, `#22D3EE` Data Analysis, `#C6F432` Testing, `#FF9F1C` PostgreSQL, `#F4A3FF` Erzählhandwerk, `#FF4D6D` Combat Design, `#B5E3FF` Godot, `#FFC6A8` Pixelart. Guter freier Kandidat: `#4FE3C1` (Mint).
+3. **Farbe wählen.** Eine kräftige Farbe, auf der schwarzer Text gut lesbar ist (Kontrast ≥ 4,5 : 1 zu `#0B0B0B`). Vorhandene Farben nicht wiederholen: `#A98BFF` Kotlin, `#FF6A3D` Rust, `#FFD400` Linux, `#4D8BFF` Python, `#2BD97C` Automation, `#FF5CA8` Git, `#22D3EE` Data Analysis, `#C6F432` Testing, `#FF9F1C` PostgreSQL, `#F4A3FF` Erzählhandwerk, `#FF4D6D` Combat Design, `#B5E3FF` Godot, `#FFC6A8` Pixelart, `#4FE3C1` 2D-Animation. Guter freier Kandidat: `#A8B8FF` (Periwinkle).
 4. **Module schreiben** (Abschnitte 5–7). Ein Modul pro Datei, Dateiname = Modul-ID.
 5. **Karten, Projekte, Glossar, Spickzettel, Berufsseite** ergänzen (Abschnitt 8).
 6. **Prüfen:** `pnpm content:check <bereich>`, dann `pnpm verify <bereich>`, dann `pnpm test` und `pnpm build`.
@@ -153,6 +153,7 @@ Manche Bereiche lehren Handwerk ohne Programmcode, zum Beispiel Erzählhandwerk.
 - **Kreative Aufgaben** lassen die Lösung offen. Es gibt keine Mustertexte: `practice` mit `lang: prose` hat keine `solution`, die Checkliste enthält überprüfbare Kriterien, keine Geschmacksurteile. Analysen veröffentlichter Texte dürfen eine Musterantwort haben.
 - **Callouts** `INTERVIEW` und `PRAXIS` nur, wenn sie wirklich passen; `PRAXIS` zeigt dann, wie Studios oder Autoren arbeiten.
 - **Zeichnen und Pixelart** zeigen Pixel als Textraster in `text`-Blöcken, eine Zeile pro Pixelreihe: `#` dunkel, `+` Mittelton, `-` hell, `.` leer, höchstens 16 Pixel breit. Ein `bug` lässt dann die fehlerhafte Reihe anklicken. Zeichenaufgaben laufen auf Papier, Karopapier oder im Editor und werden über die Checkliste selbst geprüft. Die Schaubilder des Bereichs `pixelart` erzeugt `node tooling/pixelart-figures.ts` aus Code; sie zeigen Prinzipien, keine fertigen Figuren. Bilder Dritter werden nur verlinkt.
+- **Animation** zeigt Bewegung als Text: Bildlisten mit Dauer in ms und Ticks, Spacing-Charts mit einem `|` je Zeichnung, Höhen als Balken aus `#`. In Unterwegs-Modulen bleibt jede Zeile solcher Blöcke bei höchstens 34 Zeichen, dann scrollt bei 360 px nichts seitlich. Ob eine Bewegung wirkt, prüft der Lernende im Beobachtungstest mit anderen Menschen und mit Checklisten, nie mit einer automatischen Prüfung.
 
 ## 6. Lektionen schreiben
 
