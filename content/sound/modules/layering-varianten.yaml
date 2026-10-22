@@ -1,0 +1,601 @@
+id: layering-varianten
+title: "Layering und Varianten: ein Klang für eine eigene Aktion"
+level: 2
+minutes: 150
+summary: Wie du einen Klang aus Schichten baust, ohne dass sie sich gegenseitig auslöschen, wie viele Varianten eine Aktion braucht, ob du sie vorab renderst oder Godot sie kombinieren lässt, und wie du das Ergebnis im Spiel blind gegen eine zweite Fassung prüfst.
+place: pc
+goals:
+  - Du baust einen Klang aus Schichten in einem Folder-Track, richtest die Transienten aus und prüfst Versatz, Polarität und Summenpegel.
+  - Du rechnest aus Häufigkeit und Variantenzahl aus, wie oft dieselbe Variante kommt, und begründest den Modus des `AudioStreamRandomizer` mit dem in Godot 4.7.2 gemessenen Verhalten.
+  - Du wägst vorgerenderte Kombinationen gegen Schichten ab, die `AudioStreamSynchronized` zur Laufzeit kombiniert.
+  - Du legst die Transiente auf das Kontaktbild einer selbst gewählten Aktion und rechnest Bildnummern in Frames und Samples um.
+  - Du vergleichst zwei Fassungen im Spiel blind und liest aus der Trefferzahl, ob du sie unterscheiden kannst.
+resources:
+  - title: Godot Docs · AudioStreamRandomizer, PlaybackMode
+    url: https://docs.godotengine.org/en/stable/classes/class_audiostreamrandomizer.html#enum-audiostreamrandomizer-playbackmode
+  - title: Godot Docs · AudioStreamSynchronized
+    url: https://docs.godotengine.org/en/stable/classes/class_audiostreamsynchronized.html
+  - title: REAPER User Guide 7.81 · Folder Tracks (S. 99)
+    url: https://www.reaper.fm/userguide/ReaperUserGuide781c.pdf#page=99
+  - title: Kotaku · Jonathan Blow über die Schritte in The Witness (2012)
+    url: https://kotaku.com/sounds-like-every-footstep-will-matter-in-the-next-game-5964696
+lesson: |
+  Im Training mit dem Dummy aus der [Testszene](/combat/testszene-angriff) schlägst du in einer Minute vierzigmal zu. Jeder Treffer spielt dieselbe Datei. Nach dem zehnten Schlag hörst du nicht mehr den Treffer, sondern die Datei. Jon Fagerström, Sebastian Schlecht und Vesa Välimäki beschreiben das so: Ein einzelnes Sample immer wieder abzuspielen „results in a mechanical output, often called the ‚machine-gun effect‘“ ([DAFx 2021](https://dafx2020.mdw.ac.at/proceedings/papers/DAFx20in21_paper_22.pdf)), kurz: der Maschinengewehr-Effekt.
+
+  Aus der Musik kennst du Round Robin bei Drum-Samplern. Im Spiel kommt hinzu: Wie oft ein Klang spielt, bestimmt der Spieler, und jede Wiederholung hängt an seinem Tastendruck. Dieses Modul baut einen Klang für eine Aktion, die du selbst wählst: aus Schichten, in Varianten, abgestimmt auf die Bilder der Animation und im Spiel gegen eine zweite Fassung getestet. Wie du einen `AudioStreamRandomizer` im Inspektor einrichtest, steht in [Audio zuordnen](/godot/audio). Hier geht es darum, was du hineinlegst und wie er sich verhält. Welche Aktion, welche Quellen und wie es klingt, entscheidest du. Seitenangaben meinen die PDF-Seiten des [REAPER User Guide 7.81](https://www.reaper.fm/userguide/ReaperUserGuide781c.pdf).
+
+  ## Schichten bauen: ein Folder-Track je Klang
+
+  Eine **Schicht** (Layer) ist ein Teilklang, der mit anderen zusammen einen Klang ergibt. Nach der Zeit getrennt: Anschlag (die Transiente), Körper, Fahne. Nach der Frequenz: tief, mittel, hoch. Welche Rolle die Bänder spielen und wie Hyper Light Drifter einen Schuss aus 9 Schichten baut, behandelt [Hüllkurve, Frequenz, Dynamik und Raum](/sound/klangformung). Quellen sind deine Aufnahmen, ein Synthesizer wie Serum 2 oder fremdes Material mit geklärter Lizenz ([Quellen und Lizenzen](/sound/quellen-lizenzen)).
+
+  In REAPER bekommt jeder Klang einen **Folder-Track**, jede Schicht eine Spur darin. Die Kinder senden an den Ordner statt an den Master, FX auf dem Ordner wirken auf die Summe, und mit den Fadern der Kinder stellst du das Verhältnis ein ([S. 99](https://www.reaper.fm/userguide/ReaperUserGuide781c.pdf#page=99)). Die Regionen liegen über dem ganzen Stapel. In der Region Render Matrix aus [REAPER als Werkbank](/sound/reaper-werkbank) kreuzt du den Ordner an, um die Summe zu rendern, denn der Render einer Spur enthält alles, was in sie geroutet ist (S. 417). Kreuzt du die Kinder an, bekommst du jede Schicht einzeln, für den Fall, dass Godot sie kombinieren soll.
+
+  ```text
+  Ordner „schlag“      FX für die Summe
+  ├── anschlag         Items a1, a2, a3
+  ├── koerper          Items k1, k2, k3, k4
+  └── fahne            Items f1, f2
+  Regionen schlag_01 … schlag_04 über dem Stapel
+  (Namen und Anzahl sind Platzhalter)
+  ```
+
+  ## Ausrichten: Transienten, Versatz, Polarität, Summe
+
+  Für das Ausrichten hilft der **Snap Offset**: ein Punkt im Item, an dem es einrastet, statt an seinem Anfang (S. 134). Setzt du ihn auf die Transiente und stellst *Media items snap to* auf *Only snap at start/snap offset*, stapeln sich Items an ihren Transienten (S. 142). Dynamic split kann den Snap Offset auf den Spitzenwert in den ersten Millisekunden setzen (S. 190), und Tab springt zur nächsten Transiente im Item (S. 186).
+
+  Kleine Versätze kosten Tiefe. Spielen zwei ähnliche Schichten mit wenigen Millisekunden Abstand, löschen sich manche Frequenzen aus, andere verstärken sich: ein Kammfilter. Das Modell rechnet zwei gleiche Schichten, eine um 5 ms verschoben, relativ zu einer Schicht allein:
+
+  ```python run
+  import math
+
+  versatz_ms = 5.0
+  for f in (50, 100, 200, 300, 400):
+      faktor = abs(2 * math.cos(math.pi * f * versatz_ms / 1000))
+      db = 20 * math.log10(faktor) if faktor > 1e-9 else float("-inf")
+      print(f, "Hz", round(db, 1))
+  ```
+
+  Bei 5 ms fällt 100 Hz ganz weg, die erste Auslöschung liegt bei 1 / (2 × Versatz). Echte Schichten sind nie gleich, die Auslöschung ist dann teilweise. Du hörst sie trotzdem, wenn du ein Item um ein paar Millisekunden schiebst und das Gewicht dünner wird.
+
+  **Polarität:** Jede Spur hat einen Knopf, der die Phase umkehrt, und jedes Item die Eigenschaft *invert phase* (S. 19, S. 135). Stammen zwei Schichten aus derselben Aufnahme, etwa eine Kopie mit Tiefpass als eigene tiefe Schicht, löscht eine gedrehte Polarität genau das aus, was beide gemeinsam haben. Klingt die Summe dünner als eine Schicht allein, dreh bei einer die Polarität und vergleiche.
+
+  **Summe:** Schichten addieren sich. Wie viel lauter zwei Signale zusammen werden, hängt davon ab, wie ähnlich sie sind; die Rechnung steht in [Mischung](/sound/mischung-stille). Behalte die Anzeige des Ordners im Blick; der *Dry run* beim Rendern markiert Übersteuerungen (S. 416).
+
+  ## Varianten: wie viele, und was Godot daraus macht
+
+  Eine **Variante** ist eine andere Fassung desselben Klangs. Wie viele du brauchst, folgt aus der Cue-Liste ([Vom Ereignis zur Cue-Liste](/sound/klangplan)): wie oft der Klang pro Minute spielt und wie dicht die Wiederholungen aufeinander folgen.
+
+  Was der `AudioStreamRandomizer` daraus macht, hängt am Modus. Gemessen in Godot 4.7.2, je 20 000 Wiedergaben, jede Variante ein Signal, an dem sich ablesen ließ, welche lief:
+
+  | Modus | n | direkt gleich | A-B-A |
+  | --- | --- | --- | --- |
+  | `PLAYBACK_RANDOM` | 4 | 24,8 % | 25,8 % |
+  | `PLAYBACK_RANDOM_NO_REPEATS` | 4 | 0 % | 33,3 % |
+  | `PLAYBACK_RANDOM` | 6 | 16,9 % | 16,7 % |
+  | `PLAYBACK_RANDOM_NO_REPEATS` | 6 | 0 % | 20,4 % |
+  | `PLAYBACK_RANDOM_NO_REPEATS` | 2 | 0 % | 100 % |
+
+  `PLAYBACK_RANDOM` wiederholt mit 1/n, wie ein Würfel. `PLAYBACK_RANDOM_NO_REPEATS` schließt die zuletzt gespielte Variante aus, laut Doku „whenever possible“ ([PlaybackMode](https://docs.godotengine.org/en/stable/classes/class_audiostreamrandomizer.html#enum-audiostreamrandomizer-playbackmode)). Dafür kehrt die vorletzte mit 1/(n − 1) zurück, häufiger als beim Würfel. Dieser Modus ist der Standard (`playback_mode` 0). Über einen echten `AudioStreamPlayer` mit 40 `play()`-Aufrufen, aufgenommen am Master-Bus, ergab er 0 direkte Wiederholungen, `PLAYBACK_RANDOM` 10.
+
+  > [!WARNING] Zwei Varianten, ein neues Muster
+  > Mit zwei Varianten bleibt `PLAYBACK_RANDOM_NO_REPEATS` keine Wahl: A B A B A B. Das ist wieder ein festes Muster, nur mit doppelter Periode. Und dieselbe Datei zweimal im Pool zählt in diesem Modus als eine: Mit A, A, B wechselte Godot 4.7.2 streng zwischen A und B, statt A doppelt so oft zu spielen. Gewichten geht über das Gewicht je Eintrag (`stream_N/weight`, im Code [`set_stream_probability_weight()`](https://docs.godotengine.org/en/stable/classes/class_audiostreamrandomizer.html#class-audiostreamrandomizer-method-set-stream-probability-weight)). Gemessen in 4.7.2 mit Gewicht 2 für A und 1 für B und C, je 20 000 Wiedergaben: A kam mit `PLAYBACK_RANDOM` in 49 % der Fälle, mit `PLAYBACK_RANDOM_NO_REPEATS` in 40 %, ohne Gewicht wären es 33 %.
+
+  Ein Modell in Python verhält sich genauso, wenn es die zuletzt gezogene Variante ausschließt:
+
+  ```python run
+  import random
+  random.seed(1)
+
+  def ziehen(n, zuege, ohne_wiederholung):
+      folge, letzte = [], None
+      for _ in range(zuege):
+          auswahl = [v for v in range(n) if not (ohne_wiederholung and v == letzte)]
+          letzte = random.choice(auswahl or list(range(n)))
+          folge.append(letzte)
+      return folge
+
+  for modus, ohne in (("RANDOM", False), ("NO_REPEATS", True)):
+      f = ziehen(4, 20000, ohne)
+      direkt = sum(a == b for a, b in zip(f, f[1:])) / (len(f) - 1)
+      aba = sum(a == c for a, c in zip(f, f[2:])) / (len(f) - 2)
+      print(f"{modus:10}  direkt {direkt:.3f}  A-B-A {aba:.3f}")
+  ```
+
+  **Woher die Unterschiede kommen:** Am stärksten unterscheiden sich echte Takes, weil Anschlag und Körper jedes Mal anders ausfallen; deshalb nimmst du in [Feldaufnahme mit dem Handy](/sound/feldaufnahme) gleich mehrere auf. Aus einem Take werden weitere, wenn du einen anderen Ausschnitt nimmst. Die Tonhöhe stellst du je Item in Halbtönen ein, Shift+9 und Shift+0 verschieben um einen Halbton, Shift+7 und Shift+8 um einen Cent ([S. 193–194](https://www.reaper.fm/userguide/ReaperUserGuide781c.pdf#page=193)). Godot kann Tonhöhe und Lautstärke bei jeder Wiedergabe zufällig ändern; Nicolae Berbece rät zu leicht veränderter Tonhöhe bei jedem Abspielen ([Game Feel: Why Your Death Animation Sucks](https://www.youtube.com/watch?v=pmSAG51BybY), ab etwa 13:04). Eine Tonhöhenänderung verschiebt aber den ganzen Klang gleich, das Muster aus Anschlag und Körper bleibt. Zufallswerte strecken deine Takes, sie ersetzen sie nicht.
+
+  Gleich laut? Eine Variante ist hier die Summe mehrerer Schichten, also normalisierst du die gerenderte Datei, nicht die Items darin: im Render-Dialog unter *Postprocess…*, „each file separately“ gleicht die Varianten an, „to loudest file“ erhält ihre Unterschiede (S. 414). *Normalize items* je Item würde das Verhältnis der Schichten ändern und den Pegel vor den FX des Ordners ([REAPER als Werkbank](/sound/reaper-werkbank)). Ein Normalisierungswert ist ein Startpunkt. Ob eine Variante lauter wirkt, hörst du im Spiel.
+
+  > [!PRAXIS] 1119 Schritte in The Witness
+  > Jonathan Blow erklärte 2012 auf dem Blog des Spiels, zitiert bei Kotaku, warum The Witness damals schon 1119 Schrittklänge hatte: getrennte Klänge für linken und rechten Fuß, je Material „5-6 variations for each foot, to avoid mechanical-sounding repeats“, dazu Schritte mit eigenem Hall für bestimmte Orte und „texture footsteps“, die über einen Grundschritt gelegt werden. Läuft man über Gras, durch das etwas Erde schaut, spielt das Spiel den Grasschritt mit einer Erdschicht, deren Lautstärke davon abhängt, wie viel Erde sichtbar ist ([Kotaku](https://kotaku.com/sounds-like-every-footstep-will-matter-in-the-next-game-5964696)). Varianten und Schichten sind dort keine Verzierung, sondern Datenmodell.
+
+  ## Vorgerendert oder in Godot kombiniert
+
+  Zwei Wege führen zu Abwechslung aus Schichten:
+
+  - **Vorgerendert:** Jede Kombination wird eine Datei. Jede hast du gehört und geprüft, aber 3 Anschläge × 4 Körper × 2 Fahnen sind 24 Dateien.
+  - **Zur Laufzeit:** Du renderst die Schichten einzeln und lässt Godot kombinieren. 9 Dateien ergeben 24 Kombinationen, von denen du manche nie zusammen gehört hast.
+
+  Für die Laufzeit gibt es `AudioStreamSynchronized`. Laut Doku beginnen seine Streams „at exactly the same time when play is pressed“ und enden, wenn der letzte endet ([AudioStreamSynchronized](https://docs.godotengine.org/en/stable/classes/class_audiostreamsynchronized.html)). Legst du in jeden Platz einen `AudioStreamRandomizer`, wählt jede Schicht bei jeder Wiedergabe neu:
+
+  ```gdscript title=schichten.gd
+  extends AudioStreamPlayer
+  ## Spielt zwei Schichten im selben Sample. Jede Schicht wählt ihre Variante
+  ## bei jeder Wiedergabe neu. Varianten im Inspektor eintragen.
+
+  @export var anschlag: Array[AudioStream] = []
+  @export var koerper: Array[AudioStream] = []
+
+
+  func _ready() -> void:
+  	var schichten := AudioStreamSynchronized.new()
+  	schichten.stream_count = 2
+  	schichten.set_sync_stream(0, _randomizer(anschlag))
+  	schichten.set_sync_stream(1, _randomizer(koerper))
+  	stream = schichten
+
+
+  func _randomizer(varianten: Array[AudioStream]) -> AudioStreamRandomizer:
+  	var r := AudioStreamRandomizer.new()
+  	r.playback_mode = AudioStreamRandomizer.PLAYBACK_RANDOM_NO_REPEATS
+  	for v in varianten:
+  		r.add_stream(-1, v)
+  	return r
+  ```
+
+  Gemessen in Godot 4.7.2: Mit 3 Anschlägen und 4 Körpern ergaben 200 Wiedergaben alle 12 Kombinationen. Im Aufbau mit dem Master-Bus begannen beide Schichten in jeder von 40 Wiedergaben im selben Sample, und `finished` kam einmal je Wiedergabe. Zwei getrennte Player, im selben Frame gestartet, trafen im selben Messaufbau 100-mal von 100 ebenfalls dasselbe Sample. Das zeigt nur, dass es dort so war; zugesagt ist der gemeinsame Start beim `AudioStreamSynchronized`. Im Inspektor geht es ohne Code: *Stream* → *New AudioStreamSynchronized*, *Stream Count* 2, in jeden Platz einen neuen `AudioStreamRandomizer`.
+
+  > [!DEEP] Wie die Messung lief
+  > Jede Variante war ein `AudioStreamWAV` mit einem konstanten Wert, je Variante ein anderer. `instantiate_playback()` und `mix_audio()` lieferten für jede Wiedergabe die ersten Samples, und am Wert ließ sich ablesen, welche Variante lief. Für die Gegenprobe spielte ein `AudioStreamPlayer` headless, ein `AudioEffectRecord` auf dem Master-Bus nahm auf, und ein Python-Skript las die WAV aus. Bei den Schichten war eine Schicht in Hundertsteln, die andere in Zehnteln abgestuft, sodass jede Summe genau eine Kombination verriet.
+
+  ## Auf deine Aktion abgestimmt
+
+  Wähl eine Aktion aus deinen Animationen, für die du im Prüfprotokoll von [In der Testszene prüfen](/animation/testszene) die Ton-Bilder markiert hast. Dort stehen Bildnummern, keine Millisekunden ([Animation im Spiel](/animation/animation-im-spiel)). Jetzt rechnest du um. Bild k einer Animation mit s Bildern pro Sekunde beginnt bei (k − 1) / s Sekunden, wenn alle Bilder gleich lang stehen:
+
+  ```text
+  Animation       12 Bilder/s, Kontakt in Bild 4
+  Beginn Bild 4   (4 − 1) / 12 = 0,25 s
+  Physik-Frames   0,25 × 60 = 15
+  Samples         0,25 × 48 000 = 12 000
+  ```
+
+  Die Transiente gehört auf dieses Bild, bei einem Treffer in den Frame, in dem der Treffer gemeldet wird ([Trefferfeedback](/combat/trefferfeedback)). Zwei weitere Maße prüfst du: die Länge des Klangs gegen die Dauer der Aktion und gegen den Abstand zur nächsten Wiederholung. Ein Körper, der länger klingt als der Abstand zwischen zwei Schlägen, liegt beim nächsten Schlag unter dessen Anschlag.
+
+  In REAPER stellst du die Zeitleiste per Rechtsklick auf *Absolute Frames* (S. 46) und die Bildrate unter *Project Settings → Video* auf 60 (S. 408, S. 410). Dann liest du Frames direkt ab. Wie du einen Clip deiner Szene als Bildspur ins Projekt holst, steht in [Foley, Atmo und eigenes Material](/sound/foley-umgebung).
+
+  ## Im Spiel prüfen: A/B blind
+
+  Im Editor klingt jede Fassung anders als im Spiel, zwischen Schritten, Musik und Hitstop. Also vergleichst du im Spiel, und zwar blind: Wer weiß, welche Fassung läuft, hört, was er erwartet. Das Skript hängt an einem `AudioStreamPlayer` unter dem Dummy und spielt je Treffer Fassung A oder B. Tab schaltet um. Mit `blind` wählt es bei jedem Treffer zufällig, und erst F2 gibt aus, was lief.
+
+  Warum F2: Startest du das Spiel aus dem Editor, gehören drei Funktionstasten dem Editor. F8 beendet das Spiel ([Running the scene](https://docs.godotengine.org/en/stable/getting_started/step_by_step/nodes_and_scenes.html#running-the-scene)), F9 hält es im Game-Fenster an, F10 rückt einen Frame vor ([Game embedding](https://docs.godotengine.org/en/stable/tutorials/editor/game_embedding.html#pause-f9)). Laut Quelltext von 4.7.2 erkennt das aus dem Editor gestartete Spiel diese Tasten selbst und meldet sie dem Editor; deine Skripte bekommen sie trotzdem ([scene_debugger.cpp](https://github.com/godotengine/godot/blob/4.7.2-stable/scene/debugger/scene_debugger.cpp)). Eine Auswertung auf F9 hielte das Spiel also zugleich an. Tab und F2 fängt es nicht ab. Getestet ist das Skript in Godot 4.7.2 headless mit simulierten Tasten, nicht im Editor.
+
+  ```gdscript title=ab_hit_sound.gd
+  extends AudioStreamPlayer
+  ## Spielt bei jedem Treffer Fassung A oder B desselben Klangs.
+  ## Tab schaltet zwischen A und B um. Mit blind = true wählt das Skript
+  ## bei jedem Treffer zufällig; F2 gibt danach aus, was lief.
+
+  @export var stream_a: AudioStream
+  @export var stream_b: AudioStream
+  @export var blind := false
+
+  var _use_b := false
+  var _played: PackedStringArray = []
+
+
+  func play_hit() -> void:
+  	if blind:
+  		_use_b = randi() % 2 == 1
+  	stream = stream_b if _use_b else stream_a
+  	_played.append("B" if _use_b else "A")
+  	play()
+
+
+  func _unhandled_key_input(event: InputEvent) -> void:
+  	if not event.is_pressed() or event.is_echo():
+  		return
+  	var key := (event as InputEventKey).keycode
+  	if key == KEY_TAB and not blind:
+  		_use_b = not _use_b
+  		print("Fassung jetzt: ", "B" if _use_b else "A")
+  	elif key == KEY_F2:
+  		print("Gespielt: ", " ".join(_played))
+  		_played.clear()
+  ```
+
+  In `enemy.gd` aus der Testszene ruft `take_hit()` den Ton auf, direkt nach der Zeile, die den Treffer ins Log schreibt. So liegt er im Frame der Treffermeldung:
+
+  ```gdscript
+  	HitLog.add("%s getroffen: …" % […])
+  	if has_node(^"HitSound"):
+  		$HitSound.play_hit()
+  ```
+
+  Der Ablauf: zehn Treffer blind, nach jedem A oder B notieren und einen Satz zum Eindruck, erst dann F2. Wer rät, kommt in 5,5 % der Fälle auf 8 von 10 oder mehr; die Rechnung steht in einer Übung. Liegst du bei 5 von 10, unterscheidest du die Fassungen im Spiel nicht, so deutlich der Unterschied im Editor auch war.
+
+  ```text
+  A/B-Protokoll   Datum, Godot 4.7.2
+  Aktion          …, Treffer in Frame …
+  A               Fassung 1
+  B               Fassung 2, eine Änderung: …
+  Blind, 10       Tipp:     A A B …
+                  Gespielt: A B B …
+  Richtig         … von 10
+  Eindruck        „…“ (vor F2 notiert)
+  Entscheidung    …
+  ```
+
+  > [!INTERVIEW]
+  > „Unsere Schritte nerven nach zwei Minuten. Was machst du?“ Gute Antwort, etwa als Audio Designer: Erst zählen, wie oft sie pro Minute spielen und wie viele Varianten es gibt, dann den Modus des Containers prüfen; mit zwei Varianten und Wiederholungsschutz entsteht ein A-B-A-B. Danach mehr echte Takes statt nur Tonhöhe, eventuell Schichten, die die Engine kombiniert. Jede Änderung höre ich im Spiel gegen die alte Fassung, möglichst blind, und ich höre mindestens so lange, wie es dauert, bis es nervt.
+
+  ## Häufige Fehler
+
+  - **Nur die Tonhöhe variiert.** Das Muster aus Anschlag und Körper bleibt erkennbar.
+  - **Zwei Varianten mit Wiederholungsschutz.** Ergibt A B A B.
+  - **Dieselbe Datei zweimal im Pool.** Gewichtet sie mit `PLAYBACK_RANDOM_NO_REPEATS` nicht doppelt; dafür gibt es das Gewicht je Eintrag.
+  - **Schichten um Millisekunden versetzt.** Ein Kammfilter frisst das Gewicht.
+  - **Gedrehte Polarität bei Schichten aus derselben Aufnahme.** Gemeinsame Anteile löschen sich aus.
+  - **Transiente nach Millisekunden statt nach dem Kontaktbild gesetzt.** Nach der nächsten Timing-Änderung sitzt sie falsch.
+  - **Körper länger als der Abstand zur nächsten Wiederholung.** Der nächste Anschlag verschwimmt.
+  - **Im Editor verglichen, nicht blind.** Du hörst, was du erwartest.
+
+  ## Zusammenfassung
+
+  - Schichten nach Zeit (Anschlag, Körper, Fahne) und Frequenz; in REAPER ein Folder-Track je Klang, Regionen über dem Stapel.
+  - Snap Offset auf der Transiente richtet Schichten aus; wenige Millisekunden Versatz löschen tiefe Frequenzen aus.
+  - `PLAYBACK_RANDOM` wiederholt mit 1/n, `PLAYBACK_RANDOM_NO_REPEATS` nie direkt, dafür A-B-A mit 1/(n − 1); mit zwei Varianten entsteht A B A B.
+  - Echte Takes tragen die Abwechslung, Tonhöhe und Lautstärke strecken sie.
+  - Vorgerendert heißt geprüft, aber viele Dateien; `AudioStreamSynchronized` mit Randomizern kombiniert zur Laufzeit und startet die Schichten gemeinsam.
+  - Die Transiente liegt auf dem Kontaktbild: Bild k bei (k − 1) / s Sekunden.
+  - Fassungen vergleichst du im Spiel und blind; die Trefferzahl sagt, ob du sie unterscheidest.
+exercises:
+  - id: modus-wahl
+    type: choice
+    title: Was der Wiederholungsschutz tut
+    prompt: |
+      Welche Aussagen über `AudioStreamRandomizer` in Godot 4.7.2 stimmen, so wie in der Lektion gemessen?
+    options:
+      - text: Mit `PLAYBACK_RANDOM_NO_REPEATS` und vier Varianten kommt dieselbe Variante nie zweimal direkt hintereinander.
+        correct: true
+        why: In 20 000 Wiedergaben gab es keine direkte Wiederholung.
+      - text: Mit `PLAYBACK_RANDOM_NO_REPEATS` und zwei Varianten wechseln sie streng ab.
+        correct: true
+        why: Schließt der Modus die letzte Variante aus, bleibt nur die andere. Gemessen kam A-B-A in 100 % der Fälle.
+      - text: "`PLAYBACK_RANDOM` vermeidet Wiederholungen, solange es mehr als zwei Varianten gibt."
+        correct: false
+        why: "`PLAYBACK_RANDOM` wählt wie ein Würfel; mit vier Varianten war fast jede vierte Wiedergabe eine direkte Wiederholung."
+      - text: Trägst du dieselbe Datei zweimal ein, spielt `PLAYBACK_RANDOM_NO_REPEATS` sie doppelt so oft.
+        correct: false
+        why: Im Modus ohne Wiederholung zählte sie als eine. Mit A, A, B wechselten A und B streng ab.
+      - text: Ohne Änderung im Inspektor steht ein neuer Randomizer auf `PLAYBACK_RANDOM`.
+        correct: false
+        why: Der Standard ist `PLAYBACK_RANDOM_NO_REPEATS`, `playback_mode` 0.
+    explanation: |
+      Der Wiederholungsschutz verhindert nur die direkte Wiederholung. Er verlagert sie: Die vorletzte Variante kommt häufiger zurück. Mit zwei Varianten wird daraus ein festes Muster. Mehr echte Varianten sind deshalb das wirksamere Mittel gegen Gleichförmigkeit als der Modus allein.
+    resources:
+      - title: Godot Docs · AudioStreamRandomizer, PlaybackMode
+        url: https://docs.godotengine.org/en/stable/classes/class_audiostreamrandomizer.html#enum-audiostreamrandomizer-playbackmode
+
+  - id: schichten-ordnen
+    type: order
+    title: Ein Klang aus Schichten
+    prompt: |
+      Bring die Arbeitsschritte in eine sinnvolle Reihenfolge, vom leeren Projekt zur gerenderten Summe.
+    lang: prose
+    lines: |
+      Einen Folder-Track für den Klang anlegen, je Schicht eine Kinderspur.
+      Die Items der Schichten auf die Spuren legen.
+      Snap Offset jedes Items auf seine Transiente setzen und die Items daran ausrichten.
+      Die Summe gegen jede Schicht allein hören, Versatz und Polarität prüfen.
+      Mit den Fadern der Kinder das Verhältnis einstellen, die Anzeige des Ordners im Blick.
+      Je Variante eine Region über den ganzen Stapel legen.
+      In der Region Render Matrix den Ordner ankreuzen und rendern.
+    alternatives:
+      - [1, 2, 3, 4, 6, 5, 7]
+    explanation: |
+      Erst die Struktur, dann der Inhalt, dann die Ausrichtung. Versatz und Polarität prüfst du, bevor du Pegel einstellst, weil eine Auslöschung jeden Fader-Wert wertlos macht. Die Regionen hängen nur an der Lage der Items; ob du sie vor oder nach den Fadern legst, ist gleich. Gerendert wird zuletzt, und zwar der Ordner, weil sein Render alle Kinder enthält.
+    resources:
+      - title: REAPER User Guide 7.81 · Folder Tracks (S. 99)
+        url: https://www.reaper.fm/userguide/ReaperUserGuide781c.pdf#page=99
+      - title: REAPER User Guide 7.81 · Snap Offset (S. 142)
+        url: https://www.reaper.fm/userguide/ReaperUserGuide781c.pdf#page=142
+
+  - id: wiederholungen
+    type: output
+    title: Wie oft hörst du dieselbe Variante?
+    prompt: |
+      Ein Treffer spielt 30-mal pro Minute (Platzhalter), es gibt vier Varianten. Das Programm rechnet erwartete Werte aus. Was gibt es aus?
+    lang: python
+    code: |
+      n = 4          # Varianten
+      treffer = 30   # pro Minute
+      # PLAYBACK_RANDOM: erwartete direkte Wiederholungen pro Minute
+      print(round((treffer - 1) / n, 2))
+      # PLAYBACK_RANDOM_NO_REPEATS: erwartete A-B-A pro Minute
+      print(round((treffer - 2) / (n - 1), 2))
+      # PLAYBACK_RANDOM: mindestens eine direkte Wiederholung in 10 Treffern
+      print(round(1 - (1 - 1 / n) ** 9, 3))
+    expected: |
+      7.25
+      9.33
+      0.925
+    explanation: |
+      Bei 30 Treffern gibt es 29 Paare direkt aufeinanderfolgender Treffer; jedes ist mit 1/4 gleich, also etwa 7 Wiederholungen pro Minute. Der Wiederholungsschutz streicht sie, aber 28 Dreiergruppen kehren mit 1/3 zur vorletzten Variante zurück, also etwa 9 A-B-A pro Minute. Mit `PLAYBACK_RANDOM` ist schon in zehn Treffern zu 92,5 % mindestens eine direkte Wiederholung dabei. Mehr Varianten senken beide Zahlen; welche davon dich stört, hörst du im Spiel.
+    resources:
+      - title: Godot Docs · AudioStreamRandomizer
+        url: https://docs.godotengine.org/en/stable/classes/class_audiostreamrandomizer.html
+
+  - id: kombinationen
+    type: output
+    title: Vorab rendern oder kombinieren lassen
+    prompt: |
+      Drei Anschläge, vier Körper, zwei Fahnen, jede Datei 0,6 Sekunden lang (Platzhalter). Was gibt das Programm aus?
+    lang: python
+    code: |
+      anschlag, koerper, fahne = 3, 4, 2
+      laenge = 0.6
+      print(anschlag * koerper * fahne)
+      print(anschlag + koerper + fahne)
+      print(round(anschlag * koerper * fahne * laenge, 1))
+      print(round((anschlag + koerper + fahne) * laenge, 1))
+    expected: |
+      24
+      9
+      14.4
+      5.4
+    explanation: |
+      Vorgerendert brauchst du eine Datei je Kombination, 24 Dateien mit zusammen 14,4 Sekunden Audio. Lässt du Godot kombinieren, reichen 9 Dateien mit 5,4 Sekunden, und es entstehen dieselben 24 Kombinationen. Der Preis: Du hast nicht jede davon gehört, und jede Wiedergabe mischt drei Stimmen statt einer. Welche Seite überwiegt, hängt an der Zahl der Schichten und daran, wie kritisch einzelne Kombinationen sind.
+    resources:
+      - title: Godot Docs · AudioStreamSynchronized
+        url: https://docs.godotengine.org/en/stable/classes/class_audiostreamsynchronized.html
+
+  - id: kammfilter
+    type: output
+    title: Zwei Schichten, 2,5 ms auseinander
+    prompt: |
+      Dasselbe Modell wie in der Lektion, aber mit 2,5 ms Versatz. Was gibt es aus?
+    lang: python
+    code: |
+      import math
+
+      versatz_ms = 2.5
+      for f in (100, 200, 400):
+          faktor = abs(2 * math.cos(math.pi * f * versatz_ms / 1000))
+          db = 20 * math.log10(faktor) if faktor > 1e-9 else float("-inf")
+          print(f, "Hz", round(db, 1))
+    expected: |
+      100 Hz 3.0
+      200 Hz -inf
+      400 Hz 6.0
+    hints:
+      - Die erste Auslöschung liegt bei 1 / (2 × Versatz).
+    explanation: |
+      Bei 2,5 ms liegt die erste Auslöschung bei 1 / 0,005 s = 200 Hz. 100 Hz sind eine Viertelperiode verschoben und gewinnen 3 dB, 400 Hz eine ganze Periode und gewinnen die vollen 6 dB. Halbierst du den Versatz, wandert die Auslöschung eine Oktave nach oben. Das ist der Grund, Schichten am Snap Offset auszurichten statt nach Augenmaß.
+
+  - id: zufall-oder-gehoer
+    type: output
+    title: Geraten oder gehört?
+    prompt: |
+      Im Blindtest lagst du bei 8 von 10 Treffern richtig. Das Programm rechnet, wie wahrscheinlich das beim reinen Raten mit 50 % je Treffer ist. Was gibt es aus?
+    lang: python
+    code: |
+      from math import comb
+
+      richtig, versuche = 8, 10
+      p = sum(comb(versuche, k) for k in range(richtig, versuche + 1)) / 2 ** versuche
+      print(round(p, 3))
+    expected: |
+      0.055
+    explanation: |
+      Es gibt 45 Wege, genau 8 von 10 zu treffen, 10 Wege für 9 und einen für 10, zusammen 56 von 1024 möglichen Folgen. Raten führt also in 5,5 % der Fälle zu diesem Ergebnis oder einem besseren. Das ist ein Hinweis, dass du die Fassungen unterscheidest, kein Beweis. Ein zweiter Durchgang mit zehn Treffern macht ihn deutlich stärker. Bei 5 oder 6 von 10 unterscheidet dein Ohr die Fassungen im Spiel vermutlich nicht.
+
+  - id: kontaktbild-umrechnen
+    type: gap
+    title: Vom Kontaktbild zur Sampleposition
+    prompt: |
+      Eine Animation mit 10 Bildern pro Sekunde, alle Bilder gleich lang. Der Kontakt ist Bild 5, Bild 1 beginnt bei 0 ms. Rechne den Beginn von Bild 5 um.
+    lang: text
+    code: |
+      Beginn Bild 5    ⟦400⟧ ms
+      Physik-Frames    ⟦24⟧ bei 60 pro Sekunde
+      Samples          ⟦19200⟧ bei 48 kHz
+    gaps:
+      - label: Millisekunden
+        hint: (5 − 1) / 10 Sekunden
+      - label: Frames
+        hint: 0,4 × 60
+      - label: Samples
+        hint: 0,4 × 48 000
+        accept: ["19 200", "19.200"]
+    explanation: |
+      Bild 5 beginnt, wenn vier Bilder zu je 100 ms abgelaufen sind, also bei 400 ms. Das sind 24 Physik-Frames und 19 200 Samples. Wer mit 5 / 10 rechnet, landet ein ganzes Bild zu spät, bei 500 ms. Rechne mit Bildnummern, solange du planst, und erst beim Platzieren in Frames oder Samples.
+    resources:
+      - title: REAPER User Guide 7.81 · Zeitleiste in Absolute Frames (S. 46)
+        url: https://www.reaper.fm/userguide/ReaperUserGuide781c.pdf#page=46
+
+  - id: schichten-gdscript
+    type: gap
+    title: Zwei Schichten, ein Start
+    prompt: |
+      Ergänze das Skript so, dass beide Schichten gemeinsam starten und jede ihre Variante ohne direkte Wiederholung wählt.
+    lang: gdscript
+    code: |
+      func _ready() -> void:
+      	var schichten := ⟦AudioStreamSynchronized⟧.new()
+      	schichten.stream_count = 2
+      	schichten.⟦set_sync_stream⟧(0, _randomizer(anschlag))
+      	schichten.set_sync_stream(1, _randomizer(koerper))
+      	stream = schichten
+
+
+      func _randomizer(varianten: Array[AudioStream]) -> AudioStreamRandomizer:
+      	var r := AudioStreamRandomizer.new()
+      	r.playback_mode = AudioStreamRandomizer.⟦PLAYBACK_RANDOM_NO_REPEATS⟧
+      	for v in varianten:
+      		r.⟦add_stream⟧(-1, v)
+      	return r
+    gaps:
+      - label: Stream-Klasse
+        hint: Der Stream, dessen Teile „at exactly the same time“ beginnen.
+      - label: Platz belegen
+        hint: Die Methode, die einen Stream in einen nummerierten Platz legt.
+      - label: Modus
+        hint: Der Modus, der die zuletzt gespielte Variante auslässt.
+      - label: Variante anhängen
+        hint: Ein negativer Index hängt ans Ende des Pools an.
+    explanation: |
+      `AudioStreamSynchronized` startet seine Plätze gemeinsam, `set_sync_stream` belegt einen Platz. Jeder Platz bekommt einen eigenen Randomizer, also wählt jede Schicht unabhängig. `add_stream(-1, v)` hängt laut Doku ans Ende an. Der Modus steht hier ausdrücklich, obwohl er der Standard ist; so sieht jeder, der das Skript liest, was gemeint ist.
+    resources:
+      - title: Godot Docs · AudioStreamSynchronized
+        url: https://docs.godotengine.org/en/stable/classes/class_audiostreamsynchronized.html
+      - title: Godot Docs · AudioStreamRandomizer · add_stream
+        url: https://docs.godotengine.org/en/stable/classes/class_audiostreamrandomizer.html#class-audiostreamrandomizer-method-add-stream
+
+  - id: transiente-zu-spaet
+    type: bug
+    title: Der Schlag kommt ein Bild zu spät
+    prompt: |
+      Im Spiel klingt der Schlag sichtbar nach dem Kontakt, etwa ein Bild zu spät. Die Animation hat 12 Bilder pro Sekunde, alle gleich lang. Welche Zeile der Planung ist falsch? Korrigiere sie; es reicht `Transiente bei` mit dem Wert in ganzen Millisekunden und `ms`.
+    lang: text
+    code: |
+      Aktion          Schlag, 6 Bilder
+      Kontaktbild     Bild 4
+      Bilddauer       1000 / 12 = 83,3 ms
+      Transiente bei  4 × 83,3 = 333 ms
+      Länge Klang     bis Ende Bild 6
+    lines: [4]
+    fix:
+      - line: 4
+        answers:
+          - Transiente bei (4 − 1) × 83,3 = 250 ms
+          - Transiente bei 250 ms
+          - transiente bei 250 ms
+          - Transiente bei 249,9 ms
+          - Transiente bei (4 - 1) × 83,3 = 250 ms
+          - Transiente bei (4 - 1) * 83,3 = 250 ms
+          - Transiente bei (4 - 1) x 83,3 = 250 ms
+          - Transiente bei 3 × 83,3 = 250 ms
+          - Transiente bei 3 * 83,3 = 250 ms
+          - Transiente bei 3 x 83,3 = 250 ms
+          - Transiente bei 3 × 83,3 = 249,9 ms
+          - Transiente bei 3 * 83,3 = 249,9 ms
+          - Transiente bei 3 x 83,3 = 249,9 ms
+    explanation: |
+      Bild 4 beginnt, wenn drei Bilder abgelaufen sind, also bei 3 × 83,3 ms, gerundet 250 ms. 333 ms ist der Beginn von Bild 5. Der Fehler ist ein klassisches Um-eins-daneben: Bild 1 beginnt bei 0, nicht bei einer Bilddauer. Wer Ton-Bilder als Nummern plant, rechnet erst ganz am Ende in Zeit um.
+
+  - id: polaritaet
+    type: bug
+    title: Die Summe ist dünner als eine Schicht
+    prompt: |
+      Die tiefe Schicht ist eine Kopie des Körpers mit ReaEQ-Tiefpass. Jede klingt allein voll. Spielen beide zusammen, fehlt das Gewicht fast ganz. Welche Zeile erklärt das?
+    lang: text
+    code: |
+      Ordner schlag, Region schlag_01
+      anschlag  a2  Versatz 0 ms  Polarität normal
+      koerper   k1  Versatz 0 ms  Polarität normal
+      tief      k1  Versatz 0 ms  Polarität invertiert
+      Fader     anschlag −4 dB, koerper 0 dB, tief 0 dB
+    lines: [4]
+    explanation: |
+      „tief“ und „koerper“ stammen aus derselben Aufnahme und liegen ohne Versatz übereinander. Mit gedrehter Polarität ist „tief“ im Bassbereich das Spiegelbild des Körpers, und beide löschen sich dort aus, wo sie gleich sind. Die Fader-Werte sind kein Fehler, nur Platzhalter. Polarität zurückdrehen, und die Summe hat ihr Gewicht.
+    resources:
+      - title: REAPER User Guide 7.81 · Media Item Properties, invert phase (S. 135)
+        url: https://www.reaper.fm/userguide/ReaperUserGuide781c.pdf#page=135
+
+  - id: ab-label-vertauscht
+    type: bug
+    title: Blind fast immer daneben
+    prompt: |
+      Ohne `blind` hörst du beim Umschalten mit Tab klar, welche Fassung läuft. Im Blindtest liegst du aber bei 1 von 10, obwohl du dir sicher warst. Finde die Zeile und korrigiere sie.
+    lang: gdscript
+    code: |
+      func play_hit() -> void:
+      	if blind:
+      		_use_b = randi() % 2 == 1
+      	stream = stream_b if _use_b else stream_a
+      	_played.append("A" if _use_b else "B")
+      	play()
+    lines: [5]
+    fix:
+      - line: 5
+        answers:
+          - _played.append("B" if _use_b else "A")
+          - _played.append("A" if not _use_b else "B")
+    explanation: |
+      Die Zeile schreibt „A“, wenn B läuft, und umgekehrt. Die Auflösung nach F2 ist also das Gegenteil des Gespielten. 1 von 10 ist beim Raten genauso unwahrscheinlich wie 9 von 10; ein Ergebnis weit unter dem Zufall ist deshalb auch ein Signal, meist für einen Fehler im Aufbau. Prüfe ein Testwerkzeug, bevor du ihm glaubst: zwei klar verschiedene Prüfklänge, drei Treffer mit Tab, Auflösung vergleichen.
+
+  - id: randomizer-folgen
+    type: explain
+    title: Zwei echte Folgen lesen
+    prompt: |
+      Diese Folgen kommen aus der Messung in Godot 4.7.2, jeweils die ersten 20 von 20 000 Wiedergaben mit vier Varianten. Erkläre, was die Modi unterscheidet und was das für einen Klang bedeutet, der 30-mal pro Minute spielt.
+    lang: text
+    code: |
+      PLAYBACK_RANDOM
+      2 1 4 1 1 2 3 3 2 4 1 1 3 4 4 4 3 2 4 3
+      PLAYBACK_RANDOM_NO_REPEATS
+      1 3 2 4 2 1 3 1 2 1 2 3 2 4 3 2 3 2 3 2
+    points:
+      - RANDOM wiederholt direkt (1 1, 3 3, sogar 4 4 4), im Mittel mit 1/n.
+      - NO_REPEATS wiederholt nie direkt, springt aber oft zur vorletzten Variante zurück (2 1 2 1 2, 3 2 3 2), mit 1/(n − 1).
+      - Bei 30 Wiedergaben pro Minute heißt das etwa 7 direkte Wiederholungen oder etwa 9 A-B-A-Folgen pro Minute.
+      - Mehr Varianten senken beides; mit nur zwei Varianten wird NO_REPEATS zu einem festen A B A B.
+    explanation: |
+      Im oberen Modus wählt der Randomizer jedes Mal frei, deshalb tauchen Dopplungen und sogar Dreier auf, etwa jede vierte Wiedergabe. Im unteren Modus ist die direkte Wiederholung ausgeschlossen, dafür pendelt die Folge oft zwischen zwei Varianten. Beides kann bei einem häufigen Klang auffallen, auf verschiedene Weise. Das wirksamste Mittel sind mehr Varianten. Welcher Modus besser klingt, entscheidet dein Ohr im Spiel, nicht die Statistik.
+    resources:
+      - title: Godot Docs · AudioStreamRandomizer, PlaybackMode
+        url: https://docs.godotengine.org/en/stable/classes/class_audiostreamrandomizer.html#enum-audiostreamrandomizer-playbackmode
+
+  - id: ab-test-bauen
+    type: practice
+    title: Den A/B-Test in die Testszene bauen
+    prompt: |
+      Bau den A/B-Test in die Testszene aus [Testszene: Angriff mit Frame-Daten](/combat/testszene-angriff): ein `AudioStreamPlayer` namens `HitSound` unter dem Dummy mit `ab_hit_sound.gd`, zwei Prüfklänge als A und B, der Aufruf in `take_hit()`. Prüfe das Werkzeug, bevor du es für deine Klänge nutzt.
+    lang: gdscript
+    solution: |
+      # Szenenbaum (Ausschnitt)
+      # Dummy (CharacterBody2D)   enemy.gd
+      # ├── …
+      # └── HitSound (AudioStreamPlayer)   ab_hit_sound.gd
+      #       stream_a: pruef_hoch.wav, stream_b: pruef_tief.wav
+      #       bus: SFX (Platzhalter)
+
+      # enemy.gd, in take_hit(), direkt nach HitLog.add(...)
+      	if has_node(^"HitSound"):
+      		$HitSound.play_hit()
+
+      # Prüfung des Werkzeugs:
+      # 1. blind aus: drei Treffer, Tab, drei Treffer.
+      #    Hörbar erst A, dann B; F2 gibt "A A A B B B" aus.
+      # 2. blind an: fünf Treffer, Tipp notieren, F2.
+      #    Mit zwei klar verschiedenen Prüfklängen stimmt jeder Tipp.
+      # 3. HitSound testweise entfernen: Treffer laufen weiter,
+      #    keine Fehlermeldung.
+    checklist:
+      - "`HitSound` liegt unter dem Dummy und hat `ab_hit_sound.gd`; entfernst du `HitSound` testweise, läuft der Dummy ohne Fehlermeldung weiter."
+      - Der Ton kommt im Frame der Treffermeldung, also direkt nach der Zeile mit `HitLog.add` in `take_hit()`.
+      - Mit `blind` aus gibt F2 nach drei Treffern, Tab und drei Treffern genau `A A A B B B` aus, und das Spiel läuft dabei weiter.
+      - Mit `blind` an und zwei klar verschiedenen Prüfklängen stimmen alle deine notierten Tipps mit der Ausgabe von F2 überein.
+    explanation: |
+      Das Werkzeug ist Technik und darf deshalb eine Musterlösung haben. Die Prüfung mit zwei klar verschiedenen Prüfklängen ist der wichtigste Schritt: Erst wenn das Werkzeug bei einem offensichtlichen Unterschied stimmt, kannst du ihm bei einem feinen trauen. `has_node()` hält das Skript des Gegners für Instanzen ohne `HitSound` lauffähig.
+    resources:
+      - title: Godot Docs · Node._unhandled_key_input
+        url: https://docs.godotengine.org/en/stable/classes/class_node.html#class-node-private-method-unhandled-key-input
+
+  - id: eigene-varianten
+    type: practice
+    title: Varianten für deine Aktion
+    prompt: |
+      Wähl eine Aktion aus deinen Animationen mit markierten Ton-Bildern. Bau dafür einen Klang aus Schichten in einem Folder-Track, leg Varianten an, richte die Transiente auf das Kontaktbild aus und teste zwei Fassungen blind im Spiel. Schreib das A/B-Protokoll. Welche Schichten, wie viele Varianten und welcher Klang, entscheidest du.
+    lang: prose
+    checklist:
+      - Du hast notiert, welche Aktion es ist und in welchem Bild der Kontakt liegt, mit Umrechnung in Frames.
+      - Jede Variante ist eine eigene Region mit einem Namen nach deinem Schema.
+      - Du hast die Summe gegen jede Schicht allein gehört und notiert, ob du Versatz oder Polarität geändert hast.
+      - Die Zahl der Varianten ist aus der Häufigkeit in deiner Cue-Liste begründet, und der Modus des Randomizers steht in deiner Notiz.
+      - Das A/B-Protokoll enthält zehn Tipps, die Auflösung von F2 und deinen Eindruck, notiert vor F2.
+      - Du hast eine Entscheidung festgehalten und sie mit dem Ergebnis des Blindtests begründet.
+    explanation: |
+      Die Checkliste prüft, ob deine Entscheidungen nachvollziehbar sind, nicht ob sie gefallen. Die Umrechnung in Frames zeigt, dass der Klang an der richtigen Stelle sitzt. Die Begründung der Variantenzahl verbindet den Klang mit dem Spiel. Und das Protokoll trennt, was du erwartet hast, von dem, was du im Spiel tatsächlich unterscheiden konntest.
+    resources:
+      - title: Godot Docs · AudioStreamRandomizer
+        url: https://docs.godotengine.org/en/stable/classes/class_audiostreamrandomizer.html
