@@ -71,7 +71,7 @@ Eine vollständige, minimale Vorlage mit jeder Übungsart liegt in [`tooling/fix
 
 1. **Lehrplan entwerfen.** Schreibe zuerst die Liste der Module auf: 10–16 Module in 2–4 Tracks, vom Einstieg bis zum Profi-Niveau. Frage dich bei jedem Modul: *Was kann ich danach, was ich vorher nicht konnte?* Und: *Würde ein Arbeitgeber das erwarten?*
 2. **Ordner anlegen:** `content/<bereich>/` mit `area.yaml` (Abschnitt 4). Die Ordner-ID ist kurz, klein und kebab-case, zum Beispiel `go`, `typescript`, `devops`.
-3. **Farbe wählen.** Eine kräftige Farbe, auf der schwarzer Text gut lesbar ist (Kontrast ≥ 4,5 : 1 zu `#0B0B0B`). Vorhandene Farben nicht wiederholen: `#A98BFF` Kotlin, `#FF6A3D` Rust, `#FFD400` Linux, `#4D8BFF` Python, `#2BD97C` Automation, `#FF5CA8` Git, `#22D3EE` Data Analysis, `#C6F432` Testing, `#FF9F1C` PostgreSQL, `#F4A3FF` Erzählhandwerk, `#FF4D6D` Combat Design. Gute freie Kandidaten: `#FFC6A8` (Apricot), `#B5E3FF` (Eisblau).
+3. **Farbe wählen.** Eine kräftige Farbe, auf der schwarzer Text gut lesbar ist (Kontrast ≥ 4,5 : 1 zu `#0B0B0B`). Vorhandene Farben nicht wiederholen: `#A98BFF` Kotlin, `#FF6A3D` Rust, `#FFD400` Linux, `#4D8BFF` Python, `#2BD97C` Automation, `#FF5CA8` Git, `#22D3EE` Data Analysis, `#C6F432` Testing, `#FF9F1C` PostgreSQL, `#F4A3FF` Erzählhandwerk, `#FF4D6D` Combat Design, `#FFC6A8` Pixelart. Guter freier Kandidat: `#B5E3FF` (Eisblau).
 4. **Module schreiben** (Abschnitte 5–7). Ein Modul pro Datei, Dateiname = Modul-ID.
 5. **Karten, Projekte, Glossar, Spickzettel, Berufsseite** ergänzen (Abschnitt 8).
 6. **Prüfen:** `pnpm content:check <bereich>`, dann `pnpm verify <bereich>`, dann `pnpm test` und `pnpm build`.
@@ -152,6 +152,7 @@ Manche Bereiche lehren Handwerk ohne Programmcode, zum Beispiel Erzählhandwerk.
 - **Übungen** nutzen `lang: prose` (Abschnitt 7). `output` passt nur, wo man wirklich etwas vorhersagt, etwa den Zustand einer Verzweigung; die Warnung „keine Vorhersage-Übung“ ist dort bewusst akzeptiert. `bug` heißt „die gemeinte Zeile finden“, meist ohne `fix`.
 - **Kreative Aufgaben** lassen die Lösung offen. Es gibt keine Mustertexte: `practice` mit `lang: prose` hat keine `solution`, die Checkliste enthält überprüfbare Kriterien, keine Geschmacksurteile. Analysen veröffentlichter Texte dürfen eine Musterantwort haben.
 - **Callouts** `INTERVIEW` und `PRAXIS` nur, wenn sie wirklich passen; `PRAXIS` zeigt dann, wie Studios oder Autoren arbeiten.
+- **Zeichnen und Pixelart** zeigen Pixel als Textraster in `text`-Blöcken, eine Zeile pro Pixelreihe: `#` dunkel, `+` Mittelton, `-` hell, `.` leer, höchstens 16 Pixel breit. Ein `bug` lässt dann die fehlerhafte Reihe anklicken. Zeichenaufgaben laufen auf Papier, Karopapier oder im Editor und werden über die Checkliste selbst geprüft. Die Schaubilder des Bereichs `pixelart` erzeugt `node tooling/pixelart-figures.ts` aus Code; sie zeigen Prinzipien, keine fertigen Figuren. Bilder Dritter werden nur verlinkt.
 
 ## 6. Lektionen schreiben
 
@@ -239,6 +240,20 @@ lesson: |
 - `pnpm vm:verify` führt nach `lab` alle `vm`-Blöcke der Lektion der Reihe nach als `ops` in einer Login-Shell aus, ohne Terminal. Dateien bleiben von Block zu Block erhalten, Shell-Variablen und das aktuelle Verzeichnis nicht. Jeder Block muss mit 0 enden (bei `console` zählt der letzte Befehl), Blöcke mit `fails` mit einem anderen Wert.
 
 Tabellen (GFM) sind erlaubt und im Spickzettel ausdrücklich erwünscht.
+
+### Bilder
+
+Screenshots und Abbildungen gehören dorthin, wo Text nicht reicht: ein Editor-Dock, das man wiedererkennen soll, ein Spielbild mit einem Darstellungsfehler, den man diagnostiziert. Sie gehen in Lektionen und in allen Markdown-Feldern der Übungen.
+
+```markdown
+![Inspektor eines Sprite2D mit Filter Linear: die Figur ist verwaschen](/media/godot/pixelraster/filter-linear@2x.png "Godot 4.7.2, Filter Linear, vierfach skaliert")
+```
+
+- **Ablage:** nur PNG unter `public/media/<bereich>/<modul>/`. Der Service Worker legt alle PNG-Dateien aus `public/` beim Installieren ab, Bilder gehen also offline. Halte sie klein (Pixelart und Editor-Ausschnitte als PNG mit wenigen Farben, meist unter 100 KB).
+- **Alt-Text ist Pflicht** und beschreibt, was zu sehen ist, auch das, worauf es ankommt. Der Titel in Anführungszeichen wird zur Bildunterschrift; nenne dort Quelle und Version.
+- **Größe:** Der Build liest Breite und Höhe aus der Datei, damit die Seite beim Laden nicht springt. Eine Datei `…@2x.png` hat doppelt so viele Pixel, wie sie anzeigt, und bleibt auf hochauflösenden Displays scharf. Ein Bild ist nie breiter als die Textspalte; ein Tipp öffnet es in voller Größe zum Zoomen. Gestalte Bilder für Unterwegs-Module deshalb so, dass sie bei 330 px Breite lesbar bleiben: lieber einen Ausschnitt als den ganzen Bildschirm.
+- **Prüfung:** `content:check` meldet fehlende Dateien und fehlende Alt-Texte als Fehler. Bilder von außerhalb (`https://…`) sind nicht erlaubt: Sie gingen offline nicht und könnten verschwinden.
+- Ein Bild allein in einem Absatz wird eine Abbildung mit Unterschrift; mitten im Text erscheint es als Block ohne Unterschrift.
 
 ## 7. Übungen
 

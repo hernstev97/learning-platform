@@ -415,6 +415,7 @@ function loadModule(areaId: string, moduleId: string, report: Reporter, raw: Raw
   if (choices > exercises.length / 3) report.warn(where, `${choices} von ${exercises.length} Übungen sind Multiple Choice – mehr aktive Formate`);
   const noResources = exercises.filter((e) => !e.resources.length).length;
   if (noResources > exercises.length / 2) report.warn(where, `${noResources} Übungen ohne Doku-Link (resources)`);
+  for (const problem of md.takeImageProblems()) report.error(where, problem);
   return {
     id: moduleId, title: f.str('title'), summary: f.str('summary'), level: level(data.level, where, report), minutes: f.num('minutes', 60, 5, 600),
     goals: f.texts('goals').map((goal) => inline(goal)), lesson, toc, resources: resources(data.resources, where, report), exercises, lab, vm, bear: false, place,
@@ -611,6 +612,7 @@ function loadArea(dir: string, raw: RawExercise[], sink: { errors: Issue[]; warn
   const page = (name: string) => existsSync(join(dir, name)) ? md.document(readFileSync(join(dir, name), 'utf8')).html : null;
   const cheatsheet = page('cheatsheet.md');
   const career = page('career.md');
+  for (const problem of md.takeImageProblems()) report.error('Bereich', problem);
 
   const moduleSummaries: ModuleSummary[] = tracks.flatMap((track) => track.modules).map((mid) => {
     const m = modules[mid];
