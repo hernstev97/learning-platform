@@ -198,7 +198,7 @@ def retry_delays(attempts: int, cap: float = 30.0) -> list[float]:
 def rufe(anfrage, token):
     r = anfrage(token.aktuell())
     if r.status != 401:
-        return r                       # 403 nie mit neuem Token beantworten
+        return r                       # 403: neues Token mit gleichem Scope hilft nicht
     token.verwerfen()
     r = anfrage(token.aktuell())       # genau einmal wiederholen
     if r.status == 401:
@@ -336,7 +336,8 @@ lauf_id.set(os.environ.get("INVOCATION_ID", uuid.uuid4().hex[:12]))
 | keyring | Skripte am Desktop: `keyring.get_password(dienst, name)` → `None` |
 | `.env` + python-dotenv | Entwicklung; `load_dotenv()` überschreibt nichts; Datei in `.gitignore` |
 | `LoadCredential=api_token` | systemd-Dienst, Datei aus `/etc/credstore/`, lesen unter `$CREDENTIALS_DIRECTORY` |
-| `Environment=` / `EnvironmentFile=` | nur Einstellungen, keine Geheimnisse (über D-Bus sichtbar) |
+| `Environment=` | keine Geheimnisse: über D-Bus sichtbar, an Kindprozesse vererbt |
+| `EnvironmentFile=` | Einstellungen; Werte landen in der Umgebung und werden vererbt |
 | `${{ secrets.NAME }}` | Actions, als `env:` an einzelne Schritte; nicht in Forks |
 
 Leak: widerrufen → ersetzen → Audit-Log prüfen → entfernen → Ursache abstellen.
@@ -344,7 +345,7 @@ Leak: widerrufen → ersetzen → Audit-Log prüfen → entfernen → Ursache ab
 ## Playwright im Betrieb
 
 ```python
-context.storage_state(path="playwright/.auth/state.json")    # wie ein Passwort behandeln
+context.storage_state(path="playwright/.auth/state.json")    # wie ein Passwort; indexed_db=True bei Bedarf
 context = browser.new_context(storage_state="playwright/.auth/state.json")
 
 with page.expect_response("**/api/kurse") as info:            # warten mit Ziel

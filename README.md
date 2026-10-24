@@ -75,7 +75,7 @@ src/pages/                 Startseite, Bereich, Lektion, Übung, Karten, Wiederh
 src/python/                Pyodide-Worker und Harness für Python, pytest und SQLite (dieselbe Harness nutzt pnpm verify), Liste der Test-Pakete
 src/pg/                    PostgreSQL 18 (PGlite) im Worker: frische Datenbank je Lauf, Ausgabe wie psql (dieselbe Engine nutzen pnpm verify und der Build)
 src/vm/                    Linux-VM im Browser (v86): Laden, Snapshot, Steuerkanal, Prüfungen, Terminal in Übungen und Lektionen
-vendor/pyodide/            Zusätzliche Pyodide-Pakete (tzdata, beautifulsoup4, PyYAML, pandas mit numpy, pytest, Hypothesis)
+vendor/pyodide/            Zusätzliche Pyodide-Pakete (tzdata, beautifulsoup4, PyYAML, pandas mit numpy, pytest, Hypothesis, openpyxl mit et_xmlfile)
 vendor/vm/                 Gebautes Debian-Image samt Snapshot für die Linux-VM
 ```
 
