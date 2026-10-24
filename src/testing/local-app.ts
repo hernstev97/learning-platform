@@ -83,6 +83,7 @@ import { localDay } from '../engine/storage.ts';
 import { positionHref } from '../engine/persistence.ts';
 import type { Exercise } from '../content/types.ts';
 import type { DrillEvent, Entry, Grade, Position } from '../../convex/model.ts';
+import type { TutorReply, TutorRequest, TutorStatus } from '../engine/tutor.ts';
 export const isCloud = false;
 export const getSyncStatus = () => getStorageWarning() ? 'Nicht gespeichert' : 'Lernstand nur in diesem Browser gespeichert';
 export const hasPendingWrites = () => false;
@@ -131,3 +132,13 @@ export function saveNote(area: string, moduleId: string, text: string) {
   save(area);
 }
 export const flushNote = () => {};
+
+// Tutor: invisible unless a browser test installs a fake provider before the page loads (e2e/tutor.spec.ts).
+type TutorFake = { status: TutorStatus | null; reply(request: TutorRequest): TutorReply | Promise<TutorReply> };
+const tutorFake = () => (window as unknown as { __tutorFake?: TutorFake }).__tutorFake;
+export const tutorReachable = () => navigator.onLine;
+export function watchTutor(show: (status: TutorStatus | null) => void) { show(tutorFake()?.status ?? null); return () => {}; }
+export async function askTutor(request: TutorRequest): Promise<TutorReply> {
+  const fake = tutorFake();
+  return fake ? fake.reply(structuredClone(request)) : { ok: false, reason: 'disabled' };
+}

@@ -39,6 +39,13 @@ test('separate devices share lessons, drafts, exercise success and the latest st
   await phone.close();
 });
 
+test('without an API key the deployed tutor reports itself absent and the exercise page has no panel', async ({ page }) => {
+  expect(await http.query(api.tutor.status, {})).toEqual({ enabled: false, problem: null });
+  await page.goto(`${base}/1`); await synced(page);
+  await expect(page.locator('#answer-g1')).toBeVisible();
+  await expect(page.locator('#tutor')).toBeHidden();
+});
+
 test('continue learning on another device skips solved work and ignores card reviews', async ({ page, browser }) => {
   const phone = await browser.newContext({ viewport: { width: 390, height: 844 } }); await fixture(phone);
   const other = await phone.newPage();

@@ -11,6 +11,7 @@ import { schedule } from './engine/review.ts';
 import { drill, drillBase } from './engine/drill.ts';
 import { latestArea, projectSnapshot, safeDraft, sameEntry, toEntries } from './engine/persistence.ts';
 import { browserStorage, readOfflineCopy, writeOfflineCopy } from './engine/offline.ts';
+import type { TutorReply, TutorRequest, TutorStatus } from './engine/tutor.ts';
 
 export { catalog };
 const areas = new Map<string, Area>();
@@ -365,4 +366,16 @@ export async function resetProgress(areaId: string): Promise<void> {
   if (!active) throw new Error(OFFLINE_ONLY);
   await Promise.all([...inflight]);
   await track(client.mutation(api.progress.resetArea, { areaId, generation: generationOf(snapshot, areaId) }));
+}
+
+// Optional AI tutor (LRN-6, convex/tutor.ts). Hidden without configuration, offline and in the offline reading mode.
+export const tutorReachable = () => active && offlineSince === null && !unreachable && navigator.onLine;
+/** Reports the tutor's status, null while it is unavailable (also when the backend does not have it yet). */
+export function watchTutor(show: (status: TutorStatus | null) => void): () => void {
+  if (!active) { show(null); return () => {}; }
+  return client.onUpdate(api.tutor.status, {}, (value) => { if (active) show(value); }, () => show(null));
+}
+export async function askTutor(request: TutorRequest): Promise<TutorReply> {
+  if (!tutorReachable()) return { ok: false, reason: 'provider' };
+  return client.action(api.tutor.ask, request);
 }
