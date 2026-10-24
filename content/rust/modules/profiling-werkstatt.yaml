@@ -1,0 +1,1708 @@
+id: profiling-werkstatt
+title: "Werkstatt: Profilieren und optimieren"
+level: 3
+minutes: 240
+summary: Ein absichtlich langsames Rust-Programm Schritt für Schritt schneller machen, mit Baseline, Benchmark, Profil, genau einer Änderung pro Runde und einem Messprotokoll.
+goals:
+  - Du legst ein Cargo-Profil für Messungen an und begründest, warum Profile auf einem Release-Build mit Debug-Infos beruhen.
+  - Du misst eine Baseline mit hyperfine und einen criterion-Benchmark mit gespeicherter Baseline und vergleichst danach jede Änderung damit.
+  - Du nimmst ein Programm mit samply auf, findest im Profil die teure Stelle und schätzt mit Amdahls Gesetz ab, welche Änderung zuerst kommt.
+  - Du zählst Allokationen mit einem eigenen `GlobalAlloc` und senkst sie gezielt, ohne das Ergebnis zu ändern.
+  - Du schreibst ein Messprotokoll, das Messaufbau, Befund, Änderung und Entscheidung belegt.
+resources:
+  - title: samply · README
+    url: https://github.com/mstange/samply
+  - title: Cargo Book · Custom profiles
+    url: https://doc.rust-lang.org/cargo/reference/profiles.html#custom-profiles
+  - title: criterion.rs · Command-Line Options
+    url: https://bheisler.github.io/criterion.rs/book/user_guide/command_line_options.html
+  - title: The Rust Performance Book · Profiling
+    url: https://nnethercote.github.io/perf-book/profiling.html
+  - title: Firefox Profiler · UI Tour
+    url: https://github.com/firefox-devtools/profiler/blob/main/docs-user/guide-ui-tour-panels.md
+place: pc
+lesson: |
+  In [Performance messen und lesen](/rust/performance-messen) hast du Ausgaben gelesen. Jetzt erzeugst du sie selbst. Das Werkstück ist `logauswertung`, ein kleines Programm ohne fremde Crates. Es erzeugt 200 000 Zeilen eines Access-Logs und berechnet daraus Anfragen, Serverfehler (5xx) und die p95-Latenz je Methode und Pfad. Auf einem Testrechner braucht es dafür gut drei Sekunden. Am Ende dieser Werkstatt sind es 63 ms, und du kannst für jeden Schritt belegen, warum.
+
+  Der Code enthält mehrere Bremsen, wie sie in echten Codebasen vorkommen. Such sie nicht durch Lesen. Der Sinn der Werkstatt ist, dass Messung und Profil dir sagen, wo du anfängst. Alle Zahlen in dieser Lektion stammen aus Läufen auf dem Testrechner. Deine werden anders aussehen; die Verhältnisse sollten ähnlich sein.
+
+  ## Das Werkstück: eine absichtlich langsame Log-Auswertung
+
+  Leg das Projekt an und ersetze den Inhalt der Dateien:
+
+  ```console
+  $ cargo new logauswertung
+  $ cd logauswertung
+  ```
+
+  `Cargo.toml`, mit allem, was diese Werkstatt braucht:
+
+  ```toml
+  [package]
+  name = "logauswertung"
+  version = "0.1.0"
+  edition = "2024"
+
+  [dev-dependencies]
+  criterion = "0.8"
+
+  [[bench]]
+  name = "auswerten"
+  harness = false
+
+  [profile.profiling]
+  inherits = "release"
+  debug = true
+  ```
+
+  `src/lib.rs` enthält den Generator für das Log, die Datentypen und die Auswertung:
+
+  ```rust
+  use std::collections::HashMap;
+  use std::fmt::{self, Write};
+
+  /// Erzeugt `zeilen` synthetische Access-Log-Zeilen. Gleicher `seed`, gleiche Zeilen.
+  /// Format: `2026-10-24T08:15:02Z 10.0.3.17 GET /api/orders 200 87ms`
+  pub fn erzeuge_log(zeilen: usize, seed: u64) -> String {
+      // (Pfad, Anteil in Prozent, POST möglich, typische Latenz in ms)
+      const PFADE: [(&str, u64, bool, u64); 12] = [
+          ("/health", 22, false, 2),
+          ("/static/app.js", 14, false, 6),
+          ("/static/app.css", 12, false, 5),
+          ("/api/orders", 10, true, 40),
+          ("/api/orders/:id", 9, false, 25),
+          ("/api/search", 8, false, 90),
+          ("/api/users/:id", 7, false, 20),
+          ("/api/cart", 6, true, 35),
+          ("/login", 4, true, 60),
+          ("/api/users", 3, false, 45),
+          ("/api/checkout", 3, true, 120),
+          ("/logout", 2, true, 15),
+      ];
+      let mut x = seed.max(1);
+      let mut log = String::with_capacity(zeilen * 64);
+      for i in 0..zeilen {
+          // xorshift64: schnell, deterministisch, kein Crate nötig
+          x ^= x << 13;
+          x ^= x >> 7;
+          x ^= x << 17;
+          let mut wahl = x % 100;
+          let mut eintrag = PFADE[0];
+          for p in PFADE {
+              if wahl < p.1 {
+                  eintrag = p;
+                  break;
+              }
+              wahl -= p.1;
+          }
+          let (pfad, _, post_moeglich, basis) = eintrag;
+          let methode = if post_moeglich && (x >> 4) % 3 == 0 { "POST" } else { "GET" };
+          let status = match (x >> 8) % 100 {
+              0..=88 => 200,
+              89..=93 => 404,
+              94..=97 => 500,
+              _ => 503,
+          };
+          // jede 12. Anfrage hängt bis zu 1,5 s länger (langer Schwanz für p95)
+          let extra = if (x >> 24) % 12 == 0 { (x >> 32) % 1500 } else { 0 };
+          let ms = basis + (x >> 16) % (2 * basis) + extra;
+          let _ = writeln!(
+              log,
+              "2026-10-24T{:02}:{:02}:{:02}Z 10.0.{}.{} {methode} {pfad} {status} {ms}ms",
+              (i / 3600) % 24,
+              (i / 60) % 60,
+              i % 60,
+              (x >> 40) % 256,
+              (x >> 48) % 256,
+          );
+      }
+      log
+  }
+
+  #[derive(Debug, Clone, PartialEq, Default)]
+  pub struct Pfad {
+      pub anfragen: u32,
+      pub fehler: u32,
+      pub latenzen: Vec<u32>,
+      pub p95: u32,
+  }
+
+  #[derive(Debug, PartialEq)]
+  pub struct Bericht {
+      /// ("GET /api/orders", Statistik), meiste Anfragen zuerst
+      pub pfade: Vec<(String, Pfad)>,
+      /// ("200", Anzahl), aufsteigend nach Code
+      pub status: Vec<(String, u32)>,
+  }
+
+  impl fmt::Display for Bericht {
+      fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+          for (name, p) in &self.pfade {
+              writeln!(
+                  f,
+                  "{name:<24} {:>7} Anfragen {:>6} Fehler  p95 {:>5} ms",
+                  p.anfragen, p.fehler, p.p95
+              )?;
+          }
+          let codes: Vec<String> = self.status.iter().map(|(c, n)| format!("{c}={n}")).collect();
+          writeln!(f, "Status: {}", codes.join(" "))
+      }
+  }
+
+  /// Wertet das Log aus: Anfragen, Fehler (5xx) und p95-Latenz je Methode und Pfad,
+  /// dazu die Häufigkeit jedes Statuscodes.
+  pub fn auswerten(log: &str) -> Bericht {
+      let mut pfade: HashMap<String, Pfad> = HashMap::new();
+      let mut status: HashMap<String, u32> = HashMap::new();
+
+      for zeile in log.lines() {
+          let zeile = zeile.to_string();
+          let teile: Vec<String> = zeile.split(' ').map(|t| t.to_string()).collect();
+          if teile.len() != 6 {
+              continue;
+          }
+          let schluessel = format!("{} {}", teile[2], teile[3]);
+          let code = teile[4].clone();
+          let ms: u32 = teile[5].trim_end_matches("ms").parse().unwrap_or(0);
+
+          if !pfade.contains_key(&schluessel) {
+              pfade.insert(schluessel.clone(), Pfad::default());
+          }
+          let pfad = pfade.get_mut(&schluessel).unwrap();
+          pfad.anfragen += 1;
+          if code.starts_with('5') {
+              pfad.fehler += 1;
+          }
+          pfad.latenzen.push(ms);
+          pfad.latenzen.sort();
+          let rang = (pfad.latenzen.len() * 95).div_ceil(100);
+          pfad.p95 = pfad.latenzen[rang - 1];
+
+          if status.contains_key(&code) {
+              *status.get_mut(&code).unwrap() += 1;
+          } else {
+              status.insert(code.clone(), 1);
+          }
+      }
+
+      let mut pfade: Vec<(String, Pfad)> = pfade.into_iter().collect();
+      pfade.sort_by(|a, b| b.1.anfragen.cmp(&a.1.anfragen).then(a.0.cmp(&b.0)));
+      let mut status: Vec<(String, u32)> = status.into_iter().collect();
+      status.sort();
+      Bericht { pfade, status }
+  }
+  ```
+
+  `src/main.rs` liest optional die Zeilenzahl und druckt den Bericht:
+
+  ```rust
+  use logauswertung::{auswerten, erzeuge_log};
+  use std::env;
+  use std::process::ExitCode;
+
+  fn main() -> ExitCode {
+      let zeilen: usize = match env::args().nth(1) {
+          None => 200_000,
+          Some(arg) => match arg.parse() {
+              Ok(n) => n,
+              Err(_) => {
+                  eprintln!("Aufruf: logauswertung [zeilen]");
+                  return ExitCode::from(2);
+              }
+          },
+      };
+      let log = erzeuge_log(zeilen, 42);
+      let bericht = auswerten(&log);
+      print!("{bericht}");
+      ExitCode::SUCCESS
+  }
+  ```
+
+  Das Log entsteht im Programm selbst und ist für denselben `seed` immer gleich. So misst jeder Lauf exakt dieselbe Arbeit, und du brauchst keine echte Logdatei mit echten IP-Adressen.
+
+  ## Schritt 1: Messprofil und Baseline
+
+  Gemessen wird nie im Debug-Build. Wie groß der Unterschied ist, zeigt die fertig optimierte Fassung vom Ende dieser Werkstatt: 349,0 ms im Debug-Build, 62,8 ms im Release-Build. Funktionsnamen findet der Profiler auch so, denn `release` entfernt die Symbole standardmäßig nicht (`strip = "none"`). Für eingebaute (inlined) Funktionen und Quellzeilen braucht er zusätzlich Debug-Infos. Das leistet das Profil `profiling` aus der `Cargo.toml` oben: Es erbt alle Einstellungen von `release` und legt Debug-Infos dazu ([Cargo Book: Custom profiles](https://doc.rust-lang.org/cargo/reference/profiles.html#custom-profiles), [debug](https://doc.rust-lang.org/cargo/reference/profiles.html#debug)). Das samply-README empfiehlt genau dieses Profil ([Turn on debug info](https://github.com/mstange/samply#turn-on-debug-info-for-full-stacks)). Bauen und kurz prüfen (Ausgabe gekürzt):
+
+  ```console
+  $ cargo build --profile profiling
+      Finished `profiling` profile [optimized + debuginfo] target(s) in 0.57s
+  $ target/profiling/logauswertung | head -3
+  GET /health                43922 Anfragen   2579 Fehler  p95   565 ms
+  GET /static/app.js         27882 Anfragen   1667 Fehler  p95   578 ms
+  GET /static/app.css        24222 Anfragen   1516 Fehler  p95   601 ms
+  ```
+
+  Das Binary liegt unter `target/profiling/`, getrennt von `target/release/`. `debug = true` ändert die Optimierung nicht, nur die Größe der Datei. Profile wirken nur in der `Cargo.toml` an der Wurzel eines Workspace oder in einer `.cargo/config.toml` (dort schlägt das samply-README das Profil für alle Projekte vor). In einem Mitglied meldet Cargo `profiles for the non root package will be ignored` ([Cargo Book: Profiles](https://doc.rust-lang.org/cargo/reference/profiles.html)).
+
+  Bevor du etwas änderst, hältst du fest, wo du stehst. hyperfine misst das ganze Programm ([hyperfine](https://github.com/sharkdp/hyperfine#basic-benchmarks)). Danach kopierst du das Binary weg, denn jeder Build überschreibt `target/profiling/logauswertung`, und spätere Vergleiche sollen gegen genau dieses Programm laufen:
+
+  ```console
+  $ hyperfine --warmup 3 target/profiling/logauswertung
+  Benchmark 1: target/profiling/logauswertung (10 runs)
+                  mean     ±       σ          min     …     max
+    Wall Time    3.142 s   ±   0.009 s      3.129 s   …   3.157 s
+    Memory        15.6 MiB ±     0.2 MiB     15.2 MiB …    15.8 MiB
+  $ cp target/profiling/logauswertung logauswertung-vorher
+  ```
+
+  3,142 s ± 0,009 s, sehr geringe Streuung. Das ist die Baseline.
+
+  ## Schritt 2: ein criterion-Benchmark für die heiße Funktion
+
+  hyperfine misst alles, auch das Erzeugen des Logs. Für die Funktion, um die es geht, legst du einen criterion-Benchmark an. Die Einträge in der `Cargo.toml` stehen schon oben. `benches/auswerten.rs`:
+
+  ```rust
+  use criterion::{Criterion, criterion_group, criterion_main};
+  use logauswertung::{auswerten, erzeuge_log};
+  use std::hint::black_box;
+
+  fn bench_auswerten(c: &mut Criterion) {
+      let log = erzeuge_log(50_000, 42);
+      let mut gruppe = c.benchmark_group("logauswertung");
+      gruppe.sample_size(10);
+      gruppe.bench_function("auswerten_50k", |b| {
+          b.iter(|| auswerten(black_box(&log)))
+      });
+      gruppe.finish();
+  }
+
+  criterion_group!(benches, bench_auswerten);
+  criterion_main!(benches);
+  ```
+
+  Eine Iteration der Ausgangsfassung dauert mit 50 000 Zeilen rund 200 ms. Mit den üblichen 100 Stichproben würde criterion sehr lange messen, deshalb senkt `sample_size(10)` die Zahl auf das erlaubte Minimum ([sample_size](https://docs.rs/criterion/latest/criterion/struct.BenchmarkGroup.html#method.sample_size)). Gespeichert wird das Ergebnis unter einem Namen, damit du später gezielt dagegen vergleichen kannst ([Command-Line Options](https://bheisler.github.io/criterion.rs/book/user_guide/command_line_options.html)). Der naheliegende Aufruf scheitert (Ausgabe gekürzt):
+
+  ```console
+  $ cargo bench -- --save-baseline vorher
+       Running unittests src/lib.rs (target/release/deps/logauswertung-c3c50f6602f2758b)
+  error: Unrecognized option: 'save-baseline'
+  error: bench failed, to rerun pass `--lib`
+  ```
+
+  `cargo bench` startet zuerst das eingebaute Test-Gerüst für `src/lib.rs` und `src/main.rs`, und das kennt `--save-baseline` nicht. Die criterion-FAQ nennt zwei Auswege: nur den criterion-Benchmark starten oder für Bibliothek und Binary `bench = false` setzen ([FAQ](https://bheisler.github.io/criterion.rs/book/faq.html), [Cargo Book: bench field](https://doc.rust-lang.org/cargo/reference/cargo-targets.html#the-bench-field)). Mit `--bench auswerten` (Ausgabe gekürzt):
+
+  ```console
+  $ cargo bench --bench auswerten -- --save-baseline vorher
+  logauswertung/auswerten_50k
+                          time:   [210.45 ms 210.87 ms 211.28 ms]
+  ```
+
+  Ein erster Befund steckt schon in den beiden Zahlen. Das ganze Programm mit 200 000 Zeilen braucht 3,1 s, die Auswertung von 50 000 Zeilen 0,21 s. Viermal so viele Zeilen kosten also rund fünfzehnmal so viel Zeit. Irgendetwas wächst schneller als die Eingabe.
+
+  ## Schritt 3: die Aufnahme mit samply
+
+  [samply](https://github.com/mstange/samply) ist ein Sampling-Profiler. Er startet das Programm, nimmt standardmäßig 1000-mal pro Sekunde den Stack auf und öffnet danach das Ergebnis im Firefox Profiler im Browser. Die Daten bleiben auf deinem Rechner, bis du sie selbst hochlädst. Installiert wird samply mit `cargo install --locked samply` oder über die Installer im README.
+
+  ```console
+  $ samply record ./target/profiling/logauswertung
+  ```
+
+  Unter Linux braucht samply Zugriff auf Performance-Events des Kernels. Ist das normalen Benutzern verboten, bricht samply sofort ab. So sah es auf dem Testrechner aus:
+
+  ```text
+  '/proc/sys/kernel/perf_event_paranoid' is currently set to 2.
+  In order for samply to work with a non-root user, this level needs
+  to be set to 1 or lower.
+  You can execute the following command and then try again:
+      echo '1' | sudo tee /proc/sys/kernel/perf_event_paranoid
+  ```
+
+  Der Wert 2 verbietet unprivilegierten Benutzern das Profilieren des Kernels, samply verlangt 1 oder weniger ([Kernel-Doku: perf_event_paranoid](https://docs.kernel.org/admin-guide/sysctl/kernel.html#perf-event-paranoid)). Der Befehl aus der Meldung gilt bis zum nächsten Neustart; `sudo sysctl kernel.perf_event_paranoid=1` wirkt genauso. Auf einem eigenen Entwicklungsrechner ist das üblich. Auf geteilten Servern oder in Containern entscheidet der Administrator.
+
+  > [!WARNING] Systemeinstellung, nicht Projekteinstellung
+  > `perf_event_paranoid` gilt für alle Benutzer des Rechners. Setz ihn nur dort herunter, wo du allein arbeitest, und nur so lange, wie du profilierst. Eine dauerhafte Änderung über `/etc/sysctl.d/` gehört nicht in ein Projekt-README.
+
+  Im Firefox Profiler zeigen drei Ansichten dieselben Daten unterschiedlich ([UI Tour](https://github.com/firefox-devtools/profiler/blob/main/docs-user/guide-ui-tour-panels.md)):
+
+  - **Call Tree**: Aufrufe als Baum mit Gesamt- und Selbstzeit. Mit „Invert call stack“ stehen die Funktionen mit der meisten Selbstzeit oben ([Filtering call trees](https://github.com/firefox-devtools/profiler/blob/main/docs-user/guide-filtering-call-trees.md)).
+  - **Flame Graph**: derselbe Baum als Flamegraph, gelesen wie in [Performance messen und lesen](/rust/performance-messen).
+  - **Stack Chart**: die Stacks in zeitlicher Reihenfolge, passend zur Zeitleiste oben.
+
+  Eine Aufnahme der Ausgangsfassung ergibt 3151 Samples, hier gefaltet und auf eine Ebene unter `auswerten` vereinfacht. Die Zahlen in dieser Lektion stammen aus [pprof-rs](https://docs.rs/pprof/latest/pprof/), einem Sampling-Profiler, der im Prozess selbst läuft (ebenfalls 1000 Hz, Profil `profiling`), weil samply auf dem Testrechner nicht messen durfte. Im Call Tree von samply suchst du nach denselben Funktionsnamen.
+
+  ```text
+  main;auswerten;sort 3057       # 97,0 %
+  main;erzeuge_log 32            #  1,0 %
+  main;auswerten;collect 30      #  1,0 %
+  main;auswerten;hashmap 15      #  0,5 %
+  main;auswerten;format! 8       #  0,3 %
+  main;auswerten;… 9             #  0,3 %
+  ```
+
+  Fast jedes Sample endet im Sortieren. Der Stack darunter, gekürzt um die Typparameter:
+
+  ```text
+  logauswertung::auswerten
+    <[u32]>::sort
+      alloc::slice::stable_sort
+        core::slice::sort::stable::sort
+          core::slice::sort::stable::driftsort_main
+            core::slice::sort::stable::drift::sort
+              core::slice::sort::stable::drift::logical_merge
+                core::slice::sort::stable::merge::merge
+                  MergeState::merge_down        # 3049 Samples
+  ```
+
+  `<[u32]>::sort` wird nur an einer Stelle aufgerufen: `pfad.latenzen.sort()` in der Schleife über die Zeilen. Nach jeder Zeile sortiert das Programm alle bisherigen Latenzen dieses Pfads neu, um den p95-Wert aktuell zu halten. Der Pfad `/health` hat 43 922 Anfragen; seine Liste wird 43 922-mal sortiert, jedes Mal ein Stück länger. Die Arbeit wächst damit quadratisch mit der Zahl der Zeilen pro Pfad. Das erklärt den Befund aus Schritt 2.
+
+  Amdahl sagt dir auch, was du nicht tun solltest: Die Allokationen durch `to_string`, `collect` und `format!` sind im Code gut sichtbar. Im Profil stecken `collect`, `format!`, `drop` und `clone` zusammen in 44 von 3151 Samples, also in 1,4 %. Sie zuerst zu entfernen, würde höchstens 1,4 % sparen.
+
+  ## Schritt 4: genau eine Änderung, dann neu messen
+
+  Die erste Änderung verschiebt die p95-Berechnung hinter die Schleife. Jeder Pfad wird einmal sortiert, mehr nicht:
+
+  ```diff
+           pfad.latenzen.push(ms);
+  -        pfad.latenzen.sort();
+  -        let rang = (pfad.latenzen.len() * 95).div_ceil(100);
+  -        pfad.p95 = pfad.latenzen[rang - 1];
+
+           if status.contains_key(&code) {
+               *status.get_mut(&code).unwrap() += 1;
+           } else {
+               status.insert(code.clone(), 1);
+           }
+       }
+
+  +    for pfad in pfade.values_mut() {
+  +        pfad.latenzen.sort();
+  +        let rang = (pfad.latenzen.len() * 95).div_ceil(100);
+  +        pfad.p95 = pfad.latenzen[rang - 1];
+  +    }
+  +
+       let mut pfade: Vec<(String, Pfad)> = pfade.into_iter().collect();
+  ```
+
+  Das Ergebnis muss gleich bleiben. Weil die Ausgabe deterministisch ist, reicht ein Vergleich der beiden Programme: `diff <(./logauswertung-vorher) <(target/profiling/logauswertung)` darf nichts ausgeben. Besser ist ein Test, der alte und neue Funktion auf denselben Daten vergleicht; das übst du in den Aufgaben. Dann misst du gegen die Baseline (criterion-Ausgabe gekürzt):
+
+  ```console
+  $ cargo build --profile profiling
+  $ hyperfine --warmup 3 ./logauswertung-vorher target/profiling/logauswertung
+  Benchmark 1: ./logauswertung-vorher (10 runs)
+                  mean     ±       σ          min     …     max
+    Wall Time    3.143 s   ±   0.004 s      3.134 s   …   3.147 s
+    Memory        15.6 MiB ±     0.1 MiB     15.3 MiB …    15.8 MiB
+
+  Benchmark 2: target/profiling/logauswertung (29 runs)
+                  mean     ±       σ          min     …     max
+    Wall Time    0.103 s   ±   0.002 s      0.100 s   …   0.107 s            -96.7%  (30.4x faster)
+    Memory        15.8 MiB ±     0.1 MiB     15.5 MiB …    15.9 MiB           +1.2%
+  $ cargo bench --bench auswerten -- --baseline vorher
+  logauswertung/auswerten_50k
+                          time:   [17.018 ms 17.032 ms 17.051 ms]
+                          change: [−91.937% −91.919% −91.900%] (p = 0.00 < 0.05)
+                          Performance has improved.
+  ```
+
+  Das ganze Programm ist 30,4-mal schneller. Der Benchmark mit 50 000 Zeilen zeigt nur Faktor 12: Bei weniger Zeilen pro Pfad fiel das quadratische Sortieren weniger ins Gewicht. Der Benchmark hat die Richtung richtig gezeigt, das Ausmaß im Betrieb hängt aber von der Eingabegröße ab. Miss mit Daten in der Größenordnung, die das Programm wirklich sieht.
+
+  > [!MERKE]
+  > Eine Runde ist immer: messen, genau eine Änderung, Ergebnis prüfen, gegen dieselbe Baseline messen, festhalten. Danach wird das neue Programm die nächste Baseline.
+
+  ## Schritt 5: neues Profil, Allokationen zählen
+
+  Nach der ersten Änderung sieht das Profil ganz anders aus. Damit genug Samples zusammenkommen, wurde es mit 2 000 000 Zeilen aufgenommen (974 Samples, vereinfacht, kleine Posten zusammengefasst):
+
+  ```text
+  main;erzeuge_log 314                    # 32,2 %
+  main;auswerten;collect 144              # 14,8 %
+  main;auswerten;collect;malloc 107       # 11,0 %
+  main;auswerten;collect;realloc 38       #  3,9 %
+  main;auswerten;hashmap 95               #  9,8 %
+  main;auswerten;parse 75                 #  7,7 %
+  main;auswerten;format! 57               #  5,9 %
+  main;auswerten;lines 42                 #  4,3 %
+  main;auswerten;drop;free 33             #  3,4 %
+  main;auswerten;to_string 32             #  3,3 %
+  main;auswerten;… 37                     #  3,8 %
+  ```
+
+  `erzeuge_log` ist das Testgerüst und nicht Teil der Aufgabe. In `auswerten` fällt `collect` auf: die Zeile `zeile.split(' ').map(|t| t.to_string()).collect()`, die jede Zeile in einen `Vec<String>` kopiert, mit `malloc` und `realloc` darunter. Zusammen mit `format!`, `to_string` und `free` sind Allokationen jetzt der größte Posten in `auswerten`. Ab hier lohnt es sich, sie zu zählen. Der Zähler aus dem Lese-Modul kommt als Beispiel ins Projekt, `examples/allokationen.rs`:
+
+  ```rust
+  //! Zählt Heap-Allokationen nur während `auswerten` (nicht beim Erzeugen, nicht beim Drucken).
+  use logauswertung::{auswerten, erzeuge_log};
+  use std::alloc::{GlobalAlloc, Layout, System};
+  use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+  struct Zaehler;
+  static ALLOKATIONEN: AtomicUsize = AtomicUsize::new(0);
+
+  unsafe impl GlobalAlloc for Zaehler {
+      unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+          ALLOKATIONEN.fetch_add(1, Relaxed);
+          unsafe { System.alloc(layout) }
+      }
+      unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+          unsafe { System.dealloc(ptr, layout) }
+      }
+  }
+
+  #[global_allocator]
+  static GLOBAL: Zaehler = Zaehler;
+
+  fn main() {
+      let zeilen: usize = std::env::args().nth(1).map_or(200_000, |a| a.parse().unwrap());
+      let log = erzeuge_log(zeilen, 42);
+      let vorher = ALLOKATIONEN.load(Relaxed);
+      let bericht = auswerten(&log);
+      let nachher = ALLOKATIONEN.load(Relaxed);
+      std::hint::black_box(&bericht);
+      println!("{} Allokationen in auswerten ({zeilen} Zeilen)", nachher - vorher);
+  }
+  ```
+
+  ```console
+  $ cargo run --profile profiling --example allokationen
+  2400254 Allokationen in auswerten (200000 Zeilen)
+  ```
+
+  Zwölf Allokationen pro Zeile. Die nächsten drei Runden folgen demselben Muster, je eine Änderung:
+
+  1. **Teile als `&str`.** `zeile.to_string()` fällt weg, `teile` wird ein `Vec<&str>`, der auf die Zeile zeigt.
+  2. **Geliehene Schlüssel und `entry`.** Die Maps bekommen `(&str, &str)` und `&str` als Schlüssel, `entry(…).or_default()` ersetzt `contains_key` plus `insert`. `format!` läuft nur noch einmal pro Pfad beim Erstellen des Berichts.
+  3. **Kein `Vec` pro Zeile.** Die sechs Felder kommen mit `let (Some(_), …, None) = (teile.next(), …) else { continue };` direkt aus dem Iterator.
+
+  ## Schritt 6: das Messprotokoll
+
+  Jede Zeile stammt aus einem hyperfine-Vergleich von vorheriger und neuer Fassung im selben Lauf (`--warmup 3`), die Allokationen aus `examples/allokationen.rs`:
+
+  Die Prozentangaben vergleichen mit der vorherigen Fassung im selben hyperfine-Lauf; deshalb weichen sie leicht von dem ab, was du aus den gerundeten Zeilen nachrechnest.
+
+  | Runde | Änderung | Wall Time | Allokationen |
+  | --- | --- | --- | --- |
+  | 0 | Ausgangsfassung | 3,142 s ± 0,009 s | 2 582 829 |
+  | 1 | p95 nach der Schleife | 103 ms ± 2 ms (−96,7 %) | 2 400 254 |
+  | 2 | Teile als `&str` | 89,3 ms ± 2,2 ms (−13,4 %) | 800 254 |
+  | 3 | `entry`, geliehene Schlüssel | 70,6 ms ± 2,5 ms (−21,1 %) | 400 271 |
+  | 4 | kein `Vec` pro Zeile | 63,5 ms ± 2,3 ms (−10,3 %) | 271 |
+
+  Die erste Runde hat 97 % der Zeit gespart, die drei weiteren zusammen knapp 40 % des Rests. Nach Runde 4 steckt in der Aufnahme mehr als die Hälfte der Samples in `erzeuge_log`. Die Auswertung selbst ist kein großer Posten mehr. Hier hörst du auf, es sei denn, eine Anforderung verlangt mehr. Ein Messprotokoll sollte enthalten:
+
+  - **Messaufbau:** Rechner (allgemein), Build-Profil, Eingabe, Werkzeuge mit Version und Optionen.
+  - **Baseline** mit Streuung, bevor etwas geändert wurde.
+  - **Pro Runde:** Hypothese aus dem Profil, genau eine Änderung, Nachweis, dass das Ergebnis gleich bleibt, Messung gegen die vorherige Fassung.
+  - **Entscheidung:** behalten oder verwerfen, und wann du aufhörst.
+
+  ## Häufige Fehler
+
+  - **Debug-Build profilieren.** 349 statt 63 ms bei der fertigen Fassung, und das Profil zeigt Kosten, die es im Release-Build nicht gibt, weil nichts eingebaut wird.
+  - **Ohne Debug-Infos profilieren.** Eingebaute Funktionen verschwinden, ihre Zeit erscheint beim Aufrufer.
+  - **`cargo bench -- --save-baseline …`** ohne `--bench`: `Unrecognized option`, weil das eingebaute Test-Gerüst die Option nicht kennt.
+  - **Das alte Binary nicht aufheben.** Nach dem nächsten Build gibt es nichts mehr, wogegen du vergleichen kannst.
+  - **Zwei Änderungen in einer Runde.** Dann bleibt offen, welche wie viel gebracht hat.
+  - **Benchmark mit zu kleiner Eingabe.** Mit 50 000 Zeilen zeigte die erste Änderung Faktor 12, im Programm mit 200 000 Zeilen Faktor 30.
+  - **Das Testgerüst optimieren.** `erzeuge_log` dominiert am Ende das Profil, gehört aber nicht zur Aufgabe.
+  - **Zahlen von verschiedenen Tagen vergleichen.** Last, Takt und Temperatur ändern sich. Vorher und nachher gehören in denselben hyperfine-Lauf.
+
+  > [!PRAXIS] Baselines im Team
+  > In Projekten mit Performance-Anforderungen läuft ein criterion-Vergleich gegen die Baseline des Hauptzweigs vor jedem Release, immer auf derselben Maschine. Auf geteilten CI-Runnern teilen sich mehrere Jobs dieselbe Hardware, dort schwanken Messungen stärker als auf einer festen Maschine. Jede Optimierung bekommt einen eigenen Commit mit dem Messprotokoll in der Beschreibung. So lässt sich eine einzelne Änderung zurücknehmen, wenn sie später Ärger macht.
+
+  > [!INTERVIEW] „Erzähl von einer Optimierung, die du gemacht hast.“
+  > Antworte mit dem Protokoll statt mit dem Trick: „Das Programm brauchte 3,1 Sekunden. Ich habe zuerst eine Baseline mit hyperfine genommen und dann mit samply profiliert. 97 % der Samples lagen im Sortieren, weil nach jeder Zeile neu sortiert wurde. Ich habe nur das geändert, ein Test hat bestätigt, dass der Bericht gleich bleibt, und die Laufzeit fiel auf 103 ms. Danach habe ich in drei weiteren Runden die Allokationen von zwölf pro Zeile auf fast null gesenkt und bei 63 ms aufgehört, weil der Rest im Testgerüst lag.“ Interviewer hören dabei auf drei Dinge: Messung vor Änderung, eine Änderung pro Runde, ein begründeter Schluss.
+
+  ## Zusammenfassung
+
+  - Gemessen und profiliert wird ein Release-Build mit Debug-Infos, am einfachsten über ein eigenes Profil `profiling` mit `inherits = "release"` und `debug = true`.
+  - Zuerst die Baseline: hyperfine für das ganze Programm, das alte Binary aufheben, criterion mit `--bench name -- --save-baseline vorher` für die heiße Funktion.
+  - samply braucht unter Linux `perf_event_paranoid` ≤ 1. Call Tree mit „Invert call stack“ zeigt Selbstzeit, Flame Graph die Struktur, Stack Chart den zeitlichen Verlauf.
+  - Das Profil entscheidet die Reihenfolge. Hier lagen 97 % im Sortieren, die gut sichtbaren Allokationen bei 1,4 %.
+  - Eine Runde ist: eine Änderung, Ergebnis per Test prüfen, gegen dieselbe Baseline messen, festhalten.
+  - Allokationen zählt ein eigener `GlobalAlloc` stabil. `&str` statt `String`, `entry` und Iteratoren statt Zwischen-`Vec` senkten sie von 2,4 Millionen auf 271.
+  - Aufhören, wenn das Profil keinen lohnenden Posten im eigenen Code mehr zeigt.
+exercises:
+  - id: profil-wahl
+    type: choice
+    title: Welches Binary kommt unter den Profiler?
+    prompt: |
+      Du willst `logauswertung` mit samply aufnehmen und danach im Call Tree nachsehen, welche Zeile im Quelltext teuer ist. Welches Binary nimmst du?
+    options:
+      - text: "`target/profiling/logauswertung`, gebaut mit `inherits = \"release\"` und `debug = true`."
+        correct: true
+        why: Optimiert wie das ausgelieferte Programm, und die Debug-Infos ordnen Samples Funktionen, eingebauten Funktionen und Quellzeilen zu.
+      - text: "`target/debug/logauswertung` aus `cargo build`."
+        correct: false
+        why: Im Debug-Build war die fertige Fassung 5,6-mal langsamer, und ohne Optimierung verteilt sich die Zeit anders. Du würdest Stellen optimieren, die im Release-Build kein Problem sind.
+      - text: "`target/release/logauswertung` ohne Debug-Infos."
+        correct: false
+        why: Die Zeiten stimmen, aber eingebaute Funktionen verschwinden im Stack, und die Quelltext-Ansicht findet keine Zeilen.
+      - text: "Das Binary, das `cargo run --release` gerade baut, aufgenommen mit `samply record cargo run --release`."
+        correct: false
+        why: Dann nimmt samply auch Cargo selbst auf, samt Prüfung, ob neu gebaut werden muss. Nimm das fertige Binary direkt auf.
+    explanation: |
+      Ein Profil soll zeigen, wo das ausgelieferte Programm Zeit verbringt. Das verlangt die Optimierungen von `release`. Damit der Profiler die Samples Funktionen und Zeilen zuordnen kann, braucht er Debug-Infos. Das eigene Profil `profiling` liefert beides, ohne `release` selbst zu verändern. Das samply-README empfiehlt genau diesen Aufbau.
+    resources:
+      - title: samply · Turn on debug info for full stacks
+        url: https://github.com/mstange/samply#turn-on-debug-info-for-full-stacks
+      - title: Cargo Book · debug
+        url: https://doc.rust-lang.org/cargo/reference/profiles.html#debug
+
+  - id: entry-allokationen
+    type: output
+    title: Drei Wege zur selben Zählung
+    prompt: |
+      Der Zähler zählt jeden Aufruf von `alloc`. Die drei Maps haben vorab Platz für acht Einträge, wachsen also nicht. Was gibt das Programm aus?
+    lang: rust
+    code: |
+      use std::alloc::{GlobalAlloc, Layout, System};
+      use std::collections::HashMap;
+      use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+      struct Zaehler;
+      static N: AtomicUsize = AtomicUsize::new(0);
+
+      unsafe impl GlobalAlloc for Zaehler {
+          unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+              N.fetch_add(1, Relaxed);
+              unsafe { System.alloc(layout) }
+          }
+          unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+              unsafe { System.dealloc(ptr, layout) }
+          }
+      }
+
+      #[global_allocator]
+      static A: Zaehler = Zaehler;
+
+      fn main() {
+          let methoden = ["GET", "POST", "GET", "GET", "DELETE", "GET"];
+
+          // A: entry mit eigenem String-Schlüssel
+          let mut a: HashMap<String, u32> = HashMap::with_capacity(8);
+          let t = N.load(Relaxed);
+          for m in methoden {
+              *a.entry(m.to_string()).or_insert(0) += 1;
+          }
+          let na = N.load(Relaxed) - t;
+
+          // B: erst nachsehen, nur neue Schlüssel kopieren
+          let mut b: HashMap<String, u32> = HashMap::with_capacity(8);
+          let t = N.load(Relaxed);
+          for m in methoden {
+              if let Some(n) = b.get_mut(m) {
+                  *n += 1;
+              } else {
+                  b.insert(m.to_string(), 1);
+              }
+          }
+          let nb = N.load(Relaxed) - t;
+
+          // C: geliehene Schlüssel
+          let mut c: HashMap<&str, u32> = HashMap::with_capacity(8);
+          let t = N.load(Relaxed);
+          for m in methoden {
+              *c.entry(m).or_insert(0) += 1;
+          }
+          let nc = N.load(Relaxed) - t;
+
+          println!("{na} {nb} {nc}");
+          println!("{} {} {}", a["GET"], b["GET"], c["GET"]);
+      }
+    expected: |
+      6 3 0
+      4 4 4
+    hints:
+      - "`entry` nimmt den Schlüssel als Wert. Bei `HashMap<String, _>` muss er also vorher ein `String` sein."
+      - "`get_mut` sucht mit einem `&str`, ohne etwas anzulegen."
+    explanation: |
+      Variante A ruft für jede der sechs Methoden `m.to_string()` auf, bevor `entry` überhaupt nachsieht. Das sind sechs Allokationen, auch für die vier Treffer, deren String danach sofort wieder freigegeben wird. Variante B sucht zuerst mit `get_mut(m)`; das geht mit `&str`, weil `String` sich als `str` ausleihen lässt. Nur die drei neuen Schlüssel GET, POST und DELETE werden kopiert. Variante C leiht die Schlüssel aus dem Array und alloziert nie. In allen drei Fällen zählt GET viermal.
+    resources:
+      - title: std · HashMap::entry
+        url: https://doc.rust-lang.org/std/collections/hash_map/struct.HashMap.html#method.entry
+      - title: std · HashMap::get_mut
+        url: https://doc.rust-lang.org/std/collections/hash_map/struct.HashMap.html#method.get_mut
+
+  - id: profil-bauen
+    type: command
+    title: Das Messprofil bauen
+    prompt: |
+      In der `Cargo.toml` steht das Profil `[profile.profiling]`. Baue das Projekt mit genau diesem Profil.
+    context: Du bist im Verzeichnis `logauswertung`.
+    answers:
+      - cargo build --profile profiling
+      - cargo build --profile=profiling
+      - cargo b --profile profiling
+      - cargo b --profile=profiling
+    output: |
+          Finished `profiling` profile [optimized + debuginfo] target(s) in 0.57s
+    explanation: |
+      `--profile <name>` wählt ein beliebiges Profil, auch ein eigenes ([cargo build](https://doc.rust-lang.org/cargo/commands/cargo-build.html#compilation-options)). `--release` ist die Kurzform für `--profile release`. Das Ergebnis liegt unter `target/profiling/`. Die Meldung „optimized + debuginfo“ bestätigt, dass `inherits = "release"` und `debug = true` gegriffen haben.
+    resources:
+      - title: Cargo Book · cargo build, Compilation Options
+        url: https://doc.rust-lang.org/cargo/commands/cargo-build.html#compilation-options
+
+  - id: hyperfine-vergleich
+    type: command
+    title: Vorher gegen nachher
+    prompt: |
+      Du hast die alte Fassung nach `./logauswertung-vorher` kopiert und die neue gebaut. Vergleiche beide mit hyperfine, mit **drei Aufwärmläufen**, die alte Fassung als Referenz.
+    context: Du bist im Projektverzeichnis. Die neue Fassung liegt unter `target/profiling/logauswertung`.
+    answers:
+      - hyperfine --warmup 3 ./logauswertung-vorher target/profiling/logauswertung
+      - hyperfine --warmup 3 ./logauswertung-vorher ./target/profiling/logauswertung
+      - hyperfine -w 3 ./logauswertung-vorher target/profiling/logauswertung
+      - hyperfine -w 3 ./logauswertung-vorher ./target/profiling/logauswertung
+      - hyperfine --warmup=3 ./logauswertung-vorher target/profiling/logauswertung
+      - hyperfine --warmup=3 ./logauswertung-vorher ./target/profiling/logauswertung
+      - hyperfine ./logauswertung-vorher target/profiling/logauswertung --warmup 3
+      - hyperfine ./logauswertung-vorher target/profiling/logauswertung -w 3
+    output: |
+      Benchmark 1: ./logauswertung-vorher (28 runs)
+                      mean     ±       σ          min     …     max
+        Wall Time    103.1 ms  ±     2.2 ms     100.2 ms  …   108.0 ms
+        Memory        15.8 MiB ±     0.1 MiB     15.5 MiB …    15.9 MiB
+
+      Benchmark 2: target/profiling/logauswertung (33 runs)
+                      mean     ±       σ          min     …     max
+        Wall Time     89.3 ms  ±     2.2 ms      86.9 ms  …    96.7 ms           -13.4%
+        Memory        15.9 MiB ±     0.2 MiB     15.6 MiB …    16.1 MiB           +0.7%
+    hints:
+      - Die Option für Aufwärmläufe heißt `--warmup` oder kurz `-w`.
+      - Das erste Kommando ist die Referenz, mit der alle weiteren verglichen werden.
+    explanation: |
+      `--warmup 3` startet jedes Kommando vor der Messung dreimal, damit Binary und Daten im Cache liegen. hyperfine vergleicht jedes weitere Kommando mit dem ersten; die Prozentzahl in der Zeile von Benchmark 2 bezieht sich also auf `logauswertung-vorher`. Beide Kommandos laufen im selben Aufruf und damit unter möglichst gleichen Bedingungen. Seit hyperfine 2.0 werden sie direkt gestartet, ohne Shell.
+    resources:
+      - title: hyperfine · Warmup runs and preparation commands
+        url: https://github.com/sharkdp/hyperfine#warmup-runs-and-preparation-commands
+
+  - id: samply-aufnahme
+    type: command
+    title: Ein Profil aufnehmen
+    prompt: |
+      Nimm das Binary `target/profiling/logauswertung` mit samply auf, ohne Argumente (es nutzt dann 200 000 Zeilen).
+    context: Du bist im Projektverzeichnis, `perf_event_paranoid` steht auf 1.
+    answers:
+      - samply record ./target/profiling/logauswertung
+      - samply record target/profiling/logauswertung
+      - samply record -- ./target/profiling/logauswertung
+      - samply record -- target/profiling/logauswertung
+    explanation: |
+      `samply record` startet das Kommando als Kindprozess, nimmt standardmäßig mit 1000 Hz auf und öffnet danach den Firefox Profiler mit einem lokalen Server, der Symbole und Quelltext liefert ([samply](https://github.com/mstange/samply#description)). Mit `--save-only -o datei.json.gz` speichert samply nur, `samply load datei.json.gz` öffnet die Aufnahme später. Steht `perf_event_paranoid` auf 2, bricht samply mit einer Meldung ab, die den nötigen Befehl nennt.
+    resources:
+      - title: samply · README
+        url: https://github.com/mstange/samply
+
+  - id: baseline-speichern
+    type: command
+    title: Die Baseline sichern
+    prompt: |
+      Lass nur den criterion-Benchmark `benches/auswerten.rs` laufen und speichere das Ergebnis als Baseline mit dem Namen `vorher`.
+    context: In der `Cargo.toml` steht `[[bench]] name = "auswerten"` mit `harness = false`.
+    answers:
+      - cargo bench --bench auswerten -- --save-baseline vorher
+      - cargo bench --bench auswerten -- --save-baseline=vorher
+      - cargo bench --bench=auswerten -- --save-baseline vorher
+      - cargo bench --bench=auswerten -- --save-baseline=vorher
+    hints:
+      - Optionen für criterion stehen hinter `--`.
+      - Ohne `--bench auswerten` startet Cargo zuerst das eingebaute Test-Gerüst, das die Option nicht kennt.
+    explanation: |
+      Alles vor `--` gehört Cargo, alles dahinter dem Benchmark-Programm. `--bench auswerten` startet nur diesen Benchmark; ohne die Angabe startet Cargo auch das Test-Gerüst von `src/lib.rs` und bricht mit `Unrecognized option: 'save-baseline'` ab. `--save-baseline vorher` legt die Messung unter `target/criterion/…/vorher/` ab. Sie bleibt dort, bis du sie mit demselben Namen überschreibst.
+    resources:
+      - title: criterion.rs · Command-Line Options
+        url: https://bheisler.github.io/criterion.rs/book/user_guide/command_line_options.html
+      - title: criterion.rs · FAQ
+        url: https://bheisler.github.io/criterion.rs/book/faq.html
+
+  - id: baseline-vergleichen
+    type: command
+    title: Gegen die Baseline messen
+    prompt: |
+      Du hast eine Änderung gemacht. Miss den Benchmark `auswerten` erneut und vergleiche mit der gespeicherten Baseline `vorher`, ohne sie zu überschreiben.
+    answers:
+      - cargo bench --bench auswerten -- --baseline vorher
+      - cargo bench --bench auswerten -- --baseline=vorher
+      - cargo bench --bench=auswerten -- --baseline vorher
+      - cargo bench --bench=auswerten -- --baseline=vorher
+    output: |
+      logauswertung/auswerten_50k
+                              time:   [12.653 ms 12.674 ms 12.697 ms]
+                              change: [−25.113% −24.883% −24.603%] (p = 0.00 < 0.05)
+                              Performance has improved.
+      Found 1 outliers among 10 measurements (10.00%)
+        1 (10.00%) high mild
+    explanation: |
+      `--baseline vorher` vergleicht mit der benannten Baseline statt mit dem letzten Lauf. So kannst du mehrere Versuche gegen denselben Ausgangspunkt messen. `--save-baseline` würde sie dagegen überschreiben. Die Ausgabe oben stammt aus Runde 2 gegen Runde 1 (50 000 Zeilen): Die Baseline `vorher` war nach Runde 1 neu gespeichert worden, damit jede Runde gegen die direkt vorherige misst. Ergebnis −24,9 %, das ganze Intervall weit jenseits der Rauschschwelle.
+    resources:
+      - title: criterion.rs · Command-Line Options
+        url: https://bheisler.github.io/criterion.rs/book/user_guide/command_line_options.html
+
+  - id: wachstum-messen
+    type: practice
+    title: Wie wächst die Laufzeit?
+    prompt: |
+      In Schritt 2 hast du aus zwei Zahlen geschlossen, dass etwas schneller wächst als die Eingabe. Mach daraus eine Messung: Schreibe einen zweiten criterion-Benchmark `benches/wachstum.rs`, der `auswerten` für 10 000, 20 000 und 50 000 Zeilen misst und den Durchsatz in Zeilen pro Sekunde anzeigt.
+
+      1. Trag `[[bench]] name = "wachstum"` mit `harness = false` in die `Cargo.toml` ein.
+      2. Nutze eine `BenchmarkGroup`, `Throughput::Elements` und `bench_with_input` mit `BenchmarkId::from_parameter`.
+      3. Erzeuge die Logs außerhalb der Messung.
+      4. Lass ihn für die Ausgangsfassung und nach der ersten Änderung laufen (`cargo bench --bench wachstum`) und notiere die `thrpt`-Zeilen.
+      5. Erkläre in zwei, drei Sätzen, was der Durchsatz über die Komplexität verrät.
+    lang: rust
+    starter: |
+      use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+      use logauswertung::{auswerten, erzeuge_log};
+      use std::hint::black_box;
+
+      fn wachstum(c: &mut Criterion) {
+          let mut gruppe = c.benchmark_group("wachstum");
+          // …
+          gruppe.finish();
+      }
+
+      criterion_group!(benches, wachstum);
+      criterion_main!(benches);
+    solution: |
+      use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+      use logauswertung::{auswerten, erzeuge_log};
+      use std::hint::black_box;
+
+      fn wachstum(c: &mut Criterion) {
+          let mut gruppe = c.benchmark_group("wachstum");
+          gruppe.sample_size(10);
+          for zeilen in [10_000, 20_000, 50_000] {
+              let log = erzeuge_log(zeilen, 42);
+              gruppe.throughput(Throughput::Elements(zeilen as u64));
+              gruppe.bench_with_input(BenchmarkId::from_parameter(zeilen), &log, |b, log| {
+                  b.iter(|| auswerten(black_box(log)))
+              });
+          }
+          gruppe.finish();
+      }
+
+      criterion_group!(benches, wachstum);
+      criterion_main!(benches);
+    verify: false
+    checklist:
+      - Die Logs entstehen vor `bench_with_input`, nicht in der gemessenen Closure.
+      - "`gruppe.throughput(Throughput::Elements(zeilen as u64))` steht vor jedem `bench_with_input`, damit criterion Zeilen pro Sekunde ausgibt."
+      - Die Eingabe läuft durch `black_box`.
+      - Du hast beide Fassungen gemessen und die drei `thrpt`-Werte je Fassung notiert.
+      - Deine Erklärung sagt, dass sinkender Durchsatz bei wachsender Eingabe auf mehr als lineare Arbeit hindeutet und gleichbleibender Durchsatz auf lineare.
+    explanation: |
+      Auf dem Testrechner fiel der Durchsatz der Ausgangsfassung von 893,6 über 520,8 auf 237,6 Kelem/s, also Tausend Zeilen pro Sekunde. Je mehr Zeilen, desto teurer wird jede einzelne: Das passt zum Sortieren nach jeder Zeile, dessen Arbeit mit der Länge der Liste wächst. Nach der ersten Änderung blieb er bei 2,98, 2,88 und 2,91 Melem/s, die Arbeit pro Zeile ist also konstant. `Throughput::Elements` rechnet die Zeit pro Iteration in Elemente pro Sekunde um; `BenchmarkId::from_parameter` benennt die Messungen nach der Zeilenzahl.
+    resources:
+      - title: criterion · BenchmarkGroup::bench_with_input
+        url: https://docs.rs/criterion/latest/criterion/struct.BenchmarkGroup.html#method.bench_with_input
+      - title: criterion · Throughput
+        url: https://docs.rs/criterion/latest/criterion/enum.Throughput.html
+
+  - id: profil-erbt-falsch
+    type: bug
+    title: Fünfmal langsamer unter dem Profiler
+    prompt: |
+      Ein Kollege hat das Messprofil angelegt. Seitdem misst hyperfine für `target/profiling/logauswertung` 350,9 ms ± 6,3 ms. Dasselbe Programm aus `cargo build --release` braucht 62,8 ms ± 2,4 ms. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: toml
+    code: |
+      [profile.profiling]
+      inherits = "dev"
+      debug = true
+    lines: [2]
+    fix:
+      - line: 2
+        answers:
+          - inherits = "release"
+          - inherits = 'release'
+    explanation: |
+      Ein eigenes Profil braucht `inherits` und übernimmt alle Einstellungen des genannten Profils ([Custom profiles](https://doc.rust-lang.org/cargo/reference/profiles.html#custom-profiles)). Mit `inherits = "dev"` entsteht ein Debug-Build mit `opt-level = 0`, Überlaufprüfungen und `debug-assertions`. Auf dem Testrechner war das Binary damit 5,6-mal langsamer als mit `inherits = "release"` (62,6 ms ± 2,1 ms). Ein Profil davon zeigt Kosten von Funktionen, die der Release-Build einbaut oder ganz wegoptimiert. `debug = true` allein macht keinen Debug-Build; es legt nur Debug-Infos dazu.
+    resources:
+      - title: Cargo Book · Custom profiles
+        url: https://doc.rust-lang.org/cargo/reference/profiles.html#custom-profiles
+      - title: Cargo Book · Default profiles
+        url: https://doc.rust-lang.org/cargo/reference/profiles.html#default-profiles
+
+  - id: profil-deuten
+    type: explain
+    title: Was dieses Profil verlangt
+    prompt: |
+      Das ist die Aufnahme der Ausgangsfassung aus Schritt 3 (3151 Samples, vereinfacht) und die Schleife aus `auswerten`, gekürzt. Dazu die Messungen: 50 000 Zeilen brauchen im Benchmark 210,9 ms, 200 000 Zeilen im ganzen Programm 3,142 s. Erkläre, wo die Zeit hingeht, warum sie stärker als die Zeilenzahl wächst und was du als Erstes änderst. Begründe auch, warum die Allokationen warten.
+    lang: text
+    code: |
+      main;auswerten;sort 3057       # 97,0 %
+      main;erzeuge_log 32            #  1,0 %
+      main;auswerten;collect 30      #  1,0 %
+      main;auswerten;hashmap 15      #  0,5 %
+      main;auswerten;format! 8       #  0,3 %
+      main;auswerten;… 9             #  0,3 %
+
+      for zeile in log.lines() {
+          let zeile = zeile.to_string();
+          let teile: Vec<String> = zeile.split(' ').map(|t| t.to_string()).collect();
+          // …
+          let pfad = pfade.get_mut(&schluessel).unwrap();
+          // …
+          pfad.latenzen.push(ms);
+          pfad.latenzen.sort();
+          let rang = (pfad.latenzen.len() * 95).div_ceil(100);
+          pfad.p95 = pfad.latenzen[rang - 1];
+          // …
+      }
+    points:
+      - 97 % der Samples liegen im Sortieren, aufgerufen aus `auswerten`. Die einzige Stelle ist `pfad.latenzen.sort()` in der Schleife.
+      - Nach jeder Zeile wird die ganze bisherige Liste des Pfads sortiert. Die Arbeit pro Zeile wächst mit der Länge der Liste, insgesamt also quadratisch mit den Zeilen pro Pfad. Viermal so viele Zeilen kosten deshalb rund fünfzehnmal so viel Zeit.
+      - Erste Änderung, und nur diese, p95 erst nach der Schleife berechnen und jeden Pfad einmal sortieren. Danach neu messen und prüfen, dass der Bericht gleich bleibt.
+      - Die Allokationen (`collect` mit den `to_string`-Kopien, `format!`, Freigaben) liegen zusammen bei rund 1,4 % der Samples. Nach Amdahl spart ihr Entfernen jetzt höchstens so viel. Sie kommen dran, wenn das nächste Profil sie als großen Posten zeigt.
+    explanation: |
+      Das Profil ist eindeutig: 3057 von 3151 Samples enden im Sortieren unter `auswerten`. Im Code gibt es genau eine Sortierstelle, und die steht in der Schleife über alle Zeilen. Sie sortiert nach jeder Zeile die wachsende Latenzliste des Pfads neu, damit `p95` immer aktuell ist. Das macht die Arbeit quadratisch in der Zahl der Zeilen pro Pfad und erklärt, warum viermal so viele Zeilen fünfzehnmal so lange brauchen. Die erste Änderung verschiebt deshalb die p95-Berechnung hinter die Schleife. Die Allokationen sind im Code auffälliger, im Profil aber klein. Wer mit ihnen anfinge, würde nach Amdahl höchstens 1,4 % gewinnen und die 97 % übersehen. Auf dem Testrechner brachte die Sortier-Änderung Faktor 30,4.
+    resources:
+      - title: std · slice::sort
+        url: https://doc.rust-lang.org/std/primitive.slice.html#method.sort
+      - title: Firefox Profiler · Invert call stack
+        url: https://github.com/firefox-devtools/profiler/blob/main/docs-user/guide-filtering-call-trees.md
+
+  - id: p95-aus-der-schleife
+    type: practice
+    title: Die heiße Funktion umbauen
+    prompt: |
+      Schreibe `auswerten` so um, dass p95 erst nach der Schleife berechnet wird. Der Bericht muss exakt gleich bleiben. Die Ausgangsfassung bleibt als `auswerten_langsam` im Code, damit ein Test beide auf denselben Daten vergleicht.
+
+      1. Ändere nur die p95-Berechnung, sonst nichts (eine Änderung pro Runde).
+      2. Ergänze die Tests: gleicher Bericht für mehrere Größen und Seeds, darunter ein leeres Log, und ein Fall mit bekanntem p95 und kaputten Zeilen.
+      3. Übertrag die neue Funktion in dein Projekt und miss mit hyperfine gegen `logauswertung-vorher` und mit criterion gegen die Baseline `vorher`.
+      4. Halte im Messprotokoll fest: Befund aus dem Profil, Änderung, beide Messungen, Testergebnis.
+    lang: rust
+    starter: |
+      use std::collections::HashMap;
+      use std::fmt::Write;
+
+      /// Erzeugt `zeilen` synthetische Access-Log-Zeilen. Gleicher `seed`, gleiche Zeilen.
+      /// Format: `2026-10-24T08:15:02Z 10.0.3.17 GET /api/orders 200 87ms`
+      pub fn erzeuge_log(zeilen: usize, seed: u64) -> String {
+          // (Pfad, Anteil in Prozent, POST möglich, typische Latenz in ms)
+          const PFADE: [(&str, u64, bool, u64); 12] = [
+              ("/health", 22, false, 2),
+              ("/static/app.js", 14, false, 6),
+              ("/static/app.css", 12, false, 5),
+              ("/api/orders", 10, true, 40),
+              ("/api/orders/:id", 9, false, 25),
+              ("/api/search", 8, false, 90),
+              ("/api/users/:id", 7, false, 20),
+              ("/api/cart", 6, true, 35),
+              ("/login", 4, true, 60),
+              ("/api/users", 3, false, 45),
+              ("/api/checkout", 3, true, 120),
+              ("/logout", 2, true, 15),
+          ];
+          let mut x = seed.max(1);
+          let mut log = String::with_capacity(zeilen * 64);
+          for i in 0..zeilen {
+              // xorshift64: schnell, deterministisch, kein Crate nötig
+              x ^= x << 13;
+              x ^= x >> 7;
+              x ^= x << 17;
+              let mut wahl = x % 100;
+              let mut eintrag = PFADE[0];
+              for p in PFADE {
+                  if wahl < p.1 {
+                      eintrag = p;
+                      break;
+                  }
+                  wahl -= p.1;
+              }
+              let (pfad, _, post_moeglich, basis) = eintrag;
+              let methode = if post_moeglich && (x >> 4) % 3 == 0 { "POST" } else { "GET" };
+              let status = match (x >> 8) % 100 {
+                  0..=88 => 200,
+                  89..=93 => 404,
+                  94..=97 => 500,
+                  _ => 503,
+              };
+              // jede 12. Anfrage hängt bis zu 1,5 s länger (langer Schwanz für p95)
+              let extra = if (x >> 24) % 12 == 0 { (x >> 32) % 1500 } else { 0 };
+              let ms = basis + (x >> 16) % (2 * basis) + extra;
+              let _ = writeln!(
+                  log,
+                  "2026-10-24T{:02}:{:02}:{:02}Z 10.0.{}.{} {methode} {pfad} {status} {ms}ms",
+                  (i / 3600) % 24,
+                  (i / 60) % 60,
+                  i % 60,
+                  (x >> 40) % 256,
+                  (x >> 48) % 256,
+              );
+          }
+          log
+      }
+
+      #[derive(Debug, Clone, PartialEq, Default)]
+      pub struct Pfad {
+          pub anfragen: u32,
+          pub fehler: u32,
+          pub latenzen: Vec<u32>,
+          pub p95: u32,
+      }
+
+      #[derive(Debug, PartialEq)]
+      pub struct Bericht {
+          /// ("GET /api/orders", Statistik), meiste Anfragen zuerst
+          pub pfade: Vec<(String, Pfad)>,
+          /// ("200", Anzahl), aufsteigend nach Code
+          pub status: Vec<(String, u32)>,
+      }
+
+      /// Die Ausgangsfassung aus der Lektion, unverändert.
+      fn auswerten_langsam(log: &str) -> Bericht {
+          let mut pfade: HashMap<String, Pfad> = HashMap::new();
+          let mut status: HashMap<String, u32> = HashMap::new();
+
+          for zeile in log.lines() {
+              let zeile = zeile.to_string();
+              let teile: Vec<String> = zeile.split(' ').map(|t| t.to_string()).collect();
+              if teile.len() != 6 {
+                  continue;
+              }
+              let schluessel = format!("{} {}", teile[2], teile[3]);
+              let code = teile[4].clone();
+              let ms: u32 = teile[5].trim_end_matches("ms").parse().unwrap_or(0);
+
+              if !pfade.contains_key(&schluessel) {
+                  pfade.insert(schluessel.clone(), Pfad::default());
+              }
+              let pfad = pfade.get_mut(&schluessel).unwrap();
+              pfad.anfragen += 1;
+              if code.starts_with('5') {
+                  pfad.fehler += 1;
+              }
+              pfad.latenzen.push(ms);
+              pfad.latenzen.sort();
+              let rang = (pfad.latenzen.len() * 95).div_ceil(100);
+              pfad.p95 = pfad.latenzen[rang - 1];
+
+              if status.contains_key(&code) {
+                  *status.get_mut(&code).unwrap() += 1;
+              } else {
+                  status.insert(code.clone(), 1);
+              }
+          }
+
+          let mut pfade: Vec<(String, Pfad)> = pfade.into_iter().collect();
+          pfade.sort_by(|a, b| b.1.anfragen.cmp(&a.1.anfragen).then(a.0.cmp(&b.0)));
+          let mut status: Vec<(String, u32)> = status.into_iter().collect();
+          status.sort();
+          Bericht { pfade, status }
+      }
+
+      /// p95 erst nach der Schleife berechnen; der Bericht muss gleich bleiben.
+      fn auswerten(log: &str) -> Bericht {
+          todo!()
+      }
+
+      fn main() {
+          let log = erzeuge_log(200_000, 42);
+          let bericht = auswerten(&log);
+          println!("{} Pfade, Status: {:?}", bericht.pfade.len(), bericht.status);
+      }
+
+      #[cfg(test)]
+      mod tests {
+          use super::*;
+
+          #[test]
+          fn gleicher_bericht_wie_vorher() {
+              let log = erzeuge_log(5_000, 42);
+              assert_eq!(auswerten(&log), auswerten_langsam(&log));
+              // weitere Größen und Seeds, auch ein leeres Log
+          }
+
+          #[test]
+          fn p95_und_kaputte_zeilen() {
+              // ein Log, dessen p95 du von Hand nachrechnen kannst, plus kaputte Zeilen
+              todo!()
+          }
+      }
+    solution: |
+      use std::collections::HashMap;
+      use std::fmt::Write;
+
+      /// Erzeugt `zeilen` synthetische Access-Log-Zeilen. Gleicher `seed`, gleiche Zeilen.
+      /// Format: `2026-10-24T08:15:02Z 10.0.3.17 GET /api/orders 200 87ms`
+      pub fn erzeuge_log(zeilen: usize, seed: u64) -> String {
+          // (Pfad, Anteil in Prozent, POST möglich, typische Latenz in ms)
+          const PFADE: [(&str, u64, bool, u64); 12] = [
+              ("/health", 22, false, 2),
+              ("/static/app.js", 14, false, 6),
+              ("/static/app.css", 12, false, 5),
+              ("/api/orders", 10, true, 40),
+              ("/api/orders/:id", 9, false, 25),
+              ("/api/search", 8, false, 90),
+              ("/api/users/:id", 7, false, 20),
+              ("/api/cart", 6, true, 35),
+              ("/login", 4, true, 60),
+              ("/api/users", 3, false, 45),
+              ("/api/checkout", 3, true, 120),
+              ("/logout", 2, true, 15),
+          ];
+          let mut x = seed.max(1);
+          let mut log = String::with_capacity(zeilen * 64);
+          for i in 0..zeilen {
+              // xorshift64: schnell, deterministisch, kein Crate nötig
+              x ^= x << 13;
+              x ^= x >> 7;
+              x ^= x << 17;
+              let mut wahl = x % 100;
+              let mut eintrag = PFADE[0];
+              for p in PFADE {
+                  if wahl < p.1 {
+                      eintrag = p;
+                      break;
+                  }
+                  wahl -= p.1;
+              }
+              let (pfad, _, post_moeglich, basis) = eintrag;
+              let methode = if post_moeglich && (x >> 4) % 3 == 0 { "POST" } else { "GET" };
+              let status = match (x >> 8) % 100 {
+                  0..=88 => 200,
+                  89..=93 => 404,
+                  94..=97 => 500,
+                  _ => 503,
+              };
+              // jede 12. Anfrage hängt bis zu 1,5 s länger (langer Schwanz für p95)
+              let extra = if (x >> 24) % 12 == 0 { (x >> 32) % 1500 } else { 0 };
+              let ms = basis + (x >> 16) % (2 * basis) + extra;
+              let _ = writeln!(
+                  log,
+                  "2026-10-24T{:02}:{:02}:{:02}Z 10.0.{}.{} {methode} {pfad} {status} {ms}ms",
+                  (i / 3600) % 24,
+                  (i / 60) % 60,
+                  i % 60,
+                  (x >> 40) % 256,
+                  (x >> 48) % 256,
+              );
+          }
+          log
+      }
+
+      #[derive(Debug, Clone, PartialEq, Default)]
+      pub struct Pfad {
+          pub anfragen: u32,
+          pub fehler: u32,
+          pub latenzen: Vec<u32>,
+          pub p95: u32,
+      }
+
+      #[derive(Debug, PartialEq)]
+      pub struct Bericht {
+          /// ("GET /api/orders", Statistik), meiste Anfragen zuerst
+          pub pfade: Vec<(String, Pfad)>,
+          /// ("200", Anzahl), aufsteigend nach Code
+          pub status: Vec<(String, u32)>,
+      }
+
+      /// Die Ausgangsfassung aus der Lektion, unverändert.
+      fn auswerten_langsam(log: &str) -> Bericht {
+          let mut pfade: HashMap<String, Pfad> = HashMap::new();
+          let mut status: HashMap<String, u32> = HashMap::new();
+
+          for zeile in log.lines() {
+              let zeile = zeile.to_string();
+              let teile: Vec<String> = zeile.split(' ').map(|t| t.to_string()).collect();
+              if teile.len() != 6 {
+                  continue;
+              }
+              let schluessel = format!("{} {}", teile[2], teile[3]);
+              let code = teile[4].clone();
+              let ms: u32 = teile[5].trim_end_matches("ms").parse().unwrap_or(0);
+
+              if !pfade.contains_key(&schluessel) {
+                  pfade.insert(schluessel.clone(), Pfad::default());
+              }
+              let pfad = pfade.get_mut(&schluessel).unwrap();
+              pfad.anfragen += 1;
+              if code.starts_with('5') {
+                  pfad.fehler += 1;
+              }
+              pfad.latenzen.push(ms);
+              pfad.latenzen.sort();
+              let rang = (pfad.latenzen.len() * 95).div_ceil(100);
+              pfad.p95 = pfad.latenzen[rang - 1];
+
+              if status.contains_key(&code) {
+                  *status.get_mut(&code).unwrap() += 1;
+              } else {
+                  status.insert(code.clone(), 1);
+              }
+          }
+
+          let mut pfade: Vec<(String, Pfad)> = pfade.into_iter().collect();
+          pfade.sort_by(|a, b| b.1.anfragen.cmp(&a.1.anfragen).then(a.0.cmp(&b.0)));
+          let mut status: Vec<(String, u32)> = status.into_iter().collect();
+          status.sort();
+          Bericht { pfade, status }
+      }
+
+      /// p95 erst nach der Schleife: einmal sortieren je Pfad statt nach jeder Zeile.
+      fn auswerten(log: &str) -> Bericht {
+          let mut pfade: HashMap<String, Pfad> = HashMap::new();
+          let mut status: HashMap<String, u32> = HashMap::new();
+
+          for zeile in log.lines() {
+              let zeile = zeile.to_string();
+              let teile: Vec<String> = zeile.split(' ').map(|t| t.to_string()).collect();
+              if teile.len() != 6 {
+                  continue;
+              }
+              let schluessel = format!("{} {}", teile[2], teile[3]);
+              let code = teile[4].clone();
+              let ms: u32 = teile[5].trim_end_matches("ms").parse().unwrap_or(0);
+
+              if !pfade.contains_key(&schluessel) {
+                  pfade.insert(schluessel.clone(), Pfad::default());
+              }
+              let pfad = pfade.get_mut(&schluessel).unwrap();
+              pfad.anfragen += 1;
+              if code.starts_with('5') {
+                  pfad.fehler += 1;
+              }
+              pfad.latenzen.push(ms);
+
+              if status.contains_key(&code) {
+                  *status.get_mut(&code).unwrap() += 1;
+              } else {
+                  status.insert(code.clone(), 1);
+              }
+          }
+
+          for pfad in pfade.values_mut() {
+              pfad.latenzen.sort();
+              let rang = (pfad.latenzen.len() * 95).div_ceil(100);
+              pfad.p95 = pfad.latenzen[rang - 1];
+          }
+
+          let mut pfade: Vec<(String, Pfad)> = pfade.into_iter().collect();
+          pfade.sort_by(|a, b| b.1.anfragen.cmp(&a.1.anfragen).then(a.0.cmp(&b.0)));
+          let mut status: Vec<(String, u32)> = status.into_iter().collect();
+          status.sort();
+          Bericht { pfade, status }
+      }
+
+      fn main() {
+          let log = erzeuge_log(200_000, 42);
+          let bericht = auswerten(&log);
+          println!("{} Pfade, Status: {:?}", bericht.pfade.len(), bericht.status);
+      }
+
+      #[cfg(test)]
+      mod tests {
+          use super::*;
+
+          #[test]
+          fn gleicher_bericht_wie_vorher() {
+              for (zeilen, seed) in [(0, 1), (1, 7), (3_000, 42), (10_000, 3)] {
+                  let log = erzeuge_log(zeilen, seed);
+                  assert_eq!(auswerten(&log), auswerten_langsam(&log), "{zeilen} Zeilen, seed {seed}");
+              }
+          }
+
+          #[test]
+          fn p95_und_kaputte_zeilen() {
+              let mut log = String::from("kaputte Zeile\n\n");
+              for ms in 1..=20 {
+                  log.push_str(&format!("2026-10-24T00:00:00Z 10.0.0.1 GET /health 200 {ms}ms\n"));
+              }
+              let b = auswerten(&log);
+              assert_eq!(b.pfade.len(), 1);
+              assert_eq!(b.pfade[0].1.anfragen, 20);
+              assert_eq!(b.pfade[0].1.p95, 19);
+              assert_eq!(b, auswerten_langsam(&log));
+          }
+      }
+    checklist:
+      - Nur die p95-Berechnung ist verschoben; Schlüssel, Allokationen und Sortierung des Berichts sind unverändert.
+      - Ein Test vergleicht `auswerten` und `auswerten_langsam` auf denselben erzeugten Logs, auch mit 0 Zeilen.
+      - Ein Test prüft p95 an einem Fall, den du von Hand nachrechnen kannst, und überspringt kaputte Zeilen.
+      - Du hast hyperfine (vorher gegen nachher im selben Lauf) und criterion (`--baseline vorher`) gemessen und beide Zahlen notiert.
+      - Du kannst erklären, warum der Faktor im Benchmark mit 50 000 Zeilen kleiner ausfällt als im Programm mit 200 000 Zeilen.
+    explanation: |
+      Die Musterlösung verschiebt drei Zeilen: Sortieren und p95 laufen einmal pro Pfad in einer eigenen Schleife über `pfade.values_mut()`. Das Ergebnis ist gleich, weil der p95-Wert nur vom Endstand der Liste abhängt; der Zwischenstand nach jeder Zeile wurde nie gebraucht. Die Tests sichern genau das ab, auch für die Randfälle leeres Log und kaputte Zeilen. Auf dem Testrechner fiel das Programm von 3,143 s auf 0,103 s (30,4-mal schneller), der Benchmark mit 50 000 Zeilen um 91,9 %. Der Unterschied kommt daher, dass die quadratische Arbeit mit der Zahl der Zeilen pro Pfad wächst.
+    resources:
+      - title: The Rust Book · Writing tests
+        url: https://doc.rust-lang.org/book/ch11-01-writing-tests.html
+      - title: std · slice::sort
+        url: https://doc.rust-lang.org/std/primitive.slice.html#method.sort
+
+  - id: allokationen-halbieren
+    type: practice
+    title: Allokationen mindestens halbieren
+    prompt: |
+      Ausgangspunkt ist der Stand nach der ersten Änderung (`auswerten_vorher`, zwölf Allokationen pro Zeile). Schreibe `auswerten` so um, dass sie **höchstens halb so viele** Allokationen braucht und denselben Bericht liefert.
+
+      1. Zähle mit einem eigenen `GlobalAlloc`. Weil Tests parallel in eigenen Threads laufen, zählt der Zähler pro Thread (`thread_local!` mit `Cell<usize>`).
+      2. Ein Test vergleicht die Berichte und prüft `nachher * 2 <= vorher`.
+      3. Geh in Runden vor: Nimm dir die größten Allokationsquellen aus dem Profil zuerst vor und miss nach jeder Änderung.
+      4. Notiere für jede Runde die Allokationen und die hyperfine-Zeit.
+    lang: rust
+    starter: |
+      use std::alloc::{GlobalAlloc, Layout, System};
+      use std::cell::Cell;
+      use std::collections::HashMap;
+      use std::fmt::Write;
+
+      // Zählt Allokationen pro Thread: Tests laufen parallel in eigenen Threads.
+      thread_local! {
+          static ALLOKATIONEN: Cell<usize> = const { Cell::new(0) };
+      }
+
+      struct Zaehler;
+
+      unsafe impl GlobalAlloc for Zaehler {
+          unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+              let _ = ALLOKATIONEN.try_with(|n| n.set(n.get() + 1));
+              unsafe { System.alloc(layout) }
+          }
+          unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+              unsafe { System.dealloc(ptr, layout) }
+          }
+      }
+
+      #[global_allocator]
+      static GLOBAL: Zaehler = Zaehler;
+
+      /// Allokationen, die `f` im aktuellen Thread auslöst.
+      fn zaehle<T>(f: impl FnOnce() -> T) -> (T, usize) {
+          let vorher = ALLOKATIONEN.with(Cell::get);
+          let ergebnis = f();
+          let nachher = ALLOKATIONEN.with(Cell::get);
+          (ergebnis, nachher - vorher)
+      }
+
+      /// Erzeugt `zeilen` synthetische Access-Log-Zeilen. Gleicher `seed`, gleiche Zeilen.
+      /// Format: `2026-10-24T08:15:02Z 10.0.3.17 GET /api/orders 200 87ms`
+      pub fn erzeuge_log(zeilen: usize, seed: u64) -> String {
+          // (Pfad, Anteil in Prozent, POST möglich, typische Latenz in ms)
+          const PFADE: [(&str, u64, bool, u64); 12] = [
+              ("/health", 22, false, 2),
+              ("/static/app.js", 14, false, 6),
+              ("/static/app.css", 12, false, 5),
+              ("/api/orders", 10, true, 40),
+              ("/api/orders/:id", 9, false, 25),
+              ("/api/search", 8, false, 90),
+              ("/api/users/:id", 7, false, 20),
+              ("/api/cart", 6, true, 35),
+              ("/login", 4, true, 60),
+              ("/api/users", 3, false, 45),
+              ("/api/checkout", 3, true, 120),
+              ("/logout", 2, true, 15),
+          ];
+          let mut x = seed.max(1);
+          let mut log = String::with_capacity(zeilen * 64);
+          for i in 0..zeilen {
+              // xorshift64: schnell, deterministisch, kein Crate nötig
+              x ^= x << 13;
+              x ^= x >> 7;
+              x ^= x << 17;
+              let mut wahl = x % 100;
+              let mut eintrag = PFADE[0];
+              for p in PFADE {
+                  if wahl < p.1 {
+                      eintrag = p;
+                      break;
+                  }
+                  wahl -= p.1;
+              }
+              let (pfad, _, post_moeglich, basis) = eintrag;
+              let methode = if post_moeglich && (x >> 4) % 3 == 0 { "POST" } else { "GET" };
+              let status = match (x >> 8) % 100 {
+                  0..=88 => 200,
+                  89..=93 => 404,
+                  94..=97 => 500,
+                  _ => 503,
+              };
+              // jede 12. Anfrage hängt bis zu 1,5 s länger (langer Schwanz für p95)
+              let extra = if (x >> 24) % 12 == 0 { (x >> 32) % 1500 } else { 0 };
+              let ms = basis + (x >> 16) % (2 * basis) + extra;
+              let _ = writeln!(
+                  log,
+                  "2026-10-24T{:02}:{:02}:{:02}Z 10.0.{}.{} {methode} {pfad} {status} {ms}ms",
+                  (i / 3600) % 24,
+                  (i / 60) % 60,
+                  i % 60,
+                  (x >> 40) % 256,
+                  (x >> 48) % 256,
+              );
+          }
+          log
+      }
+
+      #[derive(Debug, Clone, PartialEq, Default)]
+      pub struct Pfad {
+          pub anfragen: u32,
+          pub fehler: u32,
+          pub latenzen: Vec<u32>,
+          pub p95: u32,
+      }
+
+      #[derive(Debug, PartialEq)]
+      pub struct Bericht {
+          /// ("GET /api/orders", Statistik), meiste Anfragen zuerst
+          pub pfade: Vec<(String, Pfad)>,
+          /// ("200", Anzahl), aufsteigend nach Code
+          pub status: Vec<(String, u32)>,
+      }
+
+      /// Stand nach der ersten Änderung (p95 nach der Schleife).
+      fn auswerten_vorher(log: &str) -> Bericht {
+          let mut pfade: HashMap<String, Pfad> = HashMap::new();
+          let mut status: HashMap<String, u32> = HashMap::new();
+
+          for zeile in log.lines() {
+              let zeile = zeile.to_string();
+              let teile: Vec<String> = zeile.split(' ').map(|t| t.to_string()).collect();
+              if teile.len() != 6 {
+                  continue;
+              }
+              let schluessel = format!("{} {}", teile[2], teile[3]);
+              let code = teile[4].clone();
+              let ms: u32 = teile[5].trim_end_matches("ms").parse().unwrap_or(0);
+
+              if !pfade.contains_key(&schluessel) {
+                  pfade.insert(schluessel.clone(), Pfad::default());
+              }
+              let pfad = pfade.get_mut(&schluessel).unwrap();
+              pfad.anfragen += 1;
+              if code.starts_with('5') {
+                  pfad.fehler += 1;
+              }
+              pfad.latenzen.push(ms);
+
+              if status.contains_key(&code) {
+                  *status.get_mut(&code).unwrap() += 1;
+              } else {
+                  status.insert(code.clone(), 1);
+              }
+          }
+
+          for pfad in pfade.values_mut() {
+              pfad.latenzen.sort();
+              let rang = (pfad.latenzen.len() * 95).div_ceil(100);
+              pfad.p95 = pfad.latenzen[rang - 1];
+          }
+
+          let mut pfade: Vec<(String, Pfad)> = pfade.into_iter().collect();
+          pfade.sort_by(|a, b| b.1.anfragen.cmp(&a.1.anfragen).then(a.0.cmp(&b.0)));
+          let mut status: Vec<(String, u32)> = status.into_iter().collect();
+          status.sort();
+          Bericht { pfade, status }
+      }
+
+      /// Derselbe Bericht wie `auswerten_vorher`, mit höchstens halb so vielen Allokationen.
+      fn auswerten(log: &str) -> Bericht {
+          todo!()
+      }
+
+      fn main() {
+          let log = erzeuge_log(200_000, 42);
+          let (_, vorher) = zaehle(|| auswerten_vorher(&log));
+          let (_, nachher) = zaehle(|| auswerten(&log));
+          println!("vorher {vorher} Allokationen, nachher {nachher}");
+      }
+
+      #[cfg(test)]
+      mod tests {
+          use super::*;
+
+          #[test]
+          fn gleicher_bericht() {
+              for (zeilen, seed) in [(0, 1), (1, 7), (5_000, 42)] {
+                  let log = erzeuge_log(zeilen, seed);
+                  assert_eq!(auswerten(&log), auswerten_vorher(&log));
+              }
+          }
+
+          #[test]
+          fn hoechstens_halb_so_viele_allokationen() {
+              let log = erzeuge_log(20_000, 42);
+              let (a, vorher) = zaehle(|| auswerten_vorher(&log));
+              let (b, nachher) = zaehle(|| auswerten(&log));
+              assert_eq!(a, b);
+              println!("vorher {vorher}, nachher {nachher}");
+              assert!(nachher * 2 <= vorher, "vorher {vorher}, nachher {nachher}");
+          }
+      }
+    solution: |
+      use std::alloc::{GlobalAlloc, Layout, System};
+      use std::cell::Cell;
+      use std::collections::HashMap;
+      use std::fmt::Write;
+
+      // Zählt Allokationen pro Thread: Tests laufen parallel in eigenen Threads.
+      thread_local! {
+          static ALLOKATIONEN: Cell<usize> = const { Cell::new(0) };
+      }
+
+      struct Zaehler;
+
+      unsafe impl GlobalAlloc for Zaehler {
+          unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+              let _ = ALLOKATIONEN.try_with(|n| n.set(n.get() + 1));
+              unsafe { System.alloc(layout) }
+          }
+          unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+              unsafe { System.dealloc(ptr, layout) }
+          }
+      }
+
+      #[global_allocator]
+      static GLOBAL: Zaehler = Zaehler;
+
+      /// Allokationen, die `f` im aktuellen Thread auslöst.
+      fn zaehle<T>(f: impl FnOnce() -> T) -> (T, usize) {
+          let vorher = ALLOKATIONEN.with(Cell::get);
+          let ergebnis = f();
+          let nachher = ALLOKATIONEN.with(Cell::get);
+          (ergebnis, nachher - vorher)
+      }
+
+      /// Erzeugt `zeilen` synthetische Access-Log-Zeilen. Gleicher `seed`, gleiche Zeilen.
+      /// Format: `2026-10-24T08:15:02Z 10.0.3.17 GET /api/orders 200 87ms`
+      pub fn erzeuge_log(zeilen: usize, seed: u64) -> String {
+          // (Pfad, Anteil in Prozent, POST möglich, typische Latenz in ms)
+          const PFADE: [(&str, u64, bool, u64); 12] = [
+              ("/health", 22, false, 2),
+              ("/static/app.js", 14, false, 6),
+              ("/static/app.css", 12, false, 5),
+              ("/api/orders", 10, true, 40),
+              ("/api/orders/:id", 9, false, 25),
+              ("/api/search", 8, false, 90),
+              ("/api/users/:id", 7, false, 20),
+              ("/api/cart", 6, true, 35),
+              ("/login", 4, true, 60),
+              ("/api/users", 3, false, 45),
+              ("/api/checkout", 3, true, 120),
+              ("/logout", 2, true, 15),
+          ];
+          let mut x = seed.max(1);
+          let mut log = String::with_capacity(zeilen * 64);
+          for i in 0..zeilen {
+              // xorshift64: schnell, deterministisch, kein Crate nötig
+              x ^= x << 13;
+              x ^= x >> 7;
+              x ^= x << 17;
+              let mut wahl = x % 100;
+              let mut eintrag = PFADE[0];
+              for p in PFADE {
+                  if wahl < p.1 {
+                      eintrag = p;
+                      break;
+                  }
+                  wahl -= p.1;
+              }
+              let (pfad, _, post_moeglich, basis) = eintrag;
+              let methode = if post_moeglich && (x >> 4) % 3 == 0 { "POST" } else { "GET" };
+              let status = match (x >> 8) % 100 {
+                  0..=88 => 200,
+                  89..=93 => 404,
+                  94..=97 => 500,
+                  _ => 503,
+              };
+              // jede 12. Anfrage hängt bis zu 1,5 s länger (langer Schwanz für p95)
+              let extra = if (x >> 24) % 12 == 0 { (x >> 32) % 1500 } else { 0 };
+              let ms = basis + (x >> 16) % (2 * basis) + extra;
+              let _ = writeln!(
+                  log,
+                  "2026-10-24T{:02}:{:02}:{:02}Z 10.0.{}.{} {methode} {pfad} {status} {ms}ms",
+                  (i / 3600) % 24,
+                  (i / 60) % 60,
+                  i % 60,
+                  (x >> 40) % 256,
+                  (x >> 48) % 256,
+              );
+          }
+          log
+      }
+
+      #[derive(Debug, Clone, PartialEq, Default)]
+      pub struct Pfad {
+          pub anfragen: u32,
+          pub fehler: u32,
+          pub latenzen: Vec<u32>,
+          pub p95: u32,
+      }
+
+      #[derive(Debug, PartialEq)]
+      pub struct Bericht {
+          /// ("GET /api/orders", Statistik), meiste Anfragen zuerst
+          pub pfade: Vec<(String, Pfad)>,
+          /// ("200", Anzahl), aufsteigend nach Code
+          pub status: Vec<(String, u32)>,
+      }
+
+      /// Stand nach der ersten Änderung (p95 nach der Schleife).
+      fn auswerten_vorher(log: &str) -> Bericht {
+          let mut pfade: HashMap<String, Pfad> = HashMap::new();
+          let mut status: HashMap<String, u32> = HashMap::new();
+
+          for zeile in log.lines() {
+              let zeile = zeile.to_string();
+              let teile: Vec<String> = zeile.split(' ').map(|t| t.to_string()).collect();
+              if teile.len() != 6 {
+                  continue;
+              }
+              let schluessel = format!("{} {}", teile[2], teile[3]);
+              let code = teile[4].clone();
+              let ms: u32 = teile[5].trim_end_matches("ms").parse().unwrap_or(0);
+
+              if !pfade.contains_key(&schluessel) {
+                  pfade.insert(schluessel.clone(), Pfad::default());
+              }
+              let pfad = pfade.get_mut(&schluessel).unwrap();
+              pfad.anfragen += 1;
+              if code.starts_with('5') {
+                  pfad.fehler += 1;
+              }
+              pfad.latenzen.push(ms);
+
+              if status.contains_key(&code) {
+                  *status.get_mut(&code).unwrap() += 1;
+              } else {
+                  status.insert(code.clone(), 1);
+              }
+          }
+
+          for pfad in pfade.values_mut() {
+              pfad.latenzen.sort();
+              let rang = (pfad.latenzen.len() * 95).div_ceil(100);
+              pfad.p95 = pfad.latenzen[rang - 1];
+          }
+
+          let mut pfade: Vec<(String, Pfad)> = pfade.into_iter().collect();
+          pfade.sort_by(|a, b| b.1.anfragen.cmp(&a.1.anfragen).then(a.0.cmp(&b.0)));
+          let mut status: Vec<(String, u32)> = status.into_iter().collect();
+          status.sort();
+          Bericht { pfade, status }
+      }
+
+      /// Teile als &str, Schlüssel geliehen, entry statt contains_key + insert.
+      fn auswerten(log: &str) -> Bericht {
+          let mut pfade: HashMap<(&str, &str), Pfad> = HashMap::new();
+          let mut status: HashMap<&str, u32> = HashMap::new();
+
+          for zeile in log.lines() {
+              let teile: Vec<&str> = zeile.split(' ').collect();
+              if teile.len() != 6 {
+                  continue;
+              }
+              let code = teile[4];
+              let ms: u32 = teile[5].trim_end_matches("ms").parse().unwrap_or(0);
+
+              let pfad = pfade.entry((teile[2], teile[3])).or_default();
+              pfad.anfragen += 1;
+              if code.starts_with('5') {
+                  pfad.fehler += 1;
+              }
+              pfad.latenzen.push(ms);
+              *status.entry(code).or_insert(0) += 1;
+          }
+
+          for pfad in pfade.values_mut() {
+              pfad.latenzen.sort();
+              let rang = (pfad.latenzen.len() * 95).div_ceil(100);
+              pfad.p95 = pfad.latenzen[rang - 1];
+          }
+
+          let mut pfade: Vec<(String, Pfad)> = pfade
+              .into_iter()
+              .map(|((methode, pfad), s)| (format!("{methode} {pfad}"), s))
+              .collect();
+          pfade.sort_by(|a, b| b.1.anfragen.cmp(&a.1.anfragen).then(a.0.cmp(&b.0)));
+          let mut status: Vec<(String, u32)> =
+              status.into_iter().map(|(c, n)| (c.to_string(), n)).collect();
+          status.sort();
+          Bericht { pfade, status }
+      }
+
+      fn main() {
+          let log = erzeuge_log(200_000, 42);
+          let (_, vorher) = zaehle(|| auswerten_vorher(&log));
+          let (_, nachher) = zaehle(|| auswerten(&log));
+          println!("vorher {vorher} Allokationen, nachher {nachher}");
+      }
+
+      #[cfg(test)]
+      mod tests {
+          use super::*;
+
+          #[test]
+          fn gleicher_bericht() {
+              for (zeilen, seed) in [(0, 1), (1, 7), (5_000, 42)] {
+                  let log = erzeuge_log(zeilen, seed);
+                  assert_eq!(auswerten(&log), auswerten_vorher(&log));
+              }
+          }
+
+          #[test]
+          fn hoechstens_halb_so_viele_allokationen() {
+              let log = erzeuge_log(20_000, 42);
+              let (a, vorher) = zaehle(|| auswerten_vorher(&log));
+              let (b, nachher) = zaehle(|| auswerten(&log));
+              assert_eq!(a, b);
+              println!("vorher {vorher}, nachher {nachher}");
+              assert!(nachher * 2 <= vorher, "vorher {vorher}, nachher {nachher}");
+          }
+      }
+    checklist:
+      - Der Zähler zählt pro Thread und liest den Stand nur vor und nach dem gemessenen Aufruf.
+      - Der Test vergleicht die Berichte von `auswerten_vorher` und `auswerten` und prüft die Halbierung mit einer Meldung, die beide Zahlen nennt.
+      - Die Teile der Zeile werden geliehen (`&str`), nicht kopiert.
+      - Die Maps sind mit geliehenen Schlüsseln und `entry` gebaut; `format!` läuft nur noch beim Erstellen des Berichts.
+      - Du hast pro Runde Allokationen und Laufzeit notiert und kannst sagen, welche Änderung wie viel gebracht hat.
+    explanation: |
+      Die Musterlösung leiht alle Teile der Zeile, nutzt `(&str, &str)` und `&str` als Schlüssel mit `entry` und baut die Strings des Berichts erst am Ende, einmal pro Pfad. Mit 200 000 Zeilen fiel die Zahl von 2 400 254 auf 400 271. Übrig sind zwei pro Zeile für den `Vec<&str>`, der beim `collect` einmal wächst. Wer auch ihn ersetzt, landet bei 271. Der Zähler pro Thread ist wichtig: Ein globaler Zähler würde Allokationen anderer Tests mitzählen, die gleichzeitig laufen. `try_with` statt `with` vermeidet eine Panik, falls während des Thread-Endes noch alloziert wird.
+    resources:
+      - title: std · GlobalAlloc
+        url: https://doc.rust-lang.org/std/alloc/trait.GlobalAlloc.html
+      - title: std · LocalKey::try_with
+        url: https://doc.rust-lang.org/std/thread/struct.LocalKey.html#method.try_with
+      - title: Perf Book · Heap Allocations
+        url: https://nnethercote.github.io/perf-book/heap-allocations.html
+
+  - id: messprotokoll-werkstatt
+    type: practice
+    title: Dein Messprotokoll
+    prompt: |
+      Schreibe das Messprotokoll deiner eigenen Werkstatt-Runden, so wie es in einen Pull Request gehört. Nimm deine Zahlen, nicht die aus der Lektion. Mindestens: Messaufbau, Baseline mit Streuung, jede Runde mit Hypothese aus dem Profil, Änderung, Nachweis gleicher Ergebnisse und Messung, dazu eine Entscheidung, wann du aufgehört hast.
+    lang: text
+    starter: |
+      Messaufbau:
+      Baseline:
+      Runde 1:
+      Entscheidung:
+    solution: |
+      Messaufbau: Testrechner, Linux, Rust 1.99.1, Profil profiling
+      (inherits = "release", debug = true), 200 000 erzeugte Zeilen
+      (seed 42), hyperfine 2.0 mit --warmup 3, criterion 0.8 mit
+      50 000 Zeilen, Allokationen mit examples/allokationen.rs.
+
+      Baseline: 3,142 s ± 0,009 s; criterion 210,87 ms; 2 582 829
+      Allokationen. 50 000 Zeilen 0,21 s, 200 000 Zeilen 3,1 s: wächst
+      stärker als die Eingabe.
+
+      Runde 1: Profil 97,0 % in slice::sort aus auswerten (Sortieren
+      nach jeder Zeile). Änderung: p95 nach der Schleife. Bericht
+      gleich (Test und diff). 103 ms ± 2 ms (30,4-mal schneller),
+      criterion −91,9 %.
+      Runde 2: Profil zeigt collect (Vec<String>) mit malloc/realloc
+      als größten Posten in auswerten. Änderung: Teile als &str.
+      Bericht gleich (Test). 89,3 ms ± 2,2 ms (−13,4 %),
+      800 254 Allokationen.
+      Runde 3: Profil zeigt hashmap, format! und to_string für die
+      Schlüssel. Änderung: entry und geliehene Schlüssel. Bericht
+      gleich (Test). 70,6 ms ± 2,5 ms (−21,1 %), 400 271 Allokationen.
+      Runde 4: Profil zeigt noch collect mit malloc für den Vec<&str>
+      pro Zeile. Änderung: Felder direkt aus dem Iterator. Bericht
+      gleich (Test). 63,5 ms ± 2,3 ms (−10,3 %), 271 Allokationen.
+
+      Entscheidung: Stand von Runde 4 behalten. Mehr als die Hälfte
+      der Samples liegt jetzt in erzeuge_log (Testgerüst). Weitere
+      Arbeit an auswerten lohnt erst mit einer neuen Anforderung.
+    checklist:
+      - Jemand anderes könnte deine Messung mit den Angaben im Messaufbau wiederholen (Profil, Eingabe, Werkzeuge mit Optionen).
+      - Die Baseline steht mit Streuung da, bevor die erste Änderung beschrieben wird.
+      - Jede Runde nennt den Befund aus dem Profil, der sie begründet, nicht nur die Änderung.
+      - Jede Runde enthält genau eine Änderung und einen Nachweis, dass der Bericht gleich bleibt.
+      - Jede Messung ist gegen die direkt vorherige Fassung im selben hyperfine-Lauf oder gegen eine benannte criterion-Baseline gemacht.
+      - Die Entscheidung zum Aufhören ist mit dem letzten Profil begründet.
+    explanation: |
+      Die Musterlösung zeigt das Protokoll mit den Zahlen des Testrechners. Deine Zahlen weichen ab, die Struktur sollte gleich sein. Ein gutes Protokoll lässt sich prüfen: Jede Aussage hat eine Messung, jede Änderung eine Begründung aus dem Profil, und das Ende ist eine Entscheidung, keine Erschöpfung. Genau so liest ein Reviewer eine Performance-Änderung, und genau so erzählst du sie im Vorstellungsgespräch.
+    resources:
+      - title: The Rust Performance Book · Benchmarking
+        url: https://nnethercote.github.io/perf-book/benchmarking.html
