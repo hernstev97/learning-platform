@@ -1,0 +1,907 @@
+id: logs-geheimnisse
+title: Logs und Geheimnisse im Betrieb
+level: 3
+minutes: 210
+summary: JSON-Logs mit Lauf-ID, Rotation und einem Filter, der Geheimnisse schwärzt – und Secrets aus keyring, .env,
+  systemd-Credentials und GitHub Actions, samt Plan für ein geleaktes Token.
+goals:
+- Du schreibst einen JSON-Formatter und gibst jedem Eintrag eine Lauf-ID, per contextvars-Filter am Handler oder per
+  LoggerAdapter.
+- Du entscheidest zwischen Journal und Dateirotation und konfigurierst RotatingFileHandler so, dass er wirklich rotiert.
+- Du schreibst einen Filter, der Tokens in Logmeldungen schwärzt, und kennst seine Grenzen.
+- Du wählst die passende Quelle für Secrets – keyring, .env, systemd LoadCredential oder GitHub-Actions-Secrets.
+- Du reagierst auf ein geleaktes Token in der richtigen Reihenfolge.
+resources:
+- &logging
+  title: Python · logging
+  url: https://docs.python.org/3/library/logging.html
+- &handlers
+  title: Python · logging.handlers
+  url: https://docs.python.org/3/library/logging.handlers.html
+- &contextvars
+  title: Python · contextvars
+  url: https://docs.python.org/3/library/contextvars.html
+- &systemd
+  title: systemd.exec · Credentials
+  url: https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#Credentials
+- &actions
+  title: GitHub Docs · Using secrets in GitHub Actions
+  url: https://docs.github.com/en/actions/security-for-github-actions/security-guides/using-secrets-in-github-actions
+place: unterwegs
+lesson: |
+  Um drei Uhr ist der Bericht fehlgeschlagen. Das Logfile hat 4000 Zeilen aus drei Läufen, die sich überlappt haben, und keine Zeile sagt, zu welchem Lauf sie gehört. In Zeile 812 steht außerdem `Authorization: Bearer eyJ…`, ein vollständiges Token. Ab jetzt ist das Logfile selbst ein Geheimnis: Wer es in ein Ticket kopiert, gibt den Zugang weiter.
+
+  Beides gehört zusammen. Ein Job soll über sich so viel verraten, dass du einen Fehler findest, und nichts, womit jemand anders etwas anfangen kann. Die Grundlagen von `logging` (Logger, Handler, Formatter, Stufen) stehen im Modul [Kommandozeilen-Werkzeuge](/automation/cli-werkzeuge). Dieses Modul baut darauf auf.
+
+  ## JSON-Logs: eine Zeile, ein Ereignis
+
+  Eine Zeile wie `WARNING bericht: 3 Zeilen verworfen` liest ein Mensch gut. Eine Maschine muss sie mit regulären Ausdrücken zerlegen. Schreibt jeder Eintrag ein JSON-Objekt in eine Zeile, kannst du mit `jq`, `journalctl -o json` oder einem Logsystem nach Feldern filtern: alle Fehler eines Laufs, alle Einträge eines Moduls. Ein eigener [Formatter](https://docs.python.org/3/library/logging.html#formatter-objects) überschreibt dafür `format`.
+
+  ```python run
+  import json
+  import logging
+  from sys import stdout
+
+  class JsonLog(logging.Formatter):
+      def format(self, r):
+          d = {"stufe": r.levelname,
+               "logger": r.name}
+          d["text"] = r.getMessage()
+          if r.exc_info:
+              d["fehler"] = repr(
+                  r.exc_info[1])
+          return json.dumps(
+              d, ensure_ascii=False)
+
+  h = logging.StreamHandler(stdout)
+  h.setFormatter(JsonLog())
+  log = logging.getLogger("bericht")
+  log.handlers = [h]
+  log.propagate = False
+  log.warning("%d verworfen", 3)
+  try:
+      1 / 0
+  except ZeroDivisionError:
+      log.exception("Summe kaputt")
+  ```
+
+  `r.getMessage()` setzt die Argumente ein, genau wie bei der normalen Ausgabe. `json.dumps` maskiert Zeilenumbrüche in Meldungen als `\n`; ein Eintrag bleibt dadurch immer eine Zeile, auch wenn eine Exception-Meldung mehrzeilig ist. Das Beispiel schreibt nur Typ und Meldung der Exception. Den vollständigen Traceback liefert `self.formatException(r.exc_info)`, er kann aber Werte aus deinem Code enthalten. `handlers = [h]` ersetzt hier die Handler früherer Läufe im Browser; in einem Programm konfigurierst du einmal in `main()`.
+
+  Ein Zeitstempel fehlt im Beispiel absichtlich. Läuft der Job unter systemd, versieht das Journal jede Zeile mit Zeit, Unit und Prozess. Schreibst du in eine eigene Datei, ergänze `r.created`, die Unix-Zeit des Eintrags.
+
+  ## Lauf-ID: welcher Eintrag zu welchem Lauf gehört
+
+  Überlappen sich zwei Läufe, mischen sich ihre Zeilen. Eine **Lauf-ID** in jedem Eintrag trennt sie wieder. Dafür gibt es zwei Wege.
+
+  Der [`LoggerAdapter`](https://docs.python.org/3/library/logging.html#loggeradapter-objects) hängt jedem Eintrag feste Zusatzfelder an. Du musst ihn aber an jede Funktion weitergeben, die loggt. Und ohne den Parameter `merge_extra=True` (seit Python 3.13) ignoriert er das `extra` einzelner Aufrufe.
+
+  ```python run
+  import logging
+  from sys import stdout
+
+  h = logging.StreamHandler(stdout)
+  h.setFormatter(logging.Formatter(
+      "%(lauf)s %(message)s"))
+  log = logging.getLogger("job")
+  log.handlers = [h]
+  log.propagate = False
+  a = logging.LoggerAdapter(
+      log, {"lauf": "a1b2"})
+  a.warning("Import gestartet")
+  ```
+
+  Der zweite Weg braucht keine Weitergabe. Eine [`ContextVar`](https://docs.python.org/3/library/contextvars.html) hält die ID des aktuellen Laufs, und ein Filter schreibt sie in jeden Eintrag. `asyncio` gibt jeder Task eine Kopie des Kontexts; zwei gleichzeitige Läufe im selben Prozess behalten so ihre eigene ID.
+
+  ```python run
+  import contextvars
+  import logging
+  from sys import stdout
+
+  lauf_id = contextvars.ContextVar(
+      "lauf_id", default="-")
+
+  class LaufFilter(logging.Filter):
+      def filter(self, r):
+          r.lauf = lauf_id.get()
+          return True
+
+  FMT = ("%(lauf)s %(name)s "
+         "%(message)s")
+  h = logging.StreamHandler(stdout)
+  h.addFilter(LaufFilter())
+  h.setFormatter(
+      logging.Formatter(FMT))
+  log = logging.getLogger("job")
+  log.handlers = [h]
+  log.propagate = False
+  lauf_id.set("c3d4")
+  log.info("unsichtbar")
+  log.warning("Seite 2 fehlt")
+  logging.getLogger("job.http"
+      ).warning("Timeout")
+  ```
+
+  Der Filter hängt am **Handler**, nicht am Logger. Die Dokumentation sagt ausdrücklich, dass [Filter an einem Logger](https://docs.python.org/3/library/logging.html#filter-objects) nur Einträge sehen, die direkt an diesem Logger entstehen, nicht die von Kind-Loggern wie `job.http`. Ein Handler sieht alles, was bei ihm ankommt.
+
+  Woher kommt die ID? Unter systemd steht in der Umgebungsvariablen [`INVOCATION_ID`](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#%24INVOCATION_ID) eine eindeutige ID für jeden Start der Unit. Das Journal speichert sie als Feld `_SYSTEMD_INVOCATION_ID`; nimmst du sie als Lauf-ID, findest du mit `journalctl _SYSTEMD_INVOCATION_ID=…` alle Zeilen dieses Laufs, auch die von systemd selbst. Ohne systemd genügt `uuid.uuid4().hex[:12]`.
+
+  ## Journal oder Dateirotation
+
+  Läuft dein Job als systemd-Dienst, schreibe nach stderr. Das Journal sammelt die Zeilen, versieht sie mit Metadaten und löscht alte Einträge nach den Grenzen in `journald.conf`. Eine eigene Logdatei brauchst du dann nicht.
+
+  Ohne systemd, etwa bei einem Werkzeug, das du von Hand startest, wächst eine Logdatei sonst unbegrenzt. [`RotatingFileHandler`](https://docs.python.org/3/library/logging.handlers.html#rotatingfilehandler) beginnt eine neue Datei, sobald die aktuelle `maxBytes` erreichen würde, und behält `backupCount` alte. Die Dokumentation warnt: Ist einer der beiden Werte 0, rotiert er nie.
+
+  ```python run
+  import logging
+  from logging.handlers import (
+      RotatingFileHandler)
+  from pathlib import Path
+
+  h = RotatingFileHandler(
+      "job.log", maxBytes=50,
+      backupCount=2)
+  log = logging.getLogger("rot")
+  log.handlers = [h]
+  log.propagate = False
+  for i in range(20):
+      log.warning("Zeile %02d", i)
+  h.close()
+  liste = Path(".").glob("job.log*")
+  print(sorted(map(str, liste)))
+  ```
+
+  Aus 20 Zeilen bleiben drei Dateien; die ältesten Einträge sind gelöscht. [`TimedRotatingFileHandler`](https://docs.python.org/3/library/logging.handlers.html#timedrotatingfilehandler) mit `when="midnight"` rotiert stattdessen täglich. Beide Handler sind für einen Prozess gebaut. Schreiben mehrere Prozesse in dieselbe Datei, empfiehlt das [Logging Cookbook](https://docs.python.org/3/howto/logging-cookbook.html#logging-to-a-single-file-from-multiple-processes) einen eigenen Sammelprozess oder einen `QueueHandler`.
+
+  ## Ein Filter, der Geheimnisse schwärzt
+
+  Die beste Regel ist, Geheimnisse gar nicht erst zu loggen. Ein Filter ist das Sicherheitsnetz für den Fall, dass es doch passiert: eine Debug-Ausgabe der Header, eine Exception mit URL. Er ersetzt bekannte Werte und typische Muster, bevor der Eintrag geschrieben wird.
+
+  ```python run
+  import logging
+  import re
+  from sys import stdout
+
+  MUSTER = re.compile(
+      r"(Bearer\s+|token=)[^\s&]+")
+
+  class Schwaerzen(logging.Filter):
+      def filter(self, r):
+          text = r.getMessage()
+          r.msg = MUSTER.sub(
+              r"\1***", text)
+          r.args = None
+          return True
+
+  h = logging.StreamHandler(stdout)
+  h.addFilter(Schwaerzen())
+  log = logging.getLogger("http")
+  log.handlers = [h]
+  log.propagate = False
+  log.warning("GET /x?token=abc123")
+  log.warning("Header: Bearer %s",
+              "eyJhbGciOi")
+  ```
+
+  `r.getMessage()` liefert den fertigen Text, auch wenn das Geheimnis als Argument kam. Danach steht der geschwärzte Text in `r.msg`, und `r.args = None` verhindert, dass die Argumente ein zweites Mal eingesetzt werden. Seit Python 3.12 darf ein Filter auch einen neuen `LogRecord` zurückgeben, statt den alten zu verändern; dann sehen andere Handler das Original.
+
+  Die Grenzen solltest du kennen. Der Filter sieht die Meldung, aber nicht den Traceback, den erst der Formatter erzeugt. Er findet, was zu seinen Mustern passt, aber kein Token in Base64 oder in einem `extra`-Feld. Am zuverlässigsten schwärzt er die Werte, die dein Programm tatsächlich kennt: Lies die Geheimnisse beim Start und gib sie dem Filter mit.
+
+  ## Woher Geheimnisse kommen
+
+  Ein Token im Quellcode landet im Repository und von dort in jedem Klon. Je nach Umgebung gibt es bessere Orte.
+
+  | Quelle | Passt für | Achtung |
+  | --- | --- | --- |
+  | keyring | Skripte am eigenen Desktop | braucht einen entsperrten Schlüsselbund |
+  | `.env` | lokale Entwicklung | in `.gitignore`, nur für dich lesbar |
+  | `LoadCredential` | systemd-Dienste | Datei nur für den Dienst lesbar |
+  | `EnvironmentFile` | Einstellungen | nicht für Geheimnisse |
+  | Actions-Secrets | CI-Läufe | nicht in Forks, nicht in Befehlszeilen |
+
+  [keyring](https://pypi.org/project/keyring/) spricht den Schlüsselbund des Desktops an, unter Linux meist über den Secret Service. `keyring.get_password(dienst, name)` liefert `None`, wenn nichts gespeichert ist. Auf einem Server ohne Desktop-Sitzung gibt es oft keinen nutzbaren Schlüsselbund.
+
+  ```python
+  import keyring
+
+  token = keyring.get_password(
+      "bericht", "api")
+  if token is None:
+      raise SystemExit(
+          "Kein Token: keyring "
+          "set bericht api")
+  ```
+
+  [python-dotenv](https://pypi.org/project/python-dotenv/) liest eine Datei `.env` in die Umgebung. `load_dotenv()` überschreibt dabei keine Variablen, die schon gesetzt sind. Die Datei gehört in `.gitignore`; ins Repository kommt eine `.env.example` mit leeren Werten.
+
+  Für Dienste ist systemd der richtige Ort. Die Dokumentation zu [`Environment=`](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#Environment=) sagt ausdrücklich, dass Umgebungsvariablen für Geheimnisse ungeeignet sind: Sie sind über D-Bus für unprivilegierte Clients sichtbar und werden an Kindprozesse vererbt. Stattdessen gibt es [`LoadCredential=`](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#LoadCredential=ID:PATH).
+
+  ```ini
+  [Service]
+  ExecStart=/opt/bericht/run.py
+  EnvironmentFile=/etc/bericht.env
+  LoadCredential=api_token
+  ```
+
+  Ohne Pfad sucht systemd die Datei `api_token` in `/etc/credstore/`, bei User-Diensten in `~/.config/credstore/`. Der Dienst findet eine schreibgeschützte Kopie unter `$CREDENTIALS_DIRECTORY/api_token`, die nur sein Benutzer lesen kann, nach Möglichkeit in nicht auslagerbarem Speicher. Mit `systemd-creds encrypt` verschlüsselst du die Datei, und `LoadCredentialEncrypted=` entschlüsselt sie erst beim Start. `EnvironmentFile=` bleibt für Einstellungen ohne Geheimnis, etwa die URL.
+
+  In GitHub Actions legst du das Token als Repository- oder Environment-Secret an und reichst es als Umgebungsvariable an genau den Schritt weiter, der es braucht. GitHub schwärzt den Wert in der Ausgabe, aber [nicht davon abgeleitete Werte](https://docs.github.com/en/actions/security-for-github-actions/security-guides/using-secrets-in-github-actions); mit `::add-mask::` maskierst du sie selbst. An Läufe aus Forks werden Secrets nicht weitergegeben.
+
+  ```yaml
+  - run: python bericht.py
+    env:
+      TOKEN: ${{ secrets.TOKEN }}
+  ```
+
+  ## Wenn ein Token geleakt ist
+
+  Ein Token ist in einen öffentlichen Commit geraten, in ein Ticket, in ein geteiltes Logfile. Die Reihenfolge der nächsten Schritte entscheidet, wie viel Schaden entsteht.
+
+  1. **Widerrufen.** Sofort beim Anbieter, vor allem anderen. Ab dem Moment des Leaks musst du davon ausgehen, dass jemand anders es hat.
+  2. **Ersetzen.** Neues Token erzeugen und an allen Stellen eintragen, die das alte nutzten: credstore, Actions-Secret, Schlüsselbund.
+  3. **Prüfen.** Im Audit-Log des Anbieters nachsehen, ob das alte Token zwischen Leak und Widerruf benutzt wurde.
+  4. **Aufräumen.** Das Token aus Code, Konfiguration und Logs entfernen. Die Git-Historie umzuschreiben ist ein optionaler letzter Schritt, nie ein Ersatz für Schritt 1: Klone, Forks und Caches behalten den alten Stand.
+  5. **Ursache abstellen.** `.gitignore`, [Secret Scanning und Push Protection](https://docs.github.com/en/code-security/secret-scanning/introduction/about-secret-scanning), ein Filter im Logging.
+
+  Der häufigste Fehler ist die umgekehrte Reihenfolge: zuerst den Commit löschen, in der Hoffnung, dass es niemand gesehen hat. Das kostet Zeit, in der das Token gültig bleibt.
+
+  > [!PRAXIS]
+  > Schreibe ins Runbook eines Jobs, wo sein Token liegt, wie man es widerruft und wo das neue eingetragen wird. Wer um drei Uhr ein Leak bemerkt, soll nicht erst suchen müssen.
+
+  ## Häufige Fehler
+
+  - **Filter am falschen Logger.** Er sieht die Einträge von Kind-Loggern nicht. An den Handler hängen.
+  - **`RotatingFileHandler` ohne `backupCount`.** Mit 0 rotiert er nie, die Datei wächst weiter.
+  - **Mehrere Prozesse, eine rotierende Datei.** Einträge gehen verloren oder landen in der falschen Datei.
+  - **Token in `Environment=`.** Für andere Benutzer über `systemctl show` lesbar.
+  - **`.env` im Repository.** Einmal gepusht, ist es ein Leak.
+  - **Erst aufräumen, dann widerrufen.** Das Token bleibt gültig, während du die Historie umschreibst.
+
+  > [!INTERVIEW]
+  > „Wie gibst du einem systemd-Dienst ein API-Token?“ Nicht über `Environment=`, weil Umgebungsvariablen über D-Bus sichtbar sind und vererbt werden. Ich lege die Datei in `/etc/credstore/`, am besten mit `systemd-creds` verschlüsselt, und gebe sie mit `LoadCredential=` an den Dienst. Das Programm liest sie aus `$CREDENTIALS_DIRECTORY`.
+
+  > [!MERKE]
+  > Bei einem Leak zuerst widerrufen. Alles andere kommt danach.
+
+  ## Zusammenfassung
+
+  - JSON-Logs schreiben ein Ereignis pro Zeile; `getMessage()` setzt die Argumente ein, `json.dumps` hält die Zeile zusammen.
+  - Eine Lauf-ID kommt per `ContextVar` und Filter am Handler in jeden Eintrag, auch von Kind-Loggern. Unter systemd passt `INVOCATION_ID`.
+  - Unter systemd schreibst du nach stderr; sonst rotiert `RotatingFileHandler`, wenn `maxBytes` und `backupCount` größer als 0 sind.
+  - Ein Schwärzungsfilter ist ein Netz, keine Erlaubnis zum Loggen von Geheimnissen.
+  - keyring für den Desktop, `.env` für die Entwicklung, `LoadCredential` für Dienste, Secrets für Actions.
+  - Leak: widerrufen, ersetzen, prüfen, aufräumen, Ursache abstellen.
+exercises:
+- id: quelle-waehlen
+  type: choice
+  title: Wohin mit dem Token?
+  prompt: Ein Bericht läuft als systemd-Dienst auf einem Server ohne Desktop und braucht ein API-Token. Was ist die
+    passende Lösung?
+  options:
+  - text: Die Datei in `/etc/credstore/api_token` ablegen und mit `LoadCredential=api_token` an den Dienst geben.
+    correct: true
+    why: Der Dienst liest das Token aus `$CREDENTIALS_DIRECTORY`; nur sein Benutzer kommt an die Kopie.
+  - text: "`Environment=API_TOKEN=…` in die Unit schreiben."
+    correct: false
+    why: Laut systemd-Dokumentation sind Umgebungsvariablen einer Unit über D-Bus für unprivilegierte Clients sichtbar
+      und werden an Kindprozesse vererbt.
+  - text: Das Token mit keyring im Schlüsselbund speichern.
+    correct: false
+    why: Ohne Desktop-Sitzung gibt es meist keinen entsperrten Schlüsselbund, den ein Dienst nutzen könnte.
+  - text: Das Token in die `config.toml` im Repository schreiben, das Repository ist privat.
+    correct: false
+    why: Private Repositorys werden geklont, gesichert und manchmal öffentlich. Das Token wäre in jeder Kopie.
+  explanation: Für Dienste sind systemd-Credentials gebaut. Sie trennen das Geheimnis von der Unit-Datei und von der
+    Umgebung und lassen sich mit `systemd-creds` verschlüsselt ablegen.
+  resources:
+  - *systemd
+- id: leak-reihenfolge
+  type: order
+  title: Ein Token ist öffentlich geworden
+  prompt: Ein Token steht in einem öffentlichen Commit. Bring die Schritte in eine sinnvolle Reihenfolge.
+  lang: prose
+  lines: |-
+    Token beim Anbieter widerrufen
+    Neues Token erzeugen und überall eintragen
+    Im Audit-Log prüfen, ob das alte Token benutzt wurde
+    Token aus Code, Konfiguration und Logs entfernen
+    Ursache abstellen, etwa mit Push Protection
+  alternatives:
+  - [1, 3, 2, 4, 5]
+  - [1, 2, 3, 5, 4]
+  - [1, 3, 2, 5, 4]
+  explanation: Entscheidend ist der erste Schritt. Solange das Token gültig ist, kann jeder es benutzen, der den Commit
+    gesehen hat. Ersetzen und Prüfen dürfen ihre Plätze tauschen, ebenso Aufräumen und Ursache abstellen; Widerrufen
+    kommt immer zuerst.
+  resources:
+  - title: GitHub Docs · About secret scanning
+    url: https://docs.github.com/en/code-security/secret-scanning/introduction/about-secret-scanning
+- id: adapter-vorhersagen
+  type: output
+  title: Welche Lauf-ID gewinnt?
+  prompt: Welche Ausgabe erzeugt dieses Programm (Python 3.14)?
+  lang: python
+  code: |-
+    import logging
+    from sys import stdout
+
+    h = logging.StreamHandler(stdout)
+    h.setFormatter(logging.Formatter(
+        "%(lauf)s %(message)s"))
+    log = logging.getLogger("ad")
+    log.handlers = [h]
+    log.propagate = False
+    a = logging.LoggerAdapter(
+        log, {"lauf": "A"})
+    a.warning("start")
+    a.warning("x", extra={"lauf": "B"})
+    b = logging.LoggerAdapter(
+        log, {"lauf": "A"},
+        merge_extra=True)
+    b.warning("y", extra={"lauf": "B"})
+  expected: |-
+    A start
+    A x
+    B y
+  explanation: |
+    Ohne `merge_extra` ersetzt der Adapter das `extra` jedes Aufrufs durch sein eigenes; das `B` beim zweiten Aufruf geht verloren. Mit `merge_extra=True`, verfügbar seit Python 3.13, werden beide zusammengeführt, und der Wert des einzelnen Aufrufs gewinnt.
+  resources:
+  - *logging
+- id: filter-am-logger
+  type: output
+  title: Wer sieht den Filter?
+  prompt: Welche Ausgabe erzeugt dieses Programm?
+  lang: python
+  code: |-
+    import logging
+    from sys import stdout
+
+    class Markiere(logging.Filter):
+        def filter(self, r):
+            r.msg = "[M] " + r.msg
+            return True
+
+    job = logging.getLogger("job")
+    h = logging.StreamHandler(stdout)
+    job.handlers = [h]
+    job.propagate = False
+    job.addFilter(Markiere())
+    job.warning("a")
+    logging.getLogger(
+        "job.http").warning("b")
+  expected: |-
+    [M] a
+    b
+  explanation: |
+    Ein Filter am Logger `job` sieht nur Einträge, die direkt an `job` entstehen. Der Eintrag von `job.http` wandert zwar zum Handler von `job`, aber am Filter vorbei. Hängt der Filter am Handler (`h.addFilter`), erwischt er beide. Für Lauf-IDs und Schwärzen ist das der entscheidende Unterschied.
+  resources:
+  - title: Python · Filter Objects
+    url: https://docs.python.org/3/library/logging.html#filter-objects
+- id: handler-gap
+  type: gap
+  title: Rotierende JSON-Logs einrichten
+  prompt: Ergänze die Einrichtung so, dass die Datei bei 1 MB rotiert, fünf alte Dateien bleiben und jeder Eintrag
+    als JSON mit Lauf-ID geschrieben wird.
+  lang: python
+  code: |-
+    h = RotatingFileHandler(
+        "job.log",
+        ⟦maxBytes⟧=1_000_000,
+        ⟦backupCount⟧=5)
+    h.⟦setFormatter⟧(JsonLog())
+    h.⟦addFilter⟧(LaufFilter())
+    log.handlers = [h]
+    lauf_id.⟦set⟧(os.environ.get(
+        "INVOCATION_ID", "lokal"))
+  gaps:
+  - label: Größengrenze
+    hint: Der Parameter heißt nach der Größe in Bytes.
+  - label: Zahl alter Dateien
+    hint: Ist er 0, rotiert der Handler nie.
+  - label: Formatter setzen
+    hint: Handler bekommen ihren Formatter mit einer set-Methode.
+  - label: Filter anhängen
+    hint: Dieselbe Methode gibt es an Loggern und Handlern.
+  - label: ContextVar setzen
+    hint: Eine ContextVar hat get und …
+  explanation: '`maxBytes` und `backupCount` müssen beide größer als 0 sein, sonst rotiert nichts. Formatter und Filter
+    hängen am Handler; so tragen auch Einträge von Kind-Loggern die Lauf-ID. Unter systemd liefert `INVOCATION_ID`
+    eine ID, die auch im Journal steht.'
+  resources:
+  - *handlers
+  - *contextvars
+- id: json-formatter
+  type: code
+  title: Ein JSON-Formatter
+  prompt: |
+    Schreibe die Klasse `JsonLog(logging.Formatter)`. `format(r)` gibt pro Eintrag eine Zeile JSON zurück mit den Schlüsseln `stufe` (Name der Stufe), `logger` (Name des Loggers), `text` (die fertige Meldung mit eingesetzten Argumenten) und `lauf` (das Attribut `lauf` des Eintrags oder `None`, falls es fehlt). Hat der Eintrag eine Exception, kommt `fehler` mit dem Namen ihrer Klasse dazu. Umlaute bleiben lesbar, nicht als `ö`.
+  lang: python
+  starter: |-
+    import json
+    import logging
+
+    class JsonLog(logging.Formatter):
+        def format(self, r):
+            return r.msg
+  solution: |-
+    import json
+    import logging
+
+    class JsonLog(logging.Formatter):
+        def format(self, r):
+            d = {"stufe": r.levelname,
+                 "logger": r.name}
+            d["text"] = r.getMessage()
+            d["lauf"] = getattr(
+                r, "lauf", None)
+            e = r.exc_info
+            if e:
+                k = e[0].__name__
+                d["fehler"] = k
+            return json.dumps(
+                d, ensure_ascii=False)
+  setup: |-
+    import io
+    import itertools
+    import json
+    import logging
+
+    _nr = itertools.count()
+
+    def logger_mit(formatter):
+        """Neuer Logger, der in einen StringIO-Puffer schreibt."""
+        puffer = io.StringIO()
+        h = logging.StreamHandler(puffer)
+        h.setFormatter(formatter)
+        log = logging.getLogger(f"test{next(_nr)}")
+        log.handlers = [h]
+        log.propagate = False
+        log.setLevel(logging.DEBUG)
+        return log, puffer
+  tests:
+  - name: Felder und eingesetzte Argumente
+    code: |-
+      log, out = logger_mit(JsonLog())
+      log.warning("%d Zeilen", 3)
+      d = json.loads(out.getvalue())
+      assert d["stufe"] == "WARNING", d
+      assert d["text"] == "3 Zeilen", d
+      assert d["logger"] == log.name, d
+      assert d["lauf"] is None, d
+  - name: Lauf-ID aus extra
+    code: |-
+      log, out = logger_mit(JsonLog())
+      log.info("ok", extra={"lauf": "a1"})
+      d = json.loads(out.getvalue())
+      assert d["lauf"] == "a1", d
+  - name: Exception als Klassenname
+    code: |-
+      log, out = logger_mit(JsonLog())
+      try:
+          1 / 0
+      except ZeroDivisionError:
+          log.exception("kaputt")
+      d = json.loads(out.getvalue())
+      assert d.get("fehler") == (
+          "ZeroDivisionError"), d
+  - name: Eine Zeile, Umlaute lesbar
+    code: |-
+      log, out = logger_mit(JsonLog())
+      log.error("Größe\nfalsch")
+      text = out.getvalue()
+      assert text.count("\n") == 1, (
+          f"mehrere Zeilen: {text!r}")
+      assert "Größe" in text, text
+  hints:
+  - '`r.getMessage()` liefert die Meldung mit eingesetzten Argumenten.'
+  - '`getattr(r, "lauf", None)` liest ein Attribut, das vielleicht fehlt.'
+  - '`r.exc_info` ist bei einer Exception ein Tupel `(Klasse, Exception, Traceback)`.'
+  explanation: |
+    Der Formatter macht aus einem `LogRecord` genau eine Zeile. `getMessage()` statt `msg` setzt die Argumente ein; sonst stünde dort `%d Zeilen`. `json.dumps` maskiert den Zeilenumbruch, also bleibt auch eine mehrzeilige Meldung eine Zeile, und Werkzeuge wie `jq` lesen Zeile für Zeile. `ensure_ascii=False` hält Umlaute lesbar. Der Klassenname der Exception reicht zum Filtern; den vollen Traceback gibst du nur aus, wenn du weißt, dass keine Geheimnisse darin stehen.
+  resources:
+  - title: Python · Formatter Objects
+    url: https://docs.python.org/3/library/logging.html#formatter-objects
+  - title: Python · LogRecord attributes
+    url: https://docs.python.org/3/library/logging.html#logrecord-attributes
+- id: lauf-id-filter
+  type: code
+  title: Lauf-ID für alle Logger
+  prompt: |
+    Schreibe drei Teile:
+
+    - `lauf_id`: eine `ContextVar` mit dem Standardwert `"-"`.
+    - `LaufFilter(logging.Filter)`: setzt in jedem Eintrag das Attribut `lauf` auf den aktuellen Wert von `lauf_id` und lässt den Eintrag durch.
+    - `einrichten(logger, stream)`: hängt an `logger` genau einen `StreamHandler(stream)` mit dem Format `"%(lauf)s %(name)s: %(message)s"` und dem Filter. Auch Einträge von Kind-Loggern wie `<name>.http` sollen die Lauf-ID bekommen.
+  lang: python
+  starter: |-
+    import contextvars
+    import logging
+
+    lauf_id = contextvars.ContextVar(
+        "lauf_id", default="-")
+
+    class LaufFilter(logging.Filter):
+        def filter(self, r):
+            return True
+
+    def einrichten(logger, stream):
+        ...
+  solution: |-
+    import contextvars
+    import logging
+
+    lauf_id = contextvars.ContextVar(
+        "lauf_id", default="-")
+
+    class LaufFilter(logging.Filter):
+        def filter(self, r):
+            r.lauf = lauf_id.get()
+            return True
+
+    FORMAT = ("%(lauf)s %(name)s: "
+              "%(message)s")
+
+    def einrichten(logger, stream):
+        h = logging.StreamHandler(
+            stream)
+        h.setFormatter(
+            logging.Formatter(FORMAT))
+        h.addFilter(LaufFilter())
+        logger.handlers = [h]
+  setup: |-
+    import contextvars
+    import io
+    import itertools
+    import logging
+
+    _nr = itertools.count()
+
+    def neuer_logger():
+        log = logging.getLogger(f"job{next(_nr)}")
+        log.propagate = False
+        log.setLevel(logging.INFO)
+        return log
+  tests:
+  - name: Lauf-ID im Eintrag
+    code: |-
+      log, out = neuer_logger(), io.StringIO()
+      einrichten(log, out)
+      def lauf():
+          lauf_id.set("L7")
+          log.warning("start")
+      contextvars.Context().run(lauf)
+      zeile = out.getvalue().strip()
+      assert zeile == f"L7 {log.name}: start", (
+          zeile)
+  - name: Auch der Kind-Logger
+    code: |-
+      log, out = neuer_logger(), io.StringIO()
+      einrichten(log, out)
+      kind = logging.getLogger(log.name + ".http")
+      def lauf():
+          lauf_id.set("L8")
+          kind.warning("Timeout")
+      contextvars.Context().run(lauf)
+      zeile = out.getvalue().strip()
+      assert zeile.startswith("L8 "), (
+          f"Zeile: {zeile!r}")
+  - name: Ohne gesetzte ID steht -
+    code: |-
+      log, out = neuer_logger(), io.StringIO()
+      einrichten(log, out)
+      contextvars.Context().run(
+          log.warning, "ohne")
+      zeile = out.getvalue().strip()
+      assert zeile.startswith("- "), zeile
+  - name: Zwei Läufe, zwei IDs
+    code: |-
+      log, out = neuer_logger(), io.StringIO()
+      einrichten(log, out)
+      def lauf(i):
+          lauf_id.set(i)
+          log.warning("x")
+      contextvars.Context().run(lauf, "A")
+      contextvars.Context().run(lauf, "B")
+      ids = [z.split()[0] for z in
+             out.getvalue().splitlines()]
+      assert ids == ["A", "B"], ids
+  hints:
+  - '`lauf_id.get()` liefert den Wert im aktuellen Kontext oder den Standardwert.'
+  - Ein Filter am Logger sieht keine Einträge von Kind-Loggern. Hänge ihn an den Handler.
+  explanation: |
+    Die `ContextVar` trägt die ID durch den Code, ohne dass jede Funktion einen Parameter dafür braucht. Der Filter liest sie in dem Moment, in dem ein Eintrag entsteht. Er hängt am Handler, weil nur der Handler auch die Einträge von `job.http` sieht. Die Tests laufen jeweils in einem frischen `Context`; so sieht jeder Lauf nur seine eigene ID, wie zwei asyncio-Tasks, die jede eine Kopie des Kontexts bekommen.
+  resources:
+  - *contextvars
+  - title: Python · Filter Objects
+    url: https://docs.python.org/3/library/logging.html#filter-objects
+- id: schwaerzen
+  type: code
+  title: Geheimnisse im Log schwärzen
+  prompt: |
+    Schreibe `Schwaerzen(logging.Filter)`. Der Konstruktor bekommt eine Liste bekannter Geheimnisse. `filter(r)` holt die fertige Meldung, ersetzt darin jedes bekannte Geheimnis durch `***` und jedes Wort nach `Bearer ` ebenfalls durch `***` (aus `Bearer abc` wird `Bearer ***`). Danach steht der Text in `r.msg`, `r.args` ist `None`, und der Eintrag wird durchgelassen. Leere Strings in der Liste werden ignoriert.
+  lang: python
+  starter: |-
+    import logging
+    import re
+
+    class Schwaerzen(logging.Filter):
+        def __init__(self, werte):
+            super().__init__()
+            self.werte = werte
+
+        def filter(self, r):
+            for w in self.werte:
+                r.msg = r.msg.replace(
+                    w, "***")
+            return True
+  solution: |-
+    import logging
+    import re
+
+    BEARER = re.compile(
+        r"Bearer\s+\S+")
+
+    class Schwaerzen(logging.Filter):
+        def __init__(self, werte):
+            super().__init__()
+            self.werte = [
+                w for w in werte if w]
+
+        def filter(self, r):
+            text = r.getMessage()
+            for w in self.werte:
+                text = text.replace(
+                    w, "***")
+            text = BEARER.sub(
+                "Bearer ***", text)
+            r.msg = text
+            r.args = None
+            return True
+  setup: |-
+    import io
+    import itertools
+    import logging
+
+    _nr = itertools.count()
+
+    def logger_mit(filt):
+        puffer = io.StringIO()
+        h = logging.StreamHandler(puffer)
+        h.addFilter(filt)
+        log = logging.getLogger(f"s{next(_nr)}")
+        log.handlers = [h]
+        log.propagate = False
+        return log, puffer
+  tests:
+  - name: Geheimnis als Argument
+    code: |-
+      log, out = logger_mit(
+          Schwaerzen(["geheim-123"]))
+      log.warning("Token %s", "geheim-123")
+      text = out.getvalue().strip()
+      assert text == "Token ***", text
+  - name: Bearer-Header
+    code: |-
+      log, out = logger_mit(Schwaerzen([]))
+      log.warning("Authorization: Bearer eyJ9.x")
+      text = out.getvalue().strip()
+      assert text == "Authorization: Bearer ***", (
+          text)
+  - name: Normale Meldungen bleiben gleich
+    code: |-
+      log, out = logger_mit(
+          Schwaerzen(["geheim-123"]))
+      log.warning("%d Dateien", 3)
+      assert out.getvalue().strip() == (
+          "3 Dateien"), out.getvalue()
+  - name: Leerer Wert in der Liste
+    code: |-
+      log, out = logger_mit(
+          Schwaerzen(["", "geheim-123"]))
+      log.warning("Import fertig")
+      text = out.getvalue().strip()
+      assert text == "Import fertig", (
+          f"zerstört: {text!r}")
+  hints:
+  - '`r.getMessage()` setzt die Argumente ein; danach steht das Geheimnis im Text, egal wie es übergeben wurde.'
+  - '`"abc".replace("", "***")` fügt `***` zwischen jedem Zeichen ein. Filtere leere Werte vorher heraus.'
+  - '`re.compile(r"Bearer\s+\S+")` findet das Wort nach `Bearer`.'
+  explanation: |
+    Der Starter schaut nur in `r.msg`, also in die Vorlage `"Token %s"`. Das Geheimnis kommt aber als Argument und steht erst nach `getMessage()` im Text. Nach dem Ersetzen muss `r.args` auf `None`, sonst versucht der Formatter, Argumente in einen Text ohne Platzhalter einzusetzen. Der leere String ist ein echter Betriebsfall: Ist eine Umgebungsvariable nicht gesetzt, landet `""` in der Liste, und ohne Prüfung würde jede Meldung unlesbar.
+  resources:
+  - title: Python · Filter Objects
+    url: https://docs.python.org/3/library/logging.html#filter-objects
+  - title: Python · re.sub
+    url: https://docs.python.org/3/library/re.html#re.sub
+- id: credential-lesen
+  type: code
+  title: Ein Geheimnis aus systemd oder der Umgebung
+  prompt: |
+    Schreibe `lade_geheimnis(name, umgebung)`. `umgebung` ist ein Dictionary wie `os.environ`.
+
+    - Steht in `umgebung` der Schlüssel `CREDENTIALS_DIRECTORY` und gibt es dort eine Datei `name`, gib ihren Inhalt ohne Zeilenumbruch am Ende zurück.
+    - Sonst gib `umgebung[name.upper()]` zurück, wenn der Wert nicht leer ist (für die Entwicklung).
+    - Sonst wirf `LookupError` mit `name` in der Meldung.
+  lang: python
+  starter: |-
+    import os
+    from pathlib import Path
+
+    def lade_geheimnis(name, umgebung):
+        return umgebung[name.upper()]
+  solution: |-
+    from pathlib import Path
+
+    def aus_datei(ordner, name):
+        if not ordner:
+            return None
+        datei = Path(ordner) / name
+        if not datei.is_file():
+            return None
+        text = datei.read_text()
+        return text.rstrip("\n")
+
+    def lade_geheimnis(name, umgebung):
+        ordner = umgebung.get(
+            "CREDENTIALS_DIRECTORY")
+        wert = aus_datei(ordner, name)
+        if wert is None:
+            wert = umgebung.get(
+                name.upper())
+        if not wert:
+            raise LookupError(name)
+        return wert
+  setup: |-
+    from pathlib import Path
+    Path("creds").mkdir()
+    Path("creds/api_token").write_text("aus-datei\n")
+  tests:
+  - name: Credential-Datei hat Vorrang
+    code: |-
+      u = {"CREDENTIALS_DIRECTORY": "creds",
+           "API_TOKEN": "aus-umgebung"}
+      w = lade_geheimnis("api_token", u)
+      assert w == "aus-datei", repr(w)
+  - name: Umgebung als Rückfall
+    code: |-
+      u = {"API_TOKEN": "aus-umgebung"}
+      w = lade_geheimnis("api_token", u)
+      assert w == "aus-umgebung", repr(w)
+  - name: Datei fehlt im Credentials-Ordner
+    code: |-
+      u = {"CREDENTIALS_DIRECTORY": "creds",
+           "SMTP_PASS": "pw"}
+      w = lade_geheimnis("smtp_pass", u)
+      assert w == "pw", repr(w)
+  - name: Nichts da oder leer – LookupError
+    code: |-
+      for u in ({}, {"API_TOKEN": ""}):
+          try:
+              lade_geheimnis("api_token", u)
+          except LookupError as e:
+              assert "api_token" in str(e)
+          else:
+              assert False, f"{u}: LookupError"
+  hints:
+  - '`umgebung.get("CREDENTIALS_DIRECTORY")` ist `None`, wenn der Dienst keine Credentials hat.'
+  - '`Path(ordner) / name` baut den Pfad; `is_file()` prüft, ob es die Datei gibt.'
+  explanation: |
+    Unter systemd mit `LoadCredential=api_token` liegt das Token als Datei in `$CREDENTIALS_DIRECTORY` und nicht in der Umgebung. Dateien enden oft mit einem Zeilenumbruch, der im HTTP-Header einen Fehler auslöst; `rstrip("\n")` entfernt ihn. Die Umgebung bleibt als bewusster Rückfall für die Entwicklung. Weil `umgebung` ein Parameter ist, testest du alle Wege ohne echte Umgebungsvariablen, und die Fehlermeldung nennt nur den Namen, nie einen Wert.
+  resources:
+  - *systemd
+- id: logs-auswerten
+  type: code
+  title: Fehler je Lauf zählen
+  prompt: |
+    Schreibe `fehler_je_lauf(zeilen)`. `zeilen` sind Zeilen eines Logs; die meisten sind JSON-Objekte mit den Schlüsseln `stufe` und `lauf`, einige stammen von anderen Programmen und sind kein JSON. Zähle je Lauf die Einträge mit `stufe` `"ERROR"` oder `"CRITICAL"` und gib ein Dictionary `{lauf: anzahl}` zurück. Läufe ohne Fehler erscheinen nicht. Zeilen, die kein JSON-Objekt sind, überspringst du.
+  lang: python
+  starter: |-
+    import json
+
+    def fehler_je_lauf(zeilen):
+        zaehler = {}
+        for z in zeilen:
+            d = json.loads(z)
+            zaehler[d["lauf"]] = 1
+        return zaehler
+  solution: |-
+    import json
+    from collections import Counter
+
+    SCHWER = {"ERROR", "CRITICAL"}
+
+    def lies(zeile):
+        try:
+            d = json.loads(zeile)
+        except ValueError:
+            return {}
+        if isinstance(d, dict):
+            return d
+        return {}
+
+    def fehler_je_lauf(zeilen):
+        zaehler = Counter()
+        for z in zeilen:
+            d = lies(z)
+            stufe = d.get("stufe")
+            if stufe in SCHWER:
+                lauf = d.get("lauf")
+                zaehler[lauf] += 1
+        return dict(zaehler)
+  tests:
+  - name: Zählt je Lauf
+    code: |-
+      z = ['{"stufe": "ERROR", "lauf": "a"}',
+           '{"stufe": "INFO", "lauf": "a"}',
+           '{"stufe": "ERROR", "lauf": "a"}',
+           '{"stufe": "CRITICAL", "lauf": "b"}']
+      r = fehler_je_lauf(z)
+      assert r == {"a": 2, "b": 1}, r
+  - name: Läufe ohne Fehler fehlen
+    code: |-
+      z = ['{"stufe": "WARNING", "lauf": "c"}']
+      assert fehler_je_lauf(z) == {}
+  - name: Fremde Zeilen überspringen
+    code: |-
+      z = ["Traceback (most recent call last):",
+           "",
+           "42",
+           '{"stufe": "ERROR", "lauf": "d"}']
+      r = fehler_je_lauf(z)
+      assert r == {"d": 1}, r
+  hints:
+  - '`json.loads` wirft bei Nicht-JSON `ValueError`.'
+  - '`"42"` ist gültiges JSON, aber kein Objekt. Prüfe mit `isinstance(d, dict)`.'
+  explanation: |
+    JSON-Logs sind Daten, die du mit ein paar Zeilen Python auswertest, statt sie mit regulären Ausdrücken zu zerlegen. Echte Logs sind aber nie ganz sauber: Ein Traceback, eine Leerzeile oder die Ausgabe eines anderen Programms landet dazwischen. Die Funktion bleibt robust, indem sie fremde Zeilen überspringt, statt beim ersten Fehler abzubrechen; eine Zahl wie `42` ist gültiges JSON, aber kein Eintrag.
+  resources:
+  - title: Python · json.loads
+    url: https://docs.python.org/3/library/json.html#json.loads
+- id: environment-in-unit
+  type: bug
+  title: Ein Kollege sieht das Token
+  prompt: |
+    Ein Kollege ohne Root-Rechte hat mit `systemctl show bericht.service` das API-Token gesehen. Das Programm liest das Token bereits mit `lade_geheimnis("api_token", os.environ)` aus der vorigen Aufgabe, die Datei liegt in `/etc/credstore/api_token`. Finde die Zeile, die das Token offenlegt, und ersetze sie.
+  lang: ini
+  code: |-
+    [Unit]
+    Description=Täglicher Bericht
+
+    [Service]
+    Type=oneshot
+    ExecStart=/opt/bericht/run.py
+    Environment=API_TOKEN=geheim-123
+  lines:
+  - 7
+  fix:
+  - line: 7
+    answers:
+    - LoadCredential=api_token
+    - LoadCredential=api_token:/etc/credstore/api_token
+    - LoadCredentialEncrypted=api_token
+  explanation: |
+    Werte aus `Environment=` sind Eigenschaften der Unit und für unprivilegierte Clients über D-Bus lesbar, also auch über `systemctl show`. Außerdem erbt jeder Kindprozess sie. `LoadCredential=api_token` liest die Datei aus `/etc/credstore/` und legt eine Kopie in `$CREDENTIALS_DIRECTORY` ab, die nur der Benutzer des Dienstes lesen kann. Das alte Token gilt nach diesem Vorfall als geleakt und wird widerrufen.
+  resources:
+  - *systemd
+- id: actions-secret
+  type: explain
+  title: Ein Secret im Workflow
+  prompt: Erkläre, was dieser Ausschnitt eines GitHub-Actions-Workflows mit dem Secret macht, was GitHub dabei schützt
+    und was nicht.
+  lang: yaml
+  code: |-
+    steps:
+      - run: python -m pytest
+        env:
+          TOKEN: ${{ secrets.TOKEN }}
+      - run: python bericht.py
+        env:
+          TOKEN: ${{ secrets.TOKEN }}
+  points:
+  - Das Secret kommt als Umgebungsvariable nur in die Schritte, die es nennen, nicht in die Befehlszeile.
+  - GitHub ersetzt den genauen Wert in der Ausgabe durch Sternchen, abgeleitete oder umgeformte Werte aber nicht.
+  - Läufe aus Forks bekommen das Secret nicht; Tests, die es brauchen, scheitern dort.
+  - Die Tests sollten mit Fakes laufen und das echte Token gar nicht brauchen.
+  explanation: |
+    `secrets.TOKEN` wird zur Laufzeit eingesetzt und nur an die genannten Schritte weitergegeben. GitHub empfiehlt, Secrets nicht über die Befehlszeile zu übergeben, weil andere Prozesse diese sehen können; die Umgebungsvariable ist der bessere Weg. Die Schwärzung in der Ausgabe erkennt nur den exakten Wert. Gibt ein Programm das Token in Base64 oder als Teil einer URL aus, steht es lesbar im Log. Dass die Testschritte das Secret bekommen, ist hier unnötig: Tests mit Fakes brauchen kein echtes Token, und weniger Schritte mit Zugang heißt weniger Stellen, an denen es herauskommen kann.
+  resources:
+  - *actions
