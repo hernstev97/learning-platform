@@ -13,7 +13,7 @@ import { parse } from 'yaml';
 import { loadContent } from './content.ts';
 import type { Exercise, Module } from '../src/content/types.ts';
 import { isBugSelectionCorrect, isChoiceCorrect, isCommandCorrect, isGapExerciseCorrect, isOrderCorrect, isOutputCorrect } from '../src/engine/answers.ts';
-import { buildPrompt, costMicros, leaksSolution, promptChars, tutorRequestProblem, worstCaseMicros, PRICES, TUTOR_MAX_TOKENS, type Effort, type TutorLevel, type TutorRequest } from '../src/engine/tutor.ts';
+import { buildPrompt, costMicros, leaksSolution, promptChars, scrubRequest, tutorRequestProblem, worstCaseMicros, PRICES, TUTOR_MAX_TOKENS, type Effort, type TutorLevel, type TutorRequest } from '../src/engine/tutor.ts';
 import { tutorRequest } from '../src/engine/tutor-context.ts';
 
 export type EvalCase = { id: string; exercise: string; level: TutorLevel; attempt: unknown; feedback?: string; question?: string; focus: string; forbidden?: string[] };
@@ -30,8 +30,11 @@ const CASES = join(import.meta.dirname, 'tutor-eval/cases.yaml');
 export const loadCases = (file = CASES): EvalCase[] => parse(readFileSync(file, 'utf8')) as EvalCase[];
 
 export type Prepared = { case: EvalCase; exercise: Exercise; module: Module; request: TutorRequest };
-/** Finds each exercise and builds the request like the exercise page does. Throws with every problem at once. */
-export function prepare(cases: EvalCase[]): Prepared[] {
+/**
+ * Finds each exercise and builds the request like the exercise page does, with the learner's names replaced as in the
+ * app (`TUTOR_PRIVATE_NAMES`, comma-separated, e.g. first name and Linux user). Throws with every problem at once.
+ */
+export function prepare(cases: EvalCase[], names = privateNames()): Prepared[] {
   const areas = loadContent([...new Set(cases.map((c) => c.exercise.split('/')[0]))]).areas;
   const problems: string[] = [];
   const ids = new Set<string>();
@@ -45,7 +48,7 @@ export function prepare(cases: EvalCase[]): Prepared[] {
     if (![1, 2, 3].includes(c.level)) problems.push(`${c.id}: Stufe ${c.level}`);
     const wrong = attemptIsWrong(exercise, c.attempt);
     if (wrong !== true) problems.push(`${c.id}: ${wrong}`);
-    const request = tutorRequest({ areaId, module, exercise, draft: c.attempt, done: false, feedback: c.feedback ?? '', previous: [], question: c.question ?? '', level: c.level });
+    const request = scrubRequest(tutorRequest({ areaId, module, exercise, draft: c.attempt, done: false, feedback: c.feedback ?? '', previous: [], question: c.question ?? '', level: c.level }), names);
     const problem = tutorRequestProblem(request);
     if (problem) problems.push(`${c.id}: Anfrage zu groß (${problem})`);
     return [{ case: c, exercise, module, request }];
@@ -89,6 +92,7 @@ export function estimateMicros(prepared: Prepared[], variant: Variant): number {
   }, 0);
 }
 
+export const privateNames = () => (process.env.TUTOR_PRIVATE_NAMES ?? '').split(',').map((name) => name.trim()).filter(Boolean);
 const usd = (micros: number) => `${(micros / 1_000_000).toFixed(2)} $`;
 const flag = (name: string) => process.argv.includes(`--${name}`);
 const option = (name: string) => { const i = process.argv.indexOf(`--${name}`); return i > 0 ? process.argv[i + 1] : undefined; };
@@ -99,6 +103,7 @@ async function live(prepared: Prepared[], variants: Variant[], maxMicros: number
   // Only an explicit key: the SDK would otherwise also pick up other local credentials.
   const apiKey = process.env.ANTHROPIC_API_KEY?.trim();
   if (!apiKey) throw new Error('--live braucht ANTHROPIC_API_KEY in der Umgebung.');
+  if (!privateNames().length) console.warn('Hinweis: TUTOR_PRIVATE_NAMES ist leer. Namen in Kursbeispielen (etwa /home/<name>) gehen unverändert mit.');
   const { default: Anthropic } = await import('@anthropic-ai/sdk');
   const client = new Anthropic({ apiKey, maxRetries: 1, timeout: 120_000 });
   mkdirSync(out, { recursive: true });
@@ -119,11 +124,11 @@ async function live(prepared: Prepared[], variants: Variant[], maxMicros: number
   // Variants in turn per case, so every variant sees the same cache conditions.
   for (const p of prepared) for (const variant of variants) {
     const first = await send(variant, p.request, false);
-    const leaked = leaksSolution(first.text, p.request.leak);
+    const leaked = leaksSolution(first.text, p.request.leak, p.request.attempt);
     const retry = leaked ? await send(variant, p.request, true) : null;
     const shown = retry?.text ?? first.text;
     const forbidden = (p.case.forbidden ?? []).filter((text) => shown.toLowerCase().includes(text.toLowerCase()));
-    results.push({ case: p.case.id, variant: variant.name, level: p.case.level, text: first.text, leaked, retryText: retry?.text ?? null, retryLeaked: retry ? leaksSolution(retry.text, p.request.leak) : null, stop: first.stop, forbidden, ms: first.ms + (retry?.ms ?? 0), micros: first.micros + (retry?.micros ?? 0), usage: first.usage });
+    results.push({ case: p.case.id, variant: variant.name, level: p.case.level, text: first.text, leaked, retryText: retry?.text ?? null, retryLeaked: retry ? leaksSolution(retry.text, p.request.leak, p.request.attempt) : null, stop: first.stop, forbidden, ms: first.ms + (retry?.ms ?? 0), micros: first.micros + (retry?.micros ?? 0), usage: first.usage });
     writeFileSync(join(out, 'results.jsonl'), results.map((r) => JSON.stringify(r)).join('\n') + '\n');
     console.log(`${p.case.id} · ${variant.name}: ${first.ms} ms${leaked ? ', Lösung verraten' : ''}${forbidden.length ? `, Verbotenes: ${forbidden.join(', ')}` : ''} · gesamt ${usd(spent)}`);
   }

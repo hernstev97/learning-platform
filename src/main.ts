@@ -80,6 +80,8 @@ async function connect(url: string, key: string): Promise<void> {
     return;
   }
   const sessionId = clerk.session.id;
+  // Only for the optional tutor: these never leave the browser, they are replaced in its requests (src/engine/tutor.ts).
+  state.setPrivateNames([clerk.user?.firstName, clerk.user?.lastName, clerk.user?.username, clerk.user?.primaryEmailAddress?.emailAddress]);
   const client = new ConvexClient(url, { unsavedChangesWarning: true });
   abandonConnection = () => { void client.close(); };
   let disconnect = () => {};

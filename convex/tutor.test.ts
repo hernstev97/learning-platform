@@ -3,7 +3,7 @@ import { convexTest } from 'convex-test';
 import schema from './schema';
 import { api, internal } from './_generated/api';
 import { tutorRequest } from '../src/engine/tutor-context';
-import { buildPrompt, costMicros, promptChars, worstCaseMicros, type TutorRequest } from '../src/engine/tutor';
+import { buildPrompt, costMicros, promptChars, worstCaseMicros, TUTOR_MAX_TOKENS, type TutorRequest } from '../src/engine/tutor';
 import type { ExplainExercise, GapExercise, Module, PracticeExercise } from '../src/content/types';
 
 // The tutor against a fake provider: fetch is replaced, so the official SDK builds its real request but nothing leaves
@@ -96,7 +96,7 @@ describe('a hint', () => {
     const reply = await t.action(api.tutor.ask, ask());
     expect(reply).toEqual({ ok: true, text: 'Welches Schlüsselwort leitet in Python eine Funktion ein?', retried: false });
     const [request] = sent;
-    expect(request.json).toMatchObject({ model: 'claude-sonnet-5-5', max_tokens: 1500, output_config: { effort: 'medium' } });
+    expect(request.json).toMatchObject({ model: 'claude-sonnet-5-5', max_tokens: TUTOR_MAX_TOKENS, output_config: { effort: 'medium' } });
     expect(Object.keys(request.json).sort()).toEqual(['max_tokens', 'messages', 'model', 'output_config', 'system']);
     // No personal identifiers anywhere in the payload: no account, issuer, e-mail, metadata or exercise ID.
     const everything = JSON.stringify({ body: request.body, headers: request.headers });
@@ -209,6 +209,31 @@ describe('monthly budget', () => {
     vi.spyOn(console, 'error').mockImplementation(() => {});
     expect(await t.action(api.tutor.ask, ask())).toEqual({ ok: false, reason: 'provider' });
     expect(await t.query(internal.tutor.monthUsage, { month })).toMatchObject({ requests: 2, pendingMicros: 0 });
+  });
+  it('books a timed-out request at its reservation, because it may still have been billed', async () => {
+    withKey();
+    const t = create().withIdentity(identity);
+    const { default: Anthropic } = await import('@anthropic-ai/sdk');
+    fakeProvider.mockImplementationOnce(async () => { throw new Anthropic.APIConnectionTimeoutError(); });
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(await t.action(api.tutor.ask, ask())).toEqual({ ok: false, reason: 'provider' });
+    const row = await t.query(internal.tutor.monthUsage, { month });
+    expect(row).toMatchObject({ requests: 1, pendingMicros: 0, costMicros: worstCaseMicros('claude-sonnet-5-5', promptChars(buildPrompt(ask()))) });
+  });
+  it('releases a reservation left behind by an aborted action after 15 minutes', async () => {
+    withKey({ TUTOR_MONTHLY_BUDGET_USD: '0.30' });
+    const t = create().withIdentity(identity);
+    await t.run(async (ctx) => { await ctx.db.insert('tutorUsage', { month, requests: 0, inputTokens: 0, cacheWriteTokens: 0, cacheReadTokens: 0, outputTokens: 0, costMicros: 0, pendingMicros: 290_000, updatedAt: Date.now() - 16 * 60_000 }); });
+    expect(await t.action(api.tutor.ask, ask())).toMatchObject({ ok: true });
+    expect(await t.query(internal.tutor.monthUsage, { month })).toMatchObject({ requests: 1, pendingMicros: 0 });
+  });
+  it('reads the month the page asks for, so a subscription moves on at the turn of the month', async () => {
+    withKey();
+    const t = create().withIdentity(identity);
+    await t.run(async (ctx) => { await ctx.db.insert('tutorUsage', { month: '2026-09', requests: 3, inputTokens: 0, cacheWriteTokens: 0, cacheReadTokens: 0, outputTokens: 0, costMicros: 4_990_000, pendingMicros: 0, updatedAt: 0 }); });
+    expect(await t.query(api.tutor.status, { month: '2026-09' })).toMatchObject({ month: '2026-09', requests: 3, exhausted: true });
+    expect(await t.query(api.tutor.status, { month: '2026-10' })).toMatchObject({ month: '2026-10', requests: 0, exhausted: false });
+    expect(await t.query(api.tutor.status, { month: 'kaputt' })).toMatchObject({ month });
   });
   it('rejects oversized context before reserving anything', async () => {
     withKey();

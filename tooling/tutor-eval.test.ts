@@ -2,6 +2,8 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { loadContent } from './content.ts';
 import { attemptIsWrong, DEFAULT_VARIANTS, estimateMicros, gradingSheet, loadCases, prepare, VARIANTS } from './tutor-eval.ts';
+import { leaksSolution, tutorRequestProblem } from '../src/engine/tutor.ts';
+import { tutorRequest } from '../src/engine/tutor-context.ts';
 
 // The eval never calls a model here: it checks the cases and the prompts the live run would send.
 describe('tutor eval cases', () => {
@@ -24,9 +26,32 @@ describe('tutor eval cases', () => {
     expect(sheet).toContain('| sonnet-medium | 1 | 0 / 0 | 6.4 s | 0.01 $ |');
     expect(sheet).toContain('> Welchen Typ hat `erledigt / gesamt`?');
   });
+  it('does not count quoting the learner’s own attempt as giving the solution away', () => {
+    for (const p of prepared) expect(leaksSolution(`Dein Versuch:\n${p.request.attempt}`, p.request.leak, p.request.attempt), p.case.id).toBe(false);
+  });
   it('rejects a correct attempt', () => {
     const gap = loadContent(undefined, join(import.meta.dirname, 'fixtures')).areas.beispiel.modules['alle-typen'].exercises.find((e) => e.type === 'gap')!;
     expect(attemptIsWrong(gap, { g1: 'def', g2: 'x * 2' })).toBe('Versuch ist richtig');
     expect(attemptIsWrong(gap, { g1: 'fun', g2: 'x * 2' })).toBe(true);
+  });
+});
+
+describe('tutor requests for all content', () => {
+  // Every exercise must fit the server's limits, and restating its own task must not count as giving the answer away.
+  const { areas } = loadContent();
+  const all = Object.values(areas).flatMap((area) => Object.values(area.modules).flatMap((module) => module.exercises.map((exercise) => ({ area, module, exercise }))));
+  it('fits every exercise', () => {
+    const problems = all.flatMap(({ area, module, exercise }) => {
+      const problem = tutorRequestProblem(tutorRequest({ areaId: area.id, module, exercise, draft: undefined, done: false, feedback: '', previous: [], question: '', level: 1 }));
+      return problem ? [`${area.id}/${exercise.id}: ${problem}`] : [];
+    });
+    expect(problems).toEqual([]);
+  });
+  it('lets the tutor restate the task', () => {
+    const flagged = all.filter(({ area, module, exercise }) => {
+      const { leak } = tutorRequest({ areaId: area.id, module, exercise, draft: undefined, done: false, feedback: '', previous: [], question: '', level: 1 });
+      return leaksSolution(leak.visible, leak);
+    }).map(({ area, exercise }) => `${area.id}/${exercise.id}`);
+    expect(flagged).toEqual([]);
   });
 });

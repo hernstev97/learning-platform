@@ -4,13 +4,18 @@ import { normalizeOutput, tokens } from './answers.ts';
 
 export type TutorLevel = 1 | 2 | 3;
 /**
- * Accepted solutions, as the client derives them from the exercise (src/engine/tutor-context.ts). The tutor's answer
- * gives the solution away when it contains, for every group, one of its `answers`. `given` is what the learner already
- * sees (starter code, the faulty line); only the part an answer adds to it counts. Bug exercises without fixes list
- * their faulty `lines` instead; naming all of them gives the solution away.
+ * One part of an accepted solution, e.g. one gap. `given` is what the learner already sees of it (starter code, the
+ * faulty line); only what an answer adds to it counts.
  */
-export type LeakGroup = { answers: string[]; given: string };
-export type LeakRule = { lang: string; groups: LeakGroup[]; lines: number[] };
+export type LeakGroup = { answers: string[]; given: string; /** Must appear exactly as written, e.g. two lines in their order. */ exact?: boolean };
+/**
+ * Accepted solutions, as the client derives them from the exercise (src/engine/tutor-context.ts). An answer gives the
+ * solution away when it contains one of the `answers` of every group, names every faulty line a bug exercise still
+ * hides (`lines`, by number or by quoting `lineTexts`), or names every correct option of a choice (`options`, 1-based).
+ * `visible` is the task as the learner sees it: an answer that also stands there cannot be told apart from restating
+ * the task and is not checked.
+ */
+export type LeakRule = { lang: string; groups: LeakGroup[]; lines: number[]; lineTexts: string[]; options: number[]; visible: string };
 /** Everything the client sends. Learning content only: no account, e-mail or progress of other exercises. */
 export type TutorRequest = {
   areaId: string;
@@ -31,9 +36,9 @@ export type TutorRequest = {
 };
 
 /** Characters. The longest lesson as text has about 41,000 (python/nebenlaeufigkeit, October 2026), the longest exercise 10,500. */
-export const TUTOR_LIMITS = { lesson: 60_000, exercise: 30_000, attempt: 12_000, feedback: 4_000, question: 1_000, previous: 3, previousText: 2_000, leakChars: 40_000 } as const;
+export const TUTOR_LIMITS = { lesson: 60_000, exercise: 30_000, attempt: 12_000, feedback: 4_000, question: 1_000, previous: 3, previousText: 2_000, leakChars: 60_000 } as const;
 /** Upper bound of one answer including adaptive thinking. A longer answer stops with `max_tokens` and counts as an error. */
-export const TUTOR_MAX_TOKENS = 1500;
+export const TUTOR_MAX_TOKENS = 3000;
 export const TUTOR_WARN_SHARE = 0.8;
 
 /** Checks sizes on the server; null when the request is acceptable. */
@@ -47,16 +52,21 @@ export function tutorRequestProblem(request: TutorRequest): string | null {
   if (question.length > TUTOR_LIMITS.question) return 'question';
   if (request.done && !question.trim()) return 'question';
   if (previous.length > TUTOR_LIMITS.previous || previous.some((text) => text.length > TUTOR_LIMITS.previousText)) return 'previous';
-  const leakChars = leak.groups.reduce((sum, group) => sum + group.given.length + group.answers.reduce((n, text) => n + text.length, 0), 0);
-  if (leak.groups.length > 64 || leak.groups.some((group) => group.answers.length > 32) || leakChars > TUTOR_LIMITS.leakChars || leak.lines.length > 64) return 'leak';
+  const length = (texts: string[]) => texts.reduce((sum, text) => sum + text.length, 0);
+  const leakChars = leak.groups.reduce((sum, group) => sum + group.given.length + length(group.answers), 0) + length(leak.lineTexts) + leak.visible.length;
+  if (leak.groups.length > 64 || leak.groups.some((group) => group.answers.length > 128) || leak.lines.length > 64 || leak.options.length > 32 || leakChars > TUTOR_LIMITS.leakChars) return 'leak';
   return null;
 }
 
 /**
- * Own texts without a model solution (`practice` with `lang: prose`) get no tutor: there is nothing to diagnose
- * against, and in `narrative` and `combat` the learner writes and decides these himself (LRN-29, area texts).
+ * Own texts get no tutor: in `narrative` and `combat` the learner writes them and makes every design decision himself
+ * (LRN-29, combat/area.yaml), so written practice tasks there stay his alone, even where a model answer exists. Nor
+ * does any practice task without a model solution, which leaves nothing to diagnose against.
  */
-export const tutorAllowed = (kind: string, leak: LeakRule) => !(kind === 'practice' && !leak.groups.length);
+export function tutorAllowed(areaId: string, kind: string, leak: LeakRule): boolean {
+  if (kind !== 'practice') return true;
+  return leak.groups.length > 0 && !(AREA_RULES[areaId] && ['prose', 'text'].includes(leak.lang));
+}
 
 // ── Prompt ───────────────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -66,7 +76,7 @@ Regeln:
 - Antworte auf Deutsch in der Du-Form, in zwei bis fünf kurzen Sätzen. Kein Gruß, keine Einleitung, keine Zusammenfassung am Ende.
 - Stütze dich auf die mitgeschickte Lektion und Übung. Was du nicht sicher weißt, kennzeichnest du als unsicher, statt zu raten. Für Details verweist du auf die offizielle Dokumentation oder einen Abschnitt der Lektion.
 - Code, Befehle und Bezeichner schreibst du in Backticks.
-- Solange die Übung nicht gelöst ist, gibst du die Lösung nie aus: keine richtige Antwort, keine korrigierte Zeile, keine Musterlösung, auch nicht in Teilen, die zusammen die Lösung ergeben. Bei Auswahlaufgaben nennst du die richtige Option nicht, bei Fehlersuche nicht die fehlerhafte Zeile. Die Lösung zeigt nur der Button „Lösung zeigen“.
+- Solange die Übung nicht gelöst ist, gibst du die Lösung nie aus: keine richtige Antwort, keine korrigierte Zeile, keine Musterlösung, auch nicht in Teilen, die zusammen die Lösung ergeben. Bei Auswahlaufgaben nennst du die richtige Option nicht, bei der Fehlersuche nicht die fehlerhafte Zeile, solange der Lernende sie nicht gefunden hat. Die Lösung zeigt nur der Button „Lösung zeigen“.
 - Die Stufe der Anfrage bestimmt, wie konkret du wirst:
   - Stufe 1, Denkanstoß: eine Gegenfrage oder ein Hinweis, worauf der Lernende achten soll. Den Fehler nennst du nicht.
   - Stufe 2, Konzept: Nenne das Konzept, um das es geht, und den Abschnitt der Lektion, in dem es steht. Erkläre es kurz, ohne es auf die Übung anzuwenden.
@@ -86,6 +96,12 @@ const LEVELS: Record<TutorLevel, string> = {
   2: 'Stufe 2, Konzept: Nenne das Konzept und den Abschnitt der Lektion und erkläre es kurz, ohne es auf die Übung anzuwenden.',
   3: 'Stufe 3, Fehlerstelle: Sag, wo im Versuch der Fehler steckt und warum er nicht stimmt, ohne die richtige Antwort zu nennen.',
 };
+/** Level 3 where "where the error is" would itself be the answer. */
+const LEVEL_3: Record<string, string> = {
+  bug: 'Stufe 3, Fehlerstelle: Grenze ein, in welchem Teil des Codes der Fehler steckt, etwa in welcher Funktion, Schleife oder Bedingung, und warum er nicht stimmt. Nenne keine Zeilennummer, zitiere die fehlerhafte Zeile nicht und gib keine korrigierte Zeile vor.',
+  choice: 'Stufe 3, Fehlerstelle: Sag, welcher Gedanke hinter der gewählten Auswahl nicht stimmt, ohne die richtige Option zu nennen.',
+};
+const levelText = (request: TutorRequest) => request.level === 3 && LEVEL_3[request.kind] && (request.kind !== 'bug' || request.leak.lines.length) ? LEVEL_3[request.kind] : LEVELS[request.level];
 export const LEVEL_NAMES: Record<TutorLevel, string> = { 1: 'Denkanstoß', 2: 'Konzept', 3: 'Fehlerstelle' };
 export const RETRY_NOTE = 'Deine vorige Antwort enthielt die Lösung und wurde verworfen. Gib einen Hinweis derselben Stufe, der die Lösung nicht enthält.';
 
@@ -108,7 +124,7 @@ export function buildPrompt(request: TutorRequest, retry = false): TutorPrompt {
     request.feedback.trim() ? tag('rueckmeldung', request.feedback.trim()) : '',
     request.previous.length ? tag('bisherige_hinweise', request.previous.map((text, i) => `${i + 1}. ${text.trim()}`).join('\n')) : '',
     request.question.trim() ? tag('frage', request.question.trim()) : '',
-    tag('anfrage', request.done ? 'Beantworte die Frage.' : LEVELS[request.level]),
+    tag('anfrage', request.done ? 'Beantworte die Frage.' : levelText(request)),
     retry ? tag('hinweis', RETRY_NOTE) : '',
   ].filter(Boolean).join('\n\n');
   return {
@@ -122,46 +138,102 @@ export function buildPrompt(request: TutorRequest, retry = false): TutorPrompt {
 }
 export const promptChars = (prompt: TutorPrompt) => [...prompt.system, ...prompt.messages[0].content].reduce((sum, block) => sum + block.text.length, 0);
 
+// ── Personal names ───────────────────────────────────────────────────────────────────────────────────────────────
+
+/** Same length as the name they replace, so lengths in code examples stay right (`"Steven".length`). */
+const STAND_INS = ['', '', '', 'Ida', 'Alex', 'Robin', 'Jordan', 'Charlie', 'Marianne', 'Alexandra', 'Maximilian'];
+const standIn = (match: string) => {
+  const name = (STAND_INS[match.length] ?? 'X'.repeat(match.length)).slice(0, match.length);
+  return match === match.toLowerCase() ? name.toLowerCase() : match === match.toUpperCase() ? name.toUpperCase() : name;
+};
+const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+/**
+ * Replaces the learner's own names and e-mail addresses (from the signed-in session, never stored) in everything the
+ * request carries. Course examples use the owner's name (`/home/steven`); the provider gets a neutral stand-in. The
+ * same input always gives the same output, so the prompt cache still works.
+ */
+export function scrubRequest<T>(value: T, names: string[]): T {
+  const emails = names.filter((n) => n.includes('@'));
+  const words = names.filter((n) => !n.includes('@')).flatMap((n) => n.split(/\s+/)).filter((n) => n.length >= 3);
+  if (!emails.length && !words.length) return value;
+  const patterns = [
+    ...emails.map((email) => [new RegExp(escapeRegExp(email), 'gi'), () => 'name@example.com'] as const),
+    ...words.map((word) => [new RegExp(`(?<![\\p{L}\\p{N}_])${escapeRegExp(word)}(?![\\p{L}\\p{N}_])`, 'giu'), standIn] as const),
+  ];
+  const scrub = (item: unknown): unknown => typeof item === 'string' ? patterns.reduce((text, [pattern, replace]) => text.replace(pattern, replace), item)
+    : Array.isArray(item) ? item.map(scrub)
+    : item && typeof item === 'object' ? Object.fromEntries(Object.entries(item).map(([key, inner]) => [key, scrub(inner)]))
+    : item;
+  return scrub(value) as T;
+}
+
 // ── Solution check ───────────────────────────────────────────────────────────────────────────────────────────────
 
 /** Markdown code markers would turn `val` into one token; the check compares the plain text. */
 const plain = (text: string) => text.replace(/^```.*$/gm, '').replace(/`/g, ' ');
-const tokenize = (text: string, lang: string) => lang === 'output' ? tokens(normalizeOutput(text), 'prose') : tokens(text, lang);
-/** Too short to tell apart from ordinary text (`?.`, `it`, `42`): such answers are not checked. */
+const SHELLS = ['bash', 'sh', 'shell', 'zsh', 'fish', 'console', 'terminal'];
+const tokenize = (text: string, lang: string) => {
+  if (lang === 'output') return tokens(normalizeOutput(text), 'prose');
+  // A full stop or comma after a word ends the sentence, it is not part of a shell word (`ls -al.`).
+  return tokens(SHELLS.includes(lang.toLowerCase()) ? text.replace(/([\w~/])[.,;:!?](?=\s|$)/g, '$1') : text, lang);
+};
+/** Too short to tell apart from ordinary text (`?.`, `it`, `42`): such answers are only checked as a code span. */
 const checkable = (part: string[]) => part.join('').length >= 3;
+const indexOf = (haystack: string[], needle: string[], from = 0) => {
+  if (!needle.length) return -1;
+  for (let i = from; i + needle.length <= haystack.length; i++) if (needle.every((token, j) => haystack[i + j] === token)) return i;
+  return -1;
+};
+const unique = (parts: string[][]) => [...new Map(parts.map((p) => [p.join('\u0000'), p])).values()];
 
 /**
- * The tokens an answer adds to what the learner already sees: without the common start and end. A tiny difference
- * (`n + 1` instead of `n`) keeps one neighbouring token on each side until it is long enough to check.
+ * The tokens an answer adds to what the learner already sees: without the common start and end. A difference too
+ * small to check (`n + 1` instead of `n`) is widened by neighbouring tokens, to the left, the right or both. An answer
+ * that only removes something is checked as a whole.
  */
-export function answerCore(answer: string[], given: string[]): string[] {
-  if (!given.length) return answer;
+export function answerCores(answer: string[], given: string[]): string[][] {
+  if (!given.length) return [answer];
   let start = 0;
   while (start < answer.length && start < given.length && answer[start] === given[start]) start++;
   let end = 0;
   while (end < answer.length - start && end < given.length - start && answer[answer.length - 1 - end] === given[given.length - 1 - end]) end++;
-  let from = start, to = answer.length - end;
-  if (from >= to) return [];
-  while (!checkable(answer.slice(from, to)) && (from > 0 || to < answer.length)) { from = Math.max(0, from - 1); to = Math.min(answer.length, to + 1); }
-  return answer.slice(from, to);
+  const from = start, to = answer.length - end;
+  if (from >= to) return [answer];
+  if (checkable(answer.slice(from, to))) return [answer.slice(from, to)];
+  const grow = (left: boolean, right: boolean) => {
+    let a = from, b = to;
+    while (!checkable(answer.slice(a, b)) && ((left && a > 0) || (right && b < answer.length))) { if (left && a > 0) a--; if (right && b < answer.length) b++; }
+    return answer.slice(a, b);
+  };
+  return unique([grow(true, false), grow(false, true), grow(true, true)].filter(checkable));
 }
 
-function longestRun(haystack: string[], needle: string[]): number {
-  let best = 0;
-  let row = new Array<number>(needle.length + 1).fill(0);
-  for (const token of haystack) {
-    const next = new Array<number>(needle.length + 1).fill(0);
-    for (let j = 1; j <= needle.length; j++) if (token === needle[j - 1]) { next[j] = row[j - 1] + 1; if (next[j] > best) best = next[j]; }
-    row = next;
+/** Marks every token of `needle` that lies in a piece of at least four tokens found in `source`. */
+function covered(needle: string[], source: string[]): boolean[] {
+  const marks = new Array<boolean>(needle.length).fill(false);
+  for (let i = 0; i < needle.length;) {
+    let best = 0;
+    for (let h = 0; h < source.length; h++) {
+      let k = 0;
+      while (i + k < needle.length && h + k < source.length && needle[i + k] === source[h + k]) k++;
+      if (k > best) best = k;
+    }
+    if (best >= 4) { marks.fill(true, i, i + best); i += best; } else i++;
   }
-  return best;
+  return marks;
 }
-/** Short answers must appear exactly; for longer ones (code, queries) a contiguous 80 % of the tokens is enough. */
-const contains = (haystack: string[], needle: string[]) => longestRun(haystack, needle) >= (needle.length <= 8 ? needle.length : Math.ceil(needle.length * 0.8));
-const indexOf = (haystack: string[], needle: string[], from: number) => {
-  for (let i = from; i + needle.length <= haystack.length; i++) if (needle.every((token, j) => haystack[i + j] === token)) return i;
-  return -1;
-};
+/**
+ * Short answers must appear exactly. Longer ones (code, queries) count as given away when the answer covers 80 % of
+ * what is new in them, also split over several code blocks; what the task or the learner's own attempt already shows
+ * is not new.
+ */
+function present(haystack: string[], needle: string[], known: string[]): boolean {
+  if (needle.length <= 8) return indexOf(haystack, needle) >= 0;
+  const old = covered(needle, known);
+  const hits = covered(needle, haystack);
+  const fresh = old.filter((x) => !x).length;
+  return fresh >= 3 && hits.filter((hit, i) => hit && !old[i]).length >= fresh * 0.8;
+}
 /** Predicted output written out line by line, in order, even with words in between. */
 function outputLines(haystack: string[], answer: string): boolean {
   const lines = normalizeOutput(answer).split('\n').map((line) => tokens(line, 'prose'));
@@ -171,31 +243,71 @@ function outputLines(haystack: string[], answer: string): boolean {
   return true;
 }
 
-const LINE_REFERENCES = /\bZeilen?\s+(\d+(?:\s*(?:,|und|bis|sowie|oder|–|-)\s*\d+)*)/gi;
-export function mentionedLines(text: string): Set<number> {
-  const lines = new Set<number>();
-  for (const match of text.matchAll(LINE_REFERENCES)) for (const n of match[1].match(/\d+/g) ?? []) lines.add(Number(n));
-  return lines;
+const ORDINALS = ['erste', 'zweite', 'dritte', 'vierte', 'fünfte', 'sechste', 'siebte', 'achte', 'neunte', 'zehnte', 'elfte', 'zwölfte', 'dreizehnte', 'vierzehnte', 'fünfzehnte', 'sechzehnte', 'siebzehnte', 'achtzehnte', 'neunzehnte', 'zwanzigste'];
+/** Numbers a text refers to with one of `nouns`: „Zeile 3“, „Zeilen 2 bis 4“, „die dritte Zeile“. */
+function mentioned(text: string, nouns: string): Set<number> {
+  const found = new Set<number>();
+  for (const match of text.matchAll(new RegExp(`\\b(?:${nouns})\\s+(?:Nr\\.\\s*)?(\\d+(?:\\s*(?:,|und|bis|sowie|oder|–|-)\\s*\\d+)*)`, 'giu'))) {
+    const parts = match[1].split(/\s*(,|und|sowie|oder|bis|–|-)\s*/);
+    for (let i = 0; i < parts.length; i += 2) {
+      const n = Number(parts[i]);
+      found.add(n);
+      if (['bis', '–', '-'].includes(parts[i + 1]) && Number(parts[i + 2]) - n < 200) for (let k = n + 1; k < Number(parts[i + 2]); k++) found.add(k);
+    }
+  }
+  for (const match of text.matchAll(new RegExp(`\\b(${ORDINALS.join('|')})[nrs]?\\s+(?:${nouns})`, 'giu'))) found.add(ORDINALS.indexOf(match[1].toLowerCase()) + 1);
+  return found;
 }
+export const mentionedLines = (text: string) => mentioned(text, 'Zeilen?');
+export const mentionedOptions = (text: string) => mentioned(text, 'Optionen|Option|Antworten|Antwort|Auswahl');
+
+/** Code spans and blocks of an answer, as token lists. */
+const codeSpans = (answer: string, lang: string) => [...answer.matchAll(/```[^\n]*\n([\s\S]*?)```|`([^`\n]+)`/g)].map((m) => tokenize(m[1] ?? m[2], lang)).filter((t) => t.length);
 
 /**
  * Deterministic check before an answer is shown: does it contain a complete accepted solution? Every checkable group
- * must be present; groups whose answers are all too short to check do not block a verdict. A guard against giving the
- * solution away by accident, not against paraphrases.
+ * must be present; groups whose answers are all too short to tell apart from text do not block a verdict, unless no
+ * group is checkable, then they count when they stand alone as a code span. A guard against giving the solution away
+ * by accident, not against paraphrases. `attempt` is what the learner wrote; repeating it gives nothing away.
  */
-export function leaksSolution(answer: string, rule: LeakRule): boolean {
+export function leaksSolution(answer: string, rule: LeakRule, attempt = ''): boolean {
   const text = plain(answer);
   const haystack = tokenize(text, rule.lang);
-  const found = rule.groups.map((group) => {
+  const visible = tokenize(plain(rule.visible), rule.lang);
+  const written = tokenize(plain(attempt), rule.lang);
+  const known = [...visible, ...written];
+  // A short answer the task shows or the learner already typed (one right gap of two) is nothing new.
+  const fresh = (core: string[]) => indexOf(visible, core) < 0 && (core.length > 8 || indexOf(written, core) < 0);
+  const groups = rule.groups.map((group) => {
     const given = tokenize(group.given, rule.lang);
-    const checks = group.answers.map((candidate) => ({ candidate, core: answerCore(tokenize(candidate, rule.lang), given) })).filter(({ core }) => checkable(core));
-    if (!checks.length) return null;
-    return checks.some(({ candidate, core }) => contains(haystack, core) || (rule.lang === 'output' && outputLines(haystack, candidate)));
-  }).filter((result) => result !== null);
-  if (found.length && found.every(Boolean)) return true;
-  if (rule.lines.length && !rule.groups.length) {
+    const parts = group.answers.map((candidate) => ({ candidate, cores: answerCores(tokenize(candidate, rule.lang), given).filter(fresh) }));
+    const checks = parts.filter(({ cores }) => cores.some(checkable));
+    return {
+      checkable: checks.length > 0,
+      found: checks.some(({ candidate, cores }) => cores.some((core) => checkable(core) && (group.exact ? indexOf(haystack, core) >= 0 : present(haystack, core, known)))
+        || (rule.lang === 'output' && outputLines(haystack, candidate) && !outputLines(visible, candidate) && !outputLines(written, candidate))),
+      short: parts.map(({ cores }) => cores).flat().filter((core) => core.length > 0),
+    };
+  });
+  const strong = groups.filter((g) => g.checkable);
+  if (strong.length && strong.every((g) => g.found)) return true;
+  const weak = groups.filter((g) => g.short.length);
+  if (!strong.length && weak.length) {
+    const spans = codeSpans(answer, rule.lang);
+    if (weak.every((g) => g.short.some((core) => spans.some((span) => span.length === core.length && indexOf(span, core) === 0)))) return true;
+  }
+  if (rule.lines.length) {
+    // Lines the task itself names or quotes are no secret.
+    const quoted = rule.lineTexts.map((line) => tokenize(line, rule.lang));
+    const quotes = (tokens: string[], i: number) => !!quoted[i] && checkable(quoted[i]) && indexOf(tokens, quoted[i]) >= 0;
+    const shown = mentionedLines(rule.visible);
+    const hidden = rule.lines.map((line, i) => ({ line, i })).filter(({ line, i }) => !shown.has(line) && !quotes(visible, i));
     const named = mentionedLines(text);
-    if (rule.lines.every((line) => named.has(line))) return true;
+    if (hidden.length && hidden.every(({ line, i }) => named.has(line) || quotes(haystack, i))) return true;
+  }
+  if (rule.options.length) {
+    const named = mentionedOptions(text);
+    if (rule.options.every((option) => named.has(option))) return true;
   }
   return false;
 }
@@ -221,6 +333,8 @@ export const costMicros = (model: string, usage: TutorUsage): number => {
 };
 /** Most a request can cost: every character a token, all of it written to the cache, the full answer length. */
 export const worstCaseMicros = (model: string, chars: number) => costMicros(model, { input: 0, cacheWrite: chars, cacheRead: 0, output: TUTOR_MAX_TOKENS });
+/** A long lesson plus exercise; the panel pauses once not even such a request fits into the budget. */
+const TYPICAL_PROMPT_CHARS = 30_000;
 
 export type TutorConfig =
   | { enabled: false; problem: string | null }
@@ -248,10 +362,11 @@ export const usageMonth = (now: Date) => now.toISOString().slice(0, 7);
 export type TutorStatus =
   | { enabled: false; problem: string | null }
   | { enabled: true; month: string; model: string; spentMicros: number; budgetMicros: number; requests: number; warn: boolean; exhausted: boolean };
-export function tutorStatus(config: TutorConfig, month: string, spentMicros: number, requests: number): TutorStatus {
+/** `spent` is booked usage; `pending` is reserved for requests still running and only matters for the pause. */
+export function tutorStatus(config: TutorConfig, month: string, spent: number, pending: number, requests: number): TutorStatus {
   if (!config.enabled) return { enabled: false, problem: config.problem };
-  const exhausted = spentMicros + worstCaseMicros(config.model, 0) > config.budgetMicros;
-  return { enabled: true, month, model: config.model, spentMicros, budgetMicros: config.budgetMicros, requests, warn: spentMicros >= config.budgetMicros * TUTOR_WARN_SHARE, exhausted };
+  const exhausted = spent + pending + worstCaseMicros(config.model, TYPICAL_PROMPT_CHARS) > config.budgetMicros;
+  return { enabled: true, month, model: config.model, spentMicros: spent, budgetMicros: config.budgetMicros, requests, warn: spent >= config.budgetMicros * TUTOR_WARN_SHARE, exhausted };
 }
 
 export type TutorReply =
