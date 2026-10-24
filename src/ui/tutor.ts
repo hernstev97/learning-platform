@@ -2,7 +2,7 @@
 // this page's memory. Invisible without configuration, offline, in the offline reading mode and for own texts.
 import { askTutor, onStorageChange, tutorReachable, watchTutor } from '../app.ts';
 import type { Exercise, Module, TocEntry } from '../content/types.ts';
-import { LEVEL_NAMES, tutorAllowed, type TutorLevel, type TutorReply, type TutorStatus } from '../engine/tutor.ts';
+import { LEVEL_NAMES, TUTOR_LIMITS, tutorAllowed, type TutorLevel, type TutorReply, type TutorStatus } from '../engine/tutor.ts';
 import { leakRule, tutorRequest } from '../engine/tutor-context.ts';
 import { $, escape, html } from './dom.ts';
 
@@ -82,7 +82,7 @@ export type TutorHooks = {
 };
 
 export function mountTutor(after: Element, hooks: TutorHooks): { refresh(): void; cleanup(): void } {
-  const allowed = tutorAllowed(hooks.exercise.type, leakRule(hooks.exercise));
+  const allowed = tutorAllowed(hooks.areaId, hooks.exercise.type, leakRule(hooks.exercise));
   const section = document.createElement('section');
   section.id = 'tutor';
   section.className = 'tutor';
@@ -147,7 +147,7 @@ export function mountTutor(after: Element, hooks: TutorHooks): { refresh(): void
     try {
       reply = await askTutor(tutorRequest({
         areaId: hooks.areaId, module: hooks.module, exercise: hooks.exercise, draft: hooks.draft(), done,
-        feedback: hooks.feedback(), previous: answers.slice(-3), question: question.value, level,
+        feedback: hooks.feedback(), previous: answers.slice(-3).map((text) => text.slice(0, TUTOR_LIMITS.previousText)), question: question.value, level,
       }));
     } catch { reply = { ok: false, reason: 'provider' }; }
     pending = false;

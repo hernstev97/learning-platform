@@ -2,7 +2,7 @@
 // Deterministic and without DOM, so the exercise page and the eval harness build byte-identical prompts.
 import type { Answers, Exercise, Module } from '../content/types.ts';
 import { assemble } from './answers.ts';
-import type { LeakRule, TutorRequest } from './tutor.ts';
+import type { LeakGroup, LeakRule, TutorRequest } from './tutor.ts';
 
 const ENTITIES: Record<string, string> = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ', shy: '' };
 /** Rendered Markdown (trusted build-time HTML) as readable text: blocks on their own lines, entities decoded. */
@@ -69,7 +69,7 @@ export function exerciseText(exercise: Exercise): string {
       break;
     case 'explain':
       parts.push(`Zu erklären (Sprache ${exercise.lang}):\n${fence(exercise.code, exercise.lang)}`);
-      parts.push(`Kernpunkte, die eine gute Erklärung enthält (der Lernende sieht sie erst nach seinem Text):\n${list(exercise.points.map(htmlToText))}`);
+      solution.push(`Kernpunkte, die eine gute Erklärung enthält (der Lernende sieht sie erst nach seinem Text):\n${list(exercise.points.map(htmlToText))}`);
       break;
     case 'sql':
       parts.push(`Datenbank (${exercise.engine === 'postgres' ? 'PostgreSQL' : 'SQLite'}), Schema:\n${fence(exercise.schema, 'sql')}`);
@@ -128,23 +128,39 @@ export function attemptText(exercise: Exercise, draft: unknown): string {
 }
 
 const group = (answers: string[], given = '') => ({ answers, given });
-/** Accepted solutions per type for the check in leaksSolution (src/engine/tutor.ts). */
-export function leakRule(exercise: Exercise): LeakRule {
+const rule = (lang: string, groups: LeakGroup[], visible: string[], extra: Partial<LeakRule> = {}): LeakRule => ({ lang, groups, lines: [], lineTexts: [], options: [], visible: visible.filter(Boolean).join('\n\n'), ...extra });
+/** Language of choice options: code options compare like code, everything else as running text. */
+const optionLang = (lang: string) => lang && lang !== 'prose' ? lang : 'prose';
+/**
+ * Accepted solutions per type for the check in leaksSolution (src/engine/tutor.ts), plus the task as the learner sees
+ * it. For a bug exercise the faulty lines count only while the learner has not found them yet.
+ */
+export function leakRule(exercise: Exercise, draft?: unknown): LeakRule {
+  const prompt = htmlToText(exercise.prompt);
   switch (exercise.type) {
-    case 'gap': return { lang: exercise.lang, groups: exercise.gaps.map((gap) => group(gap.answers)), lines: [] };
-    case 'choice': return { lang: 'prose', groups: exercise.options.filter((o) => o.correct).map((o) => group([htmlToText(o.html)])), lines: [] };
-    case 'order': return { lang: exercise.lang, groups: [group([exercise.lines, ...exercise.alternatives.map((alt) => alt.map((i) => exercise.lines[i]))].map((lines) => lines.join('\n')))], lines: [] };
-    case 'output': return { lang: 'output', groups: [group(exercise.expected)], lines: [] };
-    case 'command': return { lang: 'shell', groups: [group(exercise.answers)], lines: [] };
-    case 'code': return { lang: 'python', groups: [group([exercise.solution], exercise.starter)], lines: [] };
-    case 'practice': return { lang: exercise.lang, groups: exercise.solution ? [group([exercise.solution], exercise.starter)] : [], lines: [] };
+    case 'gap': return rule(exercise.lang, exercise.gaps.map((gap) => group(gap.answers)), [prompt, exercise.code]);
+    case 'choice': {
+      const correct = exercise.options.flatMap((o, i) => o.correct ? [i + 1] : []);
+      return rule(optionLang(exercise.lang), exercise.options.filter((o) => o.correct).map((o) => group([htmlToText(o.html)])), [prompt, exercise.code ?? ''], { options: correct });
+    }
+    case 'order': {
+      // Every line is on screen; the solution is the arrangement, so each pair of neighbours must appear in order.
+      const orders = [exercise.lines.map((_, i) => i), ...exercise.alternatives];
+      const pairs = exercise.lines.slice(1).map((_, i) => ({ answers: [...new Set(orders.map((o) => `${exercise.lines[o[i]]}\n${exercise.lines[o[i + 1]]}`))], given: '', exact: true }));
+      return rule(exercise.lang, pairs, [prompt]);
+    }
+    case 'output': return rule('output', [group(exercise.expected)], [prompt, exercise.code]);
+    case 'command': return rule('shell', [group(exercise.answers)], [prompt, exercise.context ? htmlToText(exercise.context) : '']);
+    case 'code': return rule('python', [group([exercise.solution], exercise.starter)], [prompt, ...exercise.tests.map((t) => t.code)]);
+    case 'practice': return rule(exercise.lang, exercise.solution ? [group([exercise.solution], exercise.starter)] : [], [prompt, ...exercise.checklist.map(htmlToText)]);
     case 'bug': {
       const lines = exercise.code.split('\n');
-      return { lang: exercise.lang, groups: exercise.fixes.map((fix) => group(fix.answers, lines[fix.line - 1] ?? '')), lines: exercise.lines };
+      const hidden = !(draft as { found?: boolean } | undefined)?.found;
+      return rule(exercise.lang, exercise.fixes.map((fix) => group(fix.answers, lines[fix.line - 1] ?? '')), [prompt], hidden ? { lines: exercise.lines, lineTexts: exercise.lines.map((n) => lines[n - 1]?.trim() ?? '') } : {});
     }
-    case 'explain': return { lang: 'prose', groups: [group([htmlToText(exercise.explanation)])], lines: [] };
-    case 'sql': return { lang: 'sql', groups: [group([exercise.solution], exercise.starter)], lines: [] };
-    case 'scenario': return { lang: 'shell', groups: [group([exercise.solution])], lines: [] };
+    case 'explain': return rule('prose', exercise.points.map((point) => group([htmlToText(point)])), [prompt, exercise.code]);
+    case 'sql': return rule('sql', [group([exercise.solution], exercise.starter)], [prompt, exercise.schema]);
+    case 'scenario': return rule('shell', [group([exercise.solution])], [prompt]);
   }
 }
 
@@ -162,6 +178,6 @@ export function tutorRequest(input: TutorInput): TutorRequest {
     feedback: input.feedback,
     previous: input.previous,
     question: input.question,
-    leak: leakRule(exercise),
+    leak: leakRule(exercise, input.draft),
   };
 }

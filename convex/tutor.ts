@@ -14,25 +14,30 @@ import {
 
 const findMonth = (ctx: QueryCtx | MutationCtx, month: string) => ctx.db.query('tutorUsage').withIndex('by_month', (q) => q.eq('month', month)).unique();
 
+/** `month` comes from the client clock so that a subscription moves on at the turn of the month; the server's is the fallback. */
 export const status = query({
-  args: {},
-  handler: async (ctx): Promise<TutorStatus> => {
+  args: { month: v.optional(v.string()) },
+  handler: async (ctx, args): Promise<TutorStatus> => {
     await requireOwner(ctx);
     const config = tutorConfig(process.env);
-    if (!config.enabled) return tutorStatus(config, '', 0, 0);
-    const month = usageMonth(new Date());
+    if (!config.enabled) return tutorStatus(config, '', 0, 0, 0);
+    const month = args.month && /^\d{4}-(0[1-9]|1[0-2])$/.test(args.month) ? args.month : usageMonth(new Date());
     const row = await findMonth(ctx, month);
-    return tutorStatus(config, month, (row?.costMicros ?? 0) + (row?.pendingMicros ?? 0), row?.requests ?? 0);
+    return tutorStatus(config, month, row?.costMicros ?? 0, row?.pendingMicros ?? 0, row?.requests ?? 0);
   },
 });
+
+/** No request runs this long (90 s timeout, at most two attempts); an older reservation was left by an aborted action. */
+const STALE_RESERVATION_MS = 15 * 60_000;
 
 /** Books the most a request can cost before it is sent; false when that would exceed the monthly budget. */
 export const reserve = internalMutation({
   args: { month: v.string(), micros: v.number(), budgetMicros: v.number() },
   handler: async (ctx, { month, micros, budgetMicros }) => {
     const row = await findMonth(ctx, month);
-    if ((row?.costMicros ?? 0) + (row?.pendingMicros ?? 0) + micros > budgetMicros) return false;
-    if (row) await ctx.db.patch(row._id, { pendingMicros: row.pendingMicros + micros, updatedAt: Date.now() });
+    const pending = row && Date.now() - row.updatedAt < STALE_RESERVATION_MS ? row.pendingMicros : 0;
+    if ((row?.costMicros ?? 0) + pending + micros > budgetMicros) return false;
+    if (row) await ctx.db.patch(row._id, { pendingMicros: pending + micros, updatedAt: Date.now() });
     else await ctx.db.insert('tutorUsage', { month, requests: 0, inputTokens: 0, cacheWriteTokens: 0, cacheReadTokens: 0, outputTokens: 0, costMicros: 0, pendingMicros: micros, updatedAt: Date.now() });
     return true;
   },
@@ -74,7 +79,7 @@ const tutorRequest = {
   feedback: v.string(),
   previous: v.array(v.string()),
   question: v.string(),
-  leak: v.object({ lang: v.string(), groups: v.array(v.object({ answers: v.array(v.string()), given: v.string() })), lines: v.array(v.number()) }),
+  leak: v.object({ lang: v.string(), groups: v.array(v.object({ answers: v.array(v.string()), given: v.string(), exact: v.optional(v.boolean()) })), lines: v.array(v.number()), lineTexts: v.array(v.string()), options: v.array(v.number()), visible: v.string() }),
 };
 
 /**
@@ -90,8 +95,9 @@ export const ask = action({
     if (!config.enabled) return { ok: false, reason: 'disabled' };
     assertId(request.areaId);
     if (tutorRequestProblem(request)) return { ok: false, reason: 'too_large' };
-    if (!tutorAllowed(request.kind, request.leak)) return { ok: false, reason: 'not_allowed' };
-    const client = new Anthropic({ apiKey: config.apiKey, maxRetries: 1, timeout: 60_000 });
+    if (!tutorAllowed(request.areaId, request.kind, request.leak)) return { ok: false, reason: 'not_allowed' };
+    // No automatic retries: a retried request could be billed twice without being counted.
+    const client = new Anthropic({ apiKey: config.apiKey, maxRetries: 0, timeout: 90_000 });
     for (const retry of [false, true]) {
       const prompt = buildPrompt(request, retry);
       const month = usageMonth(new Date());
@@ -101,7 +107,9 @@ export const ask = action({
       try {
         message = await client.messages.create({ model: config.model, max_tokens: TUTOR_MAX_TOKENS, output_config: { effort: config.effort }, system: prompt.system, messages: prompt.messages });
       } catch (error) {
-        await ctx.runMutation(internal.tutor.settle, { month, reserved, usage: null });
+        // After a timeout the request may still have been billed: the reservation then counts as spent.
+        const timedOut = error instanceof Anthropic.APIConnectionTimeoutError;
+        await ctx.runMutation(internal.tutor.settle, { month, reserved, usage: timedOut ? { input: 0, cacheWrite: 0, cacheRead: 0, output: 0, costMicros: reserved } : null });
         // Status and class only: the request carries the learner's text.
         console.error('tutor request failed', error instanceof Anthropic.APIError ? `${error.constructor.name} ${error.status ?? ''}` : String((error as Error)?.name));
         return { ok: false, reason: 'provider' };
@@ -112,7 +120,7 @@ export const ask = action({
       if (message.stop_reason === 'max_tokens') return { ok: false, reason: 'truncated' };
       const text = message.content.flatMap((block) => block.type === 'text' ? [block.text] : []).join('\n\n').trim();
       if (!text) return { ok: false, reason: 'provider' };
-      if (request.done || !leaksSolution(text, request.leak)) return { ok: true, text, retried: retry };
+      if (request.done || !leaksSolution(text, request.leak, request.attempt)) return { ok: true, text, retried: retry };
     }
     return { ok: false, reason: 'leak' };
   },

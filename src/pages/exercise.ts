@@ -98,7 +98,7 @@ const exercisePage: Page<{ name: 'exercise'; area: string; module: string; index
     draft: () => progress.drafts[exercise.id],
     done: () => view.solved() || isDone(progress, exercise) || !!progress.revealed[exercise.id]
       || (exercise.type === 'explain' && !!(progress.drafts[exercise.id] as { revealed?: boolean } | undefined)?.revealed),
-    feedback: () => [...main.querySelectorAll<HTMLElement>('#feedback.bad, #feedback.partial, #results, #run-output')]
+    feedback: () => [...main.querySelectorAll<HTMLElement>('#feedback.bad, #feedback.partial, #results, #run-output, #sql-result')]
       .filter((el) => !el.hidden && (el.id !== 'results' || el.querySelector('.test.pass, .test.fail')))
       .map((el) => el.innerText.trim()).join('\n\n').slice(0, 4000),
     staticHint: () => {
