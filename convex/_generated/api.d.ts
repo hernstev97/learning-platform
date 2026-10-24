@@ -11,6 +11,7 @@
 import type * as auth from "../auth.js";
 import type * as model from "../model.js";
 import type * as progress from "../progress.js";
+import type * as tutor from "../tutor.js";
 
 import type {
   ApiFromModules,
@@ -22,6 +23,7 @@ declare const fullApi: ApiFromModules<{
   auth: typeof auth;
   model: typeof model;
   progress: typeof progress;
+  tutor: typeof tutor;
 }>;
 
 /**

@@ -1,7 +1,9 @@
-import { backupProgress, catalog, importProgress, isCloud, loadArea, onProgressChange, progressOf, resetProgress, summaryOf } from '../app.ts';
+import { backupProgress, catalog, importProgress, isCloud, loadArea, onProgressChange, progressOf, resetProgress, summaryOf, watchTutor } from '../app.ts';
 import { areaStats, convertLegacyBear, parseBackup } from '../engine/storage.ts';
 import { markLegacyImported, scanLegacy } from '../engine/legacy.ts';
 import { $, html } from '../ui/dom.ts';
+import { tutorUsageText } from '../ui/tutor.ts';
+import type { TutorStatus } from '../engine/tutor.ts';
 import type { Page } from '../router.ts';
 
 const data: Page = async (main) => {
@@ -9,6 +11,15 @@ const data: Page = async (main) => {
   const legacy = isCloud ? await scanLegacy(catalog) : null;
   if (location.pathname !== '/daten') return;
   let active = true;
+  // Tutor usage this month (LRN-6); the section stays hidden when the tutor is not configured.
+  let tutor: TutorStatus | null = null;
+  const showTutor = () => {
+    const section = main.querySelector<HTMLElement>('#tutor-usage');
+    const text = tutor ? tutorUsageText(tutor) : '';
+    if (!section) return;
+    section.hidden = !text;
+    $('#tutor-usage-text', section).textContent = text;
+  };
   const render = () => {
     if (!active) return;
     main.innerHTML = html`<div class="page narrow data-page">
@@ -22,6 +33,7 @@ const data: Page = async (main) => {
           return html`<tr data-progress-area="${area.id}"><td>${area.title}</td><td>${stats.done} / ${stats.total}</td><td>${Object.keys(progressOf(area.id).cards).length}</td><td><button type="button" class="btn small" data-reset="${area.id}">Zurück&shy;setzen</button></td></tr>`;
         })}
       </tbody></table></div>
+      <section class="data-section" id="tutor-usage" hidden><h2 class="section-title">KI-Tutor</h2><p id="tutor-usage-text"></p><p class="muted small">Gezählt werden nur Tokens und Kosten je Monat, keine Texte. Die zweite Sicherung ist das Ausgabenlimit in der Claude Console.</p></section>
       <section class="data-section"><h2 class="section-title">Sichern</h2><p>Lädt eine JSON-Datei mit dem Lernstand und den Notizen aller Bereiche herunter.</p><button type="button" class="btn primary" id="export">Sicherung herunterladen</button></section>
       <section class="data-section"><h2 class="section-title">Wiederherstellen</h2><p>Eine Sicherung ergänzt fehlende Einträge. Vorhandene Serverwerte haben Vorrang, auch bewusst zurückgenommene Häkchen. Nach einem vollständigen Bereichsreset kannst du ihn hier absichtlich wiederherstellen.</p><label class="btn" for="import-file">Sicherung auswählen</label><input type="file" id="import-file" accept="application/json,.json" class="sr-only"></section>
       <section class="data-section"><h2 class="section-title">Von kotlin.kiumu.app übernehmen</h2>
@@ -31,6 +43,7 @@ const data: Page = async (main) => {
       </section>
       <p id="data-message" class="feedback info" role="status" aria-live="polite"></p>
     </div>`.value;
+    showTutor();
     const message = (text: string, kind = 'ok') => { const el = main.querySelector('#data-message'); if (!active || !el) return; el.className = `feedback ${kind}`; el.textContent = text; };
     main.querySelector<HTMLButtonElement>('#import-local')?.addEventListener('click', async (event) => {
       if (!legacy) return;
@@ -90,6 +103,7 @@ const data: Page = async (main) => {
     }));
   };
   render();
+  const stopTutor = watchTutor((value) => { tutor = value; showTutor(); });
   const unsubscribe = onProgressChange(() => {
     for (const area of catalog.areas) {
       const row = main.querySelector(`[data-progress-area="${area.id}"]`);
@@ -97,6 +111,6 @@ const data: Page = async (main) => {
       if (row) { row.children[1].textContent = `${stats.done} / ${stats.total}`; row.children[2].textContent = String(Object.keys(progressOf(area.id).cards).length); }
     }
   });
-  return () => { active = false; unsubscribe(); };
+  return () => { active = false; unsubscribe(); stopTutor(); };
 };
 export default data;

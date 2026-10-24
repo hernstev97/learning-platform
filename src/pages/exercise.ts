@@ -6,6 +6,7 @@ import type { Page } from '../router.ts';
 import { moduleNumber } from '../ui/area-nav.ts';
 import { $, $$, html, icons, pad, placeMark, raw } from '../ui/dom.ts';
 import { exerciseView } from '../ui/exercise-view.ts';
+import { mountTutor } from '../ui/tutor.ts';
 
 const exercisePage: Page<{ name: 'exercise'; area: string; module: string; index: number }> = async (main, route) => {
   const summary = summaryOf(route.area)!;
@@ -24,6 +25,8 @@ const exercisePage: Page<{ name: 'exercise'; area: string; module: string; index
   const track = (event: DrillEvent) => { if (!isDone(progress, exercise)) recordDrill(summary.id, exercise.id, event, false); };
   // Reopening hints already needed on an earlier visit is not new trouble; only needing more of them is.
   let hintsThisVisit = 0;
+  // Set once the tutor panel is mounted; solving or revealing switches it to free questions.
+  let refreshTutor = () => {};
   const updateNav = () => {
     const solved = isDone(progress, exercise);
     const next = $<HTMLAnchorElement>('#next', main);
@@ -50,13 +53,15 @@ const exercisePage: Page<{ name: 'exercise'; area: string; module: string; index
     fail: () => track('fail'),
     hint() { if (++hintsThisVisit > (progress.drills[exercise.id]?.hints ?? 0)) track('hint'); },
     reveal() {
-      if (isDone(progress, exercise)) return;
-      // A solution shown on an earlier visit already counts.
-      if (!progress.revealed[exercise.id]) track('reveal');
-      progress.revealed[exercise.id] = true;
-      setEntry(summary.id, { kind: 'revealed', id: exercise.id, value: true });
+      if (!isDone(progress, exercise)) {
+        // A solution shown on an earlier visit already counts.
+        if (!progress.revealed[exercise.id]) track('reveal');
+        progress.revealed[exercise.id] = true;
+        setEntry(summary.id, { kind: 'revealed', id: exercise.id, value: true });
+      }
+      refreshTutor();
     },
-    changed: () => { if (main.querySelector('#next')) updateNav(); },
+    changed: () => { if (main.querySelector('#next')) updateNav(); refreshTutor(); },
   }, {
     heading: 'h1',
     counter: `Übung ${pad(index + 1)} / ${pad(total)}`,
@@ -87,7 +92,24 @@ const exercisePage: Page<{ name: 'exercise'; area: string; module: string; index
     </div>`.value;
 
   const view = mount($('.player', main));
-  const cleanups: ((() => void) | void)[] = [view.cleanup];
+  // Optional AI tutor below the hints; it stays hidden unless Convex has a key (src/ui/tutor.ts).
+  const tutor = mountTutor($('.help-row', main), {
+    areaId: summary.id, module, exercise, lessonHref: base,
+    draft: () => progress.drafts[exercise.id],
+    done: () => view.solved() || isDone(progress, exercise) || !!progress.revealed[exercise.id]
+      || (exercise.type === 'explain' && !!(progress.drafts[exercise.id] as { revealed?: boolean } | undefined)?.revealed),
+    feedback: () => [...main.querySelectorAll<HTMLElement>('#feedback.bad, #feedback.partial, #results, #run-output, #sql-result')]
+      .filter((el) => !el.hidden && (el.id !== 'results' || el.querySelector('.test.pass, .test.fail')))
+      .map((el) => el.innerText.trim()).join('\n\n').slice(0, 4000),
+    staticHint: () => {
+      const hint = main.querySelector<HTMLButtonElement>('#hint');
+      if (!hint || hint.disabled) return false;
+      hint.click();
+      return true;
+    },
+  });
+  refreshTutor = tutor.refresh;
+  const cleanups: ((() => void) | void)[] = [view.cleanup, tutor.cleanup];
   updateNav();
 
   // Arrow keys move between exercises when focus is on the step bar.

@@ -11,6 +11,7 @@ import { schedule } from './engine/review.ts';
 import { drill, drillBase } from './engine/drill.ts';
 import { latestArea, projectSnapshot, safeDraft, sameEntry, toEntries } from './engine/persistence.ts';
 import { browserStorage, readOfflineCopy, writeOfflineCopy } from './engine/offline.ts';
+import { scrubRequest, usageMonth, type TutorReply, type TutorRequest, type TutorStatus } from './engine/tutor.ts';
 
 export { catalog };
 const areas = new Map<string, Area>();
@@ -28,6 +29,8 @@ let copyTimer: ReturnType<typeof setTimeout> | undefined;
 let offlineSince: number | null = null;
 let active = false;
 let pending = 0;
+/** Tutor actions in flight (see checkConnection). */
+let tutorCalls = 0;
 const inflight = new Set<Promise<unknown>>();
 let stopDraft: (() => void) | undefined;
 let draftToken = 0;
@@ -123,7 +126,8 @@ export async function connectProgress(convex: ConvexClient, denied: () => void):
   const checkConnection = () => {
     const state = client.connectionState();
     connected = state.isWebSocketConnected;
-    const oldest = state.timeOfOldestInflightRequest?.getTime();
+    // A tutor answer takes several seconds by design; while one runs, a long request is no sign of an outage.
+    const oldest = tutorCalls ? undefined : state.timeOfOldestInflightRequest?.getTime();
     const down = !navigator.onLine || !connected || (oldest !== undefined && Date.now() - oldest > 5000);
     downSince = down ? downSince ?? Date.now() : null;
     const next = downSince !== null && Date.now() - downSince >= 3000;
@@ -365,4 +369,23 @@ export async function resetProgress(areaId: string): Promise<void> {
   if (!active) throw new Error(OFFLINE_ONLY);
   await Promise.all([...inflight]);
   await track(client.mutation(api.progress.resetArea, { areaId, generation: generationOf(snapshot, areaId) }));
+}
+
+// Optional AI tutor (LRN-6, convex/tutor.ts). Hidden without configuration, offline and in the offline reading mode.
+export const tutorReachable = () => active && offlineSince === null && !unreachable && navigator.onLine;
+/** Reports the tutor's status, null while it is unavailable (also when the backend does not have it yet). */
+export function watchTutor(show: (status: TutorStatus | null) => void): () => void {
+  if (!active) { show(null); return () => {}; }
+  return client.onUpdate(api.tutor.status, { month: usageMonth(new Date()) }, (value) => { if (active) show(value); }, () => show(null));
+}
+/** The signed-in learner's names and e-mail, set by main.ts from the session; replaced before a tutor request leaves. */
+let privateNames: string[] = [];
+export function setPrivateNames(names: (string | null | undefined)[]): void {
+  privateNames = [...new Set(names.flatMap((name) => name?.trim() ? [name.trim()] : []))];
+}
+export async function askTutor(request: TutorRequest): Promise<TutorReply> {
+  if (!tutorReachable()) return { ok: false, reason: 'provider' };
+  tutorCalls++;
+  try { return await client.action(api.tutor.ask, scrubRequest(request, privateNames)); }
+  finally { tutorCalls--; }
 }

@@ -20,4 +20,10 @@ export default defineSchema({
     .index('by_area_module', ['areaId', 'moduleId']),
   imports: defineTable({ areaId: v.string(), importId: v.string(), importedAt: v.number() })
     .index('by_area_import', ['areaId', 'importId']),
+  // AI tutor (convex/tutor.ts): one row per UTC month with token counters and cost in micro-dollars. No texts.
+  // pendingMicros holds the worst case of requests in flight, so the monthly budget also holds for parallel requests.
+  tutorUsage: defineTable({
+    month: v.string(), requests: v.number(), inputTokens: v.number(), cacheWriteTokens: v.number(), cacheReadTokens: v.number(), outputTokens: v.number(),
+    costMicros: v.number(), pendingMicros: v.number(), updatedAt: v.number(),
+  }).index('by_month', ['month']),
 });
