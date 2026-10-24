@@ -29,7 +29,7 @@ import { assemble, fixedCode, gapSolution, normalizeOutput } from '../src/engine
 import { languageOf } from '../src/engine/highlight.ts';
 import { compareSql } from '../src/engine/sql.ts';
 import type { PgEngine } from '../src/pg/engine.ts';
-import { testPins, USES_TESTS } from '../src/python/packages.ts';
+import { excelPins, testPins, USES_EXCEL, USES_TESTS } from '../src/python/packages.ts';
 import { nodeEngine } from './pg-node.ts';
 import type { BugExercise, GapExercise, OrderExercise, OutputExercise, SqlExercise } from '../src/content/types.ts';
 
@@ -60,21 +60,21 @@ function exec(command: string, args: string[], options: { input?: string; cwd?: 
   });
 }
 
-// pandas and numpy in the browser's versions, pinned by Pyodide's lock file, plus pytest and Hypothesis in the
-// versions of the wheels the browser loads.
+// pandas and numpy in the browser's versions, pinned by Pyodide's lock file, plus pytest, Hypothesis and openpyxl in
+// the versions of the wheels the browser loads.
 const DATA_PACKAGES = ['numpy', 'pandas', 'python-dateutil', 'pytz', 'six'];
 const USES_DATA = /^\s*(?:import|from)\s+(?:pandas|numpy)\b/m;
 let packagePython: Promise<string> | null = null;
 function packageEnvironment(): Promise<string> {
   packagePython ??= (async () => {
     const lock = JSON.parse(readFileSync(join(ROOT, 'node_modules/pyodide/pyodide-lock.json'), 'utf8'));
-    const pins = [...DATA_PACKAGES.map((name) => `${name}==${lock.packages[name].version}`), ...testPins()];
+    const pins = [...DATA_PACKAGES.map((name) => `${name}==${lock.packages[name].version}`), ...testPins(), ...excelPins()];
     const dir = join(ROOT, 'node_modules/.cache/verify-python', createHash('sha256').update(pins.join(' ')).digest('hex').slice(0, 12));
     const bin = join(dir, 'bin/python');
     if (existsSync(bin)) return bin;
     for (const args of [['venv', '--quiet', '--python', '3.14', dir], ['pip', 'install', '--quiet', '--python', bin, ...pins]]) {
       const result = await exec('uv', args, { timeout: 300000 });
-      if (result.code !== 0) throw new Error(`uv ${args[0]} fehlgeschlagen (für pandas- und pytest-Übungen wird uv gebraucht):\n${result.stderr.trim()}`);
+      if (result.code !== 0) throw new Error(`uv ${args[0]} fehlgeschlagen (für pandas-, pytest- und openpyxl-Übungen wird uv gebraucht):\n${result.stderr.trim()}`);
     }
     return bin;
   })();
@@ -83,7 +83,7 @@ function packageEnvironment(): Promise<string> {
 
 async function python(job: { code: string; setup?: string; tests?: { code: string }[] } & Record<string, unknown>): Promise<any> {
   const source = [job.setup ?? '', job.code, ...(job.tests ?? []).map((test) => test.code)].join('\n');
-  const interpreter = job.kind === 'pytest' || USES_DATA.test(source) || USES_TESTS.test(source) ? await packageEnvironment() : 'python3';
+  const interpreter = job.kind === 'pytest' || USES_DATA.test(source) || USES_TESTS.test(source) || USES_EXCEL.test(source) ? await packageEnvironment() : 'python3';
   const result = await exec(interpreter, [HARNESS], { input: JSON.stringify(job), timeout: 15000 });
   if (result.timedOut) throw new Error('Zeitüberschreitung (15 s)');
   if (result.code !== 0) throw new Error(result.stderr.trim().split('\n').slice(-5).join('\n'));

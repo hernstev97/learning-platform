@@ -8,7 +8,7 @@ Die Plattform ist kein Nachschlagewerk. Jedes Modul besteht aus einer Lektion, d
 
 ## Start
 
-Node.js 24, pnpm 11. Für `pnpm verify` zusätzlich `python3` (3.14), `rustc` (Edition 2024) und `uv` (legt für pandas- und pytest-Übungen eine Umgebung mit den pandas-, numpy-, pytest- und Hypothesis-Versionen des Browsers an), für den Bear-Generator Python 3.
+Node.js 24, pnpm 11. Für `pnpm verify` zusätzlich `python3` (3.14), `rustc` (Edition 2024) und `uv` (legt für pandas-, pytest- und Excel-Übungen eine Umgebung mit den pandas-, numpy-, pytest-, Hypothesis- und openpyxl-Versionen des Browsers an), für den Bear-Generator Python 3.
 
 ```sh
 pnpm install
@@ -20,7 +20,7 @@ pnpm dev            # http://127.0.0.1:5180
 | Befehl | Zweck |
 | --- | --- |
 | `pnpm content:check [bereich[/modul]]` | Inhalte validieren (Pflichtfelder, IDs, Lücken, Richtwerte) |
-| `pnpm verify [bereich[/modul]]` | Python-Übungen und -Beispiele ausführen (auch pandas, pytest und Hypothesis), SQL mit der SQLite und dem PostgreSQL des Browsers prüfen, Rust kompilieren, TypeScript-Ausgaben mit Node prüfen, Ausgaben vergleichen, Git-Labore durchspielen |
+| `pnpm verify [bereich[/modul]]` | Python-Übungen und -Beispiele ausführen (auch pandas, pytest, Hypothesis und openpyxl), SQL mit der SQLite und dem PostgreSQL des Browsers prüfen, Rust kompilieren, TypeScript-Ausgaben mit Node prüfen, Ausgaben vergleichen, Git-Labore durchspielen |
 | `pnpm links [bereich]` | Alle externen Links und Anker prüfen |
 | `pnpm test` | Unit-Tests (Prüflogik, Speicher, Bear-Rekonstruktion, Inhalte) |
 | `pnpm lint`, `pnpm typecheck` | ESLint und strikte TypeScript-Prüfung einschließlich Backend |
