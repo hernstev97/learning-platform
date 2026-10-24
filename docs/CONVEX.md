@@ -136,6 +136,30 @@ Die Clerk-Instanz wurde für `learn.kiumu.app` als **Secondary application** ang
 
 Beim erstmaligen Produktionssetup wurde der Entwicklungsstand einmalig per Convex-Snapshot übertragen: vorher alle vier Produktionstabellen als leer geprüft, anschließend ohne `--replace` oder `--append` importiert. Zwei Fortschrittseinträge und ein Entwurf wurden unverändert übernommen und gegen den Snapshot verglichen; die Entwicklung wurde nicht gelöscht. **Diesen einmaligen Import nicht auf eine inzwischen benutzte Produktion wiederholen.** Für spätere Zusammenführungen den ergänzenden JSON-/Legacy-Import der App verwenden.
 
+## KI-Tutor (optional, LRN-6)
+
+Unter den Hinweisen einer Übung kann ein Tutor gestufte Hilfe geben: Stufe 1 Denkanstoß, Stufe 2 Konzept mit Link auf den Lektionsabschnitt, Stufe 3 Fehlerstelle. Die nächste Stufe wählt der Lernende. Ist die Übung gelöst oder die Lösung angezeigt, beantwortet er freie Fragen. **Ohne `ANTHROPIC_API_KEY` im Convex-Deployment gibt es ihn nicht**: Die Übungsseite und `/daten` sehen dann aus wie vorher. Offline und im Offline-Lesemodus ist er ebenfalls ausgeblendet.
+
+Einschalten (Entwicklung; für Produktion dieselben Befehle mit `--prod`, erst nach Stevens Entscheidung):
+
+```sh
+pnpm exec convex env set ANTHROPIC_API_KEY sk-ant-…          # Pflicht, Schlüssel aus der Claude Console
+pnpm exec convex env set TUTOR_MODEL claude-sonnet-5-5        # optional, Vorschlag aus LRN-6
+pnpm exec convex env set TUTOR_EFFORT medium                  # optional: low, medium oder high
+pnpm exec convex env set TUTOR_MONTHLY_BUDGET_USD 5           # optional: Dollar je Monat, über 0 und höchstens 500
+```
+
+Modell, Effort und Budget sind Vorschläge aus LRN-6, keine Entscheidungen. Erlaubt sind nur Modelle mit hinterlegtem Preis (`PRICES` in `src/engine/tutor.ts`: `claude-sonnet-5-5`, `claude-haiku-5-5`, Stand 24.10.2026). Bei einem anderen Modell oder einem ungültigen Wert bleibt der Tutor aus, und `/daten` nennt den Grund. Claude Max enthält monatliches API-Guthaben; es gilt, wenn der Schlüssel aus der mit dem Plan verknüpften Console-Organisation stammt (Antwort im Kommentar zu LRN-6 vom 24.10.2026).
+
+- **Budget:** Vor jeder Anfrage reserviert `convex/tutor.ts` die höchsten möglichen Kosten (jedes Zeichen als Token, alles als Cache-Schreibvorgang, volle Antwortlänge) in `tutorUsage`. Passt das nicht mehr ins Monatsbudget, geht keine Anfrage raus. Danach ersetzt der echte Verbrauch aus `usage` die Reservierung, getrennt nach Input, Cache-Write, Cache-Read und Output in Mikro-Dollar. So hält der Deckel auch bei parallelen Anfragen. Monat ist der UTC-Kalendermonat wie bei den Ausgabenlimits der Console. Ab 80 % zeigt das Panel einen Hinweis, danach pausiert es bis Monatsende. Den Verbrauch zeigt `/daten`. Als zweite Sicherung in der Console einen eigenen Workspace mit Ausgabenlimit anlegen.
+- **Daten:** Der Browser schickt Lektionstext, Übung mit Musterlösung, den aktuellen Entwurf, die Rückmeldung der letzten Prüfung (bei Python die Testausgabe), die Antworten des Tutors in diesem Besuch und die eigene Frage. Keine Übungs-ID, keine Clerk-ID, keine E-Mail, kein Lernstand anderer Übungen. Convex speichert davon nichts außer den Zählern; der Verlauf verschwindet mit dem Neuladen. Anthropic nutzt API-Daten nicht fürs Training und löscht sie nach 30 Tagen; eine EU-Verarbeitung bietet Anthropic nicht.
+- **Lösungsprüfung:** Vor der Anzeige prüft `leaksSolution` (`src/engine/tutor.ts`) mit den Normalisierern aus `src/engine/answers.ts`, ob die Antwort eine vollständige akzeptierte Lösung enthält. Verglichen wird nur, was der Lernende selbst schreiben muss, nicht Startcode oder die fehlerhafte Zeile. Bei einem Treffer wird einmal neu angefragt, beim zweiten zeigt die Seite den nächsten statischen Hinweis. Die Prüfung fängt versehentliches Verraten, keine Umschreibungen. Sehr kurze Lösungen (unter drei Zeichen, etwa `?.` oder `42`) lassen sich nicht von normalem Text unterscheiden und bleiben ungeprüft.
+- **Bereiche mit eigener Regel:** In `narrative` erklärt der Tutor nur Handwerk, Struktur und Checklisten, Rechtschreibung nur auf ausdrücklichen Wunsch, keine inhaltlichen Vorschläge, kein Umschreiben, keine Bewertung der Wirkung (LRN-29). In `combat` schlägt er keine Designentscheidungen vor (`area.yaml`). Bei eigenen Texten ohne Musterlösung (`practice` mit `lang: prose`) gibt es keinen Tutor, auch serverseitig nicht.
+- **Prompt-Cache:** Systemprompt, Lektion und Übung stehen in fester Reihenfolge vor zwei Cache-Breakpoints, alles Veränderliche danach. Ein Test in `convex/tutor.test.ts` prüft, dass der zweite Hinweis zur selben Übung byte-gleich bis zum Breakpoint ist und als Cache-Treffer verbucht wird. Mit echtem Schlüssel muss das einmal am echten `cache_read_input_tokens` bestätigt werden.
+- **Tests ohne Schlüssel:** `convex/tutor.test.ts` ersetzt `fetch`, sodass das echte SDK seine echte Anfrage baut, aber nichts das Netz erreicht. `e2e/tutor.spec.ts` prüft das Panel im lokalen Testadapter mit `window.__tutorFake`.
+- **Eval vor der Modellwahl:** `pnpm tutor:eval` prüft die 30 Fälle in `tooling/tutor-eval/cases.yaml`, baut dieselben Prompts wie die App und schätzt die Kosten, ohne Netz und ohne Schlüssel. Der echte Lauf braucht `ANTHROPIC_API_KEY` in der Shell und kostet Geld: `pnpm tutor:eval --live --max-usd 2 --variants sonnet-low,sonnet-medium,haiku-medium`. Er bricht ab, bevor die nächste Anfrage das Limit überschreiten könnte, und schreibt `results.jsonl` und einen Bewertungsbogen `grading.md` nach `tutor-eval/` (nicht im Repository).
+- **Noch nicht gebaut:** Streaming (Antwort kommt nach einigen Sekunden komplett, mit Ladeanzeige), Bewertung von `explain` und `practice` gegen Kernpunkte (Schritt 3), Fragen in der Lektion, gespeicherter Verlauf, Rechtschreibprüfung auf Wunsch im Bereich `narrative`, Ausweichmodell bei `refusal`.
+
 ## Tests und lokale Backend-Prüfung
 
 ```sh
@@ -148,6 +172,7 @@ pnpm verify
 pnpm test:e2e         # Bestehende Lernabläufe mit lokalem Regressionstest-Adapter
 pnpm test:pwa:e2e     # Produktionsbuild: Manifest, Service Worker, Offline-Lesen, Offline-Entwürfe
 pnpm build
+pnpm tutor:eval       # Trockenlauf des Tutor-Evals, ohne Netz
 ```
 
 Der lokale Adapter wird ausschließlich von `vite serve --mode test-local` geladen. Produktionsbuilds verwenden unabhängig vom Modus immer `src/main.ts` mit Auth-Gate. `test:convex:e2e` verwendet dagegen den echten Convex-JavaScript-Client und ein **wegwerfbares lokales Convex-Deployment**, um zwei Browser, WebSockets, Optimismus, Import/Export und Verbindungsabbrüche zu prüfen:

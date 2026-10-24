@@ -89,6 +89,8 @@ Convex speichert gelöste Übungen mit Fingerprint, versionierte Entwürfe, gele
 
 Die globale Suche (Lupe in der Kopfzeile, Taste `/` oder `Strg`/`⌘`+`K`) findet Module, Lektionsabschnitte, Glossarbegriffe, Spickzettel-Abschnitte, Projekte und Interview-Karten aller Bereiche und springt direkt an die Stelle. Der Index entsteht beim Build aus den Inhalten, wird erst beim ersten Öffnen geladen und funktioniert offline. Einen externen Suchdienst gibt es nicht.
 
+Optional gibt es einen **KI-Tutor** unter den Hinweisen einer Übung: drei Hinweisstufen ohne die Lösung, danach freie Fragen, mit Monatsbudget. Er erscheint nur, wenn im Convex-Deployment ein Anthropic-Schlüssel hinterlegt ist. Details: [KI-Tutor](docs/CONVEX.md#ki-tutor-optional-lrn-6).
+
 Die Plattform ist als App installierbar (PWA) und offline lesbar. Details und Grenzen: [Offline und installierbare App](docs/CONVEX.md#offline-und-installierbare-app).
 
 Das Design (hell oder dunkel) folgt der Systemeinstellung, bis es über den Schalter in der Kopfzeile gewählt wird. Diese Wahl gilt pro Gerät (`localStorage`, Schlüssel `learn:theme`) und wird nicht synchronisiert.
