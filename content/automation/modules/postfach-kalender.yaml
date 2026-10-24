@@ -1,0 +1,1027 @@
+id: postfach-kalender
+title: Postfach und Kalender automatisieren
+level: 2
+minutes: 230
+summary: Mails per IMAP lesen und mit Flags als Verarbeitungszustand markieren, Anhänge sicher speichern und versenden,
+  Termine als ICS nach RFC 5545 erzeugen und lesen – Kalender-APIs als Konzept.
+goals:
+- Du erklärst das IMAP-Modell aus Postfach, UID, UIDVALIDITY und Flags.
+- Du liest Nachrichten mit imaplib über UIDs, ohne sie als gelesen zu markieren, und setzt ein Flag erst nach
+  erfolgreicher Verarbeitung.
+- Du liest Anhänge mit dem email-Paket, speicherst sie unter sicheren Namen und versendest eigene Anhänge.
+- Du erzeugst und liest ICS-Dateien mit CRLF, Zeilenfaltung, Escaping, UID und DTSTAMP.
+- Du ordnest die Kalender-APIs von Google und Microsoft ein – OAuth-Scopes und inkrementelle Synchronisation.
+resources:
+- &imaplib
+  title: Python · imaplib
+  url: https://docs.python.org/3/library/imaplib.html
+- &imap
+  title: RFC 9051 · IMAP4rev2
+  url: https://www.rfc-editor.org/rfc/rfc9051.html
+- &emailmsg
+  title: Python · email.message
+  url: https://docs.python.org/3/library/email.message.html
+- &ics
+  title: RFC 5545 · iCalendar
+  url: https://www.rfc-editor.org/rfc/rfc5545.html
+- &gsync
+  title: Google Calendar API · Synchronize resources efficiently
+  url: https://developers.google.com/workspace/calendar/api/guides/sync
+place: unterwegs
+lesson: |
+  Rechnungen kommen als PDF per Mail. Jeden Montag lädt jemand sie herunter, benennt sie um, legt sie in einen Ordner und trägt die Fälligkeit in den Kalender ein. Das lässt sich automatisieren. Aber ein Postfach ist ein gemeinsamer Zustand: Menschen lesen darin, verschieben, markieren. Ein Job, der alles als gelesen markiert oder eine Mail löscht, bevor er sie sicher verarbeitet hat, richtet Schaden an, den niemand sofort bemerkt.
+
+  Dieses Modul zeigt, wie ein Job im Postfach Spuren hinterlässt, die Menschen und Job gleichermaßen verstehen, wie er Anhänge sicher annimmt und wie er Termine so erzeugt, dass jeder Kalender sie liest. Die ausführbaren Beispiele arbeiten mit Fakes, deren Antworten genauso aussehen wie die von `imaplib`; der Code für echte Server ist zum Lesen gedacht und gegen einen lokalen Testserver geprüft.
+
+  ## Das IMAP-Modell: Postfach, UID und Flags
+
+  Bei [IMAP](https://www.rfc-editor.org/rfc/rfc9051.html) bleiben die Mails auf dem Server. Ein Konto hat mehrere Postfächer (Ordner) wie `INBOX`. Jede Nachricht hat zwei Nummern. Die **Sequenznummer** ist ihre aktuelle Position im Postfach; löscht jemand eine frühere Nachricht, rutscht sie nach. Die **UID** dagegen bleibt. Sie steigt mit jeder neuen Nachricht und ändert sich laut RFC nicht, solange der Wert **UIDVALIDITY** des Postfachs gleich bleibt. Ein Job arbeitet deshalb immer mit UIDs und merkt sich zusätzlich UIDVALIDITY. Ändert sich der Wert, sind alle gemerkten UIDs ungültig, und der Job muss neu abgleichen.
+
+  Jede Nachricht trägt **Flags**. Systemflags beginnen mit Backslash: `\Seen` (gelesen), `\Flagged`, `\Answered`, `\Deleted`. Dazu kommen **Schlüsselwörter** ohne Backslash, etwa `$Verarbeitet`. Ob du eigene Schlüsselwörter anlegen darfst, sagt der Server beim Auswählen des Postfachs: Enthält `PERMANENTFLAGS` das Zeichen `\*`, ist es erlaubt.
+
+  Damit hast du einen Verarbeitungszustand, der im Postfach selbst steht. Der Job sucht Nachrichten ohne `$Verarbeitet`, verarbeitet sie und setzt das Schlüsselwort erst danach. `\Seen` taugt dafür nicht: Liest ein Mensch die Rechnung vorher, würde der Job sie überspringen. Eine Alternative ist ein Ordner „Erledigt“, in den der Job verschiebt; Server mit der Erweiterung [MOVE](https://www.rfc-editor.org/rfc/rfc6851.html) können das in einem Schritt.
+
+  Eine Falle steckt im Abholen. `FETCH … BODY[]` setzt laut RFC [`\Seen` implizit](https://www.rfc-editor.org/rfc/rfc9051.html#section-6.4.5). `BODY.PEEK[]` liefert dieselben Bytes, ohne etwas zu verändern.
+
+  ## imaplib: verbinden, suchen, abholen
+
+  [`imaplib`](https://docs.python.org/3/library/imaplib.html) gehört zur Standardbibliothek. Alle Befehle mit UIDs laufen über `imap.uid(befehl, …)`. Jeder Befehl liefert ein Paar aus Status und Daten, etwa `("OK", [b"1 2"])` für eine Suche.
+
+  ```python
+  import imaplib
+  import ssl
+
+  FLAG = "$Verarbeitet"
+  ctx = ssl.create_default_context()
+  with imaplib.IMAP4_SSL(
+          HOST, ssl_context=ctx,
+          timeout=30) as imap:
+      imap.login(USER, PASSWORT)
+      imap.select("INBOX")
+      typ, daten = imap.uid(
+          "SEARCH", None,
+          "UNKEYWORD", FLAG)
+      for uid in daten[0].split():
+          typ, teile = imap.uid(
+              "FETCH", uid,
+              "(BODY.PEEK[])")
+          verarbeite(teile[0][1])
+          imap.uid(
+              "STORE", uid,
+              "+FLAGS", f"({FLAG})")
+  ```
+
+  Drei Details sind wichtig. Erstens prüft `IMAP4_SSL` das Zertifikat nur, wenn du einen Kontext aus `ssl.create_default_context()` übergibst; ohne ihn ist die Verbindung laut Dokumentation verschlüsselt, aber der Server nicht geprüft. Zweitens schickt `with` am Ende `LOGOUT`. Drittens ist die Antwort auf `FETCH` eine Liste, in der die Nachricht als Tupel `(kopf, bytes)` steckt. Die Dokumentation warnt, dass die Liste zusätzliche, unaufgeforderte Einträge enthalten kann; robuster Code sucht das Tupel, statt sich auf `teile[0][1]` zu verlassen.
+
+  Dieses Beispiel ist zum Lesen gedacht. Gegen einen echten Server läuft es am Rechner, am besten zuerst gegen einen lokalen Testserver wie [GreenMail](https://greenmail-mail-test.github.io/greenmail/) in Docker. Große Anbieter wie Microsoft 365 und Gmail erwarten für IMAP OAuth 2.0 über den Mechanismus XOAUTH2 ([Microsoft](https://learn.microsoft.com/en-us/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth), [Google](https://developers.google.com/workspace/gmail/imap/xoauth2-protocol)); `imaplib` unterstützt das über `authenticate`. Die Token-Logik dafür kennst du aus dem Modul [API-Authentifizierung](/automation/api-authentifizierung).
+
+  ## Flags als Verarbeitungszustand, getestet mit einem Fake
+
+  Ein Fake mit denselben Antwortformen wie `imaplib` macht den Ablauf im Browser prüfbar. Er hat je IMAP-Befehl eine Methode, merkt sich, welche UIDs noch offen sind, und antwortet wie `imaplib` mit Status und Datenliste.
+
+  ```python run
+  class FakeImap:
+      def __init__(self, mails):
+          self.mails = mails
+          self.offen = list(mails)
+
+      def uid(self, befehl, *args):
+          f = getattr(self, befehl)
+          return "OK", f(*args)
+
+      def SEARCH(self, *kriterien):
+          offen = self.offen
+          return [b" ".join(offen)]
+
+      def FETCH(self, uid, teil):
+          roh = self.mails[uid]
+          kopf = b"UID " + uid
+          return [(kopf, roh), b")"]
+
+      def STORE(self, uid, *flags):
+          self.offen.remove(uid)
+          return []
+
+  FLAG = "$Verarbeitet"
+  imap = FakeImap({b"1": b"Mail 1",
+                   b"2": b"Mail 2"})
+  imap.uid("STORE", b"1", "+FLAGS",
+           f"({FLAG})")
+  print(imap.uid("SEARCH", None,
+                 "UNKEYWORD", FLAG))
+  ```
+
+  Mit diesem Fake prüfst du die Fälle, die im echten Postfach heikel sind: Eine Verarbeitung scheitert, und die Mail muss unmarkiert bleiben. Der nächste Lauf findet sie wieder. Weil das Flag erst nach Erfolg gesetzt wird, ist der Ablauf *at least once*; die Verarbeitung selbst muss also mit einem zweiten Versuch für dieselbe Mail umgehen können, etwa über einen eindeutigen Schlüssel wie die `Message-ID`.
+
+  ## Anhänge lesen und sicher speichern
+
+  Das [email-Paket](https://docs.python.org/3/library/email.message.html) zerlegt die Rohdaten. Mit `policy.default` bekommst du ein `EmailMessage`-Objekt, dessen `iter_attachments()` die Anhänge liefert. `get_filename()` dekodiert den Dateinamen, auch Umlaute in kodierter Form, und `get_content()` liefert bei einem PDF die Bytes.
+
+  ```python run
+  from email import policy
+  from email.message import (
+      EmailMessage)
+  from email.parser import (
+      BytesParser)
+
+  mail = EmailMessage()
+  mail["Subject"] = "Rechnung 4711"
+  mail.set_content("Siehe Anhang.")
+  mail.add_attachment(
+      b"%PDF-1.7 ...",
+      maintype="application",
+      subtype="pdf",
+      filename="../../.bashrc")
+  roh = mail.as_bytes()
+
+  msg = BytesParser(
+      policy=policy.default
+  ).parsebytes(roh)
+  for t in msg.iter_attachments():
+      print(t.get_filename())
+      print(t.get_content()[:8])
+  ```
+
+  Der Dateiname kommt vom Absender, und der hat hier `../../.bashrc` geschrieben. Wer `ordner / teil.get_filename()` speichert, schreibt außerhalb des Zielordners. Ein lokaler Test mit GreenMail zeigt dasselbe: `get_filename()` reicht den Namen unverändert durch. Behandle ihn deshalb wie jede fremde Eingabe: nur den letzten Pfadteil nehmen, auf erlaubte Zeichen beschränken, führende Punkte entfernen, einen Ersatznamen vorsehen und vorhandene Dateien nicht überschreiben.
+
+  ```python run
+  import re
+  from pathlib import Path
+
+  FREMD = re.compile(
+      r"[^A-Za-z0-9._-]")
+
+  def sicher(name):
+      name = Path(name or "").name
+      name = FREMD.sub("_", name)
+      name = name.lstrip(".")
+      return name or "anhang"
+
+  namen = ["../../.bashrc", ".."]
+  namen.append("Rechnung Okt*.pdf")
+  for n in namen:
+      print(sicher(n))
+  ```
+
+  `iter_attachments()` liefert nur die direkten Unterteile einer Nachricht. Steckt ein Anhang in einer weitergeleiteten Mail, findest du ihn mit `msg.walk()` und `get_content_disposition() == "attachment"`. Prüfe außerdem den Inhalt, nicht nur die Endung: Ein PDF beginnt mit `%PDF-`. Begrenze die Größe, bevor du speicherst.
+
+  Anhänge versendest du mit derselben Klasse. [`add_attachment`](https://docs.python.org/3/library/email.message.html#email.message.EmailMessage.add_attachment) macht aus der Mail automatisch eine `multipart/mixed`-Nachricht; der Versand selbst läuft wie im Modul [Benachrichtigungen](/automation/benachrichtigungen) über `smtplib`.
+
+  ```python run
+  from email.message import (
+      EmailMessage)
+
+  mail = EmailMessage()
+  mail["From"] = "job@example.org"
+  mail["To"] = "team@example.org"
+  mail["Subject"] = "Bericht"
+  mail.set_content("Bericht anbei.")
+  mail.add_attachment(
+      b"%PDF-1.7 ...",
+      maintype="application",
+      subtype="pdf",
+      filename="bericht.pdf")
+  print(mail.get_content_type())
+  teile = mail.iter_parts()
+  print([t.get_content_type()
+         for t in teile])
+  ```
+
+  ## ICS: Termine als Datei
+
+  Eine `.ics`-Datei nach [RFC 5545](https://www.rfc-editor.org/rfc/rfc5545.html) versteht jeder Kalender. Sie besteht aus Zeilen der Form `NAME:Wert`, getrennt durch **CRLF**, also `\r\n`. Ein Kalender braucht `VERSION:2.0` und `PRODID`, jeder Termin (`VEVENT`) braucht `UID` und `DTSTAMP`; `DTSTART` ist Pflicht, solange die Datei keine `METHOD` angibt.
+
+  ```text
+  BEGIN:VCALENDAR
+  VERSION:2.0
+  PRODID:-//lernen//bericht//DE
+  BEGIN:VEVENT
+  UID:rechnung-4711@example.org
+  DTSTAMP:20261024T080000Z
+  DTSTART:20261103T080000Z
+  DTEND:20261103T083000Z
+  SUMMARY:Rechnung 4711 fällig
+  END:VEVENT
+  END:VCALENDAR
+  ```
+
+  Die **UID** identifiziert den Termin dauerhaft. Erzeugst du denselben Termin noch einmal mit derselben UID, aktualisiert ein Kalender ihn, statt einen zweiten anzulegen. Eine stabile UID aus fachlichen Daten wie der Rechnungsnummer macht den Export also idempotent. Zeiten mit angehängtem `Z` sind UTC, eindeutig und ohne Zeitzonendefinition. Wer lokale Zeiten mit `TZID=Europe/Berlin` schreibt, muss die Zeitzone als `VTIMEZONE` mitliefern.
+
+  Texte werden [escaped](https://www.rfc-editor.org/rfc/rfc5545.html#section-3.3.11): Backslash, Semikolon und Komma bekommen einen Backslash davor, ein Zeilenumbruch wird zu `\n`. Doppelpunkte bleiben, wie sie sind. Die Reihenfolge zählt: Erst den Backslash ersetzen, sonst verdoppelst du die gerade eingefügten.
+
+  ```python run
+  ERSATZ = [("\\", "\\\\"),
+            (";", "\\;"),
+            (",", "\\,"),
+            ("\n", "\\n")]
+
+  def esc(t):
+      for alt, neu in ERSATZ:
+          t = t.replace(alt, neu)
+      return t
+
+  print(esc("Raum 3, OG; Tür B"))
+  ```
+
+  Lange Zeilen werden **gefaltet**: [RFC 5545 §3.1](https://www.rfc-editor.org/rfc/rfc5545.html#section-3.1) verlangt höchstens 75 **Oktetts** pro Zeile, ohne den Zeilenumbruch. Die Fortsetzung beginnt mit einem Leerzeichen, das beim Lesen samt CRLF entfernt wird. Gezählt werden Bytes, nicht Zeichen: `ä` braucht in UTF-8 zwei. Ein Leser muss deshalb **zuerst entfalten** und erst dann Zeilen zerlegen.
+
+  ```python run
+  import re
+
+  FALTE = re.compile(r"\r\n[ \t]")
+  ics = ("SUMMARY:Quartals\r\n"
+         " bericht\r\n"
+         "UID:r-4711\r\n")
+  flach = FALTE.sub("", ics)
+  for z in flach.splitlines():
+      n, _, w = z.partition(":")
+      print(n, "=", w)
+  ```
+
+  Eine ICS-Datei verschickst du als Anhang mit dem Typ `text/calendar`. Für echte Einladungen mit Zusagen und Absagen gibt es das Protokoll [iTIP](https://www.rfc-editor.org/rfc/rfc5546.html) mit `METHOD:REQUEST`; für einen Eintrag in den eigenen Kalender reicht `METHOD:PUBLISH` oder eine Datei ohne `METHOD`.
+
+  ## Kalender-APIs als Konzept: Google und Microsoft Graph
+
+  Statt Dateien zu verschicken, kann ein Job Termine direkt anlegen. Die [Google Calendar API](https://developers.google.com/workspace/calendar/api/v3/reference/events) und [Microsoft Graph](https://learn.microsoft.com/en-us/graph/api/resources/event) arbeiten mit JSON und OAuth 2.0. Für den Kalender einer Person brauchst du deren Zustimmung zu einem Scope wie Kalender lesen oder schreiben; für Dienstkonten in Firmen legt ein Administrator fest, auf welche Kalender sie zugreifen dürfen. Ein ganztägiger Termin hat bei Google ein Ende, das **nicht** mehr dazugehört: Der Termin am 3. November endet am 4.
+
+  ```python
+  termin = {
+      "summary": "Rechnung fällig",
+      "start": {
+          "date": "2026-11-03"},
+      "end": {
+          "date": "2026-11-04"},
+  }
+  ```
+
+  Wer Termine liest und lokal spiegelt, sollte nicht jedes Mal alles laden. Beide APIs bieten inkrementelle Synchronisation. Google liefert am Ende einer vollständigen Liste ein `nextSyncToken`; der nächste Abruf mit `syncToken` bringt nur Änderungen seitdem, auch gelöschte Termine mit Status `cancelled`. Ist das Token abgelaufen, antwortet Google mit **410 Gone**, und laut [Anleitung](https://developers.google.com/workspace/calendar/api/guides/sync) verwirft der Client seinen lokalen Stand und lädt alles neu. Microsoft Graph macht dasselbe mit [Delta-Abfragen](https://learn.microsoft.com/en-us/graph/delta-query-events): `@odata.nextLink` für die nächste Seite, `@odata.deltaLink` für den nächsten Abgleich.
+
+  > [!PRAXIS]
+  > Lass einen neuen Postfach-Job zuerst gegen ein eigenes Testpostfach oder einen lokalen Testserver laufen, mit echten Beispielmails ohne echte Daten. Prüfe danach im Mailprogramm, dass keine Mail plötzlich gelesen, verschoben oder verschwunden ist.
+
+  ## Häufige Fehler
+
+  - **Sequenznummern speichern.** Nach dem nächsten Löschen zeigen sie auf andere Mails. UIDs und UIDVALIDITY merken.
+  - **`BODY[]` statt `BODY.PEEK[]`.** Der Job markiert alles als gelesen.
+  - **Flag vor der Verarbeitung.** Scheitert sie, gilt die Mail trotzdem als erledigt.
+  - **Dateiname vom Absender übernommen.** `../../` schreibt außerhalb des Ordners.
+  - **ICS mit `\n` statt `\r\n`** oder nach Zeichen statt Bytes gefaltet. Strenge Kalender lehnen die Datei ab.
+  - **Neue UID bei jedem Export.** Jeder Lauf legt den Termin noch einmal an.
+  - **410 als Fehler gemeldet.** Bei Google heißt das „neu synchronisieren“, nicht „abbrechen“.
+
+  > [!INTERVIEW]
+  > „Wie merkst du dir in einem Mail-Job, was schon verarbeitet ist?“ Im Postfach selbst, mit einem eigenen Schlüsselwort wie `$Verarbeitet`, das ich nach erfolgreicher Verarbeitung setze. Ich hole Mails mit `BODY.PEEK[]`, damit sie für Menschen ungelesen bleiben, und arbeite mit UIDs. Wenn der Server keine eigenen Schlüsselwörter erlaubt, verschiebe ich in einen Ordner oder speichere UIDVALIDITY und UID in einer Datenbank.
+
+  > [!MERKE]
+  > Abholen mit `BODY.PEEK[]`, markieren nach dem Erfolg, Dateinamen nie ungeprüft übernehmen.
+
+  ## Zusammenfassung
+
+  - IMAP-Nachrichten haben Sequenznummern (Position) und UIDs (stabil, solange UIDVALIDITY gleich bleibt).
+  - Eigene Schlüsselwörter wie `$Verarbeitet` sind ein Verarbeitungszustand im Postfach, wenn `PERMANENTFLAGS` `\*` enthält.
+  - `BODY.PEEK[]` holt ohne `\Seen`; das Flag kommt nach der erfolgreichen Verarbeitung.
+  - `IMAP4_SSL` prüft das Zertifikat nur mit `ssl.create_default_context()`.
+  - Anhänge liest `iter_attachments()`; ihre Namen behandelst du als fremde Eingabe.
+  - ICS braucht CRLF, Faltung nach 75 Oktetts, Escaping, eine stabile UID und DTSTAMP.
+  - Kalender-APIs synchronisieren inkrementell; ein ungültiges Token heißt neu laden.
+exercises:
+- id: uid-statt-nummer
+  type: choice
+  title: Warum UIDs?
+  prompt: Ein Job merkt sich, welche Mails er verarbeitet hat. Warum speichert er UIDs statt Sequenznummern?
+  options:
+  - text: Sequenznummern rücken nach, wenn eine frühere Nachricht gelöscht wird; UIDs bleiben, solange UIDVALIDITY
+      gleich ist.
+    correct: true
+    why: Die Sequenznummer ist nur die aktuelle Position. Die UID ist die dauerhafte Kennung im Postfach.
+  - text: UIDs sind über alle Ordner eines Kontos eindeutig.
+    correct: false
+    why: UIDs gelten je Postfach. Dieselbe UID kann in INBOX und Archiv verschiedene Nachrichten meinen.
+  - text: UIDs ändern sich nie, auch nicht, wenn UIDVALIDITY wechselt.
+    correct: false
+    why: Ein neuer UIDVALIDITY-Wert heißt gerade, dass alte UIDs nicht mehr gelten.
+  - text: Sequenznummern gibt es nur für ungelesene Nachrichten.
+    correct: false
+    why: Jede Nachricht hat eine Sequenznummer, ihre Position im Postfach.
+  explanation: Wer Sequenznummern speichert, markiert nach dem nächsten Löschen die falschen Mails. UIDs zusammen
+    mit UIDVALIDITY sind die stabile Adresse einer Nachricht.
+  resources:
+  - *imap
+- id: postfach-ablauf
+  type: order
+  title: Ein Postfach-Lauf
+  prompt: Bring die Schritte eines Jobs in die richtige Reihenfolge, der Rechnungen aus dem Postfach holt.
+  lang: prose
+  lines: |-
+    Verbindung mit TLS und Zertifikatsprüfung öffnen
+    Postfach auswählen und UIDVALIDITY prüfen
+    UIDs ohne $Verarbeitet suchen
+    Nachricht mit BODY.PEEK[] holen
+    Anhang prüfen und unter sicherem Namen speichern
+    $Verarbeitet für diese UID setzen
+  explanation: UIDVALIDITY wird vor der Suche geprüft, weil gemerkte UIDs sonst ins Leere zeigen können. Das Flag
+    steht am Ende, damit eine gescheiterte Verarbeitung beim nächsten Lauf wieder auftaucht.
+  resources:
+  - *imaplib
+- id: ics-escape
+  type: output
+  title: Sonderzeichen im Termin
+  prompt: Welche Ausgabe erzeugt dieses Programm?
+  lang: python
+  code: |-
+    def esc(t):
+        t = t.replace("\\", "\\\\")
+        t = t.replace(";", "\\;")
+        t = t.replace(",", "\\,")
+        return t.replace("\n", "\\n")
+
+    titel = "Review; Raum 3, OG"
+    print("SUMMARY:" + esc(titel))
+  expected: SUMMARY:Review\; Raum 3\, OG
+  explanation: |
+    Semikolon und Komma trennen in ICS Werte und Listen. In einem Text bekommen sie deshalb einen Backslash. Der Doppelpunkt nach `SUMMARY` ist das Trennzeichen zwischen Name und Wert; Doppelpunkte im Wert würden nicht escaped.
+  resources:
+  - title: RFC 5545 · TEXT
+    url: https://www.rfc-editor.org/rfc/rfc5545.html#section-3.3.11
+- id: zeichen-oktetts
+  type: output
+  title: Zeichen oder Bytes?
+  prompt: Welche Ausgabe erzeugt dieses Programm?
+  lang: python
+  code: |-
+    zeile = "SUMMARY:Größenprüfung"
+    print(len(zeile))
+    print(len(zeile.encode("utf-8")))
+  expected: |-
+    21
+    24
+  explanation: |
+    `ö`, `ß` und `ü` brauchen in UTF-8 je zwei Bytes. RFC 5545 begrenzt Zeilen auf 75 Oktetts, also Bytes. Wer nach `len(zeile)` faltet, erzeugt bei Umlauten zu lange Zeilen.
+  resources:
+  - title: RFC 5545 · Content Lines
+    url: https://www.rfc-editor.org/rfc/rfc5545.html#section-3.1
+- id: imap-befehle
+  type: gap
+  title: Suchen, holen, markieren
+  prompt: Ergänze die imaplib-Aufrufe. Gesucht sind Nachrichten ohne `$Verarbeitet`; sie werden geholt, ohne als
+    gelesen zu gelten, und danach markiert.
+  lang: python
+  code: |-
+    typ, daten = imap.⟦uid⟧(
+        "SEARCH", None,
+        "⟦UNKEYWORD⟧",
+        "$Verarbeitet")
+    uid = daten[0].split()[0]
+    typ, teile = imap.uid(
+        "FETCH", uid,
+        "(⟦BODY.PEEK[]⟧)")
+    imap.uid("STORE", uid,
+             "⟦+FLAGS⟧",
+             "($Verarbeitet)")
+  gaps:
+  - label: Befehle mit UIDs
+    hint: Eine Methode schickt jeden Befehl mit UIDs statt Sequenznummern.
+  - label: Suchkriterium
+    hint: Das Gegenteil von KEYWORD.
+  - label: Abholen ohne \Seen
+    hint: Wie BODY[], nur ohne Spuren.
+  - label: Flag hinzufügen
+    hint: FLAGS ersetzt alle, mit Plus kommt eines dazu.
+  explanation: '`uid` sorgt dafür, dass alle Nummern UIDs sind. `UNKEYWORD` findet Nachrichten ohne das Schlüsselwort,
+    `BODY.PEEK[]` holt sie, ohne `\Seen` zu setzen, und `+FLAGS` fügt `$Verarbeitet` hinzu, ohne die übrigen Flags
+    anzutasten.'
+  resources:
+  - *imaplib
+- id: postfach-verarbeiten
+  type: code
+  title: Rechnungen aus dem Postfach holen
+  prompt: |
+    Schreibe `abarbeiten(imap, verarbeite)`. `imap` verhält sich wie ein `imaplib.IMAP4`-Objekt mit ausgewähltem Postfach.
+
+    - Suche mit `imap.uid("SEARCH", None, "UNKEYWORD", "$Verarbeitet")`. Die Antwort ist `("OK", [b"1 2 3"])`.
+    - Hole jede Nachricht mit `imap.uid("FETCH", uid, "(BODY.PEEK[])")`. In der Antwortliste steckt die Nachricht als Tupel `(kopf, rohdaten)`; die Liste kann davor und danach andere Einträge enthalten.
+    - Rufe `verarbeite(rohdaten)` auf. Gelingt das, setze `imap.uid("STORE", uid, "+FLAGS", "($Verarbeitet)")`. Wirft `verarbeite`, setze nichts und mach mit der nächsten UID weiter.
+    - Gib die Liste der UIDs zurück, bei denen `verarbeite` gescheitert ist.
+  lang: python
+  starter: |-
+    FLAG = "$Verarbeitet"
+
+    def abarbeiten(imap, verarbeite):
+        typ, daten = imap.uid(
+            "SEARCH", None,
+            "UNKEYWORD", FLAG)
+        for uid in daten[0].split():
+            imap.uid(
+                "STORE", uid,
+                "+FLAGS", f"({FLAG})")
+            typ, teile = imap.uid(
+                "FETCH", uid,
+                "(BODY[])")
+            verarbeite(teile[0][1])
+        return []
+  solution: |-
+    FLAG = "$Verarbeitet"
+
+    def rohdaten(teile):
+        for teil in teile:
+            if isinstance(teil, tuple):
+                return teil[1]
+        raise LookupError("keine Mail")
+
+    def abarbeiten(imap, verarbeite):
+        typ, daten = imap.uid(
+            "SEARCH", None,
+            "UNKEYWORD", FLAG)
+        fehler = []
+        for uid in daten[0].split():
+            typ, teile = imap.uid(
+                "FETCH", uid,
+                "(BODY.PEEK[])")
+            try:
+                roh = rohdaten(teile)
+                verarbeite(roh)
+            except Exception:
+                fehler.append(uid)
+                continue
+            imap.uid(
+                "STORE", uid,
+                "+FLAGS", f"({FLAG})")
+        return fehler
+  setup: |-
+    class FakeImap:
+        """Antwortet wie imaplib (Formen geprüft gegen einen lokalen GreenMail-Server)."""
+        def __init__(self, mails, laerm=()):
+            self.mails = dict(mails)
+            self.flags = {u: set() for u in self.mails}
+            self.laerm = set(laerm)
+            self.log = []
+
+        def _pruefe(self, *_):
+            raise AssertionError("Bitte imap.uid(...) benutzen: Sequenznummern verschieben sich.")
+        fetch = search = store = _pruefe
+
+        def uid(self, befehl, *args):
+            self.log.append((befehl, args))
+            if befehl == "SEARCH":
+                assert args[-2:] == ("UNKEYWORD", "$Verarbeitet"), f"Suche: {args}"
+                offen = [u for u, f in self.flags.items() if "$Verarbeitet" not in f]
+                return "OK", [b" ".join(offen)]
+            if befehl == "FETCH":
+                uid, teil = args
+                if "PEEK" not in teil:
+                    self.flags[uid].add("\\Seen")
+                kopf = f"{int(uid)} (UID {int(uid)} BODY[] {{{len(self.mails[uid])}}}".encode()
+                antwort = [(kopf, self.mails[uid]), b")"]
+                if uid in self.laerm:
+                    antwort.insert(0, b"9 (FLAGS (\\Seen))")
+                return "OK", antwort
+            if befehl == "STORE":
+                uid, art, flags = args
+                assert art == "+FLAGS", f"STORE {art}"
+                self.flags[uid].update(flags.strip("()").split())
+                return "OK", [f"{int(uid)} (FLAGS ({' '.join(sorted(self.flags[uid]))}) UID {int(uid)})".encode()]
+            raise AssertionError(f"unerwarteter Befehl {befehl}")
+
+    def scheitert_bei(*inhalte):
+        gesehen = []
+        def verarbeite(roh):
+            gesehen.append(roh)
+            if roh in inhalte:
+                raise ValueError("kaputtes PDF")
+        verarbeite.gesehen = gesehen
+        return verarbeite
+  tests:
+  - name: Alles verarbeitet und markiert
+    code: |-
+      imap = FakeImap({b"1": b"A", b"2": b"B"})
+      v = scheitert_bei()
+      r = abarbeiten(imap, v)
+      assert r == [], r
+      assert v.gesehen == [b"A", b"B"]
+      for u in (b"1", b"2"):
+          assert "$Verarbeitet" in imap.flags[u]
+  - name: Ungelesen bleibt ungelesen
+    code: |-
+      imap = FakeImap({b"1": b"A"})
+      abarbeiten(imap, scheitert_bei())
+      assert "\\Seen" not in imap.flags[b"1"], (
+          "BODY[] setzt \\Seen – BODY.PEEK[] nicht")
+  - name: Fehler – nicht markieren, weitermachen
+    code: |-
+      imap = FakeImap({b"1": b"A", b"2": b"B",
+                       b"3": b"C"})
+      v = scheitert_bei(b"B")
+      r = abarbeiten(imap, v)
+      assert r == [b"2"], r
+      assert v.gesehen == [b"A", b"B", b"C"]
+      assert "$Verarbeitet" not in imap.flags[b"2"]
+      assert "$Verarbeitet" in imap.flags[b"3"]
+  - name: Nächster Lauf findet nur den Rest
+    code: |-
+      imap = FakeImap({b"1": b"A", b"2": b"B"})
+      abarbeiten(imap, scheitert_bei(b"B"))
+      v = scheitert_bei()
+      abarbeiten(imap, v)
+      assert v.gesehen == [b"B"], v.gesehen
+  - name: Zusätzliche Einträge in der Antwort
+    code: |-
+      imap = FakeImap({b"1": b"A"}, laerm=[b"1"])
+      v = scheitert_bei()
+      abarbeiten(imap, v)
+      assert v.gesehen == [b"A"], v.gesehen
+  hints:
+  - Setze das Flag erst nach `verarbeite`, in einem Zweig, den eine Exception überspringt.
+  - Durchsuche die FETCH-Antwort nach dem ersten Eintrag, der ein Tupel ist.
+  - '`try … except Exception` um `verarbeite`, dann `continue`.'
+  explanation: |
+    Der Starter markiert vor der Verarbeitung und holt mit `BODY[]`: Jede Mail gilt danach als gelesen, und eine gescheiterte Rechnung ist trotzdem „erledigt“. Die Lösung holt mit `BODY.PEEK[]`, sucht das Tupel in der Antwort, statt `teile[0][1]` zu vertrauen, und setzt `$Verarbeitet` nur im Erfolgsfall. Eine gescheiterte Mail bleibt unmarkiert und taucht im nächsten Lauf wieder auf. Die Formen der Fake-Antworten stammen aus einem Lauf gegen einen lokalen GreenMail-Server.
+  resources:
+  - *imaplib
+  - *imap
+- id: anhaenge-speichern
+  type: code
+  title: Anhänge unter sicheren Namen speichern
+  prompt: |
+    Schreibe `sichere_anhaenge(roh, ordner)`. `roh` sind die Bytes einer Mail, `ordner` ist ein vorhandener Ordner.
+
+    - Lies die Mail mit `BytesParser(policy=policy.default)` und speichere jeden Teil aus `iter_attachments()` mit `get_content()` als Datei in `ordner`.
+    - Der Dateiname ist der letzte Pfadteil von `get_filename()`. Ersetze darin jedes Zeichen außer `A–Z`, `a–z`, `0–9`, `.`, `_` und `-` durch `_` und entferne führende Punkte. Bleibt nichts übrig oder fehlt der Name, heißt die Datei `anhang`.
+    - Gibt es die Datei schon, hänge vor der Endung `-2`, `-3` … an.
+    - Gib die Liste der gespeicherten Dateinamen zurück.
+  lang: python
+  starter: |-
+    from email import policy
+    from email.parser import (
+        BytesParser)
+    from pathlib import Path
+
+    def sichere_anhaenge(roh, ordner):
+        msg = BytesParser(
+            policy=policy.default
+        ).parsebytes(roh)
+        namen = []
+        teile = msg.iter_attachments()
+        for teil in teile:
+            name = teil.get_filename()
+            ziel = Path(ordner) / name
+            ziel.write_bytes(
+                teil.get_content())
+            namen.append(name)
+        return namen
+  solution: |-
+    import re
+    from email import policy
+    from email.parser import (
+        BytesParser)
+    from pathlib import Path
+
+    FREMD = re.compile(
+        r"[^A-Za-z0-9._-]")
+
+    def sicher(name):
+        name = Path(name or "").name
+        name = FREMD.sub("_", name)
+        name = name.lstrip(".")
+        return name or "anhang"
+
+    def frei(ordner, name):
+        p = Path(name)
+        stamm, ext = p.stem, p.suffix
+        ziel, n = ordner / name, 2
+        while ziel.exists():
+            neu = f"{stamm}-{n}{ext}"
+            ziel = ordner / neu
+            n += 1
+        return ziel
+
+    def sichere_anhaenge(roh, ordner):
+        ordner = Path(ordner)
+        msg = BytesParser(
+            policy=policy.default
+        ).parsebytes(roh)
+        namen = []
+        teile = msg.iter_attachments()
+        for teil in teile:
+            name = teil.get_filename()
+            name = sicher(name)
+            ziel = frei(ordner, name)
+            daten = teil.get_content()
+            ziel.write_bytes(daten)
+            namen.append(ziel.name)
+        return namen
+  setup: |-
+    from email.message import EmailMessage
+    from pathlib import Path
+
+    def mail_mit(*namen):
+        m = EmailMessage()
+        m["Subject"] = "Rechnungen"
+        m["From"] = "rechnung@example.org"
+        m["To"] = "eingang@example.org"
+        m.set_content("Im Anhang.")
+        for i, name in enumerate(namen):
+            m.add_attachment(f"%PDF-1.7 Nr. {i}".encode(), maintype="application",
+                             subtype="pdf", filename=name)
+        return m.as_bytes()
+
+    def ordner(name):
+        p = Path(name)
+        p.mkdir()
+        return p
+  tests:
+  - name: Ein normaler Anhang
+    code: |-
+      o = ordner("a")
+      r = sichere_anhaenge(
+          mail_mit("rechnung.pdf"), o)
+      assert r == ["rechnung.pdf"], r
+      inhalt = (o / "rechnung.pdf").read_bytes()
+      assert inhalt == b"%PDF-1.7 Nr. 0"
+  - name: Pfad aus dem Namen wird ignoriert
+    code: |-
+      o = ordner("b")
+      r = sichere_anhaenge(
+          mail_mit("../../.bashrc"), o)
+      assert r == ["bashrc"], r
+      assert (o / "bashrc").exists()
+      assert not Path(".bashrc").exists()
+  - name: Seltsame Zeichen und leere Namen
+    code: |-
+      o = ordner("c")
+      r = sichere_anhaenge(
+          mail_mit("Rechnung Okt*.pdf", ".."), o)
+      assert r == ["Rechnung_Okt_.pdf",
+                   "anhang"], r
+  - name: Gleiche Namen überschreiben nichts
+    code: |-
+      o = ordner("d")
+      r = sichere_anhaenge(mail_mit(
+          "r.pdf", "r.pdf", "r.pdf"), o)
+      assert r == ["r.pdf", "r-2.pdf",
+                   "r-3.pdf"], r
+      b = (o / "r-2.pdf").read_bytes()
+      assert b == b"%PDF-1.7 Nr. 1", b
+  - name: Mail ohne Anhang
+    code: |-
+      o = ordner("e")
+      assert sichere_anhaenge(
+          mail_mit(), o) == []
+  hints:
+  - '`Path("../../.bashrc").name` ist `".bashrc"`.'
+  - '`re.sub(r"[^A-Za-z0-9._-]", "_", name)` ersetzt alles andere.'
+  - Für `-2`, `-3` zerlegst du den Namen mit `Path(name).stem` und `.suffix`.
+  explanation: |
+    Der Dateiname eines Anhangs ist fremde Eingabe wie ein Formularfeld. Der Starter übernimmt ihn direkt und schreibt mit `../../.bashrc` außerhalb des Ordners; mit zwei gleichnamigen Anhängen überschreibt er den ersten. Die Lösung nimmt nur den letzten Pfadteil, lässt eine kleine Zeichenmenge zu, entfernt führende Punkte gegen versteckte Dateien und `..`, und sucht einen freien Namen. Ein lokaler Test gegen GreenMail zeigt, dass `get_filename()` einen Namen wie `../../etc/passwd` unverändert liefert.
+  resources:
+  - *emailmsg
+  - title: Python · email.parser
+    url: https://docs.python.org/3/library/email.parser.html
+- id: ics-falten
+  type: code
+  title: Lange ICS-Zeilen falten
+  prompt: |
+    Schreibe `falte(zeile)`. Sie teilt eine ICS-Zeile so auf, dass jede Teilzeile in UTF-8 höchstens 75 Bytes lang ist, und verbindet die Teile mit `"\r\n "` (CRLF und ein Leerzeichen). Das Leerzeichen zählt zur Länge der Fortsetzungszeile. Zeichen werden nie zerteilt. Entfernt man alle `"\r\n "`, entsteht wieder die ursprüngliche Zeile.
+  lang: python
+  starter: |-
+    def falte(zeile):
+        teile = []
+        while zeile:
+            teile.append(zeile[:75])
+            zeile = zeile[75:]
+        return "\r\n ".join(teile)
+  solution: |-
+    def falte(zeile, grenze=75):
+        teile, aktuell = [], ""
+        for zeichen in zeile:
+            neu = aktuell + zeichen
+            laenge = len(neu.encode())
+            if laenge > grenze:
+                teile.append(aktuell)
+                aktuell = " " + zeichen
+            else:
+                aktuell = neu
+        teile.append(aktuell)
+        return "\r\n".join(teile)
+  setup: |-
+    def bytes_je_zeile(text):
+        return [len(z.encode()) for z in text.split("\r\n")]
+  tests:
+  - name: Kurze Zeilen bleiben gleich
+    code: |-
+      z = "SUMMARY:Kurz"
+      assert falte(z) == z, falte(z)
+  - name: Lange ASCII-Zeile
+    code: |-
+      z = "DESCRIPTION:" + "x" * 100
+      f = falte(z)
+      assert bytes_je_zeile(f) == [75, 38], (
+          bytes_je_zeile(f))
+      assert f.replace("\r\n ", "") == z
+  - name: Umlaute zählen doppelt
+    code: |-
+      z = "SUMMARY:" + "ä" * 80
+      f = falte(z)
+      laengen = bytes_je_zeile(f)
+      assert max(laengen) <= 75, laengen
+      assert f.replace("\r\n ", "") == z
+  - name: Kein Zeichen wird zerteilt
+    code: |-
+      z = "X" * 74 + "ü" + "Y"
+      f = falte(z)
+      assert f == "X" * 74 + "\r\n üY", (
+          repr(f))
+  hints:
+  - Baue die Teilzeile Zeichen für Zeichen auf und miss mit `len(teil.encode())`.
+  - Eine Fortsetzungszeile beginnt mit `" "`; das Leerzeichen zählt mit.
+  explanation: |
+    Der Starter zählt Zeichen und lässt die Fortsetzungs-Leerzeichen weg. Bei ASCII stimmt die Länge zufällig fast, bei Umlauten nicht mehr: 75 `ä` sind 150 Bytes. RFC 5545 misst in Oktetts und verlangt, dass Faltung beim Lesen durch Entfernen von CRLF und genau einem Leerzeichen rückgängig gemacht wird. Weil die Lösung über Zeichen läuft und Bytes nur misst, kann sie kein `ü` zwischen zwei Zeilen zerreißen.
+  resources:
+  - title: RFC 5545 · Content Lines
+    url: https://www.rfc-editor.org/rfc/rfc5545.html#section-3.1
+- id: ics-termin
+  type: code
+  title: Einen Termin als VEVENT schreiben
+  prompt: |
+    Schreibe `vevent(uid, beginn, ende, titel, jetzt)`. `beginn`, `ende` und `jetzt` sind `datetime`-Werte mit Zeitzone. Gib diese sieben Zeilen zurück, jede mit `\r\n` abgeschlossen:
+
+    ```text
+    BEGIN:VEVENT
+    UID:<uid>
+    DTSTAMP:<jetzt>
+    DTSTART:<beginn>
+    DTEND:<ende>
+    SUMMARY:<titel>
+    END:VEVENT
+    ```
+
+    Zeiten stehen in UTC im Format `20261103T080000Z`. Im Titel escapest du Backslash, Semikolon, Komma und Zeilenumbruch nach RFC 5545. Fehlt einer Zeit die Zeitzone, oder liegt `ende` nicht nach `beginn`, wirf `ValueError`.
+  lang: python
+  starter: |-
+    def vevent(uid, beginn, ende,
+               titel, jetzt):
+        zeilen = [
+            "BEGIN:VEVENT",
+            f"UID:{uid}",
+            f"DTSTAMP:{jetzt}",
+            f"DTSTART:{beginn}",
+            f"DTEND:{ende}",
+            f"SUMMARY:{titel}",
+            "END:VEVENT",
+        ]
+        return "\n".join(zeilen)
+  solution: |-
+    from datetime import UTC
+
+    FORMAT = "%Y%m%dT%H%M%SZ"
+    ERSATZ = [("\\", "\\\\"),
+              (";", "\\;"),
+              (",", "\\,"),
+              ("\n", "\\n")]
+
+    def utc(zeit):
+        if zeit.tzinfo is None:
+            raise ValueError(zeit)
+        z = zeit.astimezone(UTC)
+        return z.strftime(FORMAT)
+
+    def esc(t):
+        for alt, neu in ERSATZ:
+            t = t.replace(alt, neu)
+        return t
+
+    def vevent(uid, beginn, ende,
+               titel, jetzt):
+        start = utc(beginn)
+        stop = utc(ende)
+        if ende <= beginn:
+            raise ValueError("Ende")
+        zeilen = [
+            "BEGIN:VEVENT",
+            f"UID:{uid}",
+            f"DTSTAMP:{utc(jetzt)}",
+            f"DTSTART:{start}",
+            f"DTEND:{stop}",
+            f"SUMMARY:{esc(titel)}",
+            "END:VEVENT",
+        ]
+        text = "\r\n".join(zeilen)
+        return text + "\r\n"
+  setup: |-
+    from datetime import datetime, UTC
+    from zoneinfo import ZoneInfo
+
+    BERLIN = ZoneInfo("Europe/Berlin")
+    JETZT = datetime(2026, 10, 24, 8, 0, tzinfo=UTC)
+  tests:
+  - name: Aufbau mit CRLF
+    code: |-
+      a = datetime(2026, 11, 3, 8, tzinfo=UTC)
+      e = datetime(2026, 11, 3, 9, tzinfo=UTC)
+      t = vevent("r-4711@example.org", a, e,
+                 "Rechnung fällig", JETZT)
+      assert t == (
+          "BEGIN:VEVENT\r\n"
+          "UID:r-4711@example.org\r\n"
+          "DTSTAMP:20261024T080000Z\r\n"
+          "DTSTART:20261103T080000Z\r\n"
+          "DTEND:20261103T090000Z\r\n"
+          "SUMMARY:Rechnung fällig\r\n"
+          "END:VEVENT\r\n"), repr(t)
+  - name: Berliner Zeit wird UTC
+    code: |-
+      a = datetime(2026, 11, 3, 9, tzinfo=BERLIN)
+      e = datetime(2026, 11, 3, 10, tzinfo=BERLIN)
+      t = vevent("x", a, e, "T", JETZT)
+      assert "DTSTART:20261103T080000Z\r\n" in t, t
+  - name: Escaping in der richtigen Reihenfolge
+    code: |-
+      a = datetime(2026, 11, 3, 8, tzinfo=UTC)
+      e = datetime(2026, 11, 3, 9, tzinfo=UTC)
+      t = vevent("x", a, e,
+                 "C:\\Bericht; Q3, final", JETZT)
+      soll = "SUMMARY:C:\\\\Bericht\\; Q3\\, final\r\n"
+      assert soll in t, repr(t)
+  - name: Ungültige Zeiten
+    code: |-
+      a = datetime(2026, 11, 3, 8, tzinfo=UTC)
+      ohne = datetime(2026, 11, 3, 9)
+      for ende in (a, ohne):
+          try:
+              vevent("x", a, ende, "T", JETZT)
+          except ValueError:
+              pass
+          else:
+              assert False, f"{ende!r}"
+  hints:
+  - '`zeit.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")` liefert das UTC-Format.'
+  - Ersetze den Backslash zuerst, dann Semikolon, Komma und Zeilenumbruch.
+  - Rechne beide Zeiten in UTC um, bevor du sie vergleichst; eine Zeit ohne Zone wirft dabei schon.
+  explanation: |
+    Der Starter schreibt `datetime`-Werte im Python-Format, trennt mit `\n` und escaped nichts. Ein strenger Kalender lehnt das ab, ein toleranter zeigt falsche Zeiten. Die Lösung rechnet jede Zeit in UTC um und hängt `Z` an; so ist der Termin ohne `VTIMEZONE` eindeutig. 9 Uhr in Berlin ist am 3. November 8 Uhr UTC, weil die Sommerzeit dann vorbei ist. Eine Zeit ohne Zone wäre „irgendwo 9 Uhr“ und wird abgelehnt.
+  resources:
+  - *ics
+  - title: Python · datetime.astimezone
+    url: https://docs.python.org/3/library/datetime.html#datetime.datetime.astimezone
+- id: ics-lesen
+  type: code
+  title: Termine aus einer ICS-Datei lesen
+  prompt: |
+    Schreibe `lies_termine(text)`. Gib für jeden `VEVENT` ein Dictionary mit den Schlüsseln `uid`, `summary` und `dtstart` zurück, soweit die Eigenschaften vorkommen.
+
+    - Entfalte zuerst: CRLF oder LF, gefolgt von einem Leerzeichen oder Tab, wird entfernt.
+    - Eine Zeile ist `NAME;parameter=…:wert`. Nimm den Namen bis zum ersten `;` oder `:`, den Wert ab dem ersten `:`.
+    - `summary` wird zurück-escaped: `\n` und `\N` werden Zeilenumbruch, `\,`, `\;` und `\\` werden Komma, Semikolon und Backslash. `dtstart` und `uid` bleiben roh.
+  lang: python
+  starter: |-
+    def lies_termine(text):
+        termine = []
+        for z in text.split("\r\n"):
+            if z[:8] == "SUMMARY:":
+                termine.append(
+                    {"summary": z[8:]})
+        return termine
+  solution: |-
+    import re
+
+    FALTE = re.compile(r"\r?\n[ \t]")
+    ESC = re.compile(r"\\(.)")
+    FELDER = {"UID": "uid",
+              "SUMMARY": "summary",
+              "DTSTART": "dtstart"}
+
+    def ersetze(m):
+        if m[1] in "nN":
+            return "\n"
+        return m[1]
+
+    def unesc(w):
+        return ESC.sub(ersetze, w)
+
+    def lies_termine(text):
+        text = FALTE.sub("", text)
+        termine, akt = [], None
+        for z in text.splitlines():
+            teile = z.partition(":")
+            kopf, _, wert = teile
+            name = kopf.split(";")[0]
+            if z == "BEGIN:VEVENT":
+                akt = {}
+            elif z == "END:VEVENT":
+                termine.append(akt)
+                akt = None
+            elif akt is None:
+                continue
+            elif name in FELDER:
+                if name == "SUMMARY":
+                    wert = unesc(wert)
+                k = FELDER[name]
+                akt[k] = wert
+        return termine
+  tests:
+  - name: Ein einfacher Termin
+    code: |-
+      t = ("BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\n"
+           "UID:a1\r\nSUMMARY:Review\r\n"
+           "DTSTART:20261103T080000Z\r\n"
+           "END:VEVENT\r\nEND:VCALENDAR\r\n")
+      r = lies_termine(t)
+      assert r == [{"uid": "a1",
+                    "summary": "Review",
+                    "dtstart": "20261103T080000Z"}], r
+  - name: Gefaltete Zeile
+    code: |-
+      t = ("BEGIN:VEVENT\r\nSUMMARY:Abgabe Quart\r\n"
+           " alsbericht\r\nEND:VEVENT\r\n")
+      r = lies_termine(t)
+      assert r == [{"summary":
+                    "Abgabe Quartalsbericht"}], r
+  - name: Parameter und Escaping
+    code: |-
+      t = ("BEGIN:VEVENT\r\n"
+           "DTSTART;TZID=Europe/Berlin:20261103T090000\r\n"
+           "SUMMARY:Raum 3\\, OG\\; Zugang: B\\nKarte\r\n"
+           "END:VEVENT\r\n")
+      r = lies_termine(t)[0]
+      assert r["dtstart"] == "20261103T090000", r
+      assert r["summary"] == (
+          "Raum 3, OG; Zugang: B\nKarte"), r
+  - name: Backslash vor n bleibt Backslash
+    code: |-
+      t = ("BEGIN:VEVENT\r\n"
+           "SUMMARY:C:\\\\neu\r\nEND:VEVENT\r\n")
+      r = lies_termine(t)[0]["summary"]
+      assert r == "C:\\neu", repr(r)
+  - name: Zwei Termine, nur LF
+    code: |-
+      t = ("BEGIN:VEVENT\nUID:1\nEND:VEVENT\n"
+           "BEGIN:VEVENT\nUID:2\nEND:VEVENT\n")
+      r = lies_termine(t)
+      assert r == [{"uid": "1"}, {"uid": "2"}], r
+  hints:
+  - '`re.sub(r"\r?\n[ \t]", "", text)` entfaltet.'
+  - '`zeile.partition(":")` trennt am ersten Doppelpunkt; der Name endet vor dem ersten `;`.'
+  - Ersetze Escapes in einem Durchgang von links nach rechts, etwa mit `re.sub(r"\\(.)", …)`. Nacheinander ausgeführte `replace` verwechseln `\\n` mit `\n`.
+  explanation: |
+    Ein Leser muss in der Reihenfolge des RFC arbeiten: erst entfalten, dann Zeilen zerlegen, dann Werte zurück-escapen. Der Starter scheitert schon an der Faltung und an LF-Dateien. Beim Zurück-Escapen ist die Falle `\\n`: Das ist ein escaped Backslash, gefolgt von einem `n`, kein Zeilenumbruch. Ein regulärer Ausdruck, der jeden Backslash mit dem folgenden Zeichen als Paar liest, löst das in einem Durchgang. Parameter wie `TZID` gehören zum Namen und werden für dieses Ergebnis abgeschnitten; ein vollständiger Parser wertet sie aus.
+  resources:
+  - *ics
+  - title: Python · re.sub
+    url: https://docs.python.org/3/library/re.html#re.sub
+- id: body-statt-peek
+  type: bug
+  title: Neue Rechnungen erscheinen als gelesen
+  prompt: |
+    Seit der Job läuft, sieht die Buchhaltung neue Rechnungen im Mailprogramm nicht mehr fett, sondern als gelesen. Der Job soll nur lesen und danach `$Verarbeitet` setzen. Finde die Zeile, die das verursacht, und korrigiere sie.
+  lang: python
+  code: |-
+    def hole(imap, uid):
+        typ, teile = imap.uid(
+            "FETCH", uid,
+            "(BODY[])")
+        for teil in teile:
+            if isinstance(teil, tuple):
+                return teil[1]
+        raise LookupError(uid)
+  lines:
+  - 4
+  fix:
+  - line: 4
+    answers:
+    - '"(BODY.PEEK[])")'
+  explanation: |
+    `BODY[]` setzt laut RFC 9051 das Flag `\Seen` implizit. `BODY.PEEK[]` liefert dieselben Bytes und lässt die Flags in Ruhe. Für die Buchhaltung bleibt die Mail dadurch ungelesen, bis ein Mensch sie öffnet; der Zustand des Jobs steht in `$Verarbeitet`.
+  resources:
+  - title: RFC 9051 · FETCH
+    url: https://www.rfc-editor.org/rfc/rfc9051.html#section-6.4.5
+- id: kalender-sync
+  type: explain
+  title: Einen Kalender inkrementell spiegeln
+  prompt: Erkläre, wie diese Funktion einen Google-Kalender lokal spiegelt, warum sie bei `Gone` (HTTP 410) alles löscht
+    und wann sie das neue Token speichert.
+  lang: python
+  code: |-
+    def sync(api, lokal):
+        try:
+            r = api.liste(lokal.token)
+        except Gone:
+            lokal.leeren()
+            r = api.liste(None)
+        for e in r["items"]:
+            status = e.get("status")
+            if status == "cancelled":
+                lokal.loesche(e["id"])
+            else:
+                lokal.speichere(e)
+        neu = r["nextSyncToken"]
+        lokal.token = neu
+  points:
+  - Mit Token liefert die API nur Änderungen seit dem letzten Abgleich, ohne Token alles.
+  - Gelöschte Termine kommen mit Status cancelled und werden lokal entfernt.
+  - 410 heißt, das Token ist ungültig; der lokale Stand wird verworfen und vollständig neu geladen.
+  - Das neue Token wird erst gespeichert, nachdem alle Änderungen verarbeitet sind.
+  explanation: |
+    Inkrementelle Synchronisation spart Abrufe: Das Sync-Token steht für „alles bis hier ist bekannt“. Google liefert gelöschte Termine in diesem Modus mit, damit der Client sie entfernen kann. Wird das Token ungültig, etwa nach Änderungen an Berechtigungen, antwortet Google mit 410, und die Anleitung verlangt, den lokalen Stand zu verwerfen und neu zu laden. Das Token wird zuletzt gespeichert: Stürzt der Job mittendrin ab, wiederholt der nächste Lauf dieselben Änderungen, statt welche zu überspringen. Der Ausschnitt nimmt an, dass `api.liste` alle Seiten zusammenfasst; das `nextSyncToken` steht bei Google nur auf der letzten.
+  resources:
+  - *gsync
+  - title: Microsoft Graph · Delta query for events
+    url: https://learn.microsoft.com/en-us/graph/delta-query-events
