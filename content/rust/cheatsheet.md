@@ -118,6 +118,22 @@ fn erster<'a>(werte: &'a [String]) -> Option<&'a str> {
 | `type Item = T` | Assoziierter Typ einer Implementierung |
 | `T: 'static` | Keine zu kurzen geliehenen Abhängigkeiten; nicht ewige Lebensdauer |
 
+## API-Design
+
+| Ziel | Werkzeug | Merksatz |
+| --- | --- | --- |
+| Prüfend konvertieren | `impl TryFrom<u16> for Port` | `TryInto` gibt es dazu |
+| Aus Text lesen | `impl FromStr for Stufe` | dann geht `"warn".parse::<Stufe>()` |
+| Viele Optionen | Builder mit `fn x(mut self, …) -> Self` | `build()` prüft und liefert `Result` |
+| Abläufe erzwingen | Typestate `Verbindung<Verbunden>` + `PhantomData` | falsche Reihenfolge = E0599 |
+| Fremde nicht implementieren lassen | sealed trait (privater Supertrait) | Trait bleibt erweiterbar |
+| Methoden für fremde Typen | extension trait `…Ext` | wirkt nur, wo importiert |
+| Enum darf wachsen | `#[non_exhaustive]` ab dem ersten Release | nachträglich selbst ein Major-Change |
+| Ergebnis nicht verwerfen | `#[must_use = "…"]` | nicht doppelt an `Result`-Funktionen |
+| Felder ändern dürfen | private Felder + Konstruktor | Literal-Syntax bricht sonst |
+
+[Rust API Guidelines · Checkliste](https://rust-lang.github.io/api-guidelines/checklist.html)
+
 ## Iteratoren und Closures
 
 | API | Zweck |
@@ -156,6 +172,95 @@ fn erster<'a>(werte: &'a [String]) -> Option<&'a str> {
 | `spawn_blocking` | Synchrone Arbeit aus Runtime-Workern auslagern; Begrenzung beachten |
 | `timeout` | Warten begrenzen; keine Rückabwicklung |
 | `mpsc::channel(n)` | Begrenzter Puffer mit Backpressure |
+| `tokio::select!` | Erster fertiger Zweig gewinnt, die anderen werden gedroppt; `biased;` für feste Reihenfolge |
+| `tokio::pin!(f)` + `&mut f` | Dieselbe Future über mehrere `select!`-Runden, etwa eine Frist |
+| `Semaphore::acquire_owned` | Permit vor `spawn` holen, in die Task verschieben; begrenzt laufende Arbeit |
+| `CancellationToken` | `cancel()` auslösen, in jeder Task `cancelled()` im `select!` abwarten |
+| `TaskTracker` | `close()`, dann `wait()` bis alle Tasks fertig sind |
+| `#[tokio::test(start_paused = true)]` | Timer ohne echte Wartezeit testen (Feature `test-util`) |
+
+| Kanal | Sender → Leser | Was ankommt |
+| --- | --- | --- |
+| `oneshot` | einer → einer | genau ein Wert (Antwort) |
+| `mpsc` | viele → einer | jede Nachricht, begrenzter Puffer |
+| `broadcast` | viele → viele | jede Nachricht an jeden; `Lagged(n)` bei Rückstand |
+| `watch` | viele → viele | nur der letzte Wert (Konfiguration, Shutdown) |
+
+## Dateien, Prozesse und Netzwerk (std)
+
+| Aufgabe | API | Falle |
+| --- | --- | --- |
+| Anhängen | `OpenOptions::new().append(true).create(true)` | – |
+| Nur neu anlegen | `.write(true).create_new(true)` | `AlreadyExists`, wenn es die Datei gibt |
+| Gepuffert schreiben | `BufWriter::new(datei)` | Drop schluckt Fehler: `flush()?` aufrufen |
+| Verzeichnis lesen | `fs::read_dir(pfad)?` | Reihenfolge unbestimmt, Einträge sind `Result` |
+| Atomar ersetzen | temp im Zielverzeichnis, `sync_all`, `fs::rename` | anderes Dateisystem: `rename` scheitert |
+| Programm starten | `Command::new(p).args(a).output()?` | keine Shell; `status.success()` prüfen |
+| Exit-Code | `status.code()` | `None` bei Signal (Unix) |
+| Kindprozess | `spawn()` und `wait()` | kein Kill bei Drop; ohne `wait` Zombie |
+| Zwei Pipes lesen | `wait_with_output()` | nacheinander bis EOF lesen kann hängen |
+| TCP-Server | `TcpListener::bind("127.0.0.1:0")?` | Port 0: das System wählt, `local_addr()` |
+| Zeilen lesen | `reader.read_line(&mut zeile)?` | `0` heißt EOF; Framing ist deine Aufgabe |
+| Schreiben | `write_all` + `flush` | `write` darf weniger schreiben |
+| Hängende Gegenstelle | `set_read_timeout(Some(d))` | ohne Timeout blockiert der Thread |
+
+```rust
+use std::{fs, io::Write};
+
+fn ersetzen(ziel: &str, inhalt: &[u8]) -> std::io::Result<()> {
+    let tmp = format!("{ziel}.tmp");
+    let mut f = fs::File::create(&tmp)?;
+    f.write_all(inhalt)?;
+    f.sync_all()?;
+    fs::rename(&tmp, ziel)
+}
+```
+
+## CLI und Tests mit Crates
+
+| Aufgabe | Werkzeug | Merksatz |
+| --- | --- | --- |
+| Argumente, Subcommands | `#[derive(Parser)]`, `#[derive(Subcommand)]` (clap) | Nutzungsfehler enden mit Status 2 |
+| Wert aus Umgebung | `#[arg(env = "LOGWERK_STUFE")]` | Vorrang: CLI > Umgebung > Datei > Standard |
+| stdin als Datei | Pfad `-` → `io::stdin().lock()` als `BufRead` | eine Funktion für beides: `Box<dyn BufRead>` |
+| Schnelle Ausgabe | `BufWriter::new(io::stdout().lock())` | `flush()` am Ende selbst aufrufen |
+| Ausgabe an `head` | `ErrorKind::BrokenPipe` als normales Ende | `println!` panikt bei Schreibfehlern |
+| Strg+C | `ctrlc::set_handler` + `AtomicBool` | ohne Handler gehen Puffer verloren |
+| TOML-Konfiguration | `#[derive(Deserialize)]`, `toml::from_str` | `#[serde(deny_unknown_fields)]` fängt Tippfehler |
+| Binary im Test | `env!("CARGO_BIN_EXE_logwerk")` | nur in Integrationstests und Benchmarks gesetzt |
+| CLI-Asserts | `assert_cmd` + `predicates` | Status, stdout und stderr getrennt prüfen |
+| Wegwerf-Verzeichnis | `tempfile::tempdir()` | wird beim Drop gelöscht; `keep()` zum Untersuchen |
+| Property-Test | `proptest! { … }` | verkleinert ein Gegenbeispiel, solange der Test scheitert |
+| Snapshot | `insta::assert_snapshot!` | Änderungen mit `cargo insta review` bewusst annehmen |
+
+## Messen und Profiling
+
+```toml
+[profile.profiling]
+inherits = "release"
+debug = true
+```
+
+```bash
+cargo build --profile profiling
+hyperfine --warmup 3 ./logauswertung-vorher target/profiling/logauswertung
+samply record ./target/profiling/logauswertung
+cargo bench --bench auswerten -- --save-baseline vorher
+cargo bench --bench auswerten -- --baseline vorher
+```
+
+| Werkzeug / Ausgabe | Lesart |
+| --- | --- |
+| `Instant::now()` / `elapsed()` | Monotone Uhr; eine Einzelmessung ist Rauschen |
+| `std::hint::black_box(x)` | Eingabe und Ergebnis vor dem Optimierer verstecken; „best effort“ |
+| criterion `time: [a b c]` | Konfidenzintervall: untere Grenze, Schätzung, obere Grenze |
+| criterion `change:` mit `p < 0.05` | Signifikant; „within noise threshold“ heißt trotzdem: nicht relevant |
+| `iter_batched` | Frische Eingabe pro Aufruf, Herstellen wird nicht gemessen |
+| hyperfine | Ganzes Programm mit Start und I/O; erstes Kommando ist die Referenz |
+| Flamegraph-Breite | Anteil der Samples inklusive Kinder; x-Achse ist keine Zeit |
+| Oberkante eines Balkens | Selbstzeit der Funktion |
+| Viel `malloc`/`free` im Profil | Allokationen zählen (`GlobalAlloc`-Zähler), `&str` statt `String`, `entry`, `with_capacity`, Puffer wiederverwenden |
+| Amdahl | 5 % Anteil an der Laufzeit spart höchstens 5 % |
 
 ## Häufige Compilerfehler
 
@@ -171,4 +276,4 @@ fn erster<'a>(werte: &'a [String]) -> Option<&'a str> {
 
 ## Offizielle Referenzen
 
-[The Book](https://doc.rust-lang.org/book/) · [Standardbibliothek](https://doc.rust-lang.org/std/) · [Cargo](https://doc.rust-lang.org/cargo/) · [Compilerfehler](https://doc.rust-lang.org/error_codes/error-index.html) · [Clippy](https://doc.rust-lang.org/clippy/) · [Tokio](https://tokio.rs/tokio/tutorial)
+[The Book](https://doc.rust-lang.org/book/) · [Standardbibliothek](https://doc.rust-lang.org/std/) · [Cargo](https://doc.rust-lang.org/cargo/) · [Compilerfehler](https://doc.rust-lang.org/error_codes/error-index.html) · [Clippy](https://doc.rust-lang.org/clippy/) · [Tokio](https://tokio.rs/tokio/tutorial) · [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/) · [Rust Performance Book](https://nnethercote.github.io/perf-book/)
