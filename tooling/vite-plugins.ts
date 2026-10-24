@@ -75,8 +75,8 @@ const PYODIDE_FILES = ['pyodide.mjs', 'pyodide.asm.mjs', 'pyodide.asm.wasm', 'py
 /**
  * Self-hosts the Pyodide runtime under /pyodide/ (copied from node_modules into public/, not committed),
  * plus the extra wheels exercises may import (vendor/pyodide: tzdata, beautifulsoup4, PyYAML, pandas with numpy,
- * pytest and Hypothesis). Wheels must match the file names and hashes in node_modules/pyodide/pyodide-lock.json;
- * Hypothesis is not in the lock file and loads by file name (src/python/packages.ts).
+ * pytest, Hypothesis and openpyxl). Wheels must match the file names and hashes in node_modules/pyodide/pyodide-lock.json;
+ * Hypothesis and openpyxl are not in the lock file and load by file name (src/python/packages.ts).
  */
 export function pyodide(): Plugin {
   return {

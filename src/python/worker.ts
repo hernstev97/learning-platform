@@ -1,7 +1,7 @@
 /// <reference lib="webworker" />
 // Runs Python in Pyodide, off the main thread. The main thread terminates this worker on timeout.
 import harness from './harness.py?raw';
-import { TEST_WHEELS, USES_TESTS } from './packages.ts';
+import { EXCEL_WHEELS, TEST_WHEELS, USES_EXCEL, USES_TESTS } from './packages.ts';
 
 type Pyodide = {
   FS: { writeFile(path: string, data: string): void };
@@ -43,7 +43,8 @@ self.onmessage = async (event: MessageEvent<Job | { id: number; kind: 'boot' }>)
     if (job.kind === 'boot') { self.postMessage({ id: job.id, result: { ready: true } }); return; }
     if (job.kind === 'prepare') {
       // Before the imports: resolving `import pytest` through the lock file would ask for wheels that are not there.
-      if (USES_TESTS.test(job.code)) await pyodide.loadPackage(TEST_WHEELS.map((file) => `${self.location.origin}/pyodide/${file}`));
+      const wheels = [...(USES_TESTS.test(job.code) ? TEST_WHEELS : []), ...(USES_EXCEL.test(job.code) ? EXCEL_WHEELS : [])];
+      if (wheels.length) await pyodide.loadPackage(wheels.map((file) => `${self.location.origin}/pyodide/${file}`));
       try { await pyodide.loadPackagesFromImports(job.code); } catch { /* unknown imports surface as ImportError in Python */ }
       if (/zoneinfo|ZoneInfo/.test(job.code)) await pyodide.loadPackage('tzdata');
       // Exercises that only call run_pytest import pytest inside the timed run; its first import takes a second or two.
