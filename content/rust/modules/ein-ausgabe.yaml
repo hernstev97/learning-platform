@@ -1,0 +1,1079 @@
+id: ein-ausgabe
+title: "Ein- und Ausgabe: Dateien, Prozesse, Netzwerk"
+level: 2
+minutes: 170
+summary: Dateien, Kindprozesse und TCP-Verbindungen mit der Standardbibliothek – was dabei im Kernel passiert, wo Daten verloren gehen und warum Programme hängen bleiben.
+place: unterwegs
+goals:
+  - Du wählst passende `OpenOptions`, setzt `BufWriter` gezielt ein und machst Schreibfehler mit `flush`, `into_inner` und `sync_all` sichtbar.
+  - Du ersetzt eine Konfigurationsdatei atomar über eine temporäre Datei, `sync_all` und `rename` und begründest jeden Schritt.
+  - Du startest Prozesse mit `Command` ohne Shell, wählst zwischen `status`, `output` und `spawn` und wertest Exit-Code, Signal, stdout und stderr aus.
+  - Du erkennst die typischen Hänger mit Pipes – fehlendes EOF und volle Pipe-Puffer – und vermeidest sie.
+  - Du baust Server und Client für ein Zeilenprotokoll über TCP mit Timeout und sauberem Verbindungsende und erklärst, warum TCP Framing braucht.
+resources:
+  - title: std::io
+    url: https://doc.rust-lang.org/std/io/index.html
+  - title: std::fs
+    url: https://doc.rust-lang.org/std/fs/index.html
+  - title: std::process
+    url: https://doc.rust-lang.org/std/process/index.html
+  - title: std::net
+    url: https://doc.rust-lang.org/std/net/index.html
+  - title: Linux man-pages · rename(2)
+    url: https://man7.org/linux/man-pages/man2/rename.2.html
+lesson: |
+  Ein Deploy-Werkzeug schreibt die neue `app.toml`, startet `git` und `systemctl` und fragt zum Schluss den Health-Port des Dienstes ab. Datei, Prozess, Netzwerk – drei Welten mit demselben Kern: Dein Programm bittet den Kernel um die Arbeit, über **Systemaufrufe** (syscalls) wie `open`, `read`, `write`, `rename` oder `connect`. Jeder kostet einen Wechsel in den Kernel, jeder kann blockieren, jeder kann scheitern. Deshalb liefert in `std::io` fast alles ein `io::Result`.
+
+  `File`, die Pipes eines Kindprozesses und `TcpStream` sind dünne Hüllen um Handles des Betriebssystems und sprechen dieselben Traits `Read` und `Write` ([std::io](https://doc.rust-lang.org/std/io/index.html#read-and-write)). Dieses Modul zeigt, wo die teuren Fehler entstehen: halbe Konfigurationsdateien, hängende Kindprozesse, Server, die auf ein Ende warten, das nie kommt. Alles hier ist synchron und blockierend; [Async Rust](/rust/async-rust) baut danach mit Tokio darauf auf.
+
+  ## Dateien: Handles, Systemaufrufe und Puffer
+
+  `File::open` fragt den Kernel nach einer Datei und bekommt einen **Dateideskriptor** zurück, unter Linux eine kleine Zahl wie `3`. Das `File` besitzt diesen Deskriptor. Jeder `read` und jeder `write` darauf wird zu einem Systemaufruf `read(2)` oder `write(2)`, denn `File` puffert nichts ([File](https://doc.rust-lang.org/std/fs/struct.File.html)). Fällt das `File` aus dem Scope, schließt `Drop` den Deskriptor.
+
+  ```rust
+  use std::fs::File;
+  use std::io::{self, Read, Write};
+
+  fn main() -> io::Result<()> {
+      let p = "deploy.log";
+      let mut f = File::create(p)?;
+      f.write_all(b"v1.4 live\n")?;
+      drop(f); // Deskriptor zu
+
+      let mut text = String::new();
+      let mut f = File::open(p)?;
+      f.read_to_string(&mut text)?;
+      print!("{text}");
+      Ok(())
+  }
+  ```
+
+  `File::create` legt an oder kürzt eine vorhandene Datei auf null Bytes. `File::open` öffnet nur zum Lesen. Für alles dazwischen gibt es `OpenOptions`. Drei Schalter brauchst du im Betrieb:
+
+  - `append(true)` schreibt jeden `write` ans aktuelle Dateiende, auch wenn andere Prozesse gleichzeitig anhängen. Richtig für Logdateien.
+  - `create_new(true)` legt die Datei nur an, wenn es sie noch nicht gibt. Prüfen und Anlegen passieren in einem Systemaufruf, kein anderer Prozess kommt dazwischen. Die Doku nennt das ausdrücklich atomar ([create_new](https://doc.rust-lang.org/std/fs/struct.OpenOptions.html#method.create_new)). Gut für Sperrdateien.
+  - `truncate(true)` kürzt beim Öffnen auf null. Wer mit `write(true)` ohne `truncate` öffnet, überschreibt nur den Anfang, und ein längerer alter Inhalt bleibt als Rest stehen.
+
+  ```rust
+  use std::fs::OpenOptions;
+  use std::io::{self, Write};
+
+  fn main() -> io::Result<()> {
+      let mut log =
+          OpenOptions::new()
+              .append(true)
+              .create(true)
+              .open("deploy.log")?;
+      writeln!(log, "v1.4 live")?;
+
+      for _ in 0..2 {
+          let r = OpenOptions::new()
+              .write(true)
+              .create_new(true)
+              .open("deploy.lock");
+          if let Err(e) = r {
+              println!("{e}");
+          } else {
+              println!("geholt");
+          }
+      }
+      Ok(())
+  }
+  ```
+
+  Der erste Durchlauf meldet `geholt`, der zweite `File exists (os error 17)`. Genau das willst du für „nur ein Deploy gleichzeitig“. Stürzt der erste Job ab, bleibt die Sperrdatei allerdings liegen. Robuster ist [`File::try_lock`](https://doc.rust-lang.org/std/fs/struct.File.html#method.try_lock) (seit Rust 1.89): Das Betriebssystem gibt die Sperre frei, sobald die Datei geschlossen wird, auch beim Absturz.
+
+  ### BufReader und BufWriter gegen viele kleine Systemaufrufe
+
+  Tausend kleine `write`-Aufrufe auf einem `File` sind tausend Wechsel in den Kernel. `writeln!(datei, "req {i}")` sind sogar drei pro Zeile: Rust reicht festen Text, Zahl und Zeilenende einzeln weiter. [`BufWriter`](https://doc.rust-lang.org/std/io/struct.BufWriter.html) sammelt die Bytes in einem Puffer, derzeit 8 KiB, und schreibt erst, wenn er voll ist. `BufReader` macht dasselbe beim Lesen. Beide lohnen sich nur bei vielen kleinen Zugriffen.
+
+  ```rust
+  use std::fs::File;
+  use std::io::{self, Write};
+  use std::io::BufWriter;
+
+  fn main() -> io::Result<()> {
+      let p = "req.log";
+      let f = File::create(p)?;
+      let mut w = BufWriter::new(f);
+      for i in 0..1000 {
+          writeln!(w, "req {i}")?;
+      }
+      // leert Puffer, meldet Fehler
+      let f = w.into_inner()?;
+      // bis auf den Datenträger
+      f.sync_all()?;
+      Ok(())
+  }
+  ```
+
+  > [!WARNING] BufWriter verschluckt Fehler beim Drop
+  > Fällt ein `BufWriter` aus dem Scope, versucht sein `Drop`, den Rest zu schreiben. Scheitert das – Platte voll, Netzlaufwerk weg –, ignoriert `Drop` den Fehler. Die std-Doku verlangt deshalb ausdrücklich, vorher `flush` aufzurufen. Eine Ebene tiefer gilt dasselbe: `File` ignoriert Fehler beim Schließen; wer sie sehen will, ruft [`sync_all`](https://doc.rust-lang.org/std/fs/struct.File.html#method.sync_all) auf. `into_inner()` leert den Puffer, meldet Fehler als `Err` und gibt dir das `File` für `sync_all` zurück.
+
+  `flush` und `sync_all` sind zwei Stufen. `flush` schiebt die Bytes aus dem Puffer deines Programms in den Kernel; andere Prozesse sehen sie, aber sie liegen noch im Page Cache im RAM. Erst `sync_all` wartet, bis sie auf dem Datenträger sind. Einen Stromausfall überlebt nur, was synchronisiert war.
+
+  ## Verzeichnisse lesen: read_dir und stabile Reihenfolge
+
+  `fs::read_dir` liefert einen Iterator über die Einträge eines Verzeichnisses. Das Beispiel legt zwei Dateien und einen Symlink an und listet sie:
+
+  ```rust
+  use std::fs;
+  use std::io;
+  use std::os::unix::fs::symlink;
+
+  fn main() -> io::Result<()> {
+      let d = "etc";
+      fs::create_dir_all(d)?;
+      fs::write("etc/b.toml", "")?;
+      fs::write("etc/a.toml", "")?;
+      symlink("b.toml", "etc/neu")?;
+
+      let mut namen = Vec::new();
+      for e in fs::read_dir(d)? {
+          let e = e?; // io::Result
+          let link = e.file_type()?
+              .is_symlink();
+          let name = e.file_name();
+          namen.push((name, link));
+      }
+      namen.sort();
+      for (n, link) in namen {
+          println!("{n:?} {link}");
+      }
+      Ok(())
+  }
+  ```
+
+  Jeder Eintrag ist ein eigenes `io::Result`, weil das Lesen mitten im Verzeichnis scheitern kann. `let e = e?;` reicht den Fehler weiter, statt ihn mit `filter_map(Result::ok)` zu verstecken. Die Reihenfolge ist plattform- und dateisystemabhängig und kann sich sogar zwischen zwei Aufrufen ändern ([read_dir](https://doc.rust-lang.org/std/fs/fn.read_dir.html#platform-specific-behavior)). Auf dem Laptop sieht sie vielleicht sortiert aus, auf dem Server nicht. Muss die Ausgabe stabil sein – in Tests, Logs oder beim Laden von `conf.d`-Dateien –, sortierst du selbst.
+
+  `file_type()` folgt Symlinks nicht: Für `neu` meldet es einen Link, keine Datei. `fs::metadata` folgt dem Link.
+
+  ## Konfiguration atomar ersetzen
+
+  Dein Dienst schreibt seine Konfiguration mit `fs::write("app.toml", neu)`. Laut Doku ist `fs::write` nur `File::create` plus `write_all`: Es kürzt die Datei auf null Bytes und schreibt danach. Stürzt der Prozess dazwischen ab, ist die Platte voll oder fällt der Strom aus, liegt eine leere oder halbe `app.toml` da, und der nächste Start scheitert.
+
+  Das Gegenmittel nutzt `rename(2)`: Existiert das Ziel schon, ersetzt der Kernel es atomar. Jeder andere Prozess sieht die alte oder die neue Datei, nie einen Zwischenstand ([rename(2)](https://man7.org/linux/man-pages/man2/rename.2.html#DESCRIPTION)).
+
+  ```rust
+  use std::fs::{self, File};
+  use std::io::{self, Write};
+  use std::path::Path;
+
+  fn ersetze(
+      ziel: &Path,
+      inhalt: &[u8],
+  ) -> io::Result<()> {
+      // gleicher Ordner wie ziel
+      let mut tmp = ziel.to_owned();
+      tmp.set_extension("tmp");
+      let mut f =
+          File::create(&tmp)?;
+      f.write_all(inhalt)?;
+      f.sync_all()?;
+      drop(f);
+      fs::rename(&tmp, ziel)
+  }
+
+  fn main() -> io::Result<()> {
+      let p = Path::new("app.toml");
+      fs::write(p, "port = 80\n")?;
+      ersetze(p, b"port = 8080\n")?;
+      let neu =
+          fs::read_to_string(p)?;
+      print!("{neu}");
+      Ok(())
+  }
+  ```
+
+  Jeder Schritt hat einen Grund:
+
+  1. **Temporäre Datei im selben Verzeichnis.** `rename` hängt nur einen Verzeichniseintrag um, die Daten bleiben, wo sie sind. Das geht nur innerhalb eines Dateisystems. Liegt die temporäre Datei in `/tmp` und ist das ein eigenes Dateisystem, etwa ein tmpfs, scheitert `rename` mit `EXDEV`, „Invalid cross-device link“ ([rename(2), Errors](https://man7.org/linux/man-pages/man2/rename.2.html#ERRORS)). `fs::rename` kopiert dann nicht heimlich, es meldet den Fehler.
+  2. **Vollständig schreiben** mit `write_all`, bei einem `BufWriter` danach `flush` oder `into_inner`.
+  3. **`sync_all` vor dem Umbenennen.** Sonst liegen die Daten womöglich noch im Page Cache, und nach einem Stromausfall zeigt der neue Name auf eine leere oder unvollständige Datei.
+  4. **`fs::rename`** auf den Zielnamen.
+
+  Unter Unix entspricht `fs::rename` dem Systemaufruf `rename`, unter Windows `MoveFileExW`; die Regeln für vorhandene Ziele unterscheiden sich im Detail ([fs::rename](https://doc.rust-lang.org/std/fs/fn.rename.html#platform-specific-behavior)).
+
+  > [!DEEP] Auch das Verzeichnis synchronisieren
+  > `sync_all` bringt Inhalt und Metadaten der Datei auf den Datenträger, aber nicht unbedingt den Verzeichniseintrag, den `rename` ändert. Laut [fsync(2)](https://man7.org/linux/man-pages/man2/fsync.2.html#DESCRIPTION) braucht es dafür ein eigenes `fsync` auf das Verzeichnis, in Rust unter Unix `File::open(verzeichnis)?.sync_all()?` nach dem `rename`. Bei einer Konfiguration, die sich nach einem Absturz neu erzeugen lässt, kannst du darauf verzichten, bei Zustandsdateien und Datenbanken nicht.
+
+  ## Prozesse starten ohne Shell
+
+  `Command::new("git")` startet keine Shell. Rust sucht `git` im `PATH` und übergibt die Argumente als Liste (`argv`) an das neue Programm. Niemand trennt an Leerzeichen, expandiert `*`, liest `;` als Befehlsende oder ersetzt `$HOME`; laut [`arg`](https://doc.rust-lang.org/std/process/struct.Command.html#method.arg) haben Quotes, Escapes, Word Splitting, Glob-Muster und Variablen keine Wirkung. Ohne Shell gibt es keine Shell-Injection.
+
+  ```rust
+  use std::process::Command;
+
+  fn text(b: &[u8]) -> &str {
+      str::from_utf8(b).unwrap()
+  }
+
+  fn main() -> std::io::Result<()> {
+      let name = "*.log; rm -rf ~";
+      // ohne Shell: ein Argument
+      let o = Command::new("echo")
+          .arg(name)
+          .output()?;
+      print!("{}", text(&o.stdout));
+
+      // mit Shell: Skript fest,
+      // Daten nur als Parameter
+      let s = Command::new("sh")
+          .arg("-c")
+          .arg(r#"test -e "$1""#)
+          .arg("sh") // wird $0
+          .arg(name) // wird $1
+          .status()?;
+      println!("{}", s.success());
+      Ok(())
+  }
+  ```
+
+  `echo` bekommt `*.log; rm -rf ~` als ein einziges Argument und gibt es unverändert aus. Brauchst du doch eine Shell, etwa für eine Pipe, rufst du `sh -c` mit einem **festen** Skript auf und reichst Daten als Positionsparameter hinein. Wer das Skript mit `format!` aus Eingaben zusammensetzt, hat die Injection zurück.
+
+  ### status, output und spawn
+
+  Drei Methoden starten den Prozess. Sie unterscheiden sich darin, ob sie warten und was mit stdin, stdout und stderr passiert ([Command::stdout](https://doc.rust-lang.org/std/process/struct.Command.html#method.stdout)):
+
+  | Methode | stdout, stderr | wartet |
+  | --- | --- | --- |
+  | `status()` | erbt | ja |
+  | `output()` | fängt ab | ja |
+  | `spawn()` | erbt | nein |
+
+  „Erbt“ heißt: Das Kind schreibt direkt in dieselben Ausgaben wie dein Programm. `output()` fängt stdout und stderr in zwei `Vec<u8>` ab, das stdin des Kindes ist dabei sofort geschlossen. `spawn()` kehrt sofort zurück und gibt dir ein `Child`. Jede Voreinstellung lässt sich mit `Stdio::piped()`, `Stdio::null()` oder `Stdio::inherit()` überschreiben.
+
+  Wie der Prozess endete, steht im [`ExitStatus`](https://doc.rust-lang.org/std/process/struct.ExitStatus.html#method.code). `success()` heißt Exit-Code 0. `code()` ist unter Unix `None`, wenn ein Signal den Prozess beendet hat, etwa `kill` oder der OOM-Killer; das Signal liefert `ExitStatusExt::signal`.
+
+  ```rust
+  use std::os::unix::process::{
+      ExitStatusExt,
+  };
+  use std::process::Command;
+
+  fn main() -> std::io::Result<()> {
+      let s = Command::new("sh")
+          .arg("-c")
+          .arg("kill -TERM $$")
+          .status()?;
+      println!("{}", s.success());
+      println!("{:?}", s.code());
+      println!("{:?}", s.signal());
+      // false, None, Some(15)
+      Ok(())
+  }
+  ```
+
+  > [!MERKE] Start geglückt heißt nicht Erfolg
+  > `Command::output()?` ist `Ok`, sobald der Prozess **gestartet** werden konnte – auch wenn er mit Code 1 endet. Das `?` fängt nur Startfehler wie „Programm nicht gefunden“. Ob das Werkzeug seine Arbeit geschafft hat, sagt erst `status.success()`.
+
+  ### stdin füttern, EOF senden, auf das Ende warten
+
+  Für einen Dialog mit dem Kind setzt du die Pipes selbst und startest mit `spawn`:
+
+  ```rust
+  use std::io::{self, Write};
+  use std::process::Command;
+  use std::process::Stdio;
+
+  fn text(b: &[u8]) -> &str {
+      str::from_utf8(b).unwrap()
+  }
+
+  fn main() -> io::Result<()> {
+      let mut cmd =
+          Command::new("sort");
+      cmd.stdin(Stdio::piped());
+      cmd.stdout(Stdio::piped());
+      let mut kind = cmd.spawn()?;
+
+      let mut ein = kind.stdin
+          .take()
+          .unwrap();
+      ein.write_all(b"web\napi\n")?;
+      drop(ein); // sort sieht EOF
+
+      let o =
+          kind.wait_with_output()?;
+      print!("{}", text(&o.stdout));
+      Ok(())
+  }
+  ```
+
+  `sort` gibt erst etwas aus, wenn seine Eingabe zu Ende ist, und das Ende sieht es erst, wenn alle schreibenden Enden der Pipe geschlossen sind. `drop(ein)` schließt deins. Ohne diese Zeile wartet `sort` auf Eingabe und `wait_with_output` auf `sort`, beide für immer. `wait` schließt zwar selbst das stdin, das noch im `Child` steckt ([Child::wait](https://doc.rust-lang.org/std/process/struct.Child.html#method.wait)), aber nach `take()` ist es deine Aufgabe.
+
+  Ein `Child` hat kein `Drop`, das den Prozess beendet ([Child](https://doc.rust-lang.org/std/process/struct.Child.html#warning)). Ohne `wait` läuft das Kind weiter, auch wenn das Handle aus dem Scope fällt. Ist es fertig und niemand hat gewartet, bleibt es als **Zombie** in der Prozesstabelle. Ein langlebiger Dienst, der nie wartet, sammelt Zombies, bis die Prozess-IDs ausgehen.
+
+  > [!WARNING] Deadlock mit zwei Pipes
+  > Eine Pipe hat einen festen Puffer im Kernel, unter Linux standardmäßig 64 KiB ([pipe(7)](https://man7.org/linux/man-pages/man7/pipe.7.html#DESCRIPTION)). Ist er voll, blockiert der `write` des Kindes. Setzt du stdout **und** stderr auf `piped` und liest erst stdout bis zum Ende, dann stderr, hängt alles, sobald das Kind mehr als 64 KiB auf stderr schreibt: Es wartet auf einen Leser, dein Programm auf das Ende von stdout. Lies beide Ströme gleichzeitig – `output()` und `wait_with_output()` tun das intern, sonst liest ein zweiter Thread stderr.
+
+  ## TCP: ein Bytestrom ohne Nachrichtengrenzen
+
+  Ein `TcpListener` ist ein Socket, an dem der Kernel Verbindungen annimmt. `accept()` gibt dir für jede Verbindung einen eigenen `TcpStream`, und der verhält sich wie eine Datei: ein Deskriptor, `Read` und `Write`, blockierende Aufrufe. Mit Port 0 wählt das Betriebssystem einen freien Port, `local_addr()` verrät welchen ([bind](https://doc.rust-lang.org/std/net/struct.TcpListener.html#method.bind)). So kollidieren Tests nie mit einem belegten Port.
+
+  Das wichtigste Denkmodell: TCP überträgt einen geordneten **Strom von Bytes**, keine Nachrichten. Zwei `write_all` beim Sender werden beim Empfänger nicht zu zwei `read`-Ergebnissen. Ein `read` kann eine halbe Nachricht liefern, eine oder anderthalb; laut [`Read::read`](https://doc.rust-lang.org/std/io/trait.Read.html#method.read) ist ein kurzes Ergebnis kein Fehler, auch mitten im Strom. Wo eine Nachricht aufhört, legt dein Protokoll fest. Das heißt **Framing**, üblich sind ein Trennzeichen wie `\n` oder eine Längenangabe vor jeder Nachricht.
+
+  Das folgende Zeilenprotokoll beantwortet `PING` mit `PONG`, `ECHO text` mit `text` und alles andere mit `ERR unbekannt`. Server und Client laufen im selben Programm.
+
+  ```rust
+  use std::io::{self, Read, Write};
+  use std::io::{BufRead, BufReader};
+  use std::io::BufWriter;
+  use std::net::Shutdown;
+  use std::net::TcpListener;
+  use std::net::TcpStream;
+  use std::thread;
+
+  fn antwort(z: &str) -> &str {
+      if z == "PING" {
+          return "PONG";
+      }
+      match z.split_once(' ') {
+          Some(("ECHO", t)) => t,
+          _ => "ERR unbekannt",
+      }
+  }
+
+  fn bediene(s: &TcpStream)
+      -> io::Result<()>
+  {
+      let mut r = BufReader::new(s);
+      let mut w = BufWriter::new(s);
+      let mut z = String::new();
+      loop {
+          z.clear();
+          let n =
+              r.read_line(&mut z)?;
+          if n == 0 {
+              return Ok(()); // EOF
+          }
+          let a = antwort(z.trim());
+          writeln!(w, "{a}")?;
+          w.flush()?;
+      }
+  }
+
+  const LOKAL: &str = "127.0.0.1:0";
+
+  fn main() -> io::Result<()> {
+      let l =
+          TcpListener::bind(LOKAL)?;
+      let addr = l.local_addr()?;
+      let mut c =
+          TcpStream::connect(addr)?;
+      let (s, _) = l.accept()?;
+      let t = thread::spawn(
+          move || bediene(&s),
+      );
+
+      c.write_all(b"PING\n")?;
+      c.write_all(b"ECHO hallo\n")?;
+      c.shutdown(Shutdown::Write)?;
+      let mut alles = String::new();
+      c.read_to_string(&mut alles)?;
+      print!("{alles}");
+      t.join().unwrap()
+  }
+  ```
+
+  Das Programm gibt `PONG` und `hallo` aus. Was dabei passiert:
+
+  - `connect` gelingt vor `accept`: Der Kernel baut die Verbindung schon auf und stellt sie in eine Warteschlange, `accept` holt sie nur ab.
+  - `read_line` liest bis einschließlich `\n` und **hängt an** den String an, deshalb `z.clear()`. `Ok(0)` heißt: Die Gegenseite hat ihre Schreibrichtung geschlossen ([read_line](https://doc.rust-lang.org/std/io/trait.BufRead.html#method.read_line)).
+  - Nach jeder Antwort ruft der Server `flush` auf. Sonst läge sie im `BufWriter`, und ein Client, der auf die Antwort wartet, bevor er weiterschreibt, wartet für immer.
+  - `shutdown(Shutdown::Write)` schließt nur die Schreibrichtung des Clients. Der Server sieht EOF, sein Thread endet und schließt den Stream, erst dann endet `read_to_string` beim Client. Schließt keine Seite, wartet [`read_to_string`](https://doc.rust-lang.org/std/io/trait.Read.html#method.read_to_string) für immer.
+
+  ### Timeouts gegen schweigende Gegenstellen
+
+  Ohne Timeout blockiert `read`, bis Daten kommen. Eine Gegenstelle, die die Verbindung offen hält und schweigt – ein hängender Dienst, ein Angreifer –, hält deinen Thread unbegrenzt fest. `set_read_timeout` begrenzt jeden einzelnen `read`:
+
+  ```rust
+  use std::io::{self, Read};
+  use std::net::TcpListener;
+  use std::net::TcpStream;
+  use std::time::Duration;
+
+  const LOKAL: &str = "127.0.0.1:0";
+
+  fn main() -> io::Result<()> {
+      // nimmt an, antwortet nie
+      let l =
+          TcpListener::bind(LOKAL)?;
+      let addr = l.local_addr()?;
+      let mut c =
+          TcpStream::connect(addr)?;
+
+      let t =
+          Duration::from_secs(2);
+      c.set_read_timeout(Some(t))?;
+      let mut puffer = [0; 512];
+      let e = c.read(&mut puffer)
+          .unwrap_err();
+      println!("{:?}", e.kind());
+      Ok(())
+  }
+  ```
+
+  Unter Linux meldet ein abgelaufener Timeout `WouldBlock` („Resource temporarily unavailable“), unter Windows `TimedOut` ([set_read_timeout](https://doc.rust-lang.org/std/net/struct.TcpStream.html#method.set_read_timeout)). Er gilt pro Aufruf: Ein Client, der alle vier Sekunden ein Byte schickt, unterläuft einen Timeout von fünf Sekunden. Gegen endlose Zeilen begrenzt du zusätzlich die Länge, etwa mit `Read::take` vor `read_line`.
+
+  ### Ein Thread pro Verbindung und seine Grenze
+
+  Der einfachste Server startet in einer Schleife über `listener.incoming()` für jede Verbindung einen Thread. Für interne Werkzeuge reicht das. Jeder Thread reserviert aber einen eigenen Stack, auf Tier-1-Plattformen derzeit 2 MiB ([std::thread](https://doc.rust-lang.org/std/thread/index.html#stack-size)). Zehntausend langsame Clients sind zehntausend Threads, die fast nur warten. Deshalb gehört eine Obergrenze dazu: ein `AtomicUsize`, der aktive Verbindungen zählt und über dem Limit mit `ERR busy` ablehnt, oder ein fester Pool von Worker-Threads an einem Channel. In [Async Rust](/rust/async-rust) teilen sich viele wartende Verbindungen wenige Threads.
+
+  Randnotiz: Kleine Schreibvorgänge fasst der Kernel unter Umständen zu größeren Paketen zusammen (Nagle-Algorithmus). Bei vielen kleinen Frage-Antwort-Runden schaltet [`set_nodelay(true)`](https://doc.rust-lang.org/std/net/struct.TcpStream.html#method.set_nodelay) das ab.
+
+  > [!PRAXIS] So sieht es in echten Diensten aus
+  > Konfigurationen und Zustandsdateien schreibt ein sorgfältiger Dienst über „temporäre Datei, sync, rename“, in Rust oft mit der Crate [tempfile](https://docs.rs/tempfile/latest/tempfile/struct.NamedTempFile.html#method.persist): `NamedTempFile::new_in(verzeichnis)` legt eine Datei mit eindeutigem Namen im Zielverzeichnis an, `persist(ziel)` benennt sie um. Laut Doku synchronisiert `persist` weder Inhalt noch Verzeichnis, `sync_all` bleibt deine Aufgabe. Externe Werkzeuge laufen mit fester Argumentliste und Zeitlimit: `spawn`, in einer Schleife `try_wait`, nach Ablauf `kill` und `wait`. Im Code-Review fallen auf: `sh -c` mit `format!`, ignorierte Exit-Codes, Server ohne Read-Timeout, `read_to_string` auf Sockets.
+
+  > [!INTERVIEW] „Warum braucht ein Protokoll über TCP Framing?“
+  > TCP garantiert Reihenfolge und Vollständigkeit der Bytes, aber keine Grenzen zwischen Nachrichten. Ein `write` beim Sender kann beim Empfänger in mehreren `read`s ankommen, zwei `write`s in einem. Deshalb legt das Protokoll fest, wo eine Nachricht endet: mit einem Trennzeichen wie `\n` oder einer Längenangabe davor. Dazu nennst du die Grenzen – maximale Nachrichtengröße, Timeout, wer die Verbindung wann schließt. Wer „ein `read`, eine Nachricht“ annimmt, baut einen Fehler, der auf Loopback selten auftritt und unter Last im echten Netz regelmäßig.
+
+  ## Häufige Fehler
+
+  - **Kein `flush` vor `rename`.** Mit `BufWriter` liegen die letzten Bytes noch im Puffer, die umbenannte Datei ist unvollständig. Erst `into_inner()?`, dann `sync_all`, dann `rename`.
+  - **Temporäre Datei in `/tmp`.** Läuft auf dem Laptop, scheitert auf dem Server mit `Invalid cross-device link (os error 18)`. Die temporäre Datei gehört neben das Ziel.
+  - **`read_to_string` auf einem Socket.** Wartet auf EOF. Hält der Client die Verbindung offen, weil er auf die Antwort wartet, hängen beide. Lies mit Framing, etwa `read_line`.
+  - **`Command::new("ls -la")`.** Sucht ein Programm, das wörtlich `ls -la` heißt, und scheitert mit `No such file or directory (os error 2)`. Programm und Argumente gehören getrennt: `Command::new("ls").arg("-la")`.
+  - **Exit-Code nicht geprüft.** `output()?` ist `Ok`, auch bei Code 1. `status.success()` prüfen, stderr in die eigene Fehlermeldung übernehmen.
+  - **`read_dir` unsortiert ausgegeben.** Die Reihenfolge hängt vom Dateisystem ab, Tests werden auf einem anderen Rechner rot. Erst sammeln, dann sortieren.
+  - **`write` statt `write_all`.** `write` darf weniger Bytes schreiben als übergeben, der Rest geht still verloren. `write_all` wiederholt, bis alles geschrieben ist oder ein Fehler kommt.
+
+  ## Zusammenfassung
+
+  - `File`, Pipes und `TcpStream` sind Handles auf Kernel-Objekte. Jeder `read` und `write` ist ein Systemaufruf, der blockieren und scheitern kann.
+  - `OpenOptions`: `append` für Logs, `create_new` als atomares „nur wenn noch nicht da“, `truncate` bewusst setzen. `BufWriter` spart Systemaufrufe, verschluckt aber Fehler beim Drop – `flush` oder `into_inner` aufrufen.
+  - `read_dir` liefert pro Eintrag ein `io::Result` in unbestimmter Reihenfolge. Für stabile Ausgabe sortieren.
+  - Atomar ersetzen: temporäre Datei im selben Verzeichnis, `write_all`, `flush`, `sync_all`, `rename`. Über Dateisystemgrenzen scheitert `rename` mit `EXDEV`.
+  - `Command` startet ohne Shell, Argumente kommen wörtlich an. `output()` fängt ab, `status()` und `spawn()` erben. Exit-Status immer prüfen, `code()` ist `None` bei einem Signal.
+  - Kindprozesse brauchen `wait`. stdin schließen, damit das Kind EOF sieht. stdout und stderr gleichzeitig lesen, sonst droht ein Deadlock am vollen Pipe-Puffer.
+  - TCP ist ein Bytestrom: Framing festlegen, `read_line` liefert `Ok(0)` bei EOF, `write_all` und `flush` zum Senden, `shutdown(Shutdown::Write)` meldet das Ende, Read-Timeouts gegen schweigende Gegenstellen.
+  - Ein Thread pro Verbindung ist einfach, braucht aber eine Obergrenze. Viele wartende Verbindungen sind der Fall für async.
+exercises:
+  - id: create-new-garantie
+    type: choice
+    title: Zwei Deploys, eine Sperrdatei
+    prompt: Zwei Deploy-Jobs starten auf demselben Server in derselben Millisekunde. Beide führen diesen Code aus, um eine Sperre zu holen. Welche Aussage stimmt?
+    lang: rust
+    code: |
+      let lock = OpenOptions::new()
+          .write(true)
+          .create_new(true)
+          .open("/run/deploy.lock");
+    options:
+      - text: Höchstens ein Job bekommt `Ok`. Der andere bekommt sofort einen Fehler der Art `AlreadyExists`, weil Prüfen und Anlegen ein einziger Systemaufruf sind.
+        correct: true
+        why: Unter Linux wird `create_new(true)` zu `open` mit `O_CREAT | O_EXCL`. Der Kernel prüft und legt in einem Schritt an, kein anderer Prozess kommt dazwischen.
+      - text: Beide können `Ok` bekommen, wenn sie exakt gleichzeitig laufen. Dagegen hilft nur ein zusätzlicher `Mutex`.
+        correct: false
+        why: Ein `Mutex` wirkt nur innerhalb eines Prozesses. Zwei Deploy-Jobs sind zwei Prozesse; die Atomarität muss der Kernel liefern, und mit `create_new` tut er das.
+      - text: Der zweite Aufruf blockiert, bis der erste Job die Sperrdatei wieder löscht.
+        correct: false
+        why: "`open` mit `create_new` wartet nicht. Es scheitert sofort. Ob du wartest, es später erneut versuchst oder abbrichst, entscheidet dein Code."
+      - text: "`if !Path::new(p).exists() { File::create(p)?; }` erreicht dasselbe und ist lesbarer."
+        correct: false
+        why: Zwischen `exists()` und `File::create` liegt ein Zeitfenster. Beide Jobs können „existiert nicht“ sehen und beide anlegen. Diese Lücke heißt TOCTOU (time of check to time of use).
+    explanation: |
+      Sobald mehrere Prozesse beteiligt sind, muss die Atomarität vom Kernel kommen. `create_new` gehört dazu: Die Doku nennt es atomar und erklärt, dass sonst zwischen Prüfen und Anlegen ein anderer Prozess die Datei erzeugen könnte. Eine Grenze hat das Muster: Stürzt der erste Job ab, bleibt die Sperrdatei liegen, und kein Deploy läuft mehr, bis jemand sie löscht. `File::try_lock` (seit Rust 1.89) hat dieses Problem nicht, weil das Betriebssystem die Sperre beim Schließen der Datei freigibt, auch beim Absturz.
+    resources:
+      - title: OpenOptions::create_new
+        url: https://doc.rust-lang.org/std/fs/struct.OpenOptions.html#method.create_new
+      - title: File::try_lock
+        url: https://doc.rust-lang.org/std/fs/struct.File.html#method.try_lock
+  - id: tcp-read-grenzen
+    type: choice
+    title: Was liefert ein einziges read?
+    prompt: Der Client schreibt zwei Zeilen, zusammen 16 Bytes. Der Server ruft danach genau einmal `read` mit einem 1024-Byte-Puffer auf. Welche Aussagen stimmen?
+    lang: rust
+    code: |
+      // Client
+      c.write_all(b"PING\n")?;
+      c.write_all(b"ECHO hallo\n")?;
+
+      // Server, ein einziges read:
+      let mut puffer = [0u8; 1024];
+      let n = s.read(&mut puffer)?;
+    options:
+      - text: "`n` kann 5 sein: nur die erste Zeile."
+        correct: true
+        why: Die zweite Zeile kann noch unterwegs sein, wenn der Server liest. `read` liefert, was gerade im Empfangspuffer liegt.
+      - text: "`n` kann 16 sein: beide Zeilen auf einmal."
+        correct: true
+        why: Liegen beide Schreibvorgänge schon im Empfangspuffer des Kernels, kommen sie in einem `read` an. TCP kennt keine Grenze zwischen ihnen.
+      - text: "`n` kann 3 sein: mitten in `PING`."
+        correct: true
+        why: Auch das erlaubt der Vertrag von `Read::read`. Auf Loopback siehst du es selten, im echten Netz mit Paketgrößen, Verlusten und Wiederholungen schon.
+      - text: "`n` ist immer 5, weil jeder `write_all` als eigenes Paket ankommt."
+        correct: false
+        why: TCP überträgt einen Bytestrom. Wie der Kernel ihn in Segmente teilt und wie viel ein `read` davon abholt, hat mit den Aufrufen beim Sender nichts zu tun.
+      - text: "`read` wartet, bis der Puffer voll ist oder der Client die Verbindung schließt."
+        correct: false
+        why: So verhält sich `read_exact`, und das scheitert bei vorzeitigem EOF. `read` kehrt zurück, sobald mindestens ein Byte da ist.
+    explanation: |
+      `read` gibt zurück, was beim Aufruf im Empfangspuffer liegt: mindestens ein Byte, höchstens so viel, wie in deinen Puffer passt. Die Doku zu `Read::read` sagt ausdrücklich, dass ein kleineres `n` kein Fehler ist, auch wenn der Strom noch nicht zu Ende ist. Deshalb braucht jedes Protokoll über TCP Framing: Der Empfänger sammelt Bytes, bis eine Nachricht vollständig ist, zum Beispiel bis zum `\n`. `BufReader::read_line` erledigt genau das.
+    resources:
+      - title: Read::read
+        url: https://doc.rust-lang.org/std/io/trait.Read.html#method.read
+      - title: BufRead::read_line
+        url: https://doc.rust-lang.org/std/io/trait.BufRead.html#method.read_line
+  - id: atomar-ersetzen-schritte
+    type: order
+    title: Konfiguration ohne halbe Datei
+    prompt: Dein Dienst soll `app.toml` über einen `BufWriter` so ersetzen, dass nach einem Absturz oder Stromausfall entweder die alte oder die neue Fassung vollständig da ist. Bring die Schritte in die richtige Reihenfolge.
+    lang: prose
+    lines: |
+      Eine temporäre Datei im Verzeichnis von app.toml anlegen, etwa app.toml.tmp
+      Den neuen Inhalt vollständig in den BufWriter schreiben
+      Den BufWriter mit into_inner leeren und das File zurückbekommen
+      sync_all auf der temporären Datei aufrufen
+      Mit fs::rename die temporäre Datei auf app.toml umbenennen
+      Unter Unix das Verzeichnis öffnen und darauf sync_all aufrufen
+    explanation: |
+      Die temporäre Datei muss im selben Verzeichnis liegen, weil `rename` nur innerhalb eines Dateisystems funktioniert und nur dort atomar ersetzt. `into_inner` schiebt den Pufferinhalt in den Kernel und meldet Fehler, statt sie wie der Drop zu verschlucken. `sync_all` wartet, bis die Daten auf dem Datenträger sind; erst danach darf der Name umgehängt werden, sonst kann `app.toml` nach einem Stromausfall auf eine leere Datei zeigen. Der letzte Schritt macht die Umbenennung selbst dauerhaft, denn laut fsync(2) synchronisiert ein `fsync` auf die Datei nicht den Verzeichniseintrag.
+    resources:
+      - title: std::fs::rename
+        url: https://doc.rust-lang.org/std/fs/fn.rename.html
+      - title: Linux man-pages · fsync(2)
+        url: https://man7.org/linux/man-pages/man2/fsync.2.html#DESCRIPTION
+  - id: ueberschreiben-ohne-truncate
+    type: output
+    title: Geöffnet, geschrieben, verdorben
+    prompt: Was gibt dieses Programm aus? Es läuft in einem leeren Verzeichnis.
+    lang: rust
+    code: |
+      use std::fs::{self, OpenOptions};
+      use std::io::{self, Write};
+
+      fn main() -> io::Result<()> {
+          let p = "app.conf";
+          fs::write(p, "port=8080\n")?;
+
+          let mut f = OpenOptions::new()
+              .append(true)
+              .open(p)?;
+          f.write_all(b"debug=1\n")?;
+
+          let mut f = OpenOptions::new()
+              .write(true)
+              .open(p)?;
+          f.write_all(b"port=90\n")?;
+
+          let inhalt =
+              fs::read_to_string(p)?;
+          print!("{inhalt}");
+          Ok(())
+      }
+    expected: |
+      port=90
+      0
+      debug=1
+    hints:
+      - Nach dem ersten `write_all` steht `port=8080\ndebug=1\n` in der Datei.
+      - "`write(true)` ohne `truncate` und ohne `append` beginnt bei Byte 0 und überschreibt nur so viele Bytes, wie du schreibst."
+    explanation: |
+      `fs::write` legt die Datei mit `port=8080\n` an, 10 Bytes. `append(true)` hängt `debug=1\n` ans Ende. Das zweite `OpenOptions` öffnet mit `write(true)`, aber ohne `truncate`: Der Schreibzeiger steht auf Byte 0, und `port=90\n` überschreibt genau die ersten 8 Bytes. Übrig bleiben die alten Bytes 8 und 9, also `0` und `\n` – eine Zeile `0`, die niemand geschrieben hat. Wer eine Datei komplett ersetzen will, nimmt `File::create`, das kürzt, oder besser das atomare Ersetzen mit `rename`.
+    resources:
+      - title: OpenOptions::write
+        url: https://doc.rust-lang.org/std/fs/struct.OpenOptions.html#method.write
+      - title: OpenOptions::truncate
+        url: https://doc.rust-lang.org/std/fs/struct.OpenOptions.html#method.truncate
+  - id: puffer-zaehlt-aufrufe
+    type: output
+    title: Wie oft klopft das Programm beim Kernel an?
+    prompt: |
+      `Fd` tut so, als wäre er ein Dateideskriptor: Jeder Aufruf von `write` steht für einen Systemaufruf und wird gezählt. `writeln!(w, "req {i}")` reicht die Zeile in drei Stücken weiter – `req `, die Zahl, `\n` – und ruft für jedes Stück `write_all` auf. Was gibt das Programm aus?
+    lang: rust
+    code: |
+      use std::io::{self, Write};
+      use std::io::BufWriter;
+
+      // tut so, als wäre jeder write
+      // ein Systemaufruf, und zählt mit
+      struct Fd(usize);
+
+      impl Write for Fd {
+          fn write(&mut self, b: &[u8])
+              -> io::Result<usize>
+          {
+              self.0 += 1;
+              Ok(b.len())
+          }
+          fn flush(&mut self)
+              -> io::Result<()>
+          {
+              Ok(())
+          }
+      }
+
+      fn main() -> io::Result<()> {
+          let mut roh = Fd(0);
+          let mut puf =
+              BufWriter::new(Fd(0));
+          for i in 0..100 {
+              writeln!(roh, "req {i}")?;
+              writeln!(puf, "req {i}")?;
+          }
+          println!("roh: {}", roh.0);
+          let vorher = puf.get_ref().0;
+          println!("vorher: {vorher}");
+          let fd = puf.into_inner()?;
+          println!("danach: {}", fd.0);
+          Ok(())
+      }
+    expected: |
+      roh: 300
+      vorher: 0
+      danach: 1
+    hints:
+      - Ohne Puffer wird jedes der drei Stücke zu einem eigenen `write`.
+      - Der `BufWriter` hat derzeit 8 KiB Platz. Die 100 Zeilen sind zusammen 690 Bytes lang.
+      - "`get_ref` schaut auf den inneren Writer, ohne den Puffer zu leeren. `into_inner` leert ihn."
+    explanation: |
+      Ohne Puffer ergeben 100 Zeilen mit je drei Stücken 300 Aufrufe von `write`. Bei einem echten `File` wären das 300 Systemaufrufe `write(2)`. Der `BufWriter` kopiert jedes Stück nur in seinen Puffer im Speicher. 690 Bytes passen in 8 KiB, deshalb hat er bis zum `into_inner` noch nichts geschrieben (`vorher: 0`). `into_inner` leert den Puffer mit einem einzigen `write` und gibt den inneren Writer zurück. Darin liegt der Gewinn bei Logdateien – und das Risiko: Wird ein `BufWriter` ohne `flush` gedroppt, liegt bis dahin womöglich alles nur im Puffer.
+    resources:
+      - title: std::io::BufWriter
+        url: https://doc.rust-lang.org/std/io/struct.BufWriter.html
+      - title: Write::write_fmt
+        url: https://doc.rust-lang.org/std/io/trait.Write.html#method.write_fmt
+  - id: exit-code-und-stderr
+    type: output
+    title: Zweimal dasselbe Skript
+    prompt: Das Programm startet dasselbe Shell-Skript zweimal, erst mit `output()`, dann mit `status()`. Was erscheint auf der **Standardausgabe** des Programms? Was auf stderr landet, zählt nicht.
+    lang: rust
+    code: |
+      use std::process::Command;
+
+      const SKRIPT: &str = "echo gebaut
+      echo 'Test rot' >&2
+      exit 3";
+
+      fn text(b: &[u8]) -> &str {
+          str::from_utf8(b).unwrap()
+      }
+
+      fn main() -> std::io::Result<()> {
+          let mut sh =
+              Command::new("sh");
+          sh.arg("-c").arg(SKRIPT);
+
+          let o = sh.output()?;
+          let code = o.status.code();
+          println!("{code:?}");
+          print!("{}", text(&o.stderr));
+
+          let s = sh.status()?;
+          println!("{}", s.success());
+          Ok(())
+      }
+    expected: |
+      Some(3)
+      Test rot
+      gebaut
+      false
+    hints:
+      - "`output()` fängt stdout und stderr des Kindes ab. Welchen der beiden Ströme gibt das Programm danach selbst aus?"
+      - "`status()` lässt das Kind direkt in die geerbten Ausgaben schreiben."
+    explanation: |
+      Ein `Command` lässt sich mehrfach ausführen. Beim ersten Lauf fängt `output()` beide Ströme in `Vec<u8>` ab. Das Programm gibt den Exit-Code `Some(3)` und den abgefangenen stderr-Text aus; das abgefangene `gebaut` gibt es nie aus. Beim zweiten Lauf erbt das Kind stdout und stderr: `gebaut` landet direkt in der Standardausgabe, `Test rot` auf stderr und zählt hier nicht. `status()` kehrt erst zurück, wenn das Skript beendet ist, deshalb steht `gebaut` vor `false`. `success()` ist `false`, weil der Exit-Code nicht 0 ist.
+    resources:
+      - title: Command::output
+        url: https://doc.rust-lang.org/std/process/struct.Command.html#method.output
+      - title: Command::status
+        url: https://doc.rust-lang.org/std/process/struct.Command.html#method.status
+  - id: zeilenprotokoll-loopback
+    type: output
+    title: Drei Stücke über Loopback
+    prompt: Server und Client laufen im selben Programm. Der Client schreibt seine Bytes in drei Stücken, das letzte endet ohne `\n`. Was gibt das Programm aus?
+    lang: rust
+    code: |
+      use std::io::{self, Read, Write};
+      use std::io::{BufRead, BufReader};
+      use std::net::Shutdown;
+      use std::net::TcpListener;
+      use std::net::TcpStream;
+      use std::thread;
+
+      fn antwort(z: &str) -> &str {
+          if z == "PING" {
+              return "PONG";
+          }
+          match z.split_once(' ') {
+              Some(("ECHO", t)) => t,
+              _ => "ERR unbekannt",
+          }
+      }
+
+      fn bediene(s: &TcpStream)
+          -> io::Result<()>
+      {
+          let mut r = BufReader::new(s);
+          let mut w = s;
+          let mut z = String::new();
+          loop {
+              z.clear();
+              let n =
+                  r.read_line(&mut z)?;
+              if n == 0 {
+                  return Ok(());
+              }
+              let a = antwort(z.trim());
+              writeln!(w, "{a}")?;
+          }
+      }
+
+      const LOKAL: &str = "127.0.0.1:0";
+
+      fn main() -> io::Result<()> {
+          let l =
+              TcpListener::bind(LOKAL)?;
+          let addr = l.local_addr()?;
+          let mut c =
+              TcpStream::connect(addr)?;
+          let (s, _) = l.accept()?;
+          let t = thread::spawn(
+              move || bediene(&s),
+          );
+
+          c.write_all(b"PI")?;
+          c.write_all(b"NG\nping\n")?;
+          c.write_all(b"ECHO bye")?;
+          c.shutdown(Shutdown::Write)?;
+          let mut alles = String::new();
+          c.read_to_string(&mut alles)?;
+          print!("{alles}");
+          t.join().unwrap()
+      }
+    expected: |
+      PONG
+      ERR unbekannt
+      bye
+    hints:
+      - "`read_line` liest bis zum nächsten `\\n`, egal in wie vielen Stücken die Bytes ankamen."
+      - Groß- und Kleinschreibung zählt bei `z == "PING"`.
+      - Nach `shutdown(Shutdown::Write)` liefert `read_line` die letzte, unvollständige Zeile und beim nächsten Aufruf `0`.
+    explanation: |
+      TCP überträgt Bytes, keine Schreibaufrufe. Aus `PI` und `NG\nping\n` macht `read_line` die Zeilen `PING` und `ping`, egal wie die Stücke ankamen. `PING` wird zu `PONG`. `ping` besteht den Vergleich nicht, weil Groß- und Kleinschreibung zählt, und hat kein Leerzeichen für `split_once`: `ERR unbekannt`. `ECHO bye` hat kein Zeilenende. Weil der Client danach seine Schreibrichtung schließt, liefert `read_line` die Bytes bis zum EOF als letzte Zeile, also `bye`. Der nächste Aufruf gibt `0` zurück, `bediene` endet, der Thread schließt den Stream, und erst dann endet `read_to_string` beim Client.
+    resources:
+      - title: BufRead::read_line
+        url: https://doc.rust-lang.org/std/io/trait.BufRead.html#method.read_line
+      - title: TcpStream::shutdown
+        url: https://doc.rust-lang.org/std/net/struct.TcpStream.html#method.shutdown
+  - id: log-sync-sperre
+    type: gap
+    title: Log, Sync, Sperre
+    prompt: Ergänze drei Stellen. Die Logzeile soll ans Ende der bestehenden `deploy.log` angehängt werden und einen Stromausfall überleben, bevor das Programm weitermacht. `deploy.lock` darf nur angelegt werden, wenn es noch nicht existiert.
+    lang: rust
+    code: |
+      use std::fs::OpenOptions;
+      use std::io::{self, Write};
+
+      fn main() -> io::Result<()> {
+          let mut f = OpenOptions::new()
+              .⟦append(true)⟧
+              .create(true)
+              .open("deploy.log")?;
+          writeln!(f, "v1.4 live")?;
+          f.⟦sync_all()⟧?;
+
+          let lock = OpenOptions::new()
+              .write(true)
+              .⟦create_new(true)⟧
+              .open("deploy.lock");
+          println!("{}", lock.is_ok());
+          Ok(())
+      }
+    gaps:
+      - label: Ans Ende schreiben
+        hint: Der Modus, in dem jeder `write` am aktuellen Dateiende landet.
+      - label: Auf den Datenträger bringen
+        hint: "`flush` reicht bei einem `File` nicht, es puffert ohnehin nichts. Gesucht ist die Methode, die auf den Datenträger wartet."
+        accept: ["sync_data()"]
+      - label: Nur wenn neu
+        hint: Prüfen und Anlegen in einem einzigen Systemaufruf.
+    explanation: |
+      `append(true)` setzt jeden Schreibvorgang ans aktuelle Ende, auch wenn andere Prozesse gleichzeitig anhängen; mit `create(true)` entsteht die Datei beim ersten Mal. `sync_all` wartet, bis Inhalt und Metadaten auf dem Datenträger sind. `sync_data` darf Metadaten wie die Änderungszeit auslassen; die Dateigröße, die beim Anhängen wächst, synchronisiert `fdatasync` unter Linux laut fsync(2) mit. Hier genügt es also auch. `flush` wäre wirkungslos: `File` hat keinen eigenen Puffer, die Bytes liegen nach `writeln!` schon im Kernel, aber noch nicht auf der Platte. `create_new(true)` scheitert mit `AlreadyExists`, wenn die Sperrdatei schon da ist – atomar, ohne Zeitfenster zwischen Prüfen und Anlegen.
+    resources:
+      - title: OpenOptions::append
+        url: https://doc.rust-lang.org/std/fs/struct.OpenOptions.html#method.append
+      - title: File::sync_data
+        url: https://doc.rust-lang.org/std/fs/struct.File.html#method.sync_data
+  - id: grep-ueber-stdin
+    type: gap
+    title: Logzeilen an grep verfüttern
+    prompt: Das Programm schickt Logzeilen über stdin an `grep -c ERROR` und gibt die Anzahl aus (`2`). Ergänze die Pipe für stdin, das Signal „Eingabe zu Ende“ und das Einsammeln von Ausgabe und Exit-Status.
+    lang: rust
+    code: |
+      use std::io::{self, Write};
+      use std::process::Command;
+      use std::process::Stdio;
+
+      const LOG: &[u8] = b"INFO start
+      ERROR db weg
+      INFO retry
+      ERROR db weg
+      ";
+
+      fn text(b: &[u8]) -> &str {
+          str::from_utf8(b).unwrap()
+      }
+
+      fn main() -> io::Result<()> {
+          let mut cmd =
+              Command::new("grep");
+          cmd.args(["-c", "ERROR"]);
+          cmd.stdin(⟦Stdio::piped()⟧);
+          cmd.stdout(Stdio::piped());
+          let mut kind = cmd.spawn()?;
+
+          let mut ein = kind.stdin
+              .take()
+              .unwrap();
+          ein.write_all(LOG)?;
+          ⟦drop(ein)⟧;
+
+          let o = kind
+              .⟦wait_with_output()⟧?;
+          print!("{}", text(&o.stdout));
+          Ok(())
+      }
+    gaps:
+      - label: stdin als Pipe
+        hint: Ohne diese Einstellung erbt grep das stdin deines Programms, und `kind.stdin` ist `None`.
+      - label: Eingabe beenden
+        hint: grep zählt erst, wenn es EOF sieht. Das kommt, sobald das schreibende Ende geschlossen ist.
+        accept: ["std::mem::drop(ein)"]
+      - label: Warten und einsammeln
+        hint: Eine Methode von `Child`, die auf das Ende wartet und den Rest der abgefangenen Ausgabe liest.
+    explanation: |
+      `Stdio::piped()` legt eine Pipe zwischen deinem Programm und grep an; `kind.stdin` ist dann ein `ChildStdin`, in das du schreibst. grep liest bis EOF und gibt erst danach die Zahl aus. EOF sieht es erst, wenn kein schreibendes Ende mehr offen ist – deshalb `drop(ein)`. Fehlt die Zeile, wartet grep auf weitere Eingabe und `wait_with_output` auf grep, beide für immer. `wait_with_output` liest alle abgefangenen Ströme gleichzeitig zu Ende und wartet auf den Exit-Status, so kann auch eine große Ausgabe keinen Pipe-Puffer verstopfen.
+    resources:
+      - title: Stdio::piped
+        url: https://doc.rust-lang.org/std/process/struct.Stdio.html#method.piped
+      - title: Child::wait_with_output
+        url: https://doc.rust-lang.org/std/process/struct.Child.html#method.wait_with_output
+  - id: health-check-client
+    type: gap
+    title: Ein Health-Check als Client
+    prompt: "`pruefe` verbindet sich mit dem Health-Port, schickt genau eine Anfrage `PING`, signalisiert dann, dass nichts mehr kommt, und liest eine Antwortzeile. Schließt der Server ohne Antwort, soll `Ok(None)` herauskommen. Ergänze das Senden, die Richtung für `shutdown` und das Lesen."
+    lang: rust
+    code: |
+      use std::io::{self, Write};
+      use std::io::{BufRead, BufReader};
+      use std::net::Shutdown;
+      use std::net::TcpStream;
+      use std::time::Duration;
+
+      fn pruefe(addr: &str)
+          -> io::Result<Option<String>>
+      {
+          let mut c =
+              TcpStream::connect(addr)?;
+          let t =
+              Duration::from_secs(2);
+          c.set_read_timeout(Some(t))?;
+          c.⟦write_all⟧(b"PING\n")?;
+          c.shutdown(
+              ⟦Shutdown::Write⟧,
+          )?;
+          let mut r = BufReader::new(c);
+          let mut z = String::new();
+          let n =
+              r.⟦read_line(&mut z)⟧?;
+          Ok((n > 0).then_some(z))
+      }
+
+      const ZIEL: &str = "127.0.0.1:80";
+
+      fn main() {
+          let r = pruefe(ZIEL);
+          println!("{r:?}");
+      }
+    gaps:
+      - label: Ganze Anfrage senden
+        hint: Die Methode, die so lange schreibt, bis alle Bytes draußen sind. `write` darf früher aufhören.
+      - label: Welche Richtung schließen?
+        hint: Nur die Senderichtung – lesen willst du danach noch.
+      - label: Eine Zeile lesen
+        hint: Liest bis einschließlich `\n` in den String und liefert die Zahl der Bytes, `0` bei EOF.
+    explanation: |
+      `write_all` ruft `write` so oft auf, bis die ganze Anfrage beim Kernel ist; ein einzelnes `write` dürfte nach einem Teil aufhören. `shutdown(Shutdown::Write)` schließt nur die Senderichtung. Der Server sieht EOF und weiß, dass keine weitere Anfrage kommt, die Antwort kann trotzdem noch zurückfließen. `Shutdown::Both` würde auch das Lesen beenden. `read_line` liest bis zum Zeilenende und gibt `0` zurück, wenn der Server geschlossen hat, ohne etwas zu senden. Daraus wird `None`. Der Read-Timeout sorgt dafür, dass ein Server, der die Verbindung annimmt und schweigt, den Health-Check nicht für immer festhält. Er schützt nur das Lesen: Antwortet die Gegenstelle gar nicht, kann schon `connect` lange hängen. Im Betrieb nimmst du deshalb [`TcpStream::connect_timeout`](https://doc.rust-lang.org/std/net/struct.TcpStream.html#method.connect_timeout).
+    resources:
+      - title: Write::write_all
+        url: https://doc.rust-lang.org/std/io/trait.Write.html#method.write_all
+      - title: TcpStream::shutdown
+        url: https://doc.rust-lang.org/std/net/struct.TcpStream.html#method.shutdown
+  - id: server-wartet-auf-eof
+    type: bug
+    title: Jeder Health-Check läuft in den Timeout
+    prompt: |
+      Der Load Balancer prüft den Dienst so: verbinden, `PING\n` senden, bis zu 5 s auf eine Antwortzeile warten. Jeder Check scheitert mit `Resource temporarily unavailable (os error 11)`, also mit dem Read-Timeout. Der Integrationstest ist dagegen grün. Er sendet `PING\n`, ruft `shutdown(Shutdown::Write)` auf und liest dann die Antwort. Finde die fehlerhafte Zeile und korrigiere sie.
+    lang: rust
+    code: |
+      use std::io::{self, BufRead};
+      use std::io::{BufReader, Write};
+      use std::net::TcpListener;
+
+      fn bediene(
+          mut r: impl BufRead,
+          mut w: impl Write,
+      ) -> io::Result<()> {
+          let mut z = String::new();
+          r.read_to_string(&mut z)?;
+          let a = match z.trim() {
+              "PING" => "PONG\n",
+              _ => "ERR unbekannt\n",
+          };
+          w.write_all(a.as_bytes())?;
+          w.flush()
+      }
+
+      fn main() -> io::Result<()> {
+          let l = TcpListener::bind(
+              "127.0.0.1:7070",
+          )?;
+          for s in l.incoming() {
+              let s = s?;
+              if let Err(e) = bediene(
+                  BufReader::new(&s),
+                  &s,
+              ) {
+                  eprintln!("{e}");
+              }
+          }
+          Ok(())
+      }
+    lines: [10]
+    fix:
+      - line: 10
+        answers:
+          - r.read_line(&mut z)?;
+          - let n = r.read_line(&mut z)?;
+          - let _ = r.read_line(&mut z)?;
+    hints:
+      - Wann kehrt ein Lesevorgang zurück, der „alles“ lesen will? Was tut der Test, was der Load Balancer nicht tut?
+    explanation: |
+      `read_to_string` liest bis EOF. Bei einer Datei kommt EOF am Dateiende, bei einem Socket erst, wenn die Gegenseite ihre Schreibrichtung schließt. Der Load Balancer hält die Verbindung offen, weil er auf die Antwort wartet; der Server wartet auf EOF. Beide warten, bis der Timeout des Clients zuschlägt. Der Test war grün, weil `shutdown(Shutdown::Write)` genau das EOF liefert, auf das der Server wartet – so versteckt sich dieser Fehler gern. Ein Protokoll über einen Strom braucht eine Nachrichtengrenze. Hier ist es das Zeilenende, und `read_line` liest genau bis dorthin. Auf die Server-Seite gehört außerdem ein Read-Timeout, damit ein schweigender Client die Schleife nicht blockiert.
+    resources:
+      - title: Read::read_to_string
+        url: https://doc.rust-lang.org/std/io/trait.Read.html#method.read_to_string
+      - title: BufRead::read_line
+        url: https://doc.rust-lang.org/std/io/trait.BufRead.html#method.read_line
+  - id: rename-ueber-dateisysteme
+    type: bug
+    title: Auf dem Server – Invalid cross-device link
+    prompt: |
+      `speichere` ersetzt `/etc/app/app.toml` nach dem Muster „temporäre Datei, sync, rename“. Im CI-Container läuft der Test durch. Auf dem Server scheitert jeder Aufruf mit `Error: Os { code: 18, kind: CrossesDevices, message: "Invalid cross-device link" }`. Finde die fehlerhafte Zeile und korrigiere sie. Die temporäre Datei soll weiter `app.tmp` heißen.
+    lang: rust
+    code: |
+      use std::env;
+      use std::fs::{self, File};
+      use std::io::{self, Write};
+      use std::path::Path;
+
+      const DIR: &str = "/etc/app";
+
+      fn speichere(neu: &[u8])
+          -> io::Result<()>
+      {
+          let ziel = Path::new(DIR)
+              .join("app.toml");
+          let tmp = env::temp_dir()
+              .join("app.tmp");
+          let mut f =
+              File::create(&tmp)?;
+          f.write_all(neu)?;
+          f.sync_all()?;
+          fs::rename(&tmp, &ziel)
+      }
+
+      fn main() -> io::Result<()> {
+          speichere(b"port = 8080\n")
+      }
+    lines: [13]
+    fix:
+      - line: 13
+        answers:
+          - let tmp = Path::new(DIR)
+          - let tmp = Path::new("/etc/app")
+          - let tmp = ziel.parent().unwrap()
+    explanation: |
+      `fs::rename` hängt nur einen Verzeichniseintrag um, die Daten bleiben, wo sie sind. Das geht nur innerhalb eines Dateisystems. Auf dem Server ist `/tmp` ein eigenes Dateisystem, oft ein tmpfs im Arbeitsspeicher, die Konfiguration liegt auf einem anderen. `rename(2)` meldet deshalb `EXDEV`, in Rust `ErrorKind::CrossesDevices`. Im CI-Container lag alles auf einem Dateisystem, dort fiel es nicht auf. Die temporäre Datei gehört ins Zielverzeichnis, und nur dort ist das Ersetzen atomar; ein Kopieren über Dateisystemgrenzen wäre es nie. Nebenbei: Scheitert `rename`, bleibt die temporäre Datei liegen. Produktiver Code räumt sie im Fehlerfall weg.
+    resources:
+      - title: std::fs::rename · Errors
+        url: https://doc.rust-lang.org/std/fs/fn.rename.html#errors
+      - title: Linux man-pages · rename(2), EXDEV
+        url: https://man7.org/linux/man-pages/man2/rename.2.html#ERRORS
+  - id: stdout-dann-stderr-haengt
+    type: explain
+    title: Die Migration hängt bei 0 % CPU
+    prompt: Ein Deploy-Werkzeug startet so das Migrationsprogramm. Bei kleinen Datenbanken klappt es. Bei einer großen, bei der `migrate` Tausende Warnungen auf stderr schreibt, hängt alles. Beide Prozesse laufen noch, keiner verbraucht CPU. Erkläre, was passiert, warum es nur bei viel Ausgabe auftritt und wie du es behebst.
+    lang: rust
+    code: |
+      use std::io::Read;
+      use std::process::Command;
+      use std::process::Stdio;
+
+      fn main() -> std::io::Result<()> {
+          let mut cmd =
+              Command::new("./migrate");
+          cmd.stdout(Stdio::piped());
+          cmd.stderr(Stdio::piped());
+          let mut kind = cmd.spawn()?;
+
+          let mut o = String::new();
+          let mut e = String::new();
+          kind.stdout.take().unwrap()
+              .read_to_string(&mut o)?;
+          kind.stderr.take().unwrap()
+              .read_to_string(&mut e)?;
+          let s = kind.wait()?;
+          println!("{s}\n{o}");
+          Ok(())
+      }
+    points:
+      - Eine Pipe hat einen begrenzten Puffer im Kernel (Linux standardmäßig 64 KiB). Ist er voll, blockiert der `write` des Kindes, bis jemand liest.
+      - Das Programm liest zuerst stdout bis EOF. EOF kommt erst, wenn `migrate` stdout schließt, praktisch also bei seinem Ende.
+      - "Schreibt `migrate` mehr als einen Puffer voll auf stderr, bleibt es stehen. Das Programm wartet auf stdout, `migrate` auf einen Leser für stderr: ein Deadlock ohne CPU-Last."
+      - Bei wenig Ausgabe passt stderr komplett in den Puffer, deshalb fällt der Fehler erst bei großen Ausgaben auf.
+      - "Lösung: beide Ströme gleichzeitig lesen – mit `wait_with_output()`, `output()` oder einem zweiten Thread für stderr – oder stderr gar nicht pipen (erben, `Stdio::null()`, Datei)."
+    explanation: |
+      Beide Ströme des Kindes hängen an Pipes, und jede Pipe hat einen festen Puffer im Kernel, unter Linux standardmäßig 64 KiB. Das Werkzeug liest zuerst stdout bis zum Ende. Dieses Ende kommt erst, wenn `migrate` stdout schließt, also wenn es fertig ist. Bei einer großen Datenbank schreibt `migrate` aber mehr als 64 KiB Warnungen auf stderr. Den stderr-Puffer leert niemand, denn das Werkzeug ist noch mit stdout beschäftigt. Der nächste `write` auf stderr blockiert, `migrate` steht, stdout endet nie, und das Werkzeug wartet für immer. Beide schlafen, deshalb 0 % CPU. Bei kleinen Datenbanken passen die Warnungen in den Puffer, das Programm läuft durch, und der Fehler bleibt bis zur ersten großen Migration unsichtbar. Die Lösung ist, beide Ströme gleichzeitig zu lesen. `kind.wait_with_output()` macht das intern; für gestreamte Ausgabe liest ein zweiter Thread stderr, während der Hauptthread stdout verarbeitet. Braucht man stderr nicht, lässt man es erben oder leitet es in eine Datei um.
+    resources:
+      - title: Linux man-pages · pipe(7), Pipe capacity
+        url: https://man7.org/linux/man-pages/man7/pipe.7.html#DESCRIPTION
+      - title: Stdio::piped
+        url: https://doc.rust-lang.org/std/process/struct.Stdio.html#method.piped
+  - id: health-protokoll-entwerfen
+    type: practice
+    title: Ein Health-Protokoll in sechs Zeilen
+    prompt: |
+      Dein Dienst bekommt einen eigenen TCP-Port für Load Balancer und Monitoring. Schreib die Spezifikation des Zeilenprotokolls in höchstens sechs kurzen Zeilen, eine Regel pro Zeile. Sie soll so eindeutig sein, dass jemand anderes Server und Client danach bauen kann, ohne dich zu fragen.
+
+      Regle mindestens: woran eine Nachricht endet, welche Befehle es gibt und was sie antworten, was bei Unbekanntem passiert, wie lang eine Zeile höchstens sein darf und wer die Verbindung wann schließt.
+    lang: text
+    starter: |
+      Format:
+      Befehle:
+      Unbekannt:
+      Grenzen:
+      Ende:
+    solution: |
+      Zeile: GROSSBUCHSTABEN + \n
+      PING -> PONG
+      HEALTH -> OK | DEGRADED <grund>
+      Sonst -> ERR unbekannt, offen
+      >256 Bytes -> ERR zu lang, zu
+      5 s still oder EOF -> Server zu
+    checklist:
+      - Das Nachrichtenende ist festgelegt, zum Beispiel `\n`.
+      - Jeder Befehl hat genau eine Antwortzeile mit festem erstem Wort, auch der Fehlerfall.
+      - Unbekannte Befehle bekommen eine eigene Fehlerantwort, und es steht fest, ob die Verbindung danach offen bleibt.
+      - Es gibt eine Obergrenze für die Zeilenlänge und eine Regel für das Überschreiten.
+      - Ein Leerlauf-Timeout ist genannt, und es ist klar, wer nach EOF oder Timeout schließt.
+      - Groß- und Kleinschreibung der Befehle ist festgelegt.
+    explanation: |
+      Ein Protokoll ist ein Vertrag zwischen zwei Programmen, die sich nicht absprechen können. Über TCP musst du die Nachrichtengrenze selbst festlegen, sonst weiß der Server nicht, wann eine Anfrage vollständig ist. Die Grenzen schützen den Dienst: Ohne Längenlimit füllt ein Client mit einer endlosen Zeile den Speicher – die Doku von `read_line` warnt genau davor –, ohne Timeout hält ein schweigender Client einen Thread fest. Feste erste Wörter wie `OK`, `DEGRADED` und `ERR` machen Antworten für Load Balancer und Skripte auswertbar, ohne Freitext zu parsen. Die Musterlösung ist eine von vielen guten. Vergleiche, welche Fälle deine regelt und welche nicht.
+    resources:
+      - title: BufRead::read_line
+        url: https://doc.rust-lang.org/std/io/trait.BufRead.html#method.read_line
+      - title: Read::take
+        url: https://doc.rust-lang.org/std/io/trait.Read.html#method.take
