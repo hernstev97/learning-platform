@@ -1,26 +1,36 @@
 id: scraping-browser
 title: Scraping & Browser-Automatisierung
 level: 2
-minutes: 180
+minutes: 240
 summary: HTML strukturiert auswerten und dynamische Oberflächen mit Playwright bedienen – mit stabilen Selektoren,
-  klaren Grenzen und reproduzierbaren Fixtures.
+  gespeichertem Login, Waits mit Zeitgrenze, Belegen bei Fehlern und gemocktem Netzwerk.
 goals:
 - Du wählst API, statisches HTML oder Browser nach der tatsächlichen Datenquelle.
 - Du extrahierst HTML mit Parsern und behandelst fehlende Elemente.
-- Du nutzt Playwright-Locators und zustandsbezogenes Warten.
+- Du nutzt Playwright-Locators und zustandsbezogenes Warten mit bewussten Zeitgrenzen.
 - Du prüfst Ziel-URLs und trennst Extraktion von schreibenden Aktionen.
+- Du speicherst einen Login mit storage_state, zeichnest bei Fehlern Trace und Screenshot auf und ersetzt
+  Netzwerkantworten mit route.
 resources:
 - &id001
   title: Beautiful Soup · Documentation
   url: https://www.crummy.com/software/BeautifulSoup/bs4/doc/
 - title: Playwright · Locators
   url: https://playwright.dev/python/docs/locators
-- title: Playwright · Auto-waiting
-  url: https://playwright.dev/python/docs/actionability
-- title: Python · HTMLParser
-  url: https://docs.python.org/3/library/html.parser.html
+- &pwauth
+  title: Playwright · Authentication
+  url: https://playwright.dev/python/docs/auth
+- &pwnet
+  title: Playwright · Network
+  url: https://playwright.dev/python/docs/network
+- &pwtrace
+  title: Playwright · Trace viewer
+  url: https://playwright.dev/python/docs/trace-viewer
+place: pc
 lesson: |
   Ein interner Katalog hat keine Exportfunktion. Du möchtest regelmäßig Titel und Detail-Links für einen Bericht übernehmen. Die Seite kann die Daten schon im HTML enthalten, sie später per JavaScript laden oder eine dokumentierte API anbieten. Die richtige Lösung beginnt damit, diese Quelle zu erkennen, statt sofort einen Browser zu starten.
+
+  Dieses Modul ist als „Am PC“ markiert, weil Playwright einen echten Browser auf deinem Rechner braucht. Lektion und die meisten Übungen gehen auch unterwegs: Die Playwright-Logik ist dort hinter Fakes geprüft, nur die letzte Praxisaufgabe startet einen Browser.
 
   Automatisiere nur zugängliche, für deinen Auftrag erlaubte Inhalte. Die Beispiele verwenden lokale HTML-Fixtures oder reservierte Beispieldomains. Sie umgehen keine Anmeldung oder Zugriffskontrolle. Das technische Ziel ist eine überprüfbare Extraktion, deren Ergebnis sich bei einer Layoutänderung sichtbar als fehlerhaft meldet.
 
@@ -132,6 +142,99 @@ lesson: |
 
   Schreibende Aktionen wie Löschen, Bestellen oder Senden brauchen einen ausdrücklich autorisierten Auftrag und eine überprüfbare Auswahl. Ein Scraping-Job sollte solche Funktionen gar nicht anbieten, wenn seine Aufgabe nur Lesen ist. Ein Loginzustand kann Zugangsdaten und Sitzungsrechte enthalten; behandle gespeicherte Browserzustände wie Geheimnisse und lege sie nicht ins Repository.
 
+  ## Login-Zustand speichern mit storage_state
+
+  Viele interne Werkzeuge verlangen eine Anmeldung. Bei jedem Lauf neu einzuloggen kostet Zeit, löst Sicherheitsabfragen aus und belastet die Anmeldung des Anbieters. Playwright kann den Zustand eines Browser-Kontexts speichern: Cookies und Local Storage, mit `indexed_db=True` (seit Playwright 1.51) auch IndexedDB. Manche Anwendungen, etwa mit Firebase Authentication, legen ihr Login-Token dort ab; ohne den Parameter fehlt es dann still. [`context.storage_state(path=…)`](https://playwright.dev/python/docs/auth) schreibt ihn als JSON-Datei, `browser.new_context(storage_state=…)` lädt ihn in einen neuen Kontext. Session Storage gehört laut Dokumentation nicht dazu.
+
+  Den ersten Login macht ein Mensch, in einem sichtbaren Browser. Das Skript wartet mit einem Ziel, nämlich der Startseite nach dem Login, und mit einer großzügigen Grenze:
+
+  ```python
+  from playwright.sync_api import sync_playwright
+
+  STATE = "playwright/.auth/katalog.json"
+
+  with sync_playwright() as p:
+      browser = p.chromium.launch(headless=False)
+      context = browser.new_context()
+      page = context.new_page()
+      page.goto("https://katalog.example.org/login")
+      page.wait_for_url("**/start", timeout=300_000)
+      context.storage_state(path=STATE)
+      browser.close()
+  ```
+
+  Spätere Läufe laden den Zustand und prüfen, ob die Sitzung noch gilt. Landet die Seite wieder beim Login, ist sie abgelaufen; der Job meldet das deutlich, statt auf der Login-Seite nach Kursen zu suchen.
+
+  ```python
+  context = browser.new_context(storage_state=STATE)
+  page = context.new_page()
+  page.goto("https://katalog.example.org/kurse")
+  if "/login" in page.url:
+      raise SystemExit("Sitzung abgelaufen: neu anmelden")
+  ```
+
+  Die Datei enthält Sitzungs-Cookies, mit denen sich jeder als du ausgeben kann. Die Playwright-Dokumentation empfiehlt einen Ordner `playwright/.auth` in `.gitignore`. Behandle die Datei wie ein Passwort: nur für dich lesbar, nie im Repository, nie in einem Ticket. Eine Sicherheitsabfrage beim Login automatisierst du nicht weg; sie ist der Grund, warum ein Mensch den ersten Login macht.
+
+  ## Warten mit Ziel und Zeitgrenze
+
+  Playwright wartet bei Aktionen wie `click` automatisch, bis das Element bedienbar ist, standardmäßig bis zu 30 Sekunden; `page.set_default_timeout()` ändert das. Assertions mit [`expect`](https://playwright.dev/python/docs/test-assertions) prüfen wiederholt, bis ihr Zustand eintritt, standardmäßig 5 Sekunden; `timeout=` setzt die Grenze für eine einzelne Prüfung. Hängt ein Ergebnis an einer Netzwerkantwort, wartest du auf genau diese Antwort.
+
+  ```python
+  page.set_default_timeout(15_000)
+  with page.expect_response("**/api/kurse") as info:
+      page.get_by_role("button", name="Laden").click()
+  print(info.value.status)
+  expect(page.get_by_role("row")).to_have_count(12, timeout=10_000)
+  ```
+
+  Ein fester Schlaf ist kein Warten mit Ziel. Die Dokumentation von [`page.wait_for_timeout`](https://playwright.dev/python/docs/api/class-page#page-wait-for-timeout) ist deutlich: „Never wait for timeout in production. Tests that wait for time are inherently flaky.“
+
+  Eine überschrittene Grenze ist eine Exception, und zwar in zwei Formen. Aktionen wie `click` werfen `playwright.sync_api.TimeoutError`, `expect` wirft `AssertionError`. Fange sie nicht weg. Sie sind der Moment, in dem du Belege sammelst.
+
+  ## Belege bei Fehlern: Tracing und Screenshots
+
+  Ein nächtlicher Browser-Job scheitert, und im Log steht nur „Timeout 15000ms exceeded“. Was war auf der Seite zu sehen? Ein [Trace](https://playwright.dev/python/docs/trace-viewer) zeichnet jeden Schritt auf: Aktionen, DOM-Schnappschüsse, Screenshots, Netzwerk und Konsole. Er entsteht nur, wenn du ihn vor dem Lauf startest. Gespeichert wird er nur, wenn du beim Stoppen einen Pfad angibst. Ein Screenshot der ganzen Seite ergänzt ihn.
+
+  ```python
+  context.tracing.start(screenshots=True, snapshots=True,
+                        sources=True)
+  try:
+      lauf(page)
+  except Exception:
+      page.screenshot(path="fehler.png", full_page=True)
+      context.tracing.stop(path="trace.zip")
+      raise
+  else:
+      context.tracing.stop()
+  ```
+
+  Ohne Pfad verwirft `tracing.stop()` die Aufzeichnung; erfolgreiche Läufe hinterlassen so keine Dateien. Das `raise` am Ende ist wichtig: Der Job soll trotzdem scheitern. `playwright show-trace trace.zip` öffnet den Trace am Rechner. Auch [trace.playwright.dev](https://trace.playwright.dev) zeigt ihn an und lädt ihn laut Dokumentation vollständig im Browser, ohne Daten zu übertragen.
+
+  Ein Trace enthält, was der Browser gesehen hat, also auch Cookies, Header und Formulareingaben. Er ist so vertraulich wie die `storage_state`-Datei. Bewahre Belege nur so lange auf, wie du sie zur Diagnose brauchst.
+
+  ## Netzwerk mocken mit route
+
+  [`page.route(muster, handler)`](https://playwright.dev/python/docs/network) fängt Anfragen ab, bevor sie das Netz erreichen. Der Handler entscheidet für jede Anfrage genau einmal: `route.fulfill(…)` antwortet selbst, `route.abort()` bricht ab, `route.continue_()` lässt sie durch. Seit Playwright 1.29 nimmt `fulfill` mit `json=` eine Python-Struktur.
+
+  ```python
+  KURSE = [{"titel": "Python", "plaetze": 3}]
+
+  def handler(route):
+      url = route.request.url
+      if url.endswith("/api/kurse"):
+          route.fulfill(json=KURSE)
+      elif "tracker" in url:
+          route.abort()
+      else:
+          route.continue_()
+
+  page.route("**/*", handler)
+  ```
+
+  Damit testest du die Extraktion gegen feste Daten, simulierst einen Fehler 500 oder eine leere Liste und blockierst Tracker, die einen Test nur langsamer machen. Das Muster ist ein Glob, der **die ganze URL** treffen muss: `**` steht für beliebige Zeichen einschließlich `/`, `*` für beliebige Zeichen außer `/`. `"/api/kurse"` trifft deshalb `http://katalog.test/api/kurse` nicht, `"**/api/kurse"` schon. Ein lokaler Lauf zeigt genau das: Mit dem kurzen Muster kommen die echten Daten durch.
+
+  Zwei Grenzen gehören dazu. Anfragen eines Service Workers sieht `route` unter Umständen nicht; `browser.new_context(service_workers="block")` schaltet ihn ab. Und Mocks gehören in Tests. Ein Job, der echte Daten abholen soll, darf nicht stillschweigend gegen gemockte Antworten laufen.
+
   ## Häufige Fehler und Wartung
 
   Ein Parser, der plötzlich null Datensätze liefert, kann eine leere Quelle oder einen kaputten Selektor sehen. Diese Fälle sind ohne zusätzliche Prüfung nicht unterscheidbar. Nutze bekannte Strukturmerkmale und zähle erwartete Container. Speichere für Tests kleine anonymisierte HTML-Fixtures, damit Änderungen am Extraktor reproduzierbar sind.
@@ -158,9 +261,12 @@ lesson: |
   - Wähle API, HTML-Parser oder Browser anhand der Quelle.
   - Nutze Struktur und prüfe fehlende oder mehrdeutige Treffer.
   - Löse Links auf und begrenze tatsächliche Ziele.
-  - Locators und Assertions ersetzen pauschale Schlafzeiten.
+  - Locators und Assertions ersetzen pauschale Schlafzeiten; jede Wartezeit hat eine bewusste Grenze.
   - Extraktion und schreibende Aktionen bleiben getrennte Aufträge.
   - Fixtures machen Layoutänderungen überprüfbar.
+  - `storage_state` spart den Login und ist so vertraulich wie ein Passwort.
+  - Bei Fehlern sichern Trace und Screenshot, was der Browser gesehen hat; der Job scheitert trotzdem.
+  - `route` ersetzt Antworten in Tests; das Muster muss die ganze URL treffen.
 exercises:
 - id: zugriff
   type: choice
@@ -340,6 +446,208 @@ exercises:
     dass dann zufällig der erste falsche Wert verwendet wird.
   resources:
   - *id001
+- id: route-handler
+  type: code
+  title: Ein Handler für route
+  prompt: |
+    Schreibe `handler(route)` für `page.route("**/*", handler)`. `route.request` hat `.url` und `.method`. Entscheide für jede Anfrage genau einmal:
+
+    - Host ist nicht `katalog.test`: `route.abort()`.
+    - Jede Methode außer `GET` und `HEAD` auf einen Pfad, der mit `/api/` beginnt: `route.fulfill(status=403, json={"fehler": "nur lesen"})`. Der Scraper darf nichts verändern.
+    - `GET` auf den Pfad `/api/kurse`: `route.fulfill(json=KURSE)`.
+    - Alles andere: `route.continue_()`.
+
+    Prüfe den Host mit `urllib.parse.urlsplit`, nicht mit `in`.
+  lang: python
+  starter: |-
+    from urllib.parse import urlsplit
+
+    KURSE = [{"titel": "Python", "plaetze": 3}]
+
+    def handler(route):
+        url = route.request.url
+        if "/api/kurse" in url:
+            route.fulfill(json=KURSE)
+        route.continue_()
+  solution: |-
+    from urllib.parse import urlsplit
+
+    KURSE = [{"titel": "Python", "plaetze": 3}]
+
+    def handler(route):
+        anfrage = route.request
+        teile = urlsplit(anfrage.url)
+        if teile.hostname != "katalog.test":
+            route.abort()
+        elif (anfrage.method not in ("GET", "HEAD")
+              and teile.path.startswith("/api/")):
+            route.fulfill(status=403,
+                          json={"fehler": "nur lesen"})
+        elif (anfrage.method == "GET"
+              and teile.path == "/api/kurse"):
+            route.fulfill(json=KURSE)
+        else:
+            route.continue_()
+  setup: |-
+    class _Anfrage:
+        def __init__(self, url, method):
+            self.url = url
+            self.method = method
+
+    class FakeRoute:
+        """Merkt sich die Entscheidungen wie Playwrights Route (fulfill, abort, continue_)."""
+        def __init__(self, url, method="GET"):
+            self.request = _Anfrage(url, method)
+            self.aufrufe = []
+        def fulfill(self, **kw):
+            self.aufrufe.append(("fulfill", kw))
+        def abort(self, error_code="failed"):
+            self.aufrufe.append(("abort", {}))
+        def continue_(self, **kw):
+            self.aufrufe.append(("continue_", kw))
+
+    def entscheide(url, method="GET"):
+        r = FakeRoute(url, method)
+        handler(r)
+        assert len(r.aufrufe) == 1, f"{url}: {len(r.aufrufe)} Entscheidungen statt genau einer"
+        return r.aufrufe[0]
+  tests:
+  - name: Kurse aus der Fixture
+    code: |-
+      art, kw = entscheide("http://katalog.test/api/kurse")
+      assert art == "fulfill", art
+      assert kw.get("json") == KURSE, kw
+  - name: Fremde Hosts werden blockiert
+    code: |-
+      for url in ["https://tracker.example.com/p.js",
+                  "http://katalog.test.evil.example/api/kurse"]:
+          art, _ = entscheide(url)
+          assert art == "abort", f"{url}: {art}"
+  - name: Schreibende API-Aufrufe werden abgelehnt
+    code: |-
+      for m in ("POST", "PUT", "PATCH", "DELETE"):
+          art, kw = entscheide("http://katalog.test/api/buchen/7", m)
+          assert art == "fulfill" and kw.get("status") == 403, (m, art, kw)
+  - name: Seiten und Bilder laufen weiter
+    code: |-
+      for url in ["http://katalog.test/kurse",
+                  "http://katalog.test/logo.png"]:
+          art, _ = entscheide(url)
+          assert art == "continue_", f"{url}: {art}"
+  hints:
+  - '`urlsplit(url).hostname` liefert den Host ohne Port, `.path` den Pfad.'
+  - Jeder Zweig ruft genau eine der drei Methoden auf. Eine `if … elif … else`-Kette sorgt dafür.
+  explanation: |
+    Playwright erwartet, dass ein Handler jede Anfrage genau einmal erledigt. Der Starter ruft nach `fulfill` zusätzlich `continue_` auf, und er erkennt `katalog.test.evil.example` als eigenen Host, weil `in` nur Teilstrings sucht. `urlsplit` vergleicht den echten Hostnamen. Die 403 für `POST` macht aus dem Test eine Sicherung: Versucht der Scraper doch zu buchen, scheitert die Anfrage, statt etwas zu verändern.
+  resources:
+  - *pwnet
+  - title: Playwright · Route
+    url: https://playwright.dev/python/docs/api/class-route
+- id: belege-bei-fehler
+  type: code
+  title: Trace und Screenshot nur bei Fehlern
+  prompt: |
+    Schreibe `mit_belegen(context, page, aktion, name)`.
+
+    - Starte `context.tracing.start(screenshots=True, snapshots=True)` und rufe dann `aktion(page)` auf.
+    - Gelingt sie, stoppe mit `context.tracing.stop()` ohne Pfad und gib das Ergebnis von `aktion` zurück.
+    - Wirft sie, speichere `page.screenshot(path=f"{name}.png", full_page=True)` und `context.tracing.stop(path=f"{name}.zip")` und wirf danach die ursprüngliche Exception weiter.
+    - Scheitert der Screenshot selbst, wird der Trace trotzdem gespeichert, und es kommt die ursprüngliche Exception durch.
+  lang: python
+  starter: |-
+    def mit_belegen(context, page, aktion, name):
+        context.tracing.start(screenshots=True,
+                              snapshots=True)
+        try:
+            return aktion(page)
+        except Exception:
+            page.screenshot(path=f"{name}.png")
+            return None
+        finally:
+            context.tracing.stop()
+  solution: |-
+    import contextlib
+
+    def mit_belegen(context, page, aktion, name):
+        context.tracing.start(screenshots=True,
+                              snapshots=True)
+        try:
+            ergebnis = aktion(page)
+        except Exception:
+            with contextlib.suppress(Exception):
+                page.screenshot(path=f"{name}.png",
+                                full_page=True)
+            context.tracing.stop(path=f"{name}.zip")
+            raise
+        context.tracing.stop()
+        return ergebnis
+  setup: |-
+    class FakeTracing:
+        def __init__(self):
+            self.log = []
+        def start(self, **kw):
+            self.log.append(("start", kw))
+        def stop(self, path=None):
+            self.log.append(("stop", path))
+
+    class FakeContext:
+        def __init__(self):
+            self.tracing = FakeTracing()
+
+    class FakePage:
+        def __init__(self, kaputt=False):
+            self.kaputt = kaputt
+            self.bilder = []
+        def screenshot(self, **kw):
+            if self.kaputt:
+                raise RuntimeError("Seite abgestürzt")
+            self.bilder.append(kw)
+
+    def scheitert(page):
+        raise TimeoutError("Timeout 15000ms exceeded")
+  tests:
+  - name: Erfolg – Trace verwerfen, Ergebnis zurück
+    code: |-
+      ctx, page = FakeContext(), FakePage()
+      r = mit_belegen(ctx, page, lambda p: 42, "lauf")
+      assert r == 42, r
+      assert ctx.tracing.log == [
+          ("start", {"screenshots": True, "snapshots": True}),
+          ("stop", None)], ctx.tracing.log
+      assert page.bilder == []
+  - name: Fehler – Screenshot, Trace, Exception
+    code: |-
+      ctx, page = FakeContext(), FakePage()
+      try:
+          mit_belegen(ctx, page, scheitert, "lauf-7")
+      except TimeoutError:
+          pass
+      else:
+          assert False, "Die Exception wurde verschluckt."
+      assert page.bilder == [{"path": "lauf-7.png",
+                              "full_page": True}], page.bilder
+      assert ctx.tracing.log[-1] == ("stop", "lauf-7.zip"), (
+          ctx.tracing.log)
+  - name: Kaputter Screenshot verdeckt nichts
+    code: |-
+      ctx, page = FakeContext(), FakePage(kaputt=True)
+      try:
+          mit_belegen(ctx, page, scheitert, "lauf-8")
+      except TimeoutError:
+          pass
+      except RuntimeError:
+          assert False, "Der Screenshot-Fehler verdeckt die Ursache."
+      assert ctx.tracing.log[-1] == ("stop", "lauf-8.zip"), (
+          ctx.tracing.log)
+  hints:
+  - Im `except`-Zweig sammelst du die Belege und beendest mit einem nackten `raise`.
+  - '`contextlib.suppress(Exception)` lässt einen Fehler beim Screenshot ins Leere laufen.'
+  explanation: |
+    Der Starter verschluckt die Exception mit `return None`, und der Job meldet Erfolg. Außerdem stoppt er den Trace immer ohne Pfad, sodass gerade im Fehlerfall nichts gespeichert wird. Die Lösung sammelt Belege nur dann, wenn sie gebraucht werden, und wirft danach dieselbe Exception weiter. Ein Screenshot einer abgestürzten Seite kann selbst scheitern; dieser Folgefehler darf weder den Trace verhindern noch die eigentliche Ursache verdecken.
+  resources:
+  - *pwtrace
+  - title: Python · contextlib.suppress
+    url: https://docs.python.org/3/library/contextlib.html#contextlib.suppress
 - id: selektor
   type: bug
   title: Die fehlende Karte wird verschwiegen
@@ -361,6 +669,30 @@ exercises:
     von einem erfolgreichen leeren Ergebnis.
   resources:
   - *id001
+- id: route-muster
+  type: bug
+  title: Der Mock greift nicht
+  prompt: |
+    Der Test soll die Kursliste aus einer Fixture bekommen, lädt aber die echten Daten von `http://katalog.test/api/kurse`. Finde die Zeile, die das verursacht, und korrigiere sie.
+  lang: python
+  code: |-
+    def test_kurse(page):
+        page.route("/api/kurse", liefere_kurse)
+        page.goto("http://katalog.test/")
+        page.get_by_role("button", name="Laden").click()
+        expect(page.get_by_role("row")).to_have_count(2)
+  lines:
+  - 2
+  fix:
+  - line: 2
+    answers:
+    - page.route("**/api/kurse", liefere_kurse)
+    - page.route("http://katalog.test/api/kurse", liefere_kurse)
+    - page.route("**/api/kurse*", liefere_kurse)
+  explanation: |
+    Ein Glob in `page.route` muss die ganze URL treffen. `"/api/kurse"` passt nicht auf `http://katalog.test/api/kurse`, also geht die Anfrage ans Netz. `"**/api/kurse"` lässt beliebige Zeichen davor zu. Ein lokaler Lauf mit Playwright 1.63 zeigt genau dieses Verhalten. Nur wenn der Kontext eine `base_url` hat, löst Playwright ein Muster ohne `*` relativ dazu auf.
+  resources:
+  - *pwnet
 - id: warten
   type: explain
   title: Warum eine Assertion nach dem Klick?
@@ -381,26 +713,84 @@ exercises:
 - id: fixture-browser
   type: practice
   title: Ein lokaler Katalogtest
-  prompt: Lege eine lokale HTML-Seite mit Suchfeld, Suchen-Button und Kursüberschrift an. Bediene sie mit Playwright
-    und prüfe die Extraktion.
+  prompt: |
+    Am PC mit installiertem Playwright: Baue einen Test gegen einen Katalog, den du selbst kontrollierst. Liefere Login-Seite, Katalogseite und `/api/kurse` über `context.route` aus, ganz ohne Server. Melde dich einmal an und speichere den Zustand mit `storage_state`; ein zweiter Kontext lädt ihn und kommt ohne Login auf die Katalogseite. Klicke „Laden“, warte auf die Antwort von `/api/kurse` und prüfe die Zeilen. Bei einem Fehler entstehen Screenshot und Trace, bei Erfolg keine Dateien.
   lang: python
   solution: |-
-    from playwright.sync_api import sync_playwright, expect
+    from pathlib import Path
+    from playwright.sync_api import expect, sync_playwright
+
+    LOGIN = """<label>Name<input></label><button>Anmelden</button>
+    <script>document.querySelector("button").onclick = () => {
+      document.cookie = "sitzung=platzhalter; path=/";
+      location.href = "/kurse"; };</script>"""
+    KATALOG = """<h1>Kurse</h1><button>Laden</button><table></table>
+    <script>document.querySelector("button").onclick = async () => {
+      const r = await fetch("/api/kurse"); const d = await r.json();
+      document.querySelector("table").innerHTML =
+        d.map(k => `<tr><td>${k.titel}</td></tr>`).join(""); };</script>"""
+    KURSE = [{"titel": "Python"}, {"titel": "Rust"}]
+    STATE = Path("playwright/.auth/katalog.json")
+
+    def server(route):
+        req = route.request
+        if req.url.endswith("/api/kurse"):
+            route.fulfill(json=KURSE)
+        elif req.url.endswith("/login"):
+            route.fulfill(body=LOGIN, content_type="text/html")
+        elif "sitzung=" in (req.header_value("cookie") or ""):
+            route.fulfill(body=KATALOG, content_type="text/html")
+        else:
+            route.fulfill(body='<script>location.href="/login"</script>',
+                          content_type="text/html")
+
+    def anmelden(browser):
+        context = browser.new_context()
+        context.route("http://katalog.test/**", server)
+        page = context.new_page()
+        page.goto("http://katalog.test/login")
+        page.get_by_label("Name").fill("test")
+        page.get_by_role("button", name="Anmelden").click()
+        page.wait_for_url("**/kurse", timeout=10_000)
+        STATE.parent.mkdir(parents=True, exist_ok=True)
+        context.storage_state(path=STATE)
+        context.close()
+
+    def katalog_pruefen(page):
+        page.goto("http://katalog.test/kurse")
+        if "/login" in page.url:
+            raise RuntimeError("Sitzung abgelaufen")
+        with page.expect_response("**/api/kurse") as info:
+            page.get_by_role("button", name="Laden").click()
+        assert info.value.status == 200
+        expect(page.get_by_role("row")).to_have_count(2)
+
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        page = browser.new_page()
-        page.set_content('<label>Suche<input></label><button>Suchen</button><h2>Python</h2>')
-        page.get_by_label("Suche").fill("Python")
-        page.get_by_role("button", name="Suchen", exact=True).click()
-        expect(page.get_by_role("heading", name="Python", exact=True)).to_be_visible()
-        browser.close()
+        anmelden(browser)
+        context = browser.new_context(storage_state=STATE)
+        context.route("http://katalog.test/**", server)
+        context.tracing.start(screenshots=True, snapshots=True)
+        page = context.new_page()
+        try:
+            katalog_pruefen(page)
+        except Exception:
+            page.screenshot(path="fehler.png", full_page=True)
+            context.tracing.stop(path="trace.zip")
+            raise
+        else:
+            context.tracing.stop()
+        finally:
+            browser.close()
   checklist:
-  - Der Test benutzt eine selbst kontrollierte lokale Fixture.
-  - Selektoren verwenden Label, Rolle oder stabile Test-ID.
-  - Fehlende Überschrift lässt die Prüfung scheitern.
-  - Es gibt keine pauschalen sleep-Aufrufe.
-  - Browser und temporäre Daten werden aufgeräumt.
-  explanation: Die Fixture prüft die Bedien- und Selektorlogik ohne fremden Dienst. Eine echte dynamische Suchfunktion
-    benötigt zusätzlich ihren eigenen Ergebnis- und Ladezustandstest.
+  - Alle Seiten und die API kommen aus `route`; der Test braucht kein Netz und keinen Server.
+  - Der zweite Kontext lädt `storage_state` und landet ohne Login auf der Katalogseite.
+  - '`playwright/.auth/` steht in `.gitignore`.'
+  - Gewartet wird auf die Antwort von `/api/kurse` und auf die Zeilen, nie mit festen Pausen.
+  - Ein absichtlich falscher Button-Name erzeugt `fehler.png` und `trace.zip`, und der Test scheitert.
+  - Ein erfolgreicher Lauf hinterlässt keinen Trace.
+  explanation: |
+    Die Musterlösung lief so mit Playwright 1.63 und Chromium. Der Katalog liegt vollständig in `route`; dadurch prüfst du Login-Zustand, Warten und Extraktion reproduzierbar, ohne einen fremden Dienst zu berühren. Das Cookie ist ein Platzhalter, der Ablauf aber derselbe wie bei einer echten Anmeldung. Probiere den Fehlerfall bewusst aus und öffne den Trace mit `playwright show-trace trace.zip`: Dort siehst du jeden Schritt mit Schnappschuss.
   resources:
-  - *id001
+  - *pwauth
+  - *pwtrace

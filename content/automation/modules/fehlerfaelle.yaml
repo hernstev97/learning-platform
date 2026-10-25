@@ -1,0 +1,991 @@
+id: fehlerfaelle
+title: Fehlerfälle ausführbar machen
+level: 3
+minutes: 230
+summary: Uhr, Zufall, Absturz und Duplikate im Test gezielt herbeiführen – Deadline mit Jitter, Retry nach Statuscode,
+  Lockfile, Checkpoint und Deduplizierung mit sqlite3.
+goals:
+- Du übergibst Uhr, Wartefunktion und Zufall als Parameter und testest Zeitverhalten ohne echtes Warten.
+- Du entscheidest Wiederholungen nach Statuscode und liest Retry-After in Sekunden und als HTTP-Datum.
+- Du verhinderst überlappende Läufe mit einem atomar angelegten Lockfile oder flock.
+- Du schreibst Checkpoints atomar und setzt nach einem simulierten Absturz an der richtigen Stelle fort.
+- Du deduplizierst mit sqlite3 über UNIQUE, INSERT OR IGNORE und rowcount.
+resources:
+- &zeit
+  title: Python · time.monotonic
+  url: https://docs.python.org/3/library/time.html#time.monotonic
+- &aws
+  title: AWS Architecture Blog · Exponential Backoff And Jitter
+  url: https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
+- &retryafter
+  title: RFC 9110 · Retry-After
+  url: https://www.rfc-editor.org/rfc/rfc9110.html#section-10.2.3
+- &osopen
+  title: Python · os.open
+  url: https://docs.python.org/3/library/os.html#os.open
+- &sqlite
+  title: Python · sqlite3
+  url: https://docs.python.org/3/library/sqlite3.html
+place: unterwegs
+lesson: |
+  Im Modul [Robuste Automatisierung](/automation/robustheit) steht, was ein Job bei Teilfehlern tun soll: begrenzt wiederholen, Zustand bestätigen, Duplikate vermeiden. Dieses Modul macht daraus Code, den du im Test scheitern lässt. Ein Fehlerfall, den du nicht herbeiführen kannst, ist ein Fehlerfall, den du nicht testest. Und ein ungetesteter Fehlerpfad ist der Teil des Programms, der im Ernstfall zum ersten Mal läuft.
+
+  Drei Werkzeuge tragen das ganze Modul. Erstens übergibst du Uhr, Wartefunktion und Zufall als Parameter, statt sie im Code fest zu verdrahten. Zweitens baust du Fakes, die auf Kommando 503 liefern oder abstürzen. Drittens legst du Absturzpunkte fest: Zwischen welchen zwei Zeilen darf der Prozess sterben, und was passiert beim nächsten Start? Alle Beispiele laufen im Browser, ohne echte Wartezeiten.
+
+  ## Zeit und Zufall als Parameter
+
+  `time.sleep(30)` in einer Wiederholungsschleife macht jeden Test 30 Sekunden langsam, und `time.monotonic()` lässt sich nicht vorspulen. Die Lösung ist eine kleine Fake-Uhr. Ihr Trick: Die Wartefunktion schläft nicht, sondern stellt die Uhr vor. So bleiben Uhr und Wartezeit im Test konsistent, genau wie im Betrieb.
+
+  ```python run
+  class Uhr:
+      def __init__(self, t=0.0):
+          self.t = t
+
+      def __call__(self):
+          return self.t
+
+      def schlafe(self, sekunden):
+          self.t += sekunden
+
+  uhr = Uhr()
+  uhr.schlafe(2.5)
+  uhr.schlafe(1)
+  print(uhr())
+  ```
+
+  Im Betrieb übergibst du [`time.monotonic`](https://docs.python.org/3/library/time.html#time.monotonic) und `time.sleep`, im Test `uhr` und `uhr.schlafe`. Eine monotone Uhr springt nicht, wenn jemand die Systemzeit verstellt oder die Zeitsynchronisation sie korrigiert; für Dauer und Budgets ist sie die richtige Wahl. Für Zufall gilt dasselbe: Übergib eine Funktion wie `random.random` und im Test `lambda: 0.5`. Dann ist jeder Testlauf gleich.
+
+  ## Deadline und Jitter
+
+  Exponentieller Backoff verdoppelt die Pause nach jedem Fehlschlag. Scheitern viele Clients gleichzeitig, etwa weil ein Dienst kurz weg war, wiederholen sie aber auch gleichzeitig und überrollen ihn beim Neustart. **Jitter** verteilt sie. Die Variante „Full Jitter“ aus dem [AWS Architecture Blog](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/) wählt eine zufällige Pause zwischen null und der exponentiellen Grenze.
+
+  ```python run
+  def pause(versuch, zufall,
+            basis=1, deckel=8):
+      grenze = basis * 2 ** versuch
+      return zufall() * min(deckel,
+                            grenze)
+
+  def halb():
+      return 0.5
+
+  for v in range(5):
+      print(v, pause(v, halb))
+  ```
+
+  Eine Anzahl von Versuchen allein begrenzt die Laufzeit nicht: Fünf Versuche mit je 30 Sekunden Timeout und wachsenden Pausen können Minuten dauern. Deshalb bekommt ein Job eine **Deadline**, ein Zeitbudget für alles zusammen. Vor jeder Pause prüft er, ob sie noch hineinpasst. Passt sie nicht, gibt er sofort auf, statt zu schlafen und danach ohnehin abzubrechen.
+
+  ```python run
+  def passt(uhr, ende, pause):
+      return uhr() + pause <= ende
+
+  class Uhr:
+      def __init__(self):
+          self.t = 0.0
+      def __call__(self):
+          return self.t
+
+  uhr = Uhr()
+  ende = uhr() + 10
+  uhr.t = 7
+  print(passt(uhr, ende, 2))
+  print(passt(uhr, ende, 4))
+  ```
+
+  ## Wiederholen nach Statuscode
+
+  Nicht jede Fehlerantwort lohnt einen zweiten Versuch. Die Frage ist immer: Kann dieselbe Anfrage später gelingen, ohne dass sich etwas an ihr ändert?
+
+  | Status | Bedeutung | Wiederholen? |
+  | --- | --- | --- |
+  | 429 | zu viele Anfragen | ja, nach Retry-After |
+  | 502, 503, 504 | Gateway oder Dienst gestört | ja, mit Backoff |
+  | 400, 422 | Anfrage ungültig | nein |
+  | 401 | Token ungültig | einmal erneuern (Modul Authentifizierung) |
+  | 403, 404 | verboten, nicht da | nein |
+
+  Ein 500 ist ein Grenzfall: Manchmal vorübergehend, oft ein Fehler, den deine Anfrage auslöst. Wiederhole automatisch nur, was dokumentiert vorübergehend ist, und nur Operationen, die zweimal ausgeführt nicht schaden. Bei schreibenden Anfragen brauchst du dafür einen Idempotency-Key, siehe [Web-APIs](/automation/web-apis).
+
+  [`Retry-After`](https://www.rfc-editor.org/rfc/rfc9110.html#section-10.2.3) kommt in zwei Formen: als Sekundenzahl `120` oder als HTTP-Datum `Sat, 24 Oct 2026 08:00:30 GMT`. Das Datum liest [`email.utils.parsedate_to_datetime`](https://docs.python.org/3/library/email.utils.html#email.utils.parsedate_to_datetime); ungültige Werte lösen `ValueError` aus. Die Wartezeit ist die Differenz zur aktuellen Zeit, nie negativ. Auch hier ist „jetzt“ ein Parameter.
+
+  ```python run
+  from datetime import datetime, UTC
+  from email.utils import (
+      parsedate_to_datetime)
+
+  jetzt = datetime(2026, 10, 24, 8,
+                   tzinfo=UTC)
+  kopf = ("Sat, 24 Oct 2026 "
+          "08:00:30 GMT")
+  ziel = parsedate_to_datetime(kopf)
+  rest = ziel - jetzt
+  print(rest.total_seconds())
+  ```
+
+  Verlangt ein Dienst eine Pause, die länger ist als dein restliches Budget, brichst du ab und lässt den nächsten geplanten Lauf übernehmen. Die Pause still zu verkürzen hieße, den Dienst früher zu belasten, als er erlaubt.
+
+  ## Lockfile gegen überlappende Läufe
+
+  Ein stündlicher Job braucht ausnahmsweise 70 Minuten. Der nächste Start beginnt, während der erste noch schreibt, und beide verarbeiten dieselben Aufträge. Ein **Lock** verhindert das: Nur wer ihn hat, arbeitet. Die naheliegende Lösung „wenn die Datei nicht existiert, lege sie an“ hat eine Lücke. Zwischen Prüfen und Anlegen kann ein zweiter Prozess dasselbe prüfen. Beide sehen „frei“, beide legen an.
+
+  [`os.open`](https://docs.python.org/3/library/os.html#os.open) mit `O_CREAT | O_EXCL` prüft und legt in einem Schritt an. Existiert die Datei schon, scheitert der Aufruf mit `FileExistsError`. Diese Atomarität garantiert das Betriebssystem.
+
+  ```python run
+  import contextlib
+  import os
+
+  class LaeuftSchon(Exception):
+      pass
+
+  @contextlib.contextmanager
+  def sperre(pfad):
+      art = (os.O_CREAT | os.O_EXCL
+             | os.O_WRONLY)
+      try:
+          fd = os.open(pfad, art)
+      except FileExistsError:
+          raise LaeuftSchon(
+              pfad) from None
+      try:
+          pid = str(os.getpid())
+          os.write(fd, pid.encode())
+          os.close(fd)
+          yield
+      finally:
+          os.remove(pfad)
+
+  with sperre("job.lock"):
+      try:
+          with sperre("job.lock"):
+              pass
+      except LaeuftSchon:
+          print("abgelehnt")
+  print(os.path.exists("job.lock"))
+  ```
+
+  Achte darauf, wo `finally` steht. Gelöscht wird nur eine Sperre, die dieser Aufruf selbst angelegt hat. Löschte auch der abgelehnte Start die Datei, gäbe er die Sperre des laufenden Jobs frei, und der dritte Start liefe parallel.
+
+  Das Lockfile hat eine Schwäche: Stirbt der Prozess durch `kill -9` oder einen Stromausfall, läuft `finally` nie, und die Datei bleibt liegen. Jeder weitere Start wird abgelehnt, bis jemand sie löscht. Auf Linux ist [`fcntl.flock`](https://docs.python.org/3/library/fcntl.html#fcntl.flock) deshalb oft besser: Den Lock hält der Kernel an der geöffneten Datei, und er verschwindet mit dem Prozess, egal wie dieser endet. Mit `LOCK_NB` wartet `flock` nicht, sondern wirft sofort `BlockingIOError`. Geöffnet wird mit `"a"`: Der Modus `"w"` würde die Datei leeren, auch wenn ein anderer Prozess den Lock hält und dort etwa seine PID notiert hat.
+
+  ```python
+  import fcntl
+  import sys
+
+  datei = open(LOCK_PFAD, "a")
+  try:
+      fcntl.flock(datei,
+                  fcntl.LOCK_EX
+                  | fcntl.LOCK_NB)
+  except BlockingIOError:
+      sys.exit("Läuft schon.")
+  ```
+
+  Dieses Beispiel läuft nur lokal; im Browser ist `flock` wirkungslos, deshalb üben die Aufgaben das Lockfile. `flock` ist ein beratender Lock: Er schützt nur gegen Prozesse, die ebenfalls `flock` benutzen. Für Shell-Aufrufe gibt es dasselbe als Befehl `flock -n` aus util-linux. Ein systemd-Timer startet einen Dienst, der noch läuft, nicht ein zweites Mal, und `systemctl start` auf einen laufenden Dienst bewirkt ebenfalls nichts. Startet aber jemand das Skript direkt oder über cron, schützt systemd nicht (siehe [Zeitsteuerung](/automation/zeitsteuerung)).
+
+  ## Checkpoint und Wiederaufnahme
+
+  Ein Job verarbeitet 500 Aufträge und stirbt bei Nummer 312. Ohne gespeicherten Fortschritt beginnt er wieder bei 1. Ein **Checkpoint** hält fest, wie weit er gekommen ist. Zwei Fragen entscheiden über seine Qualität: Wann wird er geschrieben, und wie?
+
+  **Wann:** nach der bestätigten Wirkung. Stirbt der Prozess zwischen Wirkung und Checkpoint, macht der nächste Lauf diesen einen Auftrag noch einmal. Das nennt man *at least once*; die Wirkung muss dann idempotent sein. Schreibst du den Checkpoint vorher, geht bei einem Absturz genau dieser Auftrag verloren (*at most once*). Für Arbeit, die nicht verloren gehen darf, ist die erste Reihenfolge richtig.
+
+  **Wie:** atomar. Eine halb geschriebene Checkpoint-Datei ist schlimmer als keine. Schreibe in eine temporäre Datei im selben Verzeichnis und ersetze das Ziel mit [`os.replace`](https://docs.python.org/3/library/os.html#os.replace). Das schützt gegen einen Absturz des Prozesses. Gegen einen Stromausfall braucht es zusätzlich `os.fsync` vor dem Austausch, wie im Modul [Robuste Automatisierung](/automation/robustheit).
+
+  ```python run
+  import json
+  import os
+  from pathlib import Path
+
+  def lies_stand(pfad):
+      p = Path(pfad)
+      if not p.exists():
+          return 0
+      return json.loads(
+          p.read_text())["erledigt"]
+
+  def schreibe_stand(pfad, n):
+      tmp = f"{pfad}.tmp"
+      daten = {"erledigt": n}
+      text = json.dumps(daten)
+      Path(tmp).write_text(text)
+      os.replace(tmp, pfad)
+
+  schreibe_stand("stand.json", 3)
+  print(lies_stand("stand.json"))
+  print(lies_stand("fehlt.json"))
+  ```
+
+  Eine kaputte Checkpoint-Datei behandelst du als Fehler. `json.loads` wirft dann `ValueError`, und das soll den Job anhalten. „Konnte nicht lesen, also fange ich von vorn an“ hieße, 312 Aufträge ein zweites Mal auszuführen.
+
+  Den Absturz simulierst du mit einer Wirkung, die beim ersten Aufruf für einen bestimmten Auftrag eine Exception wirft. Danach startest du denselben Lauf noch einmal und prüfst zweierlei: Wo setzt er fort, und wie oft wurde jede Wirkung ausgeführt?
+
+  ## Deduplizierung mit sqlite3
+
+  Ein Poller liest alle zehn Minuten die letzten 50 Ereignisse einer API. Die meisten kennt er schon. Er soll nur neue melden, auch nach einem Neustart. Eine Python-Menge vergisst alles beim Prozessende; eine Datenbank mit Eindeutigkeitsregel nicht. [`sqlite3`](https://docs.python.org/3/library/sqlite3.html) gehört zur Standardbibliothek und läuft auch im Browser.
+
+  ```python run
+  import sqlite3
+
+  con = sqlite3.connect(":memory:")
+  con.execute(
+      "CREATE TABLE gesehen ("
+      " quelle TEXT NOT NULL,"
+      " quell_id TEXT NOT NULL,"
+      " UNIQUE (quelle, quell_id))")
+  NEU = ("INSERT OR IGNORE INTO "
+         "gesehen VALUES (?, ?)")
+  for qid in ["e1", "e2", "e1"]:
+      cur = con.execute(
+          NEU, ("api", qid))
+      print(qid, cur.rowcount)
+  ```
+
+  `UNIQUE (quelle, quell_id)` macht die Kombination eindeutig; dieselbe ID aus einer anderen Quelle ist ein anderes Ereignis. [`INSERT OR IGNORE`](https://www.sqlite.org/lang_conflict.html) überspringt Zeilen, die die Regel verletzen würden, statt `IntegrityError` zu werfen. [`cursor.rowcount`](https://docs.python.org/3/library/sqlite3.html#sqlite3.Cursor.rowcount) sagt danach, ob eingefügt wurde: 1 für neu, 0 für bekannt. So entscheidet eine einzige Anweisung „neu oder nicht“, und zwar atomar, auch wenn zwei Prozesse gleichzeitig schreiben.
+
+  `sqlite3` öffnet bei Änderungen implizit eine Transaktion. Erst `con.commit()` macht sie dauerhaft; `with con:` committet am Ende des Blocks oder rollt bei einer Exception zurück. Wer das Commit vergisst, sieht seine Zeilen in derselben Verbindung, aber nach einem Neustart sind sie weg. Und wieder gilt die Reihenfolge: Ist die Wirkung eine E-Mail, speichere zuerst „geplant“ und markiere nach dem Versand „gesendet“, wie bei der Outbox im Modul [Benachrichtigungen](/automation/benachrichtigungen).
+
+  > [!PRAXIS]
+  > Teste jeden Fehlerpfad, den dein Runbook erwähnt. Steht dort „bei Absturz neu starten“, gehört ein Test dazu, der zwischen Wirkung und Checkpoint abstürzt und danach die Zahl der Wirkungen zählt.
+
+  ## Häufige Fehler
+
+  - **Echte Zeit im Test.** `time.sleep` macht Tests langsam, und eine echte Uhr lässt sich nicht vorspulen. Uhr und Wartefunktion übergeben.
+  - **Retry auf alles.** 400 und 404 werden durch Warten nicht besser, nur langsamer.
+  - **Retry-After nur als Zahl.** `int("Sat, 24 Oct …")` wirft mitten im Fehlerpfad.
+  - **Prüfen, dann anlegen.** Zwei Prozesse sehen gleichzeitig „frei“. `O_EXCL` oder `flock` benutzen.
+  - **Fremde Sperre gelöscht.** `finally` räumt auch auf, wenn das Anlegen gescheitert ist.
+  - **Checkpoint vor der Wirkung.** Nach einem Absturz fehlt ein Auftrag, still.
+  - **Kaputter Checkpoint heißt Neustart.** Lieber anhalten als alles doppelt ausführen.
+  - **Commit vergessen.** Die Deduplizierung vergisst nach dem Neustart alles.
+
+  > [!INTERVIEW]
+  > „Wie testest du ein Retry mit Backoff, ohne dass der Test eine Minute dauert?“ Ich übergebe Uhr, Wartefunktion und Zufall als Parameter. Im Test stellt die Wartefunktion eine Fake-Uhr vor, statt zu schlafen. Dann prüfe ich die Liste der Pausen und dass die Funktion vor Ablauf der Deadline aufgibt.
+
+  > [!MERKE]
+  > Wirkung zuerst, dann Checkpoint: Ein Absturz wiederholt dann höchstens einen Auftrag, statt einen zu verlieren.
+
+  ## Zusammenfassung
+
+  - Uhr, Wartefunktion und Zufall sind Parameter; die Fake-Wartefunktion stellt die Fake-Uhr vor.
+  - Full Jitter wählt die Pause zufällig zwischen null und der exponentiellen Grenze; eine Deadline begrenzt die Gesamtzeit.
+  - Wiederholt werden 429 und 502 bis 504, nicht 400, 401, 403 oder 404. Retry-After gibt es als Zahl und als Datum.
+  - `O_CREAT | O_EXCL` legt ein Lockfile atomar an; `flock` verschwindet mit dem Prozess.
+  - Checkpoints entstehen nach der Wirkung und werden atomar mit `os.replace` geschrieben.
+  - `INSERT OR IGNORE` mit `UNIQUE` und `rowcount` entscheidet „neu oder bekannt“ in einer Anweisung; ohne Commit ist nichts gespeichert.
+exercises:
+- id: welcher-status
+  type: choice
+  title: Welche Antworten lohnen einen zweiten Versuch?
+  prompt: Ein Import liest Daten per GET. Bei welchen Antworten wiederholt er die Anfrage automatisch nach einer Pause?
+  options:
+  - text: "`429 Too Many Requests`"
+    correct: true
+    why: Der Dienst bittet um weniger Tempo. Nach der Pause aus Retry-After kann dieselbe Anfrage gelingen.
+  - text: "`503 Service Unavailable`"
+    correct: true
+    why: Der Dienst ist vorübergehend nicht verfügbar. Mit Backoff ist ein späterer Versuch sinnvoll.
+  - text: "`400 Bad Request`"
+    correct: false
+    why: Die Anfrage selbst ist fehlerhaft. Dieselbe Anfrage scheitert beim nächsten Mal genauso.
+  - text: "`404 Not Found`"
+    correct: false
+    why: Die Ressource gibt es nicht. Warten ändert daran nichts.
+  - text: "`401 Unauthorized`"
+    correct: false
+    why: Hier hilft kein Warten, sondern genau eine Token-Erneuerung, und die ist eine eigene Regel.
+  explanation: Wiederholt wird, was vorübergehend ist und bei unveränderter Anfrage später gelingen kann. Fehler in
+    der Anfrage, fehlende Ressourcen und Rechte werden durch Zeit nicht besser.
+  resources:
+  - *retryafter
+- id: lauf-reihenfolge
+  type: order
+  title: Ein Lauf, der Abstürze übersteht
+  prompt: Bring die Schritte eines Laufs in die richtige Reihenfolge, der überlappende Starts verhindert und nach einem
+    Absturz fortsetzt.
+  lang: prose
+  lines: |-
+    Lock atomar anlegen oder abbrechen
+    Checkpoint lesen und bei Fehler anhalten
+    Nächsten offenen Auftrag ausführen
+    Bestätigung der Wirkung prüfen
+    Checkpoint atomar schreiben
+    Lock freigeben
+  explanation: Der Lock kommt zuerst, damit kein zweiter Lauf denselben Checkpoint liest. Der Checkpoint folgt der
+    bestätigten Wirkung. So wiederholt ein Absturz höchstens einen Auftrag, statt einen zu verlieren.
+  resources:
+  - *osopen
+- id: jitter-vorhersagen
+  type: output
+  title: Pausen mit festem Zufall
+  prompt: Welche Ausgabe erzeugt dieses Programm?
+  lang: python
+  code: |-
+    def pause(versuch, zufall):
+        grenze = min(8, 2 ** versuch)
+        return zufall() * grenze
+
+    halb = lambda: 0.5
+    print([pause(v, halb)
+           for v in range(5)])
+  expected: '[0.5, 1.0, 2.0, 4.0, 4.0]'
+  explanation: |
+    Die Grenzen sind 1, 2, 4, 8 und wieder 8, weil der Deckel bei 8 liegt. Mit dem festen Zufallswert 0.5 ist jede Pause die halbe Grenze. Im Betrieb liefert `random.random` Werte zwischen 0 und 1, und die Pausen verteilen sich. Der feste Wert macht das Verhalten im Test vorhersagbar.
+  resources:
+  - *aws
+- id: rowcount-vorhersagen
+  type: output
+  title: Neu oder schon bekannt?
+  prompt: Welche Ausgabe erzeugt dieses Programm?
+  lang: python
+  code: |-
+    import sqlite3
+    con = sqlite3.connect(":memory:")
+    con.execute("CREATE TABLE g"
+                " (id TEXT UNIQUE)")
+    NEU = ("INSERT OR IGNORE "
+           "INTO g VALUES (?)")
+    for i in ["a", "b", "a"]:
+        cur = con.execute(NEU, (i,))
+        print(i, cur.rowcount)
+    alle = "SELECT COUNT(*) FROM g"
+    cur = con.execute(alle)
+    print(cur.fetchone()[0])
+  expected: |-
+    a 1
+    b 1
+    a 0
+    2
+  explanation: |
+    Das zweite `a` verletzt die Eindeutigkeit. `INSERT OR IGNORE` überspringt es ohne Fehler, und `rowcount` ist 0. Die Tabelle enthält deshalb zwei Zeilen. Genau diese 1 oder 0 entscheidet in einem Poller, ob ein Ereignis gemeldet wird.
+  resources:
+  - *sqlite
+- id: absturz-vorhersagen
+  type: output
+  title: Was passiert nach dem Absturz?
+  prompt: |
+    Welche Ausgabe erzeugt dieses Programm? `lauf(absturz=3)` simuliert einen Absturz direkt nach der Wirkung für Auftrag 3.
+  lang: python
+  code: |-
+    wirkung = []
+    stand = {"bis": 0}
+
+    def lauf(absturz=None):
+        start = stand["bis"] + 1
+        for nr in range(start, 5):
+            wirkung.append(nr)
+            if nr == absturz:
+                raise RuntimeError(nr)
+            stand["bis"] = nr
+
+    try:
+        lauf(absturz=3)
+    except RuntimeError:
+        pass
+    lauf()
+    print(wirkung)
+  expected: '[1, 2, 3, 3, 4]'
+  explanation: |
+    Der erste Lauf führt 1, 2 und 3 aus und stirbt, bevor `stand` auf 3 steht. Der zweite Lauf beginnt deshalb bei 3, nicht bei 4. Auftrag 3 wirkt zweimal: *at least once*. Darum muss die Wirkung idempotent sein oder einen Schlüssel haben, an dem der Empfänger Duplikate erkennt.
+  resources:
+  - *osopen
+- id: retry-after-lesen
+  type: code
+  title: Retry-After in beiden Formen
+  prompt: |
+    Schreibe `wartezeit(status, retry_after, jetzt, standard=5)`.
+
+    - Bei Status 429, 502, 503 oder 504 gibt sie die Wartezeit in Sekunden als `float` zurück, bei allen anderen Status `None` („nicht wiederholen“).
+    - `retry_after` ist der Header als String oder `None`. Besteht er nur aus Ziffern, sind das Sekunden. Sonst versuche ihn mit `email.utils.parsedate_to_datetime` als HTTP-Datum zu lesen; die Wartezeit ist dann die Differenz zu `jetzt` (eine `datetime` mit Zeitzone), mindestens 0.
+    - Fehlt der Header oder ist er unlesbar, gilt `standard`.
+  lang: python
+  starter: |-
+    from email.utils import (
+        parsedate_to_datetime)
+
+    def wartezeit(status, retry_after,
+                  jetzt, standard=5):
+        if status >= 400:
+            return float(retry_after)
+        return None
+  solution: |-
+    from email.utils import (
+        parsedate_to_datetime)
+
+    NOCHMAL = {429, 502, 503, 504}
+
+    def bis_datum(text, jetzt):
+        d = parsedate_to_datetime(text)
+        s = (d - jetzt).total_seconds()
+        return max(0.0, s)
+
+    def wartezeit(status, retry_after,
+                  jetzt, standard=5):
+        if status not in NOCHMAL:
+            return None
+        if retry_after is None:
+            return float(standard)
+        text = retry_after.strip()
+        ok = text.isascii()
+        if ok and text.isdigit():
+            return float(text)
+        try:
+            s = bis_datum(text, jetzt)
+        except ValueError:
+            s = float(standard)
+        return s
+  setup: |-
+    from datetime import datetime, UTC
+    JETZT = datetime(2026, 10, 24, 8, 0, 0, tzinfo=UTC)
+  tests:
+  - name: Sekunden
+    code: |-
+      w = wartezeit(429, "120", JETZT)
+      assert w == 120.0, w
+  - name: HTTP-Datum
+    code: |-
+      d = "Sat, 24 Oct 2026 08:00:30 GMT"
+      w = wartezeit(503, d, JETZT)
+      assert w == 30.0, w
+  - name: Datum in der Vergangenheit
+    code: |-
+      d = "Sat, 24 Oct 2026 07:59:00 GMT"
+      w = wartezeit(503, d, JETZT)
+      assert w == 0.0, w
+  - name: Fehlender oder unlesbarer Header
+    code: |-
+      assert wartezeit(502, None, JETZT) == 5.0
+      w = wartezeit(504, "bald", JETZT, 7)
+      assert w == 7.0, w
+  - name: Nicht wiederholbare Status
+    code: |-
+      for s in (400, 401, 403, 404, 422):
+          w = wartezeit(s, "10", JETZT)
+          assert w is None, f"{s}: {w}"
+  hints:
+  - Prüfe zuerst den Status. Für alles außerhalb von 429, 502, 503 und 504 ist die Antwort `None`.
+  - '`"120".isdigit()` ist wahr, `"Sat, 24 Oct …".isdigit()` falsch.'
+  - '`parsedate_to_datetime` wirft bei Unsinn `ValueError`. Die Differenz zweier `datetime` hat `.total_seconds()`.'
+  explanation: |
+    Der Starter wiederholt bei jedem Fehler und stürzt an der Datumsform ab, genau dann, wenn der Dienst ohnehin überlastet ist. Die Lösung trennt zwei Fragen: ob wiederholt wird (Status) und wie lange gewartet wird (Header). Ein Datum in der Vergangenheit ergibt 0, nicht eine negative Pause. Weil `jetzt` ein Parameter ist, prüft der Test das Datum ohne Abhängigkeit von der echten Uhrzeit. `isascii()` schließt Ziffern wie `２` aus, die `isdigit()` sonst akzeptiert.
+  resources:
+  - *retryafter
+  - title: Python · email.utils.parsedate_to_datetime
+    url: https://docs.python.org/3/library/email.utils.html#email.utils.parsedate_to_datetime
+- id: deadline-jitter
+  type: code
+  title: Wiederholen mit Deadline und Jitter
+  prompt: |
+    Schreibe `versuche(aktion, uhr, schlafe, zufall, budget)`.
+
+    - `aktion()` liefert einen HTTP-Status. Bei 429, 502, 503 oder 504 wird wiederholt, jeder andere Status wird sofort zurückgegeben.
+    - Die Pause vor Wiederholung Nummer `k` (ab 0) ist `zufall() * min(8, 2 ** k)`.
+    - Die Deadline ist `uhr() + budget`, gemessen beim Start. Würde die nächste Pause über die Deadline hinausreichen, wirf `TimeoutError`, ohne zu schlafen.
+    - `schlafe(sekunden)` wartet. Benutze für Zeit nur `uhr` und `schlafe`.
+  lang: python
+  starter: |-
+    import time
+
+    NOCHMAL = {429, 502, 503, 504}
+
+    def versuche(aktion, uhr, schlafe,
+                 zufall, budget):
+        ...
+  solution: |-
+    NOCHMAL = {429, 502, 503, 504}
+
+    def versuche(aktion, uhr, schlafe,
+                 zufall, budget):
+        ende = uhr() + budget
+        k = 0
+        while True:
+            status = aktion()
+            if status not in NOCHMAL:
+                return status
+            grenze = min(8, 2 ** k)
+            pause = zufall() * grenze
+            if uhr() + pause > ende:
+                raise TimeoutError()
+            schlafe(pause)
+            k += 1
+  setup: |-
+    class Uhr:
+        def __init__(self, t=1000.0):
+            self.t = t
+            self.pausen = []
+        def __call__(self):
+            return self.t
+        def schlafe(self, s):
+            self.pausen.append(s)
+            self.t += s
+
+    def folge(*werte):
+        """Liefert die Status nacheinander; danach immer den letzten."""
+        rest = list(werte)
+        def aktion():
+            return rest.pop(0) if len(rest) > 1 else rest[0]
+        return aktion
+  tests:
+  - name: Erfolg ohne Pause
+    code: |-
+      u = Uhr()
+      s = versuche(folge(200), u,
+          u.schlafe, lambda: 0.5, 10)
+      assert s == 200 and u.pausen == []
+  - name: Zweimal 503, dann Erfolg
+    code: |-
+      u = Uhr()
+      s = versuche(folge(503, 503, 200),
+          u, u.schlafe, lambda: 0.5, 10)
+      assert s == 200, s
+      assert u.pausen == [0.5, 1.0], (
+          u.pausen)
+  - name: Jitter kommt aus zufall
+    code: |-
+      u = Uhr()
+      versuche(folge(429, 429, 200), u,
+          u.schlafe, lambda: 0.25, 10)
+      assert u.pausen == [0.25, 0.5], (
+          u.pausen)
+  - name: Deadline – aufgeben statt schlafen
+    code: |-
+      u = Uhr()
+      try:
+          versuche(folge(503), u,
+              u.schlafe, lambda: 1.0, 5)
+      except TimeoutError:
+          pass
+      else:
+          assert False, "TimeoutError erwartet"
+      assert u.pausen == [1.0, 2.0], (
+          f"Pausen: {u.pausen}")
+      assert u.t <= 1005, "über die Deadline"
+  - name: 400 wird nicht wiederholt
+    code: |-
+      u = Uhr()
+      s = versuche(folge(400, 200), u,
+          u.schlafe, lambda: 0.5, 10)
+      assert s == 400 and u.pausen == []
+  hints:
+  - Merke dir die Deadline einmal am Anfang. Danach fragst du vor jeder Pause `uhr()`.
+  - Prüfe die Deadline vor `schlafe`, nicht danach.
+  - 'Mit `lambda: 1.0` sind die Pausen 1, 2 und 4. Bei Budget 5 passt die dritte nicht mehr.'
+  explanation: |
+    Die Funktion kennt keine echte Zeit. Deshalb kann der Test einen Ausfall von Minuten in Millisekunden nachspielen und genau nachzählen, welche Pausen entstanden. Die Deadline wird vor der Pause geprüft: Ein Job, der weiß, dass er es nicht mehr schafft, gibt sofort auf und lässt dem nächsten Lauf die Arbeit. Jitter steckt nur im Faktor `zufall()`; mit `random.random` streuen die Pausen im Betrieb, im Test sind sie fest.
+  resources:
+  - *aws
+  - *zeit
+- id: lockfile
+  type: code
+  title: Repariere das Lockfile
+  prompt: |
+    `sperre(pfad)` soll verhindern, dass zwei Läufe gleichzeitig arbeiten. Die jetzige Fassung hat zwei Fehler: Zwischen Prüfen und Anlegen kann ein zweiter Prozess dazwischenkommen, und ein abgelehnter Start löscht die Sperre des laufenden Jobs. Repariere sie:
+
+    - Lege die Datei mit `os.open` und `os.O_CREAT | os.O_EXCL | os.O_WRONLY` an und schreibe die eigene PID hinein.
+    - Existiert sie schon, wirf `LaeuftSchon` und lass die vorhandene Datei unverändert.
+    - Nach dem `with`-Block, auch nach einer Exception darin, löschst du die Datei, aber nur, wenn dieser Aufruf sie angelegt hat.
+  lang: python
+  starter: |-
+    import contextlib
+    import os
+    from pathlib import Path
+
+    class LaeuftSchon(Exception):
+        pass
+
+    @contextlib.contextmanager
+    def sperre(pfad):
+        try:
+            if os.path.exists(pfad):
+                raise LaeuftSchon(pfad)
+            Path(pfad).write_text(
+                str(os.getpid()))
+            yield
+        finally:
+            os.remove(pfad)
+  solution: |-
+    import contextlib
+    import os
+
+    class LaeuftSchon(Exception):
+        pass
+
+    @contextlib.contextmanager
+    def sperre(pfad):
+        art = (os.O_CREAT | os.O_EXCL
+               | os.O_WRONLY)
+        try:
+            fd = os.open(pfad, art)
+        except FileExistsError:
+            raise LaeuftSchon(
+                pfad) from None
+        try:
+            pid = str(os.getpid())
+            os.write(fd, pid.encode())
+            os.close(fd)
+            yield
+        finally:
+            os.remove(pfad)
+  setup: |-
+    import contextlib
+    import os
+    import pathlib
+
+    @contextlib.contextmanager
+    def wettlauf():
+        """Simuliert einen zweiten Prozess: Prüfungen auf Existenz sehen „frei“."""
+        alt_os, alt_path = os.path.exists, pathlib.Path.exists
+        os.path.exists = lambda *a, **k: False
+        pathlib.Path.exists = lambda *a, **k: False
+        try:
+            yield
+        finally:
+            os.path.exists, pathlib.Path.exists = alt_os, alt_path
+  tests:
+  - name: Sperre enthält die PID und verschwindet
+    code: |-
+      from pathlib import Path
+      with sperre("a.lock"):
+          inhalt = Path("a.lock").read_text()
+          assert inhalt == str(os.getpid())
+      assert not Path("a.lock").exists()
+  - name: Zweiter Start wird abgelehnt
+    code: |-
+      from pathlib import Path
+      with sperre("b.lock"):
+          try:
+              with sperre("b.lock"):
+                  pass
+          except LaeuftSchon:
+              pass
+          else:
+              assert False, "LaeuftSchon"
+          assert Path("b.lock").exists(), (
+              "Die laufende Sperre ist weg.")
+  - name: Fremde Sperre bleibt unangetastet
+    code: |-
+      from pathlib import Path
+      Path("c.lock").write_text("12345")
+      try:
+          with sperre("c.lock"):
+              pass
+      except LaeuftSchon:
+          pass
+      text = Path("c.lock").read_text()
+      assert text == "12345", (
+          f"Sperre verändert: {text!r}")
+  - name: Atomar, auch im Wettlauf
+    code: |-
+      from pathlib import Path
+      Path("d.lock").write_text("12345")
+      with wettlauf():
+          try:
+              with sperre("d.lock"):
+                  pass
+          except LaeuftSchon:
+              pass
+      text = Path("d.lock").read_text()
+      assert text == "12345", (
+          "Ohne O_EXCL überschrieben")
+  - name: Exception im Block gibt frei
+    code: |-
+      from pathlib import Path
+      try:
+          with sperre("e.lock"):
+              raise KeyError("Absturz")
+      except KeyError:
+          pass
+      assert not Path("e.lock").exists()
+  hints:
+  - '`os.open(pfad, os.O_CREAT | os.O_EXCL | os.O_WRONLY)` wirft `FileExistsError`, wenn es die Datei schon gibt.'
+  - Das `try … finally`, das löscht, beginnt erst, nachdem das Anlegen geklappt hat.
+  - '`os.write` erwartet Bytes: `str(os.getpid()).encode()`.'
+  explanation: |
+    `O_EXCL` lässt das Betriebssystem Prüfen und Anlegen in einem Schritt erledigen; zwischen beiden kann kein anderer Prozess mehr dazwischenkommen. Der Test „Wettlauf“ spielt genau diese Lücke nach, indem jede Existenzprüfung „frei“ meldet. Das zweite Problem steckt in der Position von `finally`: Es darf nur aufräumen, was dieser Aufruf besitzt. Bleibt nach `kill -9` eine Datei liegen, entfernt sie ein Mensch nach Prüfung der PID, oder du nimmst gleich `flock`.
+  resources:
+  - *osopen
+  - title: Python · contextlib.contextmanager
+    url: https://docs.python.org/3/library/contextlib.html#contextlib.contextmanager
+- id: checkpoint
+  type: code
+  title: Nach dem Absturz fortsetzen
+  prompt: |
+    Schreibe `verarbeite(auftraege, anwenden, pfad)`.
+
+    - `auftraege` ist eine Liste von IDs in fester Reihenfolge. Unter `pfad` liegt der Checkpoint als JSON `{"erledigt": n}`: die Zahl der Aufträge vom Anfang der Liste, die schon erledigt sind. Fehlt die Datei, ist `n` gleich 0.
+    - Rufe `anwenden(id)` für jeden noch offenen Auftrag auf und schreibe **danach** den neuen Checkpoint, atomar über eine temporäre Datei und `os.replace`.
+    - Wirft `anwenden`, lass die Exception durch; der Checkpoint steht dann beim letzten erledigten Auftrag.
+    - Ist die Datei kein gültiges JSON, wirf `ValueError`, bevor irgendein Auftrag läuft.
+    - Gib die Zahl der in diesem Lauf erledigten Aufträge zurück.
+  lang: python
+  starter: |-
+    import json
+    import os
+    from pathlib import Path
+
+    def verarbeite(auftraege, anwenden,
+                   pfad):
+        ...
+  solution: |-
+    import json
+    import os
+    from pathlib import Path
+
+    def lies(pfad):
+        p = Path(pfad)
+        if not p.exists():
+            return 0
+        text = p.read_text()
+        daten = json.loads(text)
+        return daten["erledigt"]
+
+    def schreibe(pfad, n):
+        tmp = f"{pfad}.tmp"
+        daten = {"erledigt": n}
+        text = json.dumps(daten)
+        Path(tmp).write_text(text)
+        os.replace(tmp, pfad)
+
+    def verarbeite(auftraege, anwenden,
+                   pfad):
+        start = lies(pfad)
+        offen = auftraege[start:]
+        for i, auftrag in enumerate(
+                offen, start + 1):
+            anwenden(auftrag)
+            schreibe(pfad, i)
+        return len(offen)
+  setup: |-
+    import json
+    import os
+
+    class Absturz(Exception):
+        pass
+
+    class Wirkung:
+        """Merkt sich jede Wirkung; stürzt beim ersten Aufruf für `bei` ab."""
+        def __init__(self, bei=None):
+            self.bei = bei
+            self.liste = []
+        def __call__(self, auftrag):
+            self.liste.append(auftrag)
+            if auftrag == self.bei:
+                self.bei = None
+                raise Absturz(auftrag)
+
+    def stand(pfad):
+        with open(pfad, encoding="utf-8") as f:
+            return json.load(f)["erledigt"]
+  tests:
+  - name: Erster Lauf erledigt alles
+    code: |-
+      w = Wirkung()
+      n = verarbeite(list("abcd"), w, "s1")
+      assert n == 4 and w.liste == list("abcd")
+      assert stand("s1") == 4, stand("s1")
+  - name: Absturz bei c – Checkpoint steht auf 2
+    code: |-
+      w = Wirkung(bei="c")
+      try:
+          verarbeite(list("abcd"), w, "s2")
+      except Absturz:
+          pass
+      else:
+          assert False, "Absturz verschluckt"
+      assert stand("s2") == 2, stand("s2")
+  - name: Zweiter Lauf setzt bei c fort
+    code: |-
+      w = Wirkung(bei="c")
+      try:
+          verarbeite(list("abcd"), w, "s3")
+      except Absturz:
+          pass
+      n = verarbeite(list("abcd"), w, "s3")
+      assert n == 2, n
+      assert w.liste == list("abccd"), (
+          w.liste)
+  - name: Checkpoint über os.replace
+    code: |-
+      ersetzt, alt = [], os.replace
+      def zaehle(a, b):
+          ersetzt.append(b)
+          alt(a, b)
+      os.replace = zaehle
+      try:
+          verarbeite(list("ab"), Wirkung(),
+                     "s4")
+      finally:
+          os.replace = alt
+      assert len(ersetzt) >= 2, ersetzt
+  - name: Kaputter Checkpoint hält an
+    code: |-
+      with open("s5", "w") as f:
+          f.write("{kaputt")
+      w = Wirkung()
+      try:
+          verarbeite(list("ab"), w, "s5")
+      except ValueError:
+          pass
+      else:
+          assert False, "ValueError erwartet"
+      assert w.liste == [], w.liste
+  hints:
+  - Lies den Stand vor der Schleife. `json.loads` wirft bei kaputtem Inhalt schon `ValueError` (`JSONDecodeError` ist eine Unterklasse).
+  - '`auftraege[start:]` sind die offenen Aufträge.'
+  - Schreibe in `pfad + ".tmp"` und ersetze danach mit `os.replace`.
+  explanation: |
+    Der Checkpoint folgt der Wirkung. Stirbt der Lauf bei `c`, steht er auf 2, und der nächste Lauf beginnt bei `c`: Diese eine Wirkung läuft doppelt, keine fehlt. Der Test zählt das ausdrücklich nach. `os.replace` sorgt dafür, dass ein Absturz des Prozesses während des Schreibens den alten Checkpoint stehen lässt, statt eine halbe Datei zu hinterlassen; gegen Stromausfall käme `os.fsync` dazu. Eine kaputte Datei hält den Job an; ein stiller Neustart bei 0 würde alles doppelt ausführen.
+  resources:
+  - title: Python · os.replace
+    url: https://docs.python.org/3/library/os.html#os.replace
+  - title: Python · json.JSONDecodeError
+    url: https://docs.python.org/3/library/json.html#json.JSONDecodeError
+- id: dedup-sqlite
+  type: code
+  title: Nur neue Ereignisse melden
+  prompt: |
+    Schreibe `neue(con, quelle, ids)`. In der Datenbank `con` gibt es die Tabelle `gesehen (quelle TEXT, quell_id TEXT, UNIQUE (quelle, quell_id))`. Füge jede ID aus `ids` mit `INSERT OR IGNORE` ein und gib die Liste der IDs zurück, die wirklich neu eingefügt wurden, in der Reihenfolge von `ids`. Mache die Änderungen dauerhaft, bevor die Funktion zurückkehrt.
+  lang: python
+  starter: |-
+    import sqlite3
+
+    def neue(con, quelle, ids):
+        bekannt = set()
+        ergebnis = []
+        for i in ids:
+            if i not in bekannt:
+                bekannt.add(i)
+                ergebnis.append(i)
+        return ergebnis
+  solution: |-
+    import sqlite3
+
+    NEU = ("INSERT OR IGNORE INTO "
+           "gesehen VALUES (?, ?)")
+
+    def neue(con, quelle, ids):
+        ergebnis = []
+        with con:
+            for i in ids:
+                cur = con.execute(
+                    NEU, (quelle, i))
+                if cur.rowcount == 1:
+                    ergebnis.append(i)
+        return ergebnis
+  setup: |-
+    import sqlite3
+
+    def datenbank(name):
+        con = sqlite3.connect(name)
+        con.execute(
+            "CREATE TABLE gesehen (quelle TEXT NOT NULL, quell_id TEXT NOT NULL, UNIQUE (quelle, quell_id))")
+        con.commit()
+        return con
+  tests:
+  - name: Erster Abruf – alles neu
+    code: |-
+      con = datenbank("a.db")
+      r = neue(con, "api", ["e1", "e2"])
+      assert r == ["e1", "e2"], r
+  - name: Zweiter Abruf – nur Neues
+    code: |-
+      con = datenbank("b.db")
+      neue(con, "api", ["e1", "e2"])
+      r = neue(con, "api", ["e2", "e3"])
+      assert r == ["e3"], r
+  - name: Duplikat im selben Abruf zählt einmal
+    code: |-
+      con = datenbank("c.db")
+      r = neue(con, "api", ["e1", "e1"])
+      assert r == ["e1"], r
+  - name: Gleiche ID, andere Quelle ist neu
+    code: |-
+      con = datenbank("d.db")
+      neue(con, "api", ["e1"])
+      r = neue(con, "rss", ["e1"])
+      assert r == ["e1"], r
+  - name: Übersteht einen Neustart
+    code: |-
+      con = datenbank("e.db")
+      neue(con, "api", ["e1"])
+      neu = sqlite3.connect("e.db")
+      r = neue(neu, "api", ["e1", "e2"])
+      assert r == ["e2"], (
+          f"{r} – Commit vergessen?")
+  hints:
+  - '`con.execute(...)` liefert einen Cursor; `cursor.rowcount` ist 1, wenn eingefügt wurde, und 0, wenn die Zeile ignoriert wurde.'
+  - '`with con:` committet am Ende des Blocks.'
+  explanation: |
+    Der Starter dedupliziert nur im Speicher und nur innerhalb eines Aufrufs; nach einem Neustart ist alles wieder „neu“. Die Datenbank entscheidet dagegen mit der Eindeutigkeitsregel, und `rowcount` meldet das Ergebnis jeder einzelnen Anweisung. Weil die Prüfung in der Datenbank passiert, ist sie auch dann richtig, wenn zwei Prozesse gleichzeitig einfügen. Ohne Commit sieht eine zweite Verbindung die Zeilen nicht, genau wie ein Neustart.
+  resources:
+  - *sqlite
+  - title: SQLite · ON CONFLICT
+    url: https://www.sqlite.org/lang_conflict.html
+- id: checkpoint-zu-frueh
+  type: bug
+  title: Nach dem Absturz fehlt ein Auftrag
+  prompt: |
+    Nach einem Absturz in `anwenden` setzt der Job beim nächsten Start fort, aber genau der Auftrag, bei dem er abgestürzt ist, wird nie ausgeführt. Finde die fehlerhaften Zeilen und korrigiere sie.
+  lang: python
+  code: |-
+    def lauf(jobs, stand, anwenden):
+        start = stand.lesen()
+        for nr in range(start,
+                        len(jobs)):
+            stand.schreiben(nr + 1)
+            anwenden(jobs[nr])
+  lines:
+  - 5
+  - 6
+  fix:
+  - line: 5
+    answers:
+    - anwenden(jobs[nr])
+  - line: 6
+    answers:
+    - stand.schreiben(nr + 1)
+  explanation: |
+    Der Checkpoint steht vor der Wirkung. Stirbt der Prozess in `anwenden`, gilt der Auftrag schon als erledigt, und der nächste Lauf überspringt ihn: *at most once*. Mit der Wirkung zuerst wiederholt ein Absturz höchstens diesen einen Auftrag. Das ist für Arbeit, die nicht verloren gehen darf, die richtige Reihenfolge; die Wirkung muss dafür idempotent sein.
+  resources:
+  - *osopen
+- id: flock-erklaeren
+  type: explain
+  title: Warum verschwindet dieser Lock von selbst?
+  prompt: Erkläre, was diese Zeilen tun und warum nach einem `kill -9` kein verwaister Lock zurückbleibt. Nenne auch
+    eine Grenze.
+  lang: python
+  code: |-
+    datei = open(LOCK_PFAD, "a")
+    try:
+        fcntl.flock(datei,
+                    fcntl.LOCK_EX
+                    | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.exit("Läuft schon.")
+  points:
+  - LOCK_EX fordert einen exklusiven Lock auf der geöffneten Datei an.
+  - Mit LOCK_NB wartet der Aufruf nicht, sondern wirft sofort BlockingIOError, wenn ein anderer Prozess den Lock hält.
+  - Der Kernel hält den Lock an der offenen Datei und gibt ihn frei, wenn der Prozess endet, auch durch kill -9.
+  - Ob die Datei existiert, spielt keine Rolle; sie muss nicht gelöscht werden.
+  - flock ist beratend und schützt nur gegen Prozesse, die ebenfalls flock auf dieselbe Datei benutzen.
+  explanation: |
+    Anders als beim Lockfile mit `O_EXCL` ist hier nicht die Existenz der Datei der Lock, sondern ein Zustand im Kernel, der an der geöffneten Datei hängt. Endet der Prozess, schließt der Kernel alle seine Dateien und gibt damit auch den Lock frei. Deshalb gibt es keinen verwaisten Lock nach einem Absturz. Die Grenze: `flock` ist beratend. Ein Programm, das die Datei ohne `flock` öffnet und schreibt, wird nicht aufgehalten, und über Netzwerkdateisysteme hinweg verhält sich `flock` je nach System anders.
+  resources:
+  - title: Python · fcntl.flock
+    url: https://docs.python.org/3/library/fcntl.html#fcntl.flock
+  - title: man 2 flock
+    url: https://man7.org/linux/man-pages/man2/flock.2.html
+- id: fehlerplan
+  type: practice
+  title: Ein Fehlerplan für deinen Job
+  prompt: |
+    Nimm einen Automationsjob, den du gebaut hast oder bauen willst, zum Beispiel den Wochenbericht aus den Projekten. Schreibe für vier Fehlerfälle je zwei Sätze: Was passiert im Betrieb, welcher Fake oder Parameter löst den Fall im Test aus, und was erwartet der Test? Ein Fall betrifft die Zeit, einer einen Absturz zwischen Wirkung und Checkpoint.
+  lang: prose
+  checklist:
+  - Jeder Fall nennt den Parameter oder Fake, der ihn auslöst (Uhr, Wartefunktion, Zufall, Fake-API, Absturzpunkt).
+  - Ein Fall prüft eine Deadline oder ein Retry-After, ohne echt zu warten.
+  - Ein Fall stürzt zwischen Wirkung und Checkpoint ab und zählt danach die Wirkungen.
+  - Jede Erwartung ist beobachtbar, zum Beispiel eine Liste von Pausen, ein Exception-Typ oder eine Zahl.
+  - Mindestens ein Fall endet bewusst mit einem Abbruch statt mit einem weiteren Versuch.
+  explanation: Ein Fehlerplan macht aus „sollte robust sein“ eine Liste von Tests. Die Checkliste prüft nur, ob jeder
+    Fall auslösbar und beobachtbar ist; welche Fälle für deinen Job zählen, entscheidest du.
+  resources:
+  - *zeit

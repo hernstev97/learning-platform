@@ -1,0 +1,918 @@
+id: api-authentifizierung
+title: API-Authentifizierung – Schlüssel, Tokens und Signaturen
+level: 2
+minutes: 210
+summary: API-Keys, Basic, Bearer und OAuth 2.0 richtig einsetzen, abgelaufene Tokens genau einmal erneuern und
+  Webhooks über ihre HMAC-Signatur prüfen.
+goals:
+- Du unterscheidest API-Key, Basic und Bearer und schickst Zugangsdaten im Header statt in der URL.
+- Du holst Tokens per client_credentials und erneuerst Nutzer-Tokens per Refresh-Token mit Rotation.
+- Du erkennst ein ablaufendes Token vorab mit einer injizierten Uhr und reagierst auf 401 mit genau einer Erneuerung.
+- Du prüfst Webhook-Signaturen mit HMAC über den Rohdaten und vergleichst in konstanter Zeit.
+- Du testest Authentifizierung mit Fakes, die 401 liefern, statt mit echten Zugangsdaten.
+resources:
+- &oauth
+  title: RFC 6749 · OAuth 2.0
+  url: https://www.rfc-editor.org/rfc/rfc6749.html
+- &bearer
+  title: RFC 6750 · Bearer Token Usage
+  url: https://www.rfc-editor.org/rfc/rfc6750.html
+- &basic
+  title: RFC 7617 · Basic Authentication
+  url: https://www.rfc-editor.org/rfc/rfc7617.html
+- &hmac
+  title: Python · hmac
+  url: https://docs.python.org/3/library/hmac.html
+- &webhook
+  title: GitHub · Validating webhook deliveries
+  url: https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries
+place: unterwegs
+lesson: |
+  Ein nächtlicher Export läuft seit Wochen. Eines Morgens steht im Log: `401 Unauthorized`, danach tausend weitere Zeilen derselben Art. Das Access-Token war nach einer Stunde abgelaufen. Die schnelle Reparatur „bei 401 einfach neu versuchen“ hat eine Schleife gebaut, die den Anbieter mit ungültigen Anfragen überschüttet und am Ende das Konto sperren lässt. Authentifizierung ist kein Header, den man einmal setzt. Sie ist ein kleines Protokoll mit Zuständen: gültig, bald abgelaufen, abgelaufen, widerrufen.
+
+  Dieses Modul baut dieses Protokoll Schritt für Schritt auf. Alle ausführbaren Beispiele arbeiten mit Fakes und offensichtlichen Platzhaltern wie `geheim-123`. Kein Beispiel spricht einen echten Dienst an, und keine Übung braucht echte Zugangsdaten.
+
+  ## 401 und 403: nicht angemeldet oder nicht berechtigt
+
+  Authentifizierung beantwortet „Wer bist du?“, Autorisierung „Was darfst du?“. HTTP trennt die beiden Fälle. [401 Unauthorized](https://www.rfc-editor.org/rfc/rfc9110.html#section-15.5.2) heißt: Die Anfrage hat keine gültigen Zugangsdaten. Der Server schickt dazu einen `WWW-Authenticate`-Header, der sagt, welches Verfahren er erwartet. [403 Forbidden](https://www.rfc-editor.org/rfc/rfc9110.html#section-15.5.4) heißt: Der Server hat dich erkannt, erlaubt die Aktion aber nicht.
+
+  Für Bearer-Tokens präzisiert [RFC 6750](https://www.rfc-editor.org/rfc/rfc6750.html#section-3.1) die Fehler: `invalid_token` mit 401 für abgelaufene, widerrufene oder kaputte Tokens, `insufficient_scope` mit 403 für fehlende Rechte. Daraus folgt die wichtigste Regel dieses Moduls: Ein neues Token kann ein 401 beheben. Ein 403 behebt ein neu geholtes Token mit demselben Scope nicht, denn es hätte dieselben Rechte. Fehlt ein Scope, kann der Server ihn im Fehler nennen; dann braucht es eine neue, weiter reichende Berechtigung, und die vergibt meist ein Mensch.
+
+  ```text
+  HTTP/1.1 401 Unauthorized
+  WWW-Authenticate: Bearer
+    error="invalid_token",
+    error_description=
+      "The access token expired"
+  ```
+
+  ## API-Key, Basic und Bearer: drei Arten von Header
+
+  Ein **API-Key** ist ein langer, zufälliger String, den du im Portal des Anbieters erzeugst. Wie er übertragen wird, legt der Anbieter fest, oft in einem eigenen Header wie `X-API-Key`. Manche Dienste erlauben ihn auch als Query-Parameter. Nimm trotzdem den Header: URLs landen in Server- und Proxy-Logs, in der Shell-History und im Browserverlauf. RFC 6750 rät aus demselben Grund davon ab, [Bearer-Tokens in URLs](https://www.rfc-editor.org/rfc/rfc6750.html#section-2.3) zu schicken.
+
+  **Basic** nach [RFC 7617](https://www.rfc-editor.org/rfc/rfc7617.html) verbindet Nutzer und Passwort mit einem Doppelpunkt und kodiert das Ergebnis mit Base64. Base64 ist eine Kodierung, keine Verschlüsselung: Jeder, der den Header sieht, liest das Passwort zurück. Basic gehört deshalb ausschließlich in TLS-Verbindungen. Ein Nutzername darf keinen Doppelpunkt enthalten, sonst wäre die Trennung mehrdeutig.
+
+  ```python run
+  import base64
+
+  paar = "api-nutzer:geheim-123"
+  roh = paar.encode("utf-8")
+  kodiert = base64.b64encode(roh)
+  print("Basic", kodiert.decode())
+  print(base64.b64decode(kodiert))
+  ```
+
+  **Bearer** heißt „Inhaber“: Wer das Token besitzt, darf es benutzen. Das Token selbst sagt dem Server, wer du bist und was du darfst. Es gehört in den Header `Authorization: Bearer <token>`. Ein Bearer-Token ist so viel wert wie ein Passwort, nur meist kürzer gültig.
+
+  ```python run
+  def kopf(art, wert):
+      if art == "key":
+          return {"X-API-Key": wert}
+      if art == "bearer":
+          return {"Authorization":
+                  f"Bearer {wert}"}
+      raise ValueError(art)
+
+  print(kopf("bearer", "tok-1"))
+  ```
+
+  Halte diese Funktion klein und an einer Stelle. Dann gibt es genau einen Ort, an dem Zugangsdaten in eine Anfrage gelangen, und genau einen Ort, an dem du sicherstellst, dass sie nicht ins Log fallen.
+
+  ## OAuth 2.0: Tokens statt Passwörter
+
+  [OAuth 2.0](https://www.rfc-editor.org/rfc/rfc6749.html) trennt vier Rollen: die Person, der die Daten gehören, dein Programm als **Client**, den **Authorization Server**, der Tokens ausgibt, und den **Resource Server**, also die eigentliche API. Dein Programm bekommt vom Authorization Server ein kurzlebiges **Access-Token** für die API. Das Passwort der Person sieht dein Programm nie.
+
+  Für Automatisierung zählen zwei Wege. Handelt dein Job **als er selbst**, etwa ein Dienstkonto, das Berichte abholt, nutzt du den Grant [client_credentials](https://www.rfc-editor.org/rfc/rfc6749.html#section-4.4). Dein Programm schickt seine Client-ID und sein Client-Secret an den Token-Endpunkt und bekommt ein Access-Token zurück.
+
+  ```python
+  import httpx
+
+  antwort = httpx.post(
+      TOKEN_URL,
+      data={"grant_type":
+            "client_credentials"},
+      auth=(CLIENT_ID, SECRET),
+      timeout=10,
+  )
+  antwort.raise_for_status()
+  daten = antwort.json()
+  ```
+
+  `data=` schickt das Formular als `application/x-www-form-urlencoded`, `auth=` die Client-Daten als Basic-Header. Die Antwort enthält `access_token`, `token_type` und meist `expires_in`, die Lebensdauer in Sekunden. Bei client_credentials gibt es laut [RFC 6749 §4.4.3](https://www.rfc-editor.org/rfc/rfc6749.html#section-4.4.3) normalerweise **kein** Refresh-Token: Ist das Access-Token abgelaufen, fragst du mit denselben Client-Daten ein neues an.
+
+  > [!DEEP] Sonderzeichen im Client-Secret
+  > RFC 6749 §2.3.1 verlangt, Client-ID und Secret vor der Base64-Kodierung mit dem Formularverfahren zu kodieren. Viele Bibliotheken tun das nicht. Bei IDs aus Buchstaben und Ziffern spielt das keine Rolle; enthält ein Secret `+`, `%` oder `:`, prüfe die Dokumentation deines Anbieters.
+
+  Handelt dein Job **im Namen einer Person**, etwa für deren Kalender, meldet sich die Person einmal im Browser an (Authorization Code mit PKCE). Danach hat dein Programm ein Access-Token und ein **Refresh-Token**. Mit dem Refresh-Token holt es später ohne Browser neue Access-Tokens. Die Erstanmeldung passiert am Rechner; alles danach kann unbeaufsichtigt laufen.
+
+  ## Refresh-Token: erneuern, rotieren, sicher speichern
+
+  Die Erneuerung ist eine eigene Anfrage an den Token-Endpunkt mit `grant_type=refresh_token` ([RFC 6749 §6](https://www.rfc-editor.org/rfc/rfc6749.html#section-6)). Der Server darf dabei ein neues Refresh-Token ausgeben. Dann gilt: Der Client muss das alte verwerfen und das neue speichern. Diese **Rotation** empfiehlt die [OAuth 2.0 Security Best Current Practice](https://www.rfc-editor.org/rfc/rfc9700.html#section-4.14.2): Taucht ein bereits ersetztes Refresh-Token wieder auf, erkennt der Server einen möglichen Diebstahl und kann auch das gültige widerrufen.
+
+  ```python run
+  def erneuere(sende, ablage):
+      alt = ablage["refresh"]
+      form = {"grant_type":
+              "refresh_token",
+              "refresh_token": alt}
+      daten = sende(form)
+      neu = daten.get(
+          "refresh_token", alt)
+      ablage["refresh"] = neu
+      return daten["access_token"]
+
+  def sende(form):
+      neu = {"access_token": "a-2"}
+      neu["refresh_token"] = "r-2"
+      return neu
+
+  ablage = {"refresh": "r-1"}
+  print(erneuere(sende, ablage))
+  print(ablage)
+  ```
+
+  Im Betrieb ist `ablage` eine Datei oder ein Schlüsselbund, kein Dictionary. Schreibe das neue Refresh-Token atomar, bevor dein Programm weiterarbeitet. Stürzt es nach der Erneuerung ab, ohne gespeichert zu haben, ist das alte Token beim nächsten Lauf schon entwertet. Der Server antwortet dann mit `invalid_grant`. Das ist kein vorübergehender Fehler: Hier hilft keine Wiederholung, nur eine neue Anmeldung durch einen Menschen. Dein Job meldet das deutlich und hört auf.
+
+  ## Ablauf vorab erkennen: Token-Cache mit injizierter Uhr
+
+  Ein Token pro Anfrage zu holen ist verschwenderisch, und manche Anbieter begrenzen Token-Anfragen streng. Ein Cache hält das Token und seinen Ablaufzeitpunkt. `expires_in` ist eine Dauer, also rechnest du mit einer monotonen Uhr wie [`time.monotonic`](https://docs.python.org/3/library/time.html#time.monotonic): `bis = jetzt + expires_in`. Erneuere ein wenig **vor** dem Ablauf, damit ein Token nicht zwischen Prüfung und Ankunft beim Server verfällt.
+
+  ```python run
+  class TokenCache:
+      def __init__(self, hole, uhr):
+          self.hole = hole
+          self.uhr = uhr
+          self.wert = None
+          self.bis = 0
+
+      def aktuell(self, puffer=60):
+          jetzt = self.uhr()
+          rest = self.bis - jetzt
+          ok = rest > puffer
+          if self.wert and ok:
+              return self.wert
+          wert, dauer = self.hole()
+          self.wert = wert
+          self.bis = jetzt + dauer
+          return wert
+
+      def verwerfen(self):
+          self.wert = None
+
+  zeiten = iter([0, 3000, 3540])
+  nr = 0
+  def hole():
+      global nr
+      nr += 1
+      return f"tok-{nr}", 3600
+
+  cache = TokenCache(
+      hole, lambda: next(zeiten))
+  for _ in range(3):
+      print(cache.aktuell())
+  ```
+
+  Die Uhr ist ein Parameter. Im Betrieb übergibst du `time.monotonic`, im Test eine Funktion, die vorgegebene Zeiten liefert, hier 0, 3000 und 3540. So prüfst du in Millisekunden, was nach einer knappen Stunde passiert. Bei 3540 Sekunden fehlen noch 60 bis zum Ablauf; der Puffer greift, der Cache holt `tok-2`.
+
+  ## Genau einmal erneuern, wenn trotzdem 401 kommt
+
+  Auch ein frisches Token kann ungültig sein: Jemand hat es widerrufen, der Server wurde neu gestartet, die Uhren gehen auseinander. Deshalb gibt es neben der Prüfung vorab eine Reaktion hinterher. Die Regel ist eng: Bei 401 verwirfst du das Token, holst **ein** neues und wiederholst die Anfrage **einmal**. Kommt wieder 401, ist etwas grundsätzlich falsch, etwa ein gesperrtes Konto oder ein falsches Secret. Dann bricht der Job mit einer klaren Meldung ab.
+
+  ```python run
+  class AuthFehler(Exception):
+      pass
+
+  def rufe(anfrage, token):
+      r = anfrage(token.aktuell())
+      if r.status != 401:
+          return r
+      token.verwerfen()
+      r = anfrage(token.aktuell())
+      if r.status == 401:
+          raise AuthFehler("401")
+      return r
+  ```
+
+  Diese Funktion hat keine Schleife, und genau das ist der Punkt. Die Zahl der Versuche steht im Code, nicht in einer Bedingung, die vielleicht nie falsch wird. 403 geht unverändert zurück, denn ein neues Token mit demselben Scope ändert keine Rechte. Fehler wie 429 und 503 gehören zur Wiederholungslogik aus den Modulen [Web-APIs](/automation/web-apis) und [Fehlerfälle ausführbar machen](/automation/fehlerfaelle), nicht hierher.
+
+  > [!DEEP] Mehrere gleichzeitige Anfragen
+  > Laufen Anfragen parallel, bekommen oft mehrere gleichzeitig ein 401. Erneuert jede für sich, schickt bei Rotation die zweite ein schon ersetztes Refresh-Token. Abhilfe ist eine Sperre um die Erneuerung: Wer sie bekommt, prüft zuerst, ob ein anderer das Token inzwischen erneuert hat.
+
+  ## Webhooks: Signaturen prüfen
+
+  Bei einem Webhook ruft der Anbieter dich auf. Jeder, der deine URL kennt, kann dorthin POST-Anfragen schicken. Deshalb signiert der Anbieter jede Lieferung mit einem gemeinsamen Geheimnis. GitHub schickt im Header `X-Hub-Signature-256` den Wert `sha256=` plus den HMAC-SHA256 des Körpers als Hexstring. Die [GitHub-Dokumentation](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries) nennt einen Testfall, den du nachrechnen kannst.
+
+  ```python run
+  import hashlib
+  import hmac
+
+  geheim = (b"It's a Secret "
+            b"to Everybody")
+  koerper = b"Hello, World!"
+  mac = hmac.new(geheim, koerper,
+                 hashlib.sha256)
+  hexwert = mac.hexdigest()
+  print(hexwert[:32])
+  print(hexwert[32:])
+  ```
+
+  Drei Regeln machen die Prüfung sicher. Erstens rechnest du über die **Rohdaten**, genau die Bytes, die angekommen sind. Wer erst JSON parst und wieder serialisiert, bekommt andere Leerzeichen oder eine andere Schlüsselreihenfolge und damit eine andere Signatur. Zweitens vergleichst du mit [`hmac.compare_digest`](https://docs.python.org/3/library/hmac.html#hmac.compare_digest). `==` bricht beim ersten abweichenden Zeichen ab; aus der Antwortzeit lässt sich so Zeichen für Zeichen auf die richtige Signatur schließen. Drittens vergleichst du Bytes: `compare_digest` wirft bei Strings mit Nicht-ASCII-Zeichen einen `TypeError`, und ein Angreifer bestimmt, was im Header steht.
+
+  Eine gültige Signatur beweist die Herkunft, nicht die Frische. Eine aufgezeichnete Lieferung bleibt gültig signiert. Anbieter wie Stripe nehmen deshalb einen Zeitstempel in die signierten Daten auf, und du lehnst alte Lieferungen ab. GitHub schickt eine eindeutige ID im Header `X-GitHub-Delivery`, mit der du doppelte Lieferungen erkennst.
+
+  ## Testen mit Fakes, die 401 liefern
+
+  Authentifizierungscode testest du nicht gegen den echten Dienst. Ein Fake-Server ist eine Funktion, die je nach Token mit 200, 401 oder 403 antwortet und jede Anfrage protokolliert. Damit prüfst du die Fälle, die im Betrieb selten und teuer sind: widerrufenes Token, zweimal 401, fehlende Rechte.
+
+  ```python run
+  class Antwort:
+      def __init__(self, status):
+          self.status = status
+
+  gesehen = []
+  def fake_api(token):
+      gesehen.append(token)
+      ok = token == "tok-2"
+      return Antwort(200 if ok
+                     else 401)
+
+  print(fake_api("tok-1").status)
+  print(fake_api("tok-2").status)
+  print(gesehen)
+  ```
+
+  Ein guter Fake schützt sich selbst: Nach fünf Anfragen wirft er einen Fehler „Endlosschleife?“. So endet ein fehlerhafter Test sofort mit einer verständlichen Meldung, statt am Zeitlimit zu scheitern.
+
+  > [!PRAXIS]
+  > Lege Zugangsdaten an genau einer Stelle ab und gib sie als Parameter weiter. Dann kann ein Test einen Platzhalter übergeben, und ein Review sieht auf einen Blick, wo Geheimnisse fließen. Im Log stehen Ereignisse wie „Token erneuert“, nie das Token selbst.
+
+  ## Häufige Fehler
+
+  - **Token in der URL.** Es landet in Logs und Verlauf. Header benutzen.
+  - **Schleife bei 401.** `while status == 401` endet nie, wenn das Secret falsch ist. Genau eine Erneuerung, dann Abbruch.
+  - **Erneuern bei 403.** Neue Tokens bringen keine neuen Rechte.
+  - **Rotation vergessen.** Das neue Refresh-Token wird nicht gespeichert; der nächste Lauf scheitert mit `invalid_grant`.
+  - **Signatur über geparstes JSON.** Gültige Lieferungen werden abgelehnt, oder die Prüfung wird „repariert“, indem man sie abschaltet.
+  - **`==` statt `compare_digest`.** Funktioniert im Test und ist trotzdem angreifbar.
+
+  > [!INTERVIEW]
+  > „Was machst du, wenn eine API mitten im Job 401 liefert?“ Ich verwerfe das Token, hole genau ein neues und wiederhole die Anfrage einmal. Kommt wieder 401, breche ich mit einer klaren Meldung ab, statt den Dienst mit Wiederholungen zu belasten. 403 behandle ich nicht mit einem neuen Token, weil ein Token mit demselben Scope dieselben Rechte hat.
+
+  > [!MERKE]
+  > Ein 401 rechtfertigt eine Erneuerung, nicht zwei. Die Zahl der Versuche steht im Code.
+
+  ## Zusammenfassung
+
+  - 401 heißt „nicht gültig angemeldet“, 403 „nicht berechtigt“. Ein 401 behebt ein neues Token, ein 403 braucht mehr Rechte.
+  - API-Keys und Tokens gehören in Header, nie in URLs. Basic ist nur Base64 und braucht TLS.
+  - client_credentials liefert Tokens für Dienstkonten ohne Refresh-Token; Nutzer-Tokens erneuerst du per Refresh-Token.
+  - Rotierte Refresh-Tokens speicherst du sofort und atomar; `invalid_grant` verlangt eine neue Anmeldung.
+  - Ein Token-Cache erneuert vor dem Ablauf; die Uhr ist ein Parameter.
+  - Bei 401 genau einmal erneuern und einmal wiederholen, sonst abbrechen.
+  - Webhook-Signaturen prüfst du über die Rohdaten mit `hmac.compare_digest` auf Bytes.
+exercises:
+- id: key-im-header
+  type: choice
+  title: Header oder URL?
+  prompt: Ein Dienst akzeptiert den API-Key als Header `X-API-Key` oder als Query-Parameter `?api_key=…`. Was spricht
+    für den Header?
+  options:
+  - text: URLs landen in Server- und Proxy-Logs, in der Shell-History und im Browserverlauf.
+    correct: true
+    why: Der Header wird zwar genauso übertragen, aber nicht als Teil der Adresse gespeichert und weitergereicht.
+  - text: Header sind verschlüsselt, Query-Parameter nicht.
+    correct: false
+    why: Mit TLS sind beide verschlüsselt, ohne TLS keines von beiden. Das Problem ist die Speicherung, nicht der
+      Transport.
+  - text: Query-Parameter haben eine Längenbegrenzung, die lange Keys abschneidet.
+    correct: false
+    why: Ein API-Key ist weit unter üblichen URL-Grenzen. Das ist nicht der Grund.
+  explanation: Zugangsdaten in URLs verbreiten sich über Logs, Verlauf und Weiterleitungen. RFC 6750 rät aus demselben
+    Grund davon ab, Bearer-Tokens in URLs zu übertragen.
+  resources:
+  - *bearer
+- id: status-401-403
+  type: choice
+  title: Was hilft gegen welchen Status?
+  prompt: Dein Job bekommt eine Fehlerantwort. Welche Reaktion ist richtig?
+  options:
+  - text: 401 mit `error="invalid_token"`, erstes Mal in dieser Anfrage – Token verwerfen, ein neues holen, die Anfrage
+      einmal wiederholen.
+    correct: true
+    why: Ein abgelaufenes oder widerrufenes Token lässt sich durch ein neues ersetzen.
+  - text: 403 mit `error="insufficient_scope"` – Token erneuern, dann klappt es.
+    correct: false
+    why: Ein erneuertes Token hat denselben Scope und damit dieselben Rechte. Hier fehlt eine Berechtigung, die meist ein Mensch vergeben muss.
+  - text: 401 direkt nach einer Erneuerung – weiter erneuern, bis es klappt.
+    correct: false
+    why: Ein zweites 401 deutet auf ein grundsätzliches Problem wie ein falsches Secret oder ein gesperrtes Konto.
+      Weitere Versuche belasten den Dienst und können das Konto sperren.
+  - text: 429 – Token erneuern, weil der Server die Anfragen ablehnt.
+    correct: false
+    why: 429 heißt „zu viele Anfragen“. Das ist ein Fall für Warten und Retry-After, nicht für ein neues Token.
+  explanation: Ein 401 lässt sich durch ein neues Token beheben, und das genau einmal pro Anfrage. 403 ist eine Frage
+    der Rechte, 429 eine Frage des Tempos.
+  resources:
+  - *bearer
+- id: ablauf-bei-401
+  type: order
+  title: Ablauf bei einem abgelaufenen Token
+  prompt: Bring die Schritte einer Anfrage mit Token-Erneuerung in die richtige Reihenfolge.
+  lang: prose
+  lines: |-
+    Gültiges Token aus dem Cache holen oder neu anfordern
+    Anfrage mit Bearer-Header senden
+    Bei 401 das Token verwerfen
+    Genau ein neues Token holen
+    Die Anfrage genau einmal wiederholen
+    Bei erneutem 401 mit klarer Meldung abbrechen
+  explanation: Der Ablauf hat eine feste Zahl von Schritten und keine Schleife. Erst das Verwerfen sorgt dafür, dass
+    der Cache wirklich ein neues Token holt und nicht das alte zurückgibt.
+  resources:
+  - *bearer
+- id: puffer-vorhersagen
+  type: output
+  title: Wann holt der Cache ein neues Token?
+  prompt: |
+    Welche Ausgabe erzeugt dieses Programm? Jedes Token gilt 3600 Sekunden, der Puffer ist 60 Sekunden.
+  lang: python
+  code: |-
+    PUFFER = 60
+    bis = 0
+    wert = None
+    nr = 0
+
+    def aktuell(jetzt):
+        global bis, wert, nr
+        if jetzt + PUFFER < bis:
+            return wert
+        nr += 1
+        wert = f"t{nr}"
+        bis = jetzt + 3600
+        return wert
+
+    for t in [0, 3000, 3540, 3600]:
+        print(t, aktuell(t))
+  expected: |-
+    0 t1
+    3000 t1
+    3540 t2
+    3600 t2
+  explanation: |
+    Bei 0 gibt es noch kein Token. Bei 3000 ist `3060 < 3600`, `t1` bleibt. Bei 3540 ist `3600 < 3600` falsch: Der Puffer greift, `t2` gilt bis 7140. Bei 3600 ist `3660 < 7140`, also bleibt `t2`. Die Grenze liegt genau 60 Sekunden vor dem Ablauf.
+  resources:
+  - title: Python · time.monotonic
+    url: https://docs.python.org/3/library/time.html#time.monotonic
+- id: json-neu-serialisiert
+  type: output
+  title: Dasselbe JSON, andere Bytes
+  prompt: Welche Ausgabe erzeugt dieses Programm?
+  lang: python
+  code: |-
+    import json
+    roh = b'{"b":1,"a":2}'
+    neu = json.dumps(json.loads(roh))
+    print(neu)
+    print(neu.encode() == roh)
+  expected: |-
+    {"b": 1, "a": 2}
+    False
+  explanation: |
+    `json.dumps` setzt standardmäßig Leerzeichen nach `:` und `,`. Inhaltlich ist es dasselbe Objekt, als Bytes aber verschieden. Eine HMAC-Signatur über `neu` passt deshalb nicht zur Signatur des Absenders über `roh`. Signaturen prüfst du immer über die empfangenen Rohdaten.
+  resources:
+  - *webhook
+- id: oauth-anfrage
+  type: gap
+  title: Token holen und benutzen
+  prompt: Ergänze die Token-Anfrage eines Dienstkontos und den Header für die API.
+  lang: python
+  code: |-
+    antwort = httpx.post(
+        TOKEN_URL,
+        data={"grant_type":
+              "⟦client_credentials⟧"},
+        auth=(CLIENT_ID, SECRET),
+        timeout=10,
+    )
+    antwort.raise_for_status()
+    daten = antwort.json()
+    token = daten["⟦access_token⟧"]
+    headers = {"Authorization":
+               f"⟦Bearer⟧ {token}"}
+  gaps:
+  - label: Grant für ein Dienstkonto
+    hint: Der Job handelt als er selbst, mit Client-ID und Secret.
+  - label: Feld mit dem Token
+    hint: So heißt das Feld in der Token-Antwort nach RFC 6749.
+  - label: Verfahren im Header
+    hint: Das Wort bedeutet „Inhaber“.
+    accept: ["bearer"]
+  explanation: client_credentials ist der Grant für Maschinen ohne beteiligte Person. Die Antwort trägt das Token
+    im Feld `access_token`, und die API erwartet es im Header `Authorization` nach dem Wort `Bearer`.
+  resources:
+  - *oauth
+  - *bearer
+- id: basic-header
+  type: code
+  title: Einen Basic-Header bauen
+  prompt: |
+    Schreibe `basic_header(nutzer, passwort)`. Sie verbindet beide mit `:`, kodiert das Ergebnis als UTF-8 und dann mit Base64 und gibt `"Basic "` plus den Base64-Text zurück. Enthält `nutzer` einen Doppelpunkt, wirf `ValueError`. Die Fehlermeldung darf das Passwort nicht enthalten.
+  lang: python
+  starter: |-
+    import base64
+
+    def basic_header(nutzer, passwort):
+        ...
+  solution: |-
+    import base64
+
+    def basic_header(nutzer, passwort):
+        if ":" in nutzer:
+            raise ValueError(
+                "Doppelpunkt im Namen")
+        paar = f"{nutzer}:{passwort}"
+        roh = paar.encode("utf-8")
+        text = base64.b64encode(roh)
+        return "Basic " + text.decode()
+  tests:
+  - name: Beispiel aus RFC 7617
+    code: |-
+      h = basic_header("Aladdin",
+                       "open sesame")
+      assert h == ("Basic QWxhZGRpbjp"
+                   "vcGVuIHNlc2FtZQ=="), h
+  - name: Umlaute als UTF-8
+    code: |-
+      h = basic_header("jörg", "pw")
+      assert h == "Basic asO2cmc6cHc=", h
+  - name: Doppelpunkt im Passwort ist erlaubt
+    code: |-
+      h = basic_header("bot", "a:b")
+      assert h == "Basic Ym90OmE6Yg==", h
+  - name: Doppelpunkt im Nutzer wird abgelehnt
+    code: |-
+      try:
+          basic_header("a:b", "geheim-123")
+      except ValueError as e:
+          assert "geheim-123" not in str(e), (
+              "Das Passwort steht in der Meldung.")
+      else:
+          assert False, "ValueError erwartet"
+  explanation: |
+    Base64 macht aus beliebigen Bytes ASCII-Text, mehr nicht. Deshalb ist Basic nur über TLS vertretbar. Der Doppelpunkt trennt Nutzer und Passwort; im Nutzernamen wäre er mehrdeutig, im Passwort ist er erlaubt, weil der Server am ersten Doppelpunkt trennt. Fehlermeldungen landen in Logs und Tickets, deshalb gehört das Passwort nie hinein.
+  resources:
+  - *basic
+  - title: Python · base64
+    url: https://docs.python.org/3/library/base64.html
+- id: token-cache
+  type: code
+  title: Ein Token-Cache mit Puffer
+  prompt: |
+    Schreibe die Klasse `TokenCache(hole, uhr, puffer=60, standard=300)`.
+
+    - `hole()` liefert die Token-Antwort als Dictionary mit `access_token` und meist `expires_in` (Sekunden). Fehlt `expires_in`, gilt das Token `standard` Sekunden. `uhr()` liefert die aktuelle Zeit in Sekunden.
+    - `aktuell()` gibt das gespeicherte Token zurück, solange `uhr() + puffer < ablauf` gilt. Sonst holt sie ein neues und merkt sich `ablauf = uhr() + dauer`.
+    - `verwerfen()` vergisst das Token, sodass der nächste `aktuell()`-Aufruf ein neues holt.
+  lang: python
+  starter: |-
+    class TokenCache:
+        def __init__(self, hole, uhr,
+                     puffer=60,
+                     standard=300):
+            self.hole = hole
+            self.uhr = uhr
+            self.puffer = puffer
+            self.standard = standard
+
+        def aktuell(self):
+            return self.hole()[
+                "access_token"]
+
+        def verwerfen(self):
+            pass
+  solution: |-
+    class TokenCache:
+        def __init__(self, hole, uhr,
+                     puffer=60,
+                     standard=300):
+            self.hole = hole
+            self.uhr = uhr
+            self.puffer = puffer
+            self.standard = standard
+            self.wert = None
+            self.ablauf = 0
+
+        def gueltig(self, jetzt):
+            if self.wert is None:
+                return False
+            rest = self.ablauf - jetzt
+            return rest > self.puffer
+
+        def aktuell(self):
+            jetzt = self.uhr()
+            if self.gueltig(jetzt):
+                return self.wert
+            d = self.hole()
+            dauer = d.get("expires_in")
+            if dauer is None:
+                dauer = self.standard
+            wert = d["access_token"]
+            self.wert = wert
+            self.ablauf = jetzt + dauer
+            return wert
+
+        def verwerfen(self):
+            self.wert = None
+  setup: |-
+    class _Quelle:
+        def __init__(self, dauer=3600):
+            self.n = 0
+            self.dauer = dauer
+        def __call__(self):
+            self.n += 1
+            antwort = {"access_token": f"tok-{self.n}", "token_type": "Bearer"}
+            if self.dauer is not None:
+                antwort["expires_in"] = self.dauer
+            return antwort
+
+    class _Uhr:
+        def __init__(self):
+            self.t = 0
+        def __call__(self):
+            return self.t
+  tests:
+  - name: Erster Aufruf holt ein Token
+    code: |-
+      q, uhr = _Quelle(), _Uhr()
+      c = TokenCache(q, uhr)
+      assert c.aktuell() == "tok-1"
+      assert q.n == 1, f"{q.n} Abrufe"
+  - name: Gültiges Token wird wiederverwendet
+    code: |-
+      q, uhr = _Quelle(), _Uhr()
+      c = TokenCache(q, uhr)
+      c.aktuell()
+      uhr.t = 3539
+      assert c.aktuell() == "tok-1"
+      assert q.n == 1, f"{q.n} Abrufe"
+  - name: Im Puffer vor dem Ablauf wird erneuert
+    code: |-
+      q, uhr = _Quelle(), _Uhr()
+      c = TokenCache(q, uhr)
+      c.aktuell()
+      uhr.t = 3540
+      assert c.aktuell() == "tok-2", (
+          "60 s vor Ablauf: neues Token")
+      uhr.t = 7079
+      assert c.aktuell() == "tok-2"
+  - name: verwerfen erzwingt ein neues Token
+    code: |-
+      q, uhr = _Quelle(), _Uhr()
+      c = TokenCache(q, uhr)
+      c.aktuell()
+      c.verwerfen()
+      assert c.aktuell() == "tok-2"
+      assert c.aktuell() == "tok-2"
+      assert q.n == 2, f"{q.n} Abrufe"
+  - name: Ohne expires_in gilt der Standard
+    code: |-
+      q, uhr = _Quelle(dauer=None), _Uhr()
+      c = TokenCache(q, uhr)
+      c.aktuell()
+      uhr.t = 239
+      assert c.aktuell() == "tok-1"
+      uhr.t = 240
+      assert c.aktuell() == "tok-2", (
+          "300 s Standard, 60 s Puffer")
+  hints:
+  - Merke dir neben dem Token den Ablaufzeitpunkt `jetzt + dauer`.
+  - Ohne gespeichertes Token musst du immer holen, egal was die Uhr sagt.
+  - '`d.get("expires_in")` liefert `None`, wenn das Feld fehlt.'
+  explanation: |
+    Der Cache verbindet zwei Fragen: Habe ich ein Token, und ist es noch lange genug gültig? Der Puffer fängt Laufzeiten und kleine Uhrunterschiede ab. `expires_in` ist laut RFC 6749 nur empfohlen; fehlt es, braucht dein Code einen dokumentierten Standardwert statt eines Absturzes oder eines ewig gültigen Tokens. Weil die Uhr ein Parameter ist, prüft der Test die Grenze bei 3540 Sekunden in Millisekunden. Im Betrieb übergibst du `time.monotonic`, weil `expires_in` eine Dauer ist und eine monotone Uhr nicht springt, wenn jemand die Systemzeit verstellt.
+  resources:
+  - title: Python · time.monotonic
+    url: https://docs.python.org/3/library/time.html#time.monotonic
+  - *oauth
+- id: einmal-erneuern
+  type: code
+  title: Repariere die Endlosschleife bei 401
+  prompt: |
+    `rufe(anfrage, token)` hängt sich auf, sobald das Secret falsch ist, und erneuert sogar bei 403. Repariere sie:
+
+    - `anfrage(wert)` sendet eine Anfrage mit dem Token `wert` und liefert eine Antwort mit `.status`.
+    - `token.aktuell()` liefert das aktuelle Token, `token.verwerfen()` vergisst es.
+    - Bei 401 verwirfst du das Token und wiederholst die Anfrage **genau einmal** mit `token.aktuell()`. Kommt wieder 401, wirf `AuthFehler`.
+    - Jede andere Antwort, auch 403, gibst du unverändert zurück.
+  lang: python
+  starter: |-
+    class AuthFehler(Exception):
+        pass
+
+    def rufe(anfrage, token):
+        r = anfrage(token.aktuell())
+        while r.status >= 400:
+            token.verwerfen()
+            wert = token.aktuell()
+            r = anfrage(wert)
+        return r
+  solution: |-
+    class AuthFehler(Exception):
+        pass
+
+    def rufe(anfrage, token):
+        r = anfrage(token.aktuell())
+        if r.status != 401:
+            return r
+        token.verwerfen()
+        r = anfrage(token.aktuell())
+        if r.status == 401:
+            raise AuthFehler("401")
+        return r
+  setup: |-
+    class _Antwort:
+        def __init__(self, status):
+            self.status = status
+
+    class FakeApi:
+        """Antwortet 200 auf gültige Tokens, sonst 401 (oder immer 403)."""
+        def __init__(self, gueltig, verboten=False):
+            self.gueltig = set(gueltig)
+            self.verboten = verboten
+            self.gesehen = []
+        def __call__(self, wert):
+            self.gesehen.append(wert)
+            if len(self.gesehen) > 5:
+                raise AssertionError("Mehr als 5 Anfragen – Endlosschleife?")
+            if self.verboten:
+                return _Antwort(403)
+            return _Antwort(200 if wert in self.gueltig else 401)
+
+    class FakeToken:
+        """Liefert t1, nach verwerfen() t2, dann t3 …"""
+        def __init__(self):
+            self.geholt = 0
+            self.wert = None
+        def aktuell(self):
+            if self.wert is None:
+                self.geholt += 1
+                self.wert = f"t{self.geholt}"
+            return self.wert
+        def verwerfen(self):
+            self.wert = None
+  tests:
+  - name: Gültiges Token – eine Anfrage
+    code: |-
+      api, tok = FakeApi({"t1"}), FakeToken()
+      assert rufe(api, tok).status == 200
+      assert api.gesehen == ["t1"], api.gesehen
+  - name: Widerrufenes Token – einmal erneuern
+    code: |-
+      api, tok = FakeApi({"t2"}), FakeToken()
+      assert rufe(api, tok).status == 200
+      assert api.gesehen == ["t1", "t2"], (
+          api.gesehen)
+  - name: Zweimal 401 – AuthFehler nach zwei Anfragen
+    code: |-
+      api, tok = FakeApi(set()), FakeToken()
+      try:
+          rufe(api, tok)
+      except AuthFehler:
+          pass
+      else:
+          assert False, "AuthFehler erwartet"
+      assert api.gesehen == ["t1", "t2"], (
+          api.gesehen)
+  - name: 403 – kein neues Token
+    code: |-
+      api = FakeApi({"t1"}, verboten=True)
+      tok = FakeToken()
+      assert rufe(api, tok).status == 403
+      assert tok.geholt == 1, (
+          f"{tok.geholt} Tokens geholt")
+  hints:
+  - Die Lösung braucht keine Schleife. Schreib die zwei Versuche hintereinander hin.
+  - Prüfe nach dem ersten Versuch nur auf `401`. Alles andere geht sofort zurück.
+  explanation: |
+    Die Schleife im Starter hat keine Obergrenze: Mit falschem Secret liefert jede Erneuerung wieder 401. Außerdem reagiert sie auf 403 und 429, die ein neues Token nicht behebt. Die reparierte Fassung schreibt die zwei Versuche aus. Ein zweites 401 wird zu einem sichtbaren `AuthFehler`, den der Job meldet, statt den Dienst weiter zu belasten.
+  resources:
+  - *bearer
+- id: refresh-rotation
+  type: code
+  title: Refresh-Token erneuern und rotieren
+  prompt: |
+    Schreibe `erneuere(sende, ablage)`.
+
+    - Rufe `sende(form)` **genau einmal** auf, mit `form = {"grant_type": "refresh_token", "refresh_token": …}` und dem Token aus `ablage["refresh"]`. `sende` liefert `(status, daten)`.
+    - Bei Status 200: Enthält `daten` ein neues `refresh_token`, ersetze `ablage["refresh"]` damit. Gib `daten["access_token"]` zurück.
+    - Bei Status 400 mit `daten["error"] == "invalid_grant"`: wirf `NeuAnmelden`, ohne `ablage` zu ändern.
+    - Bei jedem anderen Status: wirf `RuntimeError`.
+  lang: python
+  starter: |-
+    class NeuAnmelden(Exception):
+        pass
+
+    def erneuere(sende, ablage):
+        ...
+  solution: |-
+    class NeuAnmelden(Exception):
+        pass
+
+    def erneuere(sende, ablage):
+        form = {"grant_type":
+                "refresh_token",
+                "refresh_token":
+                ablage["refresh"]}
+        status, d = sende(form)
+        if status == 200:
+            alt = ablage["refresh"]
+            ablage["refresh"] = d.get(
+                "refresh_token", alt)
+            return d["access_token"]
+        fehler = d.get("error")
+        if status != 400:
+            raise RuntimeError(status)
+        if fehler != "invalid_grant":
+            raise RuntimeError(fehler)
+        raise NeuAnmelden()
+  setup: |-
+    class FakeServer:
+        def __init__(self, status, daten):
+            self.antwort = (status, daten)
+            self.formulare = []
+        def __call__(self, form):
+            self.formulare.append(dict(form))
+            return self.antwort
+  tests:
+  - name: Formular für den Refresh-Grant
+    code: |-
+      s = FakeServer(200, {"access_token": "a"})
+      erneuere(s, {"refresh": "r-1"})
+      assert s.formulare == [{
+          "grant_type": "refresh_token",
+          "refresh_token": "r-1"}], s.formulare
+  - name: Rotiertes Token wird gespeichert
+    code: |-
+      s = FakeServer(200, {"access_token": "a-2",
+                           "refresh_token": "r-2"})
+      ablage = {"refresh": "r-1"}
+      assert erneuere(s, ablage) == "a-2"
+      assert ablage == {"refresh": "r-2"}, ablage
+  - name: Ohne Rotation bleibt das alte Token
+    code: |-
+      s = FakeServer(200, {"access_token": "a-2"})
+      ablage = {"refresh": "r-1"}
+      erneuere(s, ablage)
+      assert ablage == {"refresh": "r-1"}, ablage
+  - name: invalid_grant – neu anmelden, nichts ändern
+    code: |-
+      s = FakeServer(400, {"error": "invalid_grant"})
+      ablage = {"refresh": "r-1"}
+      try:
+          erneuere(s, ablage)
+      except NeuAnmelden:
+          pass
+      else:
+          assert False, "NeuAnmelden erwartet"
+      assert ablage == {"refresh": "r-1"}, ablage
+      assert len(s.formulare) == 1, (
+          "Bei invalid_grant hilft kein Retry.")
+  - name: Anderer 400 – RuntimeError
+    code: |-
+      s = FakeServer(400, {"error": "invalid_request"})
+      try:
+          erneuere(s, {"refresh": "r-1"})
+      except NeuAnmelden:
+          assert False, "Nur invalid_grant heißt neu anmelden."
+      except RuntimeError:
+          pass
+      else:
+          assert False, "RuntimeError erwartet"
+  - name: Serverfehler – RuntimeError
+    code: |-
+      s = FakeServer(500, {})
+      try:
+          erneuere(s, {"refresh": "r-1"})
+      except RuntimeError:
+          pass
+      else:
+          assert False, "RuntimeError erwartet"
+  explanation: |
+    Ein Refresh-Token ist ein Zustand, den du verwalten musst. Rotiert der Server, ist das alte Token sofort wertlos; wer das neue nicht speichert, scheitert beim nächsten Lauf. `invalid_grant` heißt, dass die Berechtigung weg ist. Kein Retry bringt sie zurück, nur eine neue Anmeldung durch einen Menschen. Deshalb trennt die Funktion diesen Fall ausdrücklich von anderen Fehlern, die später vielleicht von selbst verschwinden.
+  resources:
+  - *oauth
+  - title: RFC 9700 · Refresh Token Protection
+    url: https://www.rfc-editor.org/rfc/rfc9700.html#section-4.14.2
+- id: webhook-signatur
+  type: code
+  title: Eine Webhook-Lieferung prüfen
+  prompt: |
+    Schreibe `ist_echt(geheim, roh, kopf)` für Webhooks im Format von GitHub. `geheim` und `roh` (der empfangene Körper) sind Bytes, `kopf` ist der Wert des Headers `X-Hub-Signature-256` als String oder `None`. Gib `True` zurück, wenn `kopf` gleich `"sha256="` plus dem HMAC-SHA256 von `roh` als Hexstring ist, sonst `False`. Die Funktion wirft nie eine Exception, auch nicht bei fehlendem oder seltsamem Header.
+  lang: python
+  starter: |-
+    import hashlib
+    import hmac
+
+    def ist_echt(geheim, roh, kopf):
+        ...
+  solution: |-
+    import hashlib
+    import hmac
+
+    def ist_echt(geheim, roh, kopf):
+        if not kopf:
+            return False
+        mac = hmac.new(geheim, roh,
+                       hashlib.sha256)
+        hexwert = mac.hexdigest()
+        soll = "sha256=" + hexwert
+        return hmac.compare_digest(
+            soll.encode("utf-8"),
+            kopf.encode("utf-8"))
+  tests:
+  - name: Testfall aus der GitHub-Dokumentation
+    code: |-
+      g = b"It's a Secret to Everybody"
+      k = ("sha256=757107ea0eb2509fc2112"
+           "21cce984b8a37570b6d7586c22c46"
+           "f4379c8b043e17")
+      assert ist_echt(g, b"Hello, World!", k)
+  - name: Veränderter Körper wird abgelehnt
+    code: |-
+      g = b"It's a Secret to Everybody"
+      k = ("sha256=757107ea0eb2509fc2112"
+           "21cce984b8a37570b6d7586c22c46"
+           "f4379c8b043e17")
+      assert not ist_echt(g, b"Hello, World?", k)
+  - name: Fehlender oder falscher Header
+    code: |-
+      g, roh = b"geheim-123", b"{}"
+      assert ist_echt(g, roh, None) is False
+      assert ist_echt(g, roh, "") is False
+      assert ist_echt(g, roh, "sha1=abc") is False
+  - name: Nicht-ASCII im Header wirft nicht
+    code: |-
+      g, roh = b"geheim-123", b"{}"
+      assert ist_echt(g, roh, "sha256=ä") is False
+  hints:
+  - '`hmac.new(geheim, roh, hashlib.sha256).hexdigest()` liefert den Hexstring.'
+  - '`hmac.compare_digest` wirft bei Strings mit Nicht-ASCII-Zeichen. Vergleiche deshalb Bytes: `.encode("utf-8")`.'
+  explanation: |
+    Die Signatur entsteht über genau die Bytes, die der Absender geschickt hat. Bei `compare_digest` hängt die Laufzeit nicht davon ab, an welcher Stelle sich zwei Werte unterscheiden; so verrät die Antwortzeit nicht Zeichen für Zeichen die richtige Signatur. Die Python-Dokumentation weist darauf hin, dass Länge und Typ trotzdem erkennbar bleiben können. Den Header bestimmt im Zweifel ein Angreifer. Deshalb darf die Prüfung bei seltsamen Werten nicht abstürzen, sondern lehnt ab. Ein Absturz hieße hier einen Fehler 500 statt einer sauberen Ablehnung.
+  resources:
+  - *webhook
+  - *hmac
+- id: signatur-ueber-json
+  type: bug
+  title: Echte Lieferungen werden abgelehnt
+  prompt: |
+    Seit dem Umbau lehnt der Webhook-Empfänger jede Lieferung von GitHub als gefälscht ab, obwohl das Geheimnis stimmt. `req.body` sind die empfangenen Bytes, `req.json` das daraus geparste Objekt, `kanonisch(daten)` erzeugt sortiertes, kompaktes JSON als Bytes. Finde die Zeile, die das verursacht, und korrigiere sie.
+  lang: python
+  code: |-
+    def ist_echt(geheim, req, kopf):
+        if not kopf:
+            return False
+        mac = hmac.new(
+            geheim,
+            kanonisch(req.json),
+            hashlib.sha256)
+        hexwert = mac.hexdigest()
+        soll = "sha256=" + hexwert
+        return hmac.compare_digest(
+            soll.encode(),
+            kopf.encode())
+  lines:
+  - 6
+  fix:
+  - line: 6
+    answers:
+    - req.body,
+  explanation: |
+    GitHub signiert genau die Bytes, die es geschickt hat. `kanonisch(req.json)` erzeugt dasselbe Objekt als andere Bytes, mit anderer Reihenfolge und anderen Leerzeichen, und damit eine andere Signatur. In die HMAC-Berechnung gehört deshalb `req.body`, unverändert. Das geparste Objekt darfst du erst benutzen, nachdem die Signatur stimmt.
+  resources:
+  - *webhook
+- id: rotation-speichern
+  type: explain
+  title: Warum wird zuerst gespeichert?
+  prompt: Erkläre, warum diese Funktion das neue Refresh-Token sofort und atomar speichert und was passiert, wenn
+    das Speichern scheitert.
+  lang: python
+  code: |-
+    def erneuere(sende, ablage):
+        alt = ablage.lesen()
+        neu = sende(alt)
+        ablage.schreibe_atomar(
+            neu["refresh_token"])
+        return neu["access_token"]
+  points:
+  - Der Server rotiert das Refresh-Token; das alte ist nach der Antwort ungültig.
+  - Nur das gespeicherte neue Token erlaubt den nächsten Lauf; stürzt das Programm vorher ab, ist es verloren.
+  - Atomar heißt, dass nie eine halb geschriebene Datei zurückbleibt, die beim nächsten Lauf gelesen wird.
+  - Scheitert das Speichern, endet der nächste Lauf mit invalid_grant, und nur eine neue Anmeldung hilft.
+  explanation: |
+    Mit Rotation ist jedes Refresh-Token nur einmal gültig. Zwischen der Antwort des Servers und dem Speichern liegt das einzige Fenster, in dem das neue Token verloren gehen kann. Deshalb steht das Speichern direkt danach und vor allem anderen, und es schreibt über eine temporäre Datei und `os.replace`. Ein altes Token noch einmal zu schicken ist nicht harmlos: Server, die Rotation nach RFC 9700 umsetzen, deuten das als möglichen Diebstahl und können auch das gültige Token widerrufen.
+  resources:
+  - title: RFC 9700 · Refresh Token Protection
+    url: https://www.rfc-editor.org/rfc/rfc9700.html#section-4.14.2
+  - title: Python · os.replace
+    url: https://docs.python.org/3/library/os.html#os.replace

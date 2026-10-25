@@ -210,7 +210,8 @@ for (const area of loaded.catalog.areas) {
 }
 
 test('real content fits phone, tablet and desktop viewports', async ({ page }) => {
-  test.setTimeout(180_000);
+  // The test visits every area at three widths, so it grows with each course: 2.5 minutes at ten areas, over three at fourteen.
+  test.setTimeout(30_000 * loaded.catalog.areas.length);
   // Weak spots in every area, so the review pages show topic cards, the topic map and a running round.
   const day = (offset: number) => new Date(Date.now() + offset * 86_400_000).toISOString().slice(0, 10);
   const seeded = Object.fromEntries(loaded.catalog.areas.map((area) => {
