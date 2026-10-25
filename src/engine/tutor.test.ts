@@ -171,7 +171,7 @@ describe('configuration, cost and budget', () => {
   it('is off without a key and uses the proposed defaults otherwise', () => {
     expect(tutorConfig({})).toEqual({ enabled: false, problem: null });
     expect(tutorConfig({ ANTHROPIC_API_KEY: ' ' })).toEqual({ enabled: false, problem: null });
-    expect(tutorConfig({ ANTHROPIC_API_KEY: 'test-key' })).toEqual({ enabled: true, apiKey: 'test-key', model: 'claude-sonnet-5-5', effort: 'medium', budgetMicros: 5_000_000 });
+    expect(tutorConfig({ ANTHROPIC_API_KEY: 'test-key' })).toEqual({ enabled: true, apiKey: 'test-key', model: 'claude-sonnet-5-5', effort: 'medium', budgetMicros: 20_000_000 });
     expect(tutorConfig({ ANTHROPIC_API_KEY: 'k', TUTOR_MODEL: 'claude-haiku-5-5', TUTOR_EFFORT: 'low', TUTOR_MONTHLY_BUDGET_USD: '7.50' })).toMatchObject({ model: 'claude-haiku-5-5', effort: 'low', budgetMicros: 7_500_000 });
   });
   it('turns itself off for values it cannot account for', () => {
@@ -188,10 +188,10 @@ describe('configuration, cost and budget', () => {
   });
   it('warns at 80 % of the booked cost and pauses once a long request no longer fits', () => {
     const config = tutorConfig({ ANTHROPIC_API_KEY: 'k' });
-    expect(tutorStatus(config, '2026-10', 3_000_000, 0, 10)).toMatchObject({ warn: false, exhausted: false });
-    expect(tutorStatus(config, '2026-10', 3_000_000, 1_000_000, 10)).toMatchObject({ spentMicros: 3_000_000, warn: false, exhausted: false });
-    expect(tutorStatus(config, '2026-10', 4_000_000, 0, 10)).toMatchObject({ warn: true, exhausted: false });
-    expect(tutorStatus(config, '2026-10', 4_900_000, 0, 10)).toMatchObject({ warn: true, exhausted: true });
+    expect(tutorStatus(config, '2026-10', 12_000_000, 0, 10)).toMatchObject({ warn: false, exhausted: false });
+    expect(tutorStatus(config, '2026-10', 12_000_000, 4_000_000, 10)).toMatchObject({ spentMicros: 12_000_000, warn: false, exhausted: false });
+    expect(tutorStatus(config, '2026-10', 16_000_000, 0, 10)).toMatchObject({ warn: true, exhausted: false });
+    expect(tutorStatus(config, '2026-10', 19_900_000, 0, 10)).toMatchObject({ warn: true, exhausted: true });
     expect(usageMonth(new Date('2026-10-31T23:30:00Z'))).toBe('2026-10');
   });
 });

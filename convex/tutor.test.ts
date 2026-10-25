@@ -106,7 +106,7 @@ describe('a hint', () => {
     const row = await t.query(internal.tutor.monthUsage, { month });
     const usage = { input: row!.inputTokens, cacheWrite: row!.cacheWriteTokens, cacheRead: row!.cacheReadTokens, output: row!.outputTokens };
     expect(row).toMatchObject({ requests: 1, pendingMicros: 0, outputTokens: 120, costMicros: costMicros('claude-sonnet-5-5', usage) });
-    expect(await t.query(api.tutor.status, {})).toMatchObject({ enabled: true, month, requests: 1, spentMicros: row!.costMicros, budgetMicros: 5_000_000, warn: false, exhausted: false });
+    expect(await t.query(api.tutor.status, {})).toMatchObject({ enabled: true, month, requests: 1, spentMicros: row!.costMicros, budgetMicros: 20_000_000, warn: false, exhausted: false });
   });
   it('hits the prompt cache on the next hint for the same exercise', async () => {
     withKey();
@@ -230,7 +230,7 @@ describe('monthly budget', () => {
   it('reads the month the page asks for, so a subscription moves on at the turn of the month', async () => {
     withKey();
     const t = create().withIdentity(identity);
-    await t.run(async (ctx) => { await ctx.db.insert('tutorUsage', { month: '2026-09', requests: 3, inputTokens: 0, cacheWriteTokens: 0, cacheReadTokens: 0, outputTokens: 0, costMicros: 4_990_000, pendingMicros: 0, updatedAt: 0 }); });
+    await t.run(async (ctx) => { await ctx.db.insert('tutorUsage', { month: '2026-09', requests: 3, inputTokens: 0, cacheWriteTokens: 0, cacheReadTokens: 0, outputTokens: 0, costMicros: 19_990_000, pendingMicros: 0, updatedAt: 0 }); });
     expect(await t.query(api.tutor.status, { month: '2026-09' })).toMatchObject({ month: '2026-09', requests: 3, exhausted: true });
     expect(await t.query(api.tutor.status, { month: '2026-10' })).toMatchObject({ month: '2026-10', requests: 0, exhausted: false });
     expect(await t.query(api.tutor.status, { month: 'kaputt' })).toMatchObject({ month });

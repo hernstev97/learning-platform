@@ -340,9 +340,9 @@ export type TutorConfig =
   | { enabled: false; problem: string | null }
   | { enabled: true; apiKey: string; model: string; effort: Effort; budgetMicros: number };
 /**
- * Reads the Convex environment. Without `ANTHROPIC_API_KEY` the tutor does not exist for the app. Model and budget are
- * proposals from LRN-6, not confirmed decisions: `TUTOR_MODEL` (default claude-sonnet-5-5), `TUTOR_EFFORT` (medium),
- * `TUTOR_MONTHLY_BUDGET_USD` (5). An unknown model or an invalid value disables the tutor instead of guessing.
+ * Reads the Convex environment. Without `ANTHROPIC_API_KEY` the tutor does not exist for the app. Model, effort and budget
+ * are Steven's defaults from 25 Oct 2026 (LRN-6): `TUTOR_MODEL` (default claude-sonnet-5-5), `TUTOR_EFFORT` (medium),
+ * `TUTOR_MONTHLY_BUDGET_USD` (20). An unknown model or an invalid value disables the tutor instead of guessing.
  */
 export function tutorConfig(env: Record<string, string | undefined>): TutorConfig {
   const apiKey = env.ANTHROPIC_API_KEY?.trim();
@@ -351,9 +351,9 @@ export function tutorConfig(env: Record<string, string | undefined>): TutorConfi
   if (!PRICES[model]) return { enabled: false, problem: `TUTOR_MODEL „${model}“ ist unbekannt. Möglich: ${Object.keys(PRICES).join(', ')}.` };
   const effort = (env.TUTOR_EFFORT?.trim() || 'medium') as Effort;
   if (!EFFORTS.includes(effort)) return { enabled: false, problem: `TUTOR_EFFORT „${effort}“ ist ungültig. Möglich: ${EFFORTS.join(', ')}.` };
-  const raw = env.TUTOR_MONTHLY_BUDGET_USD?.trim() || '5';
+  const raw = env.TUTOR_MONTHLY_BUDGET_USD?.trim() || '20';
   const budget = /^\d+(?:\.\d{1,2})?$/.test(raw) ? Number(raw) : NaN;
-  if (!(budget > 0 && budget <= 500)) return { enabled: false, problem: `TUTOR_MONTHLY_BUDGET_USD „${raw}“ ist ungültig. Erwartet: Dollar über 0 und höchstens 500, z. B. 5 oder 7.50.` };
+  if (!(budget > 0 && budget <= 500)) return { enabled: false, problem: `TUTOR_MONTHLY_BUDGET_USD „${raw}“ ist ungültig. Erwartet: Dollar über 0 und höchstens 500, z. B. 20 oder 7.50.` };
   return { enabled: true, apiKey, model, effort, budgetMicros: Math.round(budget * 1_000_000) };
 }
 /** Calendar month in UTC, like the spend limits in the Claude Console. */

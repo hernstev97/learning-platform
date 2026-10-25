@@ -6,7 +6,7 @@ import type { TutorReply, TutorRequest, TutorStatus } from '../src/engine/tutor.
 const base = '/beispiel/alle-typen';
 const errorsOf = (page: Page) => { const errors: string[] = []; page.on('pageerror', (e) => errors.push(e.message)); return errors; };
 type Fake = { status: TutorStatus | null; replies: TutorReply[]; requests: TutorRequest[] };
-const enabled = (overrides: Partial<Extract<TutorStatus, { enabled: true }>> = {}): TutorStatus => ({ enabled: true, month: '2026-10', model: 'claude-sonnet-5-5', spentMicros: 1_230_000, budgetMicros: 5_000_000, requests: 87, warn: false, exhausted: false, ...overrides });
+const enabled = (overrides: Partial<Extract<TutorStatus, { enabled: true }>> = {}): TutorStatus => ({ enabled: true, month: '2026-10', model: 'claude-sonnet-5-5', spentMicros: 1_230_000, budgetMicros: 20_000_000, requests: 87, warn: false, exhausted: false, ...overrides });
 async function fake(page: Page, status: TutorStatus | null, replies: TutorReply[] = []) {
   await page.addInitScript(({ status, replies }) => {
     const value: Fake & { reply(request: TutorRequest): TutorReply } = {
@@ -74,11 +74,11 @@ test('falls back to the next static hint when the tutor would give the solution 
 });
 
 test('warns at 80 % of the budget and pauses when it is used up', async ({ page }) => {
-  await fake(page, enabled({ spentMicros: 4_100_000, warn: true }));
+  await fake(page, enabled({ spentMicros: 16_400_000, warn: true }));
   await page.goto(`${base}/1`);
-  await expect(page.locator('#tutor-budget')).toHaveText('4,10 $ von 5,00 $ Monatsbudget verbraucht.');
+  await expect(page.locator('#tutor-budget')).toHaveText('16,40 $ von 20,00 $ Monatsbudget verbraucht.');
   await expect(page.locator('#tutor-form')).toBeVisible();
-  await fake(page, enabled({ spentMicros: 4_995_000, warn: true, exhausted: true }));
+  await fake(page, enabled({ spentMicros: 19_995_000, warn: true, exhausted: true }));
   await page.reload();
   await expect(page.locator('#tutor-budget')).toContainText('Pausiert bis zum 1. November');
   await expect(page.locator('#tutor-form')).toBeHidden();
@@ -119,5 +119,5 @@ test('offers no tutor for own texts and keeps analysis exercises', async ({ page
 test('shows the month’s usage on the data page', async ({ page }) => {
   await fake(page, enabled());
   await page.goto('/daten');
-  await expect(page.locator('#tutor-usage-text')).toHaveText('Oktober 2026: 1,23 $ von 5,00 $ verbraucht, 87 Anfragen (claude-sonnet-5-5).');
+  await expect(page.locator('#tutor-usage-text')).toHaveText('Oktober 2026: 1,23 $ von 20,00 $ verbraucht, 87 Anfragen (claude-sonnet-5-5).');
 });
