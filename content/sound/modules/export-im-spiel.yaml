@@ -1,0 +1,624 @@
+id: export-im-spiel
+title: "Lautheit, Export, Import und Hörtest im Spiel"
+level: 3
+minutes: 150
+summary: Wie du Klänge und Musik nach Lautheit statt nach Spitzenpegel abstimmst, aus REAPER mit Normalisieren und Begrenzen renderst, in Godot über Busse mit Reglern und Ducking mischst und das Ergebnis im Spiel mit Mitschnitt, Messung und Hörprotokoll prüfst.
+place: pc
+goals:
+  - Du unterscheidest integrierte, kurzzeitige und momentane Lautheit und True Peak nach ITU-R BS.1770 und EBU R 128 und misst sie an einer Datei und an einem Mitschnitt aus dem Spiel.
+  - Du rechnest den Gain bis zu einem Platzhalter-Ziel und sagst vorher, ob danach ein Limiter greift.
+  - Du stellst die Nachbearbeitung im REAPER-Render-Dialog ein und weißt, was ein Neu-Rendern in Godot ändert und was nicht.
+  - Du legst Busse mit Reglern an und richtest Ducking mit `AudioEffectCompressor` und `sidechain` so ein, wie es in Godot 4.7.2 gemessen funktioniert.
+  - Du führst einen Hörtest im Spiel mit Protokoll auf verschiedenen Geräten und Lautstärken durch.
+resources:
+  - title: ITU-R BS.1770 · Algorithms to measure audio programme loudness and true-peak audio level
+    url: https://www.itu.int/rec/R-REC-BS.1770
+  - title: EBU R 128 (2023) · Loudness normalisation and permitted maximum level (PDF)
+    url: https://tech.ebu.ch/docs/r/r128.pdf
+  - title: Sony ASWG-R001 v1.10 · Average Loudness and Peak Levels (PDF, Kopie bei Game Audio Podcast)
+    url: https://www.gameaudiopodcast.com/ASWG-R001.pdf
+  - title: REAPER User Guide 7.81 · Render-Dialog und Postprocess (S. 414)
+    url: https://www.reaper.fm/userguide/ReaperUserGuide781c.pdf#page=414
+  - title: Godot Docs · AudioEffectCompressor · sidechain
+    url: https://docs.godotengine.org/en/stable/classes/class_audioeffectcompressor.html#class-audioeffectcompressor-property-sidechain
+lesson: |
+  Zwei Prüfsignale, beide auf beiden Kanälen: ein Loop aus Klicks mit seiner Spitze bei −7,1 dBFS und ein Sinuston von 1 kHz mit seiner Spitze bei −20,0 dBFS. Nach Spitzenpegel ist der Klick-Loop 13 dB lauter. Gemessen nach Lautheit ist es umgekehrt: Der Klick-Loop hat −26,4 LUFS, der Sinus −20,0 LUFS, 6,4 LU mehr. Wer nach Spitzenpegel normalisiert, stimmt Klänge also nach einer Zahl ab, die mit dem Eindruck wenig zu tun hat.
+
+  Aus der Musik kennst du LUFS als Ziel für einen Master. Im Spiel gibt es diesen einen Master nicht. Jeder Klang kommt als eigene Datei, und erst die Engine mischt sie, je nach Situation anders. Dieses Modul misst Lautheit an Dateien und am Spiel, stellt den Export in REAPER ein, baut Busse, Regler und Ducking in Godot und endet mit einem Hörtest. Prioritäten und Bus-Plan hast du in [Mischung: Musik, Geräusche und Stille](/sound/mischung-stille) geplant; WAV oder Ogg, Busse und Dezibel stehen in [Audio zuordnen](/godot/audio). Alle Zielwerte hier sind Platzhalter für Rechnungen. Normen darf man nennen, entscheiden musst du, und jede Mischentscheidung bleibt deine.
+
+  ## Lautheit messen: LUFS, LU und True Peak
+
+  Die Messung ist genormt in [ITU-R BS.1770](https://www.itu.int/dms_pubrec/itu-r/rec/bs/R-REC-BS.1770-5-202311-I!!PDF-E.pdf#page=4), aktuell Version 5 von 2023. Der Algorithmus hat vier Stufen: eine Frequenzgewichtung „K“, das mittlere Quadrat je Kanal, eine gewichtete Summe der Kanäle und ein Gating über Blöcke von 400 ms, die sich zu 75 % überlappen. Das Gating hat zwei Schwellen, „the first at −70 LKFS“ und „the second at −10 dB relative to the level measured after application of the first threshold“. LKFS und LUFS sind dieselbe Einheit; die EBU schreibt LUFS. Ein **LU** ist ein Abstand, wie ein dB.
+
+  Die EBU legt in [Tech 3341](https://tech.ebu.ch/docs/tech/tech3341.pdf#page=5) drei Zeitfenster fest, und REAPERs JS Loudness Meter zeigt sie so ([S. 120](https://www.reaper.fm/userguide/ReaperUserGuide781c.pdf#page=120)): **momentan** (LUFS-M) über 400 ms, **kurzzeitig** (LUFS-S) über 3 s, **integriert** (LUFS-I) über die ganze Messung mit Gating. Dazu kommt **True Peak**, laut Guide der „highest level of the oversampled signal“. Die Spitze zwischen zwei Samples kann höher liegen als jedes Sample. Ein Prüfsignal zeigt das: ein Sinus auf einem Viertel der Abtastrate, dessen Samples nie auf der Spitze liegen. Rechnerisch liegt die Spitze der Welle bei −0,45 dBFS, 3,0 dB über den Samples. ffmpeg maß Sample Peak −3,5 dBFS und True Peak +0,2 dBTP; sein Schätzer zeigt hier also 0,65 dB mehr als die Rechnung.
+
+  Ohne REAPER misst `ffmpeg` dasselbe ([ebur128](https://ffmpeg.org/ffmpeg-filters.html#ebur128)). Für den Klick-Loop vom Anfang:
+
+  ```console
+  $ ffmpeg -nostats -i pruefloop_lr.wav -af ebur128=peak=true -f null -
+  …
+    Integrated loudness:
+      I:         -26.4 LUFS
+      Threshold: -36.4 LUFS
+  …
+    True peak:
+      Peak:       -7.1 dBFS
+  ```
+
+  Das Gating erklärt, warum ein Spiel mit vielen Pausen nicht leiser misst. Ein Modell mit Blockwerten statt Audio, nach den Formeln der Norm:
+
+  ```python run
+  import math
+
+
+  def integriert(bloecke):
+      """Integrierte Lautheit aus Blockwerten (je 400 ms) mit dem Gating von ITU-R BS.1770."""
+      def mittel(werte):
+          return 10 * math.log10(sum(10 ** (l / 10) for l in werte) / len(werte))
+      ueber_absolut = [l for l in bloecke if l > -70]
+      relativ = mittel(ueber_absolut) - 10
+      return round(mittel([l for l in ueber_absolut if l > relativ]), 1)
+
+
+  kampf = [-20] * 50 + [-10] * 50
+  print(integriert(kampf))
+  print(integriert(kampf + [-80] * 100))   # Pausen
+  print(integriert(kampf + [-28] * 100))   # sehr leise Atmo
+  print(integriert(kampf + [-22] * 100))   # leise Atmo
+  ```
+
+  Halb −20, halb −10 LUFS ergibt −12,6 LUFS, nicht −15: Gemittelt wird die Energie, die lauten Blöcke zählen mehr. Pausen unter −70 fallen weg. Die Atmo bei −28 liegt unter der relativen Schwelle und fällt auch weg, die bei −22 nicht, und dann sinkt der Wert. Bei einem einzelnen Klick wirkt dasselbe: Ein Klick in einer Datei von 0,5 s und in einer von 2 s maß beide Male −24,8 LUFS.
+
+  ### Mono-Dateien: im Spiel lauter oder leiser
+
+  Die Norm misst einen Sinus von 1 kHz und 0 dBFS in einem Kanal mit −3,01 LKFS (BS.1770-5, S. 9; genau gemeint sind 997 Hz). Eine Mono-Datei mit einem Sinus von 997 Hz bei −20 dBFS misst deshalb −23,0 LUFS, dieselbe Welle in beiden Kanälen −20,0 LUFS. Im Spiel entscheidet der Player, gemessen mit Godot 4.7.2 am Mitschnitt des Masters:
+
+  | Wiedergabe | je Kanal | gemessen |
+  | --- | --- | --- |
+  | Datei, mono | – | −23,0 LUFS |
+  | `AudioStreamPlayer` | volle Höhe | −20,0 LUFS |
+  | `AudioStreamPlayer2D` in der Bildschirmmitte | halbe Amplitude, −6 dB | −26,0 LUFS |
+
+  Über `AudioStreamPlayer` misst der Mitschnitt 3 LU mehr als die Datei, über `AudioStreamPlayer2D` in der Bildschirmmitte 3 LU weniger. Weiter weg wird der 2D-Player leiser und wandert zur Seite ([Audio zuordnen](/godot/audio)). Miss Effekte also so, wie sie im Spiel ankommen, Klänge mit Ort an der Stelle, an der sie klingen. Für Mono-Dateien ohne Ort bietet REAPER in der Render-Nachbearbeitung „Adjust mono files by +3dB/-3dB“ (Guide S. 414, siehe unten).
+
+  ## Referenzwerte: Normen als Startpunkt, nicht als Vorgabe
+
+  [EBU R 128](https://tech.ebu.ch/docs/r/r128.pdf#page=3) normalisiert Fernsehprogramme auf −23,0 LUFS und erlaubt höchstens −1 dBTP. Gemessen wird das Programm „in its entirety, without emphasis on specific foreground elements such as speech, music or sound effects“ ([S. 4](https://tech.ebu.ch/docs/r/r128.pdf#page=4)). Für Spiele hat Sonys Audio Standards Working Group 2013 die Empfehlung [ASWG-R001](https://www.gameaudiopodcast.com/ASWG-R001.pdf#page=6) in Version 1.10 veröffentlicht. Sie nennt für Titel auf Heimkonsolen −24 (±2) LKFS, für tragbare Geräte −18 (±2) LKFS und höchstens −1 dBTP. Gemessen wird der ganze Inhalt, „for a minimum of 30 minutes“, und zwar ein repräsentativer Querschnitt des Spiels. Version 1.10 hat den Wert für Heimkonsolen von −23 auf −24 gesenkt, passend zu ATSC und ARIB. Das PDF liegt als Kopie bei Game Audio Podcast, nicht bei Sony.
+
+  Zwei Folgen für deine Arbeit. Erstens messen beide Werke das ganze Programm, nicht einzelne Dateien. Ein Zielwert für eine Effekt-Datei ist deshalb eine eigene Festlegung, ein Platzhalter, mit dem du Kategorien gegeneinander abstimmst. Ob das Spiel als Ganzes passt, zeigt erst ein langer Mitschnitt. Zweitens sind beides keine Pflichten für ein PC-Spiel. Sie sagen dir, wo andere Inhalte liegen, neben denen deins läuft.
+
+  > [!PRAXIS] Wie Sony gemessen hat
+  > Garry Taylor, damals Audio Director bei Sony Computer Entertainment Europe, beschreibt 2012 die Arbeit an den Empfehlungen ([Designing Sound](https://designingsound.org/2012/07/30/video-games-and-loudness-standards-interview-with-sonys-garry-taylor/)). Die Gruppe hatte „over 120 games, films, TV shows and trailers“ gemessen. Für ein Spiel empfahl er, das Ausgangssignal in eine DAW zu führen und „for a minimum of 30 minutes“ zu messen. Als Schwierigkeit nennt er „reproducibility and consistency when measuring non-linear material“. Für deine Testszene hast du dafür ein Werkzeug: Das Drehbuch aus der [Combat-Testszene](/combat/testszene-angriff) spielt jeden Lauf gleich ab, also misst du jede Fassung unter gleichen Bedingungen.
+
+  ## Normalisieren und Begrenzen in REAPER
+
+  Im Render-Dialog (*File → Render…*) öffnet *Postprocess…* die Nachbearbeitung. Laut Guide normalisiert sie auf „RMS-I, LUFS-I, True peak, Peak, LUFS-M max or LUFS-S max“ und begrenzt mit „Brickwall limit to Peak or True peak“. Bei mehreren Dateien wählst du „Normalize each file separately, to loudest file, or as if files play together“ ([S. 414](https://www.reaper.fm/userguide/ReaperUserGuide781c.pdf#page=414)). Dort sitzen auch Stille-Trimmen und Fades. Was die Wahl bedeutet:
+
+  | Einstellung | Wirkung |
+  | --- | --- |
+  | `each file separately` | jede Datei für sich aufs Ziel, Unterschiede verschwinden |
+  | `to loudest file` | lauteste aufs Ziel, Abstände bleiben |
+  | `as if files play together` | alle zusammen gemessen, Abstände bleiben |
+
+  Für Varianten eines Klangs ist „separately“ oft gewollt, denn sie sollen gleich laut sein ([Layering und Varianten](/sound/layering-varianten)). Für Stems einer Musik zerstört es die Balance ([Eigenes Stück aufbereiten](/sound/loops-stems)). Ob Ziel und Decke nach der Nachbearbeitung stimmen, prüfst du ohne Datei mit *Dry Run (no output)*; das Fenster mit den Render-Statistiken zeigt danach Lautheit, Spitzen und Übersteuerungen (Guide S. 415 f.).
+
+  Bevor du ein Ziel einträgst, misst du die Datei mit dem JS Loudness Meter und rechnest, was passiert. Gain ist Ziel minus Messwert, und um genau diesen Gain steigt auch der True Peak:
+
+  ```python run
+  lufs_i = -26.4      # Klick-Loop, gemessen
+  true_peak = -7.1    # gemessen
+  ziel = -18.0        # Platzhalter
+  decke = -1.0        # Platzhalter für True Peak
+
+  gain = ziel - lufs_i
+  spitze = true_peak + gain
+  print(f"Gain {gain:+.1f} dB, True Peak danach {spitze:+.1f} dBTP")
+  print("Limiter greift" if spitze > decke else "Limiter greift nicht")
+  ```
+
+  Mit ffmpeg nachgemessen: Nach +8,4 dB hatte der Klick-Loop −18,0 LUFS und +1,3 dBTP. Ein Limiter mit der Platzhalter-Decke von −1 dB (`alimiter` in ffmpeg) hielt die Spitzen bei −1,0 dBTP und senkte die Lautheit auf −19,8 LUFS. Bei spitzen Klängen kostet der Limiter also Lautheit. Miss nach dem Rendern deshalb noch einmal und entscheide, ob du das Ziel, die Decke oder den Klang änderst.
+
+  ## Formate, Abtastrate und Neu-Rendern
+
+  WAV für kurze Effekte, Ogg für Musik, das steht in [Audio zuordnen](/godot/audio). Für die Abtastrate gilt: Godot mischt standardmäßig mit 44,1 kHz (`audio/driver/mix_rate`, gemessen 44100), die Doku rät, den Wert dem System zu überlassen ([mix_rate](https://docs.godotengine.org/en/stable/classes/class_projectsettings.html#class-projectsettings-property-audio-driver-mix-rate)). Dateien mit anderer Rate rechnet Godot um. Eine Datei mit 48 kHz und einem Ton von 1000 Hz über 2 s lief bei 44,1 kHz gemessen genau 2,000 s mit 1000,0 Hz. Was auf deinem Rechner gilt, zeigt `AudioServer.get_mix_rate()`. Der Movie Maker mischt dagegen mit 48 kHz. Über 48 kHz bringt laut Import-Doku nur etwas, wenn du Klänge zur Laufzeit verlangsamst (Best practices, siehe Übung zur Mischrate). Was Godot beim Import aus Bittiefe und Rate macht, steht in [REAPER als Werkbank](/sound/reaper-werkbank).
+
+  Renderst du in den Projektordner, ersetzt jedes Neu-Rendern die Datei. Godot importiert neu, sobald sich die Prüfsumme der Quelle ändert, „applying the preset configured for that specific asset“ ([Automatic reimport](https://docs.godotengine.org/en/stable/tutorials/assets_pipeline/import_process.html#automatic-reimport)). Die Einstellungen in der `.import`-Datei bleiben also stehen, auch wenn sie nicht mehr passen. Gemessen: Ein Loop mit vier Takten wurde unter gleichem Namen mit zwei Takten neu gerendert. Die `.import`-Datei blieb Byte für Byte gleich, mit `beat_count` 16. Ein Übergang „Clip-Ende“, angefragt bei 5,0 s, kam danach erst bei 12,0 s statt bei 8,0 s. Umgekehrt beim Umbenennen im Dateimanager: Die Datei unter neuem Namen bekam neue Standardwerte (`loop` aus, `bpm` 0) und eine neue UID, die alte `.import`-Datei blieb liegen. Ordner und Namen legst du einmal fest, als Platzhalter etwa so:
+
+  ```text
+  res://audio/musik/      Ogg, mit .import-Dateien
+  res://audio/sfx/        WAV
+  res://audio/atmo/       WAV oder Ogg
+  ~/projekte/sound/       REAPER-Projekte und Rohaufnahmen, nicht im Spiel
+  ```
+
+  Die `.import`-Dateien gehören laut derselben Seite in die Versionsverwaltung, der Ordner `.godot/` nicht.
+
+  ## Busse, Regler und Ducking in Godot
+
+  Den Bus-Plan aus der Mischung setzt du im Panel *Audio* um. Mit den Platzhalter-Namen Musik, SFX, Atmo und UI und einem Kompressor auf `Musik` speichert Godot das Layout so (gekürzt):
+
+  ```ini title=default_bus_layout.tres
+  [sub_resource type="AudioEffectCompressor" id="AudioEffectCompressor_hr3ii"]
+  threshold = -20.0
+  sidechain = &"SFX"
+
+  [resource]
+  bus/1/name = &"Musik"
+  bus/1/send = &"Master"
+  bus/1/effect/0/effect = SubResource("AudioEffectCompressor_hr3ii")
+  bus/1/effect/0/enabled = true
+  bus/2/name = &"SFX"
+  bus/2/send = &"Master"
+  bus/3/name = &"Atmo"
+  bus/3/send = &"Master"
+  bus/4/name = &"UI"
+  bus/4/send = &"Master"
+  ```
+
+  Ein Regler im Menü setzt die Lautstärke eines Busses. `set_bus_volume_linear()` nimmt einen Wert von 0 bis 1 und rechnet in dB um:
+
+  ```gdscript title=bus_regler.gd
+  extends HSlider
+
+  ## Lautstärkeregler für einen Bus. Wert 0 bis 1, linear in der Amplitude.
+
+  @export var bus_name := &"Musik"
+
+  @onready var _bus := AudioServer.get_bus_index(bus_name)
+
+
+  func _ready() -> void:
+  	min_value = 0.0
+  	max_value = 1.0
+  	step = 0.01
+  	value = AudioServer.get_bus_volume_linear(_bus)
+  	value_changed.connect(_on_value_changed)
+
+
+  func _on_value_changed(v: float) -> void:
+  	AudioServer.set_bus_volume_linear(_bus, v)
+  ```
+
+  Gemessen: 0,5 ergibt −6,02 dB, 0,1 ergibt −20,00 dB, 0 ergibt `-inf`. Die untere Hälfte des Reglers deckt damit alles unter −6 dB ab. Ob sich das für Spieler gleichmäßig anfühlt, ist eine Frage für deinen Hörtest. Beim Namen zählen Groß- und Kleinschreibung: `get_bus_index(&"musik")` gab −1 zurück, und der Regler meldete danach „Index p_bus = -1 is out of bounds“.
+
+  ### Ducking: gemessen statt gerechnet
+
+  **Ducking** heißt: Ein Bus wird leiser, solange ein anderer klingt. In Godot hängt dafür ein `AudioEffectCompressor` am leiser werdenden Bus, und `sidechain` nennt den Bus, auf den er hört ([sidechain](https://docs.godotengine.org/en/stable/classes/class_audioeffectcompressor.html#class-audioeffectcompressor-property-sidechain)). Der Messaufbau: Musik als Dauerton im linken Kanal auf `Musik`, ein Effekt als Ton von 0,5 s im rechten Kanal auf `SFX` mit −6 dBFS, Kompressor mit `threshold` −20 dB, `ratio` 4 und den Standardwerten 20 µs Attack und 250 ms Release. Aus der Musikproduktion erwartest du 14 dB über der Schwelle mal (1 − 1/4), also 10,5 dB Absenkung. Gemessen:
+
+  | Zeitpunkt | Musik |
+  | --- | --- |
+  | 20 ms nach Beginn des Effekts | −21,8 dB |
+  | während des Effekts | −21,8 dB |
+  | 0,10 s nach seinem Ende | −13,8 dB |
+  | 0,25 s nach seinem Ende | −7,6 dB |
+  | 0,50 s nach seinem Ende | −2,8 dB |
+  | 1,00 s nach seinem Ende | −0,4 dB |
+
+  Doppelt so viel. Der Quelltext multipliziert die Überschreitung mit 2,08 ([audio_effect_compressor.cpp, 4.7.2](https://github.com/godotengine/godot/blob/4.7.2-stable/servers/audio/effects/audio_effect_compressor.cpp)). Und „Release 250 ms“ heißt nicht, dass die Musik nach 250 ms zurück ist: Nach einer Sekunde fehlten noch 0,4 dB. Stell Ducking deshalb nach Messung und Gehör ein, nicht nach den Zahlen im Inspektor.
+
+  Dazu kommt die Reihenfolge der Busse. Godot bearbeitet sie von rechts nach links, also von der höchsten Nummer zur niedrigsten (Quelltext `audio_server.cpp` im selben Stand 4.7.2). Der Kompressor liest den Sidechain-Bus in dem Zustand, in dem er gerade ist. Gemessen mit demselben Aufbau:
+
+  | SFX-Bus | Name | SFX | Musik |
+  | --- | --- | --- | --- |
+  | rechts von Musik | richtig | normal | −21,8 dB |
+  | rechts von Musik | richtig | stumm | 0 dB |
+  | rechts von Musik | richtig | −80 dB | 0 dB |
+  | links von Musik | richtig | stumm | −21,8 dB |
+  | links von Musik | falsch | normal | 0 dB |
+  | rechts von Musik | falsch | normal | −21,8 dB |
+
+  Steht der Sidechain-Bus rechts, ist er schon fertig gemischt, mit Fader und Mute. Ein stummer Auslöser-Bus wirkt dann nicht. Steht er links, liest der Kompressor ihn vor Fader und Mute. Ein falscher Name ist am tückischsten: Godot meldet nichts und nimmt statt des Busses den Master. Dort liegt bereits alles, was rechts von `Musik` fertig ist. Im Messlauf mit falschem Namen duckte die Musik deshalb um 21,8 dB, auch als nur die Atmo einen Ton spielte.
+
+  > [!WARNING] Ein Ducking, das funktioniert, kann trotzdem falsch sein
+  > Mit einem falschen Sidechain-Namen und dem SFX-Bus rechts von `Musik` duckt die Musik wie geplant, aber auch bei allem anderen, was rechts von `Musik` liegt; gemessen mit der Atmo. Prüf deshalb jede Regel mit einem Gegentest: Spielt nur ein Bus, der nicht auslösen soll, darf die Musik nicht leiser werden.
+
+  ## Mitschnitt und Hörtest im Spiel
+
+  ### Messen am Master
+
+  Gemessen wird am Ende das, was der Spieler hört: der Master-Bus. Ein `AudioEffectRecord` nimmt ihn auf, `get_recording()` liefert danach ein `AudioStreamWAV`. Dieses Testgerüst lief so mit Godot 4.7.2:
+
+  ```gdscript title=mitschnitt.gd
+  extends Node
+
+  ## Testgerüst: nimmt den Master-Bus auf und speichert nach „sekunden“ eine WAV-Datei.
+
+  @export var sekunden := 60.0
+  @export var datei := "user://mitschnitt.wav"
+
+  var _rec := AudioEffectRecord.new()
+  var _start := 0
+
+
+  func _ready() -> void:
+  	AudioServer.add_bus_effect(0, _rec)
+  	_rec.set_recording_active(true)
+  	_start = Time.get_ticks_msec()
+
+
+  func _process(_delta: float) -> void:
+  	if _rec.is_recording_active() and Time.get_ticks_msec() - _start > sekunden * 1000:
+  		_rec.set_recording_active(false)
+  		_rec.get_recording().save_to_wav(datei)
+  		print("Mitschnitt gespeichert: ", ProjectSettings.globalize_path(datei))
+  ```
+
+  Den Mitschnitt misst du mit dem JS Loudness Meter in REAPER oder mit ffmpeg. So entsteht die Zahl, die eine Norm meint: die Lautheit des Spiels in einem Abschnitt, nicht die einer Datei. Für einen Vergleich zwischen Fassungen läuft derselbe Abschnitt mit dem Drehbuch.
+
+  ### Hörtest mit Protokoll
+
+  Messwerte sagen, wie laut etwas ist, nicht, ob man es hört. Dafür gibt es den Hörtest. Spiel denselben Abschnitt auf mindestens zwei Wiedergabegeräten, die du hast, etwa Kopfhörern und eingebauten Lautsprechern, und mit mindestens zwei Systemlautstärken, darunter eine leise. Leise hören zeigt, welche Klänge zuerst verschwinden. Prüf dabei die Prioritäten aus deinem Plan: Ist ein Warnklang, der Vorrang haben soll, über der Musik zu hören? Pumpt das Ducking hörbar? Bleibt eine geplante Stille leer? Ein Protokoll hält das fest, als Platzhalter-Spalten:
+
+  ```csv
+  datum,fassung,geraet,systemlautstaerke,abschnitt,lufs_i,beobachtung,offene_frage
+  <datum>,<fassung>,kopfhoerer,leise,<abschnitt>,<gemessen>,<was du hörst>,<eine frage>
+  ```
+
+  Die spitzen Klammern sind Platzhalter für deine Einträge. Wichtig ist die Trennung: Beobachtung ohne Bewertung, Messwert aus dem Mitschnitt, offene Frage statt schneller Lösung. Eine Änderung testest du einzeln, wie in [Tuning als Experiment](/combat/tuning).
+
+  > [!INTERVIEW]
+  > „Spieler sagen, unser Spiel sei viel lauter als andere. Wie gehst du vor?“ Gute Antwort, etwa als Audio Designer: Ich messe nicht einzelne Dateien, sondern das Spiel. Ich schneide mindestens 30 Minuten aus repräsentativen Abschnitten mit und messe integrierte Lautheit und True Peak nach BS.1770. Als Bezug nenne ich die Empfehlung, die für die Plattform gilt, etwa ASWG-R001 mit −24 LKFS für Heimkonsolen, und frage, ob wir uns daran halten wollen. Dann suche ich, wo die Lautheit herkommt: Musikbus, Effekte, Ducking, Limiter. Erst danach ändere ich, eine Sache auf einmal, und messe wieder mit demselben Ablauf.
+
+  ## Häufige Fehler
+
+  - **Nach Spitze normalisiert.** Ein Klick-Loop mit −7,1 dBFS war 6,4 LU leiser als ein Sinus mit −20 dBFS.
+  - **Mono-Datei gemessen, im Spiel gehört.** Über `AudioStreamPlayer` 3 LU mehr, über `AudioStreamPlayer2D` in der Bildschirmmitte 3 LU weniger.
+  - **Gain ohne Blick auf True Peak.** Der Gain hebt die Spitzen genauso; danach greift der Limiter und kostet Lautheit.
+  - **Neu gerendert, Import vergessen.** `bpm` und `beat_count` bleiben stehen, Übergänge laufen falsch.
+  - **Im Dateimanager umbenannt.** Neue Standardwerte, neue UID.
+  - **Sidechain-Name falsch.** Kein Fehler, der Kompressor hört auf den Master.
+  - **Auslöser-Bus stumm geschaltet und rechts von Musik.** Kein Ducking.
+  - **Release als Rückkehrzeit gelesen.** 250 ms Release brauchten gemessen rund eine Sekunde bis fast 0 dB.
+
+  ## Zusammenfassung
+
+  - LUFS nach BS.1770 messen Energie mit Gating; momentan 0,4 s, kurzzeitig 3 s, integriert über alles. True Peak misst zwischen den Samples.
+  - Normen (EBU R 128, ASWG-R001) messen das ganze Programm. Ziele für Dateien sind deine Platzhalter; ob das Spiel passt, zeigt ein langer Mitschnitt.
+  - REAPERs Postprocess normalisiert auf LUFS-I, True Peak und andere Maße und begrenzt auf Peak oder True Peak; einzeln, zur lautesten Datei oder gemeinsam.
+  - Gain ist Ziel minus Messwert, der True Peak steigt mit. Danach neu messen.
+  - Godot mischt standardmäßig mit 44,1 kHz und rechnet andere Raten um. Neu-Rendern behält die Import-Werte, Umbenennen im Dateimanager verliert sie.
+  - Ducking in Godot 4.7.2: Absenkung etwa doppelt so stark wie die Lehrbuchformel, Rückkehr deutlich länger als der Release-Wert, Bus-Reihenfolge und Name entscheiden, was der Kompressor hört.
+  - Hörtest mit Protokoll: mehrere Geräte, leise und normal, Beobachtung, Messwert, offene Frage.
+exercises:
+  - id: welches-mass
+    type: choice
+    title: Welche Zahl beantwortet die Frage?
+    prompt: |
+      Du willst wissen, ob ein Treffer-Effekt nach dem Normalisieren übersteuern kann, wenn Godot ihn auf 44,1 kHz umrechnet. Welche Messung sagt dir das am ehesten?
+    options:
+      - text: True Peak
+        correct: true
+        why: True Peak schätzt die Spitze zwischen den Samples, also auch, was nach dem Umrechnen auftauchen kann. REAPERs Guide beschreibt ihn genau so.
+      - text: Sample Peak
+        correct: false
+        why: Er sieht nur die gespeicherten Samples. Bei einem Prüfsignal lagen sie rechnerisch 3,0 dB unter der Spitze der Welle; ffmpeg maß 3,7 dB Abstand zum True Peak.
+      - text: LUFS-I
+        correct: false
+        why: Die integrierte Lautheit sagt, wie laut der Klang wirkt, nicht, wie hoch seine Spitze ist. Der Klick-Loop hatte −26,4 LUFS bei −7,1 dBTP.
+      - text: LUFS-S max
+        correct: false
+        why: Das ist die höchste Lautheit über 3 Sekunden, für einen kurzen Effekt ohnehin wenig aussagekräftig und kein Spitzenmaß.
+    explanation: |
+      Lautheit und Spitze sind verschiedene Fragen. Ob etwas übersteuert, ist eine Frage der Spitze, und weil beim Umrechnen und Filtern zwischen den Samples höhere Werte entstehen können, ist True Peak das passende Maß. ASWG-R001 nennt als Grund für Headroom ausdrücklich Resampling und Filtern in der Engine und setzt die Grenze bei −1 dBTP. Für den Eindruck „wie laut“ nimmst du dagegen LUFS.
+    resources:
+      - title: REAPER User Guide 7.81 · JS Analysis Loudness Meter (S. 120)
+        url: https://www.reaper.fm/userguide/ReaperUserGuide781c.pdf#page=120
+      - title: Sony ASWG-R001 v1.10 (S. 6)
+        url: https://www.gameaudiopodcast.com/ASWG-R001.pdf#page=6
+
+  - id: vom-render-zum-hoertest
+    type: order
+    title: Von der Region bis zum Hörtest
+    prompt: |
+      Bring die Schritte für einen neuen Effekt in eine sinnvolle Reihenfolge.
+    lang: prose
+    lines: |
+      Den Effekt mit dem JS Loudness Meter messen, den Gain bis zum Platzhalter-Ziel rechnen und prüfen, ob der True Peak danach über der Decke liegt
+      Im Render-Dialog unter Postprocess Normalisieren und Begrenzen einstellen
+      Mit Dry Run prüfen, ob Ziel und Decke nach dem Postprocess getroffen sind
+      In den Projektordner rendern, Godot importiert neu
+      Im Import-Dock prüfen, ob die Werte zur neuen Datei passen
+      Den Abschnitt mit dem Drehbuch spielen und den Master mitschneiden
+      Mitschnitt messen und den Hörtest protokollieren
+    explanation: |
+      Erst messen und rechnen, dann einstellen: So weißt du vorher, ob der Limiter eingreift. Der Dry Run zeigt danach, ob die Nachbearbeitung Ziel und Decke trifft, ohne eine Datei zu schreiben. Nach dem Rendern importiert Godot neu, behält aber die alten Import-Werte; deshalb der Blick ins Import-Dock. Gemessen und gehört wird am Ende im Spiel, mit einem wiederholbaren Lauf, sonst vergleichst du verschiedene Situationen.
+    resources:
+      - title: REAPER User Guide 7.81 · Dry Run Render Stats (S. 416)
+        url: https://www.reaper.fm/userguide/ReaperUserGuide781c.pdf#page=416
+
+  - id: mischrate
+    type: choice
+    title: 44,1 oder 48 kHz?
+    prompt: |
+      Welche Aussagen zu Abtastraten in Godot 4.7.2 stimmen nach Messung und Doku? Mehrere Antworten richtig.
+    options:
+      - text: Ohne Änderung steht `audio/driver/mix_rate` auf 44100.
+        correct: true
+        why: Gemessen mit `ProjectSettings.get_setting()`. Die tatsächliche Rate meldet `AudioServer.get_mix_rate()`.
+      - text: Eine Datei mit 48 kHz spielt bei 44,1 kHz Mischrate um rund 9 % zu tief.
+        correct: false
+        why: Godot rechnet um. Ein 1000-Hz-Ton aus einer 48-kHz-Datei lief gemessen mit 1000,0 Hz und genau 2,000 s.
+      - text: Der Movie Maker schreibt seine WAV-Datei standardmäßig mit 48 kHz.
+        correct: true
+        why: "`editor/movie_writer/mix_rate` ist 48000; im Movie-Maker-Modus meldete `AudioServer.get_mix_rate()` 48000."
+      - text: Die Doku empfiehlt 96 kHz für alle Effekte, damit Tonhöhenänderungen sauber bleiben.
+        correct: false
+        why: Sie sagt, über 48 kHz bringe nur etwas, wenn du Klänge zur Laufzeit verlangsamst. Eine Pflicht zu 96 kHz steht dort nicht.
+    explanation: |
+      Die Mischrate ist die Rate, mit der Godot alles zusammenrechnet; Dateien mit anderer Rate rechnet es dabei um, ohne Tonhöhe oder Länge zu ändern. Welche Rate du renderst, ist eine Abwägung aus Größe, Bearbeitung und Laufzeit-Effekten. Für Messungen merkst du dir: Ein Mitschnitt aus dem Movie Maker hat 48 kHz, einer aus `AudioEffectRecord` die Mischrate des Spiels.
+    resources:
+      - title: Godot Docs · ProjectSettings audio/driver/mix_rate
+        url: https://docs.godotengine.org/en/stable/classes/class_projectsettings.html#class-projectsettings-property-audio-driver-mix-rate
+      - title: Godot Docs · Importing audio samples, Best practices
+        url: https://docs.godotengine.org/en/stable/tutorials/assets_pipeline/importing_audio_samples.html#use-appropriate-quality-settings
+
+  - id: gain-bis-ziel
+    type: output
+    title: Greift der Limiter?
+    prompt: |
+      Eine Effekt-Datei misst −23,7 LUFS-I und −4,2 dBTP. Das Ziel ist ein Platzhalter von −16 LUFS-I, die Decke −1 dBTP. Was gibt das Programm aus?
+    lang: python
+    code: |
+      lufs_i = -23.7
+      true_peak = -4.2
+      ziel = -16.0
+      decke = -1.0
+
+      gain = ziel - lufs_i
+      spitze = true_peak + gain
+      print(f"Gain {gain:+.1f} dB")
+      print(f"True Peak danach {spitze:+.1f} dBTP")
+      print("Limiter greift" if spitze > decke else "Limiter greift nicht")
+    expected: |
+      Gain +7.7 dB
+      True Peak danach +3.5 dBTP
+      Limiter greift
+    hints:
+      - Gain ist Ziel minus Messwert.
+      - Der True Peak steigt um denselben Gain.
+    explanation: |
+      Bis −16 fehlen 7,7 dB. Um genau diese 7,7 dB steigt auch der True Peak, von −4,2 auf +3,5 dBTP, 4,5 dB über der Decke. Der Limiter muss also kräftig arbeiten, und danach misst die Datei leiser als das Ziel; beim Klick-Loop kostete ein Limiter mit −1 dB Decke gemessen 1,8 LU. Ob du das hinnimmst, das Ziel senkst oder den Klang änderst, ist deine Entscheidung. Die Rechnung sagt dir nur vorher, dass du sie treffen musst.
+    resources:
+      - title: REAPER User Guide 7.81 · Render-Dialog, Postprocess (S. 414)
+        url: https://www.reaper.fm/userguide/ReaperUserGuide781c.pdf#page=414
+
+  - id: gating-leise
+    type: output
+    title: Leiser und doch lauter?
+    prompt: |
+      Das Gating-Modell aus der Lektion. Ein Abschnitt hat 30 Blöcke mit −18 LUFS, 30 leise Blöcke und 40 Blöcke Pause. Einmal liegen die leisen Blöcke bei −30, einmal bei −32 LUFS. Was gibt das Programm aus?
+    lang: python
+    code: |
+      import math
+
+
+      def integriert(bloecke):
+          def mittel(werte):
+              return 10 * math.log10(sum(10 ** (l / 10) for l in werte) / len(werte))
+          ueber_absolut = [l for l in bloecke if l > -70]
+          relativ = mittel(ueber_absolut) - 10
+          return round(mittel([l for l in ueber_absolut if l > relativ]), 1)
+
+
+      print(integriert([-18] * 30 + [-30] * 30 + [-90] * 40))
+      print(integriert([-18] * 30 + [-32] * 30 + [-90] * 40))
+    expected: |
+      -20.7
+      -18.0
+    hints:
+      - Die Pausen fallen am absoluten Gate weg.
+      - Die relative Schwelle liegt 10 LU unter dem Mittel der übrigen Blöcke, im ersten Fall bei rund −30,7.
+    explanation: |
+      Ohne die Pausen mitteln die übrigen 60 Blöcke im ersten Fall auf etwa −20,7 LUFS, die relative Schwelle liegt also bei rund −30,7. Blöcke bei −30 liegen knapp darüber und zählen mit: −20,7 LUFS. Im zweiten Fall liegt die Schwelle bei rund −30,8, Blöcke bei −32 liegen darunter und fallen weg, übrig bleiben nur die −18. So wird ein Abschnitt mit leiserer Atmo in der Messung lauter. Für dich heißt das: Die integrierte Lautheit sagt etwas über den Vordergrund, nicht darüber, wie leise die ruhigen Stellen sind. Das zeigen dir die kurzzeitigen Werte (LUFS-S) und dein Ohr.
+    resources:
+      - title: ITU-R BS.1770-5 · Gating (S. 4)
+        url: https://www.itu.int/dms_pubrec/itu-r/rec/bs/R-REC-BS.1770-5-202311-I!!PDF-E.pdf#page=4
+
+  - id: mono-im-mitschnitt
+    type: output
+    title: Dieselbe Datei im Spiel
+    prompt: |
+      Eine Mono-Datei mit einem Sinus bei −20 dBFS misst in ffmpeg −23,0 LUFS. Ein `AudioStreamPlayer` spielt sie in Godot 4.7.2 ab, Bus-Regler auf 0 dB, und ein `AudioEffectRecord` schneidet den Master mit. Wie viel LUFS-I misst der Mitschnitt? Antworte mit der Zahl.
+    lang: text
+    code: |
+      sinus_mono.wav       -23.0 LUFS
+      mitschnitt.wav (Stereo)   ???
+    expected: |
+      -20.0
+    accept:
+      - "-20"
+      - "-20,0"
+      - "−20,0"
+      - "−20"
+    explanation: |
+      Godot legt eine Mono-Datei auf beide Kanäle in voller Höhe. Der Mitschnitt ist also Stereo mit derselben Welle links und rechts, und BS.1770 addiert die Energie beider Kanäle: 3 dB mehr. Gemessen −20,0 LUFS. Das gilt für `AudioStreamPlayer`. Über `AudioStreamPlayer2D` in der Bildschirmmitte bekommt jeder Kanal die halbe Amplitude, und derselbe Mitschnitt maß −26,0 LUFS. Renderst du Effekte ohne Ort als Mono, rechne die 3 LU ein oder nutze in REAPER die Option, Mono-Dateien um 3 dB anzupassen.
+    resources:
+      - title: ITU-R BS.1770-5 · 1-kHz-Sinus in einem Kanal (S. 9)
+        url: https://www.itu.int/dms_pubrec/itu-r/rec/bs/R-REC-BS.1770-5-202311-I!!PDF-E.pdf#page=9
+
+  - id: render-blatt
+    type: gap
+    title: Die Nachbearbeitung für Varianten
+    prompt: |
+      Ergänze das Render-Blatt mit den Begriffen aus REAPERs Postprocess-Dialog. Ziel ist die integrierte Lautheit, die Spitzen sollen auch zwischen den Samples unter der Decke bleiben, und jede Variante soll für sich auf das Ziel.
+    lang: prose
+    code: |
+      Normalize to: ⟦LUFS-I⟧, Ziel -18.0 (Platzhalter)
+      Brickwall limit: ⟦True peak⟧, Decke -1.0 (Platzhalter)
+      Mehrere Dateien: Normalize each file ⟦separately⟧
+      Prüfen: ⟦Dry Run⟧ (no output), danach die Render-Statistik
+    gaps:
+      - label: Maß für das Ziel
+        hint: Integrierte Lautheit, wie REAPER sie abkürzt.
+      - label: Art der Spitze
+        hint: Nicht Sample Peak.
+        accept: ["truepeak"]
+      - label: Einzeln
+        hint: Jede Datei für sich.
+      - label: Probelauf
+        hint: Rendern ohne Datei.
+        accept: ["dryrun"]
+    explanation: |
+      LUFS-I macht die Varianten gleich laut, True Peak hält die Spitzen auch nach dem Umrechnen unter der Decke. „separately“ ist hier gewollt, weil jede Variante gleich laut sein soll; für Stems oder eine Gruppe mit gewollten Abständen wäre „as if files play together“ oder „to loudest file“ richtig. Der Dry Run zeigt das Ergebnis, bevor Dateien im Projektordner landen. Die Zahlen sind Platzhalter.
+    resources:
+      - title: REAPER User Guide 7.81 · Render-Dialog, Postprocess (S. 414)
+        url: https://www.reaper.fm/userguide/ReaperUserGuide781c.pdf#page=414
+
+  - id: regler-und-ducking
+    type: gap
+    title: Regler und Ducking im Code
+    prompt: |
+      Ergänze: Der Regler setzt den Bus linear von 0 bis 1. Der Kompressor auf „Musik“ hört auf den Bus „SFX“.
+    lang: gdscript
+    code: |
+      func _on_value_changed(v: float) -> void:
+      	AudioServer.⟦set_bus_volume_linear⟧(_bus, v)
+
+
+      func _ducking_einrichten() -> void:
+      	var comp := AudioEffectCompressor.new()
+      	comp.threshold = -20.0
+      	comp.⟦sidechain⟧ = &"SFX"
+      	AudioServer.add_bus_effect(AudioServer.⟦get_bus_index⟧(&"Musik"), comp)
+    gaps:
+      - label: Lineare Lautstärke
+        hint: Das Gegenstück zu `set_bus_volume_db`.
+      - label: Auslöser
+        hint: Die Eigenschaft, die einen Bus mit Namen nennt.
+      - label: Bus finden
+        hint: Liefert die Nummer zu einem Namen, −1 wenn es ihn nicht gibt.
+    explanation: |
+      `set_bus_volume_linear()` rechnet 0 bis 1 in dB um, 0,5 sind −6,02 dB. `sidechain` ist ein Name, kein Index, und Godot prüft ihn nicht: Ein falscher Name lässt den Kompressor auf den Master hören. `get_bus_index()` liefert −1 für einen unbekannten Namen; dann scheitert `add_bus_effect()` mit einer Fehlermeldung, die du wenigstens siehst.
+    resources:
+      - title: Godot Docs · AudioServer · set_bus_volume_linear
+        url: https://docs.godotengine.org/en/stable/classes/class_audioserver.html#class-audioserver-method-set-bus-volume-linear
+
+  - id: sidechain-name
+    type: bug
+    title: Die Musik duckt auch bei der Atmo
+    prompt: |
+      Die Musik soll leiser werden, wenn ein Effekt spielt. Das tut sie. Sie wird aber genauso leiser, wenn nur die Atmo oder ein UI-Klang spielt. Godot meldet keinen Fehler. Finde die Zeile im Bus-Layout und korrigiere sie.
+    lang: ini
+    code: |
+      [sub_resource type="AudioEffectCompressor" id="AudioEffectCompressor_hr3ii"]
+      threshold = -20.0
+      sidechain = &"Sfx"
+
+      [resource]
+      bus/1/name = &"Musik"
+      bus/1/effect/0/effect = SubResource("AudioEffectCompressor_hr3ii")
+      bus/2/name = &"SFX"
+      bus/3/name = &"Atmo"
+      bus/4/name = &"UI"
+    lines: [3]
+    fix:
+      - line: 3
+        answers:
+          - sidechain = &"SFX"
+          - sidechain = "SFX"
+    explanation: |
+      Einen Bus „Sfx“ gibt es nicht, denn bei Bus-Namen zählen Groß- und Kleinschreibung. Für einen unbekannten Namen nimmt Godot 4.7.2 den Master-Bus als Sidechain. Weil Godot die Busse von rechts nach links bearbeitet, liegt im Master schon alles, was rechts von `Musik` steht: SFX, Atmo und UI. Gemessen mit genau diesem Namen duckte die Musik bei Effekt und Atmo um 21,8 dB, mit richtigem Namen nur beim Effekt. Prüf jede Ducking-Regel mit einem Bus, der nicht auslösen soll.
+    resources:
+      - title: Godot Docs · AudioEffectCompressor · sidechain
+        url: https://docs.godotengine.org/en/stable/classes/class_audioeffectcompressor.html#class-audioeffectcompressor-property-sidechain
+
+  - id: beat-count-alt
+    type: bug
+    title: Nach dem Neu-Rendern kommt das Ende zu spät
+    prompt: |
+      Du hast einen Loop von vier auf zwei Takte gekürzt und unter gleichem Namen neu gerendert (120 BPM, 4/4, jetzt 4 Sekunden). Seitdem kommt der Übergang „Clip-Ende“ manchmal Sekunden zu spät; im Messlauf, angefragt bei 5,0 s, erst bei 12,0 s statt bei 8,0 s. Finde die Zeile in der Import-Datei und korrigiere sie.
+    lang: ini
+    code: |
+      [params]
+
+      loop=true
+      loop_offset=0
+      bpm=120
+      beat_count=16
+      bar_beats=4
+    lines: [6]
+    fix:
+      - line: 6
+        answers:
+          - beat_count=8
+    explanation: |
+      Godot importiert nach dem Neu-Rendern mit den alten Einstellungen; die `.import`-Datei blieb im Messlauf unverändert. Mit `beat_count` 16 hält Godot das Ende für 8 Sekunden nach dem Clip-Anfang, die Datei schleift aber schon nach 4. Bei 5,0 s steht der Clip bei Position 1,0, Godot wartet also 7 Sekunden. Zwei Takte zu vier Schlägen sind 8 Schläge. Ändert sich die Länge, gehört die Import-Zeile in denselben Arbeitsschritt.
+    resources:
+      - title: Godot Docs · Import process, Automatic reimport
+        url: https://docs.godotengine.org/en/stable/tutorials/assets_pipeline/import_process.html#automatic-reimport
+
+  - id: ducking-tabelle
+    type: explain
+    title: Warum der stumme Bus nur manchmal duckt
+    prompt: |
+      Erkläre diese Messung mit Godot 4.7.2. Kompressor auf „Musik“, `sidechain` „SFX“, ein Effekt spielt auf „SFX“.
+    lang: text
+    code: |
+      SFX-Bus            SFX        Musik
+      rechts von Musik   normal     -21.8 dB
+      rechts von Musik   stumm        0.0 dB
+      rechts von Musik   -80 dB       0.0 dB
+      links von Musik    stumm      -21.8 dB
+      links von Musik    -80 dB     -21.8 dB
+    points:
+      - Godot bearbeitet die Busse von der höchsten Nummer zur niedrigsten, also von rechts nach links.
+      - Rechts von Musik ist der SFX-Bus schon fertig, mit Fader und Mute; der Kompressor hört dann nichts mehr.
+      - Links von Musik liest der Kompressor den Bus, bevor Fader und Mute angewendet sind.
+      - Ein stummer Auslöser-Bus funktioniert deshalb nur links von Musik, und das ist ein Verhalten der Version, kein dokumentiertes Versprechen.
+    explanation: |
+      Der Kompressor liest den Sidechain-Bus in dem Zustand, in dem er im selben Mischschritt gerade ist. Godot bearbeitet die Busse von hinten nach vorn: Effekte, Lautstärke und Mute, dann Weitergabe an den Ziel-Bus. Steht „SFX“ rechts, ist er schon fertig, und bei Mute oder −80 dB liegt dort Stille. Steht er links, kommt er erst nach „Musik“ dran, und der Kompressor sieht ihn roh, vor Fader und Mute. Darauf kannst du einen unhörbaren Auslöser-Bus bauen, solltest aber in den Kommentar schreiben, dass er von der Reihenfolge abhängt, und es nach jedem Godot-Update nachmessen.
+    resources:
+      - title: Godot Quelltext 4.7.2 · audio_server.cpp
+        url: https://github.com/godotengine/godot/blob/4.7.2-stable/servers/audio/audio_server.cpp
+
+  - id: busse-messen
+    type: practice
+    title: Busse, Regler und Ducking messen
+    prompt: |
+      Richte in deiner Kopie der Testszene Busse nach deinem Plan ein (die Namen Musik, SFX, Atmo, UI sind Platzhalter), mit einem Regler je Bus und einer Ducking-Regel. Miss die Regel mit Prüftönen: Musik als Dauerton, ein Effekt-Ton von 0,5 s, ein Atmo-Ton zu einer anderen Zeit. Schneide den Master mit `mitschnitt.gd` mit und lies ab, wie tief und wie lange die Musik duckt und ob sie bei der Atmo ruhig bleibt.
+    lang: gdscript
+    solution: |
+      # Busse (Panel Audio, von links nach rechts): Master, Musik, SFX, Atmo, UI
+      # Musik: AudioEffectCompressor, threshold -20, ratio 4, sidechain = SFX (Platzhalter)
+      # Je Bus ein HSlider mit bus_regler.gd und passendem bus_name.
+      # Prüftöne: Dauerton auf Musik, Effekt-Ton bei 2,0 s auf SFX, Atmo-Ton bei 3,0 s auf Atmo.
+      # Mitschnitt.sekunden = 5, danach Auswertung pro 20-ms-Fenster.
+      #
+      # Erwartung mit diesen Platzhaltern (gemessen mit Godot 4.7.2):
+      #   Effekt bei 2,0 s: Musik -21.8 dB, nach 1 s zurück bis auf -0.4 dB
+      #   Atmo bei 3,0 s:   Musik bleibt (nur Rest der Release)
+      #   sidechain falsch geschrieben: Musik duckt auch bei der Atmo
+    checklist:
+      - Jeder Bus hat einen Regler; bei Wert 0,5 zeigt der Bus −6 dB.
+      - Die Ducking-Regel ist mit Prüftönen gemessen, nicht mit Musik und Effekten aus dem Spiel.
+      - Du hast notiert, wie tief die Musik duckt und nach wie vielen Millisekunden sie wieder bis auf 1 dB zurück ist.
+      - Der Gegentest mit einem Bus, der nicht auslösen soll, ist gemessen und ohne Ducking.
+      - Du hast die Reihenfolge der Busse im Panel notiert und ob der Auslöser-Bus links oder rechts von Musik steht.
+    explanation: |
+      Ducking ist eine Mischentscheidung, aber ob es so arbeitet, wie du denkst, ist eine technische Frage. Die Messung mit Prüftönen trennt beides: Erst stimmt die Technik, dann hörst du mit echter Musik, ob die Tiefe und die Rückkehr passen. In Godot 4.7.2 ist das besonders nötig, weil die Absenkung stärker ausfällt als die Lehrbuchformel und die Rückkehr länger dauert als der Release-Wert vermuten lässt.
+    resources:
+      - title: Godot Docs · AudioEffectRecord · get_recording
+        url: https://docs.godotengine.org/en/stable/classes/class_audioeffectrecord.html#class-audioeffectrecord-method-get-recording
+      - title: Godot Docs · Audio buses
+        url: https://docs.godotengine.org/en/stable/tutorials/audio/audio_buses.html
+
+  - id: eigenes-hoerprotokoll
+    type: practice
+    title: Dein Hörtest im Spiel
+    prompt: |
+      Spiel einen Abschnitt deines Spiels oder der Testszene mit deinen eigenen Klängen und deiner Musik, mit Drehbuch, damit jeder Lauf gleich ist. Schneide den Master mit und miss LUFS-I und True Peak. Hör denselben Lauf auf mindestens zwei Geräten und mit mindestens zwei Systemlautstärken, eine davon leise. Führe ein Protokoll mit Datum, Fassung, Gerät, Lautstärke, Messwert, Beobachtung und offener Frage. Prüf dabei die Prioritäten aus deinem Mix-Plan.
+    lang: prose
+    checklist:
+      - Für jede Kombination aus Gerät und Lautstärke gibt es eine Zeile im Protokoll.
+      - LUFS-I und True Peak stammen aus einem Mitschnitt des Spiels, nicht aus einzelnen Dateien.
+      - Zu jeder Priorität aus deinem Mix-Plan steht, ob sie auf jedem Gerät zu hören war.
+      - Beobachtungen beschreiben, was du hörst, ohne Wertung wie „gut“ oder „zu viel“.
+      - Jede offene Frage nennt genau eine Änderung, die du als Nächstes einzeln testen könntest.
+      - Die Fassung (Datum oder Nummer) steht in jeder Zeile, damit du später vergleichen kannst.
+    explanation: |
+      Der Hörtest beantwortet, was keine Zahl beantwortet: ob der Spieler hört, was er hören soll. Das Protokoll macht daraus etwas Vergleichbares. Mit Drehbuch und Mitschnitt kannst du die nächste Fassung unter denselben Bedingungen prüfen. Wie laut dein Spiel sein soll und was Vorrang hat, entscheidest du; das Protokoll zeigt dir, ob deine Entscheidung im Spiel ankommt.
+    resources:
+      - title: Godot Docs · AudioEffectRecord
+        url: https://docs.godotengine.org/en/stable/classes/class_audioeffectrecord.html#class-audioeffectrecord-method-get-recording
+      - title: EBU Tech 3341 · Loudness Metering (S. 5)
+        url: https://tech.ebu.ch/docs/tech/tech3341.pdf#page=5
