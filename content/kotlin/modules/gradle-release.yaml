@@ -1,7 +1,8 @@
 id: gradle-release
 title: "Gradle, Signieren und Release"
 level: 3
-minutes: 160
+minutes: 220
+place: pc
 summary: Wie aus Quellcode ein signiertes, optimiertes App Bundle wird, das über Testspuren und gestaffelte Rollouts in den Play Store kommt – automatisch gebaut und getestet in GitHub Actions.
 goals:
   - Du liest und änderst `settings.gradle.kts`, Build-Dateien und einen Version Catalog und erklärst, was Plugins und Tasks sind.
@@ -9,6 +10,7 @@ goals:
   - Du aktivierst R8 für Release-Builds und schreibst eine Keep-Regel, wenn Code per Reflection geladen wird.
   - Du erklärst Upload Key und App Signing Key bei Play App Signing und hältst Keystores und Passwörter aus dem Repository heraus.
   - Du planst einen Release über Testspuren und gestaffelten Rollout und automatisierst Tests, Lint und signierte Builds mit GitHub Actions.
+  - Du teilst Build-Logik über Convention Plugins in einem eingebundenen Build `build-logic` und wendest sie über Katalog-Aliase an.
 resources:
   - title: Gradle build overview
     url: https://developer.android.com/build/gradle-build-overview
@@ -166,6 +168,125 @@ lesson: |
   > [!WARNING] BuildConfig ist kein Tresor
   > Alles in `BuildConfig`, in Ressourcen oder im Code steckt im ausgelieferten App Bundle und lässt sich mit einem Decompiler auslesen – auch nach R8. API-Schlüssel, die geheim bleiben müssen, gehören auf einen Server, nicht in die App. Bear lässt den Nutzer deshalb seinen eigenen Linear-Schlüssel eingeben und speichert ihn verschlüsselt im Keystore des Geräts.
 
+  ## Convention Plugins: eine Build-Logik für viele Module
+
+  Mit dem Modul „App-Architektur“ hat Bear zehn Gradle-Module. Jedes braucht dieselben Zeilen: `compileSdk`, `minSdk`, Java- und Kotlin-Ziel, bei UI-Modulen Compose, bei vielen Hilt mit KSP. Kopiert in zehn Dateien, laufen sie auseinander: Ein Modul bleibt bei `minSdk` 24, eines vergisst KSP. Der alte Ausweg, ein `subprojects { … }`-Block in der Wurzel-Build-Datei, koppelt alle Module schon beim Konfigurieren an die Wurzel; Gradle nennt das als Grund, warum Optimierungen wie Configuration on Demand dann nicht richtig greifen. Gradle empfiehlt stattdessen [Convention Plugins](https://docs.gradle.org/current/userguide/sharing_build_logic_between_subprojects.html#sec:sharing_logic_via_composite_build): kleine Plugins, die genau eine Konvention festlegen, in einem eigenen eingebundenen Build.
+
+  ```text
+  build-logic/
+  ├── settings.gradle.kts
+  └── convention/
+      ├── build.gradle.kts
+      └── src/main/kotlin/
+          ├── AndroidLibraryConventionPlugin.kt
+          └── HiltConventionPlugin.kt
+  ```
+
+  `build-logic` ist ein eigener Gradle-Build. Er liest denselben Version Catalog wie die App und kennt AGP, KSP und Hilt nur zum Kompilieren:
+
+  ```kotlin title=build-logic/settings.gradle.kts
+  dependencyResolutionManagement {
+      repositories {
+          google()
+          mavenCentral()
+      }
+      versionCatalogs {
+          create("libs") {
+              from(files("../gradle/libs.versions.toml"))
+          }
+      }
+  }
+  rootProject.name = "build-logic"
+  include(":convention")
+  ```
+
+  ```kotlin title=build-logic/convention/build.gradle.kts
+  plugins {
+      `kotlin-dsl`
+  }
+
+  dependencies {
+      compileOnly(libs.android.gradlePlugin)
+      compileOnly(libs.ksp.gradlePlugin)
+      compileOnly(libs.hilt.gradlePlugin)
+  }
+
+  gradlePlugin {
+      plugins {
+          register("androidLibrary") {
+              id = "bear.android.library"
+              implementationClass = "AndroidLibraryConventionPlugin"
+          }
+          register("hilt") {
+              id = "bear.hilt"
+              implementationClass = "HiltConventionPlugin"
+          }
+      }
+  }
+  ```
+
+  Ein Plugin ist eine Klasse mit einer Methode `apply`. Sie wendet andere Plugins an und konfiguriert ihre Extensions, genau wie eine Build-Datei, nur einmal für alle:
+
+  ```kotlin
+  class AndroidLibraryConventionPlugin : Plugin<Project> {
+      override fun apply(target: Project) {
+          with(target) {
+              pluginManager.apply("com.android.library")
+              extensions.configure<LibraryExtension> {
+                  compileSdk = 37
+                  defaultConfig.minSdk = 26
+                  testOptions.targetSdk = 36
+                  lint.targetSdk = 36
+              }
+          }
+      }
+  }
+
+  class HiltConventionPlugin : Plugin<Project> {
+      override fun apply(target: Project) {
+          with(target) {
+              pluginManager.apply("com.google.devtools.ksp")
+              pluginManager.apply("com.google.dagger.hilt.android")
+              val libs = extensions.getByType<VersionCatalogsExtension>().named("libs")
+              dependencies {
+                  add("implementation", libs.findLibrary("hilt-android").get())
+                  add("ksp", libs.findLibrary("hilt-compiler").get())
+              }
+          }
+      }
+  }
+  ```
+
+  In der App bindest du `build-logic` in `settings.gradle.kts` ein und gibst den Plugins Einträge im Katalog, ohne Version, weil sie aus dem eigenen Build kommen:
+
+  ```kotlin title=settings.gradle.kts
+  pluginManagement {
+      includeBuild("build-logic")
+      repositories {
+          google()
+          mavenCentral()
+          gradlePluginPortal()
+      }
+  }
+  ```
+
+  ```toml title=gradle/libs.versions.toml
+  [plugins]
+  bear-android-library = { id = "bear.android.library" }
+  bear-hilt = { id = "bear.hilt" }
+  ```
+
+  ```kotlin title=core/data/build.gradle.kts
+  plugins {
+      alias(libs.plugins.bear.android.library)
+      alias(libs.plugins.bear.hilt)
+  }
+  ```
+
+  Eine Stelle wirkt seltsam und ist doch nötig: `compileOnly` in `build-logic` heißt, dass AGP, KSP und Hilt zur Laufzeit von woanders kommen müssen. Deshalb deklariert die Wurzel-`build.gradle.kts` diese Plugins weiterhin, aber mit `apply false`. Damit landen sie mit der Version aus dem Katalog im Klassenpfad aller Module, ohne auf das Wurzelprojekt angewendet zu werden. Fehlt die Zeile, meldet Gradle „Plugin with id 'com.google.dagger.hilt.android' not found“. Fehlt nur `apply false`, versucht Gradle, Hilt auf das Wurzelprojekt anzuwenden, das gar keine Android-App ist.
+
+  Halte jedes Plugin bei einer Aufgabe, wie es [Now in Android](https://github.com/android/nowinandroid/blob/main/build-logic/README.md) vormacht: eins für Android-Bibliotheken, eins für Compose, eins für Hilt, eins für Feature-Module, das die anderen kombiniert. Ein Riesen-Plugin mit Schaltern wird zur zweiten, schlechter lesbaren Build-Datei.
+
   ## R8: kleiner, schneller, schwerer zu lesen
 
   Im Release-Build läuft [R8](https://developer.android.com/topic/performance/app-optimization/enable-app-optimization#enable). Es entfernt ungenutzten Code und ungenutzte Ressourcen (Shrinking), optimiert (Inlining, Entfernen toter Zweige) und benennt Klassen und Methoden in kurze Namen um (Obfuscation). Das Ergebnis ist kleiner und schneller. Seit AGP 9.3 schaltest du alles mit `optimization { enable = true }` ein; ältere Projekte nutzen die bisherige Schreibweise:
@@ -191,6 +312,9 @@ lesson: |
   ```
 
   Bibliotheken wie Room, kotlinx.serialization oder WorkManager bringen ihre eigenen Regeln mit. Für Stacktraces aus dem Release erzeugt R8 eine `mapping.txt`; lädst du sie in die Play Console hoch, zeigt Android vitals lesbare Stacktraces. Teste Release-Builds deshalb immer auf einem echten Gerät, bevor sie an Nutzer gehen.
+
+  > [!NOTE] Startzeit: Baseline Profiles
+  > Nach der Installation führt Android Code zunächst interpretiert oder per JIT aus; Start und erstes Scrollen leiden. Ein Baseline Profile lässt das System die wichtigen Teile schon bei der Installation kompilieren. Wie du es mit dem Plugin `androidx.baselineprofile` erzeugst und seine Wirkung misst, zeigt das Modul „Performance messen“.
 
   ## Signieren: Upload Key und App Signing Key
 
@@ -300,10 +424,6 @@ lesson: |
   > [!PRAXIS] Was in einer Take-Home-Aufgabe auffällt
   > Ein Repository mit grünem CI-Badge, einem Version Catalog, einer `.gitignore`, die `local.properties` und Keystores ausschließt, und einem README-Abschnitt „Bauen und Testen“ mit `./gradlew testDebugUnitTest` wirkt professionell, bevor jemand eine Zeile Kotlin gelesen hat. Ein eingecheckter Keystore oder ein Passwort in `build.gradle.kts` ist dagegen ein Ausschlusskriterium.
 
-  ## Ausblick: Baseline Profiles
-
-  Beim ersten Start nach der Installation führt Android Code zunächst interpretiert oder just-in-time kompiliert aus; Startzeit und erstes Scrollen leiden. Ein [Baseline Profile](https://developer.android.com/topic/performance/baselineprofiles/overview) listet die Klassen und Methoden, die beim Start und in wichtigen Abläufen gebraucht werden. Es wird mit der App ausgeliefert, und das System kompiliert diese Teile schon bei der Installation vorab. Erzeugt wird es mit einem Macrobenchmark-Test und dem Gradle-Plugin `androidx.baselineprofile`. Für den Einstieg reicht es zu wissen, dass es das gibt und wofür – in Interviews für Mid-Level-Stellen fällt der Begriff bei Fragen zur Startzeit.
-
   ## Häufige Fehler
 
   - **Keystore oder Passwort im Repository.** Behebung: Schlüssel als kompromittiert behandeln, Upload Key zurücksetzen lassen, `.gitignore` ergänzen, Secrets nutzen.
@@ -313,6 +433,9 @@ lesson: |
   - **Versionen in jeder Build-Datei.** Unterschiedliche Module nutzen verschiedene Versionen derselben Bibliothek. Behebung: Version Catalog.
   - **Gradle-Wrapper nicht eingecheckt oder `gradle` statt `./gradlew`.** Jeder baut mit einer anderen Gradle-Version.
   - **Direkt 100 Prozent Production.** Ein Absturz trifft alle Nutzer auf einmal. Behebung: Internal Track, dann gestaffelter Rollout.
+  - **Build-Logik kopiert statt geteilt.** Zehn Module, zehn leicht verschiedene `minSdk`. Behebung: Convention Plugins in `build-logic`.
+  - **`subprojects { }` in der Wurzel.** Koppelt alle Module beim Konfigurieren an die Wurzel und bremst Optimierungen wie Configuration on Demand aus. Behebung: Convention Plugins.
+  - **Plugin in der Wurzel ohne `apply false`.** Gradle wendet es auf das Wurzelprojekt an und scheitert.
 
   ## Zusammenfassung
 
@@ -323,6 +446,7 @@ lesson: |
   - Play App Signing: Google hält den App Signing Key, du den Upload Key. Keystores und Passwörter bleiben außerhalb des Repositorys.
   - Hochgeladen wird ein App Bundle mit steigendem `versionCode`, über Internal, Closed und Open Testing bis zum gestaffelten Rollout in Production.
   - GitHub Actions baut und testet jeden Push; ein Tag löst einen signierten Release-Build mit Secrets aus.
+  - Convention Plugins in einem eingebundenen Build `build-logic` legen Konventionen einmal fest; Module wenden sie über Katalog-Aliase an, die Wurzel deklariert die Fremd-Plugins mit `apply false`.
 exercises:
   - id: zwei-schluessel
     type: choice
@@ -518,6 +642,72 @@ exercises:
         url: https://developer.android.com/build/build-variants
       - title: Enable optimization
         url: https://developer.android.com/topic/performance/app-optimization/enable-app-optimization#enable
+  - id: plugin-registrieren
+    type: gap
+    title: Ein Convention Plugin anmelden
+    prompt: |
+      Melde die Klasse `AndroidLibraryConventionPlugin` unter der ID `bear.android.library` an.
+    lang: kotlin
+    code: |
+      plugins {
+          `⟦kotlin-dsl⟧`
+      }
+
+      gradlePlugin {
+          plugins {
+              ⟦register⟧("androidLibrary") {
+                  ⟦id⟧ = "bear.android.library"
+                  ⟦implementationClass⟧ = "AndroidLibraryConventionPlugin"
+              }
+          }
+      }
+    gaps:
+      - label: Plugin für Build-Logik in Kotlin
+        hint: Es bringt die Kotlin DSL und `java-gradle-plugin` mit.
+      - label: Anmelden
+        hint: Legt einen benannten Eintrag an.
+        accept: ["create"]
+      - label: ID
+        hint: Unter diesem Namen wenden Module das Plugin an.
+      - label: Klasse
+        hint: Der Name der Klasse, die `Plugin<Project>` implementiert.
+    explanation: |
+      `kotlin-dsl` macht `build-logic/convention` zu einem Projekt, das Gradle-Plugins in Kotlin baut. Der Block `gradlePlugin` verbindet eine ID mit der Klasse, die `Plugin<Project>` implementiert. Module wenden das Plugin dann über diese ID an, am besten über einen Katalog-Alias ohne Version.
+    resources:
+      - title: Gradle · Creating a convention plugin
+        url: https://docs.gradle.org/current/userguide/implementing_gradle_plugins_convention.html#creating_a_convention_plugin
+  - id: plugin-anwenden
+    type: gap
+    title: Die Konvention im Modul nutzen
+    prompt: |
+      Binde `build-logic` ein, gib dem Plugin einen Katalog-Eintrag und wende es in `:core:data` an.
+    lang: kotlin
+    code: |
+      // settings.gradle.kts
+      pluginManagement {
+          ⟦includeBuild("build-logic")⟧
+          repositories { google(); mavenCentral(); gradlePluginPortal() }
+      }
+
+      // gradle/libs.versions.toml, Abschnitt [plugins]:
+      // bear-android-library = { id = "⟦bear.android.library⟧" }
+
+      // core/data/build.gradle.kts
+      plugins {
+          alias(⟦libs.plugins.bear.android.library⟧)
+      }
+    gaps:
+      - label: Eingebundener Build
+        hint: Macht die Plugins aus einem anderen Gradle-Build verfügbar.
+      - label: Plugin-ID
+        hint: Die ID aus `gradlePlugin`.
+      - label: Accessor
+        hint: Aus `bear-android-library` werden Punkte.
+    explanation: |
+      `includeBuild` im Block `pluginManagement` macht Gradle die Plugins aus `build-logic` bekannt. Der Katalog-Eintrag braucht keine Version, weil das Plugin aus dem eigenen Build kommt. Aus dem Bindestrich-Namen erzeugt Gradle den Accessor `libs.plugins.bear.android.library`.
+    resources:
+      - title: Gradle · Sharing build logic via a composite build
+        url: https://docs.gradle.org/current/userguide/sharing_build_logic_between_subprojects.html#sec:sharing_logic_via_composite_build
   - id: ci-workflow
     type: gap
     title: Grün bei jedem Pull Request
@@ -670,6 +860,60 @@ exercises:
         url: https://developer.android.com/studio/publish/app-signing#secure_key
       - title: gitignore (Git-Doku)
         url: https://git-scm.com/docs/gitignore
+  - id: hilt-in-der-wurzel
+    type: bug
+    title: Das Wurzelprojekt will Hilt
+    prompt: |
+      Nach dem Umbau auf Convention Plugins scheitert jeder Build sofort: `A problem occurred configuring root project 'Bear'. > The Hilt Android Gradle plugin can only be applied to an Android project.` Finde die Zeile in der Wurzel-`build.gradle.kts` und korrigiere sie.
+    lang: kotlin
+    code: |
+      plugins {
+          alias(libs.plugins.android.application) apply false
+          alias(libs.plugins.android.library) apply false
+          alias(libs.plugins.kotlin.compose) apply false
+          alias(libs.plugins.ksp) apply false
+          alias(libs.plugins.hilt)
+      }
+    lines: [6]
+    fix:
+      - line: 6
+        answers:
+          - alias(libs.plugins.hilt) apply false
+    explanation: |
+      In der Wurzel sollen die Plugins nur in den Klassenpfad, damit `bear.hilt` sie in den Modulen anwenden kann. `apply false` sorgt genau dafür. Ohne diese Angabe wendet Gradle Hilt auf das Wurzelprojekt an, und das ist keine Android-App. Ganz streichen darfst du die Zeile auch nicht: Dann fehlt Hilt im Klassenpfad, und `bear.hilt` scheitert mit „Plugin with id 'com.google.dagger.hilt.android' not found“.
+    resources:
+      - title: Gradle · Applying plugins with apply false
+        url: https://docs.gradle.org/current/userguide/plugins_intermediate.html#sec:subprojects_plugins_dsl
+  - id: hilt-plugin-erklaeren
+    type: explain
+    title: Was macht dieses Plugin?
+    prompt: |
+      Erkläre, was ein Modul bekommt, das `bear.hilt` anwendet, woher die Versionen kommen und warum das besser ist als dieselben Zeilen in jeder Build-Datei.
+    lang: kotlin
+    code: |
+      class HiltConventionPlugin : Plugin<Project> {
+          override fun apply(target: Project) {
+              with(target) {
+                  pluginManager.apply("com.google.devtools.ksp")
+                  pluginManager.apply("com.google.dagger.hilt.android")
+                  val libs = extensions.getByType<VersionCatalogsExtension>().named("libs")
+                  dependencies {
+                      add("implementation", libs.findLibrary("hilt-android").get())
+                      add("ksp", libs.findLibrary("hilt-compiler").get())
+                  }
+              }
+          }
+      }
+    points:
+      - Das Modul bekommt die Plugins KSP und Hilt angewendet.
+      - Es bekommt die Hilt-Laufzeit als `implementation` und den Hilt-Compiler als `ksp`.
+      - Die Versionen kommen aus dem gemeinsamen Version Catalog, nachgeschlagen per Name.
+      - Eine Änderung, etwa ein neues Hilt-Artefakt, passiert an einer Stelle und gilt für alle Module.
+    explanation: |
+      Das Plugin bündelt drei Dinge, die jedes Hilt-Modul braucht: das KSP-Plugin, das Hilt-Plugin und die beiden Abhängigkeiten. Die Versionen stehen weiter nur im Katalog; `findLibrary` sucht sie zur Konfigurationszeit heraus. Ein Modul schreibt nur noch `alias(libs.plugins.bear.hilt)`. Kommt ein Hilt-Update oder ein weiteres Artefakt dazu, änderst du es hier einmal, statt in zehn Build-Dateien einen Fehler zu übersehen.
+    resources:
+      - title: Now in Android · build-logic
+        url: https://github.com/android/nowinandroid/blob/main/build-logic/README.md
   - id: release-job-erklaeren
     type: explain
     title: Der Release-Job

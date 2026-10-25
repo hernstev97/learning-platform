@@ -1,0 +1,742 @@
+id: performance-diagnose
+title: "Performance & Debugging: Spuren lesen"
+level: 3
+minutes: 170
+place: unterwegs
+summary: Compiler-Reports, Traces, Logcat, Stacktraces, StrictMode- und Leak-Meldungen lesen und daraus die Ursache ableiten – bevor du etwas misst oder änderst.
+goals:
+  - Du liest den Klassen- und Composable-Report des Compose-Compilers und erklärst, welche Parameter Compose per Identität und welche per `equals` vergleicht.
+  - Du machst Klassen stabil – mit `val`, einem eigenen UI-Modell, `@Immutable` oder einer Stabilitätsdatei – und begründest die Wahl.
+  - Du findest in einem Trace-Ausschnitt den Frame über dem Budget und den Slice, der ihn verursacht.
+  - Du unterscheidest TTID und TTFD und meldest mit `ReportDrawnWhen`, wann ein Bildschirm wirklich fertig ist.
+  - Du liest Stacktraces bis zur letzten `Caused by`-Zeile, StrictMode-Meldungen und LeakCanary-Spuren und benennst die Zeile, die du änderst.
+  - Du ordnest Android vitals und Crash-Reports nach dem Release ein.
+resources:
+  - title: Stability in Compose
+    url: https://developer.android.com/develop/ui/compose/performance/stability
+  - title: Strong skipping mode
+    url: https://developer.android.com/develop/ui/compose/performance/stability/strongskipping
+  - title: Compose performance best practices
+    url: https://developer.android.com/develop/ui/compose/performance/bestpractices
+  - title: App startup time
+    url: https://developer.android.com/topic/performance/issues/launch-time
+  - title: Android vitals
+    url: https://developer.android.com/topic/performance/vitals
+lesson: |
+  Nutzer schreiben im Play Store: „Die Liste ruckelt auf meinem alten Handy.“ Ein zweiter meldet, dass die App beim Öffnen eines Gedankens abstürzt. Auf deinem Pixel läuft alles flüssig. Wer hier rät, baut drei Optimierungen ein und trifft die Ursache nicht. Wer Spuren lesen kann, findet sie in Minuten: im Compiler-Report, im Trace, in der Logcat-Zeile über dem Absturz.
+
+  Dieses Modul übt das Lesen. Alle Ausgaben sind echte Formate, für das Handy gekürzt und umbrochen. Wie du sie selbst aufnimmst – Layout Inspector, Profiler, Macrobenchmark –, zeigt das nächste Modul „Performance messen“ am PC. Die Code-Beispiele sind wie in „Compose fortgeschritten“ schmal gesetzt.
+
+  ## Skipping und Stabilität: wann Compose Arbeit spart
+
+  Ändert sich ein State, läuft die Composable neu, die ihn liest. Ihre Kinder ruft sie erneut auf. Ein Kind darf Compose **überspringen**, wenn alle Parameter gleich geblieben sind. Das ist der Grund, warum eine Liste mit hundert Zeilen nicht hundertmal neu komponiert, wenn sich oben ein Zähler ändert.
+
+  Was „gleich geblieben“ heißt, hängt an der **Stabilität** des Parametertyps. Seit Kotlin 2.0.20 ist der [Strong Skipping Mode](https://developer.android.com/develop/ui/compose/performance/stability/strongskipping) Standard. Damit gilt: Jede neu startbare Composable ist überspringbar. Parameter mit stabilem Typ vergleicht Compose mit `equals`, Parameter mit instabilem Typ nur per Identität (`===`). Lambdas merkt sich der Compiler automatisch.
+
+  Stabil sind primitive Typen, `String`, Funktionstypen und Klassen, deren öffentliche Properties alle `val` und selbst stabil sind ([Stability](https://developer.android.com/develop/ui/compose/performance/stability)). Instabil macht eine Klasse zum Beispiel:
+
+  - eine `var`-Property,
+  - eine Property mit instabilem Typ, etwa `java.util.Date` oder `java.time.Instant`,
+  - die Herkunft aus einem Gradle-Modul, das ohne Compose-Compiler baut. Der Compiler kennt diese Klassen nicht und muss vom Schlimmsten ausgehen.
+
+  ```kotlin
+  data class ThoughtUi(
+    val id: String,
+    val text: String,
+    var pinned: Boolean,
+  )
+  ```
+
+  Room liefert bei jeder Änderung neue Objekte, das ViewModel mappt sie auf neue `ThoughtUi`. Mit `var pinned` ist die Klasse instabil. Jede Zeile bekommt ein neues Objekt, `===` schlägt fehl, und **jede** Zeile komponiert neu, auch wenn sich nur ein Gedanke geändert hat. Mit `val pinned` vergleicht Compose per `equals` und überspringt die unveränderten Zeilen.
+
+  Die vier Wege zur Stabilität, in der Reihenfolge, in der du sie prüfen solltest:
+
+  1. `var` durch `val` ersetzen. Änderungen laufen über `copy`.
+  2. Im UI-Modul ein eigenes UI-Modell anlegen, statt Domänenklassen aus `:core:model` durchzureichen.
+  3. `@Immutable` oder `@Stable` an die Klasse schreiben. Das ist ein Versprechen an den Compiler. Brichst du es, zeigt die UI veraltete Werte.
+  4. Eine Stabilitätsdatei für Klassen, die du nicht ändern kannst.
+
+  ```kotlin
+  val conf = rootProject.layout
+    .projectDirectory
+    .file("stability.conf")
+  composeCompiler {
+    stabilityConfigurationFiles
+      .add(conf)
+  }
+  ```
+
+  ```text
+  // stability.conf
+  bear.core.model.*
+  java.time.Instant
+  ```
+
+  Collections wie `List` haben eine Sonderrolle. Weil `List` ein Interface ist, kann der Compiler ihre Stabilität nicht festlegen; der Report schreibt `runtime` oder gar kein Etikett. Compose vergleicht solche Parameter mit `equals`. Eine neue Liste mit gleichem Inhalt überspringt also. Viele ältere Artikel sagen anderes; sie stammen aus der Zeit vor Strong Skipping.
+
+  > [!WARNING] Erst messen, dann annotieren
+  > Ein überflüssiges Recompose kostet oft weniger als eine Millisekunde. `@Stable` an jeder Klasse macht Code nicht schneller, aber Fehler unsichtbar. Annotiere erst, wenn ein Trace oder der Layout Inspector zeigt, dass genau diese Composable zu oft läuft.
+
+  ## Compiler-Reports lesen
+
+  Der Compose-Compiler schreibt auf Wunsch auf, wie er jede Klasse und jede Composable einstuft. Du schaltest das im Gradle-Plugin ein und baust einen Release-Build, denn nur der zeigt das Verhalten der ausgelieferten App ([Compiler metrics](https://developer.android.com/develop/ui/compose/performance/stability/diagnose#compose-compiler)).
+
+  ```kotlin
+  composeCompiler {
+    reportsDestination =
+      layout.buildDirectory
+        .dir("compose_compiler")
+    metricsDestination =
+      layout.buildDirectory
+        .dir("compose_compiler")
+  }
+  ```
+
+  In `build/compose_compiler/` liegen danach `app-classes.txt`, `app-composables.txt` und `app-composables.csv`. Der Klassenreport für `ThoughtUi` von oben:
+
+  ```text
+  unstable class bear.ui.ThoughtUi {
+    stable val id: String
+    stable val text: String
+    stable var pinned: Boolean
+    <runtime stability> = Unstable
+  }
+  ```
+
+  Jede Property ist für sich `stable`, aber `var` macht die Klasse instabil. Im Composable-Report steht dann an jedem Parameter das Etikett:
+
+  ```text
+  restartable skippable
+    scheme("[…UiComposable]")
+    fun bear.ui.ThoughtRow(
+    unstable thought: ThoughtUi
+    stable onPin: Function1<…>
+  )
+  ```
+
+  `restartable skippable` steht wegen Strong Skipping fast überall. Wichtig sind die Etiketten: `unstable` heißt Vergleich per Identität. Such im Report gezielt nach `unstable` und prüfe bei jedem Treffer, ob neue Objekte bei jeder Änderung ankommen. Im Unterordner der Variante, etwa `debug/` oder `release/`, liegt `app-module.json` mit Zahlen wie `"knownUnstableArguments": 3`; sie eignen sich, um eine Änderung vorher und nachher zu vergleichen. Die Textberichte verschiedener Varianten überschreiben sich gegenseitig, also bau nur die Variante, die du lesen willst.
+
+  ## State spät lesen
+
+  Ein State-Read löst die Phase aus, in der er steht: Composition, Layout oder Zeichnen ([Phasen](https://developer.android.com/develop/ui/compose/phases)). Ändert sich ein Wert bei jedem Frame – Scrollposition, Animationsfortschritt, Fingerposition –, sollte er so spät wie möglich gelesen werden. Die Doku nennt das [Lesen aufschieben](https://developer.android.com/develop/ui/compose/performance/bestpractices#defer-reads).
+
+  ```kotlin
+  // liest in der Composition:
+  // jeder Pixel komponiert neu
+  Modifier.graphicsLayer(
+    translationY =
+      scroll.value / 2f,
+  )
+
+  // liest erst in der Ebene
+  Modifier.graphicsLayer {
+    translationY = scroll.value / 2f
+  }
+  ```
+
+  Beide Zeilen verschieben einen Kopfbereich mit halber Scrollgeschwindigkeit. Die erste liest `scroll.value` im Körper der Composable. Die zweite liest im Lambda von [`graphicsLayer`](https://developer.android.com/develop/ui/compose/graphics/draw/modifiers#graphicsLayer); ändert sich der Wert, aktualisiert Compose nur die Eigenschaften der Ebene, ohne Composition und ohne Layout. Dasselbe Muster gilt für `Modifier.offset { … }` statt `offset(x = …)` und für `drawBehind { … }`.
+
+  Das Gegenteil ist das **Rückwärts-Schreiben**: Eine Composable liest einen State und schreibt ihn danach in derselben Composition. Compose muss sofort neu komponieren, die nächste Runde schreibt wieder, und die App rechnet in jedem Frame. Schreibe State nur in Event-Handlern und Effekten.
+
+  ## Frames und Traces lesen
+
+  Ein Bildschirm mit 60 Hz zeigt alle 16,7 ms ein neues Bild, mit 90 Hz alle 11,1 ms, mit 120 Hz alle 8,3 ms. In dieser Zeit muss der Main-Thread Eingaben verarbeiten, Animationen weiterrechnen, komponieren, messen, platzieren und die Zeichenbefehle aufzeichnen; der RenderThread schickt sie an die GPU. Dauert ein Frame länger, sieht der Nutzer ein Ruckeln, englisch **Jank**.
+
+  Ein System-Trace zeichnet auf, was jeder Thread wann tut, als verschachtelte Zeitabschnitte (**Slices**). In [Perfetto](https://perfetto.dev/docs/data-sources/frametimeline) zeigen zwei Spuren pro App, was geplant war (**Expected Timeline**) und was passiert ist (**Actual Timeline**). Ein Frame, der zu spät kommt, trägt einen Jank-Typ wie „App Deadline Missed“. Android Studio fasst solche Frames in der Spur „Janky frames“ zusammen ([Jank detection](https://developer.android.com/studio/profile/jank-detection)). Abgeschrieben als Text sieht ein Frame so aus:
+
+  ```text
+  Frame 1841 · 41,2 ms
+  Jank: App Deadline Missed
+
+  main                      ms
+  Choreographer#doFrame   40,8
+   Recomposer:recompose   37,6
+    Compose:recompose     37,5
+     ThoughtRow.format    31,0
+   AndroidOwner:draw       1,9
+  ```
+
+  Lies von außen nach innen und folge dem dicksten Ast. `Choreographer#doFrame` ist der ganze Frame. Fast alles davon ist Recomposition, und darin fast alles `ThoughtRow.format`. Dieser Name kommt nicht von Compose, sondern aus der App selbst:
+
+  ```kotlin
+  fun format(t: Thought): String =
+    trace("ThoughtRow.format") {
+      formatter.format(t.created)
+    }
+  ```
+
+  `trace` aus `androidx.tracing` legt einen eigenen Slice an, im Release-Build fast ohne Kosten. Ohne ihn stünde unter `Compose:recompose` nur ein grauer Block. Mit eigenen Abschnitten machst du sichtbar, welche deiner Funktionen Zeit kostet. Hier formatiert jede Zeile bei jeder Recomposition ein Datum neu. Die Lösung ist, das Datum einmal im ViewModel zu formatieren.
+
+  ## Startzeit: TTID und TTFD
+
+  Android unterscheidet drei Starts. Beim **Kaltstart** existiert noch kein Prozess, beim **Warmstart** lebt der Prozess, die Activity wird neu erzeugt, beim **Heißstart** holt das System eine vorhandene Activity nach vorn ([App startup time](https://developer.android.com/topic/performance/issues/launch-time)). Gemessen werden zwei Zeiten:
+
+  - **TTID** (Time to Initial Display): bis zum ersten Frame. Das System schreibt sie selbst ins Log.
+  - **TTFD** (Time to Full Display): bis der Inhalt da ist, mit dem der Nutzer arbeiten kann. Das weiß nur die App, deshalb muss sie es melden.
+
+  ```text
+  I ActivityTaskManager: Displayed
+    bear/.MainActivity for user 0:
+    +612ms
+  ```
+
+  Bear zeigt nach 612 ms einen Ladekreis. Die Gedanken stehen erst später da. Damit die TTFD stimmt, meldet der Bildschirm, wann er fertig ist:
+
+  ```kotlin
+  @Composable
+  fun ThoughtsRoute(
+    state: ThoughtsState,
+  ) {
+    ReportDrawnWhen {
+      state is ThoughtsState.Loaded
+    }
+    ThoughtsScreen(state)
+  }
+  ```
+
+  `ReportDrawnWhen` aus `activity-compose` ruft `reportFullyDrawn()` auf, sobald die Bedingung stimmt. Logcat zeigt dann eine zweite Zeile, `Fully drawn bear/.MainActivity: +1s54ms`, und Macrobenchmark misst die TTFD daraus ([TTFD](https://developer.android.com/topic/performance/issues/launch-time#retrieve-TTFD)). Den Kaltstart kannst du mit einem Baseline Profile verkürzen; wie, zeigt „Performance messen“.
+
+  ## StrictMode und LeakCanary lesen
+
+  StrictMode meldet im Debug-Build Arbeit, die auf dem Main-Thread nichts verloren hat, etwa Lese- oder Schreibzugriffe auf die Platte ([StrictMode](https://developer.android.com/reference/android/os/StrictMode)). Eine Meldung sieht so aus:
+
+  ```text
+  D StrictMode: StrictMode policy
+    violation; ~duration=48 ms:
+    android.os.strictmode
+      .DiskReadViolation
+   at android.os.StrictMode…
+     .onReadFromDisk(…)
+   at java.io.FileInputStream
+     .<init>(…)
+   at bear.data.Prefs.load(
+     Prefs.kt:22)
+   at bear.MainActivity.onCreate(
+     MainActivity.kt:31)
+  ```
+
+  Die oberen Zeilen sind Framework. Interessant ist die **erste Zeile aus deinem Paket**: `Prefs.load` liest in `onCreate` synchron eine Datei. Die Lösung ist, sie in einer Coroutine auf `Dispatchers.IO` zu lesen oder DataStore zu nehmen, das ohnehin asynchron liest.
+
+  [LeakCanary](https://square.github.io/leakcanary/fundamentals-how-leakcanary-works/) findet Objekte, die der Garbage Collector nicht einsammeln kann, obwohl sie fertig sind, meist eine zerstörte Activity. Es zeigt den Weg von einer GC-Wurzel bis zum Leck:
+
+  ```text
+  ┬───
+  │ GC Root: System class
+  │
+  ├─ bear.sync.SyncHub class
+  │    Leaking: NO (a class is
+  │    never leaking)
+  │    ↓ static SyncHub.listeners
+  │                  ~~~~~~~~~
+  ├─ java.util.ArrayList instance
+  │    Leaking: UNKNOWN
+  │    ↓ ArrayList[0]
+  │               ~~~
+  ├─ bear.MainActivity$1 instance
+  │    Leaking: UNKNOWN
+  │    ↓ MainActivity$1.this$0
+  │                     ~~~~~~
+  ╰→ bear.MainActivity instance
+       Leaking: YES (Activity#
+       mDestroyed is true)
+  ```
+
+  Die Ursache liegt zwischen dem letzten `Leaking: NO` und dem ersten `Leaking: YES`; LeakCanary unterstreicht dort jede Referenz mit `~~~`, und eine davon ist zu viel. Hier hält das statische `SyncHub.listeners` ein anonymes Objekt (`MainActivity$1`), und das hält über `this$0` seine Activity. Die Activity hat sich angemeldet und nie abgemeldet. Die Lösung ist `SyncHub.listeners.remove(…)` in `onDestroy` oder besser ein Flow, den der Bildschirm lifecyclebewusst sammelt.
+
+  ## Logcat und Stacktraces lesen
+
+  Logcat sammelt die Logs aller Prozesse. Jede Zeile hat eine Stufe (`V`, `D`, `I`, `W`, `E`, `A`), ein Tag und eine Nachricht. In Android Studio filterst du mit einer Abfrage wie `package:mine level:error` ([Logcat](https://developer.android.com/studio/debug/logcat#key-value-search)). Stürzt die App ab, steht dort ein Stacktrace:
+
+  ```text
+  E AndroidRuntime: FATAL EXCEPTION:
+    main
+  java.time.format
+    .DateTimeParseException: Text
+    '2026-10-22' could not be
+    parsed: Invalid value for
+    MonthOfYear (valid values
+    1 - 12): 22
+   at java.time.format
+     .DateTimeFormatter.parse(…)
+   at java.time.LocalDate.parse(…)
+   at bear.data.Dates.parse(
+     Dates.kt:9)
+   at bear.data.Mapper.toUi(
+     Mapper.kt:14)
+   …
+  ```
+
+  Ein Stacktrace liest sich von oben nach unten. Die erste Zeile nennt Typ und Nachricht der Exception, darunter steht der Aufrufstapel: oben, wo sie geworfen wurde, unten, wer aufgerufen hat. Wirf einen Blick auf die Nachricht, bevor du in den Code springst. „Invalid value for MonthOfYear: 22“ heißt: Der Parser hält 22 für den Monat. Das Muster vertauscht Tag und Monat.
+
+  Hat eine Exception eine Ursache, folgen weitere Blöcke mit `Caused by:`. Die **letzte** `Caused by`-Zeile ist meist die eigentliche Ursache; die oberen Blöcke sind Hüllen, die beim Weiterwerfen entstanden. Zeilen wie `… 23 more` kürzen Rahmen, die schon im Block darüber stehen.
+
+  Ein **ANR** (Application Not Responding) entsteht, wenn der Main-Thread zu lange blockiert, bei Eingaben nach 5 Sekunden ([ANRs](https://developer.android.com/topic/performance/vitals/anr)). Hier gibt es keinen Stacktrace einer Exception, sondern einen Abzug aller Threads. Du suchst den Thread `main` und liest, worauf er wartet: eine Sperre, eine Datei, eine Netzwerkantwort.
+
+  ## Nach dem Release: Android vitals und Crash-Reports
+
+  Nach dem Release siehst du nicht mehr das Logcat deiner Nutzer. Was du siehst, sind Berichte. Die Play Console zeigt unter [Android vitals](https://developer.android.com/topic/performance/vitals) Abstürze und ANRs, nach Ursache gruppiert, mit Gerät, Android-Version und App-Version. Google Play bewertet zwei Kennzahlen besonders: die vom Nutzer bemerkte Absturzrate und die vom Nutzer bemerkte ANR-Rate. Die [Schwellen für schlechtes Verhalten](https://support.google.com/googleplay/android-developer/answer/9844486#user_perceived_crash_rate_threshold) liegen bei 1,09 % für Abstürze und 0,47 % für ANRs über alle Geräte und bei 8 % für ein einzelnes Handymodell. Liegt eine App darüber, kann Play sie weniger sichtbar machen. Für Startzeiten zählt ein Kaltstart ab 5 s als langsam, ein Warmstart ab 2 s; beim Heißstart nennt die [Play-Console-Hilfe](https://support.google.com/googleplay/android-developer/answer/9844486#app_startup_time) 1 s, die [Android-Doku](https://developer.android.com/google/play/vitals/launch-time) 1,5 s. Android vitals misst dabei die TTID, nicht die TTFD.
+
+  Mit R8 sind Klassen- und Methodennamen im Release verkürzt. Ein Stacktrace lautet dann `at a.b.c(SourceFile:1)`. Lesbar wird er erst mit der Mapping-Datei, die R8 beim Build schreibt. Lädst du ein App Bundle hoch, nimmt die Play Console sie mit ([Deobfuscate crash stack traces](https://support.google.com/googleplay/android-developer/answer/9848633)); für APKs und andere Dienste lädst du sie selbst hoch. Entschlüsselt werden nur Abstürze, die nach dem Hochladen ankommen.
+
+  Dienste wie Firebase Crashlytics zeigen Abstürze fast in Echtzeit und erlauben eigene Einträge für nicht tödliche Fehler. Ab Android 11 nennt `ActivityManager.getHistoricalProcessExitReasons` beim nächsten Start, warum der letzte Prozess endete: Absturz, ANR, zu wenig Speicher oder der Nutzer. Schreib in solche Berichte keine Inhalte von Nutzern, keine Namen und keine Tokens.
+
+  > [!PRAXIS]
+  > Ein guter Absturzbericht im Team nennt vier Dinge: betroffene App-Version und Geräte, die letzte `Caused by`-Zeile, die erste Zeile aus dem eigenen Code und eine Hypothese, die sich prüfen lässt. „Crash beim Öffnen“ ist kein Bericht, „ab 2.4.0, nur Android 12, `Dates.parse:9`, Muster vertauscht Tag und Monat“ schon.
+
+  > [!INTERVIEW]
+  > „Die Liste ruckelt. Wie gehst du vor?“ – Ich reproduziere es in einem Release-Build auf einem echten, eher langsamen Gerät. Dann nehme ich einen System-Trace auf und suche die Frames mit „App Deadline Missed“. Im längsten Frame folge ich dem dicksten Slice bis zu meinem Code. Ist es Recomposition, prüfe ich im Compiler-Report, ob instabile Parameter Zeilen am Überspringen hindern. Nach der Änderung messe ich noch einmal.
+
+  ## Häufige Fehler
+
+  - **Im Debug-Build messen:** Debug-Code ist ohne R8 und mit Debugger-Hooks langsamer. Ruckeln dort sagt wenig über den Release.
+  - **`@Stable` als Pflaster:** Das Versprechen stimmt nicht, und die UI zeigt alte Werte. Erst `val` und eigene UI-Modelle.
+  - **Domänenklassen aus Modulen ohne Compose-Compiler durchreichen:** Sie sind instabil. Mappe sie oder trage sie in die Stabilitätsdatei ein.
+  - **Häufige Werte zu früh lesen:** Scroll- und Animationswerte gehören in Lambda-Modifier.
+  - **Nur die erste Stacktrace-Zeile lesen:** Die Ursache steht oft in der letzten `Caused by`-Zeile.
+  - **Mapping-Datei verlieren:** Ohne sie ist jeder Release-Stacktrace unlesbar.
+
+  ## Zusammenfassung
+
+  - Strong Skipping macht jede neu startbare Composable überspringbar. Instabile Parameter vergleicht Compose per Identität.
+  - `var`, instabile Property-Typen und fremde Module machen Klassen instabil. `val`, UI-Modelle, Annotationen und die Stabilitätsdatei helfen, in dieser Reihenfolge.
+  - Der Report zeigt pro Parameter `stable`, `unstable` oder `runtime`.
+  - Werte, die sich bei jedem Frame ändern, liest du im Layout oder beim Zeichnen.
+  - Im Trace folgst du vom zu langen Frame dem dicksten Slice bis in deinen Code.
+  - TTID meldet das System, TTFD meldet die App mit `ReportDrawnWhen` oder `reportFullyDrawn()`.
+  - Bei StrictMode zählt die erste eigene Zeile, bei LeakCanary die Referenz zwischen `NO` und `YES`, bei Abstürzen die letzte `Caused by`-Zeile.
+  - Nach dem Release lesen Android vitals und Crash-Reports mit, und die Mapping-Datei macht sie lesbar.
+exercises:
+  - id: stabil-erkennen
+    type: choice
+    title: Welche Klasse ist stabil?
+    prompt: |
+      Das App-Modul baut mit Compose-Compiler und ohne Stabilitätsdatei. Welche Klasse meldet der Klassenreport als `stable class`?
+    options:
+      - text: "`data class Tag(val name: String, val color: Long)` im App-Modul"
+        correct: true
+        why: Alle Properties sind `val` mit stabilen Typen, und die Klasse liegt in einem Modul mit Compose-Compiler.
+      - text: "`data class Tag(val name: String, var color: Long)` im App-Modul"
+        correct: false
+        why: Eine `var`-Property macht die Klasse instabil, auch wenn ihr Typ stabil ist.
+      - text: "`data class Tag(val name: String)` aus `:core:model`, das ohne Compose-Compiler baut"
+        correct: false
+        why: Der Compiler kennt Klassen aus Modulen ohne Compose-Compiler nicht und stuft sie als instabil ein.
+      - text: "`class Tag(val name: String, val at: java.time.Instant)` im App-Modul"
+        correct: false
+        why: "`Instant` ist eine Java-Klasse, deren Stabilität der Compiler nicht kennt. Die Property macht die Klasse instabil."
+    explanation: |
+      Stabil heißt: Der Compiler weiß, dass sich ein Objekt nicht unbemerkt ändert. Das gilt für Klassen aus `val`-Properties mit stabilen Typen in einem Modul, das er selbst übersetzt. `var`, Java-Typen wie `Instant` oder `Date` und Klassen aus fremden Modulen machen ihn unsicher. Für `Instant` und `:core:model` hilft eine Stabilitätsdatei.
+    resources:
+      - title: Stability in Compose
+        url: https://developer.android.com/develop/ui/compose/performance/stability
+
+  - id: jank-vorgehen
+    type: order
+    title: Die Liste ruckelt – in welcher Reihenfolge?
+    prompt: |
+      Bring die Schritte der Jank-Diagnose in eine sinnvolle Reihenfolge.
+    lang: prose
+    lines: |
+      Ruckeln im Release-Build reproduzieren
+      System-Trace beim Scrollen aufnehmen
+      Frames mit App Deadline Missed suchen
+      Im längsten Frame dem dicksten Slice folgen
+      Slice einer Stelle im eigenen Code zuordnen
+      Ursache beheben
+      Denselben Ablauf erneut messen
+    explanation: |
+      Ohne reproduzierbaren Fall misst du nichts Belastbares, und im Debug-Build misst du das Falsche. Der Trace zeigt, welche Frames zu spät sind; erst im konkreten Frame siehst du, wo die Zeit hingeht. Die letzte Messung ist kein Ritual: Sie zeigt, ob die Änderung den Frame wirklich unter das Budget bringt.
+    resources:
+      - title: Jank detection
+        url: https://developer.android.com/studio/profile/jank-detection
+
+  - id: trace-verdacht
+    type: choice
+    title: Was macht Frame 2210 zu langsam?
+    prompt: |
+      Der Bildschirm läuft mit 60 Hz. Welche Stelle untersuchst du zuerst?
+    lang: text
+    code: |
+      Frame 2210 · 27,9 ms
+      Jank: App Deadline Missed
+
+      main                      ms
+      Choreographer#doFrame   27,6
+       Recomposer:recompose    3,1
+       AndroidOwner:
+         measureAndLayout     22,8
+        TagFlow.measure       21,9
+       AndroidOwner:draw       1,4
+    options:
+      - text: "`TagFlow.measure` im Layout"
+        correct: true
+        why: Von 27,6 ms Frame entfallen 21,9 ms auf das Messen dieses Layouts. Das allein sprengt das Budget von 16,7 ms.
+      - text: Die Recomposition
+        correct: false
+        why: 3,1 ms sind spürbar, aber nicht die Ursache. Ohne sie läge der Frame immer noch bei rund 25 ms.
+      - text: Das Zeichnen
+        correct: false
+        why: 1,4 ms für das Aufzeichnen der Zeichenbefehle sind unauffällig.
+      - text: Der RenderThread
+        correct: false
+        why: Der Ausschnitt zeigt nur den Main-Thread, und dort liegt die Zeit schon.
+    explanation: |
+      Folge dem dicksten Ast: `doFrame` 27,6 ms, darin `measureAndLayout` 22,8 ms, darin `TagFlow.measure` 21,9 ms. Das ist ein eigenes Layout, das beim Messen zu viel tut – vielleicht misst es Text in einer Schleife oder ruft Intrinsics für jedes Kind. Die Recomposition ist nicht schuld, `@Stable`-Annotationen würden hier nichts bringen.
+    resources:
+      - title: Overview of system tracing
+        url: https://developer.android.com/topic/performance/tracing
+
+  - id: report-vorhersagen
+    type: output
+    title: Was schreibt der Compiler in den Report?
+    prompt: |
+      Die Klasse liegt im App-Modul im Paket `bear.ui`. Wie lautet ihr Eintrag in `app-classes.txt`? Gib alle Zeilen an; der Report rückt die inneren Zeilen um zwei Leerzeichen ein.
+    lang: kotlin
+    code: |
+      data class Topic(
+        val title: String,
+        var unread: Int,
+      )
+    expected: |
+      unstable class bear.ui.Topic {
+        stable val title: String
+        stable var unread: Int
+        <runtime stability> = Unstable
+      }
+    accept:
+      - |
+        unstable class bear.ui.Topic {
+            stable val title: String
+            stable var unread: Int
+            <runtime stability> = Unstable
+        }
+      - |
+        unstable class bear.ui.Topic {
+        stable val title: String
+        stable var unread: Int
+        <runtime stability> = Unstable
+        }
+    explanation: |
+      Beide Properties haben stabile Typen, darum steht vor beiden `stable`. Die `var`-Property macht trotzdem die ganze Klasse instabil: Ein Objekt kann sich ändern, ohne dass Compose davon erfährt. Die letzte Zeile fasst zusammen, wie Compose die Klasse zur Laufzeit behandelt.
+    resources:
+      - title: Diagnose stability issues · Compose compiler
+        url: https://developer.android.com/develop/ui/compose/performance/stability/diagnose#compose-compiler
+
+  - id: zeilen-nach-klick
+    type: output
+    title: Wer komponiert nach dem Tippen neu?
+    prompt: |
+      `Book` kommt aus `:core:model`, das ohne Compose-Compiler baut. `Topic` ist eine `data class` aus `val`-Properties im App-Modul. Es gibt keine Stabilitätsdatei. `gen` steigt beim Tippen von 0 auf 1. Was steht danach in `log`, Eintrag für Eintrag vom Start an?
+    lang: kotlin
+    code: |
+      @Composable
+      fun BookRow(book: Book) {
+        SideEffect { log += "Book" }
+        Text(book.title)
+      }
+
+      @Composable
+      fun TopicRow(topic: Topic) {
+        SideEffect { log += "Topic" }
+        Text(topic.title)
+      }
+
+      @Composable
+      fun Shelf(gen: Int) {
+        Text("$gen")
+        BookRow(Book("1", "Dune"))
+        TopicRow(Topic("1", "SF"))
+      }
+    expected: |
+      Book
+      Topic
+      Book
+    hints:
+      - "`SideEffect` läuft nach jeder erfolgreichen Composition der Funktion, in der er steht."
+      - Bei jedem Durchlauf von `Shelf` entstehen neue Objekte. Wie vergleicht Compose sie?
+    explanation: |
+      Beim Start laufen beide Zeilen. Beim Tippen läuft `Shelf` neu, weil es `gen` liest, und erzeugt neue `Book`- und `Topic`-Objekte. `Topic` ist stabil: Compose vergleicht mit `equals`, das neue Objekt ist gleich, `TopicRow` wird übersprungen. `Book` ist instabil: Compose vergleicht per Identität, das neue Objekt ist ein anderes, `BookRow` läuft neu. Eine Stabilitätsdatei mit `bear.core.model.*` ändert das.
+    resources:
+      - title: Strong skipping mode
+        url: https://developer.android.com/develop/ui/compose/performance/stability/strongskipping
+
+  - id: immutable-versprechen
+    type: gap
+    title: Ein Versprechen an den Compiler
+    prompt: |
+      `ShelfUi` liegt im App-Modul. Die Liste darin wird nach dem Erzeugen nie verändert. Ergänze die Annotation, mit der du das zusicherst, und das Schlüsselwort der Property.
+    lang: kotlin
+    code: |
+      @⟦Immutable⟧
+      data class ShelfUi(
+        val title: String,
+        ⟦val⟧ bookIds: List<String>,
+      )
+    gaps:
+      - label: Annotation
+        hint: Aus `androidx.compose.runtime`. Sie verspricht, dass sich nach dem Erzeugen nichts mehr ändert.
+      - label: Property
+        hint: Mit `var` hilft keine Annotation.
+    explanation: |
+      `@Immutable` sagt dem Compiler: Alle öffentlichen Properties ändern sich nach dem Konstruktor nie. Der Report führt die Klasse dann als `stable class`. Das ist ein Versprechen, keine Prüfung. Wird die Liste doch verändert, etwa weil eine `MutableList` hineingereicht wurde, zeigt die UI veraltete Werte.
+    resources:
+      - title: Fix stability issues · Annotate classes
+        url: https://developer.android.com/develop/ui/compose/performance/stability/fix#annotated-classes
+
+  - id: stabilitaet-datei
+    type: gap
+    title: Domänenklassen stabil erklären
+    prompt: |
+      Alle Klassen aus `bear.core.model` sind unveränderlich, aber das Modul baut ohne Compose-Compiler. Ergänze die Gradle-Konfiguration und die Zeile in `stability.conf`.
+    lang: kotlin
+    code: |
+      val conf = rootProject.layout
+        .projectDirectory
+        .file("stability.conf")
+      composeCompiler {
+        ⟦stabilityConfigurationFiles⟧
+          .add(conf)
+      }
+      // stability.conf:
+      // ⟦bear.core.model.*⟧
+    gaps:
+      - label: Gradle-Property
+        hint: Eine Liste von Dateien im Block `composeCompiler`.
+      - label: Eintrag
+        hint: Ein Paketname mit Platzhalter für alle Klassen darin.
+        accept: ["bear.core.model.**"]
+    explanation: |
+      Die Stabilitätsdatei listet Klassen, die der Compiler als stabil behandeln soll, ohne dass du sie ändern musst. `*` steht für alle Klassen eines Pakets, `**` schließt Unterpakete ein. Die Datei gilt für das Modul, dessen `composeCompiler`-Block sie einträgt. Auch hier gilt: Du versprichst etwas; der Compiler prüft es nicht.
+    resources:
+      - title: Stability configuration file
+        url: https://developer.android.com/develop/ui/compose/performance/stability/fix#configuration-file
+
+  - id: lesen-aufschieben
+    type: gap
+    title: Der Kopf scrollt mit, ohne neu zu komponieren
+    prompt: |
+      Der Kopfbereich soll sich mit halber Scrollgeschwindigkeit verschieben. Ergänze den Modifier so, dass `scroll.value` erst beim Zeichnen gelesen wird.
+    lang: kotlin
+    code: |
+      Modifier.⟦graphicsLayer⟧ {
+        ⟦translationY⟧ = scroll.value / 2f
+      }
+    gaps:
+      - label: Modifier
+        hint: Er hat eine Variante mit Lambda, die erst beim Zeichnen läuft.
+      - label: Eigenschaft
+        hint: Die Verschiebung auf der y-Achse in Pixeln.
+    explanation: |
+      Die Lambda-Variante von `graphicsLayer` setzt die Eigenschaften der Ebene beim Zeichnen. Ändert sich `scroll.value`, zeichnet Compose neu, ohne zu komponieren oder zu messen. Die Variante mit Parametern, `graphicsLayer(translationY = …)`, läse den Wert in der Composition.
+    resources:
+      - title: Defer reads as long as possible
+        url: https://developer.android.com/develop/ui/compose/performance/bestpractices#defer-reads
+
+  - id: fertig-melden
+    type: gap
+    title: Wann ist der Bildschirm fertig?
+    prompt: |
+      Die TTFD soll enden, sobald die Gedanken geladen sind. Ergänze den Aufruf.
+    lang: kotlin
+    code: |
+      @Composable
+      fun ThoughtsRoute(
+        state: ThoughtsState,
+      ) {
+        ⟦ReportDrawnWhen⟧ {
+          ⟦state is ThoughtsState.Loaded⟧
+        }
+        ThoughtsScreen(state)
+      }
+    gaps:
+      - label: Composable
+        hint: Aus `activity-compose`. Sie ruft `reportFullyDrawn()` auf, sobald eine Bedingung stimmt.
+      - label: Bedingung
+        hint: Prüfe den Typ des Zustands.
+    explanation: |
+      `ReportDrawnWhen` beobachtet die Bedingung und meldet einmal, sobald sie `true` ist. Erst diese Meldung beendet die TTFD für Macrobenchmark und Logcat („Fully drawn …“). Ohne sie gälte der Ladekreis als fertiger Bildschirm. Android vitals bewertet übrigens die TTID; die TTFD misst du selbst.
+    resources:
+      - title: Time to full display
+        url: https://developer.android.com/topic/performance/issues/launch-time#retrieve-TTFD
+
+  - id: var-im-ui-modell
+    type: bug
+    title: Jede Zeile komponiert neu
+    prompt: |
+      Pinnt der Nutzer einen Gedanken, komponieren alle 200 Zeilen neu. Der Report meldet `unstable class ThoughtUi`. Das ViewModel ändert Gedanken nur über `copy`. Finde die Zeile und korrigiere sie.
+    lang: kotlin
+    code: |
+      data class ThoughtUi(
+        val id: String,
+        val text: String,
+        var pinned: Boolean,
+      )
+
+      @Composable
+      fun ThoughtRow(
+        thought: ThoughtUi,
+        onPin: (String) -> Unit,
+      ) { /* … */ }
+    lines: [4]
+    fix:
+      - line: 4
+        answers:
+          - "val pinned: Boolean,"
+    explanation: |
+      Die `var`-Property macht `ThoughtUi` instabil, und Compose vergleicht die Parameter von `ThoughtRow` per Identität. Weil Room bei jeder Änderung neue Objekte liefert, ist jedes `ThoughtUi` ein neues Objekt, und jede Zeile läuft neu. Mit `val` wird die Klasse stabil, Compose vergleicht mit `equals`, und nur die geänderte Zeile komponiert neu.
+    resources:
+      - title: Stability in Compose
+        url: https://developer.android.com/develop/ui/compose/performance/stability
+
+  - id: datum-absturz
+    type: bug
+    title: Absturz beim Öffnen eines Gedankens
+    prompt: |
+      Logcat zeigt beim Öffnen eines Gedankens vom 22. Oktober:
+
+      ```text
+      DateTimeParseException: Text
+      '2026-10-22' could not be
+      parsed: Invalid value for
+      MonthOfYear (valid values
+      1 - 12): 22
+       at bear.data.Dates.parse(
+         Dates.kt:7)
+      ```
+
+      Finde die Ursache und korrigiere die Zeile.
+    lang: kotlin
+    code: |
+      object Dates {
+        private val format =
+          DateTimeFormatter
+            .ofPattern("yyyy-dd-MM")
+
+        fun parse(raw: String) =
+          LocalDate.parse(raw, format)
+      }
+    lines: [4]
+    fix:
+      - line: 4
+        answers:
+          - .ofPattern("yyyy-MM-dd")
+    hints:
+      - Die Nachricht sagt, welche Zahl der Parser für den Monat hält.
+      - "Der Stacktrace zeigt auf Zeile 7, den Aufruf. Wo steht, wie der Text gelesen wird?"
+    explanation: |
+      Der Stacktrace zeigt die Zeile, in der die Exception entsteht: den Aufruf von `LocalDate.parse` in Zeile 7. Die Ursache steht im Muster in Zeile 4: `dd-MM` liest die zweite Zahl als Tag und die dritte als Monat. Bei `2026-10-22` wird 22 zum Monat, und das gibt es nicht. Bis zum 12. eines Monats wäre das Datum still falsch geparst worden; erst ab dem 13. stürzt die App ab. Das ist der Grund, warum solche Fehler oft wochenlang unbemerkt bleiben.
+    resources:
+      - title: DateTimeFormatter · Patterns
+        url: https://developer.android.com/reference/java/time/format/DateTimeFormatter#patterns
+
+  - id: leck-erklaeren
+    type: explain
+    title: Wer hält die Activity fest?
+    prompt: |
+      Erkläre, welche Referenz das Leck verursacht, woran du das in der Spur erkennst und wie du es behebst.
+    lang: text
+    code: |
+      ┬───
+      │ GC Root: System class
+      │
+      ├─ bear.Clock class
+      │    Leaking: NO (a class is
+      │    never leaking)
+      │    ↓ static Clock.callbacks
+      │                   ~~~~~~~~~
+      ├─ java.util.ArrayList
+      │    Leaking: UNKNOWN
+      │    ↓ ArrayList[0]
+      │               ~~~
+      ├─ bear.TimerActivity$tick$1
+      │    Leaking: UNKNOWN
+      │    ↓ TimerActivity$tick$1
+      │      .this$0
+      │       ~~~~~~
+      ╰→ bear.TimerActivity
+           Leaking: YES (Activity#
+           mDestroyed is true)
+    points:
+      - Das Leck liegt zwischen dem letzten `Leaking NO` (`Clock`) und dem ersten `Leaking YES` (`TimerActivity`); die unterstrichenen Referenzen sind die Verdächtigen.
+      - Die statische Liste `Clock.callbacks` hält ein anonymes Objekt aus `TimerActivity`, das über `this$0` die Activity festhält.
+      - Die Activity hat sich bei `Clock` angemeldet und nach `onDestroy` nicht wieder abgemeldet.
+      - "Die Lösung: im passenden Lifecycle-Callback abmelden oder statt Callback-Liste einen Flow lifecyclebewusst sammeln."
+    explanation: |
+      LeakCanary zeigt den Weg von einer GC-Wurzel zum zerstörten Objekt. Eine Klasse leckt nie, die Activity leckt sicher, dazwischen liegen die Verdächtigen. Die statische Liste `Clock.callbacks` lebt so lange wie der Prozess. Darin steckt ein anonymes Objekt, das in `TimerActivity` entstanden ist (`TimerActivity$tick$1`) und seine Activity über `this$0` festhält. Deshalb kann der Garbage Collector die Activity nach `onDestroy` nicht einsammeln. Die Behebung ist ein Abmelden in `onDestroy` oder, besser, ein `StateFlow` in `Clock`, den der Bildschirm mit `collectAsStateWithLifecycle()` liest – dann gibt es keine Liste mehr, die jemand vergessen kann.
+    resources:
+      - title: How LeakCanary works
+        url: https://square.github.io/leakcanary/fundamentals-how-leakcanary-works/
+  - id: strictmode-erklaeren
+    type: explain
+    title: Was meldet StrictMode?
+    prompt: |
+      Erkläre, was diese Meldung bedeutet, welche Zeile du dir ansiehst und was du änderst.
+    lang: text
+    code: |
+      D StrictMode: StrictMode policy
+        violation; ~duration=61 ms:
+        android.os.strictmode
+          .DiskWriteViolation
+       at android.os.StrictMode…
+         .onWriteToDisk(…)
+       at java.io.FileOutputStream
+         .write(…)
+       at bear.data.DraftStore.save(
+         DraftStore.kt:40)
+       at bear.ui.CaptureScreen…
+         .onClick(CaptureScreen.kt:77)
+    points:
+      - Auf dem Main-Thread wurde 61 ms lang auf die Platte geschrieben.
+      - Die erste Zeile aus dem eigenen Paket ist `DraftStore.save` in Zeile 40; der Aufruf kommt aus einem Klick-Handler.
+      - Der Schreibzugriff gehört auf einen Hintergrund-Dispatcher, etwa in einer Coroutine mit `Dispatchers.IO`, oder in DataStore beziehungsweise Room.
+      - 61 ms sind fast vier Frames bei 60 Hz; der Klick fühlt sich hängend an.
+    explanation: |
+      Die Meldung nennt die Art des Verstoßes (`DiskWriteViolation`) und wie lange er dauerte. Die Rahmen von `StrictMode` und `FileOutputStream` sind Framework; die erste Zeile aus `bear.` ist `DraftStore.save`, aufgerufen aus `onClick`. Der Handler läuft auf dem Main-Thread und schreibt dort synchron eine Datei. Im ViewModel würde ein `viewModelScope.launch` mit einer `suspend`-Funktion, die intern `withContext(Dispatchers.IO)` nutzt, den Main-Thread frei halten.
+    resources:
+      - title: StrictMode
+        url: https://developer.android.com/reference/android/os/StrictMode
+
+  - id: vitals-notiz
+    type: practice
+    title: Ein Absturzbericht in vier Zeilen
+    prompt: |
+      Android vitals zeigt seit Version 2.4.0 diesen Cluster. Schreib einen Bericht für dein Team mit vier kurzen Zeilen: betroffen, Ursache laut Fehlermeldung, erste eigene Zeile, Hypothese.
+
+      ```text
+      2.4.0 · 1,8 % der Nutzer
+      Android 12–16, alle Geräte
+      IllegalStateException: Flow
+        invariant is violated:
+        Emission from another
+        coroutine is detected.
+        … concurrent emissions are
+        prohibited. … use
+        'channelFlow' builder
+        instead of 'flow'
+       at kotlinx.coroutines.flow…
+       at bear.data.SyncRepo
+         $sync$1$1.invokeSuspend(
+         SyncRepo.kt:52)
+      ```
+    lang: text
+    solution: |
+      Betroffen: ab 2.4.0, 1,8 %,
+        alle Geräte
+      Ursache: emit aus einer
+        anderen Coroutine als der
+        des flow-Blocks
+      Eigene Zeile: SyncRepo.kt:52
+        in sync
+      Hypothese: emit() in einem
+        launch im flow { };
+        channelFlow nehmen
+    checklist:
+      - Der Bericht nennt Version und Anteil der Nutzer.
+      - Die Ursache steht mit den Worten der Fehlermeldung da, nicht als „Crash im Sync“.
+      - Die erste Zeile aus `bear.` ist mit Datei und Zeilennummer genannt.
+      - Die Hypothese lässt sich am Code prüfen.
+    explanation: |
+      `flow { … }` verlangt, dass `emit` aus derselben Coroutine kommt, die den Flow sammelt. Startet Code in `SyncRepo.sync` innerhalb des `flow`-Blocks ein `launch` und ruft darin `emit` auf, meldet kotlinx.coroutines genau diese Verletzung; die Meldung schlägt `channelFlow` selbst als Ausweg vor. Wer dagegen nur den Dispatcher wechseln will, nimmt `flowOn`. Der Bericht muss das nicht lösen; er muss so klar sein, dass jemand anderes die Ursache in fünf Minuten findet.
+    resources:
+      - title: Flow · exception transparency and context preservation
+        url: https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines.flow/-flow/

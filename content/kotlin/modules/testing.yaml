@@ -1,7 +1,8 @@
 id: testing
-title: "Testing: ViewModels, Coroutines, Room und Compose"
+title: "Testing: ViewModels, Coroutines, Netzwerk, Worker und Compose"
 level: 3
-minutes: 170
+minutes: 240
+place: pc
 summary: Wie du eine Android-App so testest, dass Tests schnell, stabil und aussagekräftig sind – mit Fakes statt Mocks, virtueller Zeit für Coroutines, In-Memory-Datenbanken und Compose-UI-Tests.
 goals:
   - Du ordnest Tests in die Testpyramide ein und entscheidest, ob ein Test lokal auf der JVM oder instrumentiert auf dem Gerät läuft.
@@ -9,6 +10,7 @@ goals:
   - Du testest Coroutines mit `runTest`, erklärst den Unterschied zwischen `StandardTestDispatcher` und `UnconfinedTestDispatcher` und ersetzt `Dispatchers.Main` über eine Rule.
   - Du testest ViewModels über ihren `StateFlow` und Flows mit Turbine.
   - Du schreibst Compose-UI-Tests mit Findern, Aktionen und Assertions und nutzt `testTag`, wo Texte nicht eindeutig sind.
+  - Du testest den HTTP-Stapel mit MockWebServer, Worker mit `TestListenableWorkerBuilder` und tauschst in Hilt-Tests Module mit `@TestInstallIn` aus.
 resources:
   - title: Fundamentals of testing Android apps
     url: https://developer.android.com/training/testing/fundamentals
@@ -18,8 +20,8 @@ resources:
     url: https://developer.android.com/kotlin/flow/test
   - title: Test your Compose layout
     url: https://developer.android.com/develop/ui/compose/testing
-  - title: Use test doubles in Android
-    url: https://developer.android.com/training/testing/fundamentals/test-doubles
+  - title: Hilt testing guide
+    url: https://developer.android.com/training/dependency-injection/hilt-testing
 lesson: |
   In Bear gibt es eine Funktion, die entscheidet, welcher Gedanke im kleinen Widget steht: alle vier Stunden ein anderer, zufällig, aber nie zweimal hintereinander derselbe. Wie prüfst du, dass das stimmt? Vier Stunden warten und aufs Handy schauen? Bear hat stattdessen `WidgetPickTest` – sieben Tests, die in Millisekunden laufen und jeden Randfall abdecken, auch 3:59 Uhr gegen 4:00 Uhr.
 
@@ -278,6 +280,151 @@ lesson: |
   > [!NOTE] Compose-Test-APIs v2
   > Neuere Compose-Versionen bringen im Paket `androidx.compose.ui.test.junit4.v2` eigene Varianten von `createComposeRule`, die wie `runTest` einen `StandardTestDispatcher` nutzen statt eines `UnconfinedTestDispatcher`. Coroutines in Effekten laufen dann erst, wenn die Zeit vorgerückt wird – im Test hilft `composeTestRule.waitForIdle()`. Die [Migrationsanleitung](https://developer.android.com/develop/ui/compose/testing/migrate-v2) beschreibt den Umstieg.
 
+  ## HTTP mit MockWebServer testen
+
+  Ein Fake für die API prüft, was das Repository mit Antworten macht. Er prüft nicht, ob die App die richtige Adresse aufruft, den Header mitschickt, das JSON versteht und einen 503 richtig einordnet. Dafür startet [MockWebServer](https://github.com/square/okhttp/blob/master/mockwebserver/README.md) einen echten HTTP-Server auf `localhost`. Du legst fest, was er antwortet, lässt den echten Retrofit- und OkHttp-Stapel dagegen laufen und prüfst danach, was angekommen ist. Seit OkHttp 5 heißt das Artefakt `com.squareup.okhttp3:mockwebserver3`, das Paket `mockwebserver3`. Das alte Artefakt `mockwebserver` mit dem Paket `okhttp3.mockwebserver` erscheint weiter, gilt aber als veraltet und hängt an JUnit 4 ([Changelog](https://github.com/square/okhttp/blob/master/CHANGELOG.md)).
+
+  ```kotlin
+  class TopicRemoteTest {
+      private val server = MockWebServer()
+      private lateinit var remote: TopicRemote
+
+      @Before
+      fun setUp() {
+          server.start()
+          remote = TopicRemote(topicApi(server.url("/v1/")))
+      }
+
+      @After
+      fun tearDown() {
+          server.close()
+      }
+
+      @Test
+      fun parsesTopicsAndCallsTheRightPath() = runTest {
+          server.enqueue(
+              MockResponse.Builder()
+                  .code(200)
+                  .addHeader("Content-Type", "application/json")
+                  .body("""[{"id":"1","title":"Backup","extra":true}]""")
+                  .build(),
+          )
+
+          val result = remote.refresh()
+
+          assertEquals(RefreshResult.Success(count = 1), result)
+          val request = server.takeRequest()
+          assertEquals("GET", request.method)
+          assertEquals("/v1/topics", request.target)
+      }
+
+      @Test
+      fun mapsServerErrorToRejected() = runTest {
+          server.enqueue(MockResponse.Builder().code(503).build())
+          assertEquals(RefreshResult.Rejected(503), remote.refresh())
+      }
+  }
+  ```
+
+  `topicApi(baseUrl)` ist die Funktion, mit der auch die App ihre Retrofit-Instanz baut; der Test reicht nur eine andere Adresse hinein. Die Antworten stehen in einer Warteschlange und gehen in der Reihenfolge von `enqueue` hinaus. `takeRequest()` liefert die Anfrage, die wirklich ankam, mit Methode, Pfad (`target`), Headern und Body. Das unbekannte Feld `extra` im JSON prüft nebenbei, dass `ignoreUnknownKeys` gesetzt ist. Ein Server pro Test und `close()` danach halten die Tests unabhängig; für JUnit 4 gibt es auch `MockWebServerRule` aus `mockwebserver3-junit4`.
+
+  MockWebServer-Tests laufen lokal auf der JVM und brauchen kein Gerät. Sie gehören zwischen Unit-Test mit Fake und End-to-End-Test: Sie decken genau die Schicht ab, die beim Wechsel einer Bibliothek oder eines Serverformats am ehesten bricht.
+
+  ## Worker testen mit TestListenableWorkerBuilder
+
+  Ein Worker enthält meist die wichtigste Regel der Hintergrundarbeit: wann wiederholen, wann aufgeben. Um sie zu testen, musst du WorkManager nicht planen lassen und nicht warten. [`TestListenableWorkerBuilder`](https://developer.android.com/develop/background-work/background-tasks/testing/persistent/worker-impl#testing-listenableworker-and-its-variants) baut den Worker direkt, mit Eingabedaten und einem beliebigen Versuchszähler, und du rufst `doWork()` auf:
+
+  ```kotlin
+  @RunWith(RobolectricTestRunner::class)
+  class SendThoughtWorkerTest {
+      private val context = ApplicationProvider.getApplicationContext<Context>()
+
+      private fun factory(outcome: SendOutcome) = object : WorkerFactory() {
+          override fun createWorker(
+              appContext: Context,
+              workerClassName: String,
+              workerParameters: WorkerParameters,
+          ): ListenableWorker = SendThoughtWorker(appContext, workerParameters) { outcome }
+      }
+
+      @Test
+      fun retriesWhileAttemptsRemain() = runTest {
+          val worker = TestListenableWorkerBuilder<SendThoughtWorker>(context)
+              .setInputData(workDataOf(KEY_THOUGHT_ID to "t1"))
+              .setRunAttemptCount(2)
+              .setWorkerFactory(factory(SendOutcome.Retryable))
+              .build()
+
+          assertEquals(ListenableWorker.Result.retry(), worker.doWork())
+      }
+
+      @Test
+      fun givesUpAfterFiveAttempts() = runTest {
+          val worker = TestListenableWorkerBuilder<SendThoughtWorker>(context)
+              .setInputData(workDataOf(KEY_THOUGHT_ID to "t1"))
+              .setRunAttemptCount(5)
+              .setWorkerFactory(factory(SendOutcome.Retryable))
+              .build()
+
+          assertEquals(ListenableWorker.Result.failure(), worker.doWork())
+      }
+  }
+  ```
+
+  Der Worker hat einen zusätzlichen Konstruktorparameter für den Versand. Die `WorkerFactory` im Test baut ihn mit einem Fake, der das gewünschte Ergebnis liefert; in der App erledigt das Hilt mit `@HiltWorker`. `setRunAttemptCount` stellt ein, der wievielte Versuch das ist, und damit prüfst du die Grenze für Wiederholungen ohne fünf echte Läufe. Weil der Worker einen `Context` braucht, läuft der Test mit Robolectric oder instrumentiert. Constraints, Verzögerungen und periodische Arbeit prüfst du mit `WorkManagerTestInitHelper` und dessen `TestDriver` ([Integration tests](https://developer.android.com/develop/background-work/background-tasks/testing/persistent/integration-testing)).
+
+  ## Hilt in Tests: Module austauschen
+
+  In einer App mit Hilt baut der Graph die echten Abhängigkeiten: echte API, echte Datenbank. Für einen Test eines ganzen Bildschirms willst du denselben Graphen, nur mit einer Fake-API. Das erledigt [`@TestInstallIn`](https://dagger.dev/hilt/testing#testinstallin): Ein Modul im Test-Quellcode ersetzt ein Modul der App für alle Tests dieses Quellsets.
+
+  ```kotlin
+  @Module
+  @TestInstallIn(
+      components = [SingletonComponent::class],
+      replaces = [NetworkModule::class],
+  )
+  object FakeNetworkModule {
+      @Provides
+      @Singleton
+      fun topicApi(): TopicApi = FakeTopicApi()
+  }
+
+  @HiltAndroidTest
+  class TopicsScreenTest {
+      @get:Rule(order = 0)
+      val hilt = HiltAndroidRule(this)
+
+      @get:Rule(order = 1)
+      val compose = createAndroidComposeRule<MainActivity>()
+
+      @Before
+      fun setUp() {
+          hilt.inject()
+      }
+
+      @Test
+      fun showsTopicsFromFakeApi() {
+          compose.onNodeWithText("Backup").assertIsDisplayed()
+      }
+  }
+  ```
+
+  `HiltAndroidRule` muss die erste Rule sein, damit der Graph steht, bevor die Activity startet; `order = 0` legt das fest. `hilt.inject()` füllt Felder mit `@Inject` im Test, falls du etwa den Fake direkt ansprechen willst. Gilt ein Austausch nur für einen Test, nimmst du stattdessen `@UninstallModules(NetworkModule::class)` an der Testklasse und stellst den Ersatz mit `@BindValue` bereit. Das kostet Build-Zeit, weil Hilt für solche Tests einen eigenen Graphen erzeugt; `@TestInstallIn` ist deshalb die Regel, `@UninstallModules` die Ausnahme.
+
+  Damit Hilt in instrumentierten Tests läuft, muss die Test-App `HiltTestApplication` sein. Das setzt ein eigener Runner:
+
+  ```kotlin
+  class HiltTestRunner : AndroidJUnitRunner() {
+      override fun newApplication(
+          cl: ClassLoader?,
+          className: String?,
+          context: Context?,
+      ): Application = super.newApplication(cl, HiltTestApplication::class.java.name, context)
+  }
+  ```
+
+  In `build.gradle.kts` trägst du ihn als `testInstrumentationRunner` ein und ergänzt `androidTestImplementation(libs.hilt.android.testing)` und `kspAndroidTest(libs.hilt.compiler)`. Mit Robolectric genügt `@Config(application = HiltTestApplication::class)` an der Testklasse ([Hilt testing guide](https://developer.android.com/training/dependency-injection/hilt-testing)).
+
   ## Instrumentiert, Robolectric oder Screenshot?
 
   Compose-UI-Tests laufen standardmäßig instrumentiert. [Robolectric](https://developer.android.com/training/testing/local-tests/robolectric) simuliert das Android-Framework auf der JVM, sodass viele dieser Tests auch lokal laufen – schneller und ohne Emulator, aber nicht mit allen Details eines echten Geräts. Viele Teams lassen UI-Tests in CI mit Robolectric laufen und nur wenige kritische Abläufe auf echten Geräten. Für Room rät die Doku von Robolectric ab und empfiehlt die JVM-Variante mit `BundledSQLiteDriver`.
@@ -296,6 +443,11 @@ lesson: |
   - **Geteilter Zustand zwischen Tests**, etwa ein Fake als `object`. Tests bestehen einzeln und scheitern zusammen – abhängig von der Reihenfolge.
   - **`Thread.sleep` oder echte Zeit in Tests.** Langsam und wackelig. Lösung: virtuelle Zeit, Uhrzeit hereinreichen.
   - **Nach Implementierungsdetails suchen**, etwa nach dem dritten Kind eines `Column`. Lösung: nach Text, Beschreibung oder `testTag` suchen.
+  - **Neue Tests mit dem alten MockWebServer.** `okhttp3.mockwebserver` ist seit OkHttp 5 veraltet. Nimm `mockwebserver3` in derselben Version wie OkHttp.
+  - **Server nicht schließen.** Ports und Threads bleiben offen, spätere Tests werden langsam oder scheitern.
+  - **Worker über WorkManager planen und warten.** Langsam und wackelig. Für die Logik genügt `TestListenableWorkerBuilder` und `doWork()`.
+  - **Hilt-Test ohne eigenen Runner.** Die echte Application startet, und Hilt meldet: „cannot use a @HiltAndroidApp application“. Lösung: `HiltTestRunner` mit `HiltTestApplication`.
+  - **`HiltAndroidRule` nicht als erste Rule.** Die Activity startet, bevor der Graph steht.
 
   ## Zusammenfassung
 
@@ -305,6 +457,9 @@ lesson: |
   - `runTest` nutzt virtuelle Zeit. `StandardTestDispatcher` stellt Coroutines in eine Warteschlange (`advanceUntilIdle`, `runCurrent`), `UnconfinedTestDispatcher` startet sie sofort. Ein Scheduler pro Test.
   - `MainDispatcherRule` ersetzt `Dispatchers.Main`; ViewModels prüfst du über `uiState.value`, `stateIn` braucht einen Collector, Folgen prüft Turbine.
   - Room testest du mit einer In-Memory-Datenbank, Migrationen mit `MigrationTestHelper`.
+  - MockWebServer prüft den echten HTTP-Stapel: Antworten skripten, Code ausführen, mit `takeRequest()` prüfen, was ankam.
+  - `TestListenableWorkerBuilder` baut einen Worker mit Eingabe und Versuchszähler; `doWork()` prüft die Regel ohne Planung.
+  - `@TestInstallIn` tauscht Hilt-Module für alle Tests aus; Tests brauchen `@HiltAndroidTest`, `HiltAndroidRule` als erste Rule und `HiltTestApplication`.
   - Compose-Tests arbeiten auf dem Semantics-Baum: Finder, Aktion, Assertion; `testTag`, wenn Text nicht eindeutig ist. Robolectric und Screenshot-Tests ergänzen die Pyramide.
 exercises:
   - id: fake-oder-mock
@@ -426,6 +581,36 @@ exercises:
     resources:
       - title: UnconfinedTestDispatcher (API-Referenz)
         url: https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-test/kotlinx.coroutines.test/-unconfined-test-dispatcher.html
+  - id: retrofit-pfad
+    type: output
+    title: Welche Adresse kommt an?
+    prompt: |
+      Beide APIs bekommen dieselbe Basisadresse `server.url("/v1/")` und je eine Antwort `[]`. Was geben die beiden `println` aus?
+    lang: kotlin
+    code: |
+      interface RelativeApi {
+          @GET("topics")
+          suspend fun topics(): List<TopicDto>
+      }
+
+      interface AbsoluteApi {
+          @GET("/topics")
+          suspend fun topics(): List<TopicDto>
+      }
+
+      // im Test:
+      relativeApi.topics()
+      absoluteApi.topics()
+      println(server.takeRequest().target)
+      println(server.takeRequest().target)
+    expected: |
+      /v1/topics
+      /topics
+    explanation: |
+      Retrofit löst Pfade wie ein Browser Links auf. `topics` ohne Schrägstrich hängt sich an die Basisadresse an. `/topics` mit Schrägstrich ist absolut und ersetzt den ganzen Pfad, `/v1/` geht verloren. Gegen den echten Server liefe die zweite API ins Leere. Genau diesen Fehler fängt ein MockWebServer-Test mit `takeRequest()`, ein Fake für die API nie.
+    resources:
+      - title: MockWebServer
+        url: https://github.com/square/okhttp/blob/master/mockwebserver/README.md
   - id: main-dispatcher-rule
     type: gap
     title: Main ersetzen
@@ -569,6 +754,95 @@ exercises:
         url: https://developer.android.com/develop/ui/compose/testing/apis
       - title: Compose testing cheatsheet
         url: https://developer.android.com/develop/ui/compose/testing/testing-cheatsheet
+  - id: server-skripten
+    type: gap
+    title: Eine Antwort skripten und die Anfrage prüfen
+    prompt: |
+      Der Server soll mit 503 antworten. Danach prüfst du, dass die App wirklich `GET /v1/topics` aufgerufen hat.
+    lang: kotlin
+    code: |
+      @Test
+      fun mapsServerErrorToRejected() = runTest {
+          server.⟦enqueue⟧(MockResponse.Builder().⟦code(503)⟧.build())
+
+          assertEquals(RefreshResult.Rejected(503), remote.refresh())
+
+          val request = server.⟦takeRequest()⟧
+          assertEquals("GET", request.method)
+          assertEquals("/v1/topics", request.⟦target⟧)
+      }
+    gaps:
+      - label: Antwort einreihen
+        hint: Die Antworten stehen in einer Warteschlange.
+      - label: Statuscode
+        hint: Eine Methode des Builders.
+      - label: Anfrage abholen
+        hint: Liefert die nächste Anfrage, die angekommen ist.
+      - label: Pfad
+        hint: Die Property für Pfad samt Query, so wie die App ihn geschickt hat.
+    explanation: |
+      `enqueue` reiht eine Antwort ein; die nächste Anfrage bekommt sie. `takeRequest()` gibt die Anfrage in der Reihenfolge zurück, in der sie ankam, und wartet, falls noch keine da ist. `target` enthält Pfad und Query genau so, wie sie im HTTP-Request standen.
+    resources:
+      - title: MockWebServer
+        url: https://github.com/square/okhttp/blob/master/mockwebserver/README.md
+  - id: worker-versuche
+    type: gap
+    title: Der fünfte Versuch
+    prompt: |
+      Prüfe, dass der Worker beim fünften Versuch aufgibt. Ergänze Builder, Versuchszähler und den Aufruf, der die Arbeit ausführt.
+    lang: kotlin
+    code: |
+      @Test
+      fun givesUpAfterFiveAttempts() = runTest {
+          val worker = ⟦TestListenableWorkerBuilder⟧<SendThoughtWorker>(context)
+              .setInputData(workDataOf(KEY_THOUGHT_ID to "t1"))
+              .⟦setRunAttemptCount(5)⟧
+              .setWorkerFactory(factory(SendOutcome.Retryable))
+              .build()
+
+          assertEquals(ListenableWorker.Result.failure(), worker.⟦doWork()⟧)
+      }
+    gaps:
+      - label: Builder
+        hint: Aus `androidx.work.testing`, für `ListenableWorker` und `CoroutineWorker`.
+      - label: Versuchszähler
+        hint: Bestimmt, was `runAttemptCount` im Worker liefert.
+      - label: Ausführen
+        hint: Bei einem `CoroutineWorker` eine `suspend`-Funktion.
+    explanation: |
+      `TestListenableWorkerBuilder` erzeugt den Worker, ohne WorkManager zu fragen. Mit `setRunAttemptCount(5)` sieht der Worker `runAttemptCount == 5` und gibt laut seiner Regel auf. `doWork()` ist bei `CoroutineWorker` `suspend`, deshalb läuft der Test in `runTest`. So prüfst du in Millisekunden, was in echt fünf Backoff-Runden dauern würde.
+    resources:
+      - title: Testing Worker implementation
+        url: https://developer.android.com/develop/background-work/background-tasks/testing/persistent/worker-impl#testing-listenableworker-and-its-variants
+  - id: modul-austauschen
+    type: gap
+    title: Die Fake-API für alle Hilt-Tests
+    prompt: |
+      In allen instrumentierten Tests soll `FakeTopicApi` statt der echten API kommen. Ergänze die Annotation und was sie ersetzt.
+    lang: kotlin
+    code: |
+      @Module
+      @⟦TestInstallIn⟧(
+          components = [SingletonComponent::class],
+          ⟦replaces⟧ = [⟦NetworkModule::class⟧],
+      )
+      object FakeNetworkModule {
+          @Provides
+          @Singleton
+          fun topicApi(): TopicApi = FakeTopicApi()
+      }
+    gaps:
+      - label: Annotation
+        hint: Installiert ein Modul in Tests und ersetzt dabei eins der App.
+      - label: Parameter
+        hint: Welche Module fallen weg?
+      - label: Modul
+        hint: Das Produktionsmodul, das die echte API liefert.
+    explanation: |
+      `@TestInstallIn` gilt für alle Tests im Quellset, ohne dass jede Testklasse etwas tun muss. Hilt baut dafür einmal einen Testgraphen, in dem `NetworkModule` fehlt und `FakeNetworkModule` die `TopicApi` liefert. Für einen Austausch in nur einer Testklasse wären `@UninstallModules` und `@BindValue` da; sie kosten Build-Zeit, weil sie einen eigenen Graphen erzwingen.
+    resources:
+      - title: Hilt testing · TestInstallIn
+        url: https://dagger.dev/hilt/testing#testinstallin
   - id: einen-test-starten
     type: command
     title: Nur diese eine Testklasse
@@ -698,6 +972,31 @@ exercises:
         url: https://developer.android.com/develop/ui/compose/testing/apis#finders
       - title: Semantics in Compose tests
         url: https://developer.android.com/develop/ui/compose/testing/semantics
+  - id: hilt-runner
+    type: bug
+    title: Alle Hilt-Tests scheitern beim Start
+    prompt: |
+      Jeder Test mit `@HiltAndroidTest` scheitert mit `IllegalStateException: Hilt test, TopicsScreenTest, cannot use a @HiltAndroidApp application but found app.bear.BearApp`. Im Projekt gibt es `app.bear.HiltTestRunner`. Finde die Zeile und korrigiere sie.
+    lang: kotlin
+    code: |
+      android {
+          namespace = "app.bear"
+          defaultConfig {
+              applicationId = "app.bear"
+              minSdk = 26
+              testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+          }
+      }
+    lines: [6]
+    fix:
+      - line: 6
+        answers:
+          - testInstrumentationRunner = "app.bear.HiltTestRunner"
+    explanation: |
+      Der Standard-Runner startet die echte Application, und die ist mit `@HiltAndroidApp` annotiert. Hilt-Tests brauchen aber `HiltTestApplication`, damit sie den Graphen mit den Testmodulen bauen können. `HiltTestRunner` überschreibt `newApplication` und liefert genau diese Klasse; er muss als `testInstrumentationRunner` eingetragen sein.
+    resources:
+      - title: Hilt testing · Instrumented tests
+        url: https://developer.android.com/training/dependency-injection/hilt-testing#instrumented-tests
   - id: widget-pick-test-erklaeren
     type: explain
     title: Bears WidgetPickTest

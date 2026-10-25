@@ -130,6 +130,8 @@ exercises:
 
 **`place`: unterwegs oder am PC.** Optional. `unterwegs` heißt: Lektion und alle Übungen gehen auf einem 360 px breiten Handy, Schreibaufgaben bleiben bei wenigen Sätzen. `pc` heißt: Das Modul braucht einen Rechner, etwa für längeres Schreiben, eine IDE oder ein Werkzeug. Die Plattform zeigt das als Marke „Unterwegs“ oder „Am PC“ in der Modulliste, im Kopf der Lektion und auf der Übungsseite. Ein Modul ist entweder das eine oder das andere: Wer im Handy-Modul eine längere Aufgabe braucht, legt sie in ein eigenes PC-Modul. Ohne `place` erscheint keine Marke.
 
+**Breite in Unterwegs-Modulen.** Code und Textblöcke (`text`, Codeblöcke, Code in Übungen) bleiben dort bei höchstens 34 Zeichen je Zeile; sonst scrollt bei 360 px etwas seitlich. Code rückt mit zwei Leerzeichen ein, auch wenn das Werkzeug anders formatiert (Android Studio nimmt vier, die Lektion sagt es dann dazu). Editierbarer Code zeigt bei 360 px nur etwa 27 Zeichen, Karten in `order`-Übungen etwa 22: Dort stehen kurze Zeilen oder Text statt Code. Raster und Charts der Bereiche ohne Code (unten) folgen derselben Grenze. In `pc`-Modulen gilt sie nicht.
+
 **Richtwerte pro Modul**
 
 | | Minimum | Ziel |
@@ -153,8 +155,8 @@ Manche Bereiche lehren Handwerk ohne Programmcode, zum Beispiel Erzählhandwerk.
 - **Kreative Aufgaben** lassen die Lösung offen. Es gibt keine Mustertexte: `practice` mit `lang: prose` hat keine `solution`, die Checkliste enthält überprüfbare Kriterien, keine Geschmacksurteile. Analysen veröffentlichter Texte dürfen eine Musterantwort haben.
 - **Callouts** `INTERVIEW` und `PRAXIS` nur, wenn sie wirklich passen; `PRAXIS` zeigt dann, wie Studios oder Autoren arbeiten.
 - **Zeichnen und Pixelart** zeigen Pixel als Textraster in `text`-Blöcken, eine Zeile pro Pixelreihe: `#` dunkel, `+` Mittelton, `-` hell, `.` leer, höchstens 16 Pixel breit. Ein `bug` lässt dann die fehlerhafte Reihe anklicken. Zeichenaufgaben laufen auf Papier, Karopapier oder im Editor und werden über die Checkliste selbst geprüft. Die Schaubilder des Bereichs `pixelart` erzeugt `node tooling/pixelart-figures.ts` aus Code; sie zeigen Prinzipien, keine fertigen Figuren. Bilder Dritter werden nur verlinkt.
-- **Animation** zeigt Bewegung als Text: Bildlisten mit Dauer in ms und Ticks, Spacing-Charts mit einem `|` je Zeichnung, Höhen als Balken aus `#`. In Unterwegs-Modulen bleibt jede Zeile solcher Blöcke bei höchstens 34 Zeichen, dann scrollt bei 360 px nichts seitlich. Ob eine Bewegung wirkt, prüft der Lernende im Beobachtungstest mit anderen Menschen und mit Checklisten, nie mit einer automatischen Prüfung.
-- **Level-Design** zeigt Räume als Rasterkarten in `text`-Blöcken, ein Zeichen pro Tile (`#` Wand, `.` Boden, `S` Start, `A` Ausgang, `L` Landmarke, weitere Zeichen stehen jeweils als Legende daneben). 20 Zeichen sind ein Bildschirm von 320 × 180 Pixeln bei 16-Pixel-Tiles; in Unterwegs-Modulen bleibt eine Zeile bei höchstens 34 Zeichen. Ein `bug` lässt die Zeile mit dem Problem anklicken. Ob ein Raum wirkt, prüft der Lernende im Playtest mit anderen Menschen und mit Checklisten, nie mit einer automatischen Prüfung.
+- **Animation** zeigt Bewegung als Text: Bildlisten mit Dauer in ms und Ticks, Spacing-Charts mit einem `|` je Zeichnung, Höhen als Balken aus `#`. Ob eine Bewegung wirkt, prüft der Lernende im Beobachtungstest mit anderen Menschen und mit Checklisten, nie mit einer automatischen Prüfung.
+- **Level-Design** zeigt Räume als Rasterkarten in `text`-Blöcken, ein Zeichen pro Tile (`#` Wand, `.` Boden, `S` Start, `A` Ausgang, `L` Landmarke, weitere Zeichen stehen jeweils als Legende daneben). 20 Zeichen sind ein Bildschirm von 320 × 180 Pixeln bei 16-Pixel-Tiles. Ein `bug` lässt die Zeile mit dem Problem anklicken. Ob ein Raum wirkt, prüft der Lernende im Playtest mit anderen Menschen und mit Checklisten, nie mit einer automatischen Prüfung.
 
 ## 6. Lektionen schreiben
 
