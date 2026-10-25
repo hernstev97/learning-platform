@@ -1,10 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { validateEntry, type Snapshot } from '../../convex/model.ts';
-import { OFFLINE_KEY, clearOfflineCopy, hasOfflineCopy, readOfflineCopy, waitForToken, writeOfflineCopy } from './offline.ts';
+import { assertId, validateDraft, validateEntry, type Snapshot } from '../../convex/model.ts';
+import { OFFLINE_DRAFT_PREFIX, OFFLINE_KEY, clearOfflineCopy, clearOfflineDrafts, hasOfflineCopy, readOfflineCopy, readOfflineDrafts, removeOfflineDraft, waitForToken, writeOfflineCopy, writeOfflineDraft, type OfflineDraft } from './offline.ts';
 
 function memoryStorage() {
   const data = new Map<string, string>();
-  return { data, getItem: (key: string) => data.get(key) ?? null, setItem: (key: string, value: string) => { data.set(key, value); }, removeItem: (key: string) => { data.delete(key); } } as unknown as Storage & { data: Map<string, string> };
+  return {
+    data, getItem: (key: string) => data.get(key) ?? null, setItem: (key: string, value: string) => { data.set(key, value); }, removeItem: (key: string) => { data.delete(key); },
+    key: (i: number) => [...data.keys()][i] ?? null, get length() { return data.size; },
+  } as unknown as Storage & { data: Map<string, string> };
 }
 
 describe('offline copy', () => {
@@ -40,6 +43,42 @@ describe('offline copy', () => {
     expect(readOfflineCopy(blocked, validateEntry)).toBeNull();
     expect(() => clearOfflineCopy(blocked)).not.toThrow();
     expect(writeOfflineCopy(null, snapshot)).toBe(false);
+  });
+});
+
+describe('offline drafts', () => {
+  const validate = (d: OfflineDraft) => { assertId(d.areaId); validateDraft(d); };
+  const text: OfflineDraft = { areaId: 'narrative', exerciseId: 'figuren-motivation/eigene-figur', fingerprint: 'abc123', json: '{"code":"Im Bus geschrieben","checked":[]}', generation: 0, savedAt: 5 };
+  it('keeps one draft per area, exercise and fingerprint next to the offline copy and outside the legacy pattern', () => {
+    const store = memoryStorage();
+    writeOfflineCopy(store, { entries: [], resets: [] });
+    expect(writeOfflineDraft(store, text)).toBe(true);
+    expect(writeOfflineDraft(store, { ...text, json: '{"code":"weiter","checked":[]}', savedAt: 6 })).toBe(true);
+    expect(writeOfflineDraft(store, { ...text, fingerprint: 'def456' })).toBe(true);
+    expect(readOfflineDrafts(store, validate)).toEqual([{ ...text, json: '{"code":"weiter","checked":[]}', savedAt: 6 }, { ...text, fingerprint: 'def456' }]);
+    expect([...store.data.keys()].filter((key) => /^learn:[a-z0-9-]+:v1$/.test(key))).toEqual([]);
+    // Only the text that was handed over is forgotten, never newer text typed meanwhile.
+    removeOfflineDraft(store, text);
+    expect(readOfflineDrafts(store, validate)).toHaveLength(2);
+    removeOfflineDraft(store, { ...text, json: '{"code":"weiter","checked":[]}', savedAt: 6 });
+    expect(readOfflineDrafts(store, validate).map((d) => d.fingerprint)).toEqual(['def456']);
+    clearOfflineDrafts(store);
+    expect(readOfflineDrafts(store, validate)).toEqual([]);
+    expect(hasOfflineCopy(store)).toBe(true);
+  });
+  it('skips unreadable, oversized or misplaced drafts and ignores blocked storage', () => {
+    const store = memoryStorage();
+    store.setItem(`${OFFLINE_DRAFT_PREFIX}bad`, '{bad');
+    writeOfflineDraft(store, { ...text, json: '"' + 'x'.repeat(60_000) + '"' });
+    writeOfflineDraft(store, { ...text, areaId: 'Bad Area' });
+    writeOfflineDraft(store, { ...text, exerciseId: 'figuren-motivation/ohne-generation', generation: 1.5 });
+    store.setItem(`${OFFLINE_DRAFT_PREFIX}narrative:other/id:abc123`, JSON.stringify(text));
+    expect(readOfflineDrafts(store, validate)).toEqual([]);
+    const blocked = { get length(): number { throw new Error('blocked'); }, key: () => null, getItem: () => { throw new Error('blocked'); }, setItem: () => { throw new Error('quota'); }, removeItem: () => { throw new Error('blocked'); } } as unknown as Storage;
+    expect(writeOfflineDraft(blocked, text)).toBe(false);
+    expect(readOfflineDrafts(blocked, validate)).toEqual([]);
+    expect(() => clearOfflineDrafts(blocked)).not.toThrow();
+    expect(writeOfflineDraft(null, text)).toBe(false);
   });
 });
 

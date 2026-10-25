@@ -102,6 +102,20 @@ export const saveDraft = mutation({
   },
 });
 
+/** A draft typed in offline reading mode: stored only where none is saved, so it never replaces a different one. */
+export const adoptDraft = mutation({
+  args: { areaId: v.string(), generation: v.number(), draft: draftInput },
+  handler: async (ctx, { areaId, generation, draft }): Promise<'saved' | 'same' | 'different'> => {
+    await requireOwner(ctx);
+    await checkGeneration(ctx, areaId, generation);
+    validateDraft(draft);
+    const existing = await ctx.db.query('drafts').withIndex('by_area_generation_exercise', (q) => q.eq('areaId', areaId).eq('generation', generation).eq('exerciseId', draft.exerciseId)).unique();
+    if (existing) return existing.json === draft.json && existing.fingerprint === draft.fingerprint ? 'same' : 'different';
+    await ctx.db.insert('drafts', { areaId, generation, ...draft, updatedAt: Date.now() });
+    return 'saved';
+  },
+});
+
 export const exportDrafts = query({
   args: { paginationOpts: paginationOptsValidator },
   handler: async (ctx, { paginationOpts }) => {
