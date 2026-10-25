@@ -1,0 +1,1063 @@
+id: performance-messen
+title: Performance messen und lesen
+level: 3
+minutes: 150
+summary: Messwerte, Benchmark-Ausgaben und Flamegraphs richtig lesen und daraus die nächste Handlung ableiten, statt zu raten, welche Zeile langsam ist.
+goals:
+  - Du arbeitest nach dem Ablauf Hypothese, Messung, eine Änderung, erneute Messung und schätzt mit Amdahls Gesetz ab, was eine Optimierung höchstens bringt.
+  - Du misst mit `Instant` und `black_box` und begründest, warum eine Einzelmessung und ein Debug-Build nichts beweisen.
+  - "Du liest criterion-, divan- und hyperfine-Ausgaben: Konfidenzintervall, Ausreißer, `change` mit p-Wert, Rauschschwelle, Mittelwert ± σ."
+  - Du liest einen Flamegraph mit Breite, Selbstzeit und x-Achse richtig und erkennst, wo Inlining Funktionen versteckt.
+  - Du erkennst typische Allokationsquellen in heißen Schleifen und zählst Allokationen mit einem eigenen `GlobalAlloc`.
+resources:
+  - title: The Rust Performance Book
+    url: https://nnethercote.github.io/perf-book/
+  - title: criterion.rs · Command-Line Output
+    url: https://bheisler.github.io/criterion.rs/book/user_guide/command_line_output.html
+  - title: hyperfine · README
+    url: https://github.com/sharkdp/hyperfine
+  - title: Brendan Gregg · Flame Graphs
+    url: https://www.brendangregg.com/flamegraphs.html
+place: unterwegs
+lesson: |
+  Nach einem Deployment meldet das Monitoring, dass der nächtliche Job länger läuft. Er durchsucht eine Logdatei nach Fehlerzeilen, seit Monaten unverändert, bis auf den letzten Commit. Der Reflex ist, im Diff die verdächtigste Schleife zu suchen und sie „schneller“ zu machen. Das geht oft schief. Die verdächtige Stelle ist selten die teure, und ohne Messung weißt du hinterher nicht, ob deine Änderung geholfen hat.
+
+  Dieses Modul zeigt, wie du so misst, dass eine Zahl etwas bedeutet, und wie du criterion-, hyperfine- und Flamegraph-Ausgaben liest. Alle Zahlen stammen aus echten Läufen auf einem Testrechner. Selbst messen, profilieren und optimieren kommt danach am PC in der [Werkstatt](/rust/profiling-werkstatt).
+
+  ## Messen statt raten: der Arbeitsablauf
+
+  Performance-Arbeit folgt einem festen Ablauf:
+
+  1. **Hypothese.** „Der Job ist seit Version 2.4 langsamer, und es liegt am Erkennen der Fehlerzeilen.“
+  2. **Messung.** Alte und neue Fassung unter denselben Bedingungen messen: Release-Build, dieselbe Eingabe, viele Läufe.
+  3. **Eine Änderung.** Genau eine. Wer drei Dinge gleichzeitig ändert, weiß nicht, welche geholfen und welche geschadet hat.
+  4. **Erneute Messung** mit demselben Aufbau wie in Schritt 2. Erst der Vergleich entscheidet, ob die Änderung bleibt.
+
+  Gemessen wird im Release-Build. Was die Profile `dev` und `release` unterscheidet, steht in [Module, Crates & Cargo](/rust/module-cargo). Hier zählt die Größenordnung: Der Logparser aus diesem Modul brauchte für eine Million Zeilen im Debug-Build 178,2 ms, im Release-Build 45,1 ms, Faktor 4,0. Die kleine Iterator-Schleife im nächsten Abschnitt brauchte im Debug-Build 20 bis 28 ms, im Release-Build 1,4 bis 3,4 ms. Eine Zahl aus dem Debug-Build sagt über das ausgelieferte Programm nichts.
+
+  ### Amdahls Gesetz: was eine Optimierung höchstens bringt
+
+  Frag vor jeder Optimierung, welchen Anteil der Laufzeit dieser Teil hat. Was 5 % der Laufzeit ausmacht, kann höchstens 5 % sparen, selbst wenn es danach gar keine Zeit mehr braucht. Machst du es doppelt so schnell, sparst du 2,5 %. Das ist Amdahls Gesetz. Deshalb steht am Anfang ein Profil und nicht ein Code-Review: Der Code zeigt dir, was teuer aussieht. Das Profil zeigt, was teuer ist.
+
+  ## Zeit messen mit `Instant` und `black_box`
+
+  Die einfachste Messung braucht nur die Standardbibliothek:
+
+  ```rust
+  use std::time::Instant;
+
+  fn main() {
+      let log =
+          "08:00:01 ERROR db\n"
+              .repeat(100_000);
+      let start = Instant::now();
+      let n = log
+          .lines()
+          .filter(|z| {
+              z.contains("ERROR")
+          })
+          .count();
+      let dauer = start.elapsed();
+      println!("{n} in {dauer:?}");
+  }
+  ```
+
+  [`Instant`](https://doc.rust-lang.org/std/time/struct.Instant.html) liest eine monotone Uhr: Ein späterer Zeitpunkt ist nie kleiner als ein früherer. [`SystemTime`](https://doc.rust-lang.org/std/time/struct.SystemTime.html) ist die Wanduhr des Systems, und ihre Doku sagt ausdrücklich, dass sie nicht monoton ist. Wird die Uhr während der Messung verstellt, stimmt die Differenz nicht mehr; deshalb liefert `SystemTime::duration_since` ein `Result`. Für Laufzeiten nimmst du `Instant`.
+
+  Fünf Läufe dieses Programms im Release-Build:
+
+  ```text
+  100000 in 1.36388ms
+  100000 in 1.897261ms
+  100000 in 3.016989ms
+  100000 in 3.306858ms
+  100000 in 3.370658ms
+  ```
+
+  Dasselbe Programm, dieselbe Eingabe, und der langsamste Lauf braucht fast zweieinhalbmal so lange wie der schnellste. Eine Einzelmessung ist Rauschen. Die Ursachen liegen außerhalb deines Codes: Der Prozessor ändert seinen Takt, Caches sind kalt oder warm, der Kernel schiebt den Prozess auf einen anderen Kern, ein anderes Programm will gerade dieselbe CPU. Aufwärmen, Wiederholen und die Streuung auswerten übernehmen die Werkzeuge der nächsten Abschnitte.
+
+  ### `black_box`: dem Optimierer die Abkürzung nehmen
+
+  Der Optimierer darf Arbeit entfernen, deren Ergebnis niemand braucht, und Arbeit vorziehen, die er schon beim Übersetzen ausrechnen kann. Eine Messschleife lädt dazu ein:
+
+  ```rust
+  use std::hint::black_box;
+  use std::time::Instant;
+
+  fn fib(n: u64) -> u64 {
+      if n < 2 {
+          n
+      } else {
+          fib(n - 1) + fib(n - 2)
+      }
+  }
+
+  fn main() {
+      let start = Instant::now();
+      for _ in 0..1_000 {
+          let n = black_box(20);
+          black_box(fib(n));
+      }
+      let je =
+          start.elapsed() / 1_000;
+      println!("fib(20): {je:?}");
+  }
+  ```
+
+  So gemessen kamen 17 bis 21 µs pro Aufruf heraus. Ersetzt man die beiden Zeilen in der Schleife durch `fib(20);`, meldet dasselbe Programm 16 bis 31 ns: Der Optimierer rechnet `fib(20)` nur noch ein einziges Mal und entfernt die Schleife. Die 16 bis 31 ns sind ein Aufruf, geteilt durch 1 000; bei 10 000 Durchläufen zeigte dasselbe Programm 4 bis 5 ns. [`std::hint::black_box`](https://doc.rust-lang.org/std/hint/fn.black_box.html) ist eine Identitätsfunktion, bei der der Compiler annehmen soll, dass sie mit ihrem Wert alles Mögliche anstellt. Das erste `black_box(20)` verhindert, dass er den Aufruf einmal rechnet und das Ergebnis in jedem Durchlauf wiederverwendet: Für den Compiler kann jeder Durchlauf eine andere Eingabe bekommen. Das zweite sorgt dafür, dass das Ergebnis als benutzt gilt. Die Doku nennt die Funktion ausdrücklich „best-effort“: Wie viel sie verhindert, hängt von Plattform und Backend ab. Für Benchmarks soll man sie trotzdem einsetzen. Für Korrektheit oder Kryptografie taugt sie nicht.
+
+  > [!WARNING] Zu schnell, um wahr zu sein
+  > Zeigt eine Messung Pikosekunden oder ein bis zwei Nanosekunden für eine Funktion, die Text parst oder sortiert, misst du die leere Schleife. Bei 4 GHz dauert ein Prozessortakt 0,25 ns. Prüfe zuerst, ob die Eingabe eine Konstante ist und ob das Ergebnis irgendwo landet.
+
+  ## Benchmarks mit criterion
+
+  Eine selbst gebaute Schleife beantwortet nicht, wie lange aufgewärmt wird, wie viele Wiederholungen genug sind und ob ein Unterschied zum letzten Lauf echt ist. Das übernimmt [criterion](https://docs.rs/criterion/latest/criterion/) (Version 0.8). Ein Benchmark ist eine eigene Datei unter `benches/`. `cargo bench` baut sie im Profil `bench`, das die Einstellungen von `release` erbt ([Cargo Book: bench](https://doc.rust-lang.org/cargo/reference/profiles.html#bench)).
+
+  ```toml
+  [dev-dependencies]
+  criterion = "0.8"
+
+  [[bench]]
+  name = "logparser"
+  harness = false
+  ```
+
+  `harness = false` schaltet Cargos eingebautes Test-Gerüst für diese Datei ab ([Cargo Book: harness](https://doc.rust-lang.org/cargo/reference/cargo-targets.html#the-harness-field)). Die `main`-Funktion liefert dann criterion mit `criterion_main!`. Die Datei `benches/logparser.rs` misst `zaehle_fehler` aus der Bibliothek `logparser`, an einem Log mit 10 000 Zeilen:
+
+  ```rust
+  use criterion::{
+      Criterion, criterion_group,
+      criterion_main,
+  };
+  use logparser::{
+      erzeuge_log, zaehle_fehler,
+  };
+  use std::hint::black_box;
+
+  fn bench(c: &mut Criterion) {
+      let log = erzeuge_log(10_000);
+      c.bench_function(
+          "zaehle_fehler",
+          |b| b.iter(|| {
+              zaehle_fehler(
+                  black_box(&log),
+              )
+          }),
+      );
+  }
+
+  criterion_group!(benches, bench);
+  criterion_main!(benches);
+  ```
+
+  Das Log entsteht vor `bench_function`, einmal und außerhalb der Messung. [`b.iter`](https://docs.rs/criterion/latest/criterion/struct.Bencher.html#method.iter) ruft die Closure viele tausend Mal auf und misst die Gesamtzeit. Und `black_box(&log)` hindert den Optimierer daran, Arbeit über die Wiederholungen hinweg zusammenzulegen.
+
+  ### Die criterion-Ausgabe lesen
+
+  Der erste Lauf (umbrochen):
+
+  ```text
+  zaehle_fehler
+    time: [316.17 µs 316.68 µs
+           317.27 µs]
+  Found 8 outliers among 100
+  measurements (8.00%)
+    6 (6.00%) high mild
+    2 (2.00%) high severe
+  ```
+
+  **`time`** ist ein Konfidenzintervall für die Zeit pro Aufruf: untere Grenze, beste Schätzung, obere Grenze. criterion berechnet es per Bootstrap aus 100 Stichproben, standardmäßig mit 95 % Konfidenz ([criterion: Command-Line Output](https://bheisler.github.io/criterion.rs/book/user_guide/command_line_output.html)). Ein schmales Intervall heißt: Die Messung ist stabil. **Ausreißer** sind Stichproben weit weg vom Rest. „high“ heißt langsamer, „severe“ sehr weit draußen. Viele Ausreißer deuten auf Störungen durch andere Prozesse.
+
+  Ab dem zweiten Lauf vergleicht criterion mit den gespeicherten Daten unter `target/criterion`:
+
+  ```text
+  zaehle_fehler
+    time:   [313.65 µs 314.22 µs
+             314.79 µs]
+    change: [−0.8986% −0.6890%
+             −0.4759%]
+            (p = 0.00 < 0.05)
+    Change within noise threshold.
+  ```
+
+  **`change`** ist wieder ein Intervall, diesmal für die relative Änderung. Der **p-Wert** gibt an, wie wahrscheinlich ein so großer Unterschied wäre, wenn sich nichts geändert hätte. Unter 0,05 gilt er als signifikant ([`significance_level`](https://docs.rs/criterion/latest/criterion/struct.Criterion.html#method.significance_level)). Trotzdem lautet das Urteil „within noise threshold“, denn das Intervall reicht nicht über die **Rauschschwelle** von ±1 % hinaus ([`noise_threshold`](https://docs.rs/criterion/latest/criterion/struct.Criterion.html#method.noise_threshold)). Am Code hat sich nichts geändert. Die 0,7 % sind der Unterschied zwischen zwei Läufen. Signifikant heißt nicht relevant.
+
+  | Urteil | Bedingung |
+  | --- | --- |
+  | No change … detected | p ≥ 0,05 |
+  | … within noise threshold | p < 0,05, Intervall nicht ganz jenseits ±1 % |
+  | regressed / improved | ganzes Intervall jenseits ±1 % |
+
+  ### `iter` oder `iter_batched`
+
+  `b.iter` misst alles in der Closure. Braucht die Routine bei jedem Aufruf eine frische Eingabe, weil sie sie verändert, gehört das Herstellen der Eingabe nicht in die Messung. Dafür gibt es [`iter_batched`](https://docs.rs/criterion/latest/criterion/struct.Bencher.html#method.iter_batched):
+
+  ```rust
+  use criterion::BatchSize;
+
+  fn bench_sort(c: &mut Criterion) {
+      let roh = latenzen(10_000);
+      c.bench_function(
+          "p95",
+          |b| b.iter_batched(
+              || roh.clone(),
+              |mut v| p95(&mut v),
+              BatchSize::SmallInput,
+          ),
+      );
+  }
+  ```
+
+  Die erste Closure klont 10 000 unsortierte Antwortzeiten, die zweite sortiert den Klon und liest das 95. Perzentil. Gemessen wird nur die zweite. `BatchSize::SmallInput` ist laut Doku für fast alle Benchmarks richtig. Drei Fassungen im Vergleich:
+
+  | Fassung | Schätzung |
+  | --- | --- |
+  | `iter_batched` | 73,46 µs |
+  | Klon in `iter` | 73,20 µs |
+  | ohne frische Eingabe | 2,54 µs |
+
+  Den Klon mitzumessen hat hier kaum geschadet, er kostet allein 0,78 µs; dass die Fassung mit Klon sogar knapp vorn liegt, ist Rauschen (bei `iter_batched` liegen die vorbereiteten Klone zudem kalt im Cache). Der echte Fehler ist die dritte Fassung: Ab der zweiten Wiederholung ist der Vec schon sortiert, und sortierte Daten sortieren sich fast dreißigmal schneller. Der Benchmark misst einen Fall, der im Betrieb nie vorkommt.
+
+  ### divan als Alternative
+
+  [divan](https://docs.rs/divan/latest/divan/) (Version 0.1) registriert Benchmarks per Attribut und misst mehrere Eingabegrößen in einem Durchgang:
+
+  ```rust
+  use divan::{Bencher, black_box};
+  use logparser::{
+      erzeuge_log, zaehle_fehler,
+  };
+
+  fn main() {
+      divan::main();
+  }
+
+  #[divan::bench(
+      args = [1_000, 10_000],
+  )]
+  fn zaehle(
+      bencher: Bencher,
+      n: usize,
+  ) {
+      let log = erzeuge_log(n);
+      bencher.bench(|| {
+          zaehle_fehler(
+              black_box(&log),
+          )
+      });
+  }
+  ```
+
+  divan gibt eine breite Tabelle aus. Hier stehen die Spalten untereinander:
+
+  ```text
+  Timer precision: 13 ns
+  divan_logparser
+  ╰─ zaehle
+     ├─ 1000
+     │  fastest 27.69 µs
+     │  slowest 38.88 µs
+     │  median  29.6 µs
+     │  mean    29.79 µs
+     │  samples 100, iters 100
+     ╰─ 10000
+        fastest 307.7 µs
+        slowest 371.3 µs
+        median  322 µs
+        mean    324.2 µs
+        samples 100, iters 100
+  ```
+
+  divan zeigt die Verteilung: schnellster und langsamster Lauf, Median, Mittelwert. Liegt der Mittelwert über dem Median, ziehen einzelne langsame Läufe ihn hoch. Ein Konfidenzintervall und einen Vergleich mit einem gespeicherten früheren Lauf hat divan 0.1 nicht. Für Vorher-nachher-Urteile bleibt criterion das Hauptwerkzeug.
+
+  ## Ganze Programme vergleichen mit hyperfine
+
+  criterion misst eine Funktion im selben Prozess. Wie lange das ganze Programm braucht, mit Prozessstart, Datei lesen und Ausgabe, misst [hyperfine](https://github.com/sharkdp/hyperfine). Es startet ein Kommando viele Male und wertet die Läufe aus. Das erste Kommando ist die Referenz für alle weiteren. Der Vergleich Debug gegen Release vom Anfang, Ausgabe von hyperfine 2.0 mit umgestellten Spalten:
+
+  ```text
+  $ hyperfine --warmup 3 \
+      './logparser-debug app.log' \
+      './logparser app.log'
+  Benchmark 1:
+    ./logparser-debug app.log
+    (16 runs)
+    Wall Time
+      mean ± σ   178.2 ms ± 2.4 ms
+      min … max  174.1 … 182.5 ms
+    Memory       43.7 MiB ± 0.1 MiB
+
+  Benchmark 2:
+    ./logparser app.log (62 runs)
+    Wall Time
+      mean ± σ   45.1 ms ± 3.3 ms
+      min … max  41.5 … 55.7 ms
+      -74.7%  (4.0x faster)
+    Memory       43.7 MiB, 0.0%
+  ```
+
+  - **Wall Time** ist die Zeit von Start bis Ende, als Mittelwert ± Standardabweichung σ, dazu der schnellste und langsamste Lauf. **Memory** ist der höchste belegte Arbeitsspeicher (Peak-RSS).
+  - Die Prozentzahl vergleicht mit dem ersten Kommando. Einen Faktor wie `(4.0x faster)` druckt hyperfine erst ab 30 % Unterschied. Ein fehlender Faktor sagt nichts über Signifikanz; einen Test wie criterion macht hyperfine nicht.
+  - `--warmup 3` startet das Programm vor der Messung dreimal. Danach liegen Programm und Eingabedatei im Page Cache, dem Dateicache des Kernels im RAM ([Warmup und Prepare](https://github.com/sharkdp/hyperfine#warmup-runs-and-preparation-commands)).
+  - `--prepare 'befehl'` läuft vor jedem einzelnen Lauf, etwa um den Cache zu leeren und kalte Starts zu messen.
+  - `--metrics time` zeigt zusätzlich CPU-, User- und System-Zeit ([Metriken](https://github.com/sharkdp/hyperfine#choosing-metrics-and-units)). User-Zeit verbringt das Programm in eigenem Code und Bibliotheken, System-Zeit im Kernel, etwa beim Lesen der Datei. Beim Logparser 2.3 waren es 36,6 ms User und 8,6 ms System bei 45,8 ms Wall Time.
+
+  hyperfine nimmst du, wenn die Frage das ganze Programm betrifft: Startzeit, I/O, ein CLI-Aufruf, zwei Binaries oder zwei Git-Stände. criterion nimmst du für eine Funktion, wenn du kleine Unterschiede statistisch sauber sehen willst.
+
+  > [!NOTE] Ältere Anleitungen
+  > Viele Blogposts zeigen hyperfine 1.x mit `Time (mean ± σ)` und einer Summary am Ende („… times faster than …“). Version 2.0 zeigt Zeit und Speicher als Tabelle, die Änderung je Metrik in Prozent und startet Kommandos ohne Shell. Für Pipes oder `*` brauchst du jetzt `-S` ([Changelog](https://github.com/sharkdp/hyperfine/blob/master/CHANGELOG.md)).
+
+  ## Flamegraphs lesen
+
+  Ein Sampling-Profiler unterbricht das Programm in festen Abständen, bei samply standardmäßig 1000-mal pro Sekunde, und notiert den aktuellen Aufruf-Stack ([samply](https://github.com/mstange/samply#description)). Gleiche Stacks werden gezählt. Die Rohform heißt **gefaltete Stacks** (folded stacks): ein Stack pro Zeile, Funktionen von außen nach innen mit `;` getrennt, am Ende die Zahl der Samples. Eine Aufnahme des Logparsers 2.3 mit dem Sampling-Profiler [pprof-rs](https://docs.rs/pprof/latest/pprof/) (1000 Samples pro Sekunde; gemeinsamer Anfang `main;zaehle_fehler;` weggelassen, Namen gekürzt):
+
+  ```text
+  lines 250
+  lines;memchr 311
+  ist_fehler;split 80
+  ist_fehler;split;memchr 289
+  ```
+
+  Vollständig heißt die erste Zeile `main;zaehle_fehler;lines 250`: In 250 Samples war die CPU in `lines` selbst, in 311 weiteren in `memchr`, das `lines` aufgerufen hat. Werkzeuge wie `inferno-flamegraph` machen daraus ein SVG ([inferno](https://github.com/jonhoo/inferno#using-inferno)). Vereinfacht als Text, 32 Zeichen für 930 Samples:
+
+  ```text
+  [memchr  ]
+  [split      ][memchr   ]
+  [ist_fehler ][lines            ]
+  [zaehle_fehler                 ]
+  [main                          ]
+  ```
+
+  So liest du ihn ([Brendan Gregg: Flame Graphs](https://www.brendangregg.com/flamegraphs.html)):
+
+  - **Breite ist der Anteil der Samples, inklusive Kinder.** `lines` ist 19 von 32 Zeichen breit, weil 561 von 930 Samples `lines` enthalten: 250 in `lines` selbst, 311 in `memchr`.
+  - **Die Oberkante ist Selbstzeit.** Wo über einem Balken nichts mehr liegt, war die CPU in genau dieser Funktion. `zaehle_fehler` ist komplett zugedeckt: keine Selbstzeit, die Funktion verteilt nur Arbeit.
+  - **Die x-Achse ist keine Zeit.** Geschwister stehen alphabetisch, gleiche Stacks sind zusammengefasst. Dass `ist_fehler` links steht, heißt nicht, dass es zuerst lief. Den zeitlichen Verlauf zeigt die Zeitleiste im Profiler, nicht der Flamegraph.
+  - **Farben messen nichts.** Klassische Flamegraphs färben zufällig, manche Werkzeuge nach Codeart.
+  - **Inlining versteckt Funktionen.** Kleine Funktionen baut der Compiler in den Aufrufer ein. Ohne Debug-Infos fehlen sie im Stack, ihre Zeit erscheint beim Aufrufer. Für dieses Bild sind außerdem Adapter wie `filter` und `count` weggelassen.
+
+  Damit Stacks vollständig sind, profilierst du einen Release-Build mit Debug-Infos. Das samply-README empfiehlt dafür ein eigenes Profil ([Turn on debug info](https://github.com/mstange/samply#turn-on-debug-info-for-full-stacks), [Cargo Book: custom profiles](https://doc.rust-lang.org/cargo/reference/profiles.html#custom-profiles)):
+
+  ```toml
+  [profile.profiling]
+  inherits = "release"
+  debug = true
+  ```
+
+  `debug = true` ändert die Optimierung nicht, es legt nur Debug-Infos neben den Code. Wirken Stacks trotzdem abgeschnitten, hilft `-C force-frame-pointers=yes` ([Perf Book: Frame pointers](https://nnethercote.github.io/perf-book/profiling.html#frame-pointers)).
+
+  > [!MERKE]
+  > Breit heißt teuer, oben heißt selbst gerechnet, links heißt nichts. Vergleiche ein Profil immer mit einer Messung: Ein Balken mit 28 % kann höchstens 28 % sparen.
+
+  ## Allokationen finden und vermeiden
+
+  Jede Heap-Allokation geht zum Allokator. Er sucht einen passenden freien Block, pflegt seine Verwaltungsdaten, stimmt sich mit anderen Threads ab und fragt manchmal den Kernel nach mehr Speicher. Das Rust Performance Book nennt Allokationen „moderately expensive“ und rät: Zeigt ein Profil `malloc` und `free` als heiß, lohnt es sich, die Zahl der Allokationen zu senken ([Heap Allocations](https://nnethercote.github.io/perf-book/heap-allocations.html#profiling)). Eine einzelne fällt nicht auf. Eine pro Zeile bei einer Million Zeilen schon.
+
+  | Quelle in der Schleife | Abhilfe |
+  | --- | --- |
+  | `to_string`, `format!` | `&str` behalten |
+  | `collect` in Zwischen-`Vec` | Iterator weiterreichen |
+  | `Vec::new` + viele `push` | `with_capacity(n)` |
+  | `String`-Schlüssel | `&str`-Schlüssel, `entry` |
+  | neuer Puffer je Durchlauf | ein Puffer, `clear()` |
+
+  Die Abhilfen stützen sich auf zugesicherte Eigenschaften: [`Vec::with_capacity(n)`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.with_capacity) nimmt mindestens `n` Elemente ohne neue Allokation auf. [`String::new`](https://doc.rust-lang.org/std/string/struct.String.html#method.new) alloziert nichts. [`clear`](https://doc.rust-lang.org/std/string/struct.String.html#method.clear) leert einen String, behält aber seine Kapazität. [`HashMap::entry`](https://doc.rust-lang.org/std/collections/hash_map/struct.HashMap.html#method.entry) sucht den Schlüssel einmal statt zweimal wie `contains_key` plus `insert`. Vorsicht bei `String`-Schlüsseln: `entry(z.to_string())` alloziert bei jedem Aufruf, auch wenn der Schlüssel schon existiert.
+
+  ### Allokationen zählen mit `GlobalAlloc`
+
+  Zeit schwankt, die Zahl der Allokationen nicht. Ein eigener globaler Allokator, der zählt und an den System-Allokator weiterreicht, liefert deshalb eine stabile Kennzahl, nur mit der Standardbibliothek ([`#[global_allocator]`](https://doc.rust-lang.org/std/alloc/index.html#the-global_allocator-attribute)):
+
+  ```rust
+  use std::alloc::{
+      GlobalAlloc, Layout, System,
+  };
+  use std::hint::black_box;
+  use std::sync::atomic::{
+      AtomicUsize,
+      Ordering::Relaxed,
+  };
+
+  struct Zaehler;
+  static N: AtomicUsize =
+      AtomicUsize::new(0);
+
+  unsafe impl GlobalAlloc
+      for Zaehler
+  {
+      unsafe fn alloc(&self,
+          l: Layout) -> *mut u8 {
+          N.fetch_add(1, Relaxed);
+          unsafe { System.alloc(l) }
+      }
+      unsafe fn dealloc(&self,
+          p: *mut u8, l: Layout) {
+          unsafe {
+              System.dealloc(p, l)
+          }
+      }
+  }
+
+  #[global_allocator]
+  static A: Zaehler = Zaehler;
+
+  fn n() -> usize {
+      N.load(Relaxed)
+  }
+
+  fn main() {
+      let t = n();
+      let mut a = Vec::new();
+      for i in 0..1_000u32 {
+          a.push(i);
+      }
+      let ohne = n() - t;
+
+      let t = n();
+      let mut b =
+          Vec::with_capacity(1_000);
+      for i in 0..1_000u32 {
+          b.push(i);
+      }
+      let mit = n() - t;
+
+      black_box((&a, &b));
+      println!(
+          "ohne: {ohne}, mit: {mit}"
+      );
+  }
+  ```
+
+  Auf dem Testrechner gab das `ohne: 9, mit: 1` aus. Die 9 sind eine Allokation und acht Vergrößerungen. Sie zählen mit, weil die Standardfassung von `realloc` intern `alloc` aufruft ([Quelltext von `GlobalAlloc`](https://doc.rust-lang.org/src/core/alloc/global.rs.html)). Die genaue Zahl hängt von der Wachstumsstrategie von `Vec` ab, und die ist nicht zugesichert ([Vec: Capacity and reallocation](https://doc.rust-lang.org/std/vec/struct.Vec.html#capacity-and-reallocation)). Drei Regeln für solche Zähler:
+
+  - **Nur den Abschnitt zählen, dann drucken.** `println!` kann selbst allozieren: Der erste Aufruf legte im Test einen Puffer für stdout an, eine Allokation.
+  - **Im Allokator nichts allozieren.** Kein `println!` in `alloc`, sonst ruft der Allokator sich selbst auf.
+  - **Ergebnisse benutzen.** Die [`GlobalAlloc`-Doku](https://doc.rust-lang.org/std/alloc/trait.GlobalAlloc.html) warnt, dass der Optimierer ungenutzte Allokationen entfernen darf. `black_box` hält sie am Leben.
+
+  Wer wissen will, wo die Allokationen entstehen, nimmt [dhat-rs](https://docs.rs/dhat/latest/dhat/). Es ersetzt ebenfalls den globalen Allokator, merkt sich die Herkunft jeder Allokation und kann in Tests eine Obergrenze prüfen.
+
+  ## Häufige Fehler
+
+  - **Im Debug-Build messen.** Beim Logparser Faktor 4,0, bei der kleinen Schleife 20 bis 28 statt 1,4 bis 3,4 ms. Immer `--release` oder ein Profil, das davon erbt.
+  - **Eine Messung glauben.** Fünf Läufe desselben Programms lagen um mehr als das Doppelte auseinander. Ohne Wiederholung und Streuung ist eine Zahl Zufall.
+  - **`black_box` vergessen.** Ergebnis: Pikosekunden. Konstante Eingaben und unbenutzte Ergebnisse lädt der Optimierer zum Wegrechnen ein.
+  - **Setup mitmessen oder ohne frische Eingabe messen.** Ein Sortier-Benchmark auf schon sortierten Daten war fast dreißigmal zu schnell.
+  - **Signifikant mit relevant verwechseln.** p = 0,00 bei −0,69 % ist Rauschen zwischen zwei Läufen. Das Urteil steht in der letzten Zeile.
+  - **Mehrere Änderungen auf einmal.** Dann weißt du nicht, welche geholfen hat, und eine schädliche fährt bei der nützlichen mit.
+  - **Den Flamegraph als Zeitleiste lesen.** Links und rechts sind alphabetisch, Farben bedeuten nichts.
+  - **`println!` im gezählten Abschnitt.** Der erste Aufruf alloziert selbst und verfälscht die Zählung.
+
+  > [!PRAXIS] Messprotokoll im Pull Request
+  > Wer eine Performance-Änderung zur Review stellt, schreibt dazu, was gemessen wurde: Eingabe, Werkzeug und Version, Build-Profil, vorher und nachher mit Streuung, bei Bedarf die Zahl der Allokationen und eine Entscheidung. „Fühlt sich schneller an“ ist kein Befund. Ein guter Reviewer fragt zuerst nach der Baseline und danach nach dem Code.
+
+  > [!INTERVIEW] „Ein Dienst ist nach einem Release langsamer. Wie gehst du vor?“
+  > Erst reproduzieren und beziffern: alte und neue Version im Release-Build mit derselben Eingabe vergleichen, etwa mit hyperfine oder einer criterion-Baseline. Dann eingrenzen: Profil beider Versionen aufnehmen und vergleichen, welche Balken neu oder breiter sind. Daraus eine Hypothese ableiten, genau eine Änderung machen und neu messen. Zum Schluss verhindern, dass es wieder passiert, etwa mit einem Benchmark gegen eine gespeicherte Baseline vor jedem Release. Ich optimiere nichts, bevor ich weiß, welcher Teil die Zeit kostet.
+
+  ## Zusammenfassung
+
+  - Ablauf: Hypothese, Messung, eine Änderung, erneute Messung. Immer im Release-Build.
+  - Amdahl: Ein Teil mit 5 % Anteil kann höchstens 5 % sparen. Erst das Profil, dann die Optimierung.
+  - `Instant` ist monoton, `SystemTime` nicht. Einzelmessungen sind Rauschen; `black_box` hält den Optimierer von Eingabe und Ergebnis fern, nach eigener Doku nur „best-effort“.
+  - criterion: `time` ist ein Konfidenzintervall, `change` vergleicht mit dem letzten Lauf, „regressed“ heißt erst: ganzes Intervall jenseits der Rauschschwelle und p < 0,05. `iter_batched` hält Setup aus der Messung.
+  - hyperfine misst ganze Programme: Mittelwert ± σ, min … max, Speicher, Prozent gegenüber dem ersten Kommando; `--warmup` für warmen, `--prepare` für kalten Cache.
+  - Flamegraph: Breite inklusive Kinder, Oberkante ist Selbstzeit, x-Achse alphabetisch, Farben ohne Bedeutung, Inlining versteckt Funktionen.
+  - Allokationen kosten; `with_capacity`, `clear`, `&str` statt `String` und `entry` vermeiden sie. Ein zählender `GlobalAlloc` liefert eine stabile Kennzahl.
+exercises:
+  - id: amdahl-obergrenze
+    type: choice
+    title: Was ist das Maximum?
+    prompt: |
+      Ein Profil einer Log-Auswertung hat 974 Samples. `format!` steckt in 57 davon, also in 5,9 %. Eine Kollegin will `format!` durch eine Lösung ersetzen, die laut Microbenchmark doppelt so schnell ist. Wie viel Laufzeit spart das ganze Programm **höchstens**?
+    options:
+      - text: Knapp 3 % der Laufzeit.
+        correct: true
+        why: Nur der Anteil von 5,9 % wird schneller, und zwar um die Hälfte. 5,9 % × ½ ≈ 2,9 %.
+      - text: Die Hälfte der Laufzeit, weil die Funktion doppelt so schnell wird.
+        correct: false
+        why: Doppelt so schnell wird nur `format!`. Die übrigen 94,1 % der Laufzeit bleiben, wie sie sind.
+      - text: 5,9 % der Laufzeit.
+        correct: false
+        why: Das wäre die Grenze, wenn `format!` gar keine Zeit mehr bräuchte. Doppelt so schnell spart nur die Hälfte davon.
+      - text: Ohne neuen Benchmark des ganzen Programms lässt sich keine Obergrenze angeben.
+        correct: false
+        why: Die Obergrenze folgt aus dem Anteil im Profil. Messen musst du trotzdem, um zu sehen, ob sie erreicht wird; die Grenze kennst du aber vorher.
+    explanation: |
+      Amdahls Gesetz: Wird ein Anteil p der Laufzeit um den Faktor s schneller, sinkt die Gesamtzeit um p × (1 − 1/s). Mit p = 5,9 % und s = 2 sind das 2,9 %. Deshalb lohnt sich die Frage nach dem Anteil vor jeder Optimierung: In derselben Aufnahme stecken 32 % im Erzeugen der Testdaten und rund 30 % im Zerlegen der Zeilen. Dort liegt mehr zu holen als bei `format!`.
+    resources:
+      - title: The Rust Performance Book · Profiling
+        url: https://nnethercote.github.io/perf-book/profiling.html
+
+  - id: flamegraph-regeln
+    type: choice
+    title: Was der Flamegraph sagt
+    prompt: |
+      Das ist der Text-Flamegraph des Logparsers aus der Lektion (930 Samples, vereinfacht). Welche Aussagen stimmen? **Mehrere Antworten richtig.**
+    lang: text
+    code: |
+      [memchr  ]
+      [split      ][memchr   ]
+      [ist_fehler ][lines            ]
+      [zaehle_fehler                 ]
+      [main                          ]
+    options:
+      - text: "`ist_fehler` steckte in rund 40 % der Samples, die Zeit in `split` und `memchr` eingerechnet."
+        correct: true
+        why: Die Breite zählt alle Samples, in denen die Funktion auf dem Stack lag, also auch die ihrer Kinder. Hier sind es 369 von 930.
+      - text: "`zaehle_fehler` hat keine Selbstzeit."
+        correct: true
+        why: Über `zaehle_fehler` liegen `ist_fehler` und `lines` und decken die ganze Oberkante ab. Kein Sample endete in `zaehle_fehler` selbst.
+      - text: "`ist_fehler` lief vor `lines`, weil es links steht."
+        correct: false
+        why: Die x-Achse ist keine Zeit. Geschwister stehen alphabetisch, gleiche Stacks sind zusammengefasst.
+      - text: Im SVG wäre ein roter Balken langsamer als ein gelber.
+        correct: false
+        why: Klassische Flamegraphs färben zufällig, manche Werkzeuge nach Codeart. Zeit zeigt nur die Breite.
+      - text: "`filter` fehlt im Bild, also hat `zaehle_fehler` es nie aufgerufen."
+        correct: false
+        why: Kleine Funktionen baut der Compiler in den Aufrufer ein; ohne Debug-Infos fehlen sie im Stack. Hier sind die Adapter außerdem für die Vereinfachung weggelassen.
+    explanation: |
+      Ein Flamegraph fasst gleiche Stacks zusammen. Die Breite eines Balkens ist der Anteil der Samples, in denen die Funktion irgendwo auf dem Stack lag; die Oberkante, über der nichts mehr liegt, ist die Zeit in der Funktion selbst. Reihenfolge und Farbe tragen keine Information über Zeit. Wer den Verlauf über die Zeit sehen will, nimmt die Zeitleiste des Profilers.
+    resources:
+      - title: Brendan Gregg · Flame Graphs
+        url: https://www.brendangregg.com/flamegraphs.html
+
+  - id: mittelwert-median-ausreisser
+    type: output
+    title: Ein langsamer Lauf unter fünf
+    prompt: |
+      Fünf Läufe desselben Programms, einer davon gestört. Was gibt dieses Programm aus? `Duration` druckt sich mit `{:?}` zum Beispiel als `12ms` oder `1.5ms`.
+    lang: rust
+    code: |
+      use std::time::Duration;
+
+      fn main() {
+          // Laufzeiten in ms
+          let ms = [12, 11, 13, 95, 12];
+          let mut l = ms.map(|x| {
+              Duration::from_millis(x)
+          });
+          let summe: Duration =
+              l.iter().sum();
+          println!("{:?}", summe / 5);
+          l.sort();
+          println!("{:?}", l[2]);
+          println!("{:?}", l[0]);
+      }
+    expected: |
+      28.6ms
+      12ms
+      11ms
+    hints:
+      - Rechne erst die Summe aus. Durch 5 geteilt ergibt sich der Mittelwert.
+      - Nach dem Sortieren steht in der Mitte des Arrays der Median.
+    explanation: |
+      Die Summe ist 143 ms, der Mittelwert also 28,6 ms. Er liegt höher als vier der fünf Läufe, weil ein einzelner Ausreißer (95 ms) ihn hochzieht. Der Median, der mittlere Wert nach dem Sortieren, bleibt bei 12 ms, das Minimum bei 11 ms. Deshalb zeigen divan Median und Mittelwert nebeneinander und hyperfine zusätzlich min … max: Klaffen Mittelwert und Median auseinander, war die Messung gestört oder die Laufzeit schwankt wirklich.
+    resources:
+      - title: std · Duration
+        url: https://doc.rust-lang.org/std/time/struct.Duration.html
+
+  - id: allokationen-vorhersagen
+    type: output
+    title: Drei Arten, Zahlen abzulegen
+    prompt: |
+      Der Zähler zählt jeden Aufruf von `alloc`. Vergrößerungen zählen mit, weil die Standardfassung von `realloc` intern `alloc` aufruft. Was gibt das Programm aus?
+    lang: rust
+    code: |
+      use std::alloc::{
+          GlobalAlloc, Layout, System,
+      };
+      use std::fmt::Write;
+      use std::hint::black_box;
+      use std::sync::atomic::{
+          AtomicUsize,
+          Ordering::Relaxed,
+      };
+
+      struct Zaehler;
+      static N: AtomicUsize =
+          AtomicUsize::new(0);
+
+      unsafe impl GlobalAlloc
+          for Zaehler
+      {
+          unsafe fn alloc(&self,
+              l: Layout) -> *mut u8 {
+              N.fetch_add(1, Relaxed);
+              unsafe { System.alloc(l) }
+          }
+          unsafe fn dealloc(&self,
+              p: *mut u8, l: Layout) {
+              unsafe {
+                  System.dealloc(p, l)
+              }
+          }
+      }
+
+      #[global_allocator]
+      static A: Zaehler = Zaehler;
+
+      fn n() -> usize {
+          N.load(Relaxed)
+      }
+
+      fn main() {
+          let ids = [7, 42, 1001];
+
+          let t = n();
+          let mut v =
+              Vec::with_capacity(3);
+          for id in ids {
+              v.push(id);
+          }
+          let a = n() - t;
+
+          let t = n();
+          let s: Vec<String> = ids
+              .iter()
+              .map(|id| id.to_string())
+              .collect();
+          let b = n() - t;
+
+          let t = n();
+          let mut buf =
+              String::with_capacity(16);
+          for id in ids {
+              buf.clear();
+              write!(buf, "{id}")
+                  .unwrap();
+          }
+          let c = n() - t;
+
+          black_box((&v, &s, &buf));
+          println!("{a} {b} {c}");
+      }
+    expected: |
+      1 4 1
+    hints:
+      - "`with_capacity(3)` reicht für drei `push` ohne Vergrößerung."
+      - Jeder `String` aus `to_string` braucht eigenen Speicher, und der `Vec` selbst auch.
+      - "`clear` behält die Kapazität von 16 Bytes."
+    explanation: |
+      `a` ist 1: `Vec::with_capacity(3)` alloziert einmal, und drei `push` passen ohne Vergrößerung hinein. `b` ist 4: Der `Vec<String>` braucht eine Allokation, jeder der drei Strings aus `to_string` eine eigene. `c` ist 1: Der Puffer alloziert einmal 16 Bytes; `clear` setzt nur die Länge zurück, die Kapazität bleibt, und die Zahlen passen hinein. Gedruckt wird erst nach dem letzten Zählerstand, weil `println!` beim ersten Aufruf selbst einen Puffer anlegt. `black_box` verhindert, dass der Optimierer ungenutzte Allokationen entfernt.
+    resources:
+      - title: std · String::clear
+        url: https://doc.rust-lang.org/std/string/struct.String.html#method.clear
+      - title: std · Vec::with_capacity
+        url: https://doc.rust-lang.org/std/vec/struct.Vec.html#method.with_capacity
+
+  - id: messschleife-ergaenzen
+    type: gap
+    title: Eine ehrliche Messschleife
+    prompt: |
+      Ergänze die Messung: Startzeitpunkt nehmen, die Eingabe und das Ergebnis vor dem Optimierer schützen, die vergangene Zeit lesen. Ausgegeben wird die Zeit pro Aufruf.
+    lang: rust
+    code: |
+      use std::hint::black_box;
+      use std::time::Instant;
+
+      fn summe(v: &[u64]) -> u64 {
+          v.iter().sum()
+      }
+
+      fn main() {
+          let daten: Vec<u64> =
+              (0..10_000).collect();
+          let runden = 1_000;
+          let start = ⟦Instant::now()⟧;
+          for _ in 0..runden {
+              ⟦black_box⟧(summe(
+                  ⟦black_box⟧(&daten),
+              ));
+          }
+          let dauer = start.⟦elapsed()⟧;
+          let je = dauer / runden;
+          println!("{je:?}");
+      }
+    gaps:
+      - label: Startzeitpunkt
+        hint: Eine monotone Uhr aus `std::time`, nicht die Wanduhr.
+        accept: ["std::time::Instant::now()"]
+      - label: Ergebnis schützen
+        hint: Dieselbe Funktion wie bei der Eingabe.
+        accept: ["std::hint::black_box"]
+      - label: Eingabe schützen
+        hint: Eine Identitätsfunktion aus `std::hint`.
+        accept: ["std::hint::black_box"]
+      - label: Vergangene Zeit
+        hint: Eine Methode von `Instant`, die eine `Duration` liefert.
+    explanation: |
+      `Instant::now()` liest die monotone Uhr, `elapsed()` liefert die `Duration` seit diesem Zeitpunkt. Das innere `black_box(&daten)` verhindert, dass der Compiler die Summe einmal vorausberechnet und in jeder Runde wiederverwendet. Das äußere `black_box` lässt das Ergebnis als benutzt gelten, sonst dürfte der Aufruf ganz verschwinden. Eine solche Schleife ist eine schnelle Probe; Streuung, Aufwärmen und Vergleiche liefert erst criterion.
+    resources:
+      - title: std · black_box
+        url: https://doc.rust-lang.org/std/hint/fn.black_box.html
+      - title: std · Instant::elapsed
+        url: https://doc.rust-lang.org/std/time/struct.Instant.html#method.elapsed
+
+  - id: schluessel-leihen
+    type: gap
+    title: Zählen ohne Kopien
+    prompt: |
+      `zaehle` soll die Log-Level zählen, ohne pro Zeile einen `String` anzulegen. `main` sortiert die Level und braucht dafür einen `Vec`, der nie wachsen muss. Ausgabe: `INFO=2` und `WARN=1`.
+    lang: rust
+    code: |
+      use std::collections::HashMap;
+
+      fn zaehle(log: &str)
+          -> HashMap<⟦&str⟧, u32>
+      {
+          let mut m = HashMap::new();
+          for z in log.lines() {
+              let lv = z
+                  .split(' ')
+                  .next()
+                  .unwrap_or("");
+              *m.⟦entry⟧(lv)
+                  .or_insert(0) += 1;
+          }
+          m
+      }
+
+      fn main() {
+          let log =
+              "INFO a\nWARN b\nINFO c";
+          let m = zaehle(log);
+          let n = m.len();
+          let mut namen: Vec<&str> =
+              Vec::⟦with_capacity⟧(n);
+          namen.extend(m.keys());
+          namen.sort();
+          for k in namen {
+              println!("{k}={}", m[k]);
+          }
+      }
+    gaps:
+      - label: Schlüsseltyp
+        hint: Ein geliehenes Stück von `log` statt eines eigenen Strings.
+        accept: ["&'_ str"]
+      - label: Einmal suchen
+        hint: Die API, die einen Eintrag liefert, egal ob er schon existiert.
+      - label: Feste Kapazität
+        hint: Ein Konstruktor, der Platz für `n` Elemente reserviert.
+    explanation: |
+      Mit `&str` als Schlüssel zeigt die Map auf Stücke von `log`, statt sie zu kopieren; der Compiler leitet die Lebensdauer aus dem einzigen Referenz-Parameter ab. `entry(lv)` sucht den Schlüssel einmal und liefert den Eintrag, `or_insert(0)` legt ihn bei Bedarf an. `contains_key` plus `insert` würde zweimal suchen. `Vec::with_capacity(n)` reserviert genau so viel Platz, wie es Level gibt, und muss beim `extend` nicht wachsen.
+    resources:
+      - title: std · HashMap::entry
+        url: https://doc.rust-lang.org/std/collections/hash_map/struct.HashMap.html#method.entry
+      - title: Perf Book · Hash tables
+        url: https://nnethercote.github.io/perf-book/heap-allocations.html#hash-tables
+
+  - id: zu-schnell-fuer-echt
+    type: bug
+    title: 251 Pikosekunden
+    prompt: |
+      `status` liest aus einer HTTP-Statuszeile die drei Ziffern und parst sie. criterion meldet dafür `time: [251.27 ps 251.42 ps 251.72 ps]`, bei 20 Milliarden Iterationen in fünf Sekunden. Das ist ungefähr ein einziger Prozessortakt bei 4 GHz (0,25 ns). Finde die Zeile, die die Messung wertlos macht, und korrigiere sie.
+    lang: rust
+    code: |
+      use criterion::{
+          Criterion, criterion_group,
+          criterion_main,
+      };
+      use std::hint::black_box;
+
+      const ZEILE: &str =
+          "HTTP/1.1 503 Unavailable";
+
+      fn status(z: &str) -> u16 {
+          let s = z.get(9..12)
+              .unwrap_or("0");
+          s.parse().unwrap_or(0)
+      }
+
+      fn run(c: &mut Criterion) {
+          c.bench_function(
+              "status",
+              |b| b.iter(|| {
+                  status(ZEILE)
+              }),
+          );
+      }
+
+      criterion_group!(benches, run);
+      criterion_main!(benches);
+    lines: [20]
+    fix:
+      - line: 20
+        answers:
+          - status(black_box(ZEILE))
+          - black_box(status(black_box(ZEILE)))
+          - status(std::hint::black_box(ZEILE))
+          - status(black_box(&ZEILE))
+    hints:
+      - Woher kennt der Compiler die Eingabe?
+      - Beim Bauen meldet Cargo eine Warnung zu einem Import.
+    explanation: |
+      `ZEILE` ist eine Konstante. Der Optimierer kann `status(ZEILE)` deshalb beim Übersetzen ausrechnen, und übrig bleibt eine Schleife, die eine fertige Zahl zurückgibt. Mit `status(black_box(ZEILE))` kennt der Compiler den Inhalt nicht mehr und muss wirklich parsen. Auf dem Testrechner stieg die Zeit damit auf 1,98 ns, und criterion meldete „Performance has regressed“ mit +686 %. Der Code war nicht langsamer geworden, die alte Zahl war falsch. Der Hinweis lag schon vorher in der Warnung `unused import: std::hint::black_box`.
+    resources:
+      - title: criterion.rs · Getting Started
+        url: https://bheisler.github.io/criterion.rs/book/getting_started.html
+      - title: std · black_box
+        url: https://doc.rust-lang.org/std/hint/fn.black_box.html
+
+  - id: kalter-erster-lauf
+    type: explain
+    title: Warum der erste Lauf ausreißt
+    prompt: |
+      Drei hyperfine-Läufe für den Logparser mit einer 216-MB-Datei (Spalten umgestellt, Warnung gekürzt). Vor dem ersten Lauf lag die Datei nicht im Page Cache. Erkläre, was die Warnung bedeutet, warum σ im zweiten Lauf so viel kleiner ist und welche Messung ins Protokoll gehört, wenn der Job jeden Morgen direkt nach dem Neustart des Servers läuft.
+    lang: text
+    code: |
+      $ hyperfine \
+          './logparser gross.log'
+      Wall Time
+        mean ± σ   218.2 ms ± 23.2 ms
+        min … max  204.0 … 282.9 ms
+      Warning: The first benchmarking
+      run for this command was
+      significantly slower than the
+      rest (282.9 ms). This could be
+      caused by (filesystem) caches
+      that were not filled until
+      after the first run. […]
+
+      $ hyperfine --warmup 3 \
+          './logparser gross.log'
+      Wall Time
+        mean ± σ   208.8 ms ± 3.9 ms
+        min … max  203.6 … 217.0 ms
+
+      $ hyperfine --prepare \
+          'dd if=gross.log \
+          iflag=nocache count=0 \
+          status=none' \
+          './logparser gross.log'
+      Wall Time
+        mean ± σ   295.7 ms ± 10.5 ms
+        min … max  289.4 … 324.8 ms
+    points:
+      - Der erste Lauf musste die Datei von der Platte lesen, alle weiteren bekamen sie aus dem Page Cache im RAM. Daher 282,9 ms gegen rund 205 ms.
+      - "`--warmup 3` füllt den Cache vor der Messung. Der Ausreißer fällt weg, σ sinkt von 23,2 auf 3,9 ms."
+      - Ohne Warmup mischt der Mittelwert einen kalten mit neun warmen Läufen und beschreibt keinen der beiden Fälle.
+      - Nach einem Neustart ist der Cache leer. Für diesen Job zählt der kalte Fall, also die Messung mit `--prepare`, die vor jedem Lauf den Cache für die Datei verwirft (295,7 ms ± 10,5 ms).
+    explanation: |
+      Die Warnung sagt: Der erste Lauf war viel langsamer als der Rest, vermutlich wegen eines Caches. Hier war es der Page Cache des Kernels. Nach dem ersten Lesen liegt die Datei im RAM, und jeder weitere Lauf spart sich die Platte. Ein Mittelwert über einen kalten und neun warme Läufe beschreibt keinen echten Fall, das zeigt auch das breite σ von 23,2 ms. Mit `--warmup 3` misst du sauber den warmen Fall. Ein Job direkt nach dem Neustart trifft aber auf einen leeren Cache. Dafür verwirft `--prepare` mit `dd … iflag=nocache count=0` vor jedem Lauf den Cache dieser Datei, ohne root-Rechte, und misst den kalten Fall: knapp 300 ms. Ins Protokoll gehört die Messung, die zum Betrieb passt, mit dem Hinweis, ob kalt oder warm.
+    resources:
+      - title: hyperfine · Warmup runs and preparation commands
+        url: https://github.com/sharkdp/hyperfine#warmup-runs-and-preparation-commands
+      - title: GNU coreutils · dd, iflag=nocache
+        url: https://www.gnu.org/software/coreutils/manual/html_node/dd-invocation.html#index-nocache
+
+  - id: fall-erste-messung
+    type: choice
+    title: "Logparser-Fall (1/4): Der erste Schritt"
+    prompt: |
+      Der nächtliche Job `logparser` zählt Fehlerzeilen in einer Logdatei mit einer Million Zeilen. Seit Version 2.4 meldet das Monitoring längere Laufzeiten. Der einzige Commit seit 2.3 heißt „Level ohne Rücksicht auf Groß-/Kleinschreibung erkennen“. Was machst du **zuerst**?
+    options:
+      - text: Version 2.3 und 2.4 im Release-Build mit derselben Logdatei vergleichen, zum Beispiel mit `hyperfine --warmup 3`.
+        correct: true
+        why: Das bestätigt die Regression unter kontrollierten Bedingungen und beziffert sie. Alles Weitere, auch das Profil, misst du gegen diese Zahl.
+      - text: Sofort einen Flamegraph von 2.4 aufnehmen.
+        correct: false
+        why: Ein Profil zeigt, wo Zeit hingeht, aber nicht, ob 2.4 überhaupt langsamer ist und um wie viel. Ohne Vergleich weißt du nicht, welcher Balken neu ist.
+      - text: Den Diff lesen und die verdächtigste Zeile optimieren.
+        correct: false
+        why: Das ist Raten. Ohne Messung weißt du weder, ob du die richtige Zeile triffst, noch ob deine Änderung hilft.
+      - text: "`Instant::now()` um `main` legen und beide Versionen je einmal mit `cargo run` starten."
+        correct: false
+        why: "`cargo run` baut im Debug-Profil, und eine Einzelmessung schwankt stark. Beides macht die Zahl wertlos."
+      - text: Die Laufzeiten des Jobs im Monitoring der letzten Woche mitteln.
+        correct: false
+        why: Im Betrieb ändern sich Eingabegröße und Last von Nacht zu Nacht. Das Monitoring zeigt, dass etwas passiert ist; die Ursache isolierst du nur mit kontrollierter Messung.
+    explanation: |
+      Der erste Schritt einer Regressionsanalyse ist, sie reproduzierbar zu machen und zu beziffern: gleiche Eingabe, Release-Build, beide Versionen, viele Läufe. Erst dann lohnen sich Profil und Hypothese. hyperfine passt, weil die Meldung das ganze Programm betrifft. Gibt es schon einen criterion-Benchmark mit gespeicherter Baseline von 2.3, ist auch der ein guter Start.
+    resources:
+      - title: hyperfine · Basic benchmarks
+        url: https://github.com/sharkdp/hyperfine#basic-benchmarks
+      - title: The Rust Performance Book · Benchmarking
+        url: https://nnethercote.github.io/perf-book/benchmarking.html
+
+  - id: fall-echt-oder-rauschen
+    type: choice
+    title: "Logparser-Fall (2/4): Echt oder Rauschen?"
+    prompt: |
+      Oben hyperfine für das ganze Programm, unten criterion für zwei Funktionen der Version 2.4, verglichen mit der gespeicherten Baseline von 2.3 (umbrochen, gekürzt). `zaehle_zeilen` zählt nur Zeilen, `zaehle_fehler` erkennt zusätzlich das Level. Welche Aussagen stimmen? **Mehrere Antworten richtig.**
+    lang: text
+    code: |
+      hyperfine --warmup 3
+      logparser-2.3 (71 runs)
+        44.6 ms ± 3.3 ms
+        min … max 41.5 … 57.1 ms
+      logparser-2.4 (53 runs)
+        59.4 ms ± 6.6 ms
+        min … max 54.4 … 99.1 ms
+        +33.0%  (1.3x slower)
+
+      logparser/zaehle_fehler
+        time:   [444.97 µs 450.52 µs
+                 457.93 µs]
+        change: [+37.949% +39.191%
+                 +41.082%]
+                (p = 0.00 < 0.05)
+        Performance has regressed.
+      logparser/zaehle_zeilen
+        time:   [189.00 µs 189.39 µs
+                 189.75 µs]
+        change: [+0.5876% +0.8812%
+                 +1.1837%]
+                (p = 0.00 < 0.05)
+        Change within noise threshold.
+    options:
+      - text: Die Verschlechterung von `zaehle_fehler` ist echt. Das ganze Intervall liegt weit über der Rauschschwelle, und p liegt unter 0,05.
+        correct: true
+        why: Selbst die untere Grenze (+37,9 %) liegt weit über 1 %. criterion urteilt deshalb „regressed“.
+      - text: Das reine Zeilenlesen hat sich nicht relevant verändert. Die zusätzliche Zeit entsteht beim Erkennen der Fehlerzeilen.
+        correct: true
+        why: "`zaehle_zeilen` bleibt im Rauschen. Was `zaehle_fehler` zusätzlich tut, ist das Erkennen des Levels; dort muss die Ursache liegen."
+      - text: hyperfine (+33 %) und criterion (+39 %) widersprechen sich, eine der Messungen ist kaputt.
+        correct: false
+        why: hyperfine misst das ganze Programm mit Prozessstart und Datei lesen. Dieselbe zusätzliche Zeit verteilt sich auf eine größere Gesamtzeit, der Prozentwert fällt kleiner aus.
+      - text: "`zaehle_zeilen` ist 0,9 % langsamer geworden, das ist eine zweite Regression."
+        correct: false
+        why: Die untere Grenze (+0,59 %) liegt innerhalb der Rauschschwelle von 1 %. criterion wertet das als Rauschen, und am Zeilenlesen hat der Commit nichts geändert.
+      - text: Wegen des Ausreißers bis 99,1 ms ist der hyperfine-Vergleich wertlos.
+        correct: false
+        why: Ein Ausreißer unter 53 Läufen vergrößert σ, aber schon die Minima (41,5 gegen 54,4 ms) liegen klar auseinander. criterion bestätigt die Richtung unabhängig davon.
+    explanation: |
+      Zwei Werkzeuge, ein Befund: Version 2.4 ist langsamer, und es liegt am Erkennen der Fehlerzeilen. criterion liefert das statistische Urteil auf Funktionsebene, hyperfine die Wirkung auf das ganze Programm. Dass hyperfine einen kleineren Prozentwert zeigt, ist zu erwarten, denn Start und I/O bleiben gleich. Mit `--metrics time` sieht man das direkt: Die User-Zeit stieg von 36,6 auf 49,2 ms (+34,5 %), die System-Zeit blieb bei 8,6 bis 8,8 ms.
+    resources:
+      - title: criterion.rs · Command-Line Output
+        url: https://bheisler.github.io/criterion.rs/book/user_guide/command_line_output.html
+      - title: criterion · noise_threshold
+        url: https://docs.rs/criterion/latest/criterion/struct.Criterion.html#method.noise_threshold
+
+  - id: fall-flamegraph
+    type: explain
+    title: "Logparser-Fall (3/4): Wo bleibt die Zeit?"
+    prompt: |
+      Eine Aufnahme von Version 2.4 mit derselben Arbeit wie die Aufnahme von 2.3 in der Lektion (dieselbe Eingabe, 1000 Samples pro Sekunde). Oben vereinfacht als Text, 32 Zeichen für 1382 Samples, unten gefaltet (Anfang `main;zaehle_fehler;` weggelassen). Erkläre, wohin die zusätzliche Zeit geht, woran du es erkennst und warum der Anteil zur Messung aus Teil 2 passt.
+    lang: text
+    code: |
+      [][memch]   [ma]
+      [][split   ][to_lo][memchr ]
+      [ist_fehler       ][lines      ]
+      [zaehle_fehler                 ]
+      [main                          ]
+
+      lines 193
+      lines;memchr 381
+      ist_fehler;drop;free 96
+      ist_fehler;split 112
+      ist_fehler;split;memchr 302
+      ist_fehler;to_lowercase 141
+      ist_fehler;to_lowercase;malloc 157
+    points:
+      - Neu unter `ist_fehler` sind `to_lowercase` mit `malloc` und `drop` mit `free`, zusammen 394 von 1382 Samples, rund 28,5 %.
+      - Das passt zur Messung. 39 % mehr Zeit heißt, dass der neue Teil 0,39 / 1,39 ≈ 28 % der neuen Laufzeit ausmacht.
+      - "`lines` und `split` sind dieselben Türme wie in 2.3. Die alte Arbeit ist geblieben, neue kam dazu; verglichen werden Anteile, weil absolute Sample-Zahlen zwischen Aufnahmen streuen."
+      - Ursache ist ein neuer `String` pro Zeile, nur für den Vergleich, mit Allokation und Freigabe.
+      - "`ist_fehler` hat keine Selbstzeit. Seine Breite von 58 % kommt ganz aus den Kindern."
+    explanation: |
+      In 2.4 trägt `ist_fehler` zwei neue Türme: `to_lowercase` (141 Samples selbst, 157 in `malloc`) und `drop` mit `free` (96). Zusammen sind das 394 Samples oder 28,5 % der Aufnahme. Absolute Sample-Zahlen streuen zwischen zwei Aufnahmen (insgesamt 1382 statt 930, das wären +49 % statt der +39 % aus criterion), deshalb vergleichst du Anteile: `lines` und `split` tragen dieselbe Arbeit wie vorher, neu sind die rund 400 Samples für Kleinschreibung, Allokation und Freigabe. Das deckt sich mit criterion: +39 % auf die alte Zeit sind 28 % der neuen. Die Ursache ist damit eingegrenzt. `to_lowercase` legt für jede Zeile einen neuen `String` an, nur um ihn mit „error“ zu vergleichen, und gibt ihn sofort wieder frei.
+    resources:
+      - title: std · str::to_lowercase
+        url: https://doc.rust-lang.org/std/primitive.str.html#method.to_lowercase
+      - title: Perf Book · Heap Allocations
+        url: https://nnethercote.github.io/perf-book/heap-allocations.html#profiling
+
+  - id: fall-teure-zeile
+    type: bug
+    title: "Logparser-Fall (4/4): Die teure Zeile"
+    prompt: |
+      Das ist `ist_fehler` in Version 2.4; `zaehle_fehler` ruft es für jede Zeile auf. Die Fehlerzeilen sollen weiter als `ERROR`, `error` oder `Error` erkannt werden, aber ohne die Kosten aus Teil 3. Finde die Zeile und schreibe sie so, dass sie dasselbe erkennt, ohne zu allozieren.
+    lang: rust
+    code: |
+      fn ist_fehler(z: &str) -> bool {
+          let lv = z
+              .split(' ')
+              .nth(1)
+              .unwrap_or("");
+          lv.to_lowercase() == "error"
+      }
+    lines: [6]
+    fix:
+      - line: 6
+        answers:
+          - lv.eq_ignore_ascii_case("error")
+          - lv.eq_ignore_ascii_case("ERROR")
+          - '"error".eq_ignore_ascii_case(lv)'
+          - '"ERROR".eq_ignore_ascii_case(lv)'
+          - lv.eq_ignore_ascii_case("Error")
+          - '"Error".eq_ignore_ascii_case(lv)'
+    hints:
+      - "`str` hat eine Methode, die zwei Texte ohne Rücksicht auf ASCII-Groß-/Kleinschreibung vergleicht."
+      - Sie heißt `eq_ignore_ascii_case` und braucht keinen neuen String.
+    explanation: |
+      `to_lowercase` baut einen neuen `String`, also eine Allokation und eine Freigabe pro Zeile. [`eq_ignore_ascii_case`](https://doc.rust-lang.org/std/primitive.str.html#method.eq_ignore_ascii_case) vergleicht Byte für Byte und ignoriert dabei nur ASCII-Groß-/Kleinschreibung. Für ein Log-Level reicht das. Im Testlauf zählte der Allokator in `zaehle_fehler` danach 0 statt 10 000 Allokationen pro 10 000 Zeilen, und criterion meldete gegen die Baseline von 2.3 „No change in performance detected“ (−0,2 %, p = 0,20). Die Regression ist weg, und die neue Funktion bleibt.
+    resources:
+      - title: std · str::eq_ignore_ascii_case
+        url: https://doc.rust-lang.org/std/primitive.str.html#method.eq_ignore_ascii_case
+
+  - id: messprotokoll-schreiben
+    type: practice
+    title: Das Messprotokoll zum Fall
+    prompt: |
+      Schreibe das Messprotokoll für den Pull Request, der Version 2.4.1 mit der Korrektur aus Teil 4 bringt. Fünf bis acht kurze Zeilen genügen. Diese Messwerte liegen vor (Testrechner, Release-Build):
+
+      ```text
+      Eingabe: app.log, 1 Mio. Zeilen
+      hyperfine --warmup 3, Wall Time
+        2.3    44.6 ms ± 3.3 ms
+        2.4    59.4 ms ± 6.6 ms
+        2.3    44.6 ms ± 2.5 ms
+        2.4.1  46.0 ms ± 3.7 ms
+      criterion zaehle_fehler,
+      10 000 Zeilen, gegen 2.3:
+        2.4    +39.2 %, regressed
+        2.4.1  −0.2 %, p = 0.20,
+               no change detected
+      Allokationen in zaehle_fehler
+      je 10 000 Zeilen:
+        2.3: 0  2.4: 10000  2.4.1: 0
+      Profil 2.4: to_lowercase,
+        malloc und free 28,5 %
+      ```
+    lang: text
+    starter: |
+      Problem:
+      Messaufbau:
+      Befund:
+      Änderung:
+      Ergebnis:
+      Entscheidung:
+    solution: |
+      Problem: Der Job läuft seit 2.4
+      länger.
+      Messaufbau: Release-Build, app.log
+      (1 Mio. Zeilen), hyperfine mit 3
+      Warmups, criterion gegen die
+      Baseline 2.3.
+      Befund: 2.4 ist 33 % langsamer
+      (ganzes Programm), zaehle_fehler
+      39 %. Das Profil zeigt
+      to_lowercase mit malloc und free
+      (28,5 %): ein neuer String pro
+      Zeile, 10 000 Allokationen je
+      10 000 Zeilen.
+      Änderung: nur diese Zeile, jetzt
+      eq_ignore_ascii_case.
+      Ergebnis: 0 Allokationen;
+      criterion gegen 2.3 ohne Änderung
+      (p = 0,20); hyperfine +3,1 %,
+      kleiner als die Streuung (σ 2,5
+      und 3,7 ms).
+      Entscheidung: 2.4.1 ausliefern.
+      Vor jedem Release läuft künftig
+      criterion gegen die Vorversion.
+    checklist:
+      - Das Protokoll nennt Eingabe, Build-Profil und Werkzeuge, sodass jemand die Messung wiederholen kann.
+      - Die Regression ist mit beiden Werkzeugen beziffert, und der Unterschied zwischen 33 % und 39 % ist begründet oder zumindest richtig zugeordnet.
+      - Die Ursache ist mit einem Beleg verknüpft, also Profil oder Allokationszähler, nicht nur mit dem Diff.
+      - Es ist genau eine Änderung beschrieben, und ihr Ergebnis ist gegen die Baseline von 2.3 angegeben.
+      - Die +3,1 % von hyperfine für 2.4.1 sind als Streuung eingeordnet, nicht als neue Regression.
+      - Die Entscheidung ist klar und sagt, wie eine Wiederholung künftig auffällt.
+    explanation: |
+      Ein Messprotokoll beantwortet drei Fragen: Was wurde wie gemessen? Was ist der Befund? Was folgt daraus? Die +3,1 % von hyperfine für 2.4.1 sind kleiner als die Streuung beider Messreihen, und hyperfine macht keinen Signifikanztest. criterion dagegen findet auf Funktionsebene keinen Unterschied (p = 0,20). Wer das sauber trennt, erspart dem Team eine Geisterjagd nach einer Regression, die es nicht gibt.
+    resources:
+      - title: criterion.rs · Command-Line Output
+        url: https://bheisler.github.io/criterion.rs/book/user_guide/command_line_output.html

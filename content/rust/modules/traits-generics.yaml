@@ -1,7 +1,7 @@
 id: traits-generics
 title: Traits & Generics
 level: 2
-minutes: 180
+minutes: 210
 summary: Generischer Code ohne Laufzeitkosten, gemeinsames Verhalten über Traits und die Wahl zwischen statischer und dynamischer Dispatch – das Werkzeug, mit dem Rust-Bibliotheken ihre APIs bauen.
 goals:
   - Du schreibst generische Funktionen, Structs und `impl`-Blöcke und erklärst, was Monomorphisierung kostet und bringt.
@@ -9,6 +9,7 @@ goals:
   - Du entscheidest begründet zwischen `impl Trait`, Generics und `dyn Trait` und erklärst, was eine vtable ist.
   - Du leitest die wichtigsten Standard-Traits per `derive` ab und implementierst `Display`, `From` und `Add` von Hand.
   - Du erklärst die Orphan Rule und umgehst sie mit dem Newtype-Muster.
+  - "Du entwirfst öffentliche APIs nach den Rust API Guidelines: `TryFrom`/`FromStr`, Builder, Typestate mit `PhantomData`, sealed traits, `#[non_exhaustive]` und `#[must_use]`."
 resources:
   - title: The Rust Book · Kapitel 10 – Generic Types, Traits, and Lifetimes
     url: https://doc.rust-lang.org/book/ch10-00-generics.html
@@ -18,6 +19,9 @@ resources:
     url: https://doc.rust-lang.org/reference/items/traits.html
   - title: Rust by Example · Traits
     url: https://doc.rust-lang.org/rust-by-example/trait.html
+  - title: Rust API Guidelines · Checkliste
+    url: https://rust-lang.github.io/api-guidelines/checklist.html
+place: pc
 lesson: |
   Dein Monitoring-Tool prüft Festplatten, Dienste und Zertifikate. Jede Prüfung hat einen Namen und ein Ergebnis, aber jede ermittelt es anders. Später sollen Benachrichtigungen per Mail, Slack oder in eine Datei gehen – je nach Konfiguration. In TypeScript würdest du dafür Interfaces schreiben, in Kotlin ebenfalls. In Rust heißen sie **Traits**. Dazu kommen **Generics**: Funktionen und Typen, die für viele konkrete Typen funktionieren, ohne dass du sie für jeden Typ kopierst.
 
@@ -397,6 +401,283 @@ lesson: |
   > [!PRAXIS] Newtypes als Werkzeug für Korrektheit
   > In echten Codebasen sind Newtypes nicht nur ein Trick gegen die Orphan Rule. `struct Cent(u64)`, `struct UserId(u64)` und `struct OrderId(u64)` machen Verwechslungen zu Compile-Fehlern: Eine Funktion `fn storniere(id: OrderId)` nimmt keine `UserId` an. Zur Laufzeit kostet das nichts, der Newtype hat dieselbe Größe wie der eingepackte Wert. In Code-Reviews ist „nackter `u64` für Geld“ ein häufiger Kommentar.
 
+  ## API-Design: Typen, die falsche Benutzung verhindern
+
+  Sobald andere deinen Code benutzen – ein Kollege, ein anderes Crate im Workspace, du selbst in einem halben Jahr –, wird die Signatur zur Dokumentation. Eine gute Rust-API macht falsche Benutzung zum Compile-Fehler statt zum Laufzeitfehler. Und sie lässt sich erweitern, ohne jeden Nutzer zu brechen. Die [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/) sammeln dafür Regeln mit Kürzeln wie C-BUILDER; ihre [Checkliste](https://rust-lang.github.io/api-guidelines/checklist.html) taugt als Vorlage im Code-Review. Die Werkzeuge kennst du schon aus diesem Modul: Traits, Generics und eigene Typen.
+
+  ### Prüfend konvertieren: TryFrom und FromStr
+
+  `From` darf nicht scheitern. Kann eine Umwandlung scheitern, etwa bei Port 0 oder einem unbekannten Namen aus einer Konfiguration, implementierst du [`TryFrom`](https://doc.rust-lang.org/std/convert/trait.TryFrom.html) mit einem eigenen Fehlertyp. Wie bei `From` und `Into` bekommst du `TryInto` dazu ([generische Implementierungen](https://doc.rust-lang.org/std/convert/trait.TryFrom.html#generic-implementations)). Für Text gibt es [`FromStr`](https://doc.rust-lang.org/std/str/trait.FromStr.html): Wer es implementiert, bekommt [`str::parse`](https://doc.rust-lang.org/std/primitive.str.html#method.parse) für seinen Typ. clap und viele Konfigurationsbibliotheken nutzen genau diesen Trait, um Argumente in deine Typen zu verwandeln.
+
+  ```rust
+  use std::fmt;
+  use std::str::FromStr;
+
+  #[derive(Debug, Clone, Copy, PartialEq)]
+  struct Port(u16);
+
+  #[derive(Debug, PartialEq)]
+  struct PortNull;
+
+  impl TryFrom<u16> for Port {
+      type Error = PortNull;
+
+      fn try_from(n: u16) -> Result<Self, Self::Error> {
+          if n == 0 { Err(PortNull) } else { Ok(Port(n)) }
+      }
+  }
+
+  #[derive(Debug, Clone, Copy, PartialEq)]
+  enum Stufe { Info, Warn, Error }
+
+  #[derive(Debug, PartialEq)]
+  struct UnbekannteStufe(String);
+
+  impl fmt::Display for UnbekannteStufe {
+      fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+          write!(f, "unbekannte Stufe {:?}", self.0)
+      }
+  }
+
+  impl FromStr for Stufe {
+      type Err = UnbekannteStufe;
+
+      fn from_str(s: &str) -> Result<Self, Self::Err> {
+          match s.to_ascii_lowercase().as_str() {
+              "info" => Ok(Stufe::Info),
+              "warn" => Ok(Stufe::Warn),
+              "error" => Ok(Stufe::Error),
+              _ => Err(UnbekannteStufe(s.to_string())),
+          }
+      }
+  }
+
+  fn main() {
+      println!("{:?}", Port::try_from(8080)); // Ok(Port(8080))
+      println!("{:?}", Port::try_from(0));    // Err(PortNull)
+      let p: Result<Port, _> = 443_u16.try_into(); // TryInto gibt es gratis
+      println!("{p:?}");
+
+      let s: Stufe = "WARN".parse().unwrap(); // parse ruft FromStr auf
+      println!("{s:?}");                       // Warn
+      match "debug".parse::<Stufe>() {
+          Ok(s) => println!("{s:?}"),
+          Err(e) => println!("{e}"),           // unbekannte Stufe "debug"
+      }
+  }
+  ```
+
+  Der Gewinn: Ein `Port` ist im restlichen Programm nie 0. Die Prüfung steht an genau einer Stelle statt in jeder Funktion, die einen `u16` annimmt. Das ist die Newtype-Idee aus dem vorigen Abschnitt, ergänzt um Validierung ([C-NEWTYPE](https://rust-lang.github.io/api-guidelines/type-safety.html#c-newtype)). Dass Konvertierungen über diese Standard-Traits laufen statt über eigene Namen wie `port_von_zahl`, verlangt [C-CONV-TRAITS](https://rust-lang.github.io/api-guidelines/interoperability.html#c-conv-traits).
+
+  ### Builder: viele Optionen, ein gültiges Ergebnis
+
+  Rust kennt keine benannten oder optionalen Parameter. `Pruefung::neu(name, adresse, timeout, versuche)` ist schon mit vier Argumenten schwer zu lesen, und ein fünftes bricht jeden Aufrufer. Ein [Builder](https://rust-lang.github.io/api-guidelines/type-safety.html#c-builder) sammelt die Optionen schrittweise und prüft sie am Ende in `build`:
+
+  ```rust
+  use std::time::Duration;
+
+  #[derive(Debug)]
+  pub struct Pruefung {
+      name: String,
+      adresse: String,
+      timeout: Duration,
+      versuche: u32,
+  }
+
+  #[derive(Debug)]
+  #[must_use = "ohne build() entsteht keine Prüfung"]
+  pub struct PruefungBuilder {
+      name: String,
+      adresse: Option<String>,
+      timeout: Duration,
+      versuche: u32,
+  }
+
+  impl Pruefung {
+      pub fn builder(name: impl Into<String>) -> PruefungBuilder {
+          PruefungBuilder {
+              name: name.into(),
+              adresse: None,
+              timeout: Duration::from_secs(2),
+              versuche: 1,
+          }
+      }
+  }
+
+  impl PruefungBuilder {
+      pub fn adresse(mut self, a: impl Into<String>) -> Self {
+          self.adresse = Some(a.into());
+          self
+      }
+      pub fn timeout(mut self, t: Duration) -> Self {
+          self.timeout = t;
+          self
+      }
+      pub fn versuche(mut self, n: u32) -> Self {
+          self.versuche = n;
+          self
+      }
+      pub fn build(self) -> Result<Pruefung, String> {
+          let adresse = self.adresse.ok_or("Adresse fehlt")?;
+          if self.versuche == 0 {
+              return Err("mindestens ein Versuch".into());
+          }
+          Ok(Pruefung { name: self.name, adresse, timeout: self.timeout, versuche: self.versuche })
+      }
+  }
+
+  fn main() {
+      let db = Pruefung::builder("datenbank")
+          .adresse("10.0.0.5:5432")
+          .timeout(Duration::from_millis(500))
+          .build();
+      println!("{db:?}");
+
+      let kaputt = Pruefung::builder("cache").versuche(0).build();
+      println!("{kaputt:?}"); // Err("Adresse fehlt")
+  }
+  ```
+
+  Jede Setter-Methode nimmt `self` per Wert und gibt es zurück, so entsteht die Kette. `build` liefert ein `Result`, weil erst dort alle Angaben zusammen geprüft werden können. Das `#[must_use]` am Builder warnt, wenn jemand die Kette ohne `build()` stehen lässt. Eine neue Option ist später eine neue Methode mit Standardwert, und kein Aufrufer bricht. Das funktioniert nur, weil die Felder von `Pruefung` privat sind ([C-STRUCT-PRIVATE](https://rust-lang.github.io/api-guidelines/future-proofing.html#c-struct-private)).
+
+  ### Typestate: den Zustand im Typ tragen
+
+  Manche Methoden ergeben nur in einem bestimmten Zustand Sinn: Senden erst nach dem Verbinden, Ausrollen erst nach der Freigabe. Statt das zur Laufzeit mit einem `bool` und einem Fehler zu prüfen, machst du den Zustand zum Typparameter. Zustände sind leere Structs. [`PhantomData`](https://doc.rust-lang.org/std/marker/struct.PhantomData.html) sagt dem Compiler, dass der Typ den Parameter benutzt, obwohl kein Feld ihn speichert. Es belegt keinen Speicher.
+
+  ```rust
+  use std::marker::PhantomData;
+
+  struct Getrennt;
+  struct Verbunden;
+
+  struct Verbindung<Zustand> {
+      adresse: String,
+      _zustand: PhantomData<Zustand>,
+  }
+
+  impl Verbindung<Getrennt> {
+      fn neu(adresse: &str) -> Self {
+          Verbindung { adresse: adresse.to_string(), _zustand: PhantomData }
+      }
+
+      fn verbinden(self) -> Verbindung<Verbunden> {
+          println!("verbinde mit {}", self.adresse);
+          Verbindung { adresse: self.adresse, _zustand: PhantomData }
+      }
+  }
+
+  impl Verbindung<Verbunden> {
+      fn senden(&self, zeile: &str) {
+          println!("→ {zeile}");
+      }
+  }
+
+  fn main() {
+      let v = Verbindung::neu("127.0.0.1:7000");
+      // v.senden("PING");  // Fehler: senden gibt es nur für Verbindung<Verbunden>
+      let v = v.verbinden();
+      v.senden("PING");
+      println!("{}", std::mem::size_of::<PhantomData<Verbunden>>()); // 0
+  }
+  ```
+
+  `verbinden` verbraucht die getrennte Verbindung (`self` per Wert) und liefert eine verbundene. Danach gibt es keinen Wert mehr, auf dem man fälschlich weiterarbeiten könnte; Ownership erledigt den Rest. Nimmst du den Kommentar vor `v.senden` weg, meldet rustc ([E0599](https://doc.rust-lang.org/error_codes/E0599.html)):
+
+  ```text
+  error[E0599]: no method named `senden` found for struct `Verbindung<Getrennt>` in the current scope
+     |
+  30 |     v.senden("PING");
+     |       ^^^^^^ method not found in `Verbindung<Getrennt>`
+     |
+     = note: the method was found for `Verbindung<Verbunden>`
+  ```
+
+  Typestate lohnt sich bei wenigen, klaren Zuständen und Abläufen, die immer gleich verlaufen. Steht ein Zustand erst zur Laufzeit fest (eine Verbindung kann jederzeit abbrechen), brauchst du weiterhin ein Enum und `Result`. Zu viele Zustände machen Signaturen unlesbar.
+
+  ### Sealed und Extension Traits
+
+  Ein öffentlicher Trait gibt ein stilles Versprechen: Jeder darf ihn implementieren. Fügst du später eine Pflichtmethode hinzu, bricht jede fremde Implementierung. Ein **sealed trait** verhindert fremde Implementierungen, indem er einen Supertrait aus einem privaten Modul verlangt ([C-SEALED](https://rust-lang.github.io/api-guidelines/future-proofing.html#c-sealed)). Nutzer können ihn verwenden, aber nicht implementieren. Damit darfst du ihn erweitern.
+
+  Ein **extension trait** geht in die Gegenrichtung: Er gibt einem fremden Typ neue Methoden. Die Orphan Rule erlaubt das, weil der Trait aus deinem Crate stammt. Die Konvention ist das Suffix `Ext` ([RFC 445](https://rust-lang.github.io/rfcs/0445-extension-trait-conventions.html)); du triffst es als `StreamExt` oder `AsyncReadExt` im Async-Modul wieder. Die Methoden gibt es nur dort, wo der Trait importiert ist.
+
+  ```rust
+  use std::time::Duration;
+
+  mod privat {
+      pub trait Versiegelt {}
+  }
+
+  /// Ein Ziel, das der Healthchecker prüfen kann.
+  /// Nur dieses Crate darf Ziele hinzufügen.
+  pub trait Ziel: privat::Versiegelt {
+      fn beschreibung(&self) -> String;
+  }
+
+  pub struct Tcp(pub String);
+  pub struct Http(pub String);
+
+  impl privat::Versiegelt for Tcp {}
+  impl privat::Versiegelt for Http {}
+
+  impl Ziel for Tcp {
+      fn beschreibung(&self) -> String { format!("tcp://{}", self.0) }
+  }
+  impl Ziel for Http {
+      fn beschreibung(&self) -> String { format!("http://{}", self.0) }
+  }
+
+  // Extension Trait: neue Methoden für einen fremden Typ
+  pub trait DauerExt {
+      fn als_ms_text(&self) -> String;
+  }
+
+  impl DauerExt for Duration {
+      fn als_ms_text(&self) -> String {
+          format!("{} ms", self.as_millis())
+      }
+  }
+
+  fn main() {
+      let ziele: Vec<Box<dyn Ziel>> = vec![
+          Box::new(Tcp("db:5432".into())),
+          Box::new(Http("api/health".into())),
+      ];
+      for z in &ziele {
+          println!("{}", z.beschreibung());
+      }
+      println!("{}", Duration::from_millis(1500).als_ms_text()); // 1500 ms
+  }
+  ```
+
+  Das Modul `privat` ist nicht öffentlich. Ein anderes Crate kann `privat::Versiegelt` deshalb nicht nennen und `Ziel` nicht implementieren.
+
+  ### `#[non_exhaustive]` und `#[must_use]`
+
+  Ein öffentliches Fehler-Enum mit zwei Varianten verspricht: Es gibt genau diese zwei. Eine dritte Variante in Version 1.3 bricht jedes `match` deiner Nutzer, nach SemVer wäre das ein Major-Release (SemVer und Sichtbarkeit mit `pub` vertieft das Modul [Module, Crates & Cargo](/rust/module-cargo)). Mit [`#[non_exhaustive]`](https://doc.rust-lang.org/reference/attributes/type_system.html#the-non_exhaustive-attribute) verlangt der Compiler von Nutzern **außerhalb** deines Crates einen `_`-Arm, und du darfst später Varianten ergänzen. Setze es beim ersten Release oder beim nächsten Major-Release: Das Attribut nachträglich an ein bestehendes Enum zu hängen, ist selbst ein Breaking Change, weil es jedes vorhandene `match` ohne `_` bricht ([Cargo: SemVer](https://doc.rust-lang.org/cargo/reference/semver.html#attr-adding-non-exhaustive)).
+
+  ```rust
+  #[derive(Debug)]
+  #[non_exhaustive]
+  pub enum Fehler {
+      Timeout,
+      Verweigert,
+  }
+  ```
+
+  Ein anderes Crate, das in `match f { … }` nur `Timeout` und `Verweigert` behandelt, bekommt ([E0004](https://doc.rust-lang.org/error_codes/E0004.html)):
+
+  ```text
+  error[E0004]: non-exhaustive patterns: `_` not covered
+    = note: `Fehler` is marked as non-exhaustive, so a wildcard `_` is necessary to match exhaustively
+  ```
+
+  Innerhalb deines eigenen Crates wirkt das Attribut nicht, dort bleibt das `match` vollständig prüfbar. An einem Struct verhindert es, dass fremde Crates ihn mit Literal-Syntax bauen; ein neues Feld bricht dann niemanden.
+
+  [`#[must_use]`](https://doc.rust-lang.org/reference/attributes/diagnostics.html#the-must_use-attribute) löst die Warnung `unused_must_use` aus, wenn jemand einen Rückgabewert verwirft. `Result` trägt es schon, deshalb warnt ein verworfenes `Result` ohne dein Zutun. Sinnvoll ist es an Funktionen ohne Nebenwirkung, deren Ergebnis der ganze Zweck ist – die Standardbibliothek markiert etwa `str::trim` so –, und an Typen wie Buildern. Ein `#[must_use]` ohne Begründung an einer Funktion, die ohnehin `Result` liefert, ist doppelt; Clippy meldet das als [`double_must_use`](https://rust-lang.github.io/rust-clippy/master/index.html#double_must_use).
+
+  > [!INTERVIEW] „Wie hältst du eine öffentliche API stabil?“
+  > Von Anfang an: Felder privat, Konstruktion über Funktionen oder einen Builder, wachsende Enums mit `#[non_exhaustive]`, Traits, die nur meine Bibliothek implementiert, versiegelt. Nachrüsten lässt sich das nur mit einem Major-Release. Dazu Standard-Traits wie `From`, `TryFrom`, `FromStr`, `Display` und `Debug` statt eigener Namen. Dann kann ich Varianten, Felder und Methoden ergänzen, ohne ein Major-Release zu brauchen. Neue APIs prüfe ich gegen die Checkliste der Rust API Guidelines.
+
   ## Häufige Fehler
 
   - **Bound vergessen.** `binary operation > cannot be applied to type &T` ([E0369](https://doc.rust-lang.org/error_codes/E0369.html)) oder `T doesn't implement Display` ([E0277](https://doc.rust-lang.org/error_codes/E0277.html)). Die Hilfe des Compilers schlägt den fehlenden Bound meist wörtlich vor.
@@ -405,6 +686,8 @@ lesson: |
   - **Trait nicht dyn compatible.** [E0038](https://doc.rust-lang.org/error_codes/E0038.html). Die generische Methode in einen eigenen Trait auslagern oder mit `where Self: Sized` aus der vtable ausnehmen.
   - **Fremder Trait für fremden Typ.** [E0117](https://doc.rust-lang.org/error_codes/E0117.html). Newtype drumherum bauen.
   - **`Into` statt `From` implementieren.** Funktioniert, verschenkt aber die automatische Gegenrichtung. Immer `From` implementieren.
+  - **Öffentliche Felder und erschöpfende Enums in einer Bibliothek.** Jede Ergänzung wird zum Breaking Change. Felder privat halten, wachsende Enums mit `#[non_exhaustive]` markieren.
+  - **`Option` statt Fehlertyp beim Konvertieren.** `fn port_aus_text(s: &str) -> Option<u16>` verschweigt, was falsch war. `TryFrom` oder `FromStr` mit eigenem Fehler sagen es dem Aufrufer.
   - **Blind alles ableiten.** `Copy` auf einem großen Struct macht jede Übergabe zur Kopie; `Default` auf einem Typ ohne sinnvollen Standardwert lädt zu ungültigen Zuständen ein.
 
   ## Zusammenfassung
@@ -417,6 +700,7 @@ lesson: |
   - `derive` liefert `Debug`, `Clone`, `Copy`, `PartialEq`, `Eq`, `PartialOrd`, `Ord`, `Hash`, `Default`; `Display` schreibst du selbst.
   - `From` implementieren, `Into` benutzen; `AsRef` für billige Sichten.
   - Orphan Rule: Trait oder Typ muss lokal sein. Newtypes lösen das und machen Code typsicherer.
+  - API-Design: `TryFrom`/`FromStr` prüfen beim Konvertieren, Builder sammeln Optionen, Typestate mit `PhantomData` erzwingt Abläufe. Private Felder, sealed traits und `#[non_exhaustive]` halten eine öffentliche API erweiterbar.
 exercises:
   - id: dispatch-aussagen
     type: choice
@@ -786,6 +1070,60 @@ exercises:
       - title: Rust by Example · Operator Overloading
         url: https://doc.rust-lang.org/rust-by-example/trait/ops.html
 
+  - id: typestate-release
+    type: gap
+    title: Ausrollen erst nach der Freigabe
+    prompt: |
+      Ein Release soll sich nur ausrollen lassen, nachdem es freigegeben wurde – und zwar so, dass ein Aufruf von `ausrollen` auf einem Entwurf **nicht kompiliert**. Ergänze die drei Lücken. Erwartete Ausgabe: `rolle 2.4.0 aus`.
+    lang: rust
+    code: |
+      use std::marker::PhantomData;
+
+      struct Entwurf;
+      struct Freigegeben;
+
+      struct Release<S> {
+          version: String,
+          _s: ⟦PhantomData<S>⟧,
+      }
+
+      impl Release<Entwurf> {
+          fn neu(v: &str) -> Self {
+              Release { version: v.to_string(), _s: PhantomData }
+          }
+
+          fn freigeben(⟦self⟧) -> Release<Freigegeben> {
+              Release { version: self.version, _s: PhantomData }
+          }
+      }
+
+      impl ⟦Release<Freigegeben>⟧ {
+          fn ausrollen(&self) {
+              println!("rolle {} aus", self.version);
+          }
+      }
+
+      fn main() {
+          let r = Release::neu("2.4.0").freigeben();
+          r.ausrollen();
+      }
+    gaps:
+      - label: Feldtyp für den Zustand
+        hint: Ein Marker aus `std::marker`, der den Typparameter „benutzt“, ohne Speicher zu belegen.
+        accept: ["std::marker::PhantomData<S>"]
+      - label: Empfänger von freigeben
+        hint: Der Entwurf soll danach nicht mehr existieren. Wie übergibst du einen Wert, damit er verbraucht wird?
+        accept: ["mut self"]
+      - label: Für welchen Typ gilt dieser impl-Block?
+        hint: "`ausrollen` darf es nur im freigegebenen Zustand geben."
+    explanation: |
+      Der Zustand steckt im Typparameter `S`. Weil kein Feld einen Wert vom Typ `S` speichert, braucht der Struct `PhantomData<S>` – sonst meldet der Compiler einen unbenutzten Parameter (E0392). `freigeben(self)` nimmt den Entwurf per Wert: Danach ist `r` vor der Freigabe verbraucht, niemand kann versehentlich mit dem alten Zustand weiterarbeiten. Der Block `impl Release<Freigegeben>` legt `ausrollen` nur für freigegebene Releases an. `Release::neu("2.4.0").ausrollen()` scheitert deshalb mit E0599 („the method was found for `Release<Freigegeben>`“). Zur Laufzeit kostet das nichts, `PhantomData` hat die Größe 0.
+    resources:
+      - title: std · PhantomData
+        url: https://doc.rust-lang.org/std/marker/struct.PhantomData.html
+      - title: Error-Index · E0392 (unbenutzter Typparameter)
+        url: https://doc.rust-lang.org/error_codes/E0392.html
+
   - id: fehlender-bound
     type: bug
     title: Generisch, aber nicht vergleichbar
@@ -928,6 +1266,47 @@ exercises:
         url: https://doc.rust-lang.org/std/string/trait.ToString.html#impl-ToString-for-T
       - title: Error-Index · E0119
         url: https://doc.rust-lang.org/error_codes/E0119.html
+
+  - id: api-erweiterbar
+    type: explain
+    title: Was geht in 1.4, was braucht 2.0?
+    prompt: |
+      Du reviewst die öffentliche API einer Deploy-Bibliothek in Version 1.3, die drei andere Teams nutzen. Gewünscht sind: eine neue Fehlervariante `Netzwerk`, ein neues Feld `timeout` in `Konfig` und eine neue Methode `pruefen` im Trait `Ziel`. Erkläre, welche Änderung in 1.4 ohne Bruch geht und welche ein Major-Release 2.0 braucht – und warum. Wie baust du die API in 2.0, damit solche Ergänzungen danach Minor-Releases bleiben? Was hältst du von `port_aus_text`?
+    lang: rust
+    code: |
+      pub enum DeployFehler {
+          Timeout,
+          Abgelehnt,
+      }
+
+      pub struct Konfig {
+          pub host: String,
+          pub port: u16,
+      }
+
+      pub trait Ziel {
+          fn ausrollen(&self, k: &Konfig) -> Result<(), DeployFehler>;
+      }
+
+      pub fn port_aus_text(s: &str) -> Option<u16> {
+          s.parse().ok()
+      }
+    points:
+      - "Die neue Variante bricht jedes vollständige `match` der Nutzer, also 2.0. `#[non_exhaustive]` nachzurüsten wäre selbst ein Bruch; es gehört deshalb in 2.0, danach sind neue Varianten Minor."
+      - "Das neue öffentliche Feld bricht jede Konstruktion `Konfig { host, port }`, also ebenfalls 2.0. In 2.0 werden die Felder privat, gebaut wird über Konstruktor oder Builder (oder `#[non_exhaustive]` am Struct)."
+      - "`pruefen` geht in 1.4, wenn die Methode eine Default-Implementierung bekommt (die Cargo-Referenz nennt das nur „possibly-breaking“). Ohne Default bricht sie jede fremde Implementierung; soll nur die Bibliothek `Ziel` implementieren, wird der Trait in 2.0 versiegelt."
+      - "`port_aus_text` verschweigt den Grund des Scheiterns und ist ein eigener Name für eine Standard-Konvertierung; besser ein `Port`-Newtype mit `FromStr` oder `TryFrom` und eigenem Fehlertyp."
+    explanation: |
+      Nutzer dürfen sich auf die vollständige Form einer öffentlichen API verlassen. Wer `match fehler { Timeout => …, Abgelehnt => … }` schreibt, bekommt mit `Netzwerk` einen Compile-Fehler; laut Cargo-SemVer-Referenz ist eine neue Variante in einem erschöpfenden Enum ein Major-Change. Dasselbe gilt für `#[non_exhaustive]` selbst, wenn man es nachträglich anbringt – es bricht dieselben `match`-Ausdrücke. Also: 2.0 mit `Netzwerk` und `#[non_exhaustive]`, danach darf das Enum wachsen. Öffentliche Felder erlauben `Konfig { host, port }`; ein weiteres Feld macht diesen Ausdruck ungültig. Private Felder plus `Konfig::new` oder ein Builder entkoppeln Nutzer von der Struktur, auch das ist der Schritt zu 2.0. Nur `pruefen` kann in 1.4 kommen, mit Default-Implementierung; ohne Default bricht sie jedes Team, das `Ziel` selbst implementiert hat. Soll das nie jemand außer der Bibliothek tun, versiegelt man den Trait in 2.0 mit einem privaten Supertrait. `port_aus_text` liefert bei `"80a"` und `"70000"` dasselbe `None`; ein `Port` mit `FromStr` nennt den Fehler und passt zu `str::parse`. Die Lehre: Erweiterbarkeit plant man beim ersten Release (C-STRUCT-PRIVATE, C-SEALED, C-CONV-TRAITS der Rust API Guidelines), nicht erst, wenn die erste Erweiterung ansteht.
+    resources:
+      - title: Rust API Guidelines · Future proofing
+        url: https://rust-lang.github.io/api-guidelines/future-proofing.html#c-sealed
+      - title: Rust Reference · non_exhaustive
+        url: https://doc.rust-lang.org/reference/attributes/type_system.html#the-non_exhaustive-attribute
+      - title: Cargo Book · SemVer Compatibility
+        url: https://doc.rust-lang.org/cargo/reference/semver.html#enum-variant-new
+      - title: Cargo Book · non_exhaustive nachträglich
+        url: https://doc.rust-lang.org/cargo/reference/semver.html#attr-adding-non-exhaustive
 
   - id: rabatt-regeln
     type: practice

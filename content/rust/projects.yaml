@@ -148,6 +148,113 @@ projects:
   - Graceful Shutdown mit sauber dokumentierter Teilausgabe.
   portfolio: Zeige eine gemessene Abwägung zu Workerzahl und Datenträgerlast. Erkläre Ownership-Transfer und warum
     mehr Threads nicht unbegrenzt schneller sind.
+- id: healthchecker
+  title: Healthchecker für Dienste
+  level: 3
+  hours: 28
+  summary: Dienste per TCP, HTTP und Prozessaufruf prüfen – begrenzt nebenläufig, abbrechbar, mit atomar geschriebenem Bericht und Messprotokoll.
+  capstone: false
+  brief: |-
+    Auftrag: Ein Plattformteam rollt jeden Dienstag um 6 Uhr aus. Vorher soll ein Werkzeug prüfen, ob alle Abhängigkeiten erreichbar sind: die Datenbank, zwei interne HTTP-APIs und ein lokales Prüfwerkzeug wie `pg_isready`. Heute klickt jemand die Liste von Hand ab. Das Team will einen Befehl, der in einer Pipeline läuft, einen klaren Exit-Status liefert und einen Bericht für das Deployment-Protokoll ablegt.
+
+    Baue `healthcheck` mit Tokio. Die Ziele stehen in einer TOML-Datei; jedes hat einen Namen, eine Art (`tcp`, `http` oder `befehl`) und einen Timeout:
+
+    ```toml
+    [[ziel]]
+    name = "datenbank"
+    art = "tcp"
+    adresse = "10.0.0.5:5432"
+    timeout_ms = 500
+
+    [[ziel]]
+    name = "api"
+    art = "http"
+    adresse = "10.0.0.7:8080"
+    pfad = "/health"
+    timeout_ms = 1000
+
+    [[ziel]]
+    name = "pg-bereit"
+    art = "befehl"
+    programm = "pg_isready"
+    argumente = ["-h", "10.0.0.5", "-p", "5432"]
+    timeout_ms = 2000
+    ```
+
+    Pflicht: TCP-Prüfung über Verbindungsaufbau; HTTP-Prüfung mit einer selbst geschriebenen, minimalen HTTP/1.1-Anfrage über `tokio::net::TcpStream` (nur `http://`, nur die Statuszeile auswerten, 2xx gilt als gesund – die Grenzen stehen im README); Prozessprüfung über `tokio::process::Command` mit Argumentliste, ohne Shell. Höchstens `--parallel N` Prüfungen gleichzeitig, jede mit eigenem Timeout. Strg+C bricht laufende Prüfungen ab und hinterlässt keine Kindprozesse. Der Textbericht geht auf stdout, Diagnosen auf stderr, ein JSON-Bericht wird atomar in eine Datei geschrieben. Exit-Status: 0 alle gesund, 1 mindestens ein Ziel ungesund, 2 Konfigurations- oder Aufruffehler. Dazu Tests, ein Benchmark und ein Messprotokoll.
+
+    Rahmen: Keine echten Firmenadressen im Repository, alle Tests laufen gegen lokale Fake-Dienste auf Port 0. Ein HTTP-Client wie reqwest wäre im Betrieb die bessere Wahl; hier schreibst du die Anfrage selbst, weil es um das Denkmodell Bytestrom, Framing und Timeout geht. KI darf dir Boilerplate wie das CI-YAML abnehmen. Parser, Nebenläufigkeitsmodell, Tests und Messprotokoll schreibst und begründest du selbst.
+  skills:
+  - Tokio
+  - select! und Timeouts
+  - Semaphore
+  - CancellationToken
+  - tokio::net
+  - tokio::process
+  - serde/toml
+  - clap
+  - Atomares Schreiben
+  - Integrationstests
+  - criterion
+  - hyperfine
+  steps:
+  - id: vertrag
+    title: Vertrag, Konfiguration und Fake-Dienste festlegen
+    detail: Schreibe das TOML-Format, die Exit-Status, das Berichtsformat (Text und JSON) und das Verhalten bei Strg+C auf, bevor du Code schreibst. Plane die lokalen Fake-Dienste für die Tests – gesund, langsam, HTTP 503, Port geschlossen – und welches Ergebnis jeder liefern muss.
+  - id: konfig-laden
+    title: Konfiguration laden und prüfen
+    detail: "`#[derive(Deserialize)]` mit `deny_unknown_fields` und einem Enum für die Art. Prüfe fachliche Regeln (Timeout größer 0, Programm nicht leer, Namen eindeutig) in einer `TryFrom`-Umwandlung in deine internen Typen. clap liefert `--konfig`, `--parallel` und `--bericht`; ein Fehler endet mit Status 2 und einer Meldung mit Datei und Ursache."
+  - id: tcp-pruefung
+    title: TCP-Prüfung mit Zeitlimit
+    detail: "`TcpStream::connect` innerhalb von `tokio::time::timeout`. Miss die Dauer mit `Instant` und unterscheide Zeitlimit, verweigerte Verbindung und Namensauflösung im Ergebnis. Teste gegen einen `TcpListener` auf `127.0.0.1:0` und gegen einen Port, der gerade frei geworden ist."
+  - id: http-pruefung
+    title: Minimale HTTP-Prüfung
+    detail: Sende `GET <pfad> HTTP/1.1` mit `Host` und `Connection close`, lies bis zum Ende der ersten Zeile und parse die Statuszeile in einer reinen Funktion ohne I/O. Die Funktion bekommt einen Property-Test mit proptest. Dokumentiere, was du bewusst nicht kannst (TLS, Weiterleitungen, Chunked Encoding).
+  - id: befehl-pruefung
+    title: Prozessprüfung ohne Shell
+    detail: "`tokio::process::Command` mit `args`, `kill_on_drop(true)` und Timeout. Werte `ExitStatus` aus, nimm einen gekürzten stderr-Auszug in den Bericht und unterscheide „Programm nicht gefunden“ von „Programm meldet Fehler“."
+  - id: begrenzt-nebenlaeufig
+    title: Begrenzt nebenläufig prüfen
+    detail: Starte jede Prüfung in einem `JoinSet` und begrenze die gleichzeitigen mit einer `Semaphore` (Permit wandert in die Task). Trenne Task-Fehler (`JoinError`) von fachlichen Fehlschlägen und sortiere die Ergebnisse vor der Ausgabe nach Namen.
+  - id: abbruch
+    title: Strg+C und Abbruch
+    detail: "`tokio::signal::ctrl_c` löst ein `CancellationToken` aus; jede Prüfung wartet per `select!` auf Ergebnis oder Abbruch. Prüfe, dass nach Strg+C kein Kindprozess weiterläuft, und lege fest, ob ein abgebrochener Lauf einen markierten Teilbericht schreibt."
+  - id: bericht-atomar
+    title: Bericht schreiben, ohne Halbes zu hinterlassen
+    detail: Textbericht über `BufWriter` auf gesperrtem stdout, Broken Pipe beendet still. Den JSON-Bericht schreibst du in eine temporäre Datei im Zielverzeichnis, rufst `flush` und `sync_all` auf und ersetzt das Ziel per `rename`.
+  - id: tests
+    title: Tests gegen Fake-Dienste
+    detail: "Integrationstests mit lokalen Fake-Diensten, Timeouts mit `#[tokio::test(start_paused = true)]`, wo die Zeit simuliert werden kann. Ein CLI-Test mit assert_cmd und tempfile prüft Exit-Status, stdout und die Berichtsdatei. Ein insta-Snapshot hält den Textbericht fest; Dauern filterst du heraus, damit der Snapshot stabil bleibt."
+  - id: messen
+    title: Messen und Messprotokoll
+    detail: Ein criterion-Benchmark misst Statuszeilen-Parser und Berichtserzeugung. hyperfine misst einen ganzen Lauf gegen 50 lokale Fake-Dienste mit `--parallel 1`, `8` und `32`. Halte Hypothese, Werte (Release-Build), Streuung und deine Entscheidung für den Standardwert von `--parallel` im README fest.
+  acceptance:
+  - id: exit-status
+    text: Exit-Status 0, 1 und 2 verhalten sich wie im README beschrieben; je ein automatisierter Test belegt jeden Status.
+  - id: grenze-eingehalten
+    text: Nie laufen mehr als `--parallel` Prüfungen gleichzeitig; ein Test mit zählendem Fake-Dienst belegt das.
+  - id: timeout-greift
+    text: Ein hängender Dienst wird nach seinem Timeout als ungesund gemeldet, und der Lauf endet trotzdem.
+  - id: keine-shell
+    text: Prozessprüfungen laufen mit Argumentliste ohne Shell; nach Timeout oder Strg+C bleibt kein Kindprozess zurück.
+  - id: bericht-ganz-oder-gar-nicht
+    text: Die JSON-Datei ist nach jedem Lauf entweder die alte oder die neue vollständige Fassung; die temporäre Datei liegt im Zielverzeichnis.
+  - id: stdout-sauber
+    text: stdout enthält nur den Bericht, Diagnosen gehen auf stderr; `healthcheck … | head -1` endet ohne Panic.
+  - id: tests-ci
+    text: "`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` und alle Tests (Integration, Property, Snapshot) laufen in CI grün."
+  - id: messprotokoll
+    text: Das README enthält criterion- und hyperfine-Ergebnisse aus dem Release-Build mit Hypothese, Streuung und begründeter Entscheidung.
+  stretch:
+  - HTTPS über einen gepflegten Client (reqwest mit rustls) als zusätzliche Art `https`, die minimale Implementierung bleibt für `http`.
+  - Wiederholungen mit Backoff und Jitter, sichtbar im Bericht.
+  - Ausgabe im Prometheus-Textformat für einen Node-Exporter-Textfile-Collector.
+  - Konfiguration bei SIGHUP neu laden und über einen `watch`-Kanal an laufende Prüfungen verteilen.
+  portfolio: |-
+    Zeige eine kurze Demo gegen lokale Fake-Dienste: alles gesund, dann ein langsamer Dienst, dann Strg+C mitten im Lauf. Zeige den Exit-Status und den JSON-Bericht.
+
+    Erkläre im Gespräch drei Entscheidungen: warum die Nebenläufigkeit mit einer Semaphore begrenzt ist und nicht mit der Zahl der Threads, wie Abbruch und Kindprozesse zusammenhängen, und welcher Messwert deinen Standard für `--parallel` begründet. Nenne die Grenzen der eigenen HTTP-Prüfung offen.
+
 - id: abschluss-logwerk
   title: 'Abschlussprojekt: Logwerk für den Betrieb'
   level: 3
